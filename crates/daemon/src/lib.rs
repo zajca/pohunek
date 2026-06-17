@@ -7,10 +7,9 @@
 //!
 //! Current scope (see `docs/plan-phase-1.md` "Build Order"): bind the Unix
 //! socket with correct permissions, single-instance lock, stale-socket recovery,
-//! the `daemon.health` method (milestone 2), and PTY ownership plus the in-memory
-//! session registry/supervisor with the `session.*` methods (milestone 3).
-//! Agents, detection (the state engine), the SQLite store, attach streaming, and
-//! the event log are later milestones and exist here only as stubs.
+//! `daemon.health`, PTY-backed local sessions, and raw attach streaming over a
+//! separate connection. Agents, detection (the state engine), the SQLite store,
+//! and the event log are later milestones and exist here only as stubs.
 
 #![warn(missing_debug_implementations)]
 #![warn(rust_2018_idioms)]
@@ -26,8 +25,8 @@ pub mod paths;
 
 pub mod api;
 
-// PTY ownership and the session registry/supervisor are implemented
-// (milestone 3); the remaining modules are future-milestone stubs (see plan
+// PTY ownership, the session registry/supervisor, and raw attach streaming are
+// implemented; the remaining modules are future-milestone stubs (see plan
 // "Cargo Workspace Layout").
 pub mod pty;
 pub mod session;

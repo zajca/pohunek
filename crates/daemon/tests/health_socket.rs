@@ -11,10 +11,13 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use protocol::{
-    event, method, AgentKind, Event, Request, Response, SessionId, SessionInfo, SessionNewParams,
-    SessionState, SessionStopResult, PROTOCOL_VERSION,
+    event, method, AgentKind, AttachHeader, Event, Request, Response, SessionAttachParams,
+    SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId, SessionInfo,
+    SessionNewParams, SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult,
+    PROTOCOL_VERSION,
 };
 use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio_util::codec::{Framed, LinesCodec};
@@ -96,6 +99,17 @@ async fn connect(socket: &std::path::Path) -> Framed<UnixStream, LinesCodec> {
     panic!("could not connect to test socket {}", socket.display());
 }
 
+/// Connect a raw client to `socket` for attach-stream tests.
+async fn connect_raw(socket: &std::path::Path) -> UnixStream {
+    for _ in 0..50 {
+        if let Ok(stream) = UnixStream::connect(socket).await {
+            return stream;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("could not connect raw test socket {}", socket.display());
+}
+
 /// Send a request line and read one response line.
 async fn exchange(framed: &mut Framed<UnixStream, LinesCodec>, request: &Request) -> Response {
     let line = serde_json::to_string(request).expect("serialize request");
@@ -131,6 +145,101 @@ async fn create_session(framed: &mut Framed<UnixStream, LinesCodec>) -> SessionI
         serde_json::to_value(session_params()).expect("serialize params"),
     );
     serde_json::from_value(ok_payload(exchange(framed, &req).await)).expect("session info")
+}
+
+async fn attach_session(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    id: &SessionId,
+) -> SessionAttachResult {
+    let req = Request::new(
+        "session-attach",
+        method::SESSION_ATTACH,
+        serde_json::to_value(SessionAttachParams {
+            session_id: id.clone(),
+        })
+        .expect("serialize attach params"),
+    );
+    serde_json::from_value(ok_payload(exchange(framed, &req).await)).expect("attach result")
+}
+
+async fn detach_stream(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    stream_id: &str,
+) -> SessionDetachResult {
+    let req = Request::new(
+        "session-detach",
+        method::SESSION_DETACH,
+        serde_json::to_value(SessionDetachParams {
+            stream_id: stream_id.to_owned(),
+        })
+        .expect("serialize detach params"),
+    );
+    serde_json::from_value(ok_payload(exchange(framed, &req).await)).expect("detach result")
+}
+
+async fn resize_session(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    id: &SessionId,
+    cols: u16,
+    rows: u16,
+) -> SessionResizeResult {
+    let req = Request::new(
+        "session-resize",
+        method::SESSION_RESIZE,
+        serde_json::to_value(SessionResizeParams {
+            session_id: id.clone(),
+            cols,
+            rows,
+        })
+        .expect("serialize resize params"),
+    );
+    serde_json::from_value(ok_payload(exchange(framed, &req).await)).expect("resize result")
+}
+
+async fn open_attach_stream(socket: &std::path::Path, stream_id: &str) -> UnixStream {
+    let mut raw = connect_raw(socket).await;
+    let header = serde_json::to_string(&AttachHeader {
+        attach: stream_id.to_owned(),
+    })
+    .expect("serialize attach header");
+    raw.write_all(header.as_bytes())
+        .await
+        .expect("send attach header");
+    raw.write_all(b"\n")
+        .await
+        .expect("terminate attach header");
+    raw
+}
+
+async fn read_until_marker(stream: &mut UnixStream, marker: &[u8]) -> Vec<u8> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut collected = Vec::new();
+        let mut buf = [0_u8; 1024];
+        loop {
+            let n = stream.read(&mut buf).await.expect("read raw stream");
+            assert_ne!(n, 0, "raw stream closed before marker arrived");
+            collected.extend_from_slice(&buf[..n]);
+            if collected.windows(marker.len()).any(|window| window == marker) {
+                return collected;
+            }
+        }
+    })
+    .await
+    .expect("marker arrives before timeout")
+}
+
+async fn assert_raw_stream_closes(stream: &mut UnixStream) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut buf = [0_u8; 256];
+        loop {
+            let n = stream.read(&mut buf).await.expect("read raw stream");
+            if n == 0 {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("raw stream closes before timeout");
 }
 
 async fn inspect_session(
@@ -236,6 +345,7 @@ async fn session_lifecycle_over_socket() {
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
         stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
@@ -297,6 +407,7 @@ async fn session_survives_requesting_client_exit() {
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
         stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
@@ -335,6 +446,7 @@ async fn session_exit_detection_reports_done_and_failed() {
     let success_config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "exit 0"]),
         stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
     };
     let (success_shutdown, success_handle) =
         spawn_server_with_config(&success_socket, "0.0.0", success_config).await;
@@ -349,6 +461,7 @@ async fn session_exit_detection_reports_done_and_failed() {
     let failure_config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "exit 7"]),
         stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
     };
     let (failure_shutdown, failure_handle) =
         spawn_server_with_config(&failure_socket, "0.0.0", failure_config).await;
@@ -366,6 +479,7 @@ async fn subscribe_streams_session_created_event() {
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
@@ -401,6 +515,160 @@ async fn subscribe_streams_session_created_event() {
         Value::from(created.id.0.as_str()),
         "streamed event should carry the created session id"
     );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn attach_raw_stream_round_trips_resizes_detaches_and_reattaches() {
+    let socket = temp_socket("attach-roundtrip");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut control = connect(&socket).await;
+    let created = create_session(&mut control).await;
+
+    let attach = attach_session(&mut control, &created.id).await;
+    assert!(!attach.stream_id.is_empty());
+
+    let mut raw = connect_raw(&socket).await;
+    let header = serde_json::to_string(&AttachHeader {
+        attach: attach.stream_id.clone(),
+    })
+    .expect("serialize attach header");
+    let mut attach_prelude_and_input = header.into_bytes();
+    attach_prelude_and_input.extend_from_slice(
+        b"\nprintf 'm4-leftover:%s\\n' '{\"looks\":\"json\"}'\n",
+    );
+    raw.write_all(&attach_prelude_and_input)
+        .await
+        .expect("send attach header and input in one socket write");
+
+    let output = read_until_marker(&mut raw, br#"m4-leftover:{"looks":"json"}"#).await;
+    assert!(
+        output
+            .windows(br#"m4-leftover:{"looks":"json"}"#.len())
+            .any(|window| window == br#"m4-leftover:{"looks":"json"}"#),
+        "raw output should contain the JSON-looking marker: {}",
+        String::from_utf8_lossy(&output)
+    );
+
+    raw.write_all(b"printf 'm4-bin:\\377END\\n'\n")
+        .await
+        .expect("send binary-safe marker command");
+    let output = read_until_marker(&mut raw, b"m4-bin:\xffEND").await;
+    assert!(
+        output
+            .windows(b"m4-bin:\xffEND".len())
+            .any(|window| window == b"m4-bin:\xffEND"),
+        "raw output should contain non-UTF-8/control bytes: {output:?}"
+    );
+
+    let resize = resize_session(&mut control, &created.id, 120, 40).await;
+    assert_eq!(resize.session.cols, 120);
+    assert_eq!(resize.session.rows, 40);
+    let inspected = inspect_session(&mut control, &created.id).await;
+    assert_eq!(inspected.cols, 120);
+    assert_eq!(inspected.rows, 40);
+
+    let detached = detach_stream(&mut control, &attach.stream_id).await;
+    assert!(detached.detached);
+    assert_raw_stream_closes(&mut raw).await;
+
+    let survived = inspect_session(&mut control, &created.id).await;
+    assert_eq!(survived.state, SessionState::Running);
+
+    let reattach = attach_session(&mut control, &created.id).await;
+    assert_ne!(reattach.stream_id, attach.stream_id);
+    let mut raw_again = open_attach_stream(&socket, &reattach.stream_id).await;
+    raw_again
+        .write_all(b"printf 'm4-reattach\n'\n")
+        .await
+        .expect("send input after reattach");
+    let output = read_until_marker(&mut raw_again, b"m4-reattach").await;
+    assert!(
+        output
+            .windows(b"m4-reattach".len())
+            .any(|window| window == b"m4-reattach"),
+        "reattach stream should receive PTY output: {}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let stop_req = Request::new(
+        "session-stop-after-attach",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn multiple_attach_clients_receive_output_and_disconnect_independently() {
+    let socket = temp_socket("attach-multi");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut control = connect(&socket).await;
+    let created = create_session(&mut control).await;
+
+    let first = attach_session(&mut control, &created.id).await;
+    let second = attach_session(&mut control, &created.id).await;
+    let mut raw_one = open_attach_stream(&socket, &first.stream_id).await;
+    let mut raw_two = open_attach_stream(&socket, &second.stream_id).await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    raw_one
+        .write_all(b"printf 'm4-multi\n'\n")
+        .await
+        .expect("send first multi-client marker");
+
+    let one_output = read_until_marker(&mut raw_one, b"m4-multi").await;
+    let two_output = read_until_marker(&mut raw_two, b"m4-multi").await;
+    assert!(
+        one_output
+            .windows(b"m4-multi".len())
+            .any(|window| window == b"m4-multi")
+    );
+    assert!(
+        two_output
+            .windows(b"m4-multi".len())
+            .any(|window| window == b"m4-multi")
+    );
+
+    drop(raw_one);
+    raw_two
+        .write_all(b"printf 'm4-still-attached\n'\n")
+        .await
+        .expect("send marker after dropping first attach");
+    let two_output = read_until_marker(&mut raw_two, b"m4-still-attached").await;
+    assert!(
+        two_output
+            .windows(b"m4-still-attached".len())
+            .any(|window| window == b"m4-still-attached")
+    );
+
+    let stopped = Request::new(
+        "session-stop-after-multi-attach",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stopped).await))
+            .expect("stop result");
 
     let _ = shutdown.send(());
     let _ = handle.await;

@@ -4,9 +4,11 @@
 use std::path::PathBuf;
 
 use protocol::{
-    event, method, negotiate, AgentKind, ErrorClass, Event, ProtocolError, ProtocolVersion,
-    Request, Response, SessionId, SessionInfo, SessionNewParams, SessionState, SessionStopResult,
-    StateSource, PROTOCOL_VERSION,
+    event, method, negotiate, AgentKind, AttachHeader, ErrorClass, Event, ProtocolError,
+    ProtocolVersion, Request, Response, SessionAttachParams, SessionAttachResult,
+    SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionNewParams,
+    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, StateSource,
+    PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 
@@ -121,6 +123,121 @@ fn session_stop_result_roundtrips() {
 
     let back = line_roundtrip(&result);
     assert_eq!(back, result);
+}
+
+#[test]
+fn session_attach_params_json_shape_roundtrips() {
+    let params = SessionAttachParams {
+        session_id: SessionId("s-42".to_owned()),
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize attach params");
+    assert_eq!(value, json!({ "session_id": "s-42" }));
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn session_attach_result_json_shape_roundtrips() {
+    let result = SessionAttachResult {
+        stream_id: "stream-1".to_owned(),
+    };
+
+    let value = serde_json::to_value(&result).expect("serialize attach result");
+    assert_eq!(value, json!({ "stream_id": "stream-1" }));
+
+    let back = line_roundtrip(&result);
+    assert_eq!(back, result);
+}
+
+#[test]
+fn session_detach_params_json_shape_roundtrips() {
+    let params = SessionDetachParams {
+        stream_id: "stream-1".to_owned(),
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize detach params");
+    assert_eq!(value, json!({ "stream_id": "stream-1" }));
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn session_detach_result_json_shape_roundtrips() {
+    let result = SessionDetachResult { detached: true };
+
+    let value = serde_json::to_value(&result).expect("serialize detach result");
+    assert_eq!(value, json!({ "detached": true }));
+
+    let back = line_roundtrip(&result);
+    assert_eq!(back, result);
+}
+
+#[test]
+fn session_resize_params_json_shape_roundtrips() {
+    let params = SessionResizeParams {
+        session_id: SessionId("s-42".to_owned()),
+        cols: 120,
+        rows: 40,
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize resize params");
+    assert_eq!(
+        value,
+        json!({
+            "session_id": "s-42",
+            "cols": 120,
+            "rows": 40
+        })
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn session_resize_result_carries_updated_session_info() {
+    let session = running_shell_session(None);
+    let result = SessionResizeResult {
+        session: session.clone(),
+    };
+
+    let value = serde_json::to_value(&result).expect("serialize resize result");
+    assert_eq!(
+        value,
+        json!({
+            "session": {
+                "id": "s-42",
+                "agent": "shell",
+                "cwd": "/workspace/project",
+                "pid": 4242,
+                "cols": 120,
+                "rows": 40,
+                "state": "running",
+                "state_source": "process",
+                "created_at": "2026-06-17T10:00:00Z",
+                "updated_at": "2026-06-17T10:01:00Z"
+            }
+        })
+    );
+
+    let back = line_roundtrip(&result);
+    assert_eq!(back, result);
+}
+
+#[test]
+fn attach_header_json_shape_roundtrips() {
+    let header = AttachHeader {
+        attach: "stream-1".to_owned(),
+    };
+
+    let value = serde_json::to_value(&header).expect("serialize attach header");
+    assert_eq!(value, json!({ "attach": "stream-1" }));
+
+    let back = line_roundtrip(&header);
+    assert_eq!(back, header);
 }
 
 #[test]

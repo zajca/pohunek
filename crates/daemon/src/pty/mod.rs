@@ -180,7 +180,7 @@ impl PtyHandle {
         self.pid
     }
 
-    /// Subscribe to PTY output chunks. Milestone 4 will attach clients here.
+    /// Subscribe to PTY output chunks for raw attach streams.
     #[must_use]
     pub fn subscribe_output(&self) -> broadcast::Receiver<Vec<u8>> {
         self.output_tx.subscribe()

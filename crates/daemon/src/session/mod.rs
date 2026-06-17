@@ -17,9 +17,12 @@ use serde_json::json;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, Mutex};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::pty::{PtyCommand, PtyError, PtyExit, PtyHandle};
+
+const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
 
 /// Shell command configuration used for `AgentKind::Shell`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +70,8 @@ pub struct SessionRegistryConfig {
     pub shell_command: ShellCommand,
     /// Grace period after SIGTERM before falling back to a hard kill.
     pub stop_grace: Duration,
+    /// How long a one-shot attach token may remain pending before redemption.
+    pub attach_token_ttl: Duration,
 }
 
 impl Default for SessionRegistryConfig {
@@ -74,6 +79,7 @@ impl Default for SessionRegistryConfig {
         Self {
             shell_command: ShellCommand::default(),
             stop_grace: Duration::from_millis(500),
+            attach_token_ttl: DEFAULT_ATTACH_TOKEN_TTL,
         }
     }
 }
@@ -87,7 +93,10 @@ pub struct SessionRegistry {
 #[derive(Debug)]
 struct SessionRegistryInner {
     sessions: Mutex<HashMap<SessionId, SessionEntry>>,
+    pending_attaches: Mutex<HashMap<String, PendingAttach>>,
+    active_attaches: Mutex<HashMap<String, ActiveAttach>>,
     next_id: AtomicU64,
+    next_stream_id: AtomicU64,
     config: SessionRegistryConfig,
     events: broadcast::Sender<Event>,
 }
@@ -97,6 +106,31 @@ struct SessionEntry {
     info: SessionInfo,
     pty: PtyHandle,
     stopping: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingAttach {
+    session_id: SessionId,
+    expires_at: tokio::time::Instant,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveAttach {
+    session_id: SessionId,
+    cancel: CancellationToken,
+}
+
+/// Redeemed raw attach stream state for the API bridge.
+#[derive(Debug, Clone)]
+pub struct RedeemedAttach {
+    /// One-shot stream id that was redeemed.
+    pub stream_id: String,
+    /// Session being attached.
+    pub session_id: SessionId,
+    /// PTY handle backing the session.
+    pub pty: PtyHandle,
+    /// Cancellation signal fired by `session.detach` or session exit.
+    pub cancel: CancellationToken,
 }
 
 impl Default for SessionRegistry {
@@ -113,7 +147,10 @@ impl SessionRegistry {
         Self {
             inner: Arc::new(SessionRegistryInner {
                 sessions: Mutex::new(HashMap::new()),
+                pending_attaches: Mutex::new(HashMap::new()),
+                active_attaches: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(1),
+                next_stream_id: AtomicU64::new(1),
                 config,
                 events,
             }),
@@ -215,6 +252,161 @@ impl SessionRegistry {
         self.inspect(&SessionId(id.to_owned())).await
     }
 
+    /// Mint a one-shot raw attach stream token for a running session.
+    pub async fn attach(
+        &self,
+        id: &SessionId,
+    ) -> Result<protocol::SessionAttachResult, ProtocolError> {
+        self.prune_expired_pending_attaches().await;
+        {
+            let sessions = self.inner.sessions.lock().await;
+            let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
+            if entry.info.state != SessionState::Running {
+                return Err(session_not_running(id));
+            }
+        }
+
+        let stream_id = format!(
+            "a-{}",
+            self.inner.next_stream_id.fetch_add(1, Ordering::Relaxed)
+        );
+        let pending = PendingAttach {
+            session_id: id.clone(),
+            expires_at: tokio::time::Instant::now() + self.inner.config.attach_token_ttl,
+        };
+        let mut pending_attaches = self.inner.pending_attaches.lock().await;
+        pending_attaches.insert(stream_id.clone(), pending);
+        Ok(protocol::SessionAttachResult { stream_id })
+    }
+
+    /// Redeem a one-shot attach token and register a live attach stream.
+    pub async fn redeem_attach(&self, stream_id: &str) -> Result<RedeemedAttach, ProtocolError> {
+        self.prune_expired_pending_attaches().await;
+        let pending = {
+            let mut pending_attaches = self.inner.pending_attaches.lock().await;
+            pending_attaches.remove(stream_id)
+        }
+        .ok_or_else(|| attach_token_error("attach_not_found", stream_id))?;
+
+        if tokio::time::Instant::now() > pending.expires_at {
+            return Err(attach_token_error("attach_expired", stream_id));
+        }
+
+        let pty = {
+            let sessions = self.inner.sessions.lock().await;
+            let entry = sessions
+                .get(&pending.session_id)
+                .ok_or_else(|| session_not_found(&pending.session_id.0))?;
+            if entry.info.state != SessionState::Running {
+                return Err(session_not_running(&pending.session_id));
+            }
+            entry.pty.clone()
+        };
+
+        let cancel = CancellationToken::new();
+        {
+            let mut active_attaches = self.inner.active_attaches.lock().await;
+            active_attaches.insert(
+                stream_id.to_owned(),
+                ActiveAttach {
+                    session_id: pending.session_id.clone(),
+                    cancel: cancel.clone(),
+                },
+            );
+        }
+
+        if let Err(err) = self.ensure_session_running(&pending.session_id).await {
+            let mut active_attaches = self.inner.active_attaches.lock().await;
+            active_attaches.remove(stream_id);
+            return Err(err);
+        }
+
+        self.emit_attach(event::ATTACH_OPENED, &pending.session_id, stream_id);
+        Ok(RedeemedAttach {
+            stream_id: stream_id.to_owned(),
+            session_id: pending.session_id,
+            pty,
+            cancel,
+        })
+    }
+
+    /// Cancel an active raw attach stream. Unknown streams are a no-op.
+    pub async fn detach(&self, stream_id: &str) -> protocol::SessionDetachResult {
+        let cancel = {
+            let active_attaches = self.inner.active_attaches.lock().await;
+            active_attaches.get(stream_id).and_then(|active| {
+                if active.cancel.is_cancelled() {
+                    None
+                } else {
+                    Some(active.cancel.clone())
+                }
+            })
+        };
+        let detached = if let Some(cancel) = cancel {
+            cancel.cancel();
+            true
+        } else {
+            false
+        };
+        protocol::SessionDetachResult { detached }
+    }
+
+    /// Deregister a raw attach stream after its bridge exits.
+    pub async fn finish_attach(&self, stream_id: &str) {
+        let active = {
+            let mut active_attaches = self.inner.active_attaches.lock().await;
+            active_attaches.remove(stream_id)
+        };
+
+        if let Some(active) = active {
+            self.emit_attach(event::ATTACH_CLOSED, &active.session_id, stream_id);
+        }
+    }
+
+    /// Resize a running session PTY and return the updated session info.
+    pub async fn resize(
+        &self,
+        id: &SessionId,
+        cols: u16,
+        rows: u16,
+    ) -> Result<protocol::SessionResizeResult, ProtocolError> {
+        if cols == 0 || rows == 0 {
+            return Err(ProtocolError::bad_request(
+                "session.resize requires non-zero cols and rows",
+            ));
+        }
+
+        let pty = {
+            let sessions = self.inner.sessions.lock().await;
+            let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
+            if entry.info.state != SessionState::Running {
+                return Err(session_not_running(id));
+            }
+            entry.pty.clone()
+        };
+
+        pty.resize(cols, rows)
+            .await
+            .map_err(pty_error_to_protocol)?;
+
+        let info = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let entry = sessions
+                .get_mut(id)
+                .ok_or_else(|| session_not_found(&id.0))?;
+            if entry.info.state != SessionState::Running {
+                return Err(session_not_running(id));
+            }
+            entry.info.cols = cols;
+            entry.info.rows = rows;
+            entry.info.updated_at = timestamp_now();
+            entry.info.clone()
+        };
+
+        self.emit(event::SESSION_UPDATED, &info);
+        Ok(protocol::SessionResizeResult { session: info })
+    }
+
     /// Stop a running session.
     pub async fn stop(&self, id: &SessionId) -> Result<SessionStopResult, ProtocolError> {
         let pty = {
@@ -229,6 +421,9 @@ impl SessionRegistry {
             entry.stopping = true;
             entry.pty.clone()
         };
+
+        self.remove_pending_attaches_for_session(id).await;
+        self.cancel_session_attaches(id).await;
 
         let exit = match pty.shutdown(self.inner.config.stop_grace).await {
             Ok(exit) => exit,
@@ -328,6 +523,8 @@ impl SessionRegistry {
             (event, entry.info.clone())
         };
 
+        self.cancel_session_attaches(id).await;
+        self.remove_pending_attaches_for_session(id).await;
         self.emit(updated.0, &updated.1);
     }
 
@@ -340,8 +537,50 @@ impl SessionRegistry {
         }
     }
 
+    async fn ensure_session_running(&self, id: &SessionId) -> Result<(), ProtocolError> {
+        let sessions = self.inner.sessions.lock().await;
+        let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
+        if entry.info.state == SessionState::Running {
+            Ok(())
+        } else {
+            Err(session_not_running(id))
+        }
+    }
+
+    async fn cancel_session_attaches(&self, id: &SessionId) {
+        let active_attaches = self.inner.active_attaches.lock().await;
+        for (stream_id, active) in active_attaches.iter() {
+            if active.session_id == *id {
+                debug!(session_id = %id.0, stream_id, "cancelling active attach");
+                active.cancel.cancel();
+            }
+        }
+    }
+
+    async fn prune_expired_pending_attaches(&self) {
+        let now = tokio::time::Instant::now();
+        let mut pending_attaches = self.inner.pending_attaches.lock().await;
+        pending_attaches.retain(|_, pending| pending.expires_at > now);
+    }
+
+    async fn remove_pending_attaches_for_session(&self, id: &SessionId) {
+        let mut pending_attaches = self.inner.pending_attaches.lock().await;
+        pending_attaches.retain(|_, pending| pending.session_id != *id);
+    }
+
     fn emit(&self, name: &str, info: &SessionInfo) {
         let event = Event::new(name, json!({ "session": info }));
+        let _ = self.inner.events.send(event);
+    }
+
+    fn emit_attach(&self, name: &str, session_id: &SessionId, stream_id: &str) {
+        let event = Event::new(
+            name,
+            json!({
+                "session_id": session_id,
+                "stream_id": stream_id,
+            }),
+        );
         let _ = self.inner.events.send(event);
     }
 }
@@ -375,6 +614,24 @@ fn session_not_found(id: &str) -> ProtocolError {
         ErrorClass::Runtime,
         "session_not_found",
         format!("session not found: {id}"),
+        None,
+    )
+}
+
+fn session_not_running(id: &SessionId) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Runtime,
+        "session_not_running",
+        format!("session is not running: {}", id.0),
+        None,
+    )
+}
+
+fn attach_token_error(code: &'static str, stream_id: &str) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Runtime,
+        code,
+        format!("attach stream is not available: {stream_id}"),
         None,
     )
 }
@@ -429,6 +686,7 @@ mod tests {
         let registry = SessionRegistry::new(SessionRegistryConfig {
             shell_command: ShellCommand::new("/bin/sh", ["-c", "exit 0"]),
             stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
         });
 
         let created = registry.create(params()).await.expect("create session");
@@ -446,6 +704,7 @@ mod tests {
         let registry = SessionRegistry::new(SessionRegistryConfig {
             shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
             stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
         });
 
         let created = registry.create(params()).await.expect("create session");
@@ -457,6 +716,49 @@ mod tests {
 
         assert!(stopped.stopped);
         assert_eq!(inspected.state, SessionState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn attach_tokens_are_one_shot_and_expired_tokens_are_pruned() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            attach_token_ttl: Duration::from_millis(1),
+        });
+
+        let created = registry.create(params()).await.expect("create session");
+        let expired = registry.attach(&created.id).await.expect("attach token");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let fresh = registry
+            .attach(&created.id)
+            .await
+            .expect("fresh attach token");
+
+        {
+            let pending = registry.inner.pending_attaches.lock().await;
+            assert!(
+                !pending.contains_key(&expired.stream_id),
+                "expired pending attach token should be pruned"
+            );
+            assert!(
+                pending.contains_key(&fresh.stream_id),
+                "fresh pending attach token should remain"
+            );
+        }
+
+        let redeemed = registry
+            .redeem_attach(&fresh.stream_id)
+            .await
+            .expect("redeem fresh attach token");
+        let second_redeem = registry
+            .redeem_attach(&fresh.stream_id)
+            .await
+            .expect_err("stream id is one-shot");
+        assert_eq!(second_redeem.code, "attach_not_found");
+
+        registry.finish_attach(&redeemed.stream_id).await;
+        let stopped = registry.stop(&created.id).await.expect("stop session");
+        assert!(stopped.stopped);
     }
 
     #[tokio::test]

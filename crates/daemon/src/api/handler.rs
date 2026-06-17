@@ -11,11 +11,11 @@
 //! methods.
 
 use protocol::{
-    method, negotiate, ProtocolError, Request, Response, SessionId, SessionNewParams,
-    PROTOCOL_VERSION,
+    method, negotiate, ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams,
+    SessionId, SessionNewParams, SessionResizeParams, PROTOCOL_VERSION,
 };
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 use crate::session::SessionRegistry;
@@ -67,6 +67,8 @@ pub(crate) enum Dispatch {
     /// The client asked to subscribe; send this OK ack line, then the caller
     /// streams session events on this connection until the client disconnects.
     Subscribe(String),
+    /// The client sent an attach prelude; the caller switches to raw PTY bytes.
+    Attach(String),
 }
 
 /// Parse one request line and decide how the connection should proceed.
@@ -82,6 +84,10 @@ pub(crate) async fn dispatch_line(line: &str, state: &DaemonState) -> Dispatch {
         // synthetic id so the client still gets a parseable line.
         let resp = Response::err("", ProtocolError::bad_request("empty request line"));
         return Dispatch::Reply(serialize_response(&resp));
+    }
+
+    if let Some(stream_id) = parse_attach_prelude(trimmed) {
+        return Dispatch::Attach(stream_id);
     }
 
     let request: Request = match serde_json::from_str(trimmed) {
@@ -133,6 +139,9 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::SESSION_LIST => handle_session_list(request, &state.sessions).await,
         method::SESSION_INSPECT => handle_session_inspect(request, &state.sessions).await,
         method::SESSION_STOP => handle_session_stop(request, &state.sessions).await,
+        method::SESSION_ATTACH => handle_session_attach(request, &state.sessions).await,
+        method::SESSION_DETACH => handle_session_detach(request, &state.sessions).await,
+        method::SESSION_RESIZE => handle_session_resize(request, &state.sessions).await,
         other => Response::err(request.id.clone(), ProtocolError::method_not_found(other)),
     }
 }
@@ -187,6 +196,40 @@ async fn handle_session_stop(request: &Request, sessions: &SessionRegistry) -> R
     }
 }
 
+async fn handle_session_attach(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_params::<SessionAttachParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    match sessions.attach(&params.session_id).await {
+        Ok(result) => ok_value(request, &result),
+        Err(err) => Response::err(request.id.clone(), err),
+    }
+}
+
+async fn handle_session_detach(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_params::<SessionDetachParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    let result = sessions.detach(&params.stream_id).await;
+    ok_value(request, &result)
+}
+
+async fn handle_session_resize(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_params::<SessionResizeParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    match sessions
+        .resize(&params.session_id, params.cols, params.rows)
+        .await
+    {
+        Ok(result) => ok_value(request, &result),
+        Err(err) => Response::err(request.id.clone(), err),
+    }
+}
+
 fn parse_params<T>(request: &Request) -> Result<T, ProtocolError>
 where
     T: serde::de::DeserializeOwned,
@@ -218,7 +261,7 @@ where
 ///
 /// Serialization of our own typed envelopes cannot fail in practice; if it ever
 /// did we fall back to a minimal hand-built error line rather than panicking.
-fn serialize_response(resp: &Response) -> String {
+pub(crate) fn serialize_response(resp: &Response) -> String {
     serde_json::to_string(resp).unwrap_or_else(|err| {
         warn!(error = %err, "failed to serialize response; sending fallback error");
         format!(
@@ -227,4 +270,37 @@ fn serialize_response(resp: &Response) -> String {
             resp.id().replace('"', "")
         )
     })
+}
+
+fn parse_attach_prelude(line: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    let object = value.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+
+    match object.get("attach") {
+        Some(Value::String(stream_id)) if !stream_id.is_empty() => Some(stream_id.clone()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_attach_prelude;
+
+    #[test]
+    fn attach_prelude_requires_exact_one_field_shape() {
+        assert_eq!(
+            parse_attach_prelude(r#"{"attach":"a-1"}"#),
+            Some("a-1".to_owned())
+        );
+        assert_eq!(parse_attach_prelude(r#"{"attach":""}"#), None);
+        assert_eq!(
+            parse_attach_prelude(
+                r#"{"v":1,"id":"req-1","method":"daemon.health","params":null,"attach":"a-1"}"#
+            ),
+            None
+        );
+    }
 }

@@ -4,6 +4,7 @@
 //! command supports `--json` where the plan calls for machine-readable output
 //! (see `docs/plan-phase-1.md` "CLI Grammar").
 
+pub(crate) mod attach;
 pub(crate) mod daemon;
 pub(crate) mod doctor;
 pub(crate) mod health;

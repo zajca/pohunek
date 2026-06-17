@@ -15,10 +15,11 @@ zagentmesh-protocol = { path = "../protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }
 tokio-util = { workspace = true }
 futures = { workspace = true }
 clap = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 # Exercise the host-aware target parser without a running daemon.

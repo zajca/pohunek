@@ -8,7 +8,7 @@
 #![warn(missing_debug_implementations)]
 #![warn(rust_2018_idioms)]
 #![warn(unreachable_pub)]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod client;
 mod commands;
@@ -41,6 +41,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Attach this terminal to a local session. Press Ctrl-] to detach.
+    Attach {
+        /// Session target: `session-id` or `local/session-id`.
+        target: Target,
+    },
+
     /// Check environment health (binaries, socket/state dir writability).
     Doctor {
         /// Emit machine-readable JSON instead of a table.
@@ -143,6 +149,11 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
     ensure_local_host(&cli.host)?;
 
     match cli.command {
+        Commands::Attach { target } => {
+            let paths = Paths::resolve()?;
+            commands::attach::run_attach(&paths, &target).await?;
+            Ok(ExitCode::SUCCESS)
+        }
         Commands::Doctor { json } => {
             let paths = Paths::resolve()?;
             let healthy = commands::doctor::run(&paths, json)?;
@@ -262,6 +273,32 @@ mod tests {
                 assert_eq!(target.session_id, "s-42");
                 assert_eq!(target.host.as_deref(), Some("local"));
                 assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_attach_bare_target() {
+        let cli = Cli::try_parse_from(["zagentmesh", "attach", "s-42"]).expect("parse");
+
+        match cli.command {
+            Commands::Attach { target } => {
+                assert_eq!(target.session_id, "s-42");
+                assert_eq!(target.host, None);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_attach_explicit_local_target() {
+        let cli = Cli::try_parse_from(["zagentmesh", "attach", "local/s-42"]).expect("parse");
+
+        match cli.command {
+            Commands::Attach { target } => {
+                assert_eq!(target.session_id, "s-42");
+                assert_eq!(target.host.as_deref(), Some("local"));
             }
             other => panic!("unexpected command: {other:?}"),
         }

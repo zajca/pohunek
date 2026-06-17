@@ -37,6 +37,52 @@ pub struct SessionNewParams {
 #[serde(transparent)]
 pub struct SessionId(pub String);
 
+/// Parameters for `session.attach`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionAttachParams {
+    /// Session to attach to.
+    pub session_id: SessionId,
+}
+
+/// Result returned by `session.attach`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionAttachResult {
+    /// One-shot stream identifier used by the attach connection header.
+    pub stream_id: String,
+}
+
+/// Parameters for `session.detach`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDetachParams {
+    /// Active attach stream to detach.
+    pub stream_id: String,
+}
+
+/// Result returned by `session.detach`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDetachResult {
+    /// Whether an active attach stream was detached.
+    pub detached: bool,
+}
+
+/// Parameters for `session.resize`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionResizeParams {
+    /// Session whose PTY should be resized.
+    pub session_id: SessionId,
+    /// Updated terminal width in columns.
+    pub cols: u16,
+    /// Updated terminal height in rows.
+    pub rows: u16,
+}
+
+/// Header sent as the first line on a raw attach connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachHeader {
+    /// One-shot stream identifier returned by `session.attach`.
+    pub attach: String,
+}
+
 /// Lifecycle state of a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,4 +132,11 @@ pub struct SessionInfo {
 pub struct SessionStopResult {
     /// Whether the daemon stopped a live session.
     pub stopped: bool,
+}
+
+/// Result returned by `session.resize`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionResizeResult {
+    /// Updated session summary after the resize.
+    pub session: SessionInfo,
 }

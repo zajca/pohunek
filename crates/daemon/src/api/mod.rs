@@ -13,9 +13,8 @@
 //! receive a typed `method_not_found` error (the contract for later milestones is
 //! already in the `protocol` crate).
 //!
-//! Attach STREAMING of raw terminal bytes uses a *separate* connection and is a
-//! later milestone; this server handles the JSON control connection (and its
-//! control-event subscription) only.
+//! Attach streaming uses a separate connection: the first line carries an attach
+//! prelude, then the connection switches from newline JSON to raw PTY bytes.
 
 mod handler;
 
@@ -24,14 +23,15 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use futures::{SinkExt, StreamExt};
-use protocol::Event;
+use protocol::{Event, Response};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 use tracing::{error, info, warn};
 
 use crate::error::DaemonError;
-use crate::session::SessionRegistry;
+use crate::session::{RedeemedAttach, SessionRegistry};
 
 use handler::Dispatch;
 pub use handler::{handle_request, DaemonState, HealthInfo};
@@ -185,8 +185,127 @@ async fn serve_connection(stream: UnixStream, state: DaemonState) -> Result<(), 
                 // The connection is consumed by the subscription stream.
                 return Ok(());
             }
+            Dispatch::Attach(stream_id) => {
+                run_attach_connection(framed, state.sessions.clone(), stream_id).await?;
+                return Ok(());
+            }
         }
     }
+    Ok(())
+}
+
+async fn run_attach_connection(
+    mut framed: Framed<UnixStream, LinesCodec>,
+    registry: SessionRegistry,
+    stream_id: String,
+) -> Result<(), io::Error> {
+    let attach = match registry.redeem_attach(&stream_id).await {
+        Ok(attach) => attach,
+        Err(err) => {
+            let response = Response::err(stream_id, err);
+            framed
+                .send(handler::serialize_response(&response))
+                .await
+                .map_err(codec_to_io)?;
+            return Ok(());
+        }
+    };
+
+    let parts = framed.into_parts();
+    let mut stream = parts.io;
+    if !parts.read_buf.is_empty() {
+        if let Err(err) = attach.pty.write_user_input(parts.read_buf.to_vec()).await {
+            warn!(
+                stream_id = %attach.stream_id,
+                session_id = %attach.session_id.0,
+                error = %err,
+                "failed to write buffered attach input to PTY"
+            );
+            registry.finish_attach(&attach.stream_id).await;
+            return Ok(());
+        }
+    }
+
+    let bridge_result = run_attach_bridge(&mut stream, &attach).await;
+    registry.finish_attach(&attach.stream_id).await;
+    bridge_result
+}
+
+async fn run_attach_bridge(
+    stream: &mut UnixStream,
+    attach: &RedeemedAttach,
+) -> Result<(), io::Error> {
+    let mut output = attach.pty.subscribe_output();
+    let exit_pty = attach.pty.clone();
+    let wait_exit = exit_pty.wait_exit();
+    tokio::pin!(wait_exit);
+    let mut input = [0_u8; 8192];
+
+    loop {
+        tokio::select! {
+            chunk = output.recv() => match chunk {
+                Ok(chunk) => {
+                    let write = stream.write_all(&chunk);
+                    tokio::pin!(write);
+                    tokio::select! {
+                        result = &mut write => {
+                            result?;
+                        }
+                        () = attach.cancel.cancelled() => break,
+                        exit = &mut wait_exit => {
+                            if let Err(err) = exit {
+                                warn!(
+                                    stream_id = %attach.stream_id,
+                                    session_id = %attach.session_id.0,
+                                    error = %err,
+                                    "attach bridge stopped while waiting for PTY exit"
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(
+                        stream_id = %attach.stream_id,
+                        session_id = %attach.session_id.0,
+                        skipped,
+                        "attach output subscriber lagged; PTY bytes were dropped"
+                    );
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            read = stream.read(&mut input) => {
+                let n = read?;
+                if n == 0 {
+                    break;
+                }
+                if let Err(err) = attach.pty.write_user_input(input[..n].to_vec()).await {
+                    warn!(
+                        stream_id = %attach.stream_id,
+                        session_id = %attach.session_id.0,
+                        error = %err,
+                        "failed to write attach input to PTY"
+                    );
+                    break;
+                }
+            },
+            () = attach.cancel.cancelled() => break,
+            exit = &mut wait_exit => {
+                if let Err(err) = exit {
+                    warn!(
+                        stream_id = %attach.stream_id,
+                        session_id = %attach.session_id.0,
+                        error = %err,
+                        "attach bridge stopped while waiting for PTY exit"
+                    );
+                }
+                break;
+            }
+        }
+    }
+
     Ok(())
 }
 
