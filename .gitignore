@@ -8,6 +8,12 @@
 # Local runtime/state produced by the daemon during manual testing.
 /logs
 
+# Local tool/runtime caches (per-machine; not shared)
+/.cache
+
+# Local agent memory written by Claude Code subagents (per-machine; not shared)
+/.claude/agent-memory
+
 # Editor/OS noise
 .DS_Store
 *.swp
