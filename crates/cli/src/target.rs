@@ -1,0 +1,177 @@
+//! Host-aware target parsing.
+//!
+//! Phase 2 will address sessions as `<host>/<session-id>` and add `--host` on
+//! commands (see `docs/plan-phase-1.md` "CLI Grammar (forward-compatible with
+//! Phase 2)"). The parser is host-aware *now* so Phase 2 adds transport without
+//! changing the grammar, but only the local form is *executable* in Phase 1.
+//!
+//! Grammar:
+//! - `s-42`            → local session `s-42`
+//! - `local/s-42`      → explicit local host, session `s-42`
+//! - `host-b/s-42`     → remote host `host-b`, session `s-42` (parses; not yet
+//!   executable — returns a typed `RemoteNotSupported`).
+
+use std::fmt;
+
+/// The reserved host name meaning "this machine".
+pub(crate) const LOCAL_HOST: &str = "local";
+
+/// A parsed session target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Target {
+    /// `None` for an implicit/explicit local target; `Some(host)` for a remote.
+    pub(crate) host: Option<String>,
+    /// The session identifier portion.
+    pub(crate) session_id: String,
+}
+
+impl Target {
+    /// Whether this target refers to the local host.
+    ///
+    /// True when no host was given or the host is the reserved `local` name.
+    #[must_use]
+    pub(crate) fn is_local(&self) -> bool {
+        match &self.host {
+            None => true,
+            Some(h) => h == LOCAL_HOST,
+        }
+    }
+
+    /// The host name, or `local` when implicit.
+    #[must_use]
+    pub(crate) fn host_or_local(&self) -> &str {
+        self.host.as_deref().unwrap_or(LOCAL_HOST)
+    }
+}
+
+/// Error parsing a target string.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum TargetParseError {
+    /// The input was empty.
+    #[error("empty target")]
+    Empty,
+    /// The session-id portion was empty (e.g. `host/`).
+    #[error("missing session id in target '{0}'")]
+    MissingSessionId(String),
+    /// The host portion was empty (e.g. `/s-42`).
+    #[error("missing host in target '{0}'")]
+    MissingHost(String),
+    /// More than one `/` separator.
+    #[error("invalid target '{0}': expected at most one '/' separating host and session id")]
+    TooManySeparators(String),
+}
+
+impl std::str::FromStr for Target {
+    type Err = TargetParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(TargetParseError::Empty);
+        }
+
+        let mut parts = s.splitn(3, '/');
+        // splitn with limit 3 lets us detect a third segment as "too many".
+        let first = parts.next().unwrap_or_default();
+        match (parts.next(), parts.next()) {
+            // No separator: bare session id, implicit local.
+            (None, _) => Ok(Target {
+                host: None,
+                session_id: first.to_owned(),
+            }),
+            // One separator: host/session.
+            (Some(session), None) => {
+                if first.is_empty() {
+                    return Err(TargetParseError::MissingHost(s.to_owned()));
+                }
+                if session.is_empty() {
+                    return Err(TargetParseError::MissingSessionId(s.to_owned()));
+                }
+                Ok(Target {
+                    host: Some(first.to_owned()),
+                    session_id: session.to_owned(),
+                })
+            }
+            // Two separators: malformed.
+            (Some(_), Some(_)) => Err(TargetParseError::TooManySeparators(s.to_owned())),
+        }
+    }
+}
+
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.host {
+            Some(h) => write!(f, "{h}/{}", self.session_id),
+            None => f.write_str(&self.session_id),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_bare_session_id_as_local() {
+        let t: Target = "s-42".parse().expect("parse");
+        assert_eq!(t.host, None);
+        assert_eq!(t.session_id, "s-42");
+        assert!(t.is_local());
+        assert_eq!(t.host_or_local(), "local");
+    }
+
+    #[test]
+    fn parses_explicit_local_host() {
+        let t: Target = "local/s-42".parse().expect("parse");
+        assert_eq!(t.host.as_deref(), Some("local"));
+        assert_eq!(t.session_id, "s-42");
+        assert!(t.is_local());
+    }
+
+    #[test]
+    fn parses_remote_host() {
+        let t: Target = "host-b/s-42".parse().expect("parse");
+        assert_eq!(t.host.as_deref(), Some("host-b"));
+        assert_eq!(t.session_id, "s-42");
+        assert!(!t.is_local());
+        assert_eq!(t.host_or_local(), "host-b");
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert_eq!("".parse::<Target>(), Err(TargetParseError::Empty));
+        assert_eq!("   ".parse::<Target>(), Err(TargetParseError::Empty));
+    }
+
+    #[test]
+    fn rejects_missing_session_id() {
+        assert_eq!(
+            "host/".parse::<Target>(),
+            Err(TargetParseError::MissingSessionId("host/".to_owned()))
+        );
+    }
+
+    #[test]
+    fn rejects_missing_host() {
+        assert_eq!(
+            "/s-42".parse::<Target>(),
+            Err(TargetParseError::MissingHost("/s-42".to_owned()))
+        );
+    }
+
+    #[test]
+    fn rejects_too_many_separators() {
+        assert_eq!(
+            "a/b/c".parse::<Target>(),
+            Err(TargetParseError::TooManySeparators("a/b/c".to_owned()))
+        );
+    }
+
+    #[test]
+    fn display_roundtrips() {
+        for s in ["s-42", "local/s-42", "host-b/s-42"] {
+            let t: Target = s.parse().expect("parse");
+            assert_eq!(t.to_string(), s);
+        }
+    }
+}

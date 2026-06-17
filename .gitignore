@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Cargo lockfile is committed for binaries (workspace produces binaries), so it
+# is intentionally NOT ignored here.
+
+# Local runtime/state produced by the daemon during manual testing.
+/logs
+
+# Editor/OS noise
+.DS_Store
+*.swp

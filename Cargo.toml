@@ -1,0 +1,42 @@
+# zagentmesh Cargo workspace.
+#
+# Single-user, CLI-first tool: a daemon owns PTYs running coding agents; a CLI
+# controls it over a local Unix socket using newline-delimited JSON.
+#
+# Layout and crate choices follow docs/plan-phase-1.md ("Tech Stack and Crates",
+# "Cargo Workspace Layout"). Only Build-Order milestones 1 and 2 are implemented
+# in this revision; later modules are stubs.
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+    "crates/daemon",
+    "crates/cli",
+]
+
+# Shared dependency versions. Individual crates opt in via `workspace = true`.
+# Only the crates needed for milestones 1-2 are declared here (per the plan,
+# rusqlite/portable-pty/vt100/toml/regex come in later milestones).
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "fs", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
+tracing-appender = "0.2"
+clap = { version = "4", features = ["derive"] }
+# Advisory file locking (flock) and socket-mode chmod for the single-instance
+# lock and 0600 socket. Minimal, standard FFI surface; needed for milestone 2.
+libc = "0.2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.96"
+
+# Keep release builds debuggable enough for a daemon while small.
+[profile.release]
+opt-level = 2
