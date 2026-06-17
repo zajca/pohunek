@@ -24,10 +24,14 @@
 
 mod envelope;
 mod error;
+mod session;
 mod version;
 
 pub use envelope::{Event, Request, Response, StateSource};
 pub use error::{ErrorClass, ProtocolError};
+pub use session::{
+    AgentKind, SessionId, SessionInfo, SessionNewParams, SessionState, SessionStopResult,
+};
 pub use version::{negotiate, ProtocolVersion, PROTOCOL_VERSION};
 
 /// Control-protocol method names (Phase 1).
@@ -56,4 +60,14 @@ pub mod method {
     pub const SUBSCRIBE: &str = "subscribe";
     /// Fire-and-forget native-session-id capture from the agent hook.
     pub const SESSION_REPORT_NATIVE_ID: &str = "session.report_native_id";
+}
+
+/// Control-protocol event names.
+///
+/// These are the `event` values published on subscription connections. The
+/// payload remains an open JSON object at the envelope layer.
+pub mod event {
+    pub const SESSION_CREATED: &str = "session_created";
+    pub const SESSION_UPDATED: &str = "session_updated";
+    pub const SESSION_STOPPED: &str = "session_stopped";
 }

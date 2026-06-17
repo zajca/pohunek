@@ -16,6 +16,7 @@ mod error;
 mod paths;
 mod target;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -66,6 +67,12 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Manage local PTY-backed sessions.
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -75,6 +82,47 @@ enum DaemonAction {
         /// Run the daemon in the background instead of the foreground.
         #[arg(long)]
         detach: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionAction {
+    /// Start a new session.
+    New {
+        /// Agent kind to start. Milestone 3 accepts only `shell`.
+        #[arg(long, value_enum, default_value = "shell")]
+        agent: commands::session::AgentArg,
+        /// Working directory for the session.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Initial terminal width in columns.
+        #[arg(long, default_value_t = 80)]
+        cols: u16,
+        /// Initial terminal height in rows.
+        #[arg(long, default_value_t = 24)]
+        rows: u16,
+    },
+
+    /// List known sessions.
+    List {
+        /// Emit machine-readable JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Inspect one session.
+    Inspect {
+        /// Session target: `session-id` or `local/session-id`.
+        target: Target,
+        /// Emit machine-readable JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Stop one session.
+    Stop {
+        /// Session target: `session-id` or `local/session-id`.
+        target: Target,
     },
 }
 
@@ -115,6 +163,25 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             commands::health::run(&paths, json).await?;
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Session { action } => {
+            let paths = Paths::resolve()?;
+            match action {
+                SessionAction::New {
+                    agent,
+                    cwd,
+                    cols,
+                    rows,
+                } => commands::session::run_new(&paths, agent, cwd, cols, rows).await?,
+                SessionAction::List { json } => commands::session::run_list(&paths, json).await?,
+                SessionAction::Inspect { target, json } => {
+                    commands::session::run_inspect(&paths, &target, json).await?
+                }
+                SessionAction::Stop { target } => {
+                    commands::session::run_stop(&paths, &target).await?
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 
@@ -143,5 +210,60 @@ fn ensure_local_host(host: &str) -> Result<(), CliError> {
         Err(CliError::RemoteNotSupported {
             host: target.host_or_local().to_owned(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn parses_session_new_defaults() {
+        let cli = Cli::try_parse_from(["zagentmesh", "session", "new"]).expect("parse");
+
+        match cli.command {
+            Commands::Session {
+                action:
+                    SessionAction::New {
+                        agent,
+                        cwd,
+                        cols,
+                        rows,
+                    },
+            } => {
+                assert_eq!(agent, commands::session::AgentArg::Shell);
+                assert_eq!(cwd, None);
+                assert_eq!(cols, 80);
+                assert_eq!(rows, 24);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_non_shell_agent_for_session_new() {
+        let err = Cli::try_parse_from(["zagentmesh", "session", "new", "--agent", "codex"])
+            .expect_err("non-shell agents are not accepted in this milestone");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn parses_session_inspect_target_and_json_flag() {
+        let cli = Cli::try_parse_from(["zagentmesh", "session", "inspect", "local/s-42", "--json"])
+            .expect("parse");
+
+        match cli.command {
+            Commands::Session {
+                action: SessionAction::Inspect { target, json },
+            } => {
+                assert_eq!(target.session_id, "s-42");
+                assert_eq!(target.host.as_deref(), Some("local"));
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }

@@ -5,11 +5,12 @@
 //! the daemon's runtime so the `zagentmeshd` binary and integration tests can
 //! drive it.
 //!
-//! Milestone 2 scope (see `docs/plan-phase-1.md` "Build Order" step 2): bind the
-//! Unix socket with correct permissions, single-instance lock, stale-socket
-//! recovery, and the `daemon.health` method. PTY ownership, sessions, agents,
-//! detection, the SQLite store, attach streaming, and the event log are later
-//! milestones and exist here only as stubs.
+//! Current scope (see `docs/plan-phase-1.md` "Build Order"): bind the Unix
+//! socket with correct permissions, single-instance lock, stale-socket recovery,
+//! the `daemon.health` method (milestone 2), and PTY ownership plus the in-memory
+//! session registry/supervisor with the `session.*` methods (milestone 3).
+//! Agents, detection (the state engine), the SQLite store, attach streaming, and
+//! the event log are later milestones and exist here only as stubs.
 
 #![warn(missing_debug_implementations)]
 #![warn(rust_2018_idioms)]
@@ -25,12 +26,15 @@ pub mod paths;
 
 pub mod api;
 
-// --- Future-milestone module stubs (see plan "Cargo Workspace Layout"). ---
+// PTY ownership and the session registry/supervisor are implemented
+// (milestone 3); the remaining modules are future-milestone stubs (see plan
+// "Cargo Workspace Layout").
+pub mod pty;
+pub mod session;
+
 pub mod agent;
 pub mod detect;
 pub mod events;
-pub mod pty;
-pub mod session;
 pub mod store;
 
 pub use error::DaemonError;

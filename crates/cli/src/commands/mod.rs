@@ -7,3 +7,4 @@
 pub(crate) mod daemon;
 pub(crate) mod doctor;
 pub(crate) mod health;
+pub(crate) mod session;

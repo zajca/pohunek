@@ -1,0 +1,89 @@
+//! Typed session lifecycle payloads.
+//!
+//! The generic request, response, and event envelopes still carry opaque JSON
+//! values. These shared types define the JSON shape both sides should use inside
+//! those values for session lifecycle methods and events.
+
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use crate::envelope::StateSource;
+
+/// The kind of agent backing a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentKind {
+    /// A plain shell session.
+    Shell,
+}
+
+/// Parameters for `session.new`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionNewParams {
+    /// Agent kind to start.
+    pub agent: AgentKind,
+    /// Working directory for the session. If omitted, the daemon chooses one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    /// Initial terminal width in columns.
+    pub cols: u16,
+    /// Initial terminal height in rows.
+    pub rows: u16,
+}
+
+/// Opaque session identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionId(pub String);
+
+/// Lifecycle state of a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    /// The daemon accepted the session and is starting its process.
+    Starting,
+    /// The session process is running.
+    Running,
+    /// A stop was requested and the session is winding down.
+    Stopped,
+    /// The session completed successfully.
+    Done,
+    /// The session failed.
+    Failed,
+}
+
+/// Summary returned by session lifecycle methods and published by events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    /// Stable session identifier.
+    pub id: SessionId,
+    /// Agent kind backing the session.
+    pub agent: AgentKind,
+    /// Current working directory for the session.
+    pub cwd: PathBuf,
+    /// Operating-system process id of the session root process.
+    pub pid: u32,
+    /// Current terminal width in columns.
+    pub cols: u16,
+    /// Current terminal height in rows.
+    pub rows: u16,
+    /// Current lifecycle state.
+    pub state: SessionState,
+    /// Source of the current state signal.
+    pub state_source: StateSource,
+    /// Creation timestamp in the daemon's wire timestamp format.
+    pub created_at: String,
+    /// Last update timestamp in the daemon's wire timestamp format.
+    pub updated_at: String,
+    /// Process exit code, when the session has exited with one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+/// Result returned by `session.stop`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStopResult {
+    /// Whether the daemon stopped a live session.
+    pub stopped: bool,
+}

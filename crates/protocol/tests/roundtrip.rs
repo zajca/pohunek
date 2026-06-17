@@ -1,8 +1,11 @@
 //! Round-trip serialize/deserialize tests and version-negotiation tests for the
 //! control protocol (milestone 1 checkpoint: "round-trip serde unit tests pass").
 
+use std::path::PathBuf;
+
 use protocol::{
-    method, negotiate, ErrorClass, Event, ProtocolError, ProtocolVersion, Request, Response,
+    event, method, negotiate, AgentKind, ErrorClass, Event, ProtocolError, ProtocolVersion,
+    Request, Response, SessionId, SessionInfo, SessionNewParams, SessionState, SessionStopResult,
     StateSource, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
@@ -18,6 +21,131 @@ where
         "wire form must be a single line (newline-delimited framing): {line}"
     );
     serde_json::from_str(&line).expect("deserialize")
+}
+
+fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
+    SessionInfo {
+        id: SessionId("s-42".to_owned()),
+        agent: AgentKind::Shell,
+        cwd: PathBuf::from("/workspace/project"),
+        pid: 4242,
+        cols: 120,
+        rows: 40,
+        state: SessionState::Running,
+        state_source: StateSource::Process,
+        created_at: "2026-06-17T10:00:00Z".to_owned(),
+        updated_at: "2026-06-17T10:01:00Z".to_owned(),
+        exit_code,
+    }
+}
+
+#[test]
+fn session_new_params_json_shape_roundtrips() {
+    let params = SessionNewParams {
+        agent: AgentKind::Shell,
+        cwd: Some(PathBuf::from("/workspace/project")),
+        cols: 120,
+        rows: 40,
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize params");
+    assert_eq!(
+        value,
+        json!({
+            "agent": "shell",
+            "cwd": "/workspace/project",
+            "cols": 120,
+            "rows": 40
+        })
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn session_info_json_shape_roundtrips_with_exit_code() {
+    let info = SessionInfo {
+        state: SessionState::Done,
+        state_source: StateSource::OscTitle,
+        exit_code: Some(0),
+        ..running_shell_session(None)
+    };
+
+    let value = serde_json::to_value(&info).expect("serialize session info");
+    assert_eq!(
+        value,
+        json!({
+            "id": "s-42",
+            "agent": "shell",
+            "cwd": "/workspace/project",
+            "pid": 4242,
+            "cols": 120,
+            "rows": 40,
+            "state": "done",
+            "state_source": "osc_title",
+            "created_at": "2026-06-17T10:00:00Z",
+            "updated_at": "2026-06-17T10:01:00Z",
+            "exit_code": 0
+        })
+    );
+
+    let back = line_roundtrip(&info);
+    assert_eq!(back, info);
+}
+
+#[test]
+fn session_info_omits_absent_exit_code() {
+    let info = running_shell_session(None);
+
+    let value = serde_json::to_value(&info).expect("serialize session info");
+    assert!(
+        !value
+            .as_object()
+            .expect("session info object")
+            .contains_key("exit_code"),
+        "absent exit_code must be omitted: {value}"
+    );
+
+    let back = line_roundtrip(&info);
+    assert_eq!(back.exit_code, None);
+    assert_eq!(back, info);
+}
+
+#[test]
+fn session_stop_result_roundtrips() {
+    let result = SessionStopResult { stopped: true };
+
+    let value = serde_json::to_value(&result).expect("serialize stop result");
+    assert_eq!(value, json!({ "stopped": true }));
+
+    let back = line_roundtrip(&result);
+    assert_eq!(back, result);
+}
+
+#[test]
+fn session_created_event_carries_session_info_in_flattened_payload() {
+    let session = running_shell_session(None);
+    let event = Event::new(event::SESSION_CREATED, json!({ "session": session }));
+
+    let back = line_roundtrip(&event);
+    assert_eq!(back, event);
+    assert_eq!(back.event, event::SESSION_CREATED);
+
+    let value = serde_json::to_value(&event).expect("serialize event");
+    assert_eq!(value["v"], json!(PROTOCOL_VERSION));
+    assert_eq!(value["event"], json!("session_created"));
+    assert_eq!(value["session"]["id"], json!("s-42"));
+    assert_eq!(value["session"]["agent"], json!("shell"));
+    assert_eq!(value["session"]["state"], json!("running"));
+    assert_eq!(value["session"]["state_source"], json!("process"));
+    assert!(
+        !value
+            .as_object()
+            .expect("event object")
+            .contains_key("payload"),
+        "event payload fields must be flattened: {value}"
+    );
 }
 
 #[test]
@@ -46,7 +174,10 @@ fn request_missing_params_defaults_to_null() {
 
 #[test]
 fn ok_response_roundtrip() {
-    let resp = Response::ok("req-7f3", json!({ "session_id": "s-42", "state": "working" }));
+    let resp = Response::ok(
+        "req-7f3",
+        json!({ "session_id": "s-42", "state": "working" }),
+    );
     let back = line_roundtrip(&resp);
     assert_eq!(resp, back);
     match back {
@@ -119,8 +250,11 @@ fn event_roundtrip() {
 
 #[test]
 fn event_with_id_roundtrip() {
-    let event = Event::new("session_exit", json!({ "session_id": "s-7", "exit_code": 0 }))
-        .with_id("req-99");
+    let event = Event::new(
+        "session_exit",
+        json!({ "session_id": "s-7", "exit_code": 0 }),
+    )
+    .with_id("req-99");
     let back = line_roundtrip(&event);
     assert_eq!(event, back);
     assert_eq!(back.id.as_deref(), Some("req-99"));

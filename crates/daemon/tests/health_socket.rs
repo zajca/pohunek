@@ -10,13 +10,17 @@
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
-use protocol::{method, Request, Response, PROTOCOL_VERSION};
+use protocol::{
+    event, method, AgentKind, Event, Request, Response, SessionId, SessionInfo, SessionNewParams,
+    SessionState, SessionStopResult, PROTOCOL_VERSION,
+};
 use serde_json::Value;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio_util::codec::{Framed, LinesCodec};
 
-use zagentmesh_daemon::api::{ControlServer, HealthInfo};
+use zagentmesh_daemon::api::{ControlServer, DaemonState, HealthInfo};
+use zagentmesh_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 
 /// A unique temp socket path inside a dedicated per-test directory.
 ///
@@ -58,6 +62,27 @@ async fn spawn_server(
     (tx, handle)
 }
 
+/// Spawn the control server with a custom shell command.
+async fn spawn_server_with_config(
+    socket: &std::path::Path,
+    version: &str,
+    config: SessionRegistryConfig,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let state = DaemonState::new(HealthInfo::new(version), SessionRegistry::new(config));
+    let server = ControlServer::bind_with_state(socket, state)
+        .await
+        .expect("server binds");
+    let (tx, rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        server
+            .serve(async move {
+                let _ = rx.await;
+            })
+            .await;
+    });
+    (tx, handle)
+}
+
 /// Connect a raw line-framed client to `socket`.
 async fn connect(socket: &std::path::Path) -> Framed<UnixStream, LinesCodec> {
     // Brief retry: bind returns before the listener is necessarily accepting in
@@ -81,6 +106,58 @@ async fn exchange(framed: &mut Framed<UnixStream, LinesCodec>, request: &Request
         .expect("a response line")
         .expect("response framing ok");
     serde_json::from_str(&reply).expect("parse response")
+}
+
+fn session_params() -> SessionNewParams {
+    SessionNewParams {
+        agent: AgentKind::Shell,
+        cwd: Some(std::env::temp_dir()),
+        cols: 80,
+        rows: 24,
+    }
+}
+
+fn ok_payload(response: Response) -> Value {
+    match response {
+        Response::Ok { ok, .. } => ok,
+        Response::Err { err, .. } => panic!("expected ok, got error: {err}"),
+    }
+}
+
+async fn create_session(framed: &mut Framed<UnixStream, LinesCodec>) -> SessionInfo {
+    let req = Request::new(
+        "session-new",
+        method::SESSION_NEW,
+        serde_json::to_value(session_params()).expect("serialize params"),
+    );
+    serde_json::from_value(ok_payload(exchange(framed, &req).await)).expect("session info")
+}
+
+async fn inspect_session(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    id: &SessionId,
+) -> SessionInfo {
+    let req = Request::new(
+        "session-inspect",
+        method::SESSION_INSPECT,
+        serde_json::to_value(id).expect("serialize id"),
+    );
+    serde_json::from_value(ok_payload(exchange(framed, &req).await)).expect("session info")
+}
+
+async fn wait_for_state(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    id: &SessionId,
+    state: SessionState,
+) -> SessionInfo {
+    for _ in 0..100 {
+        let info = inspect_session(framed, id).await;
+        if info.state == state {
+            return info;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("session {} did not reach state {state:?}", id.0);
 }
 
 #[tokio::test]
@@ -144,7 +221,186 @@ async fn stale_socket_is_recovered_on_bind() {
     let mut client = connect(&socket).await;
     let req = Request::new("t-3", method::DAEMON_HEALTH, Value::Null);
     let resp = exchange(&mut client, &req).await;
-    assert!(matches!(resp, Response::Ok { .. }), "health works after recovery");
+    assert!(
+        matches!(resp, Response::Ok { .. }),
+        "health works after recovery"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn session_lifecycle_over_socket() {
+    let socket = temp_socket("session-lifecycle");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
+        stop_grace: Duration::from_millis(50),
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut client = connect(&socket).await;
+    let created = create_session(&mut client).await;
+    assert_eq!(created.agent, AgentKind::Shell);
+    assert_eq!(created.state, SessionState::Running);
+    assert_eq!(created.cols, 80);
+    assert_eq!(created.rows, 24);
+    assert!(created.pid > 0);
+
+    let list_req = Request::new("session-list", method::SESSION_LIST, Value::Null);
+    let list: Vec<SessionInfo> =
+        serde_json::from_value(ok_payload(exchange(&mut client, &list_req).await))
+            .expect("session list");
+    assert!(
+        list.iter()
+            .any(|session| session.id == created.id && session.state == SessionState::Running),
+        "created session should appear in list: {list:?}"
+    );
+
+    let inspected = inspect_session(&mut client, &created.id).await;
+    assert_eq!(inspected.id, created.id);
+    assert_eq!(inspected.cwd, created.cwd);
+    assert_eq!(inspected.pid, created.pid);
+
+    let stop_req = Request::new(
+        "session-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let stopped: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut client, &stop_req).await))
+            .expect("stop result");
+    assert!(stopped.stopped);
+
+    let stopped_info = inspect_session(&mut client, &created.id).await;
+    assert_eq!(stopped_info.state, SessionState::Stopped);
+
+    let list_after_stop_req =
+        Request::new("session-list-after-stop", method::SESSION_LIST, Value::Null);
+    let list_after_stop: Vec<SessionInfo> =
+        serde_json::from_value(ok_payload(exchange(&mut client, &list_after_stop_req).await))
+            .expect("session list after stop");
+    assert!(
+        list_after_stop
+            .iter()
+            .any(|session| session.id == created.id && session.state == SessionState::Stopped),
+        "stopped session should be reflected in list: {list_after_stop:?}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn session_survives_requesting_client_exit() {
+    let socket = temp_socket("session-client-independence");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
+        stop_grace: Duration::from_millis(50),
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let created = {
+        let mut first_client = connect(&socket).await;
+        create_session(&mut first_client).await
+    };
+
+    let mut fresh_client = connect(&socket).await;
+    let list_req = Request::new("session-list-fresh", method::SESSION_LIST, Value::Null);
+    let list: Vec<SessionInfo> =
+        serde_json::from_value(ok_payload(exchange(&mut fresh_client, &list_req).await))
+            .expect("session list");
+    assert!(
+        list.iter()
+            .any(|session| session.id == created.id && session.state == SessionState::Running),
+        "fresh client should see daemon-owned session: {list:?}"
+    );
+
+    let stop_req = Request::new(
+        "session-stop-fresh",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut fresh_client, &stop_req).await))
+            .expect("stop result");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn session_exit_detection_reports_done_and_failed() {
+    let success_socket = temp_socket("session-exit-success");
+    let success_config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "exit 0"]),
+        stop_grace: Duration::from_millis(50),
+    };
+    let (success_shutdown, success_handle) =
+        spawn_server_with_config(&success_socket, "0.0.0", success_config).await;
+    let mut success_client = connect(&success_socket).await;
+    let success = create_session(&mut success_client).await;
+    let done = wait_for_state(&mut success_client, &success.id, SessionState::Done).await;
+    assert_eq!(done.exit_code, Some(0));
+    let _ = success_shutdown.send(());
+    let _ = success_handle.await;
+
+    let failure_socket = temp_socket("session-exit-failure");
+    let failure_config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "exit 7"]),
+        stop_grace: Duration::from_millis(50),
+    };
+    let (failure_shutdown, failure_handle) =
+        spawn_server_with_config(&failure_socket, "0.0.0", failure_config).await;
+    let mut failure_client = connect(&failure_socket).await;
+    let failure = create_session(&mut failure_client).await;
+    let failed = wait_for_state(&mut failure_client, &failure.id, SessionState::Failed).await;
+    assert_eq!(failed.exit_code, Some(7));
+    let _ = failure_shutdown.send(());
+    let _ = failure_handle.await;
+}
+
+#[tokio::test]
+async fn subscribe_streams_session_created_event() {
+    let socket = temp_socket("subscribe-events");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    // A subscriber connection: send `subscribe`, expect an OK ack, then keep the
+    // connection open to receive unsolicited event lines.
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::new("subscribe-1", method::SUBSCRIBE, Value::Null);
+    let ack = exchange(&mut subscriber, &subscribe_req).await;
+    match ack {
+        Response::Ok { id, ok, .. } => {
+            assert_eq!(id, "subscribe-1");
+            assert_eq!(ok["subscribed"], Value::from(true));
+        }
+        Response::Err { err, .. } => panic!("expected subscribe ack, got error: {err}"),
+    }
+
+    // A second, independent connection creates a session.
+    let mut creator = connect(&socket).await;
+    let created = create_session(&mut creator).await;
+
+    // The subscriber must receive a `session_created` event for that session.
+    // Bound the read so the test cannot hang if streaming is broken.
+    let event_line = tokio::time::timeout(Duration::from_secs(5), subscriber.next())
+        .await
+        .expect("event arrives before timeout")
+        .expect("a streamed event line")
+        .expect("event framing ok");
+    let streamed: Event = serde_json::from_str(&event_line).expect("parse event");
+
+    assert_eq!(streamed.event, event::SESSION_CREATED);
+    assert_eq!(
+        streamed.payload["session"]["id"],
+        Value::from(created.id.0.as_str()),
+        "streamed event should carry the created session id"
+    );
 
     let _ = shutdown.send(());
     let _ = handle.await;

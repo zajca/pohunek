@@ -7,12 +7,15 @@
 //! cannot take down the daemon (per `docs/architecture.md` "Concurrency and
 //! supervision").
 //!
-//! Milestone 2 implements `daemon.health` only; unknown methods receive a typed
-//! `method_not_found` error (the contract for later milestones is already in the
-//! `protocol` crate).
+//! The server handles `daemon.health` (milestone 2) and the `session.*`
+//! lifecycle methods (milestone 3), and a `subscribe` request turns the
+//! connection into a one-way stream of session lifecycle events. Unknown methods
+//! receive a typed `method_not_found` error (the contract for later milestones is
+//! already in the `protocol` crate).
 //!
-//! Attach streaming uses a *separate* connection and is a later milestone; this
-//! server handles the JSON control connection only.
+//! Attach STREAMING of raw terminal bytes uses a *separate* connection and is a
+//! later milestone; this server handles the JSON control connection (and its
+//! control-event subscription) only.
 
 mod handler;
 
@@ -21,13 +24,17 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use futures::{SinkExt, StreamExt};
+use protocol::Event;
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::broadcast;
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 use tracing::{error, info, warn};
 
 use crate::error::DaemonError;
+use crate::session::SessionRegistry;
 
-pub use handler::{handle_request, HealthInfo};
+use handler::Dispatch;
+pub use handler::{handle_request, DaemonState, HealthInfo};
 
 /// Directory mode for the runtime dir: owner rwx only (`0700`).
 const DIR_MODE: u32 = 0o700;
@@ -42,7 +49,7 @@ const MAX_LINE_BYTES: usize = 1024 * 1024;
 pub struct ControlServer {
     listener: UnixListener,
     socket_path: PathBuf,
-    health: HealthInfo,
+    state: DaemonState,
 }
 
 impl ControlServer {
@@ -58,15 +65,25 @@ impl ControlServer {
     ///
     /// Returns [`DaemonError`] on directory, permission, probe, or bind failure.
     pub async fn bind(socket_path: &Path, health: HealthInfo) -> Result<Self, DaemonError> {
-        let dir = socket_path
-            .parent()
-            .ok_or_else(|| DaemonError::Socket {
-                path: socket_path.to_path_buf(),
-                source: io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "socket path has no parent directory",
-                ),
-            })?;
+        Self::bind_with_state(
+            socket_path,
+            DaemonState::new(health, SessionRegistry::default()),
+        )
+        .await
+    }
+
+    /// Bind the control socket with explicit shared daemon state.
+    pub async fn bind_with_state(
+        socket_path: &Path,
+        state: DaemonState,
+    ) -> Result<Self, DaemonError> {
+        let dir = socket_path.parent().ok_or_else(|| DaemonError::Socket {
+            path: socket_path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "socket path has no parent directory",
+            ),
+        })?;
 
         ensure_dir_mode(dir, DIR_MODE)?;
         recover_stale_socket(socket_path).await?;
@@ -82,7 +99,7 @@ impl ControlServer {
         Ok(Self {
             listener,
             socket_path: socket_path.to_path_buf(),
-            health,
+            state,
         })
     }
 
@@ -99,7 +116,7 @@ impl ControlServer {
     /// logged and the loop continues.
     pub async fn serve(self, shutdown: impl std::future::Future<Output = ()>) {
         tokio::pin!(shutdown);
-        let health = self.health.clone();
+        let state = self.state.clone();
         loop {
             tokio::select! {
                 () = &mut shutdown => {
@@ -109,9 +126,9 @@ impl ControlServer {
                 accepted = self.listener.accept() => {
                     match accepted {
                         Ok((stream, _addr)) => {
-                            let health = health.clone();
+                            let state = state.clone();
                             tokio::spawn(async move {
-                                if let Err(err) = serve_connection(stream, health).await {
+                                if let Err(err) = serve_connection(stream, state).await {
                                     warn!(error = %err, "control connection ended with error");
                                 }
                             });
@@ -137,7 +154,11 @@ impl ControlServer {
 
 /// Serve one control connection: read newline-delimited JSON requests, dispatch
 /// each, and write back one response line per request.
-async fn serve_connection(stream: UnixStream, health: HealthInfo) -> Result<(), io::Error> {
+///
+/// A `subscribe` request is the exception: after its OK ack the connection turns
+/// into a one-way stream of session lifecycle events ([`run_event_subscription`])
+/// and is consumed there until the client disconnects.
+async fn serve_connection(stream: UnixStream, state: DaemonState) -> Result<(), io::Error> {
     let codec = LinesCodec::new_with_max_length(MAX_LINE_BYTES);
     let mut framed = Framed::new(stream, codec);
 
@@ -151,18 +172,68 @@ async fn serve_connection(stream: UnixStream, health: HealthInfo) -> Result<(), 
             Err(LinesCodecError::Io(err)) => return Err(err),
         };
 
-        let response_line = handler::dispatch_line(&line, &health);
-        framed
-            .send(response_line)
-            .await
-            .map_err(|e| match e {
-                LinesCodecError::Io(io) => io,
-                LinesCodecError::MaxLineLengthExceeded => {
-                    io::Error::new(io::ErrorKind::InvalidData, "response exceeded max line length")
-                }
-            })?;
+        match handler::dispatch_line(&line, &state).await {
+            Dispatch::Reply(response_line) => {
+                framed.send(response_line).await.map_err(codec_to_io)?;
+            }
+            Dispatch::Subscribe(ack_line) => {
+                // Subscribe BEFORE sending the ack so no event emitted between
+                // the ack and the recv loop is missed.
+                let mut events = state.sessions.subscribe();
+                framed.send(ack_line).await.map_err(codec_to_io)?;
+                run_event_subscription(&mut framed, &mut events).await?;
+                // The connection is consumed by the subscription stream.
+                return Ok(());
+            }
+        }
     }
     Ok(())
+}
+
+/// Stream session lifecycle events to a subscribed client until it disconnects.
+///
+/// Each received [`Event`] is written as one JSON line. Further input from the
+/// client is ignored (a subscription is one-way in this milestone); a closed or
+/// broken connection ends the stream. A lagging subscriber (slow reader) drops
+/// the oldest events with a warning rather than tearing down the connection.
+async fn run_event_subscription(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    events: &mut broadcast::Receiver<Event>,
+) -> Result<(), io::Error> {
+    loop {
+        tokio::select! {
+            incoming = framed.next() => match incoming {
+                // Client closed the connection or sent an unframeable line.
+                None | Some(Err(_)) => break,
+                // Ignore any further input on a one-way subscription in M3.
+                Some(Ok(_)) => {}
+            },
+            evt = events.recv() => match evt {
+                Ok(event) => {
+                    let line = serde_json::to_string(&event)
+                        .expect("Event serialization is infallible");
+                    framed.send(line).await.map_err(codec_to_io)?;
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "event subscriber lagged; some events were dropped");
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Map a line-codec send error to an [`io::Error`] for connection-level handling.
+fn codec_to_io(err: LinesCodecError) -> io::Error {
+    match err {
+        LinesCodecError::Io(io) => io,
+        LinesCodecError::MaxLineLengthExceeded => io::Error::new(
+            io::ErrorKind::InvalidData,
+            "response exceeded max line length",
+        ),
+    }
 }
 
 /// Probe an existing socket file and recover if it is stale.

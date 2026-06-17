@@ -4,8 +4,9 @@
 # controls it over a local Unix socket using newline-delimited JSON.
 #
 # Layout and crate choices follow docs/plan-phase-1.md ("Tech Stack and Crates",
-# "Cargo Workspace Layout"). Only Build-Order milestones 1 and 2 are implemented
-# in this revision; later modules are stubs.
+# "Cargo Workspace Layout"). Build-Order milestones 1-3 are implemented in this
+# revision (socket + health, then PTY ownership and the session registry); later
+# modules are stubs.
 [workspace]
 resolver = "2"
 members = [
@@ -15,8 +16,9 @@ members = [
 ]
 
 # Shared dependency versions. Individual crates opt in via `workspace = true`.
-# Only the crates needed for milestones 1-2 are declared here (per the plan,
-# rusqlite/portable-pty/vt100/toml/regex come in later milestones).
+# Crates needed for milestones 1-3 are declared here (per the plan; the daemon
+# also pulls in portable-pty directly for milestone 3). rusqlite/vt100/toml/regex
+# come in later milestones.
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -31,6 +33,8 @@ clap = { version = "4", features = ["derive"] }
 # Advisory file locking (flock) and socket-mode chmod for the single-instance
 # lock and 0600 socket. Minimal, standard FFI surface; needed for milestone 2.
 libc = "0.2"
+# RFC3339 timestamps for session metadata (milestone 3). Formatting only.
+time = { version = "0.3", features = ["formatting"] }
 
 [workspace.package]
 edition = "2021"
