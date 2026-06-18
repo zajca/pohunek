@@ -1,218 +1,247 @@
-# NEXT STEP — Milestone 6: Agent Adapters (Codex + Claude Code)
+# NEXT STEP — Milestone 7: Session-ID Hook + Resume
 
 This file describes, in detail, the immediate next step. It is a handoff for
 whoever picks up the work (you, a subagent, or a fresh session).
 
 - Authoritative spec: [`docs/plan-phase-1.md`](docs/plan-phase-1.md) — see
-  "Agent Adapter Boundary" (the trait + per-agent table), "State Engine"
-  (manifests plug into the matcher), "Hooks" / "Resume Model" (the parts that
-  start here vs. land in milestone 7), and Build-Order milestone 6.
+  "Hook Integration (Session-ID Capture Only)", "Resume Model", the
+  `AgentKind` adapter table, the "SQLite Schema" (where the resume binding
+  eventually lives — milestone 9, not here), and Build-Order milestone 7
+  ("Session-ID hook + resume": install hook, capture native id, resume after
+  daemon restart; *Check:* kill daemon, restart, resume both agents).
 - Phase scope: [`docs/phases/01-core-local-sessions.md`](docs/phases/01-core-local-sessions.md)
-  ("Prompts inject correctly, including Claude Code's Ink submit quirk", the
-  per-agent detection signals, "Risks").
+  ("After a daemon restart, sessions resume via captured native session IDs",
+  the per-agent detection signals, "Risks").
 - Reference source (vendored locally at `/tmp/herdr`): **herdr**
-  `src/detect/manifests/{claude,codex}.toml` (the real per-agent state rules to
-  port), `src/agent_resume.rs:113-188` (resume argv). **Kandev** is the model
-  for the adapter trait and input quirks: `agent/agents/agent.go:26-64`
-  (`BuildCommand`), `agent/agents/claude_acp.go:54-72` + `passthrough_payload.go`
-  (Ink submit-delay + bracketed-paste handling).
+  `src/integration/mod.rs` (`install_claude` ≈ line 1453, `install_codex` ≈
+  line 1514: write the hook script, merge it into `~/.claude/settings.json`
+  `hooks.SessionStart` / the Codex `hooks.json`, strip stale lifecycle hooks),
+  `src/integration/assets/{claude,codex}/herdr-agent-state.sh` (the hook
+  scripts to port — read stdin JSON, fire one RPC to the socket),
+  `src/agent_resume.rs:8-70` (the `SessionRef { Id | Path }` validation to
+  port). **Kandev** is not needed this milestone.
 
 ---
 
 ## Where we are now (done, verified)
 
-Milestones 1–5 are complete and merged to `main` (`cargo build`,
+Milestones 1–6 are complete (`cargo build`,
 `cargo clippy --all-targets --workspace -D warnings`, `cargo test --workspace`
-= 164 passed):
+= 203 passed):
 
 - `crates/protocol` — typed control envelopes; session lifecycle + attach types;
-  `AgentActivity { Working|Blocked|Idle }` + `SessionInfo.activity`;
-  `StateSource { OscTitle|OscProgress|Screen|Process }`; the `agent_state`
-  event. `AgentKind` currently has **only `Shell`**. `SessionNewParams.agent:
-  AgentKind` already exists. `method::SESSION_REPORT_NATIVE_ID`
-  (`session.report_native_id`) is **declared but not handled** (milestone 7).
+  `AgentKind { Shell | Codex | Claude }`; `AgentActivity { Working|Blocked|Idle }`
+  + `SessionInfo.activity`; `StateSource { OscTitle|OscProgress|Screen|Process }`;
+  the `agent_state` event; `session.input` (`SessionInputParams`/`Result`).
+  `method::SESSION_REPORT_NATIVE_ID` (`session.report_native_id`) is **declared
+  but not handled** — this is the milestone you wire up here.
 - `crates/daemon` (`zagentmeshd`) — Unix-socket server; full `session.*`
-  lifecycle, attach bridge, `subscribe` event stream; in-memory
-  `SessionRegistry` owning one PTY per session; a per-session **detection task**
-  (second output-broadcast consumer) running the M5 state engine and publishing
-  `agent_state`.
+  lifecycle (incl. `session.input`), attach bridge, `subscribe` event stream;
+  in-memory `SessionRegistry` owning one PTY per session; a per-session
+  detection task running the state engine and publishing `agent_state`.
 - `crates/cli` (`zagentmesh`) — `doctor`, `daemon`, `health`/`status`, `session`
-  group (with `--agent` arg already wired to `AgentKind`), `attach <target>`.
-- **State engine (M5):** `daemon/src/detect/` = `osc` (OSC 0/2/9, BEL/ST,
-  cross-chunk reassembly), `screen` (`vt100` grid + region slicing incl. the
-  derived regions `after_last_prompt_marker` / `prompt_box_body` /
-  `after_last_horizontal_rule`, CJK-safe), `manifest` (TOML matcher:
-  `contains`/`regex`/`line_regex` + `all`/`any`/`not`, priority, complexity
-  caps), `machine` (debounce). A shipped generic shell manifest
-  (`detect/manifests/shell.toml`, embedded via `include_str!`) is loaded by the
-  production detector through `DetectorConfig::generic_shell()`.
-- **Attach history replay (milestone 5b):** each PTY keeps a bounded raw-output
-  ring buffer (`pty::OutputHistory`, cap `SessionRegistryConfig.output_history_limit_bytes`,
-  default 10 MB). The reader thread pushes each chunk and broadcasts under one
-  mutex; `PtyHandle::attach_snapshot_and_subscribe()` snapshots + subscribes
-  atomically; `run_attach_bridge` replays the snapshot before live bytes, so a
-  (re)attaching client sees the recent screen + scrollback instead of a blank
-  terminal. In memory only; alt-screen trim is a milestone-6 TODO.
+  group (`new --agent shell|codex|claude`, `list`, `inspect`, `stop`, `input`),
+  `attach <target>`.
+- **State engine (M5):** `daemon/src/detect/` = `osc`, `screen`, `manifest`
+  (TOML matcher), `machine` (debounce). Generic shell + per-agent Codex/Claude
+  manifests embedded via `include_str!` and selected by `AgentKind` through
+  `DetectorConfig::for_agent`.
+- **Agent adapters (M6):** `daemon/src/agent/` = the `AgentAdapter` trait
+  (`id`, `launch(&LaunchOpts) -> PtyCommand`, `input_rules() -> InputRules`,
+  `manifest() -> &Manifest`, `resume(&SessionRef) -> AgentCommand`) + `codex.rs`
+  / `claude.rs`. `create_session` launches per `AgentKind`; missing binary on
+  `PATH` → typed `agent_binary_missing`. Input injection honors `InputRules`
+  (Claude Ink: bracketed-paste OFF + `\r` after a configurable ~150 ms delay;
+  Codex: bracketed-paste ON). The **resume-argv builder is built and unit-
+  tested** (`claude --resume <id>` / `codex resume <id>`) but **not wired**.
 - Stubs (TODO doc-comment only, NOT implemented):
-  `daemon/src/{agent,store,events}/mod.rs`. **`agent/mod.rs` is the module you
-  fill in here.**
+  `daemon/src/{store,events}/mod.rs`. The store stub names "resume bindings"
+  as eventual SQLite content (milestone 9).
 
-### Seams milestone 6 builds on (already in place)
+### Seams milestone 7 builds on (already in place)
 
-- `daemon/src/agent/mod.rs` — empty stub. This is where the `AgentAdapter`
-  trait + `codex.rs` + `claude.rs` live.
-- `daemon/src/detect/` — the manifest matcher and the **`include_str!` +
-  `DetectorConfig::generic_shell()` pattern** are the template. Milestone 6 adds
-  `detect/manifests/{codex,claude}.toml` the same way and selects the manifest
-  **by `AgentKind`** (generic shell stays the fallback for `Shell`).
-  `manifest.rs` already parses `visible_blocker` but leaves it **unused** — M6
-  is where it becomes the blocked "visible-UI gate".
-- `daemon/src/session/mod.rs` — `create_session` currently launches a fixed
-  shell command (`SessionRegistryConfig.shell_command`). M6 routes launch
-  through the adapter (argv/env/cwd per `AgentKind`). The PTY input write path
-  used by attach is the seam for **programmatic input injection**.
-- `crates/protocol` — `AgentKind`, `SessionNewParams.agent`, the event stream.
-  The publish/transport plumbing does not change; M6 adds enum variants and
-  (likely) one input-injection method.
+- `crates/protocol` — `method::SESSION_REPORT_NATIVE_ID` is declared but has no
+  param type and no handler. M7 adds `SessionReportNativeIdParams` and a minimal
+  result, and dispatches it (mirror the `session.input` param/result/handler
+  shapes added in M6).
+- `daemon/src/agent/mod.rs` — `SessionRef` exists as an **id-only** string
+  (`new`, validated: non-empty, ≤512 bytes, no control chars) feeding the
+  resume builder. The plan's Resume Model wants `SessionRef { kind: Id | Path }`
+  with a **Path** variant (≤4096 bytes, absolute). M7 extends `SessionRef`
+  additively; `resume()` keeps using `.value()`.
+- `daemon/src/agent/mod.rs` — `LaunchOpts.env_extra` is plumbed end-to-end but
+  `create_session` passes an **empty** `env_extra` (`session/mod.rs`). M7 fills
+  it with the hook-handshake env so the spawned agent's hook can call home.
+- `daemon/src/{store,events}/mod.rs` — empty stubs. M7 fills a **minimal**
+  resume-binding store here (see scope note below). Full SQLite + event log
+  stay milestone 9.
+- The CLI `session` group and `doctor` are the surfaces for a hook-install
+  command and (optionally) a manual `session resume`.
 
 ---
 
-## Goal of milestone 6
+## Goal of milestone 7
 
-Make the daemon launch and detect **real agents** — Codex and Claude Code —
-not just a shell. A thin per-agent adapter carries four things: launch argv/
-env/cwd, input-injection rules, the state manifest, and the resume-command
-argv. The real per-agent manifests plug into the M5 matcher so a live Codex /
-Claude session produces correct `working`/`blocked`/`idle` transitions with the
-right `source`. Prompts injected into a session submit correctly, including
-Claude Code's Ink Enter-swallow quirk.
+Capture each agent's **native session id** through a `SessionStart` hook and use
+it to **resume after a daemon restart**. The daemon installs a small hook into
+Claude's (`~/.claude/settings.json`) and Codex's config; when an agent starts it
+fires one RPC back to the socket carrying its native session id; the daemon
+records that as the session's resume binding. After the daemon is killed and
+restarted, the live PTYs are gone (by design), so the daemon rebuilds each
+session from its stored binding and resumes the agent via the M6 resume-argv
+builder.
 
-**Still local, single-host. No `SessionStart` hook, no native-session-id
-capture, no restart-resume, no worktrees, no persistence** — those are M7+.
-M6 builds the *resume-command argv builder* but does not wire restart-resume.
+Hooks are **session-id capture only** — they do **not** report live state
+(state still comes from the M5 detector). **Still local, single-host.**
+
+> **Scope note on persistence (read this).** Build-Order step 7's checkpoint
+> ("kill daemon, restart, resume both agents") needs the resume binding to
+> survive a process restart, but full **SQLite persistence + event log +
+> migration test is milestone 9**. So M7 introduces a **minimal, single-purpose
+> resume-binding store** (a JSON-lines / small file under the daemon state dir,
+> holding only what is needed to relaunch-and-resume: `session_id`, `agent`,
+> `cwd`, `cols`, `rows`, `native_session_id`, `native_session_path?`). It is an
+> explicit **precursor** to the M9 `session` table — fill `store/mod.rs` with
+> this minimal store and leave a `TODO(milestone 9)` that SQLite absorbs it. Do
+> **not** build the full schema, the worktree table, or the `events/` log here.
 
 ### Definition of done (testable)
 
-1. `AgentKind` gains `Codex` and `Claude`; `SessionNewParams`, the CLI
-   `--agent`, and `session inspect`/`list` round-trip them. Round-trip tests in
-   `protocol/tests/roundtrip.rs`.
-2. An `AgentAdapter` trait (`id`, `launch(&LaunchOpts) -> Command`,
-   `input_rules() -> InputRules`, `manifest() -> &Manifest`,
-   `resume(&SessionRef) -> Command`) with `codex.rs` and `claude.rs`
-   implementations. The shell path keeps working via a shell adapter (or an
-   explicit non-adapter branch — your call, but keep it uniform).
-3. `session new --agent codex|claude` launches the correct binary with the
-   adapter's argv/env/cwd. Missing binary on `PATH` → a typed, fail-fast error
-   (no silent fallback).
-4. Real per-agent manifests `detect/manifests/{codex,claude}.toml` (ported from
-   herdr's rules into **our** schema) are loaded per `AgentKind` into the
-   detector. `visible_blocker` is consumed: a `blocked` transition requires its
-   visible-UI evidence. Detection matches the per-agent table in the plan
-   (Codex: OSC title "Action Required" → blocked, Braille spinner → working;
-   Claude: Ink screen form "enter to select"/"esc to cancel" → blocked, spinner
-   → working).
-5. **Input injection:** a control method (e.g. `session.input` carrying the
-   text) writes into the session PTY honoring the adapter's `InputRules`:
-   Claude (Ink) → bracketed-paste OFF and the submit `\r` sent as a **separate
-   write after ~150 ms** (else Enter is swallowed); Codex → bracketed-paste ON,
-   submit `\r`. The delay value lives in config (no magic number).
-6. A `resume(&SessionRef) -> Command` builder yields `claude --resume <id>` /
-   `codex resume <id>`. Builder + unit test only — restart-resume is M7.
-7. End-to-end: with a recorded fixture (or a stub agent script emitting the real
-   OSC/screen shapes), a Codex and a Claude session each publish the expected
-   `agent_state` transitions with the correct `source`, and an injected prompt
-   reaches the PTY in the adapter-correct framing.
-8. `cargo build`, `cargo clippy --all-targets --workspace -D warnings`, and
-   `cargo test --workspace` stay clean.
+1. `method::SESSION_REPORT_NATIVE_ID` gains a `SessionReportNativeIdParams
+   { session_id, agent, native_session_id, transcript_path? }` and a minimal
+   result (e.g. `{ recorded: bool }` — the hook fires-and-forgets and ignores
+   the body). Round-trip tests in `protocol/tests/roundtrip.rs`.
+2. `SessionRef` becomes `{ kind: Id | Path, value }` (port the validation from
+   herdr `src/agent_resume.rs:8-70`: id ≤512, path ≤4096 + absolute, both
+   non-empty + no control chars). The M6 resume builders keep producing
+   `claude --resume <value>` / `codex resume <value>`. Unit tests cover both
+   kinds + each rejection.
+3. The daemon injects the hook-handshake env before spawning every Codex/Claude
+   agent: `ZAGENTMESH_SOCKET_PATH` (the control socket) and
+   `ZAGENTMESH_SESSION_ID` (the zagentmesh session id), via `LaunchOpts.env_extra`.
+   (Shell sessions get no hook env.)
+4. A hook installer (`daemon/src/integration/`) writes the per-agent hook script
+   and registers it: Claude → `~/.claude/hooks/` + merge into `settings.json`
+   `hooks.SessionStart` (matcher `*`), stripping any stale lifecycle hooks it
+   owns; Codex → its config dir + `hooks.json` (the `notify`/`SessionStart`
+   equivalent). Reinstall is **idempotent** (no duplicate entries) and never
+   clobbers unrelated user settings. Ported from herdr but emitting **our**
+   env names + **our** `session.report_native_id` method.
+5. The hook script reads its stdin JSON (`session_id`, `transcript_path`), and
+   if `ZAGENTMESH_ENV`/socket/session-id are present, sends one fire-and-forget
+   RPC (0.5 s timeout) `session.report_native_id` to the socket. Missing env or
+   missing python/runtime → silent no-op exit 0 (never break the agent).
+6. The daemon **handles** `session.report_native_id`: validate, build a
+   `SessionRef`, and write the resume binding into the minimal store (and update
+   the in-memory `SessionInfo` so `inspect`/`list` can show it). Reports for an
+   unknown/terminal session are ignored, not errors.
+7. **Restart-resume:** on startup the daemon loads the resume-binding store; a
+   `resume` path relaunches a session with the agent's resume argv (M6 builder)
+   in the stored `cwd`/size, attaches a fresh PTY + detector, and re-registers
+   it. Document (code comment + `docs`) that a daemon restart kills live PTYs by
+   design and only resumable sessions (those with a captured native id) come
+   back.
+8. CLI: a hook-install command (e.g. `zagentmesh integration install
+   [--agent claude|codex]`) and surfacing the native id / "resumable" in
+   `inspect` (and optionally a manual `session resume <target>`). Display-only
+   formatter branches unit-tested.
+9. End-to-end (extend `crates/daemon/tests/health_socket.rs`): a stub `claude`
+   and `codex` that, on launch, call `session.report_native_id` (simulating the
+   hook), then idle. Assert the binding is recorded; then **drop the registry
+   (simulated daemon kill), rebuild it against the same state dir, resume**, and
+   assert the relaunched stub received the resume argv (`--resume <id>` /
+   `resume <id>`).
+10. `cargo build`, `cargo clippy --all-targets --workspace -D warnings`, and
+    `cargo test --workspace` stay clean.
 
 ### Explicitly OUT of scope (later milestones — do NOT build here)
 
-- **`SessionStart` hook install + native-session-id capture +
-  `session.report_native_id` handling + resume *after daemon restart*** →
-  **milestone 7**. (M6 builds only the resume-argv builder.)
+- **Live-state hooks.** Hooks capture the native id only; state stays with the
+  M5 detector. Do not wire `PostToolUse`/`Stop`/etc. into activity.
+- **Full SQLite persistence + `events/` append-only log + `user_version` 1→2
+  migration test** → **milestone 9**. M7 ships only the minimal resume-binding
+  store described in the scope note.
 - **Worktree-per-session** → milestone 8.
-- **SQLite persistence + event-log file + migration test** → milestone 9.
 - **`--json` everywhere + error/recovery polish** → milestone 10.
 
 ---
 
 ## Implementation tasks
 
-### 1. `crates/protocol` — agent kinds + input-injection method
+### 1. `crates/protocol` — the native-id report
 
-- Add `Codex` and `Claude` to `AgentKind` (snake_case `#[serde]`).
-- Add the input-injection method: `method::SESSION_INPUT` (`session.input`) and
-  a `SessionInputParams { session_id, text }` (+ result). Mirror the existing
-  `session.*` param/result shapes.
-- Round-trip tests for the new `AgentKind` variants, params, and result.
+- Add `SessionReportNativeIdParams { session_id: SessionId, agent: AgentKind,
+  native_session_id: String, #[serde(default)] transcript_path: Option<String> }`
+  and a minimal result. Mirror the `session.input` param/result shapes.
+- Round-trip tests for the params (with and without `transcript_path`) and the
+  result.
 
-### 2. `crates/daemon/src/agent/` — the adapter trait + Codex/Claude
+### 2. `crates/daemon/src/agent/` — `SessionRef` kind + path
 
-Fill the stub. Keep adapters small and independently testable.
+- Extend `SessionRef` to `{ kind: Id | Path, value }`; add a `path` constructor
+  (≤4096 bytes, absolute, non-empty, no control chars) alongside the existing id
+  constructor (≤512). Keep `value()`; `resume()` is unchanged.
+- Unit tests: id/path accept + each rejection (empty, control char, over-length,
+  relative path).
 
-- `AgentAdapter` trait per the plan (`docs/plan-phase-1.md` "Agent Adapter
-  Boundary"). `LaunchOpts { cwd, cols, rows, env_extra }`, `InputRules {
-  bracketed_paste: bool, submit_delay: Duration }`.
-- `codex.rs`, `claude.rs`: launch argv/env/cwd (Claude: `claude`; Codex:
-  `codex`), `input_rules` per the table (Claude Ink: paste OFF + ~150 ms submit
-  delay; Codex: paste ON), `manifest()` returning the embedded per-agent
-  manifest, `resume()` argv (`claude --resume <id>` / `codex resume <id>`).
-- Resolve the binary from `PATH`; if absent, return a typed error — fail fast,
-  no invented default path.
+### 3. `crates/daemon/src/integration/` — hook install (new module)
 
-### 3. `crates/daemon/src/detect/manifests/` — real per-agent manifests
+- Port herdr's hook scripts (`assets/{claude,codex}/herdr-agent-state.sh`) into
+  embedded assets, rewritten to use **our** env names (`ZAGENTMESH_ENV`,
+  `ZAGENTMESH_SOCKET_PATH`, `ZAGENTMESH_SESSION_ID`) and **our** method
+  (`session.report_native_id`). Keep the fire-and-forget + 0.5 s timeout + silent
+  no-op-on-missing-env behavior.
+- `install_claude` / `install_codex` (model: herdr `install_claude` ≈ 1453,
+  `install_codex` ≈ 1514): write the script, `chmod +x`, merge into the agent's
+  settings (`~/.claude/settings.json` `hooks.SessionStart` matcher `*`; Codex
+  `hooks.json`), idempotently, stripping only hooks this installer owns. Fail
+  fast with a typed error if the agent's config dir is absent.
+- Unit-test the merge against fixture settings (fresh file, pre-existing
+  unrelated hooks, and a reinstall) — assert no duplicates and unrelated keys
+  preserved.
 
-- Add `codex.toml` and `claude.toml`, porting herdr's rules
-  (`/tmp/herdr/src/detect/manifests/{codex,claude}.toml`) into **our** manifest
-  schema (note herdr's extra flags `visible_working`/`visible_idle`/
-  `skip_state_update` are NOT in our schema — fold them into priority/region
-  choices or extend the schema deliberately if truly needed). Embed via
-  `include_str!` exactly like `shell.toml`.
-- Select the manifest by `AgentKind` in `DetectorConfig` (add
-  `DetectorConfig::for_agent(AgentKind)`); `Shell` keeps `generic_shell()`.
-- Consume `visible_blocker`: carry it on `ManifestMatch` and require its
-  evidence before the machine publishes a `blocked` transition.
-- **Build fixtures from real sessions first** (record actual Codex/Claude PTY
-  output) and unit-test the manifests against them — do not hand-wave the rules.
+### 4. `crates/daemon/src/session/` + `store/` — env, capture, store, resume
 
-### 4. `crates/daemon/src/session/mod.rs` — launch via adapter + inject input
+- `create_session`: for Codex/Claude, populate `LaunchOpts.env_extra` with
+  `ZAGENTMESH_ENV=1`, `ZAGENTMESH_SOCKET_PATH`, `ZAGENTMESH_SESSION_ID` (the
+  daemon must know its own socket path; thread it through
+  `SessionRegistryConfig`). Shell sessions: no hook env.
+- Handle `session.report_native_id`: validate, build the `SessionRef`, write the
+  binding to the minimal store, update `SessionInfo` (native id visible to
+  `inspect`/`list`). Unknown/terminal session → ignore.
+- Fill `store/mod.rs` with the minimal resume-binding store (load/save; small
+  file under the daemon state dir; `TODO(milestone 9)` that SQLite absorbs it).
+  No secrets are ever written.
+- A `resume` entry point: read a binding, relaunch via the M6 resume argv in the
+  stored `cwd`/size, wire a fresh detector, re-register. On daemon startup, load
+  the store so resumable sessions are known.
 
-- `create_session` selects the adapter by `params.agent` and launches the PTY
-  with the adapter's `Command`; wire `DetectorConfig::for_agent(params.agent)`
-  into `spawn_detector`.
-- Handle `session.input`: write `text` to the session PTY honoring the
-  adapter's `InputRules` (bracketed-paste wrapping; for Ink, spawn a short timer
-  task to send `\r` as a separate write after `submit_delay`). Do not block the
-  control connection on the delay.
+### 5. `crates/cli` — install + surface resume
 
-### 5. `crates/cli` — surface agents + a prompt command
-
-- `session new --agent codex|claude` (the `--agent` arg already maps to
-  `AgentKind`; add the variants). Show the agent in `list`/`inspect`.
-- A small `session input <target> <text>` (or `prompt`) command calling
-  `session.input`. Display-only otherwise; unit-test any new formatter branch.
+- A hook-install command (`integration install [--agent ...]`) calling the
+  daemon (or a local install path — match how `doctor` reaches config).
+- Surface the native id / "resumable" in `inspect` (and optionally
+  `session resume <target>`). Unit-test any new formatter branch.
 
 ---
 
 ## Tests (must pass before done)
 
-Most layers are unit-testable without a live agent; record fixtures for the
-detection rules.
+Most layers are unit-testable without a live agent; use stub scripts for the
+hook + resume round trip.
 
-- protocol: round-trip for the new `AgentKind` variants, `SessionInputParams`,
-  result.
-- agent: adapter `launch` argv/env/cwd per agent; `resume` argv; `input_rules`
-  values; missing-binary → typed error.
-- detect: per-agent manifest parses; precedence and `visible_blocker` gating
-  against **recorded screen/OSC fixtures** (Codex "Action Required",
-  Braille-spinner working; Claude Ink blocked form, spinner working, idle).
-- session input injection: bracketed-paste framing per agent; the Ink
-  submit-delay timer sends `\r` as a separate write after the configured delay
-  (time-driven unit test, like `machine.rs`).
-- daemon integration (extend `crates/daemon/tests/health_socket.rs`): launch a
-  stub agent script that emits the real OSC/screen shapes; assert the expected
-  `agent_state` transitions + `source` and that an injected prompt reaches the
-  PTY.
+- protocol: round-trip for `SessionReportNativeIdParams` (with/without
+  `transcript_path`) and the result.
+- agent: `SessionRef` id + path accept/reject; resume argv for an id and a path.
+- integration: hook-script asset shape (fires our method, uses our env, exits 0
+  on missing env); settings merge is idempotent and preserves unrelated keys.
+- session/store: `report_native_id` records the binding and updates
+  `SessionInfo`; the minimal store round-trips load/save; env-injection present
+  at launch for Codex/Claude and absent for Shell.
+- daemon integration (extend `crates/daemon/tests/health_socket.rs`): a stub
+  `claude`/`codex` that calls `session.report_native_id` on launch; assert the
+  binding; then rebuild the registry against the same state dir and resume;
+  assert the relaunched stub argv is `--resume <id>` / `resume <id>`.
 - Keep `cargo build`, `cargo clippy --all-targets --workspace -D warnings`, and
   `cargo test --workspace` clean.
 
@@ -220,21 +249,22 @@ detection rules.
 
 ## After this milestone
 
-Milestone 7 = **`SessionStart` hook + native-session-id capture + restart-
-resume**: install a Claude `SessionStart` hook and the Codex equivalent
-(herdr `src/integration/`, `assets/claude/herdr-agent-state.sh`); handle
-`session.report_native_id` and store the resume binding; after a daemon restart,
-rebuild sessions and resume via the M6 resume-argv builder. Then milestone 8
-(worktree-per-session), 9 (SQLite persistence + event log + migration test),
-10 (`--json` everywhere + error/recovery polish).
+Milestone 8 = **worktree-per-session** (bind one worktree per
+`(session_id, repo, branch)`; ownership check before reuse/cleanup; non-fatal
+warnings on fetch/base-branch/setup-script failure — model: Kandev
+`worktree/worktree.go:24-115`). Then milestone 9 = **SQLite persistence +
+append-only event log + `user_version` 1→2 migration test** (this is where the
+minimal M7 resume-binding store is absorbed into the `session` table and the
+`worktree` table lands; `state.db` rebuildable from sources, event log the audit
+trail). Then milestone 10 = **`--json` everywhere + error/recovery polish**.
 
-Empirical open questions to settle now (per the plan): the exact Claude Ink
-submit-delay value (start at **150 ms**, confirm empirically — Enter is
-swallowed if too short); the precise blocked/awaiting-approval signal per agent
-(OSC title vs. screen form) — **build fixtures from real Codex/Claude sessions
-first**; Codex's native-session-id capture payload shape (relevant for M7, but
-record it now while you have live sessions).
+Empirical open questions to settle now (per the plan): the exact Claude and
+Codex `SessionStart` hook stdin JSON shapes (record from real sessions — Claude
+gives `session_id` + `transcript_path`; Codex gives `session_id`); whether Codex
+exposes its native session id via `notify`/`hooks.json` the same way Claude does
+(confirm against a live Codex session); and that a daemon restart cleanly
+relaunches `claude --resume` / `codex resume` against a real captured id.
 
-Do not pull milestone 7+ hook/resume/worktree/persistence work into this step —
-keep M6 proven on real agents: both launch, both detect correctly with sources,
-prompts inject and submit (Ink quirk included), and the resume argv is built.
+Do not pull milestone 8+ worktree/persistence work into this step — keep M7
+proven: both agents install a hook, both report a native id on start, the
+binding survives a registry rebuild, and both resume via the M6 argv builder.
