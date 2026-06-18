@@ -1,267 +1,233 @@
-# NEXT STEP — Milestone 5: State Engine (VT + OSC + manifest + debounce)
+# NEXT STEP — Milestone 6: Agent Adapters (Codex + Claude Code)
 
 This file describes, in detail, the immediate next step. It is a handoff for
 whoever picks up the work (you, a subagent, or a fresh session).
 
-- Authoritative spec: [`docs/plan-phase-1.md`](docs/plan-phase-1.md) — see the
-  "State Engine" section (three layers), "Tech Stack and Crates" (VT/OSC/manifest
-  deps), "Logging and Observability" (state transitions with `source`), and
-  Build-Order milestone 5.
+- Authoritative spec: [`docs/plan-phase-1.md`](docs/plan-phase-1.md) — see
+  "Agent Adapter Boundary" (the trait + per-agent table), "State Engine"
+  (manifests plug into the matcher), "Hooks" / "Resume Model" (the parts that
+  start here vs. land in milestone 7), and Build-Order milestone 6.
 - Phase scope: [`docs/phases/01-core-local-sessions.md`](docs/phases/01-core-local-sessions.md)
-  ("Agent state from the terminal stream", "Testing and Verification", "Risks").
-- Reference source: **herdr** `src/detect/` (OSC parser, manifest matcher, state
-  machine) and `src/pane/` (`osc.rs`, `terminal.rs:466-514`,
-  `agent_detection.rs:5-13`). **Kandev** independently confirms the shape:
-  `StatusDetector.DetectState(lines, glyphs)` over a vt10x emulator with a
-  `StabilityWindow` (`agentctl/server/process/status_tracker.go`). Same Rust +
-  `portable-pty` + Tokio stack as ours.
+  ("Prompts inject correctly, including Claude Code's Ink submit quirk", the
+  per-agent detection signals, "Risks").
+- Reference source (vendored locally at `/tmp/herdr`): **herdr**
+  `src/detect/manifests/{claude,codex}.toml` (the real per-agent state rules to
+  port), `src/agent_resume.rs:113-188` (resume argv). **Kandev** is the model
+  for the adapter trait and input quirks: `agent/agents/agent.go:26-64`
+  (`BuildCommand`), `agent/agents/claude_acp.go:54-72` + `passthrough_payload.go`
+  (Ink submit-delay + bracketed-paste handling).
 
 ---
 
 ## Where we are now (done, verified)
 
-Milestones 1–4 are complete, green, and verified (`cargo test --workspace` = 64
-passed, `cargo clippy --all-targets --workspace` clean, `cargo build` clean):
+Milestones 1–5 are complete and merged to `main` (`cargo build`,
+`cargo clippy --all-targets --workspace -D warnings`, `cargo test --workspace`
+= 164 passed):
 
-- `crates/protocol` — typed control envelopes (request / response ok|err /
-  event), `ProtocolError`, `PROTOCOL_VERSION = 1`, `negotiate()`. Session
-  lifecycle + attach types in `src/session.rs` (`SessionNewParams`, `SessionId`,
-  `SessionInfo`, `SessionState`, `SessionStopResult`, `SessionAttach/Detach/
-  ResizeParams` + results, `AttachHeader`, `AgentKind = { Shell }`). Event names
-  include `attach_opened`/`attach_closed`. **`StateSource` already exists**
-  (`OscTitle | OscProgress | Screen | Process`) and `SessionInfo.state_source` is
-  already wired — milestone 5 is the first code that actually *produces* a
-  non-`Process` source.
-- `crates/daemon` (`zagentmeshd`) — Tokio Unix-socket server; `daemon.health`,
-  the `session.*` lifecycle methods, `session.attach/detach/resize`, raw attach
-  bridge (separate connection, framed→raw handover, multi-client), and a
-  `subscribe` connection that streams control events. In-memory
-  `SessionRegistry` owns one PTY per session.
-- `crates/cli` (`zagentmesh`) — `doctor`, `daemon start [--detach]`,
-  `health`/`status`, the `session` group, and `attach <target>` (raw terminal
-  client: termios raw mode, SIGWINCH→`session.resize`, Ctrl-] detach).
+- `crates/protocol` — typed control envelopes; session lifecycle + attach types;
+  `AgentActivity { Working|Blocked|Idle }` + `SessionInfo.activity`;
+  `StateSource { OscTitle|OscProgress|Screen|Process }`; the `agent_state`
+  event. `AgentKind` currently has **only `Shell`**. `SessionNewParams.agent:
+  AgentKind` already exists. `method::SESSION_REPORT_NATIVE_ID`
+  (`session.report_native_id`) is **declared but not handled** (milestone 7).
+- `crates/daemon` (`zagentmeshd`) — Unix-socket server; full `session.*`
+  lifecycle, attach bridge, `subscribe` event stream; in-memory
+  `SessionRegistry` owning one PTY per session; a per-session **detection task**
+  (second output-broadcast consumer) running the M5 state engine and publishing
+  `agent_state`.
+- `crates/cli` (`zagentmesh`) — `doctor`, `daemon`, `health`/`status`, `session`
+  group (with `--agent` arg already wired to `AgentKind`), `attach <target>`.
+- **State engine (M5):** `daemon/src/detect/` = `osc` (OSC 0/2/9, BEL/ST,
+  cross-chunk reassembly), `screen` (`vt100` grid + region slicing incl. the
+  derived regions `after_last_prompt_marker` / `prompt_box_body` /
+  `after_last_horizontal_rule`, CJK-safe), `manifest` (TOML matcher:
+  `contains`/`regex`/`line_regex` + `all`/`any`/`not`, priority, complexity
+  caps), `machine` (debounce). A shipped generic shell manifest
+  (`detect/manifests/shell.toml`, embedded via `include_str!`) is loaded by the
+  production detector through `DetectorConfig::generic_shell()`.
 - Stubs (TODO doc-comment only, NOT implemented):
-  `daemon/src/{agent,detect,store,events}/mod.rs`. **`detect/mod.rs` is the
-  module you fill in here.**
+  `daemon/src/{agent,store,events}/mod.rs`. **`agent/mod.rs` is the module you
+  fill in here.**
 
-### Seams milestone 5 builds on (already in place)
+### Seams milestone 6 builds on (already in place)
 
-- `daemon/src/pty/mod.rs` `PtyHandle::subscribe_output() ->
-  broadcast::Receiver<Vec<u8>>` — **the detection input seam.** This is the
-  *same* broadcast the attach stream consumes. Milestone 5 adds a *second*
-  independent consumer per session: a detection task. Each ~8 KB PTY read chunk
-  arrives here. (Capacity is 64; a lagging detector must log `Lagged` and resync,
-  never silently drop — same rule as the attach bridge.)
-- `daemon/src/session/mod.rs` `SessionRegistry` — owns `SessionEntry { info,
-  pty, stopping }`; emits `session_*` events via the `events` broadcast and
-  `emit()`/`emit_attach()`. This is where the detector publishes state changes.
-- `crates/protocol` `StateSource` + `SessionInfo.state_source` + the
-  `subscribe` event stream — the publish path. The detector updates
-  `SessionInfo` and emits an event the same way `resize` already does.
+- `daemon/src/agent/mod.rs` — empty stub. This is where the `AgentAdapter`
+  trait + `codex.rs` + `claude.rs` live.
+- `daemon/src/detect/` — the manifest matcher and the **`include_str!` +
+  `DetectorConfig::generic_shell()` pattern** are the template. Milestone 6 adds
+  `detect/manifests/{codex,claude}.toml` the same way and selects the manifest
+  **by `AgentKind`** (generic shell stays the fallback for `Shell`).
+  `manifest.rs` already parses `visible_blocker` but leaves it **unused** — M6
+  is where it becomes the blocked "visible-UI gate".
+- `daemon/src/session/mod.rs` — `create_session` currently launches a fixed
+  shell command (`SessionRegistryConfig.shell_command`). M6 routes launch
+  through the adapter (argv/env/cwd per `AgentKind`). The PTY input write path
+  used by attach is the seam for **programmatic input injection**.
+- `crates/protocol` — `AgentKind`, `SessionNewParams.agent`, the event stream.
+  The publish/transport plumbing does not change; M6 adds enum variants and
+  (likely) one input-injection method.
 
 ---
 
-## Goal of milestone 5
+## Goal of milestone 6
 
-Turn raw PTY bytes into a **debounced agent-activity signal** (`working`,
-`blocked`, `idle`) with a recorded `source`, published on the control event
-stream and reflected in `session.inspect`. Three layers, exactly as herdr:
+Make the daemon launch and detect **real agents** — Codex and Claude Code —
+not just a shell. A thin per-agent adapter carries four things: launch argv/
+env/cwd, input-injection rules, the state manifest, and the resume-command
+argv. The real per-agent manifests plug into the M5 matcher so a live Codex /
+Claude session produces correct `working`/`blocked`/`idle` transitions with the
+right `source`. Prompts injected into a session submit correctly, including
+Claude Code's Ink Enter-swallow quirk.
 
-1. **OSC parser (primary):** incremental, stateful parse of OSC `0`/`2` (title),
-   `9` (progress), terminated by BEL (`\x07`) or ST (`\x1b\\`); buffer partial
-   sequences across reads.
-2. **VT screen + manifest matcher (fallback):** run a VT emulator over the PTY
-   output to extract the visible screen, match its tail against per-agent TOML
-   rules.
-3. **PTY activity + debounced state machine:** bytes flowing = working; idle/
-   blocked transitions held behind a stability window so the UI never flickers.
-
-Still a plain shell — **no agent adapters, no manifests shipped for real agents,
-no resume, no persistence.** This proves the detection pipeline end-to-end on
-synthetic input (shell-emitted OSC + recorded fixtures) before any agent code.
+**Still local, single-host. No `SessionStart` hook, no native-session-id
+capture, no restart-resume, no worktrees, no persistence** — those are M7+.
+M6 builds the *resume-command argv builder* but does not wire restart-resume.
 
 ### Definition of done (testable)
 
-1. A per-session **detection task** subscribes to
-   `PtyHandle::subscribe_output()` and runs for the life of the session; it stops
-   cleanly when the session reaches a terminal state (no leaked tasks).
-2. **OSC parser** extracts title (OSC 0/2) and progress (OSC 9) incrementally and
-   **correctly reassembles sequences fragmented across read chunks**; a BEL- and
-   an ST-terminated sequence both parse; a title set via the shell
-   (`printf '\033]0;working…\007'`) is observed by the daemon.
-3. **VT screen extraction** turns PTY output into a visible screen grid; region
-   slicing handles variable-width (CJK) glyphs without an off-by-one.
-4. **Manifest matcher** evaluates TOML rules (regions + `contains`/`regex`/
-   `line_regex` gates + recursive `all`/`any`/`not`, highest `priority` wins)
-   against the screen tail and yields a state; complexity caps enforced
-   (≤128 rules, ≤512 gates, ≤1024 matchers, depth ≤8).
-5. **Debounced state machine** publishes a transition only after the stability
-   window (recheck 100 ms, 3 confirmations, cap 700 ms; stable-visible refresh
-   800 ms; startup grace 3 s) — recorded flicker fixtures collapse to a single
-   stable transition.
-6. Each published state carries `source ∈ {osc_title, osc_progress, screen,
-   process}` and is visible via `session.inspect` **and** as an event on the
-   `subscribe` stream.
-7. The detector is a **second** consumer of the output broadcast: attaching a
-   raw client (milestone 4) and detection run **simultaneously** on the same
-   session without either starving the other (lag on either side is logged, not
-   silently dropped).
-8. Integration + unit tests cover OSC fragmentation, region slicing (incl. CJK),
-   manifest precedence, debounce/anti-flicker, and the end-to-end shell-OSC →
-   published-state path. `cargo build`, `cargo clippy --all-targets --workspace`,
-   and `cargo test --workspace` stay clean.
+1. `AgentKind` gains `Codex` and `Claude`; `SessionNewParams`, the CLI
+   `--agent`, and `session inspect`/`list` round-trip them. Round-trip tests in
+   `protocol/tests/roundtrip.rs`.
+2. An `AgentAdapter` trait (`id`, `launch(&LaunchOpts) -> Command`,
+   `input_rules() -> InputRules`, `manifest() -> &Manifest`,
+   `resume(&SessionRef) -> Command`) with `codex.rs` and `claude.rs`
+   implementations. The shell path keeps working via a shell adapter (or an
+   explicit non-adapter branch — your call, but keep it uniform).
+3. `session new --agent codex|claude` launches the correct binary with the
+   adapter's argv/env/cwd. Missing binary on `PATH` → a typed, fail-fast error
+   (no silent fallback).
+4. Real per-agent manifests `detect/manifests/{codex,claude}.toml` (ported from
+   herdr's rules into **our** schema) are loaded per `AgentKind` into the
+   detector. `visible_blocker` is consumed: a `blocked` transition requires its
+   visible-UI evidence. Detection matches the per-agent table in the plan
+   (Codex: OSC title "Action Required" → blocked, Braille spinner → working;
+   Claude: Ink screen form "enter to select"/"esc to cancel" → blocked, spinner
+   → working).
+5. **Input injection:** a control method (e.g. `session.input` carrying the
+   text) writes into the session PTY honoring the adapter's `InputRules`:
+   Claude (Ink) → bracketed-paste OFF and the submit `\r` sent as a **separate
+   write after ~150 ms** (else Enter is swallowed); Codex → bracketed-paste ON,
+   submit `\r`. The delay value lives in config (no magic number).
+6. A `resume(&SessionRef) -> Command` builder yields `claude --resume <id>` /
+   `codex resume <id>`. Builder + unit test only — restart-resume is M7.
+7. End-to-end: with a recorded fixture (or a stub agent script emitting the real
+   OSC/screen shapes), a Codex and a Claude session each publish the expected
+   `agent_state` transitions with the correct `source`, and an injected prompt
+   reaches the PTY in the adapter-correct framing.
+8. `cargo build`, `cargo clippy --all-targets --workspace -D warnings`, and
+   `cargo test --workspace` stay clean.
 
 ### Explicitly OUT of scope (later milestones — do NOT build here)
 
-- **Agent adapters** (Codex/Claude launch argv, Claude Ink submit-delay,
-  input-injection, the real per-agent manifests) → **milestone 6**. Here: ship a
-  small *generic/shell* manifest (or synthetic fixtures) only — enough to prove
-  the matcher, not to detect a real agent.
-- **`SessionStart` hook + native-session-id capture + resume** → **milestone 7**.
+- **`SessionStart` hook install + native-session-id capture +
+  `session.report_native_id` handling + resume *after daemon restart*** →
+  **milestone 7**. (M6 builds only the resume-argv builder.)
 - **Worktree-per-session** → milestone 8.
-- **SQLite persistence + event-log file** → milestone 9. State stays in-memory;
-  published only on the live event stream and `inspect`.
+- **SQLite persistence + event-log file + migration test** → milestone 9.
+- **`--json` everywhere + error/recovery polish** → milestone 10.
 
 ---
 
 ## Implementation tasks
 
-### 1. `crates/protocol` — agent-activity signal + `agent_state` event
+### 1. `crates/protocol` — agent kinds + input-injection method
 
-`StateSource` already exists; the missing piece is the *activity* value and its
-event. **Design decision to make (flag the choice):** the lifecycle
-`SessionState` (`Starting|Running|Stopped|Done|Failed`) is orthogonal to agent
-activity (`Working|Blocked|Idle`) — a `Running` session is independently working
-or idle or blocked. **Recommended:** add a separate
-`enum AgentActivity { Working, Blocked, Idle }` and an
-`activity: Option<AgentActivity>` field on `SessionInfo` (None until first
-detection), rather than overloading `SessionState`. Keep the existing snake_case
-`#[serde]` style and `skip_serializing_if` for the option.
+- Add `Codex` and `Claude` to `AgentKind` (snake_case `#[serde]`).
+- Add the input-injection method: `method::SESSION_INPUT` (`session.input`) and
+  a `SessionInputParams { session_id, text }` (+ result). Mirror the existing
+  `session.*` param/result shapes.
+- Round-trip tests for the new `AgentKind` variants, params, and result.
 
-- Add `AgentActivity` (snake_case) and `SessionInfo.activity`
-  (`skip_serializing_if = "Option::is_none"`, `#[serde(default)]`).
-- Add event name `agent_state` in `pub mod event`, carrying
-  `{ session_id, activity, source }` (mirror how `session_*`/`attach_*` events
-  are shaped).
-- Round-trip unit tests in `tests/roundtrip.rs` for `AgentActivity`, the extended
-  `SessionInfo` (activity present and absent), and the `agent_state` event JSON
-  shape.
+### 2. `crates/daemon/src/agent/` — the adapter trait + Codex/Claude
 
-### 2. `crates/daemon/src/detect/mod.rs` — the three layers
+Fill the stub. Keep adapters small and independently testable.
 
-Fill in the stub. Keep the layers as separate, independently testable units
-(submodules: `osc`, `screen`, `manifest`, `machine` or similar) so each has its
-own unit tests.
+- `AgentAdapter` trait per the plan (`docs/plan-phase-1.md` "Agent Adapter
+  Boundary"). `LaunchOpts { cwd, cols, rows, env_extra }`, `InputRules {
+  bracketed_paste: bool, submit_delay: Duration }`.
+- `codex.rs`, `claude.rs`: launch argv/env/cwd (Claude: `claude`; Codex:
+  `codex`), `input_rules` per the table (Claude Ink: paste OFF + ~150 ms submit
+  delay; Codex: paste ON), `manifest()` returning the embedded per-agent
+  manifest, `resume()` argv (`claude --resume <id>` / `codex resume <id>`).
+- Resolve the binary from `PATH`; if absent, return a typed error — fail fast,
+  no invented default path.
 
-- **OSC parser** (`osc.rs`): incremental state machine; OSC `0`/`2`→title,
-  `9`→progress; terminator BEL `\x07` or ST `\x1b\\`; **buffer partial sequences
-  across `recv()` chunks**. Clear OSC evidence on foreground-process change
-  (herdr `pane/osc.rs`, `terminal.rs:466-514`) — for a plain shell, foreground
-  tracking is minimal; document what we track now and what M6 tightens.
-- **VT screen** (`screen.rs`): feed bytes to the VT emulator, expose the visible
-  grid + tail-region slices. **Dependency decision (flag to the user):** use
-  `vt100` (pure-Rust, low risk, recommended for Phase 1) vs `alacritty_terminal`.
-  The plan lists this as an open question — pick `vt100`, but run the same
-  fixtures against both if behavior is doubtful. Handle CJK width when slicing.
-- **Manifest matcher** (`manifest.rs`): parse TOML rule files (`toml` + `regex`);
-  regions = `osc_title|osc_progress|whole_recent|bottom_lines(N)|
-  bottom_non_empty_lines(N)|after_last_prompt_marker|prompt_box_body|
-  after_last_horizontal_rule`; gates = `contains` (case-insensitive) `regex`
-  `line_regex` + recursive `all`/`any`/`not`; highest `priority` wins; enforce
-  the complexity caps. Rule shape (herdr `src/detect/manifest.rs`,
-  `manifests/*.toml`):
-  ```toml
-  [[rules]]
-  id = "live_blocked_form"
-  state = "blocked"
-  priority = 980
-  region = "after_last_horizontal_rule"
-  visible_blocker = true
-  contains = ["enter to select", "esc to cancel"]
-  any = [{ contains = ["arrow keys to navigate"] }, { contains = ["↑/↓ to navigate"] }]
-  ```
-- **Debounced state machine** (`machine.rs`): bytes flowing ⇒ working; hold
-  idle/blocked until the stability window confirms. Constants live in config (no
-  magic numbers): recheck `100 ms`, `3` confirmations, cap `700 ms`,
-  stable-visible refresh `800 ms`, startup grace `3 s` (herdr
-  `pane/agent_detection.rs:5-13`). Only emit a transition that passes the window
-  and the visible-UI gate. Each emitted state records its `source`.
+### 3. `crates/daemon/src/detect/manifests/` — real per-agent manifests
 
-### 3. `crates/daemon/src/session/mod.rs` — spawn + own the detector, publish state
+- Add `codex.toml` and `claude.toml`, porting herdr's rules
+  (`/tmp/herdr/src/detect/manifests/{codex,claude}.toml`) into **our** manifest
+  schema (note herdr's extra flags `visible_working`/`visible_idle`/
+  `skip_state_update` are NOT in our schema — fold them into priority/region
+  choices or extend the schema deliberately if truly needed). Embed via
+  `include_str!` exactly like `shell.toml`.
+- Select the manifest by `AgentKind` in `DetectorConfig` (add
+  `DetectorConfig::for_agent(AgentKind)`); `Shell` keeps `generic_shell()`.
+- Consume `visible_blocker`: carry it on `ManifestMatch` and require its
+  evidence before the machine publishes a `blocked` transition.
+- **Build fixtures from real sessions first** (record actual Codex/Claude PTY
+  output) and unit-test the manifests against them — do not hand-wave the rules.
 
-- On session creation, **spawn a detection task** (alongside the existing exit
-  monitor) that owns an `osc`+`screen`+`machine` pipeline and a
-  `subscribe_output()` receiver. Track its `JoinHandle`/`CancellationToken` on
-  the `SessionEntry` so `stop`/`record_exit` cancels it — reuse the
-  active-attach cancellation pattern; **no leaked tasks** when the session ends.
-- On each confirmed transition, update `SessionInfo.activity` +
-  `state_source` + `updated_at` and emit the `agent_state` event via the same
-  `events` broadcast `emit()` uses. Last-writer-wins; the debounce lives in the
-  detector, not the registry.
-- On `Lagged` from the broadcast, log (with skipped count) and resync the VT/OSC
-  state — do not pretend bytes were seen.
+### 4. `crates/daemon/src/session/mod.rs` — launch via adapter + inject input
 
-### 4. `crates/cli` — surface activity (small)
+- `create_session` selects the adapter by `params.agent` and launches the PTY
+  with the adapter's `Command`; wire `DetectorConfig::for_agent(params.agent)`
+  into `spawn_detector`.
+- Handle `session.input`: write `text` to the session PTY honoring the
+  adapter's `InputRules` (bracketed-paste wrapping; for Ink, spawn a short timer
+  task to send `\r` as a separate write after `submit_delay`). Do not block the
+  control connection on the delay.
 
-- Show `activity` + `source` in `session inspect` (and `list`/`status` if
-  trivial) for humans and in `--json`. No new transport; this is display only.
-  Unit-test the JSON shape if you add a formatter branch.
+### 5. `crates/cli` — surface agents + a prompt command
 
-### 5. Cargo
-
-- Daemon: add the VT crate (`vt100`), `toml`, `regex`. Nothing for agents/hooks/
-  SQLite (later milestones). CLI: none expected.
+- `session new --agent codex|claude` (the `--agent` arg already maps to
+  `AgentKind`; add the variants). Show the agent in `list`/`inspect`.
+- A small `session input <target> <text>` (or `prompt`) command calling
+  `session.input`. Display-only otherwise; unit-test any new formatter branch.
 
 ---
 
 ## Tests (must pass before done)
 
-Most of this is **unit-testable without real agents** — the agents are M6. Drive
-the pipeline with synthetic input and recorded fixtures.
+Most layers are unit-testable without a live agent; record fixtures for the
+detection rules.
 
-- protocol: round-trip for `AgentActivity`, extended `SessionInfo`, `agent_state`
-  event.
-- detect unit tests (per layer):
-  - **OSC fragmentation:** feed a title/progress sequence split across several
-    chunks (mid-escape, mid-payload) and assert correct reassembly; both BEL and
-    ST terminators; a stray/aborted sequence does not wedge the parser.
-  - **region slicing:** including a CJK/wide-glyph line proves no off-by-one.
-  - **manifest precedence:** two matching rules → higher `priority` wins;
-    `all`/`any`/`not` nesting; `contains` case-insensitivity; complexity caps
-    reject an over-budget manifest.
-  - **debounce/anti-flicker:** a fixture that oscillates working↔idle within the
-    window collapses to one stable published transition; startup grace suppresses
-    early noise.
-- daemon integration (extend `crates/daemon/tests/health_socket.rs` patterns):
-  - **end-to-end OSC:** create a shell session, `subscribe`, drive a title via
-    the attach stream (`printf '\033]0;…\007'`), and assert an `agent_state`
-    event with `source = osc_title` arrives and `session.inspect` reflects it.
-  - **detector + attach coexist:** attach a raw client and run detection on the
-    same session at once; both work; lag (if any) is logged.
-  - **no leaked task:** stopping the session ends the detector (assert via clean
-    shutdown / no pending work).
-- Keep `cargo build`, `cargo clippy --all-targets --workspace`, and
+- protocol: round-trip for the new `AgentKind` variants, `SessionInputParams`,
+  result.
+- agent: adapter `launch` argv/env/cwd per agent; `resume` argv; `input_rules`
+  values; missing-binary → typed error.
+- detect: per-agent manifest parses; precedence and `visible_blocker` gating
+  against **recorded screen/OSC fixtures** (Codex "Action Required",
+  Braille-spinner working; Claude Ink blocked form, spinner working, idle).
+- session input injection: bracketed-paste framing per agent; the Ink
+  submit-delay timer sends `\r` as a separate write after the configured delay
+  (time-driven unit test, like `machine.rs`).
+- daemon integration (extend `crates/daemon/tests/health_socket.rs`): launch a
+  stub agent script that emits the real OSC/screen shapes; assert the expected
+  `agent_state` transitions + `source` and that an injected prompt reaches the
+  PTY.
+- Keep `cargo build`, `cargo clippy --all-targets --workspace -D warnings`, and
   `cargo test --workspace` clean.
 
 ---
 
 ## After this milestone
 
-Milestone 6 = **agent adapters** (Codex + Claude Code): a thin per-agent trait
-carrying launch argv/env/cwd, input-injection rules (Claude Ink: bracketed-paste
-off + delayed `\r` submit, ~150 ms — confirm empirically), the real per-agent
-state manifests (`manifests/*.toml`), and the resume command. It plugs the real
-manifests into the matcher built here. Then milestone 7 (`SessionStart` hook +
-native-session-id capture + resume after daemon restart), 8 (worktree-per-
-session), 9 (SQLite persistence + event log + migration test), 10 (`--json`
-everywhere + error/recovery polish).
+Milestone 7 = **`SessionStart` hook + native-session-id capture + restart-
+resume**: install a Claude `SessionStart` hook and the Codex equivalent
+(herdr `src/integration/`, `assets/claude/herdr-agent-state.sh`); handle
+`session.report_native_id` and store the resume binding; after a daemon restart,
+rebuild sessions and resume via the M6 resume-argv builder. Then milestone 8
+(worktree-per-session), 9 (SQLite persistence + event log + migration test),
+10 (`--json` everywhere + error/recovery polish).
 
-Empirical open questions to start probing now (per the plan): the exact
-`blocked`/awaiting-approval signal per agent (OSC vs screen form) — **build
-fixtures from real sessions first**; `vt100` vs `alacritty_terminal` sufficiency;
-the Claude Ink submit-delay value.
+Empirical open questions to settle now (per the plan): the exact Claude Ink
+submit-delay value (start at **150 ms**, confirm empirically — Enter is
+swallowed if too short); the precise blocked/awaiting-approval signal per agent
+(OSC title vs. screen form) — **build fixtures from real Codex/Claude sessions
+first**; Codex's native-session-id capture payload shape (relevant for M7, but
+record it now while you have live sessions).
 
-Do not pull milestone 6+ agent/manifest/resume work into this step — keep the
-state engine proven on synthetic input first: OSC fragments reassemble, regions
-slice correctly, manifests resolve by priority, debounce kills flicker, and a
-shell-emitted title surfaces as a published state with its `source`.
+Do not pull milestone 7+ hook/resume/worktree/persistence work into this step —
+keep M6 proven on real agents: both launch, both detect correctly with sources,
+prompts inject and submit (Ink quirk included), and the resume argv is built.
