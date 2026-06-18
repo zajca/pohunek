@@ -30,11 +30,11 @@ mod version;
 pub use envelope::{Event, Request, Response, StateSource};
 pub use error::{ErrorClass, ProtocolError};
 pub use session::{
-    AgentKind, AttachHeader, SessionAttachParams, SessionAttachResult, SessionDetachParams,
-    SessionDetachResult, SessionId, SessionInfo, SessionNewParams, SessionResizeParams,
-    SessionResizeResult, SessionState, SessionStopResult,
+    AgentActivity, AgentKind, AttachHeader, SessionAttachParams, SessionAttachResult,
+    SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionNewParams,
+    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult,
 };
-pub use version::{negotiate, ProtocolVersion, PROTOCOL_VERSION};
+pub use version::{PROTOCOL_VERSION, ProtocolVersion, negotiate};
 
 /// Control-protocol method names (Phase 1).
 ///
@@ -69,6 +69,7 @@ pub mod method {
 /// These are the `event` values published on subscription connections. The
 /// payload remains an open JSON object at the envelope layer.
 pub mod event {
+    pub const AGENT_STATE: &str = "agent_state";
     pub const ATTACH_OPENED: &str = "attach_opened";
     pub const ATTACH_CLOSED: &str = "attach_closed";
     pub const SESSION_CREATED: &str = "session_created";

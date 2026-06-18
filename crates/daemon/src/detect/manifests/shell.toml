@@ -1,0 +1,85 @@
+# Generic shell activity manifest.
+#
+# Ships with the daemon and is loaded by the production detector so the
+# screen/manifest layer runs live (not just OSC + process). It reproduces the
+# keyword -> activity mapping that previously lived in a hardcoded function,
+# now expressed as declarative rules over the OSC title, OSC progress, and the
+# whole recent visible screen.
+#
+# Precedence mirrors the old check order (blocked > idle > working) via the
+# `priority` field: blocked rules sit highest, then idle, then working.
+#
+# Each rule fires when the region contains ANY of its keywords, so the keyword
+# lists use `any = [{ contains = ... }]` (a bare `contains = [...]` array is
+# AND-matched by the engine, which is not what we want here). `contains` is
+# matched case-insensitively (the matcher lowercases both sides), so the needles
+# below are lowercase.
+
+# --- blocked (highest priority) ---
+
+[[rules]]
+id = "osc_title_blocked"
+state = "blocked"
+priority = 300
+region = "osc_title"
+any = [{ contains = "blocked" }, { contains = "action required" }]
+
+[[rules]]
+id = "osc_progress_blocked"
+state = "blocked"
+priority = 300
+region = "osc_progress"
+any = [{ contains = "blocked" }, { contains = "action required" }]
+
+[[rules]]
+id = "screen_blocked"
+state = "blocked"
+priority = 300
+region = "whole_recent"
+any = [{ contains = "blocked" }, { contains = "action required" }]
+
+# --- idle ---
+
+[[rules]]
+id = "osc_title_idle"
+state = "idle"
+priority = 200
+region = "osc_title"
+any = [{ contains = "idle" }, { contains = "ready" }]
+
+[[rules]]
+id = "osc_progress_idle"
+state = "idle"
+priority = 200
+region = "osc_progress"
+any = [{ contains = "idle" }, { contains = "ready" }]
+
+[[rules]]
+id = "screen_idle"
+state = "idle"
+priority = 200
+region = "whole_recent"
+any = [{ contains = "idle" }, { contains = "ready" }]
+
+# --- working (lowest priority) ---
+
+[[rules]]
+id = "osc_title_working"
+state = "working"
+priority = 100
+region = "osc_title"
+any = [{ contains = "working" }, { contains = "running" }, { contains = "progress" }]
+
+[[rules]]
+id = "osc_progress_working"
+state = "working"
+priority = 100
+region = "osc_progress"
+any = [{ contains = "working" }, { contains = "running" }, { contains = "progress" }]
+
+[[rules]]
+id = "screen_working"
+state = "working"
+priority = 100
+region = "whole_recent"
+any = [{ contains = "working" }, { contains = "running" }, { contains = "progress" }]

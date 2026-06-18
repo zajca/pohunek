@@ -11,7 +11,7 @@
 //! // response (typed error)
 //! {"v":1,"id":"req-7f3","err":{"class":"runtime","code":"...","msg":"...","recover":"..."}}
 //! // event (on a subscription connection)
-//! {"v":1,"event":"agent_state","session_id":"s-42","state":"blocked","source":"osc_title","ts":"..."}
+//! {"v":1,"event":"agent_state","session_id":"s-42","activity":"blocked","source":"osc_title","ts":"..."}
 //! ```
 //!
 //! `params`, `ok`, and event payloads are kept as `serde_json::Value` for the
@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::ProtocolError;
-use crate::version::{ProtocolVersion, PROTOCOL_VERSION};
+use crate::version::{PROTOCOL_VERSION, ProtocolVersion};
 
 /// A control request: `{v, id, method, params}`.
 ///

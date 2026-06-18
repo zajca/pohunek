@@ -16,13 +16,14 @@ members = [
 ]
 
 # Shared dependency versions. Individual crates opt in via `workspace = true`.
-# Crates needed for milestones 1-3 are declared here (per the plan; the daemon
-# also pulls in portable-pty directly for milestone 3). rusqlite/vt100/toml/regex
-# come in later milestones.
+# Crates shared across implemented milestones and current state-engine work are
+# declared here as individual crates opt in.
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+toml = "0.8"
+regex = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "fs", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3"
@@ -35,6 +36,7 @@ clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 # RFC3339 timestamps for session metadata (milestone 3). Formatting only.
 time = { version = "0.3", features = ["formatting"] }
+vt100 = "0.16.2"
 
 [workspace.package]
 edition = "2021"

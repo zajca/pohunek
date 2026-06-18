@@ -5,21 +5,22 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use protocol::{
-    event, AgentKind, ErrorClass, Event, ProtocolError, SessionId, SessionInfo, SessionNewParams,
-    SessionState, SessionStopResult, StateSource,
+    AgentKind, ErrorClass, Event, ProtocolError, SessionId, SessionInfo, SessionNewParams,
+    SessionState, SessionStopResult, StateSource, event,
 };
 use serde_json::json;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
-use tokio::sync::{broadcast, Mutex};
+use time::format_description::well_known::Rfc3339;
+use tokio::sync::{Mutex, broadcast, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::detect::{ActivityTransition, Detector, DetectorConfig};
 use crate::pty::{PtyCommand, PtyError, PtyExit, PtyHandle};
 
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
@@ -105,6 +106,8 @@ struct SessionRegistryInner {
 struct SessionEntry {
     info: SessionInfo,
     pty: PtyHandle,
+    detector_cancel: CancellationToken,
+    detector_resize: watch::Sender<(u16, u16)>,
     stopping: bool,
 }
 
@@ -191,6 +194,9 @@ impl SessionRegistry {
             .await
             .map_err(|_| runtime_error("spawn_failed", "PTY spawn task panicked"))?
             .map_err(pty_error_to_protocol)?;
+        let detector_output = pty.subscribe_output();
+        let detector_cancel = CancellationToken::new();
+        let (detector_resize, detector_resize_rx) = watch::channel((params.rows, params.cols));
 
         let now = timestamp_now();
         let info = SessionInfo {
@@ -202,6 +208,7 @@ impl SessionRegistry {
             rows: params.rows,
             state: SessionState::Running,
             state_source: StateSource::Process,
+            activity: None,
             created_at: now.clone(),
             updated_at: now,
             exit_code: None,
@@ -214,12 +221,22 @@ impl SessionRegistry {
                 SessionEntry {
                     info: info.clone(),
                     pty: pty.clone(),
+                    detector_cancel: detector_cancel.clone(),
+                    detector_resize,
                     stopping: false,
                 },
             );
         }
 
         self.emit(event::SESSION_CREATED, &info);
+        self.spawn_detector(
+            id.clone(),
+            detector_output,
+            params.rows,
+            params.cols,
+            detector_cancel,
+            detector_resize_rx,
+        );
         self.spawn_exit_watcher(id, pty);
         Ok(info)
     }
@@ -389,7 +406,7 @@ impl SessionRegistry {
             .await
             .map_err(pty_error_to_protocol)?;
 
-        let info = {
+        let (info, detector_resize) = {
             let mut sessions = self.inner.sessions.lock().await;
             let entry = sessions
                 .get_mut(id)
@@ -400,8 +417,9 @@ impl SessionRegistry {
             entry.info.cols = cols;
             entry.info.rows = rows;
             entry.info.updated_at = timestamp_now();
-            entry.info.clone()
+            (entry.info.clone(), entry.detector_resize.clone())
         };
+        let _ = detector_resize.send((rows, cols));
 
         self.emit(event::SESSION_UPDATED, &info);
         Ok(protocol::SessionResizeResult { session: info })
@@ -409,7 +427,7 @@ impl SessionRegistry {
 
     /// Stop a running session.
     pub async fn stop(&self, id: &SessionId) -> Result<SessionStopResult, ProtocolError> {
-        let pty = {
+        let (pty, detector_cancel) = {
             let mut sessions = self.inner.sessions.lock().await;
             let entry = sessions
                 .get_mut(id)
@@ -419,9 +437,10 @@ impl SessionRegistry {
             }
 
             entry.stopping = true;
-            entry.pty.clone()
+            (entry.pty.clone(), entry.detector_cancel.clone())
         };
 
+        detector_cancel.cancel();
         self.remove_pending_attaches_for_session(id).await;
         self.cancel_session_attaches(id).await;
 
@@ -485,6 +504,90 @@ impl SessionRegistry {
         });
     }
 
+    fn spawn_detector(
+        &self,
+        id: SessionId,
+        mut output_rx: broadcast::Receiver<Vec<u8>>,
+        rows: u16,
+        cols: u16,
+        cancel: CancellationToken,
+        mut resize_rx: watch::Receiver<(u16, u16)>,
+    ) {
+        let registry = self.clone();
+        tokio::spawn(async move {
+            let detector_config = DetectorConfig::generic_shell();
+            let mut tick = tokio::time::interval(detector_config.detection.recheck_after);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await;
+            let mut detector = Detector::new(rows, cols, Instant::now(), detector_config);
+
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tick.tick() => {
+                        for transition in detector.tick(Instant::now()) {
+                            registry.record_activity(&id, transition).await;
+                        }
+                    }
+                    changed = resize_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let (rows, cols) = *resize_rx.borrow();
+                        detector.resize(rows, cols);
+                    }
+                    received = output_rx.recv() => {
+                        match received {
+                            Ok(chunk) => {
+                                for transition in detector.feed(Instant::now(), &chunk) {
+                                    registry.record_activity(&id, transition).await;
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                warn!(
+                                    session_id = %id.0,
+                                    skipped,
+                                    "resyncing detector state after PTY output lag"
+                                );
+                                detector.resync_after_lag();
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    async fn record_activity(&self, id: &SessionId, transition: ActivityTransition) {
+        let updated = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get_mut(id) else {
+                debug!(session_id = %id.0, "detector activity arrived for unknown session");
+                return;
+            };
+
+            if entry.stopping || is_terminal(entry.info.state) {
+                return;
+            }
+
+            entry.info.activity = Some(transition.activity);
+            entry.info.state_source = transition.source;
+            entry.info.updated_at = timestamp_now();
+            transition
+        };
+
+        let event = Event::new(
+            event::AGENT_STATE,
+            json!({
+                "session_id": id,
+                "activity": updated.activity,
+                "source": updated.source,
+            }),
+        );
+        let _ = self.inner.events.send(event);
+    }
+
     async fn record_exit(&self, id: &SessionId, exit: PtyExit, stopped_by_user: bool) {
         let updated = {
             let mut sessions = self.inner.sessions.lock().await;
@@ -513,8 +616,10 @@ impl SessionRegistry {
                 entry.info.state = SessionState::Failed;
             }
             entry.info.state_source = StateSource::Process;
+            entry.info.activity = None;
             entry.info.exit_code = exit.exit_code;
             entry.info.updated_at = timestamp_now();
+            entry.detector_cancel.cancel();
             let event = if stopped {
                 event::SESSION_STOPPED
             } else {

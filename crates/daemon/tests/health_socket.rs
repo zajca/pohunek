@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use protocol::{
-    event, method, AgentKind, AttachHeader, Event, Request, Response, SessionAttachParams,
-    SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId, SessionInfo,
-    SessionNewParams, SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult,
-    PROTOCOL_VERSION,
+    AgentActivity, AgentKind, AttachHeader, Event, PROTOCOL_VERSION, Request, Response,
+    SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
+    SessionInfo, SessionNewParams, SessionResizeParams, SessionResizeResult, SessionState,
+    SessionStopResult, StateSource, event, method,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -205,9 +205,7 @@ async fn open_attach_stream(socket: &std::path::Path, stream_id: &str) -> UnixSt
     raw.write_all(header.as_bytes())
         .await
         .expect("send attach header");
-    raw.write_all(b"\n")
-        .await
-        .expect("terminate attach header");
+    raw.write_all(b"\n").await.expect("terminate attach header");
     raw
 }
 
@@ -219,7 +217,10 @@ async fn read_until_marker(stream: &mut UnixStream, marker: &[u8]) -> Vec<u8> {
             let n = stream.read(&mut buf).await.expect("read raw stream");
             assert_ne!(n, 0, "raw stream closed before marker arrived");
             collected.extend_from_slice(&buf[..n]);
-            if collected.windows(marker.len()).any(|window| window == marker) {
+            if collected
+                .windows(marker.len())
+                .any(|window| window == marker)
+            {
                 return collected;
             }
         }
@@ -267,6 +268,46 @@ async fn wait_for_state(
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("session {} did not reach state {state:?}", id.0);
+}
+
+async fn wait_for_agent_state_event(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    id: &SessionId,
+    activity: AgentActivity,
+    source: StateSource,
+) -> Event {
+    let expected_activity = serde_json::to_value(activity).expect("serialize activity");
+    let expected_source = serde_json::to_value(source).expect("serialize source");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut seen = Vec::new();
+    loop {
+        let now = tokio::time::Instant::now();
+        assert!(
+            now < deadline,
+            "agent_state event did not arrive before timeout; expected activity={expected_activity} source={expected_source}; seen={seen:?}"
+        );
+
+        let line = tokio::time::timeout(deadline - now, framed.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "agent_state event did not arrive before timeout; expected activity={expected_activity} source={expected_source}; seen={seen:?}"
+                )
+            })
+            .expect("a streamed event line")
+            .expect("event framing ok");
+        let streamed: Event = serde_json::from_str(&line).expect("parse event");
+        if streamed.event == event::AGENT_STATE
+            && streamed.payload["session_id"].as_str() == Some(id.0.as_str())
+        {
+            seen.push(streamed.payload.clone());
+            if streamed.payload["activity"] == expected_activity
+                && streamed.payload["source"] == expected_source
+            {
+                return streamed;
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -387,9 +428,10 @@ async fn session_lifecycle_over_socket() {
 
     let list_after_stop_req =
         Request::new("session-list-after-stop", method::SESSION_LIST, Value::Null);
-    let list_after_stop: Vec<SessionInfo> =
-        serde_json::from_value(ok_payload(exchange(&mut client, &list_after_stop_req).await))
-            .expect("session list after stop");
+    let list_after_stop: Vec<SessionInfo> = serde_json::from_value(ok_payload(
+        exchange(&mut client, &list_after_stop_req).await,
+    ))
+    .expect("session list after stop");
     assert!(
         list_after_stop
             .iter()
@@ -542,9 +584,8 @@ async fn attach_raw_stream_round_trips_resizes_detaches_and_reattaches() {
     })
     .expect("serialize attach header");
     let mut attach_prelude_and_input = header.into_bytes();
-    attach_prelude_and_input.extend_from_slice(
-        b"\nprintf 'm4-leftover:%s\\n' '{\"looks\":\"json\"}'\n",
-    );
+    attach_prelude_and_input
+        .extend_from_slice(b"\nprintf 'm4-leftover:%s\\n' '{\"looks\":\"json\"}'\n");
     raw.write_all(&attach_prelude_and_input)
         .await
         .expect("send attach header and input in one socket write");
@@ -607,6 +648,10 @@ async fn attach_raw_stream_round_trips_resizes_detaches_and_reattaches() {
     let _: SessionStopResult =
         serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
             .expect("stop result");
+    let stopped = inspect_session(&mut control, &created.id).await;
+    assert_eq!(stopped.state, SessionState::Stopped);
+    assert_eq!(stopped.activity, None);
+    assert_eq!(stopped.state_source, StateSource::Process);
 
     let _ = shutdown.send(());
     let _ = handle.await;
@@ -668,6 +713,128 @@ async fn multiple_attach_clients_receive_output_and_disconnect_independently() {
     );
     let _: SessionStopResult =
         serde_json::from_value(ok_payload(exchange(&mut control, &stopped).await))
+            .expect("stop result");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn detector_publishes_osc_title_activity_while_attach_receives_output() {
+    let socket = temp_socket("detector-osc-attach");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new(
+            "/bin/sh",
+            [
+                "-c",
+                "stty -echo; read trigger; printf '\\033]0;working\\007m5-detector-attach\\n'; sleep 30",
+            ],
+        ),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::new("subscribe-detector", method::SUBSCRIBE, Value::Null);
+    let ack = exchange(&mut subscriber, &subscribe_req).await;
+    assert!(matches!(ack, Response::Ok { .. }), "subscribe should ack");
+
+    let mut control = connect(&socket).await;
+    let created = create_session(&mut control).await;
+    let attach = attach_session(&mut control, &created.id).await;
+    let mut raw = open_attach_stream(&socket, &attach.stream_id).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    raw.write_all(b"\n")
+        .await
+        .expect("trigger detector marker command");
+
+    let raw_output = read_until_marker(&mut raw, b"m5-detector-attach").await;
+    assert!(
+        raw_output
+            .windows(b"m5-detector-attach".len())
+            .any(|window| window == b"m5-detector-attach"),
+        "raw attach stream should receive shell output: {}",
+        String::from_utf8_lossy(&raw_output)
+    );
+
+    let streamed = wait_for_agent_state_event(
+        &mut subscriber,
+        &created.id,
+        AgentActivity::Working,
+        StateSource::OscTitle,
+    )
+    .await;
+    assert_eq!(streamed.payload["activity"], Value::from("working"));
+    assert_eq!(streamed.payload["source"], Value::from("osc_title"));
+
+    let inspected = inspect_session(&mut control, &created.id).await;
+    assert_eq!(inspected.activity, Some(AgentActivity::Working));
+    assert_eq!(inspected.state_source, StateSource::OscTitle);
+
+    let stop_req = Request::new(
+        "session-stop-after-detector",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
+    let stopped = inspect_session(&mut control, &created.id).await;
+    assert_eq!(stopped.state, SessionState::Stopped);
+    assert_eq!(stopped.activity, None);
+    assert_eq!(stopped.state_source, StateSource::Process);
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn detector_tick_publishes_debounced_static_osc_title_activity() {
+    let socket = temp_socket("detector-osc-debounce");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new(
+            "/bin/sh",
+            ["-c", "sleep 0.2; printf '\\033]0;blocked\\007'; sleep 30"],
+        ),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::new(
+        "subscribe-detector-debounce",
+        method::SUBSCRIBE,
+        Value::Null,
+    );
+    let ack = exchange(&mut subscriber, &subscribe_req).await;
+    assert!(matches!(ack, Response::Ok { .. }), "subscribe should ack");
+
+    let mut control = connect(&socket).await;
+    let created = create_session(&mut control).await;
+
+    let streamed = wait_for_agent_state_event(
+        &mut subscriber,
+        &created.id,
+        AgentActivity::Blocked,
+        StateSource::OscTitle,
+    )
+    .await;
+    assert_eq!(streamed.payload["activity"], Value::from("blocked"));
+    assert_eq!(streamed.payload["source"], Value::from("osc_title"));
+
+    let inspected = inspect_session(&mut control, &created.id).await;
+    assert_eq!(inspected.activity, Some(AgentActivity::Blocked));
+    assert_eq!(inspected.state_source, StateSource::OscTitle);
+
+    let stop_req = Request::new(
+        "session-stop-after-detector-debounce",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
             .expect("stop result");
 
     let _ = shutdown.send(());

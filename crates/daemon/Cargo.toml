@@ -15,6 +15,8 @@ zagentmesh-protocol = { path = "../protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+toml = { workspace = true }
+regex = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
@@ -23,4 +25,5 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 libc = { workspace = true }
 time = { workspace = true }
+vt100 = { workspace = true }
 portable-pty = "0.9"

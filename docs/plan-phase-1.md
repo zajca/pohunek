@@ -86,7 +86,7 @@ Envelope sketch (illustrative):
 // response (typed error)
 {"v":1,"id":"req-7f3","err":{"class":"runtime","code":"agent_binary_missing","msg":"...","recover":"install claude"}}
 // event (on a subscription connection)
-{"v":1,"event":"agent_state","session_id":"s-42","state":"blocked","source":"osc_title","ts":"..."}
+{"v":1,"event":"agent_state","session_id":"s-42","activity":"blocked","source":"osc_title","ts":"..."}
 ```
 
 - `v` = protocol version. New fields are additive; unknown fields ignored. On

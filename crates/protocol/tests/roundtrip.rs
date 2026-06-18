@@ -4,13 +4,13 @@
 use std::path::PathBuf;
 
 use protocol::{
-    event, method, negotiate, AgentKind, AttachHeader, ErrorClass, Event, ProtocolError,
+    AgentActivity, AgentKind, AttachHeader, ErrorClass, Event, PROTOCOL_VERSION, ProtocolError,
     ProtocolVersion, Request, Response, SessionAttachParams, SessionAttachResult,
     SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionNewParams,
-    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, StateSource,
-    PROTOCOL_VERSION,
+    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, StateSource, event,
+    method, negotiate,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Serialize a value to a single JSON line, then parse it back.
 fn line_roundtrip<T>(value: &T) -> T
@@ -35,9 +35,27 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         rows: 40,
         state: SessionState::Running,
         state_source: StateSource::Process,
+        activity: None,
         created_at: "2026-06-17T10:00:00Z".to_owned(),
         updated_at: "2026-06-17T10:01:00Z".to_owned(),
         exit_code,
+    }
+}
+
+#[test]
+fn agent_activity_json_shape_roundtrips() {
+    let cases = [
+        (AgentActivity::Working, json!("working")),
+        (AgentActivity::Blocked, json!("blocked")),
+        (AgentActivity::Idle, json!("idle")),
+    ];
+
+    for (activity, expected) in cases {
+        let value = serde_json::to_value(activity).expect("serialize activity");
+        assert_eq!(value, expected);
+
+        let back = line_roundtrip(&activity);
+        assert_eq!(back, activity);
     }
 }
 
@@ -63,6 +81,35 @@ fn session_new_params_json_shape_roundtrips() {
 
     let back = line_roundtrip(&params);
     assert_eq!(back, params);
+}
+
+#[test]
+fn session_info_json_shape_roundtrips_with_activity() {
+    let info = SessionInfo {
+        activity: Some(AgentActivity::Working),
+        ..running_shell_session(None)
+    };
+
+    let value = serde_json::to_value(&info).expect("serialize session info");
+    assert_eq!(
+        value,
+        json!({
+            "id": "s-42",
+            "agent": "shell",
+            "cwd": "/workspace/project",
+            "pid": 4242,
+            "cols": 120,
+            "rows": 40,
+            "state": "running",
+            "state_source": "process",
+            "activity": "working",
+            "created_at": "2026-06-17T10:00:00Z",
+            "updated_at": "2026-06-17T10:01:00Z"
+        })
+    );
+
+    let back = line_roundtrip(&info);
+    assert_eq!(back, info);
 }
 
 #[test]
@@ -93,6 +140,24 @@ fn session_info_json_shape_roundtrips_with_exit_code() {
     );
 
     let back = line_roundtrip(&info);
+    assert_eq!(back, info);
+}
+
+#[test]
+fn session_info_omits_absent_activity() {
+    let info = running_shell_session(None);
+
+    let value = serde_json::to_value(&info).expect("serialize session info");
+    assert!(
+        !value
+            .as_object()
+            .expect("session info object")
+            .contains_key("activity"),
+        "absent activity must be omitted: {value}"
+    );
+
+    let back = line_roundtrip(&info);
+    assert_eq!(back.activity, None);
     assert_eq!(back, info);
 }
 
@@ -345,24 +410,45 @@ fn err_response_without_recover_omits_field() {
 }
 
 #[test]
-fn event_roundtrip() {
+fn agent_state_event_carries_activity_in_flattened_payload() {
     let event = Event::new(
-        "agent_state",
+        event::AGENT_STATE,
         json!({
             "session_id": "s-42",
-            "state": "blocked",
-            "source": StateSource::OscTitle,
-            "ts": "2026-06-17T10:00:00Z"
+            "activity": AgentActivity::Blocked,
+            "source": StateSource::OscTitle
         }),
     );
     let back = line_roundtrip(&event);
     assert_eq!(event, back);
     assert_eq!(back.v, PROTOCOL_VERSION);
-    assert_eq!(back.event, "agent_state");
-    // Payload keys are flattened to the top level of the JSON object.
-    let line = serde_json::to_string(&event).expect("serialize");
-    assert!(line.contains("\"session_id\":\"s-42\""), "line: {line}");
-    assert!(line.contains("\"source\":\"osc_title\""), "line: {line}");
+    assert_eq!(back.event, event::AGENT_STATE);
+
+    let value = serde_json::to_value(&event).expect("serialize event");
+    assert_eq!(
+        value,
+        json!({
+            "v": PROTOCOL_VERSION,
+            "event": "agent_state",
+            "session_id": "s-42",
+            "activity": "blocked",
+            "source": "osc_title"
+        })
+    );
+    assert!(
+        !value
+            .as_object()
+            .expect("event object")
+            .contains_key("payload"),
+        "event payload fields must be flattened: {value}"
+    );
+    assert!(
+        !value
+            .as_object()
+            .expect("event object")
+            .contains_key("state"),
+        "agent activity events must not use lifecycle state key: {value}"
+    );
 }
 
 #[test]

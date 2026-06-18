@@ -8,8 +8,8 @@ use std::path::PathBuf;
 
 use clap::ValueEnum;
 use protocol::{
-    method, AgentKind, Request, SessionId, SessionInfo, SessionNewParams, SessionState,
-    SessionStopResult, StateSource,
+    AgentActivity, AgentKind, Request, SessionId, SessionInfo, SessionNewParams, SessionState,
+    SessionStopResult, StateSource, method,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -196,20 +196,24 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
 
     let mut output = String::new();
     output.push_str(&format!(
-        "{:<id_width$}  {:<5}  {:<7}  {:<4}  {:<6}  CWD\n",
+        "{:<id_width$}  {:<5}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  CWD\n",
         "ID",
         "AGENT",
         "STATE",
+        "ACTIVITY",
+        "SOURCE",
         "PID",
         "SIZE",
         id_width = id_width
     ));
     for session in sessions {
         output.push_str(&format!(
-            "{:<id_width$}  {:<5}  {:<7}  {:<4}  {:<6}  {}\n",
+            "{:<id_width$}  {:<5}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {}\n",
             session.id.0,
             agent_label(session.agent),
             state_label(session.state),
+            activity_label_option(session.activity),
+            state_source_label(session.state_source),
             session.pid,
             format!("{}x{}", session.cols, session.rows),
             session.cwd.display(),
@@ -228,6 +232,7 @@ fn render_inspect_human(info: &SessionInfo) -> String {
         ("cols", info.cols.to_string()),
         ("rows", info.rows.to_string()),
         ("state", state_label(info.state).to_owned()),
+        ("activity", activity_label_option(info.activity).to_owned()),
         (
             "state_source",
             state_source_label(info.state_source).to_owned(),
@@ -276,6 +281,18 @@ fn state_label(state: SessionState) -> &'static str {
     }
 }
 
+fn activity_label_option(activity: Option<AgentActivity>) -> &'static str {
+    activity.map(activity_label).unwrap_or("-")
+}
+
+fn activity_label(activity: AgentActivity) -> &'static str {
+    match activity {
+        AgentActivity::Working => "working",
+        AgentActivity::Blocked => "blocked",
+        AgentActivity::Idle => "idle",
+    }
+}
+
 fn state_source_label(source: StateSource) -> &'static str {
     match source {
         StateSource::OscTitle => "osc_title",
@@ -289,7 +306,7 @@ fn state_source_label(source: StateSource) -> &'static str {
 mod tests {
     use std::path::PathBuf;
 
-    use protocol::{method, Request, SessionInfo, SessionState, StateSource};
+    use protocol::{AgentActivity, Request, SessionInfo, SessionState, StateSource, method};
     use serde_json::json;
 
     use super::*;
@@ -306,6 +323,7 @@ mod tests {
             rows: 40,
             state: SessionState::Running,
             state_source: StateSource::Process,
+            activity: None,
             created_at: "2026-06-17T10:00:00Z".to_owned(),
             updated_at: "2026-06-17T10:01:00Z".to_owned(),
             exit_code: None,
@@ -400,8 +418,25 @@ mod tests {
     fn renders_compact_session_list_table() {
         let output = render_list_human(&[running_session("s-42")]);
 
-        assert!(output.contains("ID    AGENT  STATE    PID   SIZE    CWD\n"));
-        assert!(output.contains("s-42  shell  running  4242  120x40  /workspace/project\n"));
+        assert!(
+            output.contains("ID    AGENT  STATE    ACTIVITY  SOURCE        PID   SIZE    CWD\n")
+        );
+        assert!(output.contains(
+            "s-42  shell  running  -         process       4242  120x40  /workspace/project\n"
+        ));
+    }
+
+    #[test]
+    fn renders_detected_activity_in_session_list_table() {
+        let mut session = running_session("s-42");
+        session.activity = Some(AgentActivity::Working);
+        session.state_source = StateSource::OscTitle;
+
+        let output = render_list_human(&[session]);
+
+        assert!(output.contains(
+            "s-42  shell  running  working   osc_title     4242  120x40  /workspace/project\n"
+        ));
     }
 
     #[test]
@@ -412,6 +447,8 @@ mod tests {
         assert!(output.contains("id            s-42\n"));
         assert!(output.contains("agent         shell\n"));
         assert!(output.contains("state         running\n"));
+        assert!(output.contains("activity      -\n"));
+        assert!(output.contains("state_source  process\n"));
         assert!(output.contains("exit_code     <none>\n"));
     }
 

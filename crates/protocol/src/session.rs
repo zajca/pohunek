@@ -18,6 +18,18 @@ pub enum AgentKind {
     Shell,
 }
 
+/// Current detected agent activity within a running session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentActivity {
+    /// The agent is actively processing work.
+    Working,
+    /// The agent is waiting for user input or approval.
+    Blocked,
+    /// The agent is running but not currently producing work.
+    Idle,
+}
+
 /// Parameters for `session.new`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionNewParams {
@@ -118,6 +130,9 @@ pub struct SessionInfo {
     pub state: SessionState,
     /// Source of the current state signal.
     pub state_source: StateSource,
+    /// Current detected agent activity, when the detector has published one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<AgentActivity>,
     /// Creation timestamp in the daemon's wire timestamp format.
     pub created_at: String,
     /// Last update timestamp in the daemon's wire timestamp format.
