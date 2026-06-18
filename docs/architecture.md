@@ -77,7 +77,7 @@ Key consequences of that scope, decided explicitly:
  |                                                           |
  |  +-----------+  +-----------+  +-----------+  +---------+  |
  |  | PTY +     |  | metadata  |  | event log |  | NetBird |  |
- |  | agents    |  | (SQLite)  |  | + logs    |  | discovery|  |
+ |  | agents    |  | (files)   |  | + logs    |  | discovery|  |
  |  +-----------+  +-----------+  +-----------+  +---------+  |
  +-----------------------------------------------------------+
        |
@@ -100,7 +100,8 @@ Core responsibilities:
 - Own OS PTYs, agent processes, and session lifecycle.
 - Keep sessions alive when foreground clients disconnect.
 - Track session metadata, worktree bindings, agent type, and runtime state.
-- Store local metadata in SQLite.
+- Store local metadata in file-based stores (JSON-lines today; an embedded SQLite
+  store is a deferred optimization — see "Configuration, State, and Log Storage").
 - Write structured logs and append session-lifecycle events to a local event log.
 - Record and use native agent session IDs for resume.
 - Serve two listeners with one protocol:
@@ -300,9 +301,10 @@ Runtime state under the user data directory:
 
 ```text
 ~/.local/share/zagentmesh/
-  state.db          # SQLite: sessions, worktree bindings, resume metadata
-  events/           # local append-only event log (audit/debug, not replicated)
-  worktrees/        # managed git worktrees
+  resume-bindings.jsonl    # sessions + resume metadata (JSON lines, 0600)
+  worktree-bindings.jsonl  # worktree bindings (JSON lines, 0600)
+  events/                  # local append-only event log (audit/debug, not replicated)
+  worktrees/               # managed git worktrees
 ```
 
 Structured logs under the user state directory:
@@ -311,11 +313,16 @@ Structured logs under the user state directory:
 ~/.local/state/zagentmesh/logs/
 ```
 
-`state.db` carries a schema version and forward migrations from its first
-release. The event log is the local audit/debug trail; `state.db` holds queryable
-current state. Neither is replicated across hosts.
+The metadata stores are file-based (JSON lines, atomic temp+rename, `0600`); the
+event log is the local audit/debug trail. None of these is replicated across
+hosts — each host's daemon is authoritative and is answered live (see "High-Level
+Architecture"). An embedded SQLite `state.db` (schema-versioned, with forward
+migrations) is a **deferred** option, to be adopted only if scale or query needs
+justify it; the schema is sketched in `docs/plan-phase-1.md` ("Deferred: SQLite
+Schema").
 
-Secrets are never written to `state.db`, the event log, or session metadata. They
+Secrets are never written to the metadata stores, the event log, or session
+metadata. They
 stay in the OS keychain, provider CLIs (`gh`, etc.), the SSH/agent environment,
 or explicit local environment files that are not committed.
 
@@ -339,7 +346,7 @@ cheap, free-by-default, or inherited:
 - **Secrets in terminal output are accepted, not guaranteed-redacted.** Agents
   may print tokens to the PTY; scrollback on your own disk may therefore contain
   secrets. The "no secrets" guarantee applies to *structured* metadata
-  (`state.db`, events, config), not to raw terminal streams. Scrollback is stored
+  (the metadata stores, events, config), not to raw terminal streams. Scrollback is stored
   owner-private; sessions may opt out of scrollback persistence.
 
 External text (terminal output, provider responses) is data, never instructions
@@ -387,7 +394,8 @@ Core tests:
   the `blocked` case; heuristic fallback.
 - Resume via native session IDs for Codex and Claude Code where installed.
 - Worktree binding, ownership checks, and conflict handling.
-- SQLite schema load, validation, and forward migration.
+- Metadata-store round-trip and restart survival (a single consistent write-path
+  for resume + worktree records; SQLite schema/migration deferred with the store).
 - CLI table and `--json` output.
 
 Integration tests:

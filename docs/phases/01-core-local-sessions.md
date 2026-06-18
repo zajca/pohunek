@@ -41,7 +41,9 @@ usable for daily agent work before any remote capability exists.
   detection and incremental OSC parsing.
 - Native agent session ID captured via a `SessionStart` hook for resume.
 - Worktree-per-session isolation with ownership checks.
-- SQLite metadata (`state.db`) with schema versioning.
+- File-based metadata stores (resume + worktree bindings) behind one consistent
+  write-path; durable across restart. (An embedded SQLite `state.db` is deferred —
+  see `plan-phase-1.md` "Deferred: SQLite Schema".)
 - Structured logs and a local append-only event log for session lifecycle.
 - Owner-private socket (`0700` dir, `0600` socket).
 
@@ -88,8 +90,9 @@ usable for daily agent work before any remote capability exists.
 - State engine: incremental OSC parser, virtual-terminal screen extraction,
   manifest matcher, and a debounced state machine (stability window).
 - Worktree creation/binding/ownership and safe reuse.
-- SQLite persistence: sessions, agent type, working directory, branch/worktree,
-  PTY size, lifecycle state + source, timestamps, exit status, native resume IDs.
+- File-based persistence (JSON-lines, atomic, `0600`): sessions, agent type,
+  working directory, branch/worktree, PTY size, lifecycle state + source,
+  timestamps, exit status, native resume IDs — durable across a daemon restart.
 - Structured logging and event-log records.
 - `--json` output for `list`, `inspect`, `status`.
 
@@ -141,7 +144,7 @@ not core changes.
   where installed.
 - Verify `--json` output is machine-parseable for list/inspect/status.
 - Verify missing Codex/Claude Code binaries produce clear diagnostics.
-- Verify SQLite schema load + a forward migration.
+- Verify metadata-store round-trip and survival across a daemon restart.
 
 ## Success Criteria
 
@@ -179,6 +182,6 @@ not core changes.
 - The control protocol and attach-stream model are documented well enough for
   Phase 2 to reuse them over NetBird unchanged.
 - Tests cover the local lifecycle, protocol, attach stream, state engine, input
-  injection, JSON output, logging, and a schema migration.
+  injection, JSON output, logging, and metadata-store restart survival.
 - Known limits (daemon-restart resume, `blocked` detection) are explicit and do
   not block Phase 2.

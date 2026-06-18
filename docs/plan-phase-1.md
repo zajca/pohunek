@@ -27,7 +27,7 @@ the original.
 - After a daemon restart, sessions resume via captured native session IDs.
 - Worktree-per-session isolation works with ownership checks.
 - Tests cover protocol, attach stream, the state engine (fixtures per agent),
-  input injection, resume, JSON output, and a schema migration.
+  input injection, resume, JSON output, and metadata-store restart survival.
 
 ## Tech Stack and Crates
 
@@ -40,8 +40,7 @@ the original.
 | VT screen extraction | `vt100` (or `alacritty_terminal`) | parse PTY output into a screen grid for detection; pure-Rust, low risk for Phase 1 |
 | OSC parsing | custom incremental parser (see §6) | OSC 0/2/9; sequences fragment across reads |
 | Detection manifests | `toml`, `regex` | herdr-style rule files |
-| Embedded store | `rusqlite` (bundled SQLite) | single local DB; simplest for a daemon |
-| Schema migration | `rusqlite_migration` or hand-rolled `user_version` | versioned from day one |
+| Metadata store | file-based JSON-lines (`serde_json`) | resume + worktree bindings; atomic temp+rename, `0600`, one consistent write-path. **SQLite (`rusqlite`, bundled) + `user_version` migrations are deferred** — adopt only if scale/query needs justify it |
 | CLI | `clap` (derive) | subcommands + `--json` |
 | Logging | `tracing` + `tracing-subscriber` (JSON) | structured logs to state dir |
 | Errors | `thiserror` (typed) + `anyhow` at edges | typed error classes for `--json` |
@@ -63,7 +62,7 @@ zagentmesh/
         session/             # session model + supervisor
         agent/               # agent adapter trait + codex.rs + claude.rs + manifests/*.toml
         detect/              # OSC parser, VT screen extraction, manifest matcher, state machine
-        store/               # SQLite + migrations
+        store/               # file-based metadata stores (resume + worktree bindings)
         api/                 # Unix socket server, control protocol handler, attach stream
         events/              # append-only event log
     cli/                     # zagentmesh CLI (bin: zagentmesh)
@@ -263,7 +262,14 @@ Model from Kandev (`kandev/.../worktree/worktree.go:24-115`):
 - Non-fatal warnings (fetch failure, base-branch fallback, setup-script failure):
   keep the worktree, surface the warning, let the user decide.
 
-## SQLite Schema (initial, `user_version = 1`)
+## Deferred: SQLite Schema (backlog reference)
+
+> **Not built in Phase 1.** The live metadata store is file-based JSON-lines
+> (`resume-bindings.jsonl` + `worktree-bindings.jsonl`, folded into one consistent
+> write-path in milestone 9). This schema is kept only as a reference for *if/when*
+> an embedded SQLite `state.db` is later adopted (see the Decision note in
+> `NEXT.md`). Adopt it only when scale, query needs, or transactional requirements
+> the file store cannot meet actually appear.
 
 ```sql
 CREATE TABLE session (
@@ -285,8 +291,8 @@ CREATE TABLE worktree (
 ```
 
 Event log is a separate append-only file under `events/` (JSON lines); never
-stores secrets. `state.db` is rebuildable from sources; the event log is the
-audit/debug trail.
+stores secrets. A would-be `state.db` is rebuildable from sources; the event log
+is the (non-rebuildable) audit/debug trail.
 
 ## CLI Grammar (forward-compatible with Phase 2)
 
@@ -296,7 +302,7 @@ audit/debug trail.
   accepts only the local form but the parser is host-aware.
 - `--json` on `list`, `inspect`, `status`, and all automation commands.
 - `zagentmesh doctor`: check Codex/Claude binaries, git, socket dir perms,
-  state-dir writability, schema version.
+  state-dir writability, metadata-store health.
 
 ## Logging and Observability
 
@@ -330,8 +336,11 @@ audit/debug trail.
    daemon restart. *Check:* kill daemon, restart, resume both agents.
 8. **Worktree-per-session.** Bind/ownership/warnings. *Check:* two sessions, two
    worktrees, no shared tree.
-9. **SQLite persistence + migration test + event log.** *Check:* metadata
-   survives restart; a `user_version` 1→2 migration applies cleanly.
+9. **Append-only event log + unified metadata store.** Fold the resume + worktree
+   JSON-lines stores into one consistent write-path; add the `events/` log fed
+   from the registry's `Event` broadcast. *Check:* metadata survives restart; the
+   event log has exactly one secret-free line per lifecycle event. (SQLite
+   `state.db` is deferred — see "Deferred: SQLite Schema".)
 10. **`--json` everywhere + polish errors/recovery hints.** *Check:* JSON parses;
     missing-binary and version-mismatch errors are clear.
 
