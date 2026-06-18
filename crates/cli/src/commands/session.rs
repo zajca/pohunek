@@ -340,7 +340,11 @@ fn render_inspect_human(info: &SessionInfo) -> String {
         ),
         (
             "resumable",
-            if info.native_session_id.is_some() {
+            // Resumable only while the session can still come back: it needs a
+            // captured native id AND a non-terminal state. On exit the daemon
+            // drops the resume binding, so a terminal session whose native id
+            // still lingers in its info is no longer resumable.
+            if info.native_session_id.is_some() && !is_terminal(info.state) {
                 "yes".to_owned()
             } else {
                 "no".to_owned()
@@ -426,6 +430,16 @@ fn state_label(state: SessionState) -> &'static str {
         SessionState::Done => "done",
         SessionState::Failed => "failed",
     }
+}
+
+/// Whether a session has reached a terminal state (no further transitions).
+/// Mirrors the daemon's terminal-state set: a terminal session has had its
+/// resume binding dropped and can no longer be resumed.
+fn is_terminal(state: SessionState) -> bool {
+    matches!(
+        state,
+        SessionState::Stopped | SessionState::Done | SessionState::Failed
+    )
 }
 
 fn activity_label_option(activity: Option<AgentActivity>) -> &'static str {
@@ -809,6 +823,33 @@ mod tests {
 
         assert!(has_row(&output, "native_session_id", "native-abc"));
         assert!(has_row(&output, "resumable", "yes"));
+    }
+
+    #[test]
+    fn terminal_session_is_not_resumable_despite_captured_native_id() {
+        for state in [
+            SessionState::Stopped,
+            SessionState::Done,
+            SessionState::Failed,
+        ] {
+            let mut session = running_session("s-42");
+            session.native_session_id = Some("native-abc".to_owned());
+            session.state = state;
+
+            let output = render_inspect_human(&session);
+
+            // The native id stays visible for reference (e.g. a manual resume
+            // outside the tool), but the daemon drops the resume binding on
+            // exit, so a terminal session must not report resumable=yes.
+            assert!(
+                has_row(&output, "native_session_id", "native-abc"),
+                "native id stays visible in state {state:?}: {output}"
+            );
+            assert!(
+                has_row(&output, "resumable", "no"),
+                "a terminal session ({state:?}) must not report resumable=yes: {output}"
+            );
+        }
     }
 
     #[test]

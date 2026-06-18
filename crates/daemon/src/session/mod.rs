@@ -173,6 +173,12 @@ struct SessionRegistryInner {
     events: broadcast::Sender<Event>,
     /// Minimal resume-binding store, present when persistence is configured.
     resume_store: Option<ResumeStore>,
+    /// Serializes resume-binding persistence so a resize and a native-id capture
+    /// (or two resizes) racing on the same session cannot leave a stale binding:
+    /// each persister re-reads current state under this lock, so the last writer
+    /// wins with the freshest size. Held across the (blocking) store I/O instead
+    /// of the sessions lock, keeping that hot lock free of file writes.
+    persist_lock: Mutex<()>,
     /// Per-session worktree binder, present when worktree binding is configured.
     /// Shared into `spawn_blocking` for the (blocking) git subprocesses.
     worktree: Option<Arc<WorktreeManager>>,
@@ -243,6 +249,7 @@ impl SessionRegistry {
                 config,
                 events,
                 resume_store,
+                persist_lock: Mutex::new(()),
                 worktree,
             }),
         }
@@ -529,7 +536,7 @@ impl SessionRegistry {
             }
         };
 
-        let captured = {
+        let info = {
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(&params.session_id) else {
                 debug!(
@@ -548,55 +555,66 @@ impl SessionRegistry {
 
             entry.info.native_session_id = Some(session_ref.value().to_owned());
             entry.info.updated_at = timestamp_now();
-            let binding = ResumeBinding {
-                session_id: params.session_id.0.clone(),
-                agent: entry.info.agent,
-                cwd: entry.info.cwd.clone(),
-                cols: entry.info.cols,
-                rows: entry.info.rows,
-                native_session_id: Some(session_ref.value().to_owned()),
-                native_session_path: None,
-            };
-            (binding, entry.info.clone())
+            entry.info.clone()
         };
-        let (binding, info) = captured;
-
-        if let Some(store) = &self.inner.resume_store {
-            if let Err(err) = store.record(&binding) {
-                // Persistence failure is non-fatal: the in-memory capture
-                // succeeded; only restart-resume is impaired. Surface it.
-                warn!(
-                    session_id = %binding.session_id,
-                    error = %err,
-                    "failed to persist resume binding"
-                );
-            } else if !self.is_session_live(&params.session_id).await {
-                // Close the capture-vs-exit TOCTOU window: the session lock was
-                // released between the liveness check above and this write, so
-                // `record_exit` may have marked the session terminal and removed
-                // its binding in between. If it did, our write just resurrected a
-                // dead session's binding; undo it so a restart cannot relaunch a
-                // session the user stopped or that exited.
-                if let Err(err) = store.remove(&binding.session_id) {
-                    warn!(
-                        session_id = %binding.session_id,
-                        error = %err,
-                        "failed to undo resume binding for a session that exited mid-capture"
-                    );
-                }
-            }
-        }
-
+        // Persist from the now-current in-memory state (a resize that landed
+        // first is reflected, not clobbered).
+        self.persist_resume_binding(&params.session_id).await;
         self.emit(event::SESSION_UPDATED, &info);
         SessionReportNativeIdResult { recorded: true }
     }
 
-    /// Whether a session currently exists and is not in a terminal state.
-    async fn is_session_live(&self, id: &SessionId) -> bool {
-        let sessions = self.inner.sessions.lock().await;
-        sessions
-            .get(id)
-            .is_some_and(|entry| !is_terminal(entry.info.state))
+    /// Make the persisted resume binding for `id` match the session's CURRENT
+    /// in-memory state, serialized against every other persister.
+    ///
+    /// A live session that has captured a native id gets its binding upserted
+    /// with the latest cwd/size; any other session (terminal, gone, or never
+    /// captured) gets its binding removed. The whole snapshot-then-write is
+    /// serialized by `persist_lock` and re-reads the session under the sessions
+    /// lock, so when a resize and a native-id capture (or two resizes) race,
+    /// whichever runs last reads the freshest state and writes it last — no
+    /// stale size can win, and a session that went terminal in between is never
+    /// resurrected (it re-reads as terminal and removes instead). Only the brief
+    /// snapshot holds the sessions lock; the blocking store I/O runs under
+    /// `persist_lock` alone. Best-effort: an unconfigured store or a failed
+    /// write is non-fatal and only impairs restart-resume, surfaced via a warn.
+    async fn persist_resume_binding(&self, id: &SessionId) {
+        let Some(store) = &self.inner.resume_store else {
+            return;
+        };
+        let _persist = self.inner.persist_lock.lock().await;
+        let desired = {
+            let sessions = self.inner.sessions.lock().await;
+            sessions.get(id).and_then(|entry| {
+                if is_terminal(entry.info.state) {
+                    return None;
+                }
+                entry
+                    .info
+                    .native_session_id
+                    .as_ref()
+                    .map(|native| ResumeBinding {
+                        session_id: id.0.clone(),
+                        agent: entry.info.agent,
+                        cwd: entry.info.cwd.clone(),
+                        cols: entry.info.cols,
+                        rows: entry.info.rows,
+                        native_session_id: Some(native.clone()),
+                        native_session_path: None,
+                    })
+            })
+        };
+        let result = match &desired {
+            Some(binding) => store.record(binding),
+            None => store.remove(&id.0),
+        };
+        if let Err(err) = result {
+            warn!(
+                session_id = %id.0,
+                error = %err,
+                "failed to persist resume binding"
+            );
+        }
     }
 
     /// Load the resume-binding store and relaunch each resumable session.
@@ -635,9 +653,13 @@ impl SessionRegistry {
                     // `agent_binary_missing` is left in place: it may be a
                     // transient PATH gap at startup that resolves on a later run.
                     if matches!(err.code.as_str(), "invalid_session_ref" | "not_resumable") {
-                        if let Some(store) = &self.inner.resume_store {
-                            let _ = store.remove(&session_id);
-                        }
+                        // Prune via the serialized persist path: the failed
+                        // resume registered no live session, so this re-reads the
+                        // id as absent and removes its binding. Routing it here
+                        // (instead of a direct store.remove) keeps persist_lock
+                        // the single serialization point for all binding writes.
+                        self.persist_resume_binding(&SessionId(session_id.clone()))
+                            .await;
                         warn!(session_id = %session_id, error = %err, "dropping unresumable binding");
                     } else {
                         warn!(session_id = %session_id, error = %err, "failed to resume session");
@@ -878,7 +900,7 @@ impl SessionRegistry {
             .await
             .map_err(pty_error_to_protocol)?;
 
-        let (info, detector_resize) = {
+        let (info, detector_resize, has_native) = {
             let mut sessions = self.inner.sessions.lock().await;
             let entry = sessions
                 .get_mut(id)
@@ -889,9 +911,24 @@ impl SessionRegistry {
             entry.info.cols = cols;
             entry.info.rows = rows;
             entry.info.updated_at = timestamp_now();
-            (entry.info.clone(), entry.detector_resize.clone())
+            let has_native = entry.info.native_session_id.is_some();
+            (
+                entry.info.clone(),
+                entry.detector_resize.clone(),
+                has_native,
+            )
         };
         let _ = detector_resize.send((rows, cols));
+
+        // A captured session has a persisted binding holding the pre-resize
+        // size; refresh it so a daemon restart resumes at the current size.
+        // Uncaptured sessions have no binding, so we skip the store entirely to
+        // keep file I/O off the common resize path. `persist_resume_binding`
+        // re-reads the current size, so a racing capture/resize cannot persist a
+        // stale one.
+        if has_native {
+            self.persist_resume_binding(id).await;
+        }
 
         self.emit(event::SESSION_UPDATED, &info);
         Ok(protocol::SessionResizeResult { session: info })
@@ -1105,22 +1142,11 @@ impl SessionRegistry {
         self.remove_pending_attaches_for_session(id).await;
         // A terminal session must not resurrect on the next daemon restart:
         // resume is for sessions whose live PTY a restart killed, not for ones
-        // the user stopped or that exited. Drop its resume binding.
-        self.drop_resume_binding(id);
+        // the user stopped or that exited. The session is now terminal, so
+        // `persist_resume_binding` re-reads it as terminal and removes its
+        // binding (serialized against any racing resize/capture write).
+        self.persist_resume_binding(id).await;
         self.emit(updated.0, &updated.1);
-    }
-
-    /// Best-effort removal of a session's resume binding from the store.
-    fn drop_resume_binding(&self, id: &SessionId) {
-        if let Some(store) = &self.inner.resume_store {
-            if let Err(err) = store.remove(&id.0) {
-                warn!(
-                    session_id = %id.0,
-                    error = %err,
-                    "failed to remove resume binding on session exit"
-                );
-            }
-        }
     }
 
     async fn clear_stopping(&self, id: &SessionId) {
@@ -1597,6 +1623,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resize_after_capture_updates_persisted_binding() {
+        let store_path = temp_store_path("resize-binding");
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            resume_store_path: Some(store_path.clone()),
+            ..SessionRegistryConfig::default()
+        });
+
+        let created = registry.create(params()).await.expect("create session");
+        // Capture a native id so a resume binding exists at the launch size.
+        let recorded = registry
+            .report_native_id(SessionReportNativeIdParams {
+                session_id: created.id.clone(),
+                agent: AgentKind::Shell,
+                native_session_id: "native-resize".to_owned(),
+                transcript_path: None,
+            })
+            .await;
+        assert!(recorded.recorded);
+        let before = crate::store::ResumeStore::new(store_path.clone())
+            .load()
+            .expect("load before");
+        assert_eq!(before.len(), 1);
+        assert_eq!((before[0].cols, before[0].rows), (80, 24));
+
+        // Resizing the live session must refresh the persisted dimensions so a
+        // restart resumes at the new size, not the stale capture-time size.
+        registry
+            .resize(&created.id, 132, 50)
+            .await
+            .expect("resize session");
+
+        let after = crate::store::ResumeStore::new(store_path)
+            .load()
+            .expect("load after");
+        assert_eq!(
+            after.len(),
+            1,
+            "resize must upsert, not duplicate: {after:?}"
+        );
+        assert_eq!(after[0].session_id, created.id.0);
+        assert_eq!(after[0].native_session_id.as_deref(), Some("native-resize"));
+        assert_eq!(
+            (after[0].cols, after[0].rows),
+            (132, 50),
+            "persisted binding must carry the post-resize dimensions"
+        );
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn resize_without_captured_native_id_persists_no_binding() {
+        let store_path = temp_store_path("resize-no-binding");
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            resume_store_path: Some(store_path.clone()),
+            ..SessionRegistryConfig::default()
+        });
+
+        let created = registry.create(params()).await.expect("create session");
+        // No native id captured yet: resizing must not fabricate a binding that
+        // load_and_resume would later reject as unresumable.
+        registry
+            .resize(&created.id, 100, 30)
+            .await
+            .expect("resize session");
+
+        assert!(
+            crate::store::ResumeStore::new(store_path)
+                .load()
+                .expect("load")
+                .is_empty(),
+            "resize without a native id must not create a resume binding"
+        );
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
     async fn load_and_resume_prunes_structurally_unresumable_bindings() {
         let store_path = temp_store_path("prune-corrupt");
         // A hand-corrupted binding with no native id or path can never resume.
@@ -1629,18 +1737,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn is_session_live_tracks_running_then_terminal() {
+    async fn concurrent_resize_and_recapture_keep_store_consistent_with_memory() {
+        let store_path = temp_store_path("concurrent-persist");
         let registry = SessionRegistry::new(SessionRegistryConfig {
             shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
             stop_grace: Duration::from_millis(50),
+            resume_store_path: Some(store_path.clone()),
             ..SessionRegistryConfig::default()
         });
+
         let created = registry.create(params()).await.expect("create session");
-        assert!(registry.is_session_live(&created.id).await);
-        assert!(!registry.is_session_live(&SessionId("s-missing".to_owned())).await);
+        let recorded = registry
+            .report_native_id(SessionReportNativeIdParams {
+                session_id: created.id.clone(),
+                agent: AgentKind::Shell,
+                native_session_id: "native-concurrent".to_owned(),
+                transcript_path: None,
+            })
+            .await;
+        assert!(recorded.recorded);
+
+        // Race a resize against a second native-id report (SessionStart re-fires
+        // on resume/clear/compact). The persisted binding must end at the live
+        // size, never the pre-resize one: persist_resume_binding re-reads under
+        // persist_lock, so whichever writer runs last reflects the resize.
+        let resizer = {
+            let registry = registry.clone();
+            let id = created.id.clone();
+            tokio::spawn(async move { registry.resize(&id, 200, 60).await })
+        };
+        let recapture = {
+            let registry = registry.clone();
+            let id = created.id.clone();
+            tokio::spawn(async move {
+                registry
+                    .report_native_id(SessionReportNativeIdParams {
+                        session_id: id,
+                        agent: AgentKind::Shell,
+                        native_session_id: "native-concurrent".to_owned(),
+                        transcript_path: None,
+                    })
+                    .await
+            })
+        };
+        resizer
+            .await
+            .expect("resize task")
+            .expect("resize succeeds");
+        recapture.await.expect("recapture task");
+
+        let inspected = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!((inspected.cols, inspected.rows), (200, 60));
+        let persisted = crate::store::ResumeStore::new(store_path)
+            .load()
+            .expect("load");
+        assert_eq!(persisted.len(), 1, "no duplicate binding: {persisted:?}");
+        assert_eq!(
+            (persisted[0].cols, persisted[0].rows),
+            (inspected.cols, inspected.rows),
+            "persisted binding must match the live size after a concurrent resize + recapture"
+        );
 
         let _ = registry.stop(&created.id).await;
-        assert!(!registry.is_session_live(&created.id).await);
+    }
+
+    #[tokio::test]
+    async fn resize_then_stop_leaves_no_binding() {
+        let store_path = temp_store_path("resize-then-stop");
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            resume_store_path: Some(store_path.clone()),
+            ..SessionRegistryConfig::default()
+        });
+
+        let created = registry.create(params()).await.expect("create session");
+        let recorded = registry
+            .report_native_id(SessionReportNativeIdParams {
+                session_id: created.id.clone(),
+                agent: AgentKind::Shell,
+                native_session_id: "native-resize-stop".to_owned(),
+                transcript_path: None,
+            })
+            .await;
+        assert!(recorded.recorded);
+        registry
+            .resize(&created.id, 90, 30)
+            .await
+            .expect("resize session");
+        assert_eq!(
+            crate::store::ResumeStore::new(store_path.clone())
+                .load()
+                .expect("load")
+                .len(),
+            1,
+            "resize must refresh the existing binding"
+        );
+
+        // Stopping after a resize must still drop the (resize-refreshed) binding.
+        let stopped = registry.stop(&created.id).await.expect("stop");
+        assert!(stopped.stopped);
+        assert!(
+            crate::store::ResumeStore::new(store_path)
+                .load()
+                .expect("load")
+                .is_empty(),
+            "a resized-then-stopped session must not leave a resume binding"
+        );
     }
 
     #[tokio::test]

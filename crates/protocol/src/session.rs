@@ -234,8 +234,10 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<AgentActivity>,
     /// Native agent session id captured via the `SessionStart` hook, when one
-    /// has been reported. Its presence means the session is resumable after a
-    /// daemon restart (see `docs/plan-phase-1.md` "Resume Model").
+    /// has been reported (see `docs/plan-phase-1.md` "Resume Model"). A session
+    /// is resumable after a daemon restart only while this is present **and** the
+    /// session is non-terminal: the daemon drops the resume binding on exit, so a
+    /// terminal session can retain this id for reference yet not be resumable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_id: Option<String>,
     /// Source git repository, when the session is bound to a worktree.
