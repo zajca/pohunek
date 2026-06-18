@@ -5,25 +5,29 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use protocol::{
-    AgentKind, ErrorClass, Event, ProtocolError, SessionId, SessionInfo, SessionNewParams,
-    SessionState, SessionStopResult, StateSource, event,
+    event, AgentKind, ErrorClass, Event, ProtocolError, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionNewParams, SessionState, SessionStopResult, StateSource,
 };
 use serde_json::json;
-use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tokio::sync::{Mutex, broadcast, watch};
+use time::OffsetDateTime;
+use tokio::sync::{broadcast, watch, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::agent::{AgentAdapter, ClaudeAdapter, CodexAdapter, InputRules, LaunchOpts};
 use crate::detect::{ActivityTransition, Detector, DetectorConfig};
 use crate::pty::{PtyCommand, PtyError, PtyExit, PtyHandle};
 
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+const SUBMIT: &[u8] = b"\r";
 
 /// Default per-session raw-output history cap (10 MB), replayed on attach.
 ///
@@ -56,6 +60,7 @@ impl ShellCommand {
         PtyCommand {
             program: self.program.clone(),
             args: self.args.clone(),
+            env: Vec::new(),
             cwd,
             cols,
             rows,
@@ -81,6 +86,14 @@ pub struct SessionRegistryConfig {
     pub attach_token_ttl: Duration,
     /// Per-session cap on the raw-output history buffer replayed on attach.
     pub output_history_limit_bytes: usize,
+    /// Delay before sending Claude Code's Ink submit byte as a separate write.
+    pub claude_submit_delay: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputWritePlan {
+    immediate: Vec<u8>,
+    delayed_submit: Option<(Duration, Vec<u8>)>,
 }
 
 impl Default for SessionRegistryConfig {
@@ -90,6 +103,7 @@ impl Default for SessionRegistryConfig {
             stop_grace: Duration::from_millis(500),
             attach_token_ttl: DEFAULT_ATTACH_TOKEN_TTL,
             output_history_limit_bytes: DEFAULT_OUTPUT_HISTORY_LIMIT_BYTES,
+            claude_submit_delay: crate::agent::DEFAULT_CLAUDE_SUBMIT_DELAY,
         }
     }
 }
@@ -194,11 +208,13 @@ impl SessionRegistry {
             "s-{}",
             self.inner.next_id.fetch_add(1, Ordering::Relaxed)
         ));
-        let command =
-            self.inner
-                .config
-                .shell_command
-                .to_pty_command(cwd.clone(), params.cols, params.rows);
+        let command = build_launch_command(
+            params.agent,
+            &self.inner.config.shell_command,
+            cwd.clone(),
+            params.cols,
+            params.rows,
+        )?;
         let history_limit_bytes = self.inner.config.output_history_limit_bytes;
         let pty =
             tokio::task::spawn_blocking(move || PtyHandle::spawn(command, history_limit_bytes))
@@ -242,14 +258,51 @@ impl SessionRegistry {
         self.emit(event::SESSION_CREATED, &info);
         self.spawn_detector(
             id.clone(),
+            params.agent,
             detector_output,
-            params.rows,
-            params.cols,
+            (params.rows, params.cols),
             detector_cancel,
             detector_resize_rx,
         );
         self.spawn_exit_watcher(id, pty);
         Ok(info)
+    }
+
+    /// Inject text into a running session using the agent's input framing rules.
+    pub async fn input(
+        &self,
+        params: SessionInputParams,
+    ) -> Result<SessionInputResult, ProtocolError> {
+        let (pty, rules) = {
+            let sessions = self.inner.sessions.lock().await;
+            let entry = sessions
+                .get(&params.session_id)
+                .ok_or_else(|| session_not_found(&params.session_id.0))?;
+            if entry.info.state != SessionState::Running {
+                return Err(session_not_running(&params.session_id));
+            }
+            (
+                entry.pty.clone(),
+                input_rules_for_agent(entry.info.agent, &self.inner.config),
+            )
+        };
+
+        let writes = build_input_writes(&params.text, rules);
+        pty.write_user_input(writes.immediate)
+            .await
+            .map_err(pty_error_to_protocol)?;
+
+        if let Some((delay, bytes)) = writes.delayed_submit {
+            let delayed_pty = pty.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                if let Err(err) = delayed_pty.write_user_input(bytes).await {
+                    warn!(error = %err, "failed to write delayed agent submit byte");
+                }
+            });
+        }
+
+        Ok(SessionInputResult { accepted: true })
     }
 
     /// List all known sessions.
@@ -518,18 +571,19 @@ impl SessionRegistry {
     fn spawn_detector(
         &self,
         id: SessionId,
+        agent: AgentKind,
         mut output_rx: broadcast::Receiver<Vec<u8>>,
-        rows: u16,
-        cols: u16,
+        size: (u16, u16),
         cancel: CancellationToken,
         mut resize_rx: watch::Receiver<(u16, u16)>,
     ) {
         let registry = self.clone();
         tokio::spawn(async move {
-            let detector_config = DetectorConfig::generic_shell();
+            let detector_config = DetectorConfig::for_agent(agent);
             let mut tick = tokio::time::interval(detector_config.detection.recheck_after);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tick.tick().await;
+            let (rows, cols) = size;
             let mut detector = Detector::new(rows, cols, Instant::now(), detector_config);
 
             loop {
@@ -702,20 +756,73 @@ impl SessionRegistry {
 }
 
 fn validate_new_params(params: &SessionNewParams) -> Result<(), ProtocolError> {
-    if params.agent != AgentKind::Shell {
-        return Err(ProtocolError::new(
-            ErrorClass::Runtime,
-            "agent_not_supported",
-            "only shell sessions are supported in this milestone",
-            None,
-        ));
-    }
     if params.cols == 0 || params.rows == 0 {
         return Err(ProtocolError::bad_request(
             "session.new requires non-zero cols and rows",
         ));
     }
     Ok(())
+}
+
+fn build_launch_command(
+    agent: AgentKind,
+    shell_command: &ShellCommand,
+    cwd: PathBuf,
+    cols: u16,
+    rows: u16,
+) -> Result<PtyCommand, ProtocolError> {
+    match agent {
+        AgentKind::Shell => Ok(shell_command.to_pty_command(cwd, cols, rows)),
+        AgentKind::Codex => CodexAdapter.launch(&LaunchOpts {
+            cwd,
+            cols,
+            rows,
+            env_extra: Vec::new(),
+        }),
+        AgentKind::Claude => ClaudeAdapter.launch(&LaunchOpts {
+            cwd,
+            cols,
+            rows,
+            env_extra: Vec::new(),
+        }),
+    }
+}
+
+fn input_rules_for_agent(agent: AgentKind, config: &SessionRegistryConfig) -> InputRules {
+    match agent {
+        AgentKind::Shell => InputRules {
+            bracketed_paste: false,
+            submit_delay: Duration::ZERO,
+        },
+        AgentKind::Codex => CodexAdapter.input_rules(),
+        AgentKind::Claude => InputRules {
+            submit_delay: config.claude_submit_delay,
+            ..ClaudeAdapter.input_rules()
+        },
+    }
+}
+
+fn build_input_writes(text: &str, rules: InputRules) -> InputWritePlan {
+    let mut immediate = Vec::new();
+    if rules.bracketed_paste {
+        immediate.extend_from_slice(BRACKETED_PASTE_START);
+    }
+    immediate.extend_from_slice(text.as_bytes());
+    if rules.bracketed_paste {
+        immediate.extend_from_slice(BRACKETED_PASTE_END);
+    }
+
+    let delayed_submit = if rules.submit_delay.is_zero() {
+        immediate.extend_from_slice(SUBMIT);
+        None
+    } else {
+        Some((rules.submit_delay, SUBMIT.to_vec()))
+    };
+
+    InputWritePlan {
+        immediate,
+        delayed_submit,
+    }
 }
 
 fn is_terminal(state: SessionState) -> bool {
@@ -785,6 +892,8 @@ mod tests {
     use std::time::Duration;
 
     use protocol::{AgentKind, SessionNewParams, SessionState};
+
+    use crate::agent::InputRules;
 
     use super::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 
@@ -887,5 +996,52 @@ mod tests {
             .expect_err("missing session");
 
         assert_eq!(missing.code, "session_not_found");
+    }
+
+    #[test]
+    fn bracketed_paste_input_frame_wraps_text_and_submit_together() {
+        let writes = super::build_input_writes(
+            "hello\nworld",
+            InputRules {
+                bracketed_paste: true,
+                submit_delay: Duration::ZERO,
+            },
+        );
+
+        assert_eq!(
+            writes.immediate,
+            b"\x1b[200~hello\nworld\x1b[201~\r".to_vec()
+        );
+        assert_eq!(writes.delayed_submit, None);
+    }
+
+    #[test]
+    fn delayed_submit_input_frame_splits_text_and_submit() {
+        let writes = super::build_input_writes(
+            "hello Claude",
+            InputRules {
+                bracketed_paste: false,
+                submit_delay: Duration::from_millis(150),
+            },
+        );
+
+        assert_eq!(writes.immediate, b"hello Claude".to_vec());
+        assert_eq!(
+            writes.delayed_submit,
+            Some((Duration::from_millis(150), b"\r".to_vec()))
+        );
+    }
+
+    #[test]
+    fn claude_input_rules_use_configured_submit_delay() {
+        let config = SessionRegistryConfig {
+            claude_submit_delay: Duration::from_millis(75),
+            ..SessionRegistryConfig::default()
+        };
+
+        let rules = super::input_rules_for_agent(AgentKind::Claude, &config);
+
+        assert!(!rules.bracketed_paste);
+        assert_eq!(rules.submit_delay, Duration::from_millis(75));
     }
 }

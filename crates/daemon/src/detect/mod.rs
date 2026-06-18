@@ -5,9 +5,10 @@
 //! machine. Session code can own a detector without coupling the pipeline to
 //! async runtime concerns.
 
+use std::sync::OnceLock;
 use std::time::Instant;
 
-use protocol::{AgentActivity, StateSource};
+use protocol::{AgentActivity, AgentKind, StateSource};
 
 mod machine;
 mod manifest;
@@ -30,6 +31,8 @@ const BEL: u8 = 0x07;
 /// drive the screen/manifest layer. It is a trusted, unit-tested constant (not
 /// user input), so parsing it with `.expect` at startup is acceptable.
 const GENERIC_SHELL_MANIFEST: &str = include_str!("manifests/shell.toml");
+const CODEX_MANIFEST: &str = include_str!("manifests/codex.toml");
+const CLAUDE_MANIFEST: &str = include_str!("manifests/claude.toml");
 
 #[derive(Debug, Default)]
 pub struct DetectorConfig {
@@ -42,7 +45,32 @@ impl DetectorConfig {
     pub fn generic_shell() -> Self {
         Self {
             detection: DetectionConfig::default(),
-            manifest: Some(generic_shell_manifest()),
+            manifest: Some(generic_shell_manifest().clone()),
+        }
+    }
+
+    /// Production detector config for a specific agent kind.
+    pub fn for_agent(agent: AgentKind) -> Self {
+        match agent {
+            AgentKind::Shell => Self::generic_shell(),
+            AgentKind::Codex => Self::codex(),
+            AgentKind::Claude => Self::claude(),
+        }
+    }
+
+    /// Production detector config using the embedded Codex manifest.
+    pub fn codex() -> Self {
+        Self {
+            detection: DetectionConfig::default(),
+            manifest: Some(codex_manifest().clone()),
+        }
+    }
+
+    /// Production detector config using the embedded Claude Code manifest.
+    pub fn claude() -> Self {
+        Self {
+            detection: DetectionConfig::default(),
+            manifest: Some(claude_manifest().clone()),
         }
     }
 }
@@ -51,8 +79,22 @@ impl DetectorConfig {
 ///
 /// The manifest is a shipped, trusted, unit-tested constant, so a parse failure
 /// is a programming error rather than a recoverable condition.
-fn generic_shell_manifest() -> Manifest {
-    Manifest::parse_str(GENERIC_SHELL_MANIFEST).expect("generic shell manifest must parse")
+pub fn generic_shell_manifest() -> &'static Manifest {
+    static MANIFEST: OnceLock<Manifest> = OnceLock::new();
+    MANIFEST.get_or_init(|| {
+        Manifest::parse_str(GENERIC_SHELL_MANIFEST).expect("generic shell manifest must parse")
+    })
+}
+
+pub fn codex_manifest() -> &'static Manifest {
+    static MANIFEST: OnceLock<Manifest> = OnceLock::new();
+    MANIFEST.get_or_init(|| Manifest::parse_str(CODEX_MANIFEST).expect("codex manifest must parse"))
+}
+
+pub fn claude_manifest() -> &'static Manifest {
+    static MANIFEST: OnceLock<Manifest> = OnceLock::new();
+    MANIFEST
+        .get_or_init(|| Manifest::parse_str(CLAUDE_MANIFEST).expect("claude manifest must parse"))
 }
 
 #[derive(Debug)]
@@ -183,9 +225,17 @@ impl Detector {
     fn manifest_evidence(&self, freshness: ContextFreshness) -> Option<ActivityEvidence> {
         let manifest = self.manifest.as_ref()?;
         let matched = manifest.match_context(&self.match_context(manifest, freshness))?;
+        let source = manifest_source(&matched.region);
+        if matched.activity == AgentActivity::Blocked
+            && matched.visible_blocker
+            && !is_visible_manifest_source(source)
+        {
+            return None;
+        }
+
         Some(ActivityEvidence {
             activity: matched.activity,
-            source: manifest_source(&matched.region),
+            source,
         })
     }
 
@@ -343,6 +393,13 @@ fn manifest_source(region: &ManifestRegion) -> StateSource {
     }
 }
 
+fn is_visible_manifest_source(source: StateSource) -> bool {
+    matches!(
+        source,
+        StateSource::OscTitle | StateSource::OscProgress | StateSource::Screen
+    )
+}
+
 fn region_text(region: ScreenRegion) -> String {
     region.lines.join("\n")
 }
@@ -382,7 +439,7 @@ mod tests {
                 stable_visible_refresh: Duration::from_millis(800),
                 startup_grace: Duration::ZERO,
             },
-            manifest: Some(super::generic_shell_manifest()),
+            manifest: Some(super::generic_shell_manifest().clone()),
         }
     }
 
@@ -395,7 +452,7 @@ mod tests {
                 stable_visible_refresh: Duration::from_millis(800),
                 startup_grace: Duration::ZERO,
             },
-            manifest: Some(super::generic_shell_manifest()),
+            manifest: Some(super::generic_shell_manifest().clone()),
         }
     }
 
@@ -413,11 +470,9 @@ mod tests {
         let mut detector = Detector::new(3, 80, started_at, config());
 
         assert!(detector.feed(started_at, b"\x1b]2;wor").is_empty());
-        assert!(
-            detector
-                .feed(started_at + Duration::from_millis(10), b"ki")
-                .is_empty()
-        );
+        assert!(detector
+            .feed(started_at + Duration::from_millis(10), b"ki")
+            .is_empty());
 
         assert_eq!(
             detector.feed(started_at + Duration::from_millis(20), b"ng\x07"),
@@ -659,11 +714,9 @@ mod tests {
         let mut detector = Detector::new(3, 80, started_at, detector_config);
 
         assert!(detector.feed(started_at, b"approval required").is_empty());
-        assert!(
-            detector
-                .tick(started_at + Duration::from_millis(100))
-                .is_empty()
-        );
+        assert!(detector
+            .tick(started_at + Duration::from_millis(100))
+            .is_empty());
         assert_eq!(
             detector.tick(started_at + Duration::from_millis(200)),
             vec![transition(AgentActivity::Blocked, StateSource::Screen)]
@@ -686,16 +739,12 @@ mod tests {
         ));
         let mut detector = Detector::new(3, 80, started_at, detector_config);
 
-        assert!(
-            detector
-                .feed(started_at, b"\x1b]2;idle\x07approval required")
-                .is_empty()
-        );
-        assert!(
-            detector
-                .tick(started_at + Duration::from_millis(100))
-                .is_empty()
-        );
+        assert!(detector
+            .feed(started_at, b"\x1b]2;idle\x07approval required")
+            .is_empty());
+        assert!(detector
+            .tick(started_at + Duration::from_millis(100))
+            .is_empty());
         assert_eq!(
             detector.tick(started_at + Duration::from_millis(200)),
             vec![transition(AgentActivity::Blocked, StateSource::Screen)]
@@ -708,11 +757,9 @@ mod tests {
         let mut detector = Detector::new(3, 80, started_at, debounce_config());
 
         assert!(detector.feed(started_at, b"\x1b]2;idle\x07").is_empty());
-        assert!(
-            detector
-                .tick(started_at + Duration::from_millis(100))
-                .is_empty()
-        );
+        assert!(detector
+            .tick(started_at + Duration::from_millis(100))
+            .is_empty());
         assert_eq!(
             detector.tick(started_at + Duration::from_millis(200)),
             vec![transition(AgentActivity::Idle, StateSource::OscTitle)]
@@ -731,16 +778,12 @@ mod tests {
         // Plain output with no working keyword: the screen manifest layer stays
         // dormant, so the only signal is process activity, which records the
         // published source as Process without re-emitting.
-        assert!(
-            detector
-                .feed(started_at + Duration::from_millis(100), b"plain log output")
-                .is_empty()
-        );
-        assert!(
-            detector
-                .tick(started_at + Duration::from_millis(900))
-                .is_empty()
-        );
+        assert!(detector
+            .feed(started_at + Duration::from_millis(100), b"plain log output")
+            .is_empty());
+        assert!(detector
+            .tick(started_at + Duration::from_millis(900))
+            .is_empty());
     }
 
     #[test]
@@ -788,11 +831,9 @@ mod tests {
 
         // After resync the screen is blank, so a tick finds no visible blocker to
         // reconfirm and emits nothing.
-        assert!(
-            detector
-                .tick(started_at + Duration::from_millis(100))
-                .is_empty()
-        );
+        assert!(detector
+            .tick(started_at + Duration::from_millis(100))
+            .is_empty());
     }
 
     #[test]
@@ -801,24 +842,18 @@ mod tests {
         let mut detector = Detector::new(3, 80, started_at, debounce_config());
 
         assert!(detector.feed(started_at, b"\x1b]2;idle\x07").is_empty());
-        assert!(
-            detector
-                .tick(started_at + Duration::from_millis(100))
-                .is_empty()
-        );
+        assert!(detector
+            .tick(started_at + Duration::from_millis(100))
+            .is_empty());
 
         detector.resync_after_lag();
 
-        assert!(
-            detector
-                .feed(started_at + Duration::from_millis(200), b"\x1b]2;idle\x07")
-                .is_empty()
-        );
-        assert!(
-            detector
-                .tick(started_at + Duration::from_millis(300))
-                .is_empty()
-        );
+        assert!(detector
+            .feed(started_at + Duration::from_millis(200), b"\x1b]2;idle\x07")
+            .is_empty());
+        assert!(detector
+            .tick(started_at + Duration::from_millis(300))
+            .is_empty());
         assert_eq!(
             detector.tick(started_at + Duration::from_millis(400)),
             vec![transition(AgentActivity::Idle, StateSource::OscTitle)]
@@ -889,11 +924,9 @@ mod tests {
         ));
         let mut detector = Detector::new(1, 80, started_at, detector_config);
 
-        assert!(
-            !detector
-                .feed(started_at, b"approval required")
-                .contains(&transition(AgentActivity::Blocked, StateSource::Screen))
-        );
+        assert!(!detector
+            .feed(started_at, b"approval required")
+            .contains(&transition(AgentActivity::Blocked, StateSource::Screen)));
 
         detector.resize(2, 80);
 
@@ -913,6 +946,38 @@ mod tests {
         // same `.expect`-backed parse the live daemon uses at construction.
         let _ = super::generic_shell_manifest();
         let _ = super::DetectorConfig::generic_shell();
+    }
+
+    #[test]
+    fn embedded_codex_manifest_parses() {
+        let _ = super::codex_manifest();
+        let _ = super::DetectorConfig::codex();
+    }
+
+    #[test]
+    fn embedded_claude_manifest_parses() {
+        let _ = super::claude_manifest();
+        let _ = super::DetectorConfig::claude();
+    }
+
+    #[test]
+    fn detector_config_for_agent_loads_agent_manifest() {
+        let started_at = instant();
+        let mut codex_config = super::DetectorConfig::for_agent(protocol::AgentKind::Codex);
+        codex_config.detection = config().detection;
+        let mut codex = Detector::new(3, 80, started_at, codex_config);
+        assert_eq!(
+            codex.feed(started_at, b"\x1b]2;Action Required\x07"),
+            vec![transition(AgentActivity::Blocked, StateSource::OscTitle)]
+        );
+
+        let mut claude_config = super::DetectorConfig::for_agent(protocol::AgentKind::Claude);
+        claude_config.detection = config().detection;
+        let mut claude = Detector::new(3, 80, started_at, claude_config);
+        assert_eq!(
+            claude.feed(started_at, "\x1b]2;\u{280b} thinking\x07".as_bytes()),
+            vec![transition(AgentActivity::Working, StateSource::OscTitle)]
+        );
     }
 
     #[test]
@@ -937,6 +1002,61 @@ mod tests {
                 b"\x1b[2J\x1b[Haction required"
             ),
             vec![transition(AgentActivity::Blocked, StateSource::Screen)]
+        );
+    }
+
+    #[test]
+    fn codex_manifest_maps_action_required_title_to_blocked() {
+        let started_at = instant();
+        let mut detector_config = super::DetectorConfig::codex();
+        detector_config.detection = config().detection;
+        let mut detector = Detector::new(3, 80, started_at, detector_config);
+
+        assert_eq!(
+            detector.feed(started_at, b"\x1b]2;Action Required\x07"),
+            vec![transition(AgentActivity::Blocked, StateSource::OscTitle)]
+        );
+    }
+
+    #[test]
+    fn codex_manifest_maps_braille_title_spinner_to_working() {
+        let started_at = instant();
+        let mut detector_config = super::DetectorConfig::codex();
+        detector_config.detection = config().detection;
+        let mut detector = Detector::new(3, 80, started_at, detector_config);
+
+        assert_eq!(
+            detector.feed(started_at, "\x1b]2;\u{280b} thinking\x07".as_bytes()),
+            vec![transition(AgentActivity::Working, StateSource::OscTitle)]
+        );
+    }
+
+    #[test]
+    fn claude_manifest_maps_ink_selection_form_to_blocked() {
+        let started_at = instant();
+        let mut detector_config = super::DetectorConfig::claude();
+        detector_config.detection = config().detection;
+        let mut detector = Detector::new(8, 80, started_at, detector_config);
+
+        assert_eq!(
+            detector.feed(
+                started_at,
+                "\x1b[2J\x1b[HReview\r\n\u{2500}\u{2500}\u{2500}\u{2500}\r\nenter to select\r\nesc to cancel\r\n\u{2191}/\u{2193} to navigate".as_bytes(),
+            ),
+            vec![transition(AgentActivity::Blocked, StateSource::Screen)]
+        );
+    }
+
+    #[test]
+    fn claude_manifest_maps_braille_title_spinner_to_working() {
+        let started_at = instant();
+        let mut detector_config = super::DetectorConfig::claude();
+        detector_config.detection = config().detection;
+        let mut detector = Detector::new(3, 80, started_at, detector_config);
+
+        assert_eq!(
+            detector.feed(started_at, "\x1b]2;\u{280b} thinking\x07".as_bytes()),
+            vec![transition(AgentActivity::Working, StateSource::OscTitle)]
         );
     }
 

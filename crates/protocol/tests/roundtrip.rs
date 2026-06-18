@@ -4,13 +4,13 @@
 use std::path::PathBuf;
 
 use protocol::{
-    AgentActivity, AgentKind, AttachHeader, ErrorClass, Event, PROTOCOL_VERSION, ProtocolError,
-    ProtocolVersion, Request, Response, SessionAttachParams, SessionAttachResult,
-    SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionNewParams,
-    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, StateSource, event,
-    method, negotiate,
+    event, method, negotiate, AgentActivity, AgentKind, AttachHeader, ErrorClass, Event,
+    ProtocolError, ProtocolVersion, Request, Response, SessionAttachParams, SessionAttachResult,
+    SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionNewParams, SessionResizeParams, SessionResizeResult, SessionState,
+    SessionStopResult, StateSource, PROTOCOL_VERSION,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// Serialize a value to a single JSON line, then parse it back.
 fn line_roundtrip<T>(value: &T) -> T
@@ -39,6 +39,23 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         created_at: "2026-06-17T10:00:00Z".to_owned(),
         updated_at: "2026-06-17T10:01:00Z".to_owned(),
         exit_code,
+    }
+}
+
+#[test]
+fn agent_kind_json_shape_roundtrips() {
+    let cases = [
+        (AgentKind::Shell, json!("shell")),
+        (AgentKind::Codex, json!("codex")),
+        (AgentKind::Claude, json!("claude")),
+    ];
+
+    for (agent, expected) in cases {
+        let value = serde_json::to_value(agent).expect("serialize agent");
+        assert_eq!(value, expected);
+
+        let back = line_roundtrip(&agent);
+        assert_eq!(back, agent);
     }
 }
 
@@ -177,6 +194,45 @@ fn session_info_omits_absent_exit_code() {
     let back = line_roundtrip(&info);
     assert_eq!(back.exit_code, None);
     assert_eq!(back, info);
+}
+
+#[test]
+fn session_input_method_name_is_stable() {
+    assert_eq!(method::SESSION_INPUT, "session.input");
+}
+
+#[test]
+fn session_input_params_json_shape_roundtrips() {
+    let params = SessionInputParams {
+        session_id: SessionId("s-42".to_owned()),
+        text: "write tests first".to_owned(),
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize input params");
+    assert_eq!(
+        value,
+        json!({
+            "session_id": "s-42",
+            "text": "write tests first"
+        })
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn session_input_result_json_shape_roundtrips() {
+    for result in [
+        SessionInputResult { accepted: true },
+        SessionInputResult { accepted: false },
+    ] {
+        let value = serde_json::to_value(&result).expect("serialize input result");
+        assert_eq!(value, json!({ "accepted": result.accepted }));
+
+        let back = line_roundtrip(&result);
+        assert_eq!(back, result);
+    }
 }
 
 #[test]

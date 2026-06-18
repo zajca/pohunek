@@ -16,6 +16,10 @@ use crate::envelope::StateSource;
 pub enum AgentKind {
     /// A plain shell session.
     Shell,
+    /// A Codex CLI agent session.
+    Codex,
+    /// A Claude Code agent session.
+    Claude,
 }
 
 /// Current detected agent activity within a running session.
@@ -61,6 +65,22 @@ pub struct SessionAttachParams {
 pub struct SessionAttachResult {
     /// One-shot stream identifier used by the attach connection header.
     pub stream_id: String,
+}
+
+/// Parameters for `session.input`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInputParams {
+    /// Session whose PTY should receive input.
+    pub session_id: SessionId,
+    /// Text to inject. The daemon applies agent-specific submit framing.
+    pub text: String,
+}
+
+/// Result returned by `session.input`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInputResult {
+    /// Whether the daemon accepted the input for delivery.
+    pub accepted: bool,
 }
 
 /// Parameters for `session.detach`.

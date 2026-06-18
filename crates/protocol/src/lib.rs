@@ -31,10 +31,11 @@ pub use envelope::{Event, Request, Response, StateSource};
 pub use error::{ErrorClass, ProtocolError};
 pub use session::{
     AgentActivity, AgentKind, AttachHeader, SessionAttachParams, SessionAttachResult,
-    SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionNewParams,
-    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult,
+    SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionNewParams, SessionResizeParams, SessionResizeResult, SessionState,
+    SessionStopResult,
 };
-pub use version::{PROTOCOL_VERSION, ProtocolVersion, negotiate};
+pub use version::{negotiate, ProtocolVersion, PROTOCOL_VERSION};
 
 /// Control-protocol method names (Phase 1).
 ///
@@ -58,6 +59,7 @@ pub mod method {
     pub const SESSION_ATTACH: &str = "session.attach";
     pub const SESSION_DETACH: &str = "session.detach";
     pub const SESSION_RESIZE: &str = "session.resize";
+    pub const SESSION_INPUT: &str = "session.input";
     pub const STATUS: &str = "status";
     pub const SUBSCRIBE: &str = "subscribe";
     /// Fire-and-forget native-session-id capture from the agent hook.

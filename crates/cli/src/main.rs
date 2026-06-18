@@ -95,7 +95,7 @@ enum DaemonAction {
 enum SessionAction {
     /// Start a new session.
     New {
-        /// Agent kind to start. Milestone 3 accepts only `shell`.
+        /// Agent kind to start.
         #[arg(long, value_enum, default_value = "shell")]
         agent: commands::session::AgentArg,
         /// Working directory for the session.
@@ -129,6 +129,14 @@ enum SessionAction {
     Stop {
         /// Session target: `session-id` or `local/session-id`.
         target: Target,
+    },
+
+    /// Send text to one session.
+    Input {
+        /// Session target: `session-id` or `local/session-id`.
+        target: Target,
+        /// Text to inject into the session.
+        text: String,
     },
 }
 
@@ -189,6 +197,9 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 }
                 SessionAction::Stop { target } => {
                     commands::session::run_stop(&paths, &target).await?
+                }
+                SessionAction::Input { target, text } => {
+                    commands::session::run_input(&paths, &target, &text).await?
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -254,11 +265,74 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_shell_agent_for_session_new() {
-        let err = Cli::try_parse_from(["zagentmesh", "session", "new", "--agent", "codex"])
-            .expect_err("non-shell agents are not accepted in this milestone");
+    fn parses_session_new_codex_agent() {
+        let cli = Cli::try_parse_from(["zagentmesh", "session", "new", "--agent", "codex"])
+            .expect("parse");
 
-        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+        match cli.command {
+            Commands::Session {
+                action:
+                    SessionAction::New {
+                        agent,
+                        cwd,
+                        cols,
+                        rows,
+                    },
+            } => {
+                assert_eq!(agent, commands::session::AgentArg::Codex);
+                assert_eq!(cwd, None);
+                assert_eq!(cols, 80);
+                assert_eq!(rows, 24);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_session_new_claude_agent() {
+        let cli = Cli::try_parse_from(["zagentmesh", "session", "new", "--agent", "claude"])
+            .expect("parse");
+
+        match cli.command {
+            Commands::Session {
+                action:
+                    SessionAction::New {
+                        agent,
+                        cwd,
+                        cols,
+                        rows,
+                    },
+            } => {
+                assert_eq!(agent, commands::session::AgentArg::Claude);
+                assert_eq!(cwd, None);
+                assert_eq!(cols, 80);
+                assert_eq!(rows, 24);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_session_input_target_and_text() {
+        let cli = Cli::try_parse_from([
+            "zagentmesh",
+            "session",
+            "input",
+            "local/s-42",
+            "write tests first",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Commands::Session {
+                action: SessionAction::Input { target, text },
+            } => {
+                assert_eq!(target.session_id, "s-42");
+                assert_eq!(target.host.as_deref(), Some("local"));
+                assert_eq!(text, "write tests first");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

@@ -72,6 +72,8 @@ pub struct PtyCommand {
     pub program: String,
     /// Program arguments.
     pub args: Vec<String>,
+    /// Extra environment variables to add or override for the child process.
+    pub env: Vec<(String, String)>,
     /// Working directory.
     pub cwd: PathBuf,
     /// Initial terminal width in columns.
@@ -158,6 +160,9 @@ impl PtyHandle {
 
         let mut builder = CommandBuilder::new(&command.program);
         builder.args(&command.args);
+        for (key, value) in &command.env {
+            builder.env(key, value);
+        }
         builder.cwd(&command.cwd);
 
         let mut child = pair

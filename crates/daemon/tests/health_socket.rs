@@ -7,23 +7,59 @@
 //! response carries the daemon and protocol versions. It also covers
 //! stale-socket recovery and the `method_not_found` path.
 
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use protocol::{
-    AgentActivity, AgentKind, AttachHeader, Event, PROTOCOL_VERSION, Request, Response,
+    event, method, AgentActivity, AgentKind, AttachHeader, Event, Request, Response,
     SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
-    SessionInfo, SessionNewParams, SessionResizeParams, SessionResizeResult, SessionState,
-    SessionStopResult, StateSource, event, method,
+    SessionInfo, SessionInputParams, SessionInputResult, SessionNewParams, SessionResizeParams,
+    SessionResizeResult, SessionState, SessionStopResult, StateSource, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Mutex, MutexGuard};
 use tokio_util::codec::{Framed, LinesCodec};
 
 use zagentmesh_daemon::api::{ControlServer, DaemonState, HealthInfo};
 use zagentmesh_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
+
+static PATH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+struct PathGuard {
+    _guard: MutexGuard<'static, ()>,
+    old_path: Option<OsString>,
+}
+
+impl PathGuard {
+    async fn prepend(path: &Path) -> Self {
+        let guard = PATH_LOCK.lock().await;
+        let old_path = std::env::var_os("PATH");
+        let mut paths = vec![path.to_path_buf()];
+        if let Some(old_path) = &old_path {
+            paths.extend(std::env::split_paths(old_path));
+        }
+        let joined = std::env::join_paths(paths).expect("join test PATH");
+        std::env::set_var("PATH", joined);
+        Self {
+            _guard: guard,
+            old_path,
+        }
+    }
+}
+
+impl Drop for PathGuard {
+    fn drop(&mut self) {
+        match &self.old_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+    }
+}
 
 /// A unique temp socket path inside a dedicated per-test directory.
 ///
@@ -32,6 +68,10 @@ use zagentmesh_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCo
 /// bit). This mirrors the real daemon, which always binds inside its own
 /// `zagentmesh` runtime subdir.
 fn temp_socket(tag: &str) -> std::path::PathBuf {
+    temp_dir(tag).join("daemon.sock")
+}
+
+fn temp_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -41,7 +81,22 @@ fn temp_socket(tag: &str) -> std::path::PathBuf {
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).expect("create test socket dir");
-    dir.join("daemon.sock")
+    dir
+}
+
+fn write_executable(path: &Path, body: &str) {
+    std::fs::write(path, body).expect("write executable test script");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = std::fs::metadata(path)
+            .expect("test script metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("chmod test script");
+    }
 }
 
 /// Spawn the control server on `socket`, returning a shutdown trigger and the
@@ -131,6 +186,15 @@ fn session_params() -> SessionNewParams {
     }
 }
 
+fn session_params_for_agent(agent: AgentKind, cwd: PathBuf) -> SessionNewParams {
+    SessionNewParams {
+        agent,
+        cwd: Some(cwd),
+        cols: 80,
+        rows: 24,
+    }
+}
+
 fn ok_payload(response: Response) -> Value {
     match response {
         Response::Ok { ok, .. } => ok,
@@ -145,6 +209,19 @@ async fn create_session(framed: &mut Framed<UnixStream, LinesCodec>) -> SessionI
         serde_json::to_value(session_params()).expect("serialize params"),
     );
     serde_json::from_value(ok_payload(exchange(framed, &req).await)).expect("session info")
+}
+
+async fn create_session_with_agent(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    agent: AgentKind,
+    cwd: PathBuf,
+) -> Response {
+    let req = Request::new(
+        "session-new-agent",
+        method::SESSION_NEW,
+        serde_json::to_value(session_params_for_agent(agent, cwd)).expect("serialize params"),
+    );
+    exchange(framed, &req).await
 }
 
 async fn attach_session(
@@ -194,6 +271,38 @@ async fn resize_session(
         .expect("serialize resize params"),
     );
     serde_json::from_value(ok_payload(exchange(framed, &req).await)).expect("resize result")
+}
+
+async fn input_session(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    id: &SessionId,
+    text: &str,
+) -> SessionInputResult {
+    let req = Request::new(
+        "session-input",
+        method::SESSION_INPUT,
+        serde_json::to_value(SessionInputParams {
+            session_id: id.clone(),
+            text: text.to_owned(),
+        })
+        .expect("serialize input params"),
+    );
+    serde_json::from_value(ok_payload(exchange(framed, &req).await)).expect("input result")
+}
+
+async fn read_file_until(path: &Path, marker: &[u8]) -> Vec<u8> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(bytes) = tokio::fs::read(path).await {
+                if bytes.windows(marker.len()).any(|window| window == marker) {
+                    return bytes;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("file marker arrives before timeout")
 }
 
 async fn open_attach_stream(socket: &std::path::Path, stream_id: &str) -> UnixStream {
@@ -438,6 +547,176 @@ async fn session_lifecycle_over_socket() {
             .any(|session| session.id == created.id && session.state == SessionState::Stopped),
         "stopped session should be reflected in list: {list_after_stop:?}"
     );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn session_input_writes_text_to_shell_pty() {
+    let socket = temp_socket("session-input-shell");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new(
+            "/bin/sh",
+            [
+                "-c",
+                "IFS= read -r line; printf 'got:%s\\n' \"$line\"; sleep 30",
+            ],
+        ),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut client = connect(&socket).await;
+    let created = create_session(&mut client).await;
+    let input = input_session(&mut client, &created.id, "hello from control").await;
+    assert!(input.accepted);
+
+    let attach = attach_session(&mut client, &created.id).await;
+    let mut raw = open_attach_stream(&socket, &attach.stream_id).await;
+    let output = read_until_marker(&mut raw, b"got:hello from control").await;
+    assert!(
+        output
+            .windows(b"got:hello from control".len())
+            .any(|window| window == b"got:hello from control"),
+        "input output should be replayed to attach stream: {output:?}"
+    );
+
+    let _ = detach_stream(&mut client, &attach.stream_id).await;
+    let stop_req = Request::new(
+        "session-input-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut client, &stop_req).await))
+            .expect("stop result");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn codex_stub_session_publishes_blocked_and_receives_bracketed_input() {
+    let bin_dir = temp_dir("codex-stub-bin");
+    let cwd = temp_dir("codex-stub-cwd");
+    let input_log = temp_dir("codex-stub-input").join("input.bin");
+    let cwd_log = temp_dir("codex-stub-pwd").join("pwd.txt");
+    write_executable(
+        &bin_dir.join("codex"),
+        &format!(
+            "#!/bin/sh\npwd > \"{}\"\n/bin/sleep 0.2\nprintf '\\033]2;Action Required\\007'\nIFS= read -r line\nprintf '%s' \"$line\" > \"{}\"\n/bin/sleep 30\n",
+            cwd_log.display(),
+            input_log.display()
+        ),
+    );
+
+    let socket = temp_socket("codex-stub");
+    let (shutdown, handle) = spawn_server(&socket, "0.0.0").await;
+
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::new("subscribe-codex-stub", method::SUBSCRIBE, Value::Null);
+    let ack = exchange(&mut subscriber, &subscribe_req).await;
+    assert!(matches!(ack, Response::Ok { .. }), "subscribe should ack");
+
+    let mut control = connect(&socket).await;
+    let created: SessionInfo = {
+        let _path = PathGuard::prepend(&bin_dir).await;
+        serde_json::from_value(ok_payload(
+            create_session_with_agent(&mut control, AgentKind::Codex, cwd.clone()).await,
+        ))
+        .expect("codex session info")
+    };
+    assert_eq!(created.agent, AgentKind::Codex);
+
+    let streamed = wait_for_agent_state_event(
+        &mut subscriber,
+        &created.id,
+        AgentActivity::Blocked,
+        StateSource::OscTitle,
+    )
+    .await;
+    assert_eq!(streamed.payload["activity"], Value::from("blocked"));
+    assert_eq!(streamed.payload["source"], Value::from("osc_title"));
+
+    let input = input_session(&mut control, &created.id, "run tests").await;
+    assert!(input.accepted);
+    let bytes = read_file_until(&input_log, b"\x1b[200~run tests\x1b[201~").await;
+    assert_eq!(bytes, b"\x1b[200~run tests\x1b[201~");
+
+    let launched_cwd = tokio::fs::read_to_string(&cwd_log)
+        .await
+        .expect("read cwd log");
+    assert_eq!(launched_cwd.trim(), cwd.display().to_string());
+
+    let stop_req = Request::new(
+        "session-stop-codex-stub",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn claude_stub_session_publishes_screen_blocked_and_receives_plain_input() {
+    let bin_dir = temp_dir("claude-stub-bin");
+    let cwd = temp_dir("claude-stub-cwd");
+    let input_log = temp_dir("claude-stub-input").join("input.bin");
+    write_executable(
+        &bin_dir.join("claude"),
+        &format!(
+            "#!/bin/sh\n/bin/sleep 0.2\nprintf '\\033[2J\\033[HReview\\r\\n────\\r\\nenter to select\\r\\nesc to cancel\\r\\n↑/↓ to navigate\\r\\n'\nIFS= read -r line\nprintf '%s' \"$line\" > \"{}\"\n/bin/sleep 30\n",
+            input_log.display()
+        ),
+    );
+
+    let socket = temp_socket("claude-stub");
+    let (shutdown, handle) = spawn_server(&socket, "0.0.0").await;
+
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::new("subscribe-claude-stub", method::SUBSCRIBE, Value::Null);
+    let ack = exchange(&mut subscriber, &subscribe_req).await;
+    assert!(matches!(ack, Response::Ok { .. }), "subscribe should ack");
+
+    let mut control = connect(&socket).await;
+    let created: SessionInfo = {
+        let _path = PathGuard::prepend(&bin_dir).await;
+        serde_json::from_value(ok_payload(
+            create_session_with_agent(&mut control, AgentKind::Claude, cwd).await,
+        ))
+        .expect("claude session info")
+    };
+    assert_eq!(created.agent, AgentKind::Claude);
+
+    let streamed = wait_for_agent_state_event(
+        &mut subscriber,
+        &created.id,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    )
+    .await;
+    assert_eq!(streamed.payload["activity"], Value::from("blocked"));
+    assert_eq!(streamed.payload["source"], Value::from("screen"));
+
+    let input = input_session(&mut control, &created.id, "hello Claude").await;
+    assert!(input.accepted);
+    let bytes = read_file_until(&input_log, b"hello Claude").await;
+    assert_eq!(bytes, b"hello Claude");
+
+    let stop_req = Request::new(
+        "session-stop-claude-stub",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
 
     let _ = shutdown.send(());
     let _ = handle.await;
@@ -743,16 +1022,12 @@ async fn multiple_attach_clients_receive_output_and_disconnect_independently() {
 
     let one_output = read_until_marker(&mut raw_one, b"m4-multi").await;
     let two_output = read_until_marker(&mut raw_two, b"m4-multi").await;
-    assert!(
-        one_output
-            .windows(b"m4-multi".len())
-            .any(|window| window == b"m4-multi")
-    );
-    assert!(
-        two_output
-            .windows(b"m4-multi".len())
-            .any(|window| window == b"m4-multi")
-    );
+    assert!(one_output
+        .windows(b"m4-multi".len())
+        .any(|window| window == b"m4-multi"));
+    assert!(two_output
+        .windows(b"m4-multi".len())
+        .any(|window| window == b"m4-multi"));
 
     drop(raw_one);
     raw_two
@@ -760,11 +1035,9 @@ async fn multiple_attach_clients_receive_output_and_disconnect_independently() {
         .await
         .expect("send marker after dropping first attach");
     let two_output = read_until_marker(&mut raw_two, b"m4-still-attached").await;
-    assert!(
-        two_output
-            .windows(b"m4-still-attached".len())
-            .any(|window| window == b"m4-still-attached")
-    );
+    assert!(two_output
+        .windows(b"m4-still-attached".len())
+        .any(|window| window == b"m4-still-attached"));
 
     let stopped = Request::new(
         "session-stop-after-multi-attach",

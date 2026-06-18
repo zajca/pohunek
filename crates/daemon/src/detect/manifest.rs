@@ -13,7 +13,7 @@ const MAX_DEPTH: usize = 8;
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_MATCHER_BYTES: usize = 4096;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Manifest {
     rules: Vec<Rule>,
 }
@@ -70,6 +70,7 @@ impl Manifest {
             activity: rule.activity,
             priority: rule.priority,
             region: rule.region.clone(),
+            visible_blocker: rule.visible_blocker,
         })
     }
 
@@ -125,6 +126,7 @@ pub struct ManifestMatch {
     pub activity: AgentActivity,
     pub priority: i32,
     pub region: ManifestRegion,
+    pub visible_blocker: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -233,12 +235,13 @@ pub enum MatcherKind {
     LineRegex,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Rule {
     id: String,
     activity: AgentActivity,
     priority: i32,
     region: ManifestRegion,
+    visible_blocker: bool,
     gate: Gate,
 }
 
@@ -256,7 +259,7 @@ impl Rule {
             any,
             not,
             gates,
-            visible_blocker: _visible_blocker,
+            visible_blocker,
         } = raw;
 
         let activity = parse_activity(&id, state)?;
@@ -280,6 +283,7 @@ impl Rule {
             activity,
             priority,
             region: parsed_region,
+            visible_blocker: visible_blocker.unwrap_or(false),
             gate,
         })
     }
@@ -496,7 +500,7 @@ fn finish_gate_parts(
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Gate {
     Contains(String),
     Regex(Regex),
@@ -599,9 +603,6 @@ struct RawRule {
     any: Option<Vec<RawGate>>,
     not: Option<Box<RawGate>>,
     gates: Option<RawGate>,
-    // Parsed for schema compatibility with milestone manifests. The current
-    // matcher API only emits the winning activity and source metadata, so this
-    // flag stays out of ManifestMatch until detector integration has a consumer.
     visible_blocker: Option<bool>,
 }
 
@@ -669,6 +670,7 @@ mod tests {
                 activity: AgentActivity::Working,
                 priority: 20,
                 region: ManifestRegion::WholeRecent,
+                visible_blocker: false,
             })
         );
     }
@@ -977,6 +979,28 @@ mod tests {
             Some("live_blocked_form".to_string())
         );
         assert_eq!(manifest.match_context(&missing_required_text), None);
+    }
+
+    #[test]
+    fn visible_blocker_is_retained_on_manifest_match() {
+        let manifest = Manifest::parse_str(
+            r#"
+            [[rules]]
+            id = "visible-blocker"
+            state = "blocked"
+            priority = 1
+            region = "whole_recent"
+            visible_blocker = true
+            contains = "approval required"
+            "#,
+        )
+        .expect("manifest should parse");
+
+        let context = MatchContext::default()
+            .with_region_text(ManifestRegion::WholeRecent, "approval required");
+
+        let matched = manifest.match_context(&context).expect("rule should match");
+        assert!(matched.visible_blocker);
     }
 
     #[test]

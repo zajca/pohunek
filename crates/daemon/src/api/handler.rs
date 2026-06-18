@@ -12,7 +12,7 @@
 
 use protocol::{
     method, negotiate, ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams,
-    SessionId, SessionNewParams, SessionResizeParams, PROTOCOL_VERSION,
+    SessionId, SessionInputParams, SessionNewParams, SessionResizeParams, PROTOCOL_VERSION,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -142,6 +142,7 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::SESSION_ATTACH => handle_session_attach(request, &state.sessions).await,
         method::SESSION_DETACH => handle_session_detach(request, &state.sessions).await,
         method::SESSION_RESIZE => handle_session_resize(request, &state.sessions).await,
+        method::SESSION_INPUT => handle_session_input(request, &state.sessions).await,
         other => Response::err(request.id.clone(), ProtocolError::method_not_found(other)),
     }
 }
@@ -225,6 +226,17 @@ async fn handle_session_resize(request: &Request, sessions: &SessionRegistry) ->
         .resize(&params.session_id, params.cols, params.rows)
         .await
     {
+        Ok(result) => ok_value(request, &result),
+        Err(err) => Response::err(request.id.clone(), err),
+    }
+}
+
+async fn handle_session_input(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_params::<SessionInputParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    match sessions.input(params).await {
         Ok(result) => ok_value(request, &result),
         Err(err) => Response::err(request.id.clone(), err),
     }

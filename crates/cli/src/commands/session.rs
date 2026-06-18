@@ -1,6 +1,6 @@
 //! `zagentmesh session` — manage local PTY-backed sessions.
 //!
-//! Milestone 3 only supports the local transport and the `shell` agent. The CLI
+//! Phase 1 only supports the local transport. The CLI
 //! grammar is host-aware through [`crate::target::Target`], but remote targets
 //! are rejected before any daemon request is sent.
 
@@ -8,8 +8,8 @@ use std::path::PathBuf;
 
 use clap::ValueEnum;
 use protocol::{
-    AgentActivity, AgentKind, Request, SessionId, SessionInfo, SessionNewParams, SessionState,
-    SessionStopResult, StateSource, method,
+    method, AgentActivity, AgentKind, Request, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionNewParams, SessionState, SessionStopResult, StateSource,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -24,12 +24,18 @@ use crate::target::Target;
 pub(crate) enum AgentArg {
     /// Start a plain shell session.
     Shell,
+    /// Start a Codex CLI agent session.
+    Codex,
+    /// Start a Claude Code agent session.
+    Claude,
 }
 
 impl From<AgentArg> for AgentKind {
     fn from(value: AgentArg) -> Self {
         match value {
             AgentArg::Shell => AgentKind::Shell,
+            AgentArg::Codex => AgentKind::Codex,
+            AgentArg::Claude => AgentKind::Claude,
         }
     }
 }
@@ -118,6 +124,22 @@ pub(crate) async fn run_stop(paths: &Paths, target: &Target) -> Result<(), CliEr
     Ok(())
 }
 
+/// Run `session input`.
+///
+/// # Errors
+///
+/// Returns [`CliError`] if the target is remote, the daemon is unreachable,
+/// rejects the request, or returns a payload that does not match the contract.
+pub(crate) async fn run_input(paths: &Paths, target: &Target, text: &str) -> Result<(), CliError> {
+    let request = build_input_request(target, text)?;
+    let mut client = LocalClient::connect(&paths.socket).await?;
+    let result = client.request(&request).await?;
+    let input: SessionInputResult = serde_json::from_value(result)?;
+
+    print!("{}", render_input_human(&target.session_id, &input));
+    Ok(())
+}
+
 fn request_id(method: &str) -> String {
     format!("cli-{method}")
 }
@@ -168,6 +190,17 @@ fn build_stop_request(target: &Target) -> Result<Request, CliError> {
     request_with_params(method::SESSION_STOP, &SessionId(session_id.to_owned()))
 }
 
+fn build_input_request(target: &Target, text: &str) -> Result<Request, CliError> {
+    let session_id = local_session_id(target)?;
+    request_with_params(
+        method::SESSION_INPUT,
+        &SessionInputParams {
+            session_id: SessionId(session_id.to_owned()),
+            text: text.to_owned(),
+        },
+    )
+}
+
 fn local_session_id(target: &Target) -> Result<&str, CliError> {
     if target.is_local() {
         Ok(&target.session_id)
@@ -193,10 +226,16 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
         .max()
         .unwrap_or(0)
         .max("ID".len());
+    let agent_width = sessions
+        .iter()
+        .map(|s| agent_label(s.agent).len())
+        .max()
+        .unwrap_or(0)
+        .max("AGENT".len());
 
     let mut output = String::new();
     output.push_str(&format!(
-        "{:<id_width$}  {:<5}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  CWD\n",
+        "{:<id_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  CWD\n",
         "ID",
         "AGENT",
         "STATE",
@@ -204,11 +243,12 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
         "SOURCE",
         "PID",
         "SIZE",
-        id_width = id_width
+        id_width = id_width,
+        agent_width = agent_width
     ));
     for session in sessions {
         output.push_str(&format!(
-            "{:<id_width$}  {:<5}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {}\n",
+            "{:<id_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {}\n",
             session.id.0,
             agent_label(session.agent),
             state_label(session.state),
@@ -217,7 +257,8 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
             session.pid,
             format!("{}x{}", session.cols, session.rows),
             session.cwd.display(),
-            id_width = id_width
+            id_width = id_width,
+            agent_width = agent_width
         ));
     }
     output
@@ -265,9 +306,19 @@ fn render_stop_human(session_id: &str, result: &SessionStopResult) -> String {
     format!("session {session_id}: stopped={}\n", result.stopped)
 }
 
+fn render_input_human(session_id: &str, result: &SessionInputResult) -> String {
+    if result.accepted {
+        format!("session {session_id}: input accepted\n")
+    } else {
+        format!("session {session_id}: input rejected\n")
+    }
+}
+
 fn agent_label(agent: AgentKind) -> &'static str {
     match agent {
         AgentKind::Shell => "shell",
+        AgentKind::Codex => "codex",
+        AgentKind::Claude => "claude",
     }
 }
 
@@ -306,7 +357,7 @@ fn state_source_label(source: StateSource) -> &'static str {
 mod tests {
     use std::path::PathBuf;
 
-    use protocol::{AgentActivity, Request, SessionInfo, SessionState, StateSource, method};
+    use protocol::{method, AgentActivity, Request, SessionInfo, SessionState, StateSource};
     use serde_json::json;
 
     use super::*;
@@ -359,6 +410,36 @@ mod tests {
     }
 
     #[test]
+    fn new_request_accepts_codex_agent() {
+        let request = build_new_request(AgentArg::Codex, None, 80, 24).expect("request");
+
+        assert_request(
+            &request,
+            method::SESSION_NEW,
+            json!({
+                "agent": "codex",
+                "cols": 80,
+                "rows": 24
+            }),
+        );
+    }
+
+    #[test]
+    fn new_request_accepts_claude_agent() {
+        let request = build_new_request(AgentArg::Claude, None, 80, 24).expect("request");
+
+        assert_request(
+            &request,
+            method::SESSION_NEW,
+            json!({
+                "agent": "claude",
+                "cols": 80,
+                "rows": 24
+            }),
+        );
+    }
+
+    #[test]
     fn new_request_includes_cwd_and_requested_size() {
         let request = build_new_request(
             AgentArg::Shell,
@@ -385,6 +466,34 @@ mod tests {
         let request = build_list_request();
 
         assert_request(&request, method::SESSION_LIST, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn input_request_sends_local_session_id_and_text() {
+        let target: Target = "local/s-42".parse().expect("target");
+        let request = build_input_request(&target, "write tests first").expect("request");
+
+        assert_request(
+            &request,
+            method::SESSION_INPUT,
+            json!({
+                "session_id": "s-42",
+                "text": "write tests first"
+            }),
+        );
+    }
+
+    #[test]
+    fn input_request_rejects_remote_target() {
+        let target: Target = "host-b/s-42".parse().expect("target");
+
+        let err =
+            build_input_request(&target, "write tests first").expect_err("remote target must fail");
+
+        match err {
+            CliError::RemoteNotSupported { host } => assert_eq!(host, "host-b"),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
@@ -440,6 +549,23 @@ mod tests {
     }
 
     #[test]
+    fn renders_codex_and_claude_agents_in_session_list_table() {
+        let mut codex = running_session("s-codex");
+        codex.agent = protocol::AgentKind::Codex;
+        let mut claude = running_session("s-claude");
+        claude.agent = protocol::AgentKind::Claude;
+
+        let output = render_list_human(&[codex, claude]);
+
+        assert!(output.contains(
+            "s-codex   codex   running  -         process       4242  120x40  /workspace/project\n"
+        ));
+        assert!(output.contains(
+            "s-claude  claude  running  -         process       4242  120x40  /workspace/project\n"
+        ));
+    }
+
+    #[test]
     fn renders_inspect_field_value_table() {
         let output = render_inspect_human(&running_session("s-42"));
 
@@ -450,6 +576,23 @@ mod tests {
         assert!(output.contains("activity      -\n"));
         assert!(output.contains("state_source  process\n"));
         assert!(output.contains("exit_code     <none>\n"));
+    }
+
+    #[test]
+    fn renders_claude_agent_in_session_inspect_table() {
+        let mut session = running_session("s-42");
+        session.agent = protocol::AgentKind::Claude;
+
+        let output = render_inspect_human(&session);
+
+        assert!(output.contains("agent         claude\n"));
+    }
+
+    #[test]
+    fn renders_input_result_with_target_id() {
+        let output = render_input_human("s-42", &protocol::SessionInputResult { accepted: true });
+
+        assert_eq!(output, "session s-42: input accepted\n");
     }
 
     #[test]
