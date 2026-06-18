@@ -235,7 +235,16 @@ async fn run_attach_bridge(
     stream: &mut UnixStream,
     attach: &RedeemedAttach,
 ) -> Result<(), io::Error> {
-    let mut output = attach.pty.subscribe_output();
+    // Atomically snapshot recent output and subscribe to live output so the new
+    // client sees every byte exactly once across the handoff.
+    let (replay, mut output) = attach.pty.attach_snapshot_and_subscribe();
+    // TODO(milestone 6): skip/trim replay in alternate-screen mode like herdr —
+    // a TUI repaints itself on attach, so raw history replay is noisy. Needs the
+    // detector's vt100 alt-screen state, which lands in milestone 6.
+    if !replay.is_empty() {
+        stream.write_all(&replay).await?;
+        stream.flush().await?;
+    }
     let exit_pty = attach.pty.clone();
     let wait_exit = exit_pty.wait_exit();
     tokio::pin!(wait_exit);

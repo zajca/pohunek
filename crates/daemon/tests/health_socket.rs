@@ -658,6 +658,66 @@ async fn attach_raw_stream_round_trips_resizes_detaches_and_reattaches() {
 }
 
 #[tokio::test]
+async fn reattach_replays_recent_output_history() {
+    let socket = temp_socket("attach-history-replay");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut control = connect(&socket).await;
+    let created = create_session(&mut control).await;
+
+    // First attach: produce output that should later be replayed on reattach.
+    let first = attach_session(&mut control, &created.id).await;
+    let mut raw = open_attach_stream(&socket, &first.stream_id).await;
+    raw.write_all(b"printf 'HISTORY-REPLAY-MARK\\n'\n")
+        .await
+        .expect("send history marker command");
+    let live_output = read_until_marker(&mut raw, b"HISTORY-REPLAY-MARK").await;
+    assert!(
+        live_output
+            .windows(b"HISTORY-REPLAY-MARK".len())
+            .any(|window| window == b"HISTORY-REPLAY-MARK"),
+        "first attach should receive live output: {}",
+        String::from_utf8_lossy(&live_output)
+    );
+
+    // Detach the first stream and confirm it closes.
+    let detached = detach_stream(&mut control, &first.stream_id).await;
+    assert!(detached.detached);
+    assert_raw_stream_closes(&mut raw).await;
+
+    // Reattach WITHOUT sending any input. The marker produced before detach
+    // must arrive purely from the replayed history buffer.
+    let second = attach_session(&mut control, &created.id).await;
+    assert_ne!(second.stream_id, first.stream_id);
+    let mut raw_again = open_attach_stream(&socket, &second.stream_id).await;
+    let replayed = read_until_marker(&mut raw_again, b"HISTORY-REPLAY-MARK").await;
+    assert!(
+        replayed
+            .windows(b"HISTORY-REPLAY-MARK".len())
+            .any(|window| window == b"HISTORY-REPLAY-MARK"),
+        "reattach should replay prior output without new input: {}",
+        String::from_utf8_lossy(&replayed)
+    );
+
+    let stop_req = Request::new(
+        "session-stop-after-history-replay",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
 async fn multiple_attach_clients_receive_output_and_disconnect_independently() {
     let socket = temp_socket("attach-multi");
     let config = SessionRegistryConfig {

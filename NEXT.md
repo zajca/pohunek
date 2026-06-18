@@ -46,6 +46,13 @@ Milestones 1–5 are complete and merged to `main` (`cargo build`,
   caps), `machine` (debounce). A shipped generic shell manifest
   (`detect/manifests/shell.toml`, embedded via `include_str!`) is loaded by the
   production detector through `DetectorConfig::generic_shell()`.
+- **Attach history replay (milestone 5b):** each PTY keeps a bounded raw-output
+  ring buffer (`pty::OutputHistory`, cap `SessionRegistryConfig.output_history_limit_bytes`,
+  default 10 MB). The reader thread pushes each chunk and broadcasts under one
+  mutex; `PtyHandle::attach_snapshot_and_subscribe()` snapshots + subscribes
+  atomically; `run_attach_bridge` replays the snapshot before live bytes, so a
+  (re)attaching client sees the recent screen + scrollback instead of a blank
+  terminal. In memory only; alt-screen trim is a milestone-6 TODO.
 - Stubs (TODO doc-comment only, NOT implemented):
   `daemon/src/{agent,store,events}/mod.rs`. **`agent/mod.rs` is the module you
   fill in here.**

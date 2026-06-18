@@ -18,7 +18,8 @@ the original.
 - `zagentmesh daemon start` runs as a systemd user service; `zagentmesh doctor`
   reports health.
 - `zagentmesh session new --agent {codex|claude}` starts the agent in a
-  daemon-owned PTY; `attach`/detach/reattach work without killing it.
+  daemon-owned PTY; `attach`/detach/reattach work without killing it, and a
+  reattaching client is replayed the recent screen + scrollback.
 - Agent state (`working` / `blocked` / `idle` / `done` / `failed`) is visible in
   `status` and `--json`, sourced from OSC titles + screen detection, with the
   `source` shown.
@@ -113,10 +114,21 @@ Raw terminal bytes never share the JSON control connection.
    on the **control** connection while attached.
 4. Multiple clients may attach; last-attach-wins resize, explicit resize
    available.
+5. **History replay on attach.** Each session keeps a bounded ring buffer of
+   recent raw PTY output (cap configurable, default 10 MB, in memory only). On
+   attach the daemon writes that buffer to the new client *before* live bytes,
+   so attaching to an idle session shows the current screen + scrollback instead
+   of a blank terminal. The snapshot and the live subscription are taken
+   atomically (shared mutex with the PTY reader) so the client sees every byte
+   exactly once — no gap, no duplicate. Raw byte-exact replay; refinement to
+   skip/trim replay in alternate-screen (TUI) mode like herdr is deferred to the
+   agent-adapter milestone.
 
 Reference: herdr keeps PTY ownership in the daemon and treats the pane as the
-attach unit (`herdr/src/server/terminal_attach.rs`); detach does not kill the
-PTY.
+attach unit (`herdr/src/server/terminal_attach.rs`); it bounds scrollback by
+bytes (`DEFAULT_SCROLLBACK_LIMIT_BYTES = 10 MB`) and skips replay in the
+alternate screen (`herdr/src/pane.rs` `handoff_history_ansi`). Detach does not
+kill the PTY.
 
 ## PTY Ownership (Actor Model)
 
@@ -126,7 +138,10 @@ Follow herdr's actor-per-PTY (`herdr/src/pty/actor.rs`, `actor/unix.rs`):
   (`portable-pty` master is blocking). Bridge to async via a channel
   (`tokio::sync::mpsc`) or `spawn_blocking`.
 - Each read chunk is (a) forwarded to attached clients (broadcast), (b) fed to
-  the VT emulator + OSC parser for detection.
+  the VT emulator + OSC parser for detection, (c) appended to a bounded
+  per-session output ring buffer (cap configurable, default 10 MB) used to
+  replay recent screen + scrollback to a newly attached client. The push and the
+  broadcast send share one mutex so attach can snapshot+subscribe atomically.
 - `Handle`: `write_user_input(bytes)`, `resize(cols, rows, cell_px)`, `shutdown`.
 - Resize via `master.resize(PtySize{...})`; queue resize separately from data
   writes (herdr injects terminal responses after resize completes).
@@ -304,6 +319,10 @@ audit/debug trail.
    attach a shell, type, detach, reattach; binary output survives.
 5. **VT + OSC parser + manifest matcher + state machine.** *Check:* fixtures map
    to working/idle/blocked; debounce kills flicker.
+5b. **Attach history replay.** Bounded per-session output ring buffer (default
+    10 MB); replay recent screen + scrollback to a new client on attach, taken
+    atomically with the live subscription. *Check:* reattach a session and
+    receive its prior output with no input sent; no gap or duplicate.
 6. **Agent adapters (Codex + Claude).** Launch, input injection (Claude Ink
    quirk!), manifests, resume command. *Check:* run both agents end-to-end, inject
    a prompt that actually submits, observe correct state.

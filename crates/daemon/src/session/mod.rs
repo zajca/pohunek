@@ -25,6 +25,12 @@ use crate::pty::{PtyCommand, PtyError, PtyExit, PtyHandle};
 
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
 
+/// Default per-session raw-output history cap (10 MB), replayed on attach.
+///
+/// Matches herdr's `DEFAULT_SCROLLBACK_LIMIT_BYTES`; overridable via
+/// [`SessionRegistryConfig::output_history_limit_bytes`].
+const DEFAULT_OUTPUT_HISTORY_LIMIT_BYTES: usize = 10_000_000;
+
 /// Shell command configuration used for `AgentKind::Shell`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellCommand {
@@ -73,6 +79,8 @@ pub struct SessionRegistryConfig {
     pub stop_grace: Duration,
     /// How long a one-shot attach token may remain pending before redemption.
     pub attach_token_ttl: Duration,
+    /// Per-session cap on the raw-output history buffer replayed on attach.
+    pub output_history_limit_bytes: usize,
 }
 
 impl Default for SessionRegistryConfig {
@@ -81,6 +89,7 @@ impl Default for SessionRegistryConfig {
             shell_command: ShellCommand::default(),
             stop_grace: Duration::from_millis(500),
             attach_token_ttl: DEFAULT_ATTACH_TOKEN_TTL,
+            output_history_limit_bytes: DEFAULT_OUTPUT_HISTORY_LIMIT_BYTES,
         }
     }
 }
@@ -190,10 +199,12 @@ impl SessionRegistry {
                 .config
                 .shell_command
                 .to_pty_command(cwd.clone(), params.cols, params.rows);
-        let pty = tokio::task::spawn_blocking(move || PtyHandle::spawn(command))
-            .await
-            .map_err(|_| runtime_error("spawn_failed", "PTY spawn task panicked"))?
-            .map_err(pty_error_to_protocol)?;
+        let history_limit_bytes = self.inner.config.output_history_limit_bytes;
+        let pty =
+            tokio::task::spawn_blocking(move || PtyHandle::spawn(command, history_limit_bytes))
+                .await
+                .map_err(|_| runtime_error("spawn_failed", "PTY spawn task panicked"))?
+                .map_err(pty_error_to_protocol)?;
         let detector_output = pty.subscribe_output();
         let detector_cancel = CancellationToken::new();
         let (detector_resize, detector_resize_rx) = watch::channel((params.rows, params.cols));
@@ -829,6 +840,7 @@ mod tests {
             shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
             stop_grace: Duration::from_millis(50),
             attach_token_ttl: Duration::from_millis(1),
+            ..SessionRegistryConfig::default()
         });
 
         let created = registry.create(params()).await.expect("create session");

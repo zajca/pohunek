@@ -4,6 +4,7 @@
 //! thread that drains output and waits for process exit. Async callers interact
 //! with the process through this cloneable handle.
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,53 @@ use tracing::{debug, warn};
 
 /// Output chunk size for the blocking PTY reader.
 const READ_CHUNK_BYTES: usize = 8 * 1024;
+
+/// Bounded ring buffer of raw PTY output bytes, replayed to new attach clients.
+///
+/// Keeps at most `limit` bytes of the most recent output. When a push would
+/// exceed the cap, the oldest bytes are dropped from the front. Storing raw
+/// bytes (not rendered terminal state) matches our byte-pipe model: on attach
+/// the daemon replays this buffer verbatim before live output.
+#[derive(Debug)]
+pub struct OutputHistory {
+    buffer: VecDeque<u8>,
+    limit: usize,
+}
+
+impl OutputHistory {
+    /// Create an empty history capped at `limit` bytes.
+    #[must_use]
+    pub fn new(limit: usize) -> Self {
+        Self {
+            buffer: VecDeque::new(),
+            limit,
+        }
+    }
+
+    /// Append `bytes`, then drop from the front until `len <= limit`.
+    ///
+    /// A single chunk larger than the cap is truncated to its most recent
+    /// `limit` bytes (the front is dropped), so the buffer never grows past the
+    /// configured limit.
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.buffer.extend(bytes.iter().copied());
+        while self.buffer.len() > self.limit {
+            self.buffer.pop_front();
+        }
+    }
+
+    /// Snapshot the current contents in order, oldest byte first.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.buffer.iter().copied().collect()
+    }
+
+    /// Configured byte cap.
+    #[must_use]
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
 
 /// Command to spawn in a PTY.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +125,10 @@ pub struct PtyHandle {
     reader_thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
     exit_rx: watch::Receiver<Option<PtyExit>>,
     output_tx: broadcast::Sender<Vec<u8>>,
+    /// Raw-output ring buffer shared with the reader thread. Each chunk is
+    /// pushed here and broadcast under this same lock so an attaching client can
+    /// snapshot history and subscribe atomically (no gap, no duplicate).
+    history: Arc<Mutex<OutputHistory>>,
 }
 
 impl std::fmt::Debug for PtyHandle {
@@ -89,7 +141,11 @@ impl std::fmt::Debug for PtyHandle {
 
 impl PtyHandle {
     /// Spawn a command in a new PTY.
-    pub fn spawn(command: PtyCommand) -> Result<Self, PtyError> {
+    ///
+    /// `history_limit_bytes` caps the raw-output ring buffer replayed to clients
+    /// on attach. The cap is daemon policy, not part of the command, so it is a
+    /// separate argument rather than a field of [`PtyCommand`].
+    pub fn spawn(command: PtyCommand, history_limit_bytes: usize) -> Result<Self, PtyError> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -127,6 +183,8 @@ impl PtyHandle {
         let (output_tx, _) = broadcast::channel(64);
         let (exit_tx, exit_rx) = watch::channel(None);
         let output_tx_for_thread = output_tx.clone();
+        let history = Arc::new(Mutex::new(OutputHistory::new(history_limit_bytes)));
+        let history_for_thread = Arc::clone(&history);
 
         let reader_thread = thread::Builder::new()
             .name(format!("zagentmesh-pty-{pid}"))
@@ -136,6 +194,15 @@ impl PtyHandle {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
+                            // Push to history and broadcast under the same lock
+                            // so an attach cannot observe a chunk between its
+                            // snapshot and subscribe (see
+                            // `attach_snapshot_and_subscribe`). Recover a
+                            // poisoned lock rather than killing the reader.
+                            let mut history = history_for_thread
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            history.push(&buf[..n]);
                             let _ = output_tx_for_thread.send(buf[..n].to_vec());
                         }
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
@@ -171,6 +238,7 @@ impl PtyHandle {
             reader_thread: Arc::new(Mutex::new(Some(reader_thread))),
             exit_rx,
             output_tx,
+            history,
         })
     }
 
@@ -184,6 +252,27 @@ impl PtyHandle {
     #[must_use]
     pub fn subscribe_output(&self) -> broadcast::Receiver<Vec<u8>> {
         self.output_tx.subscribe()
+    }
+
+    /// Atomically snapshot the output history and subscribe to live output.
+    ///
+    /// Both operations happen while holding the history lock the reader thread
+    /// uses to push+broadcast each chunk. This guarantees a clean partition: the
+    /// returned snapshot holds every byte pushed up to this point, and the
+    /// returned receiver delivers every byte broadcast afterwards — no chunk is
+    /// dropped or duplicated across the handoff.
+    ///
+    /// A poisoned lock is recovered with `into_inner` to match the infallible
+    /// style of [`subscribe_output`]; the buffered bytes remain valid.
+    #[must_use]
+    pub fn attach_snapshot_and_subscribe(&self) -> (Vec<u8>, broadcast::Receiver<Vec<u8>>) {
+        let history = self
+            .history
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let receiver = self.output_tx.subscribe();
+        let snapshot = history.snapshot();
+        (snapshot, receiver)
     }
 
     /// Write user input to the PTY.
@@ -311,5 +400,57 @@ fn send_signal(pid: u32, signal: libc::c_int) -> Result<(), PtyError> {
             return Ok(());
         }
         Err(PtyError::Io(err))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OutputHistory;
+
+    #[test]
+    fn snapshot_returns_appended_bytes_in_order() {
+        let mut history = OutputHistory::new(64);
+        history.push(b"hello, ");
+        history.push(b"world");
+        assert_eq!(history.snapshot(), b"hello, world");
+    }
+
+    #[test]
+    fn empty_history_snapshot_is_empty() {
+        let history = OutputHistory::new(64);
+        assert!(history.snapshot().is_empty());
+        assert_eq!(history.limit(), 64);
+    }
+
+    #[test]
+    fn push_beyond_limit_drops_oldest_and_retains_newest() {
+        let mut history = OutputHistory::new(4);
+        history.push(b"ab");
+        history.push(b"cdef");
+        // "abcdef" exceeds the 4-byte cap; the two oldest bytes are dropped.
+        let snapshot = history.snapshot();
+        assert!(snapshot.len() <= history.limit());
+        assert_eq!(snapshot, b"cdef");
+    }
+
+    #[test]
+    fn single_chunk_larger_than_limit_is_truncated_to_newest_bytes() {
+        let mut history = OutputHistory::new(3);
+        history.push(b"0123456789");
+        let snapshot = history.snapshot();
+        assert!(snapshot.len() <= history.limit());
+        assert_eq!(snapshot, b"789");
+    }
+
+    #[test]
+    fn repeated_pushes_never_exceed_limit() {
+        let mut history = OutputHistory::new(5);
+        for _ in 0..100 {
+            history.push(b"xyz");
+            assert!(history.snapshot().len() <= history.limit());
+        }
+        // Only the most recent 5 bytes of the "xyz"-repeated stream survive, in
+        // order. The stream is periodic, so its final 5 bytes are "yzxyz".
+        assert_eq!(history.snapshot(), b"yzxyz");
     }
 }
