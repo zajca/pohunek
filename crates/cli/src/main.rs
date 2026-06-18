@@ -124,6 +124,17 @@ enum SessionAction {
         /// Initial terminal height in rows.
         #[arg(long, default_value_t = 24)]
         rows: u16,
+        /// Git repository to bind a dedicated worktree for. Requires `--branch`.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Branch to check out in the bound worktree. Requires `--repo`.
+        #[arg(long)]
+        branch: Option<String>,
+        /// Base branch the worktree's branch is created from. Requires
+        /// `--repo` and `--branch`; falls back to the repository's default
+        /// branch when missing.
+        #[arg(long)]
+        base_branch: Option<String>,
     },
 
     /// List known sessions.
@@ -207,7 +218,24 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     cwd,
                     cols,
                     rows,
-                } => commands::session::run_new(&paths, agent, cwd, cols, rows).await?,
+                    repo,
+                    branch,
+                    base_branch,
+                } => {
+                    commands::session::run_new(
+                        &paths,
+                        commands::session::NewArgs {
+                            agent,
+                            cwd,
+                            cols,
+                            rows,
+                            repo,
+                            branch,
+                            base_branch,
+                        },
+                    )
+                    .await?
+                }
                 SessionAction::List { json } => commands::session::run_list(&paths, json).await?,
                 SessionAction::Inspect { target, json } => {
                     commands::session::run_inspect(&paths, &target, json).await?
@@ -279,12 +307,18 @@ mod tests {
                         cwd,
                         cols,
                         rows,
+                        repo,
+                        branch,
+                        base_branch,
                     },
             } => {
                 assert_eq!(agent, commands::session::AgentArg::Shell);
                 assert_eq!(cwd, None);
                 assert_eq!(cols, 80);
                 assert_eq!(rows, 24);
+                assert_eq!(repo, None);
+                assert_eq!(branch, None);
+                assert_eq!(base_branch, None);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -297,18 +331,9 @@ mod tests {
 
         match cli.command {
             Commands::Session {
-                action:
-                    SessionAction::New {
-                        agent,
-                        cwd,
-                        cols,
-                        rows,
-                    },
+                action: SessionAction::New { agent, .. },
             } => {
                 assert_eq!(agent, commands::session::AgentArg::Codex);
-                assert_eq!(cwd, None);
-                assert_eq!(cols, 80);
-                assert_eq!(rows, 24);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -321,18 +346,46 @@ mod tests {
 
         match cli.command {
             Commands::Session {
+                action: SessionAction::New { agent, .. },
+            } => {
+                assert_eq!(agent, commands::session::AgentArg::Claude);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_session_new_worktree_flags() {
+        let cli = Cli::try_parse_from([
+            "zagentmesh",
+            "session",
+            "new",
+            "--agent",
+            "claude",
+            "--repo",
+            "/workspace/project",
+            "--branch",
+            "feature/login",
+            "--base-branch",
+            "main",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Commands::Session {
                 action:
                     SessionAction::New {
                         agent,
-                        cwd,
-                        cols,
-                        rows,
+                        repo,
+                        branch,
+                        base_branch,
+                        ..
                     },
             } => {
                 assert_eq!(agent, commands::session::AgentArg::Claude);
-                assert_eq!(cwd, None);
-                assert_eq!(cols, 80);
-                assert_eq!(rows, 24);
+                assert_eq!(repo.as_deref(), Some(std::path::Path::new("/workspace/project")));
+                assert_eq!(branch.as_deref(), Some("feature/login"));
+                assert_eq!(base_branch.as_deref(), Some("main"));
             }
             other => panic!("unexpected command: {other:?}"),
         }

@@ -36,6 +36,7 @@ pub mod detect;
 pub mod events;
 pub mod integration;
 pub mod store;
+pub mod worktree;
 
 pub use error::DaemonError;
 pub use paths::Paths;

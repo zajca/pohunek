@@ -206,6 +206,9 @@ fn session_params() -> SessionNewParams {
         cwd: Some(std::env::temp_dir()),
         cols: 80,
         rows: 24,
+        repo: None,
+        branch: None,
+        base_branch: None,
     }
 }
 
@@ -215,7 +218,86 @@ fn session_params_for_agent(agent: AgentKind, cwd: PathBuf) -> SessionNewParams 
         cwd: Some(cwd),
         cols: 80,
         rows: 24,
+        repo: None,
+        branch: None,
+        base_branch: None,
     }
+}
+
+/// `session.new` params binding a worktree for `repo` + `branch`.
+fn session_params_for_worktree(
+    agent: AgentKind,
+    repo: PathBuf,
+    branch: &str,
+) -> SessionNewParams {
+    SessionNewParams {
+        agent,
+        cwd: None,
+        cols: 80,
+        rows: 24,
+        repo: Some(repo),
+        branch: Some(branch.to_owned()),
+        base_branch: None,
+    }
+}
+
+/// Create a worktree-bound session and return the daemon's response.
+async fn create_worktree_session(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    agent: AgentKind,
+    repo: PathBuf,
+    branch: &str,
+) -> Response {
+    let req = Request::new(
+        "session-new-worktree",
+        method::SESSION_NEW,
+        serde_json::to_value(session_params_for_worktree(agent, repo, branch))
+            .expect("serialize params"),
+    );
+    exchange(framed, &req).await
+}
+
+/// Initialize a throwaway git repo on branch `main` with one commit.
+fn init_git_repo(tag: &str) -> PathBuf {
+    let dir = temp_dir(tag);
+    let init = std::process::Command::new("git")
+        .args(["-c", "init.defaultBranch=main", "init", "-q"])
+        .arg(&dir)
+        .output()
+        .expect("git init");
+    assert!(
+        init.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    for args in [
+        vec!["config", "user.email", "test@example.com"],
+        vec!["config", "user.name", "Test"],
+        vec!["config", "commit.gpgsign", "false"],
+    ] {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(&args)
+            .output()
+            .expect("git config");
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+    std::fs::write(dir.join("README.md"), "init\n").expect("write README");
+    for args in [vec!["add", "."], vec!["commit", "-q", "-m", "init"]] {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(&args)
+            .output()
+            .expect("git commit");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    dir
 }
 
 fn ok_payload(response: Response) -> Value {
@@ -1375,6 +1457,104 @@ async fn detector_tick_publishes_debounced_static_osc_title_activity() {
     let _: SessionStopResult =
         serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
             .expect("stop result");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Milestone-8 checkpoint: two sessions on one repository with different
+/// branches get two distinct worktrees and each launches inside its own.
+#[tokio::test]
+async fn two_sessions_on_one_repo_get_distinct_worktrees() {
+    let repo = init_git_repo("two-wt-repo");
+    let worktree_root = temp_dir("two-wt-root");
+    let worktree_store = temp_dir("two-wt-store").join("worktree-bindings.jsonl");
+    let socket = temp_socket("two-worktrees");
+
+    let config = SessionRegistryConfig {
+        // Each shell records its working directory into its own worktree, which
+        // proves the process was launched *inside* the bound tree.
+        shell_command: ShellCommand::new(
+            "/bin/sh",
+            ["-c", "pwd > zagentmesh-pwd.txt; exec sleep 30"],
+        ),
+        stop_grace: Duration::from_millis(50),
+        worktree_root: Some(worktree_root.clone()),
+        worktree_store_path: Some(worktree_store.clone()),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut control = connect(&socket).await;
+    let alpha: SessionInfo = serde_json::from_value(ok_payload(
+        create_worktree_session(&mut control, AgentKind::Shell, repo.clone(), "feature/alpha").await,
+    ))
+    .expect("alpha session info");
+    let beta: SessionInfo = serde_json::from_value(ok_payload(
+        create_worktree_session(&mut control, AgentKind::Shell, repo.clone(), "feature/beta").await,
+    ))
+    .expect("beta session info");
+
+    let alpha_path = alpha.worktree_path.clone().expect("alpha worktree path");
+    let beta_path = beta.worktree_path.clone().expect("beta worktree path");
+
+    // Two distinct trees — no shared working tree.
+    assert_ne!(alpha_path, beta_path, "two branches must not share a worktree");
+    assert!(alpha_path.starts_with(&worktree_root));
+    assert!(beta_path.starts_with(&worktree_root));
+
+    // Each session was launched in its own worktree (cwd == bound worktree).
+    assert_eq!(alpha.cwd, alpha_path);
+    assert_eq!(beta.cwd, beta_path);
+    assert_eq!(alpha.branch.as_deref(), Some("feature/alpha"));
+    assert_eq!(beta.branch.as_deref(), Some("feature/beta"));
+
+    // Both are real git worktrees (a `.git` file pointer, not a directory).
+    for path in [&alpha_path, &beta_path] {
+        let git_pointer = std::fs::read_to_string(path.join(".git"))
+            .unwrap_or_else(|err| panic!("read {}/.git: {err}", path.display()));
+        assert!(
+            git_pointer.trim_start().starts_with("gitdir:"),
+            "{} must be a git worktree",
+            path.display()
+        );
+    }
+
+    // The shell in each worktree wrote its cwd there: the file lands in the
+    // session's own tree, proving the process ran inside it.
+    for path in [&alpha_path, &beta_path] {
+        let marker = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("worktree dir name")
+            .as_bytes()
+            .to_vec();
+        let recorded = read_file_until(&path.join("zagentmesh-pwd.txt"), &marker).await;
+        assert!(
+            recorded.windows(marker.len()).any(|w| w == marker.as_slice()),
+            "pwd recorded in {} must contain the worktree dir name",
+            path.display()
+        );
+    }
+
+    // The minimal worktree-binding store persisted both bindings.
+    let bindings = std::fs::read_to_string(&worktree_store).expect("read worktree store");
+    assert_eq!(
+        bindings.lines().filter(|l| !l.trim().is_empty()).count(),
+        2,
+        "two worktree bindings persisted: {bindings}"
+    );
+
+    for id in [&alpha.id, &beta.id] {
+        let stop_req = Request::new(
+            "session-stop-worktree",
+            method::SESSION_STOP,
+            serde_json::to_value(id).expect("serialize id"),
+        );
+        let _: SessionStopResult =
+            serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+                .expect("stop result");
+    }
 
     let _ = shutdown.send(());
     let _ = handle.await;

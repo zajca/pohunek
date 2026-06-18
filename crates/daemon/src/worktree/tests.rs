@@ -1,0 +1,583 @@
+//! Unit tests for the worktree binder, store, slug, ownership, and the three
+//! non-fatal warning paths. Each test that needs a repository builds a real,
+//! throwaway git repo under the system temp dir (git is required, as it is for
+//! the daemon at runtime).
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use protocol::SessionWarningKind;
+
+use super::{
+    branch_slug, is_valid_worktree, WorktreeBinding, WorktreeManager, WorktreeRequest,
+    WorktreeStatus, WorktreeStore,
+};
+
+fn unique_dir(tag: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "zagentmesh-wt-{tag}-{}-{nanos}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).expect("create temp dir");
+    dir
+}
+
+fn git_in(dir: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Initialize a git repo on branch `main` with one commit.
+fn init_repo(tag: &str) -> PathBuf {
+    let dir = unique_dir(tag);
+    let init = Command::new("git")
+        .args(["-c", "init.defaultBranch=main", "init", "-q"])
+        .arg(&dir)
+        .output()
+        .expect("git init");
+    assert!(
+        init.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    git_in(&dir, &["config", "user.email", "test@example.com"]);
+    git_in(&dir, &["config", "user.name", "Test"]);
+    git_in(&dir, &["config", "commit.gpgsign", "false"]);
+    fs::write(dir.join("README.md"), "init\n").expect("write README");
+    git_in(&dir, &["add", "."]);
+    git_in(&dir, &["commit", "-q", "-m", "init"]);
+    dir
+}
+
+fn manager(tag: &str) -> WorktreeManager {
+    let root = unique_dir(&format!("{tag}-root"));
+    let store = unique_dir(&format!("{tag}-store")).join("worktree-bindings.jsonl");
+    WorktreeManager::new(root, WorktreeStore::new(store))
+}
+
+/// Run git in `dir` and return trimmed stdout (asserting success).
+fn git_stdout(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn request(session: &str, repo: &Path, branch: &str) -> WorktreeRequest {
+    WorktreeRequest {
+        session_id: session.to_owned(),
+        repo: repo.to_path_buf(),
+        branch: branch.to_owned(),
+        base_branch: None,
+    }
+}
+
+// --- slug -----------------------------------------------------------------
+
+#[test]
+fn branch_slug_matches_reference_cases() {
+    // Ported verbatim from Kandev slug_test.go TestSanitizeBranchSlug.
+    let cases = [
+        ("main", "main"),
+        ("feature/foo", "feature-foo"),
+        ("feature/foo-bar", "feature-foo-bar"),
+        ("release/v1.2.3", "release-v1.2.3"),
+        ("user/jane/wip", "user-jane-wip"),
+        ("-leading", "leading"),
+        ("trailing-", "trailing"),
+        ("slash/", "slash"),
+        ("a//b", "a-b"),
+        ("weird:name space", "weird-name-space"),
+        ("!@#$%", ""),
+        ("", ""),
+        (".hidden", "hidden"),
+        ("修复登录问题", ""),
+        ("foo--bar", "foo-bar"),
+    ];
+    for (input, want) in cases {
+        assert_eq!(branch_slug(input), want, "branch_slug({input:?})");
+    }
+}
+
+#[test]
+fn worktree_path_disambiguates_two_branches_of_one_session() {
+    let mgr = manager("slug-path");
+    let repo = PathBuf::from("/workspace/project");
+    let a = mgr
+        .worktree_path("s-1", &repo, "feature/a")
+        .expect("path a");
+    let b = mgr
+        .worktree_path("s-1", &repo, "feature/b")
+        .expect("path b");
+    assert_ne!(a, b, "two branches must not collapse to one path");
+    assert!(a.to_string_lossy().ends_with("s-1-project-feature-a"));
+    assert!(b.to_string_lossy().ends_with("s-1-project-feature-b"));
+}
+
+#[test]
+fn worktree_path_rejects_unsluggable_branch() {
+    let mgr = manager("slug-empty");
+    let err = mgr
+        .worktree_path("s-1", Path::new("/workspace/project"), "修复")
+        .expect_err("all-non-ascii branch has no slug");
+    assert_eq!(err.code, "invalid_branch_slug");
+}
+
+// --- bind: create / reuse / ownership -------------------------------------
+
+#[test]
+fn bind_creates_a_valid_worktree_and_records_a_binding() {
+    let mgr = manager("create");
+    let repo = init_repo("create-repo");
+    let bound = mgr
+        .bind(&request("s-1", &repo, "feat/x"))
+        .expect("bind worktree");
+
+    assert!(!bound.reused);
+    assert!(bound.warnings.is_empty(), "clean create: {:?}", bound.warnings);
+    assert!(is_valid_worktree(&bound.path), "bound path must be a git worktree");
+    assert_eq!(bound.base_branch, "main");
+
+    let binding = mgr
+        .store()
+        .find("s-1", &bound.repository, &branch_slug("feat/x"))
+        .expect("load store")
+        .expect("binding recorded");
+    assert_eq!(binding.path, bound.path);
+    assert_eq!(binding.branch, "feat/x");
+    assert_eq!(binding.status, WorktreeStatus::Active);
+}
+
+#[test]
+fn bind_reuses_an_owned_valid_worktree() {
+    let mgr = manager("reuse");
+    let repo = init_repo("reuse-repo");
+    let first = mgr.bind(&request("s-1", &repo, "feat/x")).expect("first bind");
+    assert!(!first.reused);
+
+    // Re-binding the same (session, repo, branch) must reuse, not re-run
+    // `git worktree add -b` (which would fail because the branch now exists).
+    let second = mgr
+        .bind(&request("s-1", &repo, "feat/x"))
+        .expect("second bind reuses");
+    assert!(second.reused, "second bind should reuse the owned worktree");
+    assert_eq!(second.path, first.path);
+    assert!(is_valid_worktree(&second.path));
+}
+
+#[test]
+fn two_branches_of_one_repo_bind_two_distinct_trees() {
+    let mgr = manager("two-branches");
+    let repo = init_repo("two-branches-repo");
+    let a = mgr.bind(&request("s-1", &repo, "feat/a")).expect("bind a");
+    let b = mgr.bind(&request("s-1", &repo, "feat/b")).expect("bind b");
+
+    assert_ne!(a.path, b.path, "two branches must not share a tree");
+    assert!(is_valid_worktree(&a.path));
+    assert!(is_valid_worktree(&b.path));
+}
+
+#[test]
+fn bind_refuses_a_foreign_directory_at_the_target_path() {
+    let mgr = manager("foreign");
+    let repo = init_repo("foreign-repo");
+    // Pre-create a directory at the exact target path WITHOUT a binding: the
+    // daemon does not own it and must refuse to adopt or clobber it.
+    let target = mgr
+        .worktree_path("s-1", &super::canonical_or_original(&repo), "feat/x")
+        .expect("target path");
+    fs::create_dir_all(&target).expect("create foreign dir");
+
+    let err = mgr
+        .bind(&request("s-1", &repo, "feat/x"))
+        .expect_err("foreign tree must be refused");
+    assert_eq!(err.code, "worktree_path_conflict");
+}
+
+#[test]
+fn bind_recreates_when_owned_directory_was_lost() {
+    let mgr = manager("recreate");
+    let repo = init_repo("recreate-repo");
+    let first = mgr.bind(&request("s-1", &repo, "feat/x")).expect("first bind");
+
+    // Simulate the worktree directory being lost while the binding remains.
+    fs::remove_dir_all(&first.path).expect("remove worktree dir");
+    assert!(!is_valid_worktree(&first.path));
+
+    let again = mgr
+        .bind(&request("s-1", &repo, "feat/x"))
+        .expect("recreate owned worktree");
+    assert!(!again.reused, "a lost directory is recreated, not reused");
+    assert_eq!(again.path, first.path);
+    assert!(is_valid_worktree(&again.path));
+}
+
+#[test]
+fn bind_rejects_a_non_git_repository() {
+    let mgr = manager("nonrepo");
+    let not_a_repo = unique_dir("nonrepo-dir");
+    let err = mgr
+        .bind(&request("s-1", &not_a_repo, "feat/x"))
+        .expect_err("non-git repo must error");
+    assert_eq!(err.code, "not_a_git_repo");
+}
+
+#[test]
+fn bind_rejects_flag_injecting_branch_and_base() {
+    let mgr = manager("flag-inject");
+    let repo = init_repo("flag-inject-repo");
+
+    // A branch beginning with '-' must be refused before any git invocation so
+    // it cannot be parsed as a git flag.
+    let err = mgr
+        .bind(&request("s-1", &repo, "--upload-pack=evil"))
+        .expect_err("dash-leading branch rejected");
+    assert_eq!(err.code, "invalid_branch");
+
+    // Same guard for a dash-leading base branch.
+    let mut req = request("s-2", &repo, "feat/x");
+    req.base_branch = Some("--exec=evil".to_owned());
+    let err = mgr.bind(&req).expect_err("dash-leading base rejected");
+    assert_eq!(err.code, "invalid_branch");
+}
+
+#[test]
+fn bind_rejects_flag_injecting_default_branch_from_crafted_head() {
+    // A malicious repository can point HEAD at a dash-leading ref so the
+    // resolved default branch smuggles a git flag (e.g. `--upload-pack=cmd`)
+    // into `git fetch`. The default branch must be validated like any other ref.
+    let mgr = manager("crafted-head");
+    let repo = init_repo("crafted-head-repo");
+    // Configure an origin so the fetch path would be reached if validation
+    // failed to catch the crafted HEAD.
+    let bogus = unique_dir("crafted-head-origin").join("missing.git");
+    git_in(&repo, &["remote", "add", "origin", &bogus.to_string_lossy()]);
+    // Craft HEAD to a dash-leading ref directly (a real attacker controls the
+    // repo's .git contents).
+    fs::write(
+        repo.join(".git/HEAD"),
+        "ref: refs/heads/--upload-pack=evil\n",
+    )
+    .expect("write crafted HEAD");
+
+    // Bind WITHOUT an explicit base so the crafted default branch is resolved.
+    let err = mgr
+        .bind(&request("s-1", &repo, "feat/x"))
+        .expect_err("crafted default branch must be rejected");
+    assert_eq!(err.code, "invalid_branch", "got: {err:?}");
+    // No worktree was created — the malicious ref never reached a git sink.
+    let target = mgr
+        .worktree_path("s-1", &super::canonical_or_original(&repo), "feat/x")
+        .expect("target path");
+    assert!(!target.exists(), "no worktree should have been created");
+}
+
+#[test]
+fn detached_head_binds_with_explicit_base_but_fails_without() {
+    let mgr = manager("detached");
+    let repo = init_repo("detached-repo");
+    // Detach HEAD at the current commit.
+    git_in(&repo, &["checkout", "--detach", "--quiet"]);
+
+    // With an explicit, existing base branch, binding succeeds — the default
+    // branch is never consulted, so detached HEAD is not a problem.
+    let with_base = {
+        let mut req = request("s-1", &repo, "feat/x");
+        req.base_branch = Some("main".to_owned());
+        mgr.bind(&req).expect("bind with explicit base on detached HEAD")
+    };
+    assert!(is_valid_worktree(&with_base.path));
+    assert_eq!(with_base.base_branch, "main");
+
+    // Without a base, the default branch cannot be resolved on detached HEAD.
+    let err = mgr
+        .bind(&request("s-2", &repo, "feat/y"))
+        .expect_err("detached HEAD without a base must error clearly");
+    assert_eq!(err.code, "invalid_base_branch");
+    assert!(
+        err.msg.contains("detached HEAD"),
+        "error should mention detached HEAD: {}",
+        err.msg
+    );
+}
+
+#[test]
+fn successful_fetch_starts_the_worktree_from_the_fetched_commit() {
+    // Upstream gains a commit AFTER the downstream clone, so the downstream
+    // local base ref is stale. A successful fetch must start the new branch
+    // from the fetched tip, not the stale local ref.
+    let upstream = init_repo("fetch-upstream");
+    let downstream = unique_dir("fetch-downstream-parent").join("clone");
+    let clone = Command::new("git")
+        .args(["clone", "-q"])
+        .arg(&upstream)
+        .arg(&downstream)
+        .output()
+        .expect("git clone");
+    assert!(
+        clone.status.success(),
+        "git clone failed: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    git_in(&downstream, &["config", "user.email", "test@example.com"]);
+    git_in(&downstream, &["config", "user.name", "Test"]);
+    git_in(&downstream, &["config", "commit.gpgsign", "false"]);
+
+    // Advance upstream main beyond the clone.
+    std::fs::write(upstream.join("NEW.md"), "v2\n").expect("write upstream file");
+    git_in(&upstream, &["add", "."]);
+    git_in(&upstream, &["commit", "-q", "-m", "v2"]);
+    let upstream_tip = git_stdout(&upstream, &["rev-parse", "HEAD"]);
+    let stale_local = git_stdout(&downstream, &["rev-parse", "refs/heads/main"]);
+    assert_ne!(upstream_tip, stale_local, "local must be stale before fetch");
+
+    let mgr = manager("fetch-success");
+    let mut req = request("s-1", &downstream, "feat/x");
+    req.base_branch = Some("main".to_owned());
+    let bound = mgr.bind(&req).expect("bind fetches and binds");
+
+    assert!(
+        bound.warnings.is_empty(),
+        "successful fetch must not warn: {:?}",
+        bound.warnings
+    );
+    let worktree_tip = git_stdout(&bound.path, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        worktree_tip, upstream_tip,
+        "worktree must start from the fetched tip, not the stale local ref"
+    );
+}
+
+#[test]
+fn second_session_on_same_branch_gets_a_clear_in_use_error() {
+    let mgr = manager("same-branch");
+    let repo = init_repo("same-branch-repo");
+    let first = mgr.bind(&request("s-1", &repo, "feat/shared")).expect("first bind");
+    assert!(is_valid_worktree(&first.path));
+
+    // A different session requesting the SAME branch cannot get a second
+    // worktree (git allows one worktree per branch); the error must be clear.
+    let err = mgr
+        .bind(&request("s-2", &repo, "feat/shared"))
+        .expect_err("same branch in a second session must fail clearly");
+    assert_eq!(err.code, "worktree_branch_in_use", "got: {err:?}");
+}
+
+// --- non-fatal warning paths ----------------------------------------------
+
+#[test]
+fn base_branch_fallback_keeps_the_worktree_with_a_warning() {
+    let mgr = manager("base-fallback");
+    let repo = init_repo("base-fallback-repo");
+    let mut req = request("s-1", &repo, "feat/x");
+    req.base_branch = Some("release/does-not-exist".to_owned());
+
+    let bound = mgr.bind(&req).expect("bind falls back, does not abort");
+    assert!(is_valid_worktree(&bound.path), "worktree must survive fallback");
+    assert_eq!(bound.base_branch, "main", "fell back to the default branch");
+    let warning = bound
+        .warnings
+        .iter()
+        .find(|w| w.kind == SessionWarningKind::BaseBranchFallback)
+        .expect("base-branch fallback warning present");
+    assert!(warning.message.contains("release/does-not-exist"));
+    assert!(warning.message.contains("main"));
+}
+
+#[test]
+fn fetch_failure_keeps_the_worktree_with_a_warning() {
+    let mgr = manager("fetch-warn");
+    let repo = init_repo("fetch-warn-repo");
+    // Configure an origin remote that cannot be fetched from: `git fetch origin
+    // main` fails, but the local `main` exists, so binding falls back to it.
+    let bogus = unique_dir("fetch-warn-bogus").join("missing.git");
+    git_in(&repo, &["remote", "add", "origin", &bogus.to_string_lossy()]);
+
+    let bound = mgr
+        .bind(&request("s-1", &repo, "feat/x"))
+        .expect("bind falls back when fetch fails");
+    assert!(is_valid_worktree(&bound.path), "worktree must survive fetch failure");
+    assert!(
+        bound
+            .warnings
+            .iter()
+            .any(|w| w.kind == SessionWarningKind::Fetch),
+        "fetch warning present: {:?}",
+        bound.warnings
+    );
+}
+
+#[test]
+fn clean_repo_without_origin_produces_no_fetch_warning() {
+    let mgr = manager("no-origin");
+    let repo = init_repo("no-origin-repo");
+    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    assert!(
+        !bound
+            .warnings
+            .iter()
+            .any(|w| w.kind == SessionWarningKind::Fetch),
+        "no origin means nothing to fetch and no warning: {:?}",
+        bound.warnings
+    );
+}
+
+#[test]
+fn failing_setup_script_keeps_the_worktree_with_a_warning() {
+    let mgr = manager("setup-warn");
+    let repo = init_repo("setup-warn-repo");
+    // Commit a setup script on main that exits non-zero; the worktree (created
+    // from main) inherits it.
+    fs::create_dir_all(repo.join(".zagentmesh")).expect("create .zagentmesh");
+    fs::write(
+        repo.join(".zagentmesh/setup"),
+        "#!/bin/sh\necho 'boom' >&2\nexit 3\n",
+    )
+    .expect("write setup script");
+    git_in(&repo, &["add", "."]);
+    git_in(&repo, &["commit", "-q", "-m", "add failing setup"]);
+
+    let bound = mgr
+        .bind(&request("s-1", &repo, "feat/x"))
+        .expect("bind keeps worktree despite setup failure");
+    assert!(is_valid_worktree(&bound.path), "worktree must survive setup failure");
+    let warning = bound
+        .warnings
+        .iter()
+        .find(|w| w.kind == SessionWarningKind::SetupScript)
+        .expect("setup-script warning present");
+    assert!(warning.detail.is_some(), "setup warning carries detail");
+}
+
+#[test]
+fn successful_setup_script_produces_no_warning() {
+    let mgr = manager("setup-ok");
+    let repo = init_repo("setup-ok-repo");
+    fs::create_dir_all(repo.join(".zagentmesh")).expect("create .zagentmesh");
+    fs::write(repo.join(".zagentmesh/setup"), "#!/bin/sh\nexit 0\n").expect("write setup");
+    git_in(&repo, &["add", "."]);
+    git_in(&repo, &["commit", "-q", "-m", "add ok setup"]);
+
+    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    assert!(
+        bound.warnings.is_empty(),
+        "a passing setup script must not warn: {:?}",
+        bound.warnings
+    );
+}
+
+// --- cleanup ownership ----------------------------------------------------
+
+#[test]
+fn cleanup_session_removes_only_owned_worktrees() {
+    let mgr = manager("cleanup");
+    let repo = init_repo("cleanup-repo");
+    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    assert!(bound.path.exists());
+
+    // Unknown session: nothing owned, nothing removed.
+    let none = mgr.cleanup_session("s-unknown").expect("cleanup unknown");
+    assert_eq!(none, 0);
+    assert!(bound.path.exists(), "an unowned session must not touch our tree");
+
+    // Owned session: the tree and its binding are removed.
+    let removed = mgr.cleanup_session("s-1").expect("cleanup owned");
+    assert_eq!(removed, 1);
+    assert!(!bound.path.exists(), "owned worktree directory removed");
+    assert!(
+        mgr.store()
+            .find("s-1", &bound.repository, &branch_slug("feat/x"))
+            .expect("load store")
+            .is_none(),
+        "binding dropped after cleanup"
+    );
+}
+
+// --- store round-trip -----------------------------------------------------
+
+#[test]
+fn store_round_trips_find_and_remove() {
+    let path = unique_dir("store").join("worktree-bindings.jsonl");
+    let store = WorktreeStore::new(path.clone());
+    assert!(store.load().expect("empty load").is_empty());
+
+    let binding = WorktreeBinding {
+        session_id: "s-1".to_owned(),
+        repository: PathBuf::from("/workspace/project"),
+        branch: "feat/x".to_owned(),
+        base_branch: "main".to_owned(),
+        branch_slug: "feat-x".to_owned(),
+        path: PathBuf::from("/data/worktrees/s-1-project-feat-x"),
+        status: WorktreeStatus::Active,
+        created_at: "2026-06-18T00:00:00Z".to_owned(),
+        updated_at: "2026-06-18T00:00:00Z".to_owned(),
+    };
+    store.record(&binding).expect("record");
+
+    let found = store
+        .find("s-1", Path::new("/workspace/project"), "feat-x")
+        .expect("find")
+        .expect("present");
+    assert_eq!(found, binding);
+
+    // A second branch of the same (session, repo) must coexist, not overwrite.
+    let other = WorktreeBinding {
+        branch: "feat/y".to_owned(),
+        branch_slug: "feat-y".to_owned(),
+        path: PathBuf::from("/data/worktrees/s-1-project-feat-y"),
+        ..binding.clone()
+    };
+    store.record(&other).expect("record other");
+    assert_eq!(store.load().expect("load").len(), 2, "two branches coexist");
+
+    let removed = store.remove_session("s-1").expect("remove session");
+    assert_eq!(removed, 2);
+    assert!(store.load().expect("load").is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn store_file_is_owner_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = unique_dir("store-perms").join("worktree-bindings.jsonl");
+    let store = WorktreeStore::new(path.clone());
+    store
+        .record(&WorktreeBinding {
+            session_id: "s-1".to_owned(),
+            repository: PathBuf::from("/workspace/project"),
+            branch: "feat/x".to_owned(),
+            base_branch: "main".to_owned(),
+            branch_slug: "feat-x".to_owned(),
+            path: PathBuf::from("/data/worktrees/s-1-project-feat-x"),
+            status: WorktreeStatus::Active,
+            created_at: "2026-06-18T00:00:00Z".to_owned(),
+            updated_at: "2026-06-18T00:00:00Z".to_owned(),
+        })
+        .expect("record");
+    let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "store file must be owner-private");
+}

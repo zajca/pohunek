@@ -20,6 +20,14 @@ use zagentmesh_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
 /// SQLite store lands.
 const RESUME_STORE_NAME: &str = "resume-bindings.jsonl";
 
+/// Subdirectory under the data dir holding per-session git worktrees.
+const WORKTREES_SUBDIR: &str = "worktrees";
+
+/// File name of the minimal worktree-binding store under the data dir.
+///
+/// TODO(milestone 9): superseded by `state.db` (the `worktree` table).
+const WORKTREE_STORE_NAME: &str = "worktree-bindings.jsonl";
+
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
@@ -57,12 +65,15 @@ async fn run() -> Result<(), DaemonError> {
     let _lock = InstanceLock::acquire(&paths.lock)?;
     info!(lock = %paths.lock.display(), "acquired single-instance lock");
 
-    // 5. Build the session registry with the hook-handshake socket path and the
-    //    resume-binding store, so spawned agents can report their native id and
-    //    captured sessions survive a restart.
+    // 5. Build the session registry with the hook-handshake socket path, the
+    //    resume-binding store, and the worktree-binding store + worktrees root,
+    //    so spawned agents can report their native id, captured sessions survive
+    //    a restart, and a repo+branch session binds a dedicated worktree.
     let config = SessionRegistryConfig {
         socket_path: Some(paths.socket.clone()),
         resume_store_path: Some(paths.data_dir.join(RESUME_STORE_NAME)),
+        worktree_root: Some(paths.data_dir.join(WORKTREES_SUBDIR)),
+        worktree_store_path: Some(paths.data_dir.join(WORKTREE_STORE_NAME)),
         ..SessionRegistryConfig::default()
     };
     let sessions = SessionRegistry::new(config);

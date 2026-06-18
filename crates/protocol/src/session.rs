@@ -46,6 +46,21 @@ pub struct SessionNewParams {
     pub cols: u16,
     /// Initial terminal height in rows.
     pub rows: u16,
+    /// Git repository to bind a dedicated worktree for. When set together with
+    /// `branch`, the daemon creates/binds one worktree per
+    /// `(session, repository, branch)` and launches the agent inside it instead
+    /// of in `cwd` (see `docs/plan-phase-1.md` "Worktree-per-Session"). `repo`
+    /// and `branch` must be supplied together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<PathBuf>,
+    /// Branch to check out in the bound worktree. Requires `repo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Base branch the worktree's branch is created from. When the named base
+    /// branch is missing the daemon falls back to the repository's default
+    /// branch and records a non-fatal warning. Requires `repo` + `branch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
 }
 
 /// Opaque session identifier.
@@ -161,6 +176,41 @@ pub enum SessionState {
     Failed,
 }
 
+/// The kind of a non-fatal worktree-setup warning.
+///
+/// Each variant mirrors a Kandev worktree warning field (see
+/// `docs/plan-phase-1.md` "Worktree-per-Session"): none of them aborts session
+/// creation — the worktree is kept, the warning is surfaced, and the user
+/// decides whether to intervene.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionWarningKind {
+    /// A `git fetch` from the configured remote failed; the worktree was bound
+    /// from the local base ref instead, which may be out of date.
+    Fetch,
+    /// The requested base branch did not exist; the worktree was bound from the
+    /// repository's default branch instead.
+    BaseBranchFallback,
+    /// The repository setup script failed; the worktree was kept without it.
+    SetupScript,
+}
+
+/// A non-fatal warning surfaced while setting up a session's worktree.
+///
+/// Carries a machine-readable [`kind`](Self::kind), a human-readable summary,
+/// and optional raw detail (e.g. trimmed git output) for debugging. Never
+/// contains secrets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionWarning {
+    /// Machine-readable warning kind.
+    pub kind: SessionWarningKind,
+    /// Human-readable summary of what happened and what was done instead.
+    pub message: String,
+    /// Optional longer detail (e.g. trimmed git stderr) for diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 /// Summary returned by session lifecycle methods and published by events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -188,6 +238,21 @@ pub struct SessionInfo {
     /// daemon restart (see `docs/plan-phase-1.md` "Resume Model").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_id: Option<String>,
+    /// Source git repository, when the session is bound to a worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<PathBuf>,
+    /// Branch checked out in the bound worktree, when the session has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Path to the bound worktree, when the session was launched in one. Equal
+    /// to `cwd` for worktree sessions; absent for plain-`cwd` sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<PathBuf>,
+    /// Non-fatal warnings raised while setting up the worktree. Empty when the
+    /// session has no worktree or setup was clean; omitted from the wire form
+    /// when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<SessionWarning>,
     /// Creation timestamp in the daemon's wire timestamp format.
     pub created_at: String,
     /// Last update timestamp in the daemon's wire timestamp format.

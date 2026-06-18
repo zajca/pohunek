@@ -9,8 +9,8 @@ use protocol::{
     ProtocolVersion, Request, Response, SessionAttachParams, SessionAttachResult,
     SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
     SessionInputResult, SessionNewParams, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, StateSource,
-    PROTOCOL_VERSION,
+    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, SessionWarning,
+    SessionWarningKind, StateSource, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 
@@ -39,6 +39,10 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         state_source: StateSource::Process,
         activity: None,
         native_session_id: None,
+        repo: None,
+        branch: None,
+        worktree_path: None,
+        warnings: Vec::new(),
         created_at: "2026-06-17T10:00:00Z".to_owned(),
         updated_at: "2026-06-17T10:01:00Z".to_owned(),
         exit_code,
@@ -86,6 +90,9 @@ fn session_new_params_json_shape_roundtrips() {
         cwd: Some(PathBuf::from("/workspace/project")),
         cols: 120,
         rows: 40,
+        repo: None,
+        branch: None,
+        base_branch: None,
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -98,6 +105,60 @@ fn session_new_params_json_shape_roundtrips() {
             "rows": 40
         })
     );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn session_new_params_roundtrips_with_worktree_fields() {
+    let params = SessionNewParams {
+        agent: AgentKind::Claude,
+        cwd: None,
+        cols: 80,
+        rows: 24,
+        repo: Some(PathBuf::from("/workspace/project")),
+        branch: Some("feature/login".to_owned()),
+        base_branch: Some("main".to_owned()),
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize params");
+    assert_eq!(
+        value,
+        json!({
+            "agent": "claude",
+            "cols": 80,
+            "rows": 24,
+            "repo": "/workspace/project",
+            "branch": "feature/login",
+            "base_branch": "main"
+        })
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn session_new_params_omits_absent_worktree_fields() {
+    let params = SessionNewParams {
+        agent: AgentKind::Shell,
+        cwd: None,
+        cols: 80,
+        rows: 24,
+        repo: None,
+        branch: None,
+        base_branch: None,
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize params");
+    let object = value.as_object().expect("params object");
+    for absent in ["cwd", "repo", "branch", "base_branch"] {
+        assert!(
+            !object.contains_key(absent),
+            "absent {absent} must be omitted: {value}"
+        );
+    }
 
     let back = line_roundtrip(&params);
     assert_eq!(back, params);
@@ -344,6 +405,106 @@ fn session_info_omits_absent_native_session_id() {
 
     let back = line_roundtrip(&info);
     assert_eq!(back.native_session_id, None);
+}
+
+#[test]
+fn session_warning_json_shape_roundtrips() {
+    let cases = [
+        (SessionWarningKind::Fetch, json!("fetch")),
+        (
+            SessionWarningKind::BaseBranchFallback,
+            json!("base_branch_fallback"),
+        ),
+        (SessionWarningKind::SetupScript, json!("setup_script")),
+    ];
+    for (kind, expected) in cases {
+        let value = serde_json::to_value(kind).expect("serialize warning kind");
+        assert_eq!(value, expected);
+        assert_eq!(line_roundtrip(&kind), kind);
+    }
+
+    let warning = SessionWarning {
+        kind: SessionWarningKind::Fetch,
+        message: "Could not fetch from origin; using local base ref.".to_owned(),
+        detail: Some("fatal: 'origin' does not appear to be a git repository".to_owned()),
+    };
+    let value = serde_json::to_value(&warning).expect("serialize warning");
+    assert_eq!(
+        value,
+        json!({
+            "kind": "fetch",
+            "message": "Could not fetch from origin; using local base ref.",
+            "detail": "fatal: 'origin' does not appear to be a git repository"
+        })
+    );
+    assert_eq!(line_roundtrip(&warning), warning);
+}
+
+#[test]
+fn session_warning_omits_absent_detail() {
+    let warning = SessionWarning {
+        kind: SessionWarningKind::SetupScript,
+        message: "Repository setup script failed; the worktree was kept.".to_owned(),
+        detail: None,
+    };
+    let value = serde_json::to_value(&warning).expect("serialize warning");
+    assert!(
+        !value
+            .as_object()
+            .expect("warning object")
+            .contains_key("detail"),
+        "absent detail must be omitted: {value}"
+    );
+    assert_eq!(line_roundtrip(&warning), warning);
+}
+
+#[test]
+fn session_info_roundtrips_with_worktree_fields_and_warnings() {
+    let info = SessionInfo {
+        cwd: PathBuf::from("/data/worktrees/s-42-project-feature-login"),
+        repo: Some(PathBuf::from("/workspace/project")),
+        branch: Some("feature/login".to_owned()),
+        worktree_path: Some(PathBuf::from(
+            "/data/worktrees/s-42-project-feature-login",
+        )),
+        warnings: vec![SessionWarning {
+            kind: SessionWarningKind::BaseBranchFallback,
+            message: "Requested base branch \"release\" not found; used \"main\".".to_owned(),
+            detail: None,
+        }],
+        ..running_shell_session(None)
+    };
+
+    let value = serde_json::to_value(&info).expect("serialize session info");
+    assert_eq!(value["repo"], json!("/workspace/project"));
+    assert_eq!(value["branch"], json!("feature/login"));
+    assert_eq!(
+        value["worktree_path"],
+        json!("/data/worktrees/s-42-project-feature-login")
+    );
+    assert_eq!(value["warnings"][0]["kind"], json!("base_branch_fallback"));
+
+    let back = line_roundtrip(&info);
+    assert_eq!(back, info);
+}
+
+#[test]
+fn session_info_omits_absent_worktree_fields() {
+    let info = running_shell_session(None);
+
+    let value = serde_json::to_value(&info).expect("serialize session info");
+    let object = value.as_object().expect("session info object");
+    for absent in ["repo", "branch", "worktree_path", "warnings"] {
+        assert!(
+            !object.contains_key(absent),
+            "absent {absent} must be omitted: {value}"
+        );
+    }
+
+    let back = line_roundtrip(&info);
+    assert!(back.warnings.is_empty());
+    assert_eq!(back.repo, None);
+    assert_eq!(back.worktree_path, None);
 }
 
 #[test]

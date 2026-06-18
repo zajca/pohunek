@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use protocol::{
     event, AgentKind, ErrorClass, Event, ProtocolError, SessionId, SessionInfo, SessionInputParams,
     SessionInputResult, SessionNewParams, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionState, SessionStopResult, StateSource, PROTOCOL_VERSION,
+    SessionState, SessionStopResult, SessionWarning, StateSource, PROTOCOL_VERSION,
 };
 use serde_json::json;
 use time::format_description::well_known::Rfc3339;
@@ -29,6 +29,7 @@ use crate::detect::{ActivityTransition, Detector, DetectorConfig};
 use crate::integration::{ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH};
 use crate::pty::{PtyCommand, PtyError, PtyExit, PtyHandle};
 use crate::store::{ResumeBinding, ResumeStore};
+use crate::worktree::{WorktreeManager, WorktreeRequest, WorktreeStore};
 
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
@@ -101,6 +102,14 @@ pub struct SessionRegistryConfig {
     /// Backing file for the minimal resume-binding store. `None` disables
     /// persistence (sessions are then not resumable across a restart).
     pub resume_store_path: Option<PathBuf>,
+    /// Root directory under which per-session worktrees are created
+    /// (`<data_dir>/worktrees`). Must be set together with
+    /// [`Self::worktree_store_path`] to enable worktree binding; when unset, a
+    /// `session.new` carrying a repo+branch fails (no silent default).
+    pub worktree_root: Option<PathBuf>,
+    /// Backing file for the minimal worktree-binding store. Set together with
+    /// [`Self::worktree_root`].
+    pub worktree_store_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +130,14 @@ struct PtySessionSpec {
     command: PtyCommand,
     /// Native id when relaunching a captured session (`None` on first launch).
     native_session_id: Option<String>,
+    /// Source repository, when the session is bound to a worktree.
+    repo: Option<PathBuf>,
+    /// Branch checked out in the bound worktree.
+    branch: Option<String>,
+    /// Bound worktree path (equal to `cwd` for worktree sessions).
+    worktree_path: Option<PathBuf>,
+    /// Non-fatal worktree-setup warnings to surface on the session.
+    warnings: Vec<SessionWarning>,
 }
 
 impl Default for SessionRegistryConfig {
@@ -133,6 +150,8 @@ impl Default for SessionRegistryConfig {
             claude_submit_delay: crate::agent::DEFAULT_CLAUDE_SUBMIT_DELAY,
             socket_path: None,
             resume_store_path: None,
+            worktree_root: None,
+            worktree_store_path: None,
         }
     }
 }
@@ -154,6 +173,9 @@ struct SessionRegistryInner {
     events: broadcast::Sender<Event>,
     /// Minimal resume-binding store, present when persistence is configured.
     resume_store: Option<ResumeStore>,
+    /// Per-session worktree binder, present when worktree binding is configured.
+    /// Shared into `spawn_blocking` for the (blocking) git subprocesses.
+    worktree: Option<Arc<WorktreeManager>>,
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +224,15 @@ impl SessionRegistry {
     pub fn new(config: SessionRegistryConfig) -> Self {
         let (events, _) = broadcast::channel(128);
         let resume_store = config.resume_store_path.clone().map(ResumeStore::new);
+        // Worktree binding needs both a root for the trees and a store file; it
+        // is enabled only when both are configured (no silent default path).
+        let worktree = match (&config.worktree_root, &config.worktree_store_path) {
+            (Some(root), Some(store_path)) => Some(Arc::new(WorktreeManager::new(
+                root.clone(),
+                WorktreeStore::new(store_path.clone()),
+            ))),
+            _ => None,
+        };
         Self {
             inner: Arc::new(SessionRegistryInner {
                 sessions: Mutex::new(HashMap::new()),
@@ -212,6 +243,7 @@ impl SessionRegistry {
                 config,
                 events,
                 resume_store,
+                worktree,
             }),
         }
     }
@@ -222,7 +254,12 @@ impl SessionRegistry {
         self.inner.events.subscribe()
     }
 
-    /// Create a new shell-backed PTY session.
+    /// Create a new PTY-backed session.
+    ///
+    /// When `params` carries a repo + branch, a dedicated worktree is bound (or
+    /// reused) and the agent is launched **inside** it; otherwise the agent is
+    /// launched in the resolved `cwd` (today's behavior). Non-fatal worktree
+    /// warnings ride along on the returned [`SessionInfo`].
     pub async fn create(&self, params: SessionNewParams) -> Result<SessionInfo, ProtocolError> {
         validate_new_params(&params)?;
         let cwd = match params.cwd.clone() {
@@ -241,11 +278,26 @@ impl SessionRegistry {
             "s-{}",
             self.inner.next_id.fetch_add(1, Ordering::Relaxed)
         ));
+
+        // Bind a worktree when a repo+branch was requested; launch there instead
+        // of the plain cwd. A plain cwd (no repo) keeps today's behavior.
+        let bound = self.resolve_worktree(&id, &params).await?;
+        let (launch_cwd, repo, branch, worktree_path, warnings) = match bound {
+            Some(bound) => (
+                bound.path.clone(),
+                Some(bound.repository),
+                Some(bound.branch),
+                Some(bound.path),
+                bound.warnings,
+            ),
+            None => (cwd, None, None, None, Vec::new()),
+        };
+
         let env_extra = self.hook_env(params.agent, &id);
         let command = build_launch_command(
             params.agent,
             &self.inner.config.shell_command,
-            cwd.clone(),
+            launch_cwd.clone(),
             params.cols,
             params.rows,
             env_extra,
@@ -254,13 +306,60 @@ impl SessionRegistry {
         self.register_pty_session(PtySessionSpec {
             id,
             agent: params.agent,
-            cwd,
+            cwd: launch_cwd,
             cols: params.cols,
             rows: params.rows,
             command,
             native_session_id: None,
+            repo,
+            branch,
+            worktree_path,
+            warnings,
         })
         .await
+    }
+
+    /// Bind a worktree for this session when `params` requests one.
+    ///
+    /// Returns `Ok(None)` for a plain-`cwd` session (no repo). Validates that
+    /// `repo`/`branch` are supplied together and that `base_branch` is not given
+    /// without them. Runs the blocking git work on a blocking thread.
+    async fn resolve_worktree(
+        &self,
+        id: &SessionId,
+        params: &SessionNewParams,
+    ) -> Result<Option<crate::worktree::WorktreeBound>, ProtocolError> {
+        match (params.repo.as_ref(), params.branch.as_ref()) {
+            (None, None) => {
+                if params.base_branch.is_some() {
+                    return Err(ProtocolError::bad_request(
+                        "session.new base_branch requires repo and branch",
+                    ));
+                }
+                Ok(None)
+            }
+            (Some(_), None) | (None, Some(_)) => Err(ProtocolError::bad_request(
+                "session.new repo and branch must be supplied together",
+            )),
+            (Some(repo), Some(branch)) => {
+                let Some(manager) = self.inner.worktree.clone() else {
+                    return Err(runtime_error(
+                        "worktree_not_configured",
+                        "the daemon is not configured for worktree binding",
+                    ));
+                };
+                let request = WorktreeRequest {
+                    session_id: id.0.clone(),
+                    repo: repo.clone(),
+                    branch: branch.clone(),
+                    base_branch: params.base_branch.clone(),
+                };
+                let bound = tokio::task::spawn_blocking(move || manager.bind(&request))
+                    .await
+                    .map_err(|_| runtime_error("worktree_bind_failed", "worktree bind task panicked"))??;
+                Ok(Some(bound))
+            }
+        }
     }
 
     /// Spawn a PTY for `spec.command`, register the session, and start its
@@ -278,6 +377,10 @@ impl SessionRegistry {
             rows,
             command,
             native_session_id,
+            repo,
+            branch,
+            worktree_path,
+            warnings,
         } = spec;
 
         let history_limit_bytes = self.inner.config.output_history_limit_bytes;
@@ -302,6 +405,10 @@ impl SessionRegistry {
             state_source: StateSource::Process,
             activity: None,
             native_session_id,
+            repo,
+            branch,
+            worktree_path,
+            warnings,
             created_at: now.clone(),
             updated_at: now,
             exit_code: None,
@@ -566,6 +673,10 @@ impl SessionRegistry {
             env_extra,
         };
         let command = resume_pty_command(binding.agent, &session_ref, &opts)?;
+        // A resumed session relaunches in its recorded cwd, which already is the
+        // worktree path for worktree sessions (the worktree persists on disk
+        // across a daemon restart). M8 does not re-restore the worktree metadata
+        // fields here; the M9 SQLite store unifies the two records.
         self.register_pty_session(PtySessionSpec {
             id,
             agent: binding.agent,
@@ -574,6 +685,10 @@ impl SessionRegistry {
             rows: binding.rows,
             command,
             native_session_id: binding.native_session_id,
+            repo: None,
+            branch: None,
+            worktree_path: None,
+            warnings: Vec::new(),
         })
         .await
     }
@@ -1218,6 +1333,9 @@ mod tests {
             cwd: Some(PathBuf::from("/tmp")),
             cols: 80,
             rows: 24,
+            repo: None,
+            branch: None,
+            base_branch: None,
         }
     }
 

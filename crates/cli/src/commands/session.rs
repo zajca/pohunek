@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use clap::ValueEnum;
 use protocol::{
     method, AgentActivity, AgentKind, Request, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionNewParams, SessionState, SessionStopResult, StateSource,
+    SessionInputResult, SessionNewParams, SessionState, SessionStopResult, SessionWarningKind,
+    StateSource,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -40,21 +41,35 @@ impl From<AgentArg> for AgentKind {
     }
 }
 
+/// Arguments for `session new`, grouped to keep the call site readable as the
+/// optional worktree flags accumulate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NewArgs {
+    /// Agent kind to start.
+    pub agent: AgentArg,
+    /// Working directory (ignored when a worktree is bound).
+    pub cwd: Option<PathBuf>,
+    /// Initial terminal columns.
+    pub cols: u16,
+    /// Initial terminal rows.
+    pub rows: u16,
+    /// Repository to bind a worktree for.
+    pub repo: Option<PathBuf>,
+    /// Branch to check out in the worktree.
+    pub branch: Option<String>,
+    /// Base branch the worktree's branch is created from.
+    pub base_branch: Option<String>,
+}
+
 /// Run `session new`.
 ///
 /// # Errors
 ///
 /// Returns [`CliError`] if the daemon is unreachable, rejects the request, or
 /// returns a payload that does not match the session contract.
-pub(crate) async fn run_new(
-    paths: &Paths,
-    agent: AgentArg,
-    cwd: Option<PathBuf>,
-    cols: u16,
-    rows: u16,
-) -> Result<(), CliError> {
+pub(crate) async fn run_new(paths: &Paths, args: NewArgs) -> Result<(), CliError> {
     let mut client = LocalClient::connect(&paths.socket).await?;
-    let request = build_new_request(agent, cwd, cols, rows)?;
+    let request = build_new_request(&args)?;
     let result = client.request(&request).await?;
     let info: SessionInfo = serde_json::from_value(result)?;
 
@@ -155,19 +170,17 @@ where
     ))
 }
 
-fn build_new_request(
-    agent: AgentArg,
-    cwd: Option<PathBuf>,
-    cols: u16,
-    rows: u16,
-) -> Result<Request, CliError> {
+fn build_new_request(args: &NewArgs) -> Result<Request, CliError> {
     request_with_params(
         method::SESSION_NEW,
         &SessionNewParams {
-            agent: agent.into(),
-            cwd,
-            cols,
-            rows,
+            agent: args.agent.into(),
+            cwd: args.cwd.clone(),
+            cols: args.cols,
+            rows: args.rows,
+            repo: args.repo.clone(),
+            branch: args.branch.clone(),
+            base_branch: args.base_branch.clone(),
         },
     )
 }
@@ -212,11 +225,27 @@ fn local_session_id(target: &Target) -> Result<&str, CliError> {
 }
 
 fn render_new_human(info: &SessionInfo) -> String {
-    format!(
+    let mut output = format!(
         "session {} created (state: {})\n",
         info.id.0,
         state_label(info.state)
-    )
+    );
+    if let Some(path) = &info.worktree_path {
+        let branch = info
+            .branch
+            .as_deref()
+            .map(|b| format!(" (branch {b})"))
+            .unwrap_or_default();
+        output.push_str(&format!("  worktree: {}{branch}\n", path.display()));
+    }
+    for warning in &info.warnings {
+        output.push_str(&format!(
+            "  warning [{}]: {}\n",
+            warning_kind_label(warning.kind),
+            warning.message
+        ));
+    }
+    output
 }
 
 fn render_list_human(sessions: &[SessionInfo]) -> String {
@@ -232,10 +261,16 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
         .max()
         .unwrap_or(0)
         .max("AGENT".len());
+    let branch_width = sessions
+        .iter()
+        .map(|s| branch_label(s).len())
+        .max()
+        .unwrap_or(0)
+        .max("BRANCH".len());
 
     let mut output = String::new();
     output.push_str(&format!(
-        "{:<id_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  CWD\n",
+        "{:<id_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<branch_width$}  {:<4}  CWD\n",
         "ID",
         "AGENT",
         "STATE",
@@ -243,12 +278,15 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
         "SOURCE",
         "PID",
         "SIZE",
+        "BRANCH",
+        "WARN",
         id_width = id_width,
-        agent_width = agent_width
+        agent_width = agent_width,
+        branch_width = branch_width
     ));
     for session in sessions {
         output.push_str(&format!(
-            "{:<id_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {}\n",
+            "{:<id_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<branch_width$}  {:<4}  {}\n",
             session.id.0,
             agent_label(session.agent),
             state_label(session.state),
@@ -256,16 +294,34 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
             state_source_label(session.state_source),
             session.pid,
             format!("{}x{}", session.cols, session.rows),
+            branch_label(session),
+            warn_count_label(session),
             session.cwd.display(),
             id_width = id_width,
-            agent_width = agent_width
+            agent_width = agent_width,
+            branch_width = branch_width
         ));
     }
     output
 }
 
+/// Branch column value: the bound branch, or `-` for a plain session.
+fn branch_label(info: &SessionInfo) -> String {
+    info.branch.clone().unwrap_or_else(|| "-".to_owned())
+}
+
+/// Warning column value: a count, or `-` when there are none.
+fn warn_count_label(info: &SessionInfo) -> String {
+    if info.warnings.is_empty() {
+        "-".to_owned()
+    } else {
+        info.warnings.len().to_string()
+    }
+}
+
 fn render_inspect_human(info: &SessionInfo) -> String {
-    let rows = [
+    let none = || "<none>".to_owned();
+    let rows: Vec<(&str, String)> = vec![
         ("id", info.id.0.clone()),
         ("agent", agent_label(info.agent).to_owned()),
         ("cwd", info.cwd.display().to_string()),
@@ -280,9 +336,7 @@ fn render_inspect_human(info: &SessionInfo) -> String {
         ),
         (
             "native_session_id",
-            info.native_session_id
-                .clone()
-                .unwrap_or_else(|| "<none>".to_owned()),
+            info.native_session_id.clone().unwrap_or_else(none),
         ),
         (
             "resumable",
@@ -292,13 +346,29 @@ fn render_inspect_human(info: &SessionInfo) -> String {
                 "no".to_owned()
             },
         ),
+        (
+            "repo",
+            info.repo
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(none),
+        ),
+        ("branch", info.branch.clone().unwrap_or_else(none)),
+        (
+            "worktree_path",
+            info.worktree_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(none),
+        ),
+        ("warnings", warn_count_label(info)),
         ("created_at", info.created_at.clone()),
         ("updated_at", info.updated_at.clone()),
         (
             "exit_code",
             info.exit_code
                 .map(|code| code.to_string())
-                .unwrap_or_else(|| "<none>".to_owned()),
+                .unwrap_or_else(none),
         ),
     ];
     let width = rows
@@ -310,8 +380,20 @@ fn render_inspect_human(info: &SessionInfo) -> String {
 
     let mut output = String::new();
     output.push_str(&format!("{:<width$}  VALUE\n", "FIELD", width = width));
-    for (field, value) in rows {
+    for (field, value) in &rows {
         output.push_str(&format!("{field:<width$}  {value}\n", width = width));
+    }
+    // Each non-fatal warning is detailed below the table so a worktree session
+    // surfaces exactly what happened and what was done instead.
+    for warning in &info.warnings {
+        output.push_str(&format!(
+            "warning [{}]: {}\n",
+            warning_kind_label(warning.kind),
+            warning.message
+        ));
+        if let Some(detail) = &warning.detail {
+            output.push_str(&format!("  detail: {detail}\n"));
+        }
     }
     output
 }
@@ -367,11 +449,22 @@ fn state_source_label(source: StateSource) -> &'static str {
     }
 }
 
+fn warning_kind_label(kind: SessionWarningKind) -> &'static str {
+    match kind {
+        SessionWarningKind::Fetch => "fetch",
+        SessionWarningKind::BaseBranchFallback => "base_branch_fallback",
+        SessionWarningKind::SetupScript => "setup_script",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use protocol::{method, AgentActivity, Request, SessionInfo, SessionState, StateSource};
+    use protocol::{
+        method, AgentActivity, Request, SessionInfo, SessionState, SessionWarning,
+        SessionWarningKind, StateSource,
+    };
     use serde_json::json;
 
     use super::*;
@@ -390,9 +483,25 @@ mod tests {
             state_source: StateSource::Process,
             activity: None,
             native_session_id: None,
+            repo: None,
+            branch: None,
+            worktree_path: None,
+            warnings: Vec::new(),
             created_at: "2026-06-17T10:00:00Z".to_owned(),
             updated_at: "2026-06-17T10:01:00Z".to_owned(),
             exit_code: None,
+        }
+    }
+
+    fn new_args(agent: AgentArg, cwd: Option<PathBuf>) -> NewArgs {
+        NewArgs {
+            agent,
+            cwd,
+            cols: 80,
+            rows: 24,
+            repo: None,
+            branch: None,
+            base_branch: None,
         }
     }
 
@@ -411,7 +520,7 @@ mod tests {
 
     #[test]
     fn new_request_defaults_to_shell_size_and_omits_cwd() {
-        let request = build_new_request(AgentArg::Shell, None, 80, 24).expect("request");
+        let request = build_new_request(&new_args(AgentArg::Shell, None)).expect("request");
 
         assert_request(
             &request,
@@ -426,7 +535,7 @@ mod tests {
 
     #[test]
     fn new_request_accepts_codex_agent() {
-        let request = build_new_request(AgentArg::Codex, None, 80, 24).expect("request");
+        let request = build_new_request(&new_args(AgentArg::Codex, None)).expect("request");
 
         assert_request(
             &request,
@@ -441,7 +550,7 @@ mod tests {
 
     #[test]
     fn new_request_accepts_claude_agent() {
-        let request = build_new_request(AgentArg::Claude, None, 80, 24).expect("request");
+        let request = build_new_request(&new_args(AgentArg::Claude, None)).expect("request");
 
         assert_request(
             &request,
@@ -455,13 +564,43 @@ mod tests {
     }
 
     #[test]
+    fn new_request_carries_worktree_repo_branch_and_base() {
+        let args = NewArgs {
+            agent: AgentArg::Claude,
+            cwd: None,
+            cols: 80,
+            rows: 24,
+            repo: Some(PathBuf::from("/workspace/project")),
+            branch: Some("feature/login".to_owned()),
+            base_branch: Some("main".to_owned()),
+        };
+        let request = build_new_request(&args).expect("request");
+
+        assert_request(
+            &request,
+            method::SESSION_NEW,
+            json!({
+                "agent": "claude",
+                "cols": 80,
+                "rows": 24,
+                "repo": "/workspace/project",
+                "branch": "feature/login",
+                "base_branch": "main"
+            }),
+        );
+    }
+
+    #[test]
     fn new_request_includes_cwd_and_requested_size() {
-        let request = build_new_request(
-            AgentArg::Shell,
-            Some(PathBuf::from("/workspace/project")),
-            120,
-            40,
-        )
+        let request = build_new_request(&NewArgs {
+            agent: AgentArg::Shell,
+            cwd: Some(PathBuf::from("/workspace/project")),
+            cols: 120,
+            rows: 40,
+            repo: None,
+            branch: None,
+            base_branch: None,
+        })
         .expect("request");
 
         assert_request(
@@ -538,16 +677,39 @@ mod tests {
         assert_eq!(output, "session s-42 created (state: running)\n");
     }
 
+    /// Whitespace-split tokens of the list row whose first column is `id`.
+    /// Robust to column-width changes (the table is space-padded).
+    fn list_row(output: &str, id: &str) -> Vec<String> {
+        output
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some(id))
+            .map(|line| line.split_whitespace().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
     #[test]
     fn renders_compact_session_list_table() {
         let output = render_list_human(&[running_session("s-42")]);
 
-        assert!(
-            output.contains("ID    AGENT  STATE    ACTIVITY  SOURCE        PID   SIZE    CWD\n")
+        let header = output.lines().next().expect("header line");
+        for column in ["ID", "AGENT", "STATE", "BRANCH", "WARN", "CWD"] {
+            assert!(header.contains(column), "header missing {column}: {header}");
+        }
+        assert_eq!(
+            list_row(&output, "s-42"),
+            vec![
+                "s-42",
+                "shell",
+                "running",
+                "-",
+                "process",
+                "4242",
+                "120x40",
+                "-",
+                "-",
+                "/workspace/project",
+            ]
         );
-        assert!(output.contains(
-            "s-42  shell  running  -         process       4242  120x40  /workspace/project\n"
-        ));
     }
 
     #[test]
@@ -558,9 +720,21 @@ mod tests {
 
         let output = render_list_human(&[session]);
 
-        assert!(output.contains(
-            "s-42  shell  running  working   osc_title     4242  120x40  /workspace/project\n"
-        ));
+        assert_eq!(
+            list_row(&output, "s-42"),
+            vec![
+                "s-42",
+                "shell",
+                "running",
+                "working",
+                "osc_title",
+                "4242",
+                "120x40",
+                "-",
+                "-",
+                "/workspace/project",
+            ]
+        );
     }
 
     #[test]
@@ -572,12 +746,32 @@ mod tests {
 
         let output = render_list_human(&[codex, claude]);
 
-        assert!(output.contains(
-            "s-codex   codex   running  -         process       4242  120x40  /workspace/project\n"
-        ));
-        assert!(output.contains(
-            "s-claude  claude  running  -         process       4242  120x40  /workspace/project\n"
-        ));
+        assert_eq!(list_row(&output, "s-codex")[1], "codex");
+        assert_eq!(list_row(&output, "s-claude")[1], "claude");
+    }
+
+    #[test]
+    fn renders_worktree_branch_and_warning_count_in_list() {
+        let mut session = running_session("s-42");
+        session.cwd = PathBuf::from("/data/worktrees/s-42-project-feature-login");
+        session.branch = Some("feature/login".to_owned());
+        session.worktree_path = Some(session.cwd.clone());
+        session.warnings = vec![SessionWarning {
+            kind: SessionWarningKind::Fetch,
+            message: "fetch failed".to_owned(),
+            detail: None,
+        }];
+
+        let output = render_list_human(&[session]);
+        let row = list_row(&output, "s-42");
+        // Columns: ID AGENT STATE ACTIVITY SOURCE PID SIZE BRANCH WARN CWD.
+        assert_eq!(row[7], "feature/login", "branch column: {row:?}");
+        assert_eq!(row[8], "1", "warning-count column: {row:?}");
+        assert_eq!(
+            row[9],
+            "/data/worktrees/s-42-project-feature-login",
+            "cwd is the worktree path: {row:?}"
+        );
     }
 
     /// Whether the rendered field/value table contains a `field value` row,
@@ -625,6 +819,73 @@ mod tests {
         let output = render_inspect_human(&session);
 
         assert!(has_row(&output, "agent", "claude"));
+    }
+
+    #[test]
+    fn renders_worktree_fields_and_warning_detail_in_inspect() {
+        let mut session = running_session("s-42");
+        session.repo = Some(PathBuf::from("/workspace/project"));
+        session.branch = Some("feature/login".to_owned());
+        session.worktree_path = Some(PathBuf::from("/data/worktrees/s-42-project-feature-login"));
+        session.cwd = session.worktree_path.clone().expect("worktree path");
+        session.warnings = vec![SessionWarning {
+            kind: SessionWarningKind::BaseBranchFallback,
+            message: "Requested base branch \"release\" not found; used \"main\".".to_owned(),
+            detail: Some("git rev-parse failed".to_owned()),
+        }];
+
+        let output = render_inspect_human(&session);
+
+        assert!(has_row(&output, "repo", "/workspace/project"));
+        assert!(has_row(&output, "branch", "feature/login"));
+        assert!(has_row(
+            &output,
+            "worktree_path",
+            "/data/worktrees/s-42-project-feature-login"
+        ));
+        assert!(has_row(&output, "warnings", "1"));
+        assert!(
+            output.contains("warning [base_branch_fallback]:"),
+            "inspect must detail the warning: {output}"
+        );
+        assert!(
+            output.contains("detail: git rev-parse failed"),
+            "inspect must show warning detail: {output}"
+        );
+    }
+
+    #[test]
+    fn renders_inspect_worktree_fields_absent_as_none() {
+        let output = render_inspect_human(&running_session("s-42"));
+        assert!(has_row(&output, "repo", "<none>"));
+        assert!(has_row(&output, "branch", "<none>"));
+        assert!(has_row(&output, "worktree_path", "<none>"));
+        assert!(has_row(&output, "warnings", "-"));
+    }
+
+    #[test]
+    fn renders_new_summary_with_worktree_and_warnings() {
+        let mut session = running_session("s-42");
+        session.branch = Some("feature/login".to_owned());
+        session.worktree_path = Some(PathBuf::from("/data/worktrees/s-42-project-feature-login"));
+        session.cwd = session.worktree_path.clone().expect("worktree path");
+        session.warnings = vec![SessionWarning {
+            kind: SessionWarningKind::SetupScript,
+            message: "Repository setup script failed; the worktree was kept without it.".to_owned(),
+            detail: None,
+        }];
+
+        let output = render_new_human(&session);
+
+        assert!(output.contains("session s-42 created"));
+        assert!(
+            output.contains("worktree: /data/worktrees/s-42-project-feature-login (branch feature/login)"),
+            "new summary must mention the worktree: {output}"
+        );
+        assert!(
+            output.contains("warning [setup_script]:"),
+            "new summary must mention warnings: {output}"
+        );
     }
 
     #[test]
