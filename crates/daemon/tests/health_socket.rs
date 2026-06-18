@@ -120,6 +120,29 @@ async fn spawn_server(
     (tx, handle)
 }
 
+/// Spawn the control server owning an explicit, pre-built registry.
+///
+/// Used by the resume round-trip test, which needs a handle to the registry to
+/// call `load_and_resume` after a simulated restart.
+async fn spawn_server_owned(
+    socket: &std::path::Path,
+    registry: SessionRegistry,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let state = DaemonState::new(HealthInfo::new("0.0.0"), registry);
+    let server = ControlServer::bind_with_state(socket, state)
+        .await
+        .expect("server binds");
+    let (tx, rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        server
+            .serve(async move {
+                let _ = rx.await;
+            })
+            .await;
+    });
+    (tx, handle)
+}
+
 /// Spawn the control server with a custom shell command.
 async fn spawn_server_with_config(
     socket: &std::path::Path,
@@ -417,6 +440,189 @@ async fn wait_for_agent_state_event(
             }
         }
     }
+}
+
+/// Python reporter the stub agents run on launch to simulate the `SessionStart`
+/// hook: it reads the daemon-injected handshake env and fires one
+/// `session.report_native_id` RPC. Kept as a separate file (not a heredoc) so
+/// the stub shell script stays trivial to template.
+const STUB_REPORTER_PY: &str = r#"import json
+import os
+import socket
+
+session_id = os.environ.get("ZAGENTMESH_SESSION_ID")
+socket_path = os.environ.get("ZAGENTMESH_SOCKET_PATH")
+protocol_raw = os.environ.get("ZAGENTMESH_PROTOCOL_VERSION")
+native = os.environ.get("ZAGENTMESH_STUB_NATIVE_ID")
+agent = os.environ.get("ZAGENTMESH_STUB_AGENT")
+
+if not (session_id and socket_path and protocol_raw and native and agent):
+    raise SystemExit(0)
+
+request = {
+    "v": int(protocol_raw),
+    "id": "stub-report",
+    "method": "session.report_native_id",
+    "params": {
+        "session_id": session_id,
+        "agent": agent,
+        "native_session_id": native,
+    },
+}
+
+try:
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(1.0)
+    client.connect(socket_path)
+    client.sendall((json.dumps(request) + "\n").encode())
+    try:
+        client.recv(4096)
+    except Exception:
+        pass
+    client.close()
+except Exception:
+    pass
+"#;
+
+/// Build a stub agent script that logs its argv (one line per launch), fires the
+/// native-id report via [`STUB_REPORTER_PY`] using the injected handshake env,
+/// then idles. The argv log lets the test assert the resume argv after restart.
+fn stub_agent_script(argv_log: &Path, reporter_py: &Path, agent: &str, native_id: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+printf '%s\\n' \"$*\" >> '{argv}'\n\
+if [ \"${{ZAGENTMESH_ENV:-}}\" = \"1\" ] && command -v python3 >/dev/null 2>&1; then\n\
+  ZAGENTMESH_STUB_NATIVE_ID='{native}' ZAGENTMESH_STUB_AGENT='{agent}' python3 '{reporter}' || true\n\
+fi\n\
+/bin/sleep 30\n",
+        argv = argv_log.display(),
+        native = native_id,
+        agent = agent,
+        reporter = reporter_py.display(),
+    )
+}
+
+/// Poll `inspect` until the session reports the expected captured native id.
+async fn wait_for_native_id(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    id: &SessionId,
+    native_id: &str,
+) -> SessionInfo {
+    for _ in 0..250 {
+        let info = inspect_session(framed, id).await;
+        if info.native_session_id.as_deref() == Some(native_id) {
+            return info;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("native id {native_id} was not captured for session {}", id.0);
+}
+
+/// End-to-end: a stub agent installs (simulated) its hook by reporting a native
+/// id on launch; the binding survives a simulated daemon kill + registry
+/// rebuild against the same state dir; the relaunched stub receives the resume
+/// argv. Exercised for both Claude (`--resume <id>`) and Codex (`resume <id>`).
+async fn assert_resume_round_trip(
+    agent: AgentKind,
+    bin_name: &str,
+    native_id: &str,
+    expected_resume_argv: &str,
+) {
+    let bin_dir = temp_dir(&format!("{bin_name}-resume-bin"));
+    let cwd = temp_dir(&format!("{bin_name}-resume-cwd"));
+    let state_dir = temp_dir(&format!("{bin_name}-resume-state"));
+    let store_path = state_dir.join("resume-bindings.jsonl");
+    let argv_log = temp_dir(&format!("{bin_name}-resume-argv")).join("argv.log");
+    let reporter_py = temp_dir(&format!("{bin_name}-resume-reporter")).join("reporter.py");
+    write_executable(&reporter_py, STUB_REPORTER_PY);
+    write_executable(
+        &bin_dir.join(bin_name),
+        &stub_agent_script(&argv_log, &reporter_py, bin_name, native_id),
+    );
+
+    let socket = temp_socket(&format!("{bin_name}-resume"));
+    let make_config = || SessionRegistryConfig {
+        socket_path: Some(socket.clone()),
+        resume_store_path: Some(store_path.clone()),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    };
+
+    // Hold the PATH override across both the create and resume phases so the
+    // stub binary resolves at launch and at resume.
+    let _path = PathGuard::prepend(&bin_dir).await;
+
+    // --- Create phase: launch the agent; its hook reports a native id. ---
+    let registry = SessionRegistry::new(make_config());
+    let (shutdown, handle) = spawn_server_owned(&socket, registry).await;
+    let mut control = connect(&socket).await;
+    let created: SessionInfo = serde_json::from_value(ok_payload(
+        create_session_with_agent(&mut control, agent, cwd.clone()).await,
+    ))
+    .expect("stub session info");
+    assert_eq!(created.agent, agent);
+
+    // The stub fires the report RPC (proving the handshake env reached it); wait
+    // until the daemon records the native id on the session.
+    let captured = wait_for_native_id(&mut control, &created.id, native_id).await;
+    assert_eq!(captured.native_session_id.as_deref(), Some(native_id));
+
+    drop(control);
+    let _ = shutdown.send(());
+    let _ = handle.await;
+
+    // --- The binding survived the kill: persisted to the resume store. ---
+    assert!(
+        store_path.is_file(),
+        "resume store must persist across the daemon kill"
+    );
+
+    // --- Restart: rebuild a fresh registry against the SAME state dir. ---
+    let registry = SessionRegistry::new(make_config());
+    let (shutdown, handle) = spawn_server_owned(&socket, registry.clone()).await;
+    registry.load_and_resume().await;
+
+    // The relaunched stub logged the resume argv built by the M6 builder.
+    let logged = read_file_until(&argv_log, expected_resume_argv.as_bytes()).await;
+    assert!(
+        logged
+            .windows(expected_resume_argv.len())
+            .any(|window| window == expected_resume_argv.as_bytes()),
+        "resumed stub did not receive resume argv {expected_resume_argv:?}; argv log: {}",
+        String::from_utf8_lossy(&logged)
+    );
+
+    let stop_req = Request::new(
+        "session-stop-resume",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let mut cleanup = connect(&socket).await;
+    let _ = exchange(&mut cleanup, &stop_req).await;
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn claude_session_captures_native_id_and_resumes_after_restart() {
+    assert_resume_round_trip(
+        AgentKind::Claude,
+        "claude",
+        "native-claude-1",
+        "--resume native-claude-1",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn codex_session_captures_native_id_and_resumes_after_restart() {
+    assert_resume_round_trip(
+        AgentKind::Codex,
+        "codex",
+        "native-codex-1",
+        "resume native-codex-1",
+    )
+    .await;
 }
 
 #[tokio::test]

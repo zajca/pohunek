@@ -9,9 +9,16 @@ use std::process::ExitCode;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info};
 
-use zagentmesh_daemon::api::{ControlServer, HealthInfo};
+use zagentmesh_daemon::api::{ControlServer, DaemonState, HealthInfo};
 use zagentmesh_daemon::lock::InstanceLock;
+use zagentmesh_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use zagentmesh_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
+
+/// File name of the minimal resume-binding store under the data dir.
+///
+/// TODO(milestone 9): superseded by `state.db` (the `session` table) once the
+/// SQLite store lands.
+const RESUME_STORE_NAME: &str = "resume-bindings.jsonl";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -42,39 +49,57 @@ async fn run() -> Result<(), DaemonError> {
 
     // 3. Ensure the runtime dir exists (0700) before taking the lock in it.
     //    The control server enforces the same on bind, but the lock lives there
-    //    too and is acquired first.
-    ensure_runtime_dir(&paths)?;
+    //    too and is acquired first. The data dir holds the resume-binding store.
+    ensure_private_dir(&paths.runtime_dir)?;
+    ensure_private_dir(&paths.data_dir)?;
 
     // 4. Single-instance lock: a second daemon refuses to start.
     let _lock = InstanceLock::acquire(&paths.lock)?;
     info!(lock = %paths.lock.display(), "acquired single-instance lock");
 
-    // 5. Bind the control socket (stale-socket recovery + 0600).
+    // 5. Build the session registry with the hook-handshake socket path and the
+    //    resume-binding store, so spawned agents can report their native id and
+    //    captured sessions survive a restart.
+    let config = SessionRegistryConfig {
+        socket_path: Some(paths.socket.clone()),
+        resume_store_path: Some(paths.data_dir.join(RESUME_STORE_NAME)),
+        ..SessionRegistryConfig::default()
+    };
+    let sessions = SessionRegistry::new(config);
+
+    // 6. Bind the control socket (stale-socket recovery + 0600).
     let health = HealthInfo::new(DAEMON_VERSION);
-    let server = ControlServer::bind(&paths.socket, health).await?;
+    let state = DaemonState::new(health, sessions.clone());
+    let server = ControlServer::bind_with_state(&paths.socket, state).await?;
     info!(socket = %server.socket_path().display(), "ready; serving control protocol");
 
-    // 6. Serve until a termination signal.
+    // 7. A daemon restart kills live PTYs by design; relaunch the sessions whose
+    //    native id was captured. The socket is already bound, so a resumed
+    //    agent's hook can re-report. Best-effort: per-session failures are
+    //    logged, never fatal.
+    sessions.load_and_resume().await;
+
+    // 8. Serve until a termination signal.
     server.serve(shutdown_signal()).await;
 
     info!("zagentmeshd stopped");
     Ok(())
 }
 
-/// Create the runtime directory with mode 0700 if it does not exist.
-fn ensure_runtime_dir(paths: &Paths) -> Result<(), DaemonError> {
+/// Create a directory (and parents) with mode 0700 if it does not exist.
+fn ensure_private_dir(dir: &std::path::Path) -> Result<(), DaemonError> {
     use std::os::unix::fs::PermissionsExt;
 
-    std::fs::create_dir_all(&paths.runtime_dir).map_err(|source| DaemonError::Directory {
-        path: paths.runtime_dir.clone(),
+    std::fs::create_dir_all(dir).map_err(|source| DaemonError::Directory {
+        path: dir.to_path_buf(),
         source,
     })?;
-    std::fs::set_permissions(&paths.runtime_dir, std::fs::Permissions::from_mode(0o700)).map_err(
-        |source| DaemonError::Directory {
-            path: paths.runtime_dir.clone(),
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|source| {
+        DaemonError::Directory {
+            path: dir.to_path_buf(),
             source,
-        },
-    )
+        }
+    })
 }
 
 /// Resolve when SIGINT or SIGTERM is received.

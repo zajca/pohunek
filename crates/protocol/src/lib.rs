@@ -24,16 +24,20 @@
 
 mod envelope;
 mod error;
+mod integration;
 mod session;
 mod version;
 
 pub use envelope::{Event, Request, Response, StateSource};
 pub use error::{ErrorClass, ProtocolError};
+pub use integration::{
+    IntegrationInstallParams, IntegrationInstallReport, IntegrationInstallResult,
+};
 pub use session::{
     AgentActivity, AgentKind, AttachHeader, SessionAttachParams, SessionAttachResult,
     SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionNewParams, SessionResizeParams, SessionResizeResult, SessionState,
-    SessionStopResult,
+    SessionInputResult, SessionNewParams, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult,
 };
 pub use version::{negotiate, ProtocolVersion, PROTOCOL_VERSION};
 
@@ -64,6 +68,8 @@ pub mod method {
     pub const SUBSCRIBE: &str = "subscribe";
     /// Fire-and-forget native-session-id capture from the agent hook.
     pub const SESSION_REPORT_NATIVE_ID: &str = "session.report_native_id";
+    /// Install the per-agent `SessionStart` hook that captures the native id.
+    pub const INTEGRATION_INSTALL: &str = "integration.install";
 }
 
 /// Control-protocol event names.

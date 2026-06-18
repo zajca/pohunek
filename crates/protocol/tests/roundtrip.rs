@@ -5,10 +5,12 @@ use std::path::PathBuf;
 
 use protocol::{
     event, method, negotiate, AgentActivity, AgentKind, AttachHeader, ErrorClass, Event,
-    ProtocolError, ProtocolVersion, Request, Response, SessionAttachParams, SessionAttachResult,
+    IntegrationInstallParams, IntegrationInstallReport, IntegrationInstallResult, ProtocolError,
+    ProtocolVersion, Request, Response, SessionAttachParams, SessionAttachResult,
     SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionNewParams, SessionResizeParams, SessionResizeResult, SessionState,
-    SessionStopResult, StateSource, PROTOCOL_VERSION,
+    SessionInputResult, SessionNewParams, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, StateSource,
+    PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 
@@ -36,6 +38,7 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         state: SessionState::Running,
         state_source: StateSource::Process,
         activity: None,
+        native_session_id: None,
         created_at: "2026-06-17T10:00:00Z".to_owned(),
         updated_at: "2026-06-17T10:01:00Z".to_owned(),
         exit_code,
@@ -233,6 +236,167 @@ fn session_input_result_json_shape_roundtrips() {
         let back = line_roundtrip(&result);
         assert_eq!(back, result);
     }
+}
+
+#[test]
+fn session_report_native_id_method_name_is_stable() {
+    assert_eq!(
+        method::SESSION_REPORT_NATIVE_ID,
+        "session.report_native_id"
+    );
+}
+
+#[test]
+fn session_report_native_id_params_roundtrips_with_transcript_path() {
+    let params = SessionReportNativeIdParams {
+        session_id: SessionId("s-42".to_owned()),
+        agent: AgentKind::Claude,
+        native_session_id: "claude-native-abc".to_owned(),
+        transcript_path: Some("/home/user/.claude/transcripts/abc.jsonl".to_owned()),
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize report params");
+    assert_eq!(
+        value,
+        json!({
+            "session_id": "s-42",
+            "agent": "claude",
+            "native_session_id": "claude-native-abc",
+            "transcript_path": "/home/user/.claude/transcripts/abc.jsonl"
+        })
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn session_report_native_id_params_omits_absent_transcript_path() {
+    let params = SessionReportNativeIdParams {
+        session_id: SessionId("s-7".to_owned()),
+        agent: AgentKind::Codex,
+        native_session_id: "codex-native-xyz".to_owned(),
+        transcript_path: None,
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize report params");
+    assert_eq!(
+        value,
+        json!({
+            "session_id": "s-7",
+            "agent": "codex",
+            "native_session_id": "codex-native-xyz"
+        })
+    );
+    assert!(
+        !value
+            .as_object()
+            .expect("params object")
+            .contains_key("transcript_path"),
+        "absent transcript_path must be omitted: {value}"
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn session_report_native_id_result_roundtrips() {
+    for result in [
+        SessionReportNativeIdResult { recorded: true },
+        SessionReportNativeIdResult { recorded: false },
+    ] {
+        let value = serde_json::to_value(&result).expect("serialize report result");
+        assert_eq!(value, json!({ "recorded": result.recorded }));
+
+        let back = line_roundtrip(&result);
+        assert_eq!(back, result);
+    }
+}
+
+#[test]
+fn session_info_roundtrips_with_native_session_id() {
+    let info = SessionInfo {
+        native_session_id: Some("claude-native-abc".to_owned()),
+        ..running_shell_session(None)
+    };
+
+    let value = serde_json::to_value(&info).expect("serialize session info");
+    assert_eq!(value["native_session_id"], json!("claude-native-abc"));
+
+    let back = line_roundtrip(&info);
+    assert_eq!(back, info);
+    assert_eq!(back.native_session_id.as_deref(), Some("claude-native-abc"));
+}
+
+#[test]
+fn session_info_omits_absent_native_session_id() {
+    let info = running_shell_session(None);
+
+    let value = serde_json::to_value(&info).expect("serialize session info");
+    assert!(
+        !value
+            .as_object()
+            .expect("session info object")
+            .contains_key("native_session_id"),
+        "absent native_session_id must be omitted: {value}"
+    );
+
+    let back = line_roundtrip(&info);
+    assert_eq!(back.native_session_id, None);
+}
+
+#[test]
+fn integration_install_method_name_is_stable() {
+    assert_eq!(method::INTEGRATION_INSTALL, "integration.install");
+}
+
+#[test]
+fn integration_install_params_roundtrips_with_and_without_agent() {
+    let with_agent = IntegrationInstallParams {
+        agent: Some(AgentKind::Claude),
+    };
+    let value = serde_json::to_value(&with_agent).expect("serialize install params");
+    assert_eq!(value, json!({ "agent": "claude" }));
+    assert_eq!(line_roundtrip(&with_agent), with_agent);
+
+    let all_agents = IntegrationInstallParams { agent: None };
+    let value = serde_json::to_value(&all_agents).expect("serialize install params");
+    assert!(
+        !value
+            .as_object()
+            .expect("params object")
+            .contains_key("agent"),
+        "absent agent selector must be omitted: {value}"
+    );
+    assert_eq!(line_roundtrip(&all_agents), all_agents);
+}
+
+#[test]
+fn integration_install_result_roundtrips() {
+    let result = IntegrationInstallResult {
+        installed: vec![
+            IntegrationInstallReport {
+                agent: AgentKind::Claude,
+                hook_path: "/home/user/.claude/hooks/zagentmesh-agent-state.sh".to_owned(),
+                config_paths: vec!["/home/user/.claude/settings.json".to_owned()],
+            },
+            IntegrationInstallReport {
+                agent: AgentKind::Codex,
+                hook_path: "/home/user/.codex/zagentmesh-agent-state.sh".to_owned(),
+                config_paths: vec![
+                    "/home/user/.codex/hooks.json".to_owned(),
+                    "/home/user/.codex/config.toml".to_owned(),
+                ],
+            },
+        ],
+    };
+
+    let back = line_roundtrip(&result);
+    assert_eq!(back, result);
+    assert_eq!(back.installed.len(), 2);
+    assert_eq!(back.installed[0].agent, AgentKind::Claude);
+    assert_eq!(back.installed[1].config_paths.len(), 2);
 }
 
 #[test]

@@ -278,6 +278,20 @@ fn render_inspect_human(info: &SessionInfo) -> String {
             "state_source",
             state_source_label(info.state_source).to_owned(),
         ),
+        (
+            "native_session_id",
+            info.native_session_id
+                .clone()
+                .unwrap_or_else(|| "<none>".to_owned()),
+        ),
+        (
+            "resumable",
+            if info.native_session_id.is_some() {
+                "yes".to_owned()
+            } else {
+                "no".to_owned()
+            },
+        ),
         ("created_at", info.created_at.clone()),
         ("updated_at", info.updated_at.clone()),
         (
@@ -375,6 +389,7 @@ mod tests {
             state: SessionState::Running,
             state_source: StateSource::Process,
             activity: None,
+            native_session_id: None,
             created_at: "2026-06-17T10:00:00Z".to_owned(),
             updated_at: "2026-06-17T10:01:00Z".to_owned(),
             exit_code: None,
@@ -565,17 +580,41 @@ mod tests {
         ));
     }
 
+    /// Whether the rendered field/value table contains a `field value` row,
+    /// tolerant of the column width (which the longest field name sets).
+    fn has_row(output: &str, field: &str, value: &str) -> bool {
+        output.lines().any(|line| {
+            let mut parts = line.split_whitespace();
+            parts.next() == Some(field)
+                && parts.next() == Some(value)
+                && parts.next().is_none()
+        })
+    }
+
     #[test]
     fn renders_inspect_field_value_table() {
         let output = render_inspect_human(&running_session("s-42"));
 
-        assert!(output.contains("FIELD         VALUE\n"));
-        assert!(output.contains("id            s-42\n"));
-        assert!(output.contains("agent         shell\n"));
-        assert!(output.contains("state         running\n"));
-        assert!(output.contains("activity      -\n"));
-        assert!(output.contains("state_source  process\n"));
-        assert!(output.contains("exit_code     <none>\n"));
+        assert!(has_row(&output, "FIELD", "VALUE"));
+        assert!(has_row(&output, "id", "s-42"));
+        assert!(has_row(&output, "agent", "shell"));
+        assert!(has_row(&output, "state", "running"));
+        assert!(has_row(&output, "activity", "-"));
+        assert!(has_row(&output, "state_source", "process"));
+        assert!(has_row(&output, "native_session_id", "<none>"));
+        assert!(has_row(&output, "resumable", "no"));
+        assert!(has_row(&output, "exit_code", "<none>"));
+    }
+
+    #[test]
+    fn renders_native_session_id_and_resumable_when_captured() {
+        let mut session = running_session("s-42");
+        session.native_session_id = Some("native-abc".to_owned());
+
+        let output = render_inspect_human(&session);
+
+        assert!(has_row(&output, "native_session_id", "native-abc"));
+        assert!(has_row(&output, "resumable", "yes"));
     }
 
     #[test]
@@ -585,7 +624,7 @@ mod tests {
 
         let output = render_inspect_human(&session);
 
-        assert!(output.contains("agent         claude\n"));
+        assert!(has_row(&output, "agent", "claude"));
     }
 
     #[test]

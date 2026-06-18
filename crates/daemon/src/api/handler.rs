@@ -11,8 +11,9 @@
 //! methods.
 
 use protocol::{
-    method, negotiate, ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams,
-    SessionId, SessionInputParams, SessionNewParams, SessionResizeParams, PROTOCOL_VERSION,
+    method, negotiate, IntegrationInstallParams, ProtocolError, Request, Response,
+    SessionAttachParams, SessionDetachParams, SessionId, SessionInputParams, SessionNewParams,
+    SessionReportNativeIdParams, SessionResizeParams, PROTOCOL_VERSION,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -143,6 +144,10 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::SESSION_DETACH => handle_session_detach(request, &state.sessions).await,
         method::SESSION_RESIZE => handle_session_resize(request, &state.sessions).await,
         method::SESSION_INPUT => handle_session_input(request, &state.sessions).await,
+        method::SESSION_REPORT_NATIVE_ID => {
+            handle_session_report_native_id(request, &state.sessions).await
+        }
+        method::INTEGRATION_INSTALL => handle_integration_install(request),
         other => Response::err(request.id.clone(), ProtocolError::method_not_found(other)),
     }
 }
@@ -237,6 +242,29 @@ async fn handle_session_input(request: &Request, sessions: &SessionRegistry) -> 
         Err(err) => return Response::err(request.id.clone(), err),
     };
     match sessions.input(params).await {
+        Ok(result) => ok_value(request, &result),
+        Err(err) => Response::err(request.id.clone(), err),
+    }
+}
+
+async fn handle_session_report_native_id(
+    request: &Request,
+    sessions: &SessionRegistry,
+) -> Response {
+    let params = match parse_params::<SessionReportNativeIdParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    let result = sessions.report_native_id(params).await;
+    ok_value(request, &result)
+}
+
+fn handle_integration_install(request: &Request) -> Response {
+    let params = match parse_params::<IntegrationInstallParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    match crate::integration::install(params.agent) {
         Ok(result) => ok_value(request, &result),
         Err(err) => Response::err(request.id.clone(), err),
     }

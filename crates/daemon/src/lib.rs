@@ -34,6 +34,7 @@ pub mod session;
 pub mod agent;
 pub mod detect;
 pub mod events;
+pub mod integration;
 pub mod store;
 
 pub use error::DaemonError;

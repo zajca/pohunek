@@ -83,6 +83,36 @@ pub struct SessionInputResult {
     pub accepted: bool,
 }
 
+/// Parameters for `session.report_native_id`.
+///
+/// Fire-and-forget capture sent by an agent's `SessionStart` hook (see
+/// `docs/plan-phase-1.md` "Hook Integration"). The hook learns the zagentmesh
+/// `session_id` and `agent` from the launch-time handshake env and reads the
+/// agent's own `native_session_id` (and optional `transcript_path`) from its
+/// stdin JSON. The daemon records it as the session's resume binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReportNativeIdParams {
+    /// The zagentmesh session id the agent was launched under.
+    pub session_id: SessionId,
+    /// Agent kind reporting its native session id.
+    pub agent: AgentKind,
+    /// The agent's own native session identifier used to build the resume argv.
+    pub native_session_id: String,
+    /// Optional transcript path reported by the agent (Claude provides one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
+}
+
+/// Result returned by `session.report_native_id`.
+///
+/// The hook fires-and-forgets and ignores this body; it exists so the method has
+/// a typed, round-trippable response like every other control method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReportNativeIdResult {
+    /// Whether the daemon recorded the report as a resume binding.
+    pub recorded: bool,
+}
+
 /// Parameters for `session.detach`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionDetachParams {
@@ -153,6 +183,11 @@ pub struct SessionInfo {
     /// Current detected agent activity, when the detector has published one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<AgentActivity>,
+    /// Native agent session id captured via the `SessionStart` hook, when one
+    /// has been reported. Its presence means the session is resumable after a
+    /// daemon restart (see `docs/plan-phase-1.md` "Resume Model").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_session_id: Option<String>,
     /// Creation timestamp in the daemon's wire timestamp format.
     pub created_at: String,
     /// Last update timestamp in the daemon's wire timestamp format.

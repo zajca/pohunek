@@ -79,6 +79,23 @@ enum Commands {
         #[command(subcommand)]
         action: SessionAction,
     },
+
+    /// Manage agent integrations (session-id capture hooks).
+    Integration {
+        #[command(subcommand)]
+        action: IntegrationAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IntegrationAction {
+    /// Install the `SessionStart` hook that captures native session ids for
+    /// resume. Without `--agent`, installs for every supported agent present.
+    Install {
+        /// Restrict installation to a single agent.
+        #[arg(long, value_enum)]
+        agent: Option<commands::integration::HookAgentArg>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -200,6 +217,15 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 }
                 SessionAction::Input { target, text } => {
                     commands::session::run_input(&paths, &target, &text).await?
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Integration { action } => {
+            let paths = Paths::resolve()?;
+            match action {
+                IntegrationAction::Install { agent } => {
+                    commands::integration::run_install(&paths, agent).await?;
                 }
             }
             Ok(ExitCode::SUCCESS)

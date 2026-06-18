@@ -43,33 +43,111 @@ pub struct InputRules {
     pub submit_delay: Duration,
 }
 
+/// Maximum length of an id-kind native session reference, in bytes.
+const MAX_SESSION_ID_LEN: usize = 512;
+/// Maximum length of a path-kind native session reference, in bytes.
+const MAX_SESSION_PATH_LEN: usize = 4096;
+
+/// Whether a native session reference is an opaque id or a filesystem path.
+///
+/// Ported from herdr `src/agent_resume.rs`: Claude and Codex resume by id; the
+/// path variant exists for agents that resume from a transcript path. Both
+/// kinds feed the same resume-argv builder via [`SessionRef::value`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRefKind {
+    /// An opaque native session id (e.g. `claude --resume <id>`).
+    Id,
+    /// An absolute filesystem path to a native session/transcript file.
+    Path,
+}
+
 /// Native agent session reference used to build resume commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRef {
+    kind: SessionRefKind,
     value: String,
 }
 
 impl SessionRef {
-    /// Build a validated native session reference.
+    /// Build a validated id-kind native session reference.
+    ///
+    /// Validation (herdr `valid_session_id`): non-empty, ≤512 bytes, no control
+    /// characters.
     pub fn new(value: impl Into<String>) -> Result<Self, ProtocolError> {
+        Self::id(value)
+    }
+
+    /// Build a validated id-kind native session reference.
+    pub fn id(value: impl Into<String>) -> Result<Self, ProtocolError> {
         let value = value.into();
         if value.is_empty() {
             return Err(invalid_session_ref(
-                "native session reference cannot be empty",
+                "native session id cannot be empty",
             ));
         }
-        if value.len() > 512 {
+        if value.len() > MAX_SESSION_ID_LEN {
             return Err(invalid_session_ref(
-                "native session reference cannot exceed 512 bytes",
+                "native session id cannot exceed 512 bytes",
             ));
         }
         if value.chars().any(char::is_control) {
             return Err(invalid_session_ref(
-                "native session reference cannot contain control characters",
+                "native session id cannot contain control characters",
+            ));
+        }
+        // The value is exec'd as a positional resume argument (`claude --resume
+        // <id>` / `codex resume <id>`) with no `--` separator, so a leading dash
+        // would be parsed by the agent CLI as a flag. Reject it at this trust
+        // boundary to prevent argv flag injection from a socket-supplied id.
+        if value.starts_with('-') {
+            return Err(invalid_session_ref(
+                "native session id cannot begin with '-'",
             ));
         }
 
-        Ok(Self { value })
+        Ok(Self {
+            kind: SessionRefKind::Id,
+            value,
+        })
+    }
+
+    /// Build a validated path-kind native session reference.
+    ///
+    /// Validation (herdr `valid_session_path`): non-empty, ≤4096 bytes, no
+    /// control characters, and an absolute path.
+    pub fn path(value: impl Into<String>) -> Result<Self, ProtocolError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(invalid_session_ref(
+                "native session path cannot be empty",
+            ));
+        }
+        if value.len() > MAX_SESSION_PATH_LEN {
+            return Err(invalid_session_ref(
+                "native session path cannot exceed 4096 bytes",
+            ));
+        }
+        if value.chars().any(char::is_control) {
+            return Err(invalid_session_ref(
+                "native session path cannot contain control characters",
+            ));
+        }
+        if !Path::new(&value).is_absolute() {
+            return Err(invalid_session_ref(
+                "native session path must be absolute",
+            ));
+        }
+
+        Ok(Self {
+            kind: SessionRefKind::Path,
+            value,
+        })
+    }
+
+    /// Whether this reference is an id or a path.
+    #[must_use]
+    pub fn kind(&self) -> SessionRefKind {
+        self.kind
     }
 
     /// Native session reference value.
@@ -116,6 +194,19 @@ fn launch_command(
     args: Vec<String>,
     opts: &LaunchOpts,
 ) -> Result<PtyCommand, ProtocolError> {
+    build_pty_command(program, args, opts)
+}
+
+/// Resolve `program` on `PATH` and build a PTY launch command in `opts`.
+///
+/// Shared by first-launch (adapter `launch`) and resume (`resume_pty_command`):
+/// resume argv carries a runtime-built program name, so it cannot reuse the
+/// `&'static str` launch path.
+pub fn build_pty_command(
+    program: &str,
+    args: Vec<String>,
+    opts: &LaunchOpts,
+) -> Result<PtyCommand, ProtocolError> {
     Ok(PtyCommand {
         program: resolve_binary(program)?,
         args,
@@ -126,11 +217,41 @@ fn launch_command(
     })
 }
 
+/// Build the PTY command that resumes an existing agent session.
+///
+/// Combines the M6 resume-argv builder (`claude --resume <id>` /
+/// `codex resume <id>`) with `PATH` resolution and the launch env in `opts`, so
+/// the daemon can relaunch-and-resume a session after a restart.
+///
+/// # Errors
+///
+/// Returns a typed error for `AgentKind::Shell` (shells have no resume argv) or
+/// when the agent binary is not on `PATH`.
+pub fn resume_pty_command(
+    agent: protocol::AgentKind,
+    session_ref: &SessionRef,
+    opts: &LaunchOpts,
+) -> Result<PtyCommand, ProtocolError> {
+    let command = match agent {
+        protocol::AgentKind::Claude => ClaudeAdapter.resume(session_ref),
+        protocol::AgentKind::Codex => CodexAdapter.resume(session_ref),
+        protocol::AgentKind::Shell => {
+            return Err(ProtocolError::new(
+                ErrorClass::Runtime,
+                "agent_not_resumable",
+                "shell sessions cannot be resumed",
+                None,
+            ));
+        }
+    };
+    build_pty_command(&command.program, command.args, opts)
+}
+
 fn resume_command(program: &'static str, args: Vec<String>) -> AgentCommand {
     AgentCommand::new(program, args)
 }
 
-fn resolve_binary(name: &'static str) -> Result<String, ProtocolError> {
+fn resolve_binary(name: &str) -> Result<String, ProtocolError> {
     let path = std::env::var_os("PATH").ok_or_else(|| missing_binary(name))?;
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join(name);
@@ -163,7 +284,7 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-fn missing_binary(name: &'static str) -> ProtocolError {
+fn missing_binary(name: &str) -> ProtocolError {
     ProtocolError::new(
         ErrorClass::Runtime,
         "agent_binary_missing",
@@ -185,7 +306,7 @@ mod tests {
 
     use protocol::{AgentActivity, ErrorClass};
 
-    use super::{AgentAdapter, ClaudeAdapter, CodexAdapter, LaunchOpts, SessionRef};
+    use super::{AgentAdapter, ClaudeAdapter, CodexAdapter, LaunchOpts, SessionRef, SessionRefKind};
     use crate::detect::{ManifestRegion, MatchContext};
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -308,6 +429,136 @@ mod tests {
         let claude = ClaudeAdapter.resume(&session);
         assert_eq!(claude.program, "claude");
         assert_eq!(claude.args, vec!["--resume", "native-123"]);
+    }
+
+    #[test]
+    fn session_ref_id_accepts_valid_value_and_reports_kind() {
+        let session = SessionRef::id("native-123").expect("id session ref");
+        assert_eq!(session.kind(), SessionRefKind::Id);
+        assert_eq!(session.value(), "native-123");
+        // `new` is the id constructor.
+        assert_eq!(SessionRef::new("native-123").expect("new"), session);
+    }
+
+    #[test]
+    fn session_ref_id_rejects_empty_control_and_overlength() {
+        assert_eq!(
+            SessionRef::id("").expect_err("empty id rejected").code,
+            "invalid_session_ref"
+        );
+        assert_eq!(
+            SessionRef::id("bad\nid")
+                .expect_err("control char rejected")
+                .code,
+            "invalid_session_ref"
+        );
+        let too_long = "a".repeat(513);
+        assert_eq!(
+            SessionRef::id(too_long)
+                .expect_err("over-length id rejected")
+                .code,
+            "invalid_session_ref"
+        );
+    }
+
+    #[test]
+    fn session_ref_id_rejects_leading_dash_to_block_argv_flag_injection() {
+        // A native id like `--dangerously-skip-permissions` must not become a
+        // resume-argv flag.
+        assert_eq!(
+            SessionRef::id("--resume-evil")
+                .expect_err("leading-dash id rejected")
+                .code,
+            "invalid_session_ref"
+        );
+        assert_eq!(
+            SessionRef::id("-x").expect_err("single-dash id rejected").code,
+            "invalid_session_ref"
+        );
+        // A dash elsewhere is fine (real native ids contain hyphens).
+        assert!(SessionRef::id("abc-123-def").is_ok());
+    }
+
+    #[test]
+    fn session_ref_path_accepts_absolute_path_and_reports_kind() {
+        let session = SessionRef::path("/home/user/.claude/transcripts/abc.jsonl")
+            .expect("path session ref");
+        assert_eq!(session.kind(), SessionRefKind::Path);
+        assert_eq!(session.value(), "/home/user/.claude/transcripts/abc.jsonl");
+    }
+
+    #[test]
+    fn session_ref_path_rejects_relative_empty_control_and_overlength() {
+        assert_eq!(
+            SessionRef::path("relative/path.jsonl")
+                .expect_err("relative path rejected")
+                .code,
+            "invalid_session_ref"
+        );
+        assert_eq!(
+            SessionRef::path("").expect_err("empty path rejected").code,
+            "invalid_session_ref"
+        );
+        assert_eq!(
+            SessionRef::path("/bad\npath")
+                .expect_err("control char rejected")
+                .code,
+            "invalid_session_ref"
+        );
+        let too_long = format!("/{}", "a".repeat(4096));
+        assert_eq!(
+            SessionRef::path(too_long)
+                .expect_err("over-length path rejected")
+                .code,
+            "invalid_session_ref"
+        );
+    }
+
+    #[test]
+    fn resume_argv_carries_path_kind_value() {
+        let session = SessionRef::path("/abs/session.jsonl").expect("path session ref");
+        let claude = ClaudeAdapter.resume(&session);
+        assert_eq!(claude.args, vec!["--resume", "/abs/session.jsonl"]);
+        let codex = CodexAdapter.resume(&session);
+        assert_eq!(codex.args, vec!["resume", "/abs/session.jsonl"]);
+    }
+
+    #[test]
+    fn resume_pty_command_resolves_binary_and_builds_resume_argv() {
+        let bin_dir = temp_dir("resume-claude-bin");
+        write_executable(&bin_dir, "claude");
+        let cwd = temp_dir("resume-claude-cwd");
+        let session = SessionRef::id("native-123").expect("session ref");
+
+        let command = with_path(&bin_dir, || {
+            super::resume_pty_command(
+                protocol::AgentKind::Claude,
+                &session,
+                &launch_opts(cwd.clone()),
+            )
+            .expect("resume pty command")
+        });
+
+        assert!(command.program.ends_with("claude"));
+        assert_eq!(command.args, vec!["--resume", "native-123"]);
+        assert_eq!(command.cwd, cwd);
+        assert_eq!(
+            command.env,
+            vec![("ZAGENTMESH_SESSION_ID".to_owned(), "s-42".to_owned())]
+        );
+    }
+
+    #[test]
+    fn resume_pty_command_rejects_shell_agent() {
+        let cwd = temp_dir("resume-shell-cwd");
+        let session = SessionRef::id("native-123").expect("session ref");
+        let err = super::resume_pty_command(
+            protocol::AgentKind::Shell,
+            &session,
+            &launch_opts(cwd),
+        )
+        .expect_err("shell is not resumable");
+        assert_eq!(err.code, "agent_not_resumable");
     }
 
     #[test]

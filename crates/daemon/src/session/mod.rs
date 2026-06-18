@@ -11,18 +11,24 @@ use std::time::{Duration, Instant};
 
 use protocol::{
     event, AgentKind, ErrorClass, Event, ProtocolError, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionNewParams, SessionState, SessionStopResult, StateSource,
+    SessionInputResult, SessionNewParams, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionState, SessionStopResult, StateSource, PROTOCOL_VERSION,
 };
 use serde_json::json;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, watch, Mutex};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-use crate::agent::{AgentAdapter, ClaudeAdapter, CodexAdapter, InputRules, LaunchOpts};
+use crate::agent::{
+    resume_pty_command, AgentAdapter, ClaudeAdapter, CodexAdapter, InputRules, LaunchOpts,
+    SessionRef,
+};
 use crate::detect::{ActivityTransition, Detector, DetectorConfig};
+use crate::integration::{ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH};
 use crate::pty::{PtyCommand, PtyError, PtyExit, PtyHandle};
+use crate::store::{ResumeBinding, ResumeStore};
 
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
@@ -88,12 +94,33 @@ pub struct SessionRegistryConfig {
     pub output_history_limit_bytes: usize,
     /// Delay before sending Claude Code's Ink submit byte as a separate write.
     pub claude_submit_delay: Duration,
+    /// Control socket path injected into Codex/Claude agents so their hook can
+    /// call home. `None` disables hook-handshake env injection (e.g. in unit
+    /// tests that do not exercise the hook).
+    pub socket_path: Option<PathBuf>,
+    /// Backing file for the minimal resume-binding store. `None` disables
+    /// persistence (sessions are then not resumable across a restart).
+    pub resume_store_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InputWritePlan {
     immediate: Vec<u8>,
     delayed_submit: Option<(Duration, Vec<u8>)>,
+}
+
+/// Everything needed to spawn and register one PTY-backed session, shared by
+/// first launch (`create`) and resume (`resume_binding`).
+#[derive(Debug)]
+struct PtySessionSpec {
+    id: SessionId,
+    agent: AgentKind,
+    cwd: PathBuf,
+    cols: u16,
+    rows: u16,
+    command: PtyCommand,
+    /// Native id when relaunching a captured session (`None` on first launch).
+    native_session_id: Option<String>,
 }
 
 impl Default for SessionRegistryConfig {
@@ -104,6 +131,8 @@ impl Default for SessionRegistryConfig {
             attach_token_ttl: DEFAULT_ATTACH_TOKEN_TTL,
             output_history_limit_bytes: DEFAULT_OUTPUT_HISTORY_LIMIT_BYTES,
             claude_submit_delay: crate::agent::DEFAULT_CLAUDE_SUBMIT_DELAY,
+            socket_path: None,
+            resume_store_path: None,
         }
     }
 }
@@ -123,6 +152,8 @@ struct SessionRegistryInner {
     next_stream_id: AtomicU64,
     config: SessionRegistryConfig,
     events: broadcast::Sender<Event>,
+    /// Minimal resume-binding store, present when persistence is configured.
+    resume_store: Option<ResumeStore>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +201,7 @@ impl SessionRegistry {
     #[must_use]
     pub fn new(config: SessionRegistryConfig) -> Self {
         let (events, _) = broadcast::channel(128);
+        let resume_store = config.resume_store_path.clone().map(ResumeStore::new);
         Self {
             inner: Arc::new(SessionRegistryInner {
                 sessions: Mutex::new(HashMap::new()),
@@ -179,6 +211,7 @@ impl SessionRegistry {
                 next_stream_id: AtomicU64::new(1),
                 config,
                 events,
+                resume_store,
             }),
         }
     }
@@ -208,13 +241,45 @@ impl SessionRegistry {
             "s-{}",
             self.inner.next_id.fetch_add(1, Ordering::Relaxed)
         ));
+        let env_extra = self.hook_env(params.agent, &id);
         let command = build_launch_command(
             params.agent,
             &self.inner.config.shell_command,
             cwd.clone(),
             params.cols,
             params.rows,
+            env_extra,
         )?;
+
+        self.register_pty_session(PtySessionSpec {
+            id,
+            agent: params.agent,
+            cwd,
+            cols: params.cols,
+            rows: params.rows,
+            command,
+            native_session_id: None,
+        })
+        .await
+    }
+
+    /// Spawn a PTY for `spec.command`, register the session, and start its
+    /// detector and exit watcher. Shared by `create` (first launch) and
+    /// `resume_binding` (relaunch after a daemon restart).
+    async fn register_pty_session(
+        &self,
+        spec: PtySessionSpec,
+    ) -> Result<SessionInfo, ProtocolError> {
+        let PtySessionSpec {
+            id,
+            agent,
+            cwd,
+            cols,
+            rows,
+            command,
+            native_session_id,
+        } = spec;
+
         let history_limit_bytes = self.inner.config.output_history_limit_bytes;
         let pty =
             tokio::task::spawn_blocking(move || PtyHandle::spawn(command, history_limit_bytes))
@@ -223,19 +288,20 @@ impl SessionRegistry {
                 .map_err(pty_error_to_protocol)?;
         let detector_output = pty.subscribe_output();
         let detector_cancel = CancellationToken::new();
-        let (detector_resize, detector_resize_rx) = watch::channel((params.rows, params.cols));
+        let (detector_resize, detector_resize_rx) = watch::channel((rows, cols));
 
         let now = timestamp_now();
         let info = SessionInfo {
             id: id.clone(),
-            agent: params.agent,
+            agent,
             cwd,
             pid: pty.pid(),
-            cols: params.cols,
-            rows: params.rows,
+            cols,
+            rows,
             state: SessionState::Running,
             state_source: StateSource::Process,
             activity: None,
+            native_session_id,
             created_at: now.clone(),
             updated_at: now,
             exit_code: None,
@@ -258,14 +324,39 @@ impl SessionRegistry {
         self.emit(event::SESSION_CREATED, &info);
         self.spawn_detector(
             id.clone(),
-            params.agent,
+            agent,
             detector_output,
-            (params.rows, params.cols),
+            (rows, cols),
             detector_cancel,
             detector_resize_rx,
         );
         self.spawn_exit_watcher(id, pty);
         Ok(info)
+    }
+
+    /// Build the hook-handshake env injected into a Codex/Claude agent so its
+    /// `SessionStart` hook can report its native session id back to the socket.
+    /// Shell sessions (and registries without a configured socket path) get no
+    /// hook env.
+    fn hook_env(&self, agent: AgentKind, session_id: &SessionId) -> Vec<(String, String)> {
+        match agent {
+            AgentKind::Shell => Vec::new(),
+            AgentKind::Codex | AgentKind::Claude => match &self.inner.config.socket_path {
+                Some(socket_path) => vec![
+                    (ENV_FLAG.to_owned(), "1".to_owned()),
+                    (
+                        ENV_SOCKET_PATH.to_owned(),
+                        socket_path.display().to_string(),
+                    ),
+                    (ENV_SESSION_ID.to_owned(), session_id.0.clone()),
+                    (
+                        ENV_PROTOCOL_VERSION.to_owned(),
+                        PROTOCOL_VERSION.get().to_string(),
+                    ),
+                ],
+                None => Vec::new(),
+            },
+        }
     }
 
     /// Inject text into a running session using the agent's input framing rules.
@@ -303,6 +394,208 @@ impl SessionRegistry {
         }
 
         Ok(SessionInputResult { accepted: true })
+    }
+
+    /// Record an agent's native session id as the session's resume binding.
+    ///
+    /// Called from the `session.report_native_id` handler when a `SessionStart`
+    /// hook fires. Validates the native id, updates the in-memory session info
+    /// (so `inspect`/`list` show it), and persists a minimal resume binding.
+    /// Reports for an unknown or already-terminal session are ignored, not
+    /// errors (the hook fires-and-forgets).
+    pub async fn report_native_id(
+        &self,
+        params: SessionReportNativeIdParams,
+    ) -> SessionReportNativeIdResult {
+        let not_recorded = SessionReportNativeIdResult { recorded: false };
+
+        // Claude and Codex report an opaque native id, never a path.
+        let session_ref = match SessionRef::id(&params.native_session_id) {
+            Ok(session_ref) => session_ref,
+            Err(err) => {
+                debug!(
+                    session_id = %params.session_id.0,
+                    error = %err,
+                    "ignoring native-id report with an invalid native session id"
+                );
+                return not_recorded;
+            }
+        };
+
+        let captured = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get_mut(&params.session_id) else {
+                debug!(
+                    session_id = %params.session_id.0,
+                    "native-id report for an unknown session; ignoring"
+                );
+                return not_recorded;
+            };
+            if is_terminal(entry.info.state) {
+                debug!(
+                    session_id = %params.session_id.0,
+                    "native-id report for a terminal session; ignoring"
+                );
+                return not_recorded;
+            }
+
+            entry.info.native_session_id = Some(session_ref.value().to_owned());
+            entry.info.updated_at = timestamp_now();
+            let binding = ResumeBinding {
+                session_id: params.session_id.0.clone(),
+                agent: entry.info.agent,
+                cwd: entry.info.cwd.clone(),
+                cols: entry.info.cols,
+                rows: entry.info.rows,
+                native_session_id: Some(session_ref.value().to_owned()),
+                native_session_path: None,
+            };
+            (binding, entry.info.clone())
+        };
+        let (binding, info) = captured;
+
+        if let Some(store) = &self.inner.resume_store {
+            if let Err(err) = store.record(&binding) {
+                // Persistence failure is non-fatal: the in-memory capture
+                // succeeded; only restart-resume is impaired. Surface it.
+                warn!(
+                    session_id = %binding.session_id,
+                    error = %err,
+                    "failed to persist resume binding"
+                );
+            } else if !self.is_session_live(&params.session_id).await {
+                // Close the capture-vs-exit TOCTOU window: the session lock was
+                // released between the liveness check above and this write, so
+                // `record_exit` may have marked the session terminal and removed
+                // its binding in between. If it did, our write just resurrected a
+                // dead session's binding; undo it so a restart cannot relaunch a
+                // session the user stopped or that exited.
+                if let Err(err) = store.remove(&binding.session_id) {
+                    warn!(
+                        session_id = %binding.session_id,
+                        error = %err,
+                        "failed to undo resume binding for a session that exited mid-capture"
+                    );
+                }
+            }
+        }
+
+        self.emit(event::SESSION_UPDATED, &info);
+        SessionReportNativeIdResult { recorded: true }
+    }
+
+    /// Whether a session currently exists and is not in a terminal state.
+    async fn is_session_live(&self, id: &SessionId) -> bool {
+        let sessions = self.inner.sessions.lock().await;
+        sessions
+            .get(id)
+            .is_some_and(|entry| !is_terminal(entry.info.state))
+    }
+
+    /// Load the resume-binding store and relaunch each resumable session.
+    ///
+    /// Called once at daemon startup. A daemon restart kills all live PTYs by
+    /// design (see `docs/plan-phase-1.md` "Resume Model"); only sessions whose
+    /// native id was captured are persisted, so only those come back here. A
+    /// per-session resume failure is logged and skipped, never fatal.
+    pub async fn load_and_resume(&self) {
+        let Some(store) = &self.inner.resume_store else {
+            return;
+        };
+        let bindings = match store.load() {
+            Ok(bindings) => bindings,
+            Err(err) => {
+                warn!(error = %err, "failed to load resume-binding store; skipping resume");
+                return;
+            }
+        };
+        if bindings.is_empty() {
+            return;
+        }
+
+        info!(count = bindings.len(), "resuming sessions after daemon restart");
+        for binding in bindings {
+            let session_id = binding.session_id.clone();
+            let agent = binding.agent;
+            match self.resume_binding(binding).await {
+                Ok(info) => {
+                    info!(session_id = %info.id.0, ?agent, "resumed session via native id");
+                }
+                Err(err) => {
+                    // A structurally-corrupt binding (a malformed/absent native
+                    // ref) can never resume regardless of environment, so prune
+                    // it to self-heal instead of retrying it on every restart.
+                    // `agent_binary_missing` is left in place: it may be a
+                    // transient PATH gap at startup that resolves on a later run.
+                    if matches!(err.code.as_str(), "invalid_session_ref" | "not_resumable") {
+                        if let Some(store) = &self.inner.resume_store {
+                            let _ = store.remove(&session_id);
+                        }
+                        warn!(session_id = %session_id, error = %err, "dropping unresumable binding");
+                    } else {
+                        warn!(session_id = %session_id, error = %err, "failed to resume session");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Relaunch one session from its stored resume binding, reusing its id.
+    async fn resume_binding(&self, binding: ResumeBinding) -> Result<SessionInfo, ProtocolError> {
+        let session_ref = match (&binding.native_session_id, &binding.native_session_path) {
+            (Some(id), _) => SessionRef::id(id)?,
+            (None, Some(path)) => SessionRef::path(path)?,
+            (None, None) => {
+                return Err(runtime_error(
+                    "not_resumable",
+                    format!(
+                        "resume binding for {} has no native id or path",
+                        binding.session_id
+                    ),
+                ));
+            }
+        };
+
+        let id = SessionId(binding.session_id.clone());
+        self.bump_next_id_past(&id);
+        let env_extra = self.hook_env(binding.agent, &id);
+        let opts = LaunchOpts {
+            cwd: binding.cwd.clone(),
+            cols: binding.cols,
+            rows: binding.rows,
+            env_extra,
+        };
+        let command = resume_pty_command(binding.agent, &session_ref, &opts)?;
+        self.register_pty_session(PtySessionSpec {
+            id,
+            agent: binding.agent,
+            cwd: binding.cwd,
+            cols: binding.cols,
+            rows: binding.rows,
+            command,
+            native_session_id: binding.native_session_id,
+        })
+        .await
+    }
+
+    /// Advance the session-id counter past a restored `s-<N>` id so a freshly
+    /// created session never collides with a resumed one.
+    fn bump_next_id_past(&self, id: &SessionId) {
+        let Some(n) = id.0.strip_prefix("s-").and_then(|n| n.parse::<u64>().ok()) else {
+            return;
+        };
+        let mut current = self.inner.next_id.load(Ordering::Relaxed);
+        while current <= n {
+            match self.inner.next_id.compare_exchange_weak(
+                current,
+                n + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// List all known sessions.
@@ -695,7 +988,24 @@ impl SessionRegistry {
 
         self.cancel_session_attaches(id).await;
         self.remove_pending_attaches_for_session(id).await;
+        // A terminal session must not resurrect on the next daemon restart:
+        // resume is for sessions whose live PTY a restart killed, not for ones
+        // the user stopped or that exited. Drop its resume binding.
+        self.drop_resume_binding(id);
         self.emit(updated.0, &updated.1);
+    }
+
+    /// Best-effort removal of a session's resume binding from the store.
+    fn drop_resume_binding(&self, id: &SessionId) {
+        if let Some(store) = &self.inner.resume_store {
+            if let Err(err) = store.remove(&id.0) {
+                warn!(
+                    session_id = %id.0,
+                    error = %err,
+                    "failed to remove resume binding on session exit"
+                );
+            }
+        }
     }
 
     async fn clear_stopping(&self, id: &SessionId) {
@@ -770,20 +1080,22 @@ fn build_launch_command(
     cwd: PathBuf,
     cols: u16,
     rows: u16,
+    env_extra: Vec<(String, String)>,
 ) -> Result<PtyCommand, ProtocolError> {
     match agent {
+        // Shell sessions get no hook env; `to_pty_command` carries no env.
         AgentKind::Shell => Ok(shell_command.to_pty_command(cwd, cols, rows)),
         AgentKind::Codex => CodexAdapter.launch(&LaunchOpts {
             cwd,
             cols,
             rows,
-            env_extra: Vec::new(),
+            env_extra,
         }),
         AgentKind::Claude => ClaudeAdapter.launch(&LaunchOpts {
             cwd,
             cols,
             rows,
-            env_extra: Vec::new(),
+            env_extra,
         }),
     }
 }
@@ -889,11 +1201,14 @@ fn timestamp_now() -> String {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use protocol::{AgentKind, SessionNewParams, SessionState};
+    use protocol::{
+        AgentKind, SessionId, SessionNewParams, SessionReportNativeIdParams, SessionState,
+    };
 
     use crate::agent::InputRules;
+    use crate::integration::{ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH};
 
     use super::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 
@@ -904,6 +1219,19 @@ mod tests {
             cols: 80,
             rows: 24,
         }
+    }
+
+    fn temp_store_path(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "zagentmesh-session-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir.join("resume-bindings.jsonl")
     }
 
     #[tokio::test]
@@ -1030,6 +1358,216 @@ mod tests {
             writes.delayed_submit,
             Some((Duration::from_millis(150), b"\r".to_vec()))
         );
+    }
+
+    #[test]
+    fn hook_env_injected_for_agents_with_socket_and_absent_for_shell() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            socket_path: Some(PathBuf::from("/run/zagentmesh/daemon.sock")),
+            ..SessionRegistryConfig::default()
+        });
+        let id = SessionId("s-7".to_owned());
+
+        // Shell never gets hook env.
+        assert!(registry.hook_env(AgentKind::Shell, &id).is_empty());
+
+        for agent in [AgentKind::Codex, AgentKind::Claude] {
+            let env = registry.hook_env(agent, &id);
+            let lookup = |key: &str| {
+                env.iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.clone())
+            };
+            assert_eq!(lookup(ENV_FLAG).as_deref(), Some("1"));
+            assert_eq!(
+                lookup(ENV_SOCKET_PATH).as_deref(),
+                Some("/run/zagentmesh/daemon.sock")
+            );
+            assert_eq!(lookup(ENV_SESSION_ID).as_deref(), Some("s-7"));
+            assert_eq!(
+                lookup(ENV_PROTOCOL_VERSION).as_deref(),
+                Some(protocol::PROTOCOL_VERSION.get().to_string().as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn hook_env_absent_without_configured_socket() {
+        let registry = SessionRegistry::default();
+        let id = SessionId("s-1".to_owned());
+        assert!(registry.hook_env(AgentKind::Claude, &id).is_empty());
+        assert!(registry.hook_env(AgentKind::Codex, &id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn report_native_id_records_binding_and_updates_info() {
+        let store_path = temp_store_path("report");
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            resume_store_path: Some(store_path.clone()),
+            ..SessionRegistryConfig::default()
+        });
+
+        let created = registry.create(params()).await.expect("create session");
+        assert_eq!(created.native_session_id, None);
+
+        let result = registry
+            .report_native_id(SessionReportNativeIdParams {
+                session_id: created.id.clone(),
+                agent: AgentKind::Shell,
+                native_session_id: "native-abc".to_owned(),
+                transcript_path: None,
+            })
+            .await;
+        assert!(result.recorded);
+
+        // In-memory info now carries the native id.
+        let inspected = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(inspected.native_session_id.as_deref(), Some("native-abc"));
+
+        // The binding was persisted to the store.
+        let persisted = crate::store::ResumeStore::new(store_path)
+            .load()
+            .expect("load store");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].session_id, created.id.0);
+        assert_eq!(persisted[0].native_session_id.as_deref(), Some("native-abc"));
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn stopping_a_session_drops_its_resume_binding() {
+        let store_path = temp_store_path("drop-on-stop");
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            resume_store_path: Some(store_path.clone()),
+            ..SessionRegistryConfig::default()
+        });
+
+        let created = registry.create(params()).await.expect("create session");
+        let recorded = registry
+            .report_native_id(SessionReportNativeIdParams {
+                session_id: created.id.clone(),
+                agent: AgentKind::Shell,
+                native_session_id: "native-stop".to_owned(),
+                transcript_path: None,
+            })
+            .await;
+        assert!(recorded.recorded);
+        assert_eq!(
+            crate::store::ResumeStore::new(store_path.clone())
+                .load()
+                .expect("load")
+                .len(),
+            1
+        );
+
+        // Stopping the session must drop the binding so a restart does not
+        // resurrect a session the user ended.
+        let stopped = registry.stop(&created.id).await.expect("stop");
+        assert!(stopped.stopped);
+        assert!(
+            crate::store::ResumeStore::new(store_path)
+                .load()
+                .expect("load")
+                .is_empty(),
+            "stopped session must not leave a resume binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_and_resume_prunes_structurally_unresumable_bindings() {
+        let store_path = temp_store_path("prune-corrupt");
+        // A hand-corrupted binding with no native id or path can never resume.
+        let store = crate::store::ResumeStore::new(store_path.clone());
+        store
+            .record(&crate::store::ResumeBinding {
+                session_id: "s-corrupt".to_owned(),
+                agent: AgentKind::Claude,
+                cwd: PathBuf::from("/tmp"),
+                cols: 80,
+                rows: 24,
+                native_session_id: None,
+                native_session_path: None,
+            })
+            .expect("seed corrupt binding");
+
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            resume_store_path: Some(store_path.clone()),
+            ..SessionRegistryConfig::default()
+        });
+        registry.load_and_resume().await;
+
+        assert!(
+            crate::store::ResumeStore::new(store_path)
+                .load()
+                .expect("load")
+                .is_empty(),
+            "an unresumable binding must be pruned, not retried forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_session_live_tracks_running_then_terminal() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry.create(params()).await.expect("create session");
+        assert!(registry.is_session_live(&created.id).await);
+        assert!(!registry.is_session_live(&SessionId("s-missing".to_owned())).await);
+
+        let _ = registry.stop(&created.id).await;
+        assert!(!registry.is_session_live(&created.id).await);
+    }
+
+    #[tokio::test]
+    async fn report_native_id_ignores_unknown_invalid_and_terminal() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+
+        // Unknown session id.
+        let unknown = registry
+            .report_native_id(SessionReportNativeIdParams {
+                session_id: SessionId("s-missing".to_owned()),
+                agent: AgentKind::Claude,
+                native_session_id: "native-1".to_owned(),
+                transcript_path: None,
+            })
+            .await;
+        assert!(!unknown.recorded);
+
+        let created = registry.create(params()).await.expect("create session");
+
+        // Invalid (empty) native id on a live session.
+        let invalid = registry
+            .report_native_id(SessionReportNativeIdParams {
+                session_id: created.id.clone(),
+                agent: AgentKind::Shell,
+                native_session_id: String::new(),
+                transcript_path: None,
+            })
+            .await;
+        assert!(!invalid.recorded);
+
+        // Terminal session.
+        let _ = registry.stop(&created.id).await;
+        let terminal = registry
+            .report_native_id(SessionReportNativeIdParams {
+                session_id: created.id.clone(),
+                agent: AgentKind::Shell,
+                native_session_id: "native-late".to_owned(),
+                transcript_path: None,
+            })
+            .await;
+        assert!(!terminal.recorded);
     }
 
     #[test]

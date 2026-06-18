@@ -1,247 +1,161 @@
-# NEXT STEP — Milestone 7: Session-ID Hook + Resume
+# NEXT STEP — Milestone 8: Worktree-per-Session
 
 This file describes, in detail, the immediate next step. It is a handoff for
 whoever picks up the work (you, a subagent, or a fresh session).
 
 - Authoritative spec: [`docs/plan-phase-1.md`](docs/plan-phase-1.md) — see
-  "Hook Integration (Session-ID Capture Only)", "Resume Model", the
-  `AgentKind` adapter table, the "SQLite Schema" (where the resume binding
-  eventually lives — milestone 9, not here), and Build-Order milestone 7
-  ("Session-ID hook + resume": install hook, capture native id, resume after
-  daemon restart; *Check:* kill daemon, restart, resume both agents).
-- Phase scope: [`docs/phases/01-core-local-sessions.md`](docs/phases/01-core-local-sessions.md)
-  ("After a daemon restart, sessions resume via captured native session IDs",
-  the per-agent detection signals, "Risks").
-- Reference source (vendored locally at `/tmp/herdr`): **herdr**
-  `src/integration/mod.rs` (`install_claude` ≈ line 1453, `install_codex` ≈
-  line 1514: write the hook script, merge it into `~/.claude/settings.json`
-  `hooks.SessionStart` / the Codex `hooks.json`, strip stale lifecycle hooks),
-  `src/integration/assets/{claude,codex}/herdr-agent-state.sh` (the hook
-  scripts to port — read stdin JSON, fire one RPC to the socket),
-  `src/agent_resume.rs:8-70` (the `SessionRef { Id | Path }` validation to
-  port). **Kandev** is not needed this milestone.
+  "Worktree-per-Session", the "SQLite Schema" `worktree` table (which lands in
+  milestone 9, not here — M8 uses a minimal precursor like M7 did for resume
+  bindings), and Build-Order milestone 8 ("Worktree-per-session: bind/ownership/
+  warnings"; *Check:* two sessions, two worktrees, no shared tree).
+- Phase scope: [`docs/phases/01-core-local-sessions.md`](docs/phases/01-core-local-sessions.md).
+- Reference source (vendored locally): **Kandev**
+  `/tmp/kandev/apps/backend/internal/worktree/worktree.go:24-115` (the `Worktree`
+  record + non-fatal warning fields: `FetchWarning`, `BaseBranchFallbackWarning`,
+  `SetupScriptWarning`), plus `store.go` / `recreator_test.go` in the same dir
+  (ownership + reuse + recreate). **herdr** `/tmp/herdr/src/worktree.rs` is a
+  second reference. **herdr integration** is not needed this milestone.
 
 ---
 
 ## Where we are now (done, verified)
 
-Milestones 1–6 are complete (`cargo build`,
+Milestones 1–7 are complete (`cargo build`,
 `cargo clippy --all-targets --workspace -D warnings`, `cargo test --workspace`
-= 203 passed):
+= 244 passed):
 
 - `crates/protocol` — typed control envelopes; session lifecycle + attach types;
-  `AgentKind { Shell | Codex | Claude }`; `AgentActivity { Working|Blocked|Idle }`
-  + `SessionInfo.activity`; `StateSource { OscTitle|OscProgress|Screen|Process }`;
-  the `agent_state` event; `session.input` (`SessionInputParams`/`Result`).
-  `method::SESSION_REPORT_NATIVE_ID` (`session.report_native_id`) is **declared
-  but not handled** — this is the milestone you wire up here.
+  `AgentKind`; `AgentActivity` + `SessionInfo.activity`; `StateSource`;
+  `agent_state` event; `session.input`. **M7 added:** `session.report_native_id`
+  (`SessionReportNativeIdParams`/`Result`), `integration.install`
+  (`IntegrationInstall{Params,Result,Report}`), and `SessionInfo.native_session_id`
+  (additive, serde skip-if-None).
 - `crates/daemon` (`zagentmeshd`) — Unix-socket server; full `session.*`
-  lifecycle (incl. `session.input`), attach bridge, `subscribe` event stream;
-  in-memory `SessionRegistry` owning one PTY per session; a per-session
-  detection task running the state engine and publishing `agent_state`.
+  lifecycle; attach bridge; `subscribe` event stream; in-memory `SessionRegistry`
+  owning one PTY per session; per-session detection task (state engine).
 - `crates/cli` (`zagentmesh`) — `doctor`, `daemon`, `health`/`status`, `session`
   group (`new --agent shell|codex|claude`, `list`, `inspect`, `stop`, `input`),
-  `attach <target>`.
-- **State engine (M5):** `daemon/src/detect/` = `osc`, `screen`, `manifest`
-  (TOML matcher), `machine` (debounce). Generic shell + per-agent Codex/Claude
-  manifests embedded via `include_str!` and selected by `AgentKind` through
-  `DetectorConfig::for_agent`.
-- **Agent adapters (M6):** `daemon/src/agent/` = the `AgentAdapter` trait
-  (`id`, `launch(&LaunchOpts) -> PtyCommand`, `input_rules() -> InputRules`,
-  `manifest() -> &Manifest`, `resume(&SessionRef) -> AgentCommand`) + `codex.rs`
-  / `claude.rs`. `create_session` launches per `AgentKind`; missing binary on
-  `PATH` → typed `agent_binary_missing`. Input injection honors `InputRules`
-  (Claude Ink: bracketed-paste OFF + `\r` after a configurable ~150 ms delay;
-  Codex: bracketed-paste ON). The **resume-argv builder is built and unit-
-  tested** (`claude --resume <id>` / `codex resume <id>`) but **not wired**.
-- Stubs (TODO doc-comment only, NOT implemented):
-  `daemon/src/{store,events}/mod.rs`. The store stub names "resume bindings"
-  as eventual SQLite content (milestone 9).
+  `attach <target>`, and **M7's** `integration install [--agent claude|codex]`
+  (`inspect` now surfaces `native_session_id` + `resumable`).
+- **State engine (M5):** `daemon/src/detect/` (`osc`, `screen`, `manifest`,
+  `machine`); per-agent manifests selected by `AgentKind`.
+- **Agent adapters (M6):** `daemon/src/agent/` — the `AgentAdapter` trait +
+  `codex.rs`/`claude.rs`; input injection honors `InputRules`; resume-argv
+  builders (`claude --resume <id>` / `codex resume <id>`).
+- **Session-ID hook + resume (M7):** `daemon/src/integration/` installs the
+  per-agent `SessionStart` hook (idempotent settings/hooks/config merge; assets
+  fire `session.report_native_id`, fire-and-forget, exit 0 on any failure). The
+  daemon injects `ZAGENTMESH_ENV/SOCKET_PATH/SESSION_ID/PROTOCOL_VERSION` for
+  Codex/Claude; `report_native_id` captures the native id, updates `SessionInfo`,
+  and persists a `ResumeBinding`. `daemon/src/store/mod.rs` is a **minimal
+  JSON-lines resume-binding store** (the M9 SQLite precursor). On startup the
+  daemon `load_and_resume()`s captured sessions; terminal/unresumable bindings
+  are pruned so a stopped session never resurrects. `SessionRef { kind: Id|Path }`
+  validates id ≤512 / path ≤4096-absolute, no control chars, **no leading `-`**
+  (argv-flag-injection guard).
+- Stubs (TODO doc-comment only, NOT implemented): `daemon/src/events/mod.rs`
+  (append-only event log, milestone 9). `daemon/src/store/mod.rs` now holds the
+  minimal resume-binding store with a `TODO(milestone 9)` that SQLite absorbs it.
 
-### Seams milestone 7 builds on (already in place)
+### Seams milestone 8 builds on (already in place)
 
-- `crates/protocol` — `method::SESSION_REPORT_NATIVE_ID` is declared but has no
-  param type and no handler. M7 adds `SessionReportNativeIdParams` and a minimal
-  result, and dispatches it (mirror the `session.input` param/result/handler
-  shapes added in M6).
-- `daemon/src/agent/mod.rs` — `SessionRef` exists as an **id-only** string
-  (`new`, validated: non-empty, ≤512 bytes, no control chars) feeding the
-  resume builder. The plan's Resume Model wants `SessionRef { kind: Id | Path }`
-  with a **Path** variant (≤4096 bytes, absolute). M7 extends `SessionRef`
-  additively; `resume()` keeps using `.value()`.
-- `daemon/src/agent/mod.rs` — `LaunchOpts.env_extra` is plumbed end-to-end but
-  `create_session` passes an **empty** `env_extra` (`session/mod.rs`). M7 fills
-  it with the hook-handshake env so the spawned agent's hook can call home.
-- `daemon/src/{store,events}/mod.rs` — empty stubs. M7 fills a **minimal**
-  resume-binding store here (see scope note below). Full SQLite + event log
-  stay milestone 9.
-- The CLI `session` group and `doctor` are the surfaces for a hook-install
-  command and (optionally) a manual `session resume`.
+- `crates/protocol` — `SessionNewParams` has `agent`, `cwd`, `cols`, `rows`.
+  Worktree binding wants a repo + branch + base-branch. M8 adds **optional**
+  `repo`/`branch`/`base_branch` (all `#[serde(default, skip_serializing_if)]`)
+  to `SessionNewParams`, and `SessionInfo` gains optional `repo`/`branch`/
+  `worktree_path` + non-fatal `warnings` (mirror how M7 added `native_session_id`
+  additively). The SQLite schema's `session` row already names `repo`,
+  `base_branch`, `branch`, `worktree_path`.
+- `daemon/src/session/mod.rs` — `create` resolves a `cwd` today. M8 inserts a
+  worktree-resolution step: when a repo+branch is requested, bind/create the
+  worktree and launch the agent **in the worktree path** instead of the raw cwd.
+  `register_pty_session` already takes a resolved `cwd` — feed it the worktree.
+- `daemon/src/store/mod.rs` — the minimal-store pattern (load/save a small file
+  under the data dir, atomic temp+rename, 0600) is the model for a **minimal
+  worktree-binding store** (precursor to the M9 `worktree` table). Do **not**
+  build the full SQLite `worktree` table here.
+- `crates/cli` — the `session new` command and the `inspect`/`list` formatters
+  are where repo/branch/worktree + warnings surface.
 
 ---
 
-## Goal of milestone 7
+## Goal of milestone 8
 
-Capture each agent's **native session id** through a `SessionStart` hook and use
-it to **resume after a daemon restart**. The daemon installs a small hook into
-Claude's (`~/.claude/settings.json`) and Codex's config; when an agent starts it
-fires one RPC back to the socket carrying its native session id; the daemon
-records that as the session's resume binding. After the daemon is killed and
-restarted, the live PTYs are gone (by design), so the daemon rebuilds each
-session from its stored binding and resumes the agent via the M6 resume-argv
-builder.
+Bind **one git worktree per `(session_id, repository, branch)`** so concurrent
+sessions on the same repo never share a working tree. Track `path`, `branch`,
+`base_branch`, `status` (`active`/`merged`/`deleted`); check ownership before
+reuse or cleanup; and treat fetch / base-branch / setup-script failures as
+**non-fatal warnings** (keep the worktree, surface the warning, let the user
+decide). **Still local, single-host.**
 
-Hooks are **session-id capture only** — they do **not** report live state
-(state still comes from the M5 detector). **Still local, single-host.**
-
-> **Scope note on persistence (read this).** Build-Order step 7's checkpoint
-> ("kill daemon, restart, resume both agents") needs the resume binding to
-> survive a process restart, but full **SQLite persistence + event log +
-> migration test is milestone 9**. So M7 introduces a **minimal, single-purpose
-> resume-binding store** (a JSON-lines / small file under the daemon state dir,
-> holding only what is needed to relaunch-and-resume: `session_id`, `agent`,
-> `cwd`, `cols`, `rows`, `native_session_id`, `native_session_path?`). It is an
-> explicit **precursor** to the M9 `session` table — fill `store/mod.rs` with
-> this minimal store and leave a `TODO(milestone 9)` that SQLite absorbs it. Do
-> **not** build the full schema, the worktree table, or the `events/` log here.
+> **Scope note on persistence (read this).** Like M7's resume-binding store, M8
+> ships a **minimal worktree-binding store** (a small file under the data dir:
+> `session_id`, `repository`, `branch`, `base_branch`, `path`, `status`,
+> timestamps), an explicit **precursor** to the M9 `worktree` table. Do **not**
+> build the full SQLite schema or the event log here.
 
 ### Definition of done (testable)
 
-1. `method::SESSION_REPORT_NATIVE_ID` gains a `SessionReportNativeIdParams
-   { session_id, agent, native_session_id, transcript_path? }` and a minimal
-   result (e.g. `{ recorded: bool }` — the hook fires-and-forgets and ignores
-   the body). Round-trip tests in `protocol/tests/roundtrip.rs`.
-2. `SessionRef` becomes `{ kind: Id | Path, value }` (port the validation from
-   herdr `src/agent_resume.rs:8-70`: id ≤512, path ≤4096 + absolute, both
-   non-empty + no control chars). The M6 resume builders keep producing
-   `claude --resume <value>` / `codex resume <value>`. Unit tests cover both
-   kinds + each rejection.
-3. The daemon injects the hook-handshake env before spawning every Codex/Claude
-   agent: `ZAGENTMESH_SOCKET_PATH` (the control socket) and
-   `ZAGENTMESH_SESSION_ID` (the zagentmesh session id), via `LaunchOpts.env_extra`.
-   (Shell sessions get no hook env.)
-4. A hook installer (`daemon/src/integration/`) writes the per-agent hook script
-   and registers it: Claude → `~/.claude/hooks/` + merge into `settings.json`
-   `hooks.SessionStart` (matcher `*`), stripping any stale lifecycle hooks it
-   owns; Codex → its config dir + `hooks.json` (the `notify`/`SessionStart`
-   equivalent). Reinstall is **idempotent** (no duplicate entries) and never
-   clobbers unrelated user settings. Ported from herdr but emitting **our**
-   env names + **our** `session.report_native_id` method.
-5. The hook script reads its stdin JSON (`session_id`, `transcript_path`), and
-   if `ZAGENTMESH_ENV`/socket/session-id are present, sends one fire-and-forget
-   RPC (0.5 s timeout) `session.report_native_id` to the socket. Missing env or
-   missing python/runtime → silent no-op exit 0 (never break the agent).
-6. The daemon **handles** `session.report_native_id`: validate, build a
-   `SessionRef`, and write the resume binding into the minimal store (and update
-   the in-memory `SessionInfo` so `inspect`/`list` can show it). Reports for an
-   unknown/terminal session are ignored, not errors.
-7. **Restart-resume:** on startup the daemon loads the resume-binding store; a
-   `resume` path relaunches a session with the agent's resume argv (M6 builder)
-   in the stored `cwd`/size, attaches a fresh PTY + detector, and re-registers
-   it. Document (code comment + `docs`) that a daemon restart kills live PTYs by
-   design and only resumable sessions (those with a captured native id) come
-   back.
-8. CLI: a hook-install command (e.g. `zagentmesh integration install
-   [--agent claude|codex]`) and surfacing the native id / "resumable" in
-   `inspect` (and optionally a manual `session resume <target>`). Display-only
-   formatter branches unit-tested.
-9. End-to-end (extend `crates/daemon/tests/health_socket.rs`): a stub `claude`
-   and `codex` that, on launch, call `session.report_native_id` (simulating the
-   hook), then idle. Assert the binding is recorded; then **drop the registry
-   (simulated daemon kill), rebuild it against the same state dir, resume**, and
-   assert the relaunched stub received the resume argv (`--resume <id>` /
-   `resume <id>`).
-10. `cargo build`, `cargo clippy --all-targets --workspace -D warnings`, and
-    `cargo test --workspace` stay clean.
+1. `SessionNewParams` gains optional `repo`/`branch`/`base_branch`; `SessionInfo`
+   gains optional `repo`/`branch`/`worktree_path` + a `warnings: Vec<…>` of
+   non-fatal warnings. Additive serde (omitted when absent). Round-trip tests.
+2. A worktree module (`daemon/src/worktree/`) that, given a repo + branch +
+   base-branch, binds an existing owned worktree or creates a new one under the
+   data dir (`worktrees/<session>-<repo>-<branch-slug>/`), running
+   `git worktree add`. Ownership check before reuse/cleanup (don't adopt or
+   delete a tree this daemon does not own). Branch-slug disambiguation so two
+   branches of one `(session, repo)` don't collapse (Kandev `BranchSlug`).
+3. Non-fatal warnings: a failed `git fetch` falls back to a local branch with a
+   `fetch_warning`; a missing base-branch falls back to the default branch with
+   a `base_branch_fallback_warning`; a failing setup script keeps the worktree
+   with a `setup_script_warning`. None of these abort session creation.
+4. `create_session` launches Codex/Claude in the bound worktree path when a
+   repo+branch is requested; a plain `cwd` (no repo) keeps today's behavior.
+5. Minimal worktree-binding store under the data dir (load/save, atomic write,
+   `TODO(milestone 9)` that SQLite absorbs it). No secrets written.
+6. CLI: `session new --repo <path> --branch <name> [--base-branch <name>]`;
+   `inspect`/`list` surface the worktree path + branch + any warnings.
+7. End-to-end (extend `crates/daemon/tests/health_socket.rs`): create two
+   sessions on the same repo with different branches; assert two distinct
+   worktree paths (no shared tree) and that each session launched in its own
+   worktree. Cover the fetch / base-branch / setup-script warning paths.
+8. `cargo build`, `cargo clippy --all-targets --workspace -D warnings`, and
+   `cargo test --workspace` stay clean.
 
 ### Explicitly OUT of scope (later milestones — do NOT build here)
 
-- **Live-state hooks.** Hooks capture the native id only; state stays with the
-  M5 detector. Do not wire `PostToolUse`/`Stop`/etc. into activity.
-- **Full SQLite persistence + `events/` append-only log + `user_version` 1→2
-  migration test** → **milestone 9**. M7 ships only the minimal resume-binding
-  store described in the scope note.
-- **Worktree-per-session** → milestone 8.
+- **Full SQLite persistence + `events/` append-only log + migration test** →
+  **milestone 9** (absorbs both the M7 resume-binding store and the M8 worktree
+  store into `state.db`).
 - **`--json` everywhere + error/recovery polish** → milestone 10.
+- **Remote transport / NetBird** → Phase 2.
 
 ---
 
 ## Implementation tasks
 
-### 1. `crates/protocol` — the native-id report
-
-- Add `SessionReportNativeIdParams { session_id: SessionId, agent: AgentKind,
-  native_session_id: String, #[serde(default)] transcript_path: Option<String> }`
-  and a minimal result. Mirror the `session.input` param/result shapes.
-- Round-trip tests for the params (with and without `transcript_path`) and the
-  result.
-
-### 2. `crates/daemon/src/agent/` — `SessionRef` kind + path
-
-- Extend `SessionRef` to `{ kind: Id | Path, value }`; add a `path` constructor
-  (≤4096 bytes, absolute, non-empty, no control chars) alongside the existing id
-  constructor (≤512). Keep `value()`; `resume()` is unchanged.
-- Unit tests: id/path accept + each rejection (empty, control char, over-length,
-  relative path).
-
-### 3. `crates/daemon/src/integration/` — hook install (new module)
-
-- Port herdr's hook scripts (`assets/{claude,codex}/herdr-agent-state.sh`) into
-  embedded assets, rewritten to use **our** env names (`ZAGENTMESH_ENV`,
-  `ZAGENTMESH_SOCKET_PATH`, `ZAGENTMESH_SESSION_ID`) and **our** method
-  (`session.report_native_id`). Keep the fire-and-forget + 0.5 s timeout + silent
-  no-op-on-missing-env behavior.
-- `install_claude` / `install_codex` (model: herdr `install_claude` ≈ 1453,
-  `install_codex` ≈ 1514): write the script, `chmod +x`, merge into the agent's
-  settings (`~/.claude/settings.json` `hooks.SessionStart` matcher `*`; Codex
-  `hooks.json`), idempotently, stripping only hooks this installer owns. Fail
-  fast with a typed error if the agent's config dir is absent.
-- Unit-test the merge against fixture settings (fresh file, pre-existing
-  unrelated hooks, and a reinstall) — assert no duplicates and unrelated keys
-  preserved.
-
-### 4. `crates/daemon/src/session/` + `store/` — env, capture, store, resume
-
-- `create_session`: for Codex/Claude, populate `LaunchOpts.env_extra` with
-  `ZAGENTMESH_ENV=1`, `ZAGENTMESH_SOCKET_PATH`, `ZAGENTMESH_SESSION_ID` (the
-  daemon must know its own socket path; thread it through
-  `SessionRegistryConfig`). Shell sessions: no hook env.
-- Handle `session.report_native_id`: validate, build the `SessionRef`, write the
-  binding to the minimal store, update `SessionInfo` (native id visible to
-  `inspect`/`list`). Unknown/terminal session → ignore.
-- Fill `store/mod.rs` with the minimal resume-binding store (load/save; small
-  file under the daemon state dir; `TODO(milestone 9)` that SQLite absorbs it).
-  No secrets are ever written.
-- A `resume` entry point: read a binding, relaunch via the M6 resume argv in the
-  stored `cwd`/size, wire a fresh detector, re-register. On daemon startup, load
-  the store so resumable sessions are known.
-
-### 5. `crates/cli` — install + surface resume
-
-- A hook-install command (`integration install [--agent ...]`) calling the
-  daemon (or a local install path — match how `doctor` reaches config).
-- Surface the native id / "resumable" in `inspect` (and optionally
-  `session resume <target>`). Unit-test any new formatter branch.
+1. `crates/protocol` — additive `SessionNewParams`/`SessionInfo` fields +
+   round-trip tests (mirror M7's `native_session_id` additive pattern).
+2. `crates/daemon/src/worktree/` (new module) — the worktree binder/creator
+   (model: Kandev `worktree.go`/`store.go`), ownership check, branch-slug,
+   non-fatal warning collection. Unit-test slug, ownership, and warning mapping
+   against temp git repos.
+3. `crates/daemon/src/session/` + `store/` — resolve the worktree in
+   `create_session`, launch in its path; minimal worktree-binding store.
+4. `crates/cli` — `session new` repo/branch flags; surface worktree + warnings.
 
 ---
 
 ## Tests (must pass before done)
 
-Most layers are unit-testable without a live agent; use stub scripts for the
-hook + resume round trip.
-
-- protocol: round-trip for `SessionReportNativeIdParams` (with/without
-  `transcript_path`) and the result.
-- agent: `SessionRef` id + path accept/reject; resume argv for an id and a path.
-- integration: hook-script asset shape (fires our method, uses our env, exits 0
-  on missing env); settings merge is idempotent and preserves unrelated keys.
-- session/store: `report_native_id` records the binding and updates
-  `SessionInfo`; the minimal store round-trips load/save; env-injection present
-  at launch for Codex/Claude and absent for Shell.
-- daemon integration (extend `crates/daemon/tests/health_socket.rs`): a stub
-  `claude`/`codex` that calls `session.report_native_id` on launch; assert the
-  binding; then rebuild the registry against the same state dir and resume;
-  assert the relaunched stub argv is `--resume <id>` / `resume <id>`.
+- protocol: round-trip for the new optional `SessionNewParams`/`SessionInfo`
+  fields (present and absent).
+- worktree: slug disambiguation; ownership check rejects a foreign tree; the
+  three warning paths (fetch / base-branch / setup-script) keep the worktree.
+- session/store: a repo+branch session launches in the worktree; the minimal
+  store round-trips; two branches of one repo bind two trees.
+- daemon integration (extend `crates/daemon/tests/health_socket.rs`): two
+  sessions, two worktrees, no shared tree (the Build-Order checkpoint).
 - Keep `cargo build`, `cargo clippy --all-targets --workspace -D warnings`, and
   `cargo test --workspace` clean.
 
@@ -249,22 +163,12 @@ hook + resume round trip.
 
 ## After this milestone
 
-Milestone 8 = **worktree-per-session** (bind one worktree per
-`(session_id, repo, branch)`; ownership check before reuse/cleanup; non-fatal
-warnings on fetch/base-branch/setup-script failure — model: Kandev
-`worktree/worktree.go:24-115`). Then milestone 9 = **SQLite persistence +
-append-only event log + `user_version` 1→2 migration test** (this is where the
-minimal M7 resume-binding store is absorbed into the `session` table and the
-`worktree` table lands; `state.db` rebuildable from sources, event log the audit
-trail). Then milestone 10 = **`--json` everywhere + error/recovery polish**.
+Milestone 9 = **SQLite persistence + append-only event log + `user_version`
+1→2 migration test**: absorb the minimal M7 resume-binding store and the M8
+worktree store into the `session` + `worktree` tables; `state.db` rebuildable
+from sources; the event log is the audit trail. Then milestone 10 = **`--json`
+everywhere + error/recovery polish**.
 
-Empirical open questions to settle now (per the plan): the exact Claude and
-Codex `SessionStart` hook stdin JSON shapes (record from real sessions — Claude
-gives `session_id` + `transcript_path`; Codex gives `session_id`); whether Codex
-exposes its native session id via `notify`/`hooks.json` the same way Claude does
-(confirm against a live Codex session); and that a daemon restart cleanly
-relaunches `claude --resume` / `codex resume` against a real captured id.
-
-Do not pull milestone 8+ worktree/persistence work into this step — keep M7
-proven: both agents install a hook, both report a native id on start, the
-binding survives a registry rebuild, and both resume via the M6 argv builder.
+Do not pull milestone 9 SQLite work into this step — keep M8 proven: two
+sessions on one repo get two worktrees, ownership is checked before reuse/
+cleanup, and fetch/base-branch/setup-script failures are non-fatal warnings.
