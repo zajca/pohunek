@@ -7,9 +7,10 @@
 //!
 //! Current scope (see `docs/plan-phase-1.md` "Build Order"): bind the Unix
 //! socket with correct permissions, single-instance lock, stale-socket recovery,
-//! `daemon.health`, PTY-backed local sessions, and raw attach streaming over a
-//! separate connection. Agents, detection (the state engine), the SQLite store,
-//! and the event log are later milestones and exist here only as stubs.
+//! `daemon.health`, PTY-backed local sessions, raw attach streaming over a
+//! separate connection, agents, detection (the state engine), worktree-per-session
+//! binding, a unified JSON-lines metadata store (resume + worktree bindings), and
+//! an append-only event log. The SQLite store is deferred (see `NEXT.md`).
 
 #![warn(missing_debug_implementations)]
 #![warn(rust_2018_idioms)]

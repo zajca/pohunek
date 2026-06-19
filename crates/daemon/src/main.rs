@@ -14,19 +14,15 @@ use zagentmesh_daemon::lock::InstanceLock;
 use zagentmesh_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use zagentmesh_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
 
-/// File name of the minimal resume-binding store under the data dir.
-///
-/// TODO(milestone 9): superseded by `state.db` (the `session` table) once the
-/// SQLite store lands.
-const RESUME_STORE_NAME: &str = "resume-bindings.jsonl";
+/// File name of the unified metadata store (resume + worktree bindings) under
+/// the data dir.
+const STORE_NAME: &str = "metadata.jsonl";
 
 /// Subdirectory under the data dir holding per-session git worktrees.
 const WORKTREES_SUBDIR: &str = "worktrees";
 
-/// File name of the minimal worktree-binding store under the data dir.
-///
-/// TODO(milestone 9): superseded by `state.db` (the `worktree` table).
-const WORKTREE_STORE_NAME: &str = "worktree-bindings.jsonl";
+/// Subdirectory under the data dir holding the append-only event log.
+const EVENTS_SUBDIR: &str = "events";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -66,32 +62,48 @@ async fn run() -> Result<(), DaemonError> {
     info!(lock = %paths.lock.display(), "acquired single-instance lock");
 
     // 5. Build the session registry with the hook-handshake socket path, the
-    //    resume-binding store, and the worktree-binding store + worktrees root,
-    //    so spawned agents can report their native id, captured sessions survive
-    //    a restart, and a repo+branch session binds a dedicated worktree.
+    //    unified metadata store (resume + worktree bindings in one file), the
+    //    worktrees root, and the event-log directory, so spawned agents can
+    //    report their native id, captured sessions survive a restart, a
+    //    repo+branch session binds a dedicated worktree, and the lifecycle is
+    //    recorded to the append-only event log.
     let config = SessionRegistryConfig {
         socket_path: Some(paths.socket.clone()),
-        resume_store_path: Some(paths.data_dir.join(RESUME_STORE_NAME)),
+        store_path: Some(paths.data_dir.join(STORE_NAME)),
         worktree_root: Some(paths.data_dir.join(WORKTREES_SUBDIR)),
-        worktree_store_path: Some(paths.data_dir.join(WORKTREE_STORE_NAME)),
+        event_log_dir: Some(paths.data_dir.join(EVENTS_SUBDIR)),
         ..SessionRegistryConfig::default()
     };
     let sessions = SessionRegistry::new(config);
 
-    // 6. Bind the control socket (stale-socket recovery + 0600).
+    // 6. Start the append-only event log before anything emits, so the resume
+    //    events from `load_and_resume` below are captured too. Fail fast if the
+    //    log location is unusable.
+    sessions
+        .spawn_event_log()
+        .map_err(|source| DaemonError::Directory {
+            path: paths.data_dir.join(EVENTS_SUBDIR),
+            source,
+        })?;
+
+    // 7. Bind the control socket (stale-socket recovery + 0600).
     let health = HealthInfo::new(DAEMON_VERSION);
     let state = DaemonState::new(health, sessions.clone());
     let server = ControlServer::bind_with_state(&paths.socket, state).await?;
     info!(socket = %server.socket_path().display(), "ready; serving control protocol");
 
-    // 7. A daemon restart kills live PTYs by design; relaunch the sessions whose
+    // 8. A daemon restart kills live PTYs by design; relaunch the sessions whose
     //    native id was captured. The socket is already bound, so a resumed
     //    agent's hook can re-report. Best-effort: per-session failures are
     //    logged, never fatal.
     sessions.load_and_resume().await;
 
-    // 8. Serve until a termination signal.
+    // 9. Serve until a termination signal.
     server.serve(shutdown_signal()).await;
+
+    // 10. Flush the append-only event log before exit so events buffered at
+    //     shutdown are not lost (bounded so a wedged write cannot hang exit).
+    sessions.shutdown_event_log().await;
 
     info!("zagentmeshd stopped");
     Ok(())

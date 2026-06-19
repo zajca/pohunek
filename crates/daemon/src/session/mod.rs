@@ -18,6 +18,7 @@ use serde_json::json;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, watch, Mutex};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -28,10 +29,13 @@ use crate::agent::{
 use crate::detect::{ActivityTransition, Detector, DetectorConfig};
 use crate::integration::{ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH};
 use crate::pty::{PtyCommand, PtyError, PtyExit, PtyHandle};
-use crate::store::{ResumeBinding, ResumeStore};
-use crate::worktree::{WorktreeManager, WorktreeRequest, WorktreeStore};
+use crate::store::{ResumeBinding, Store};
+use crate::worktree::{WorktreeManager, WorktreeRequest};
 
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
+/// Bound on how long a graceful shutdown waits for the event-log drain to flush
+/// its backlog, so a wedged log write can never hang shutdown.
+const EVENT_LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 const SUBMIT: &[u8] = b"\r";
@@ -99,17 +103,18 @@ pub struct SessionRegistryConfig {
     /// call home. `None` disables hook-handshake env injection (e.g. in unit
     /// tests that do not exercise the hook).
     pub socket_path: Option<PathBuf>,
-    /// Backing file for the minimal resume-binding store. `None` disables
-    /// persistence (sessions are then not resumable across a restart).
-    pub resume_store_path: Option<PathBuf>,
+    /// Backing file for the unified metadata store (resume + worktree bindings).
+    /// `None` disables persistence (sessions are then not resumable across a
+    /// restart, and worktree binding is unavailable).
+    pub store_path: Option<PathBuf>,
     /// Root directory under which per-session worktrees are created
-    /// (`<data_dir>/worktrees`). Must be set together with
-    /// [`Self::worktree_store_path`] to enable worktree binding; when unset, a
-    /// `session.new` carrying a repo+branch fails (no silent default).
+    /// (`<data_dir>/worktrees`). Must be set together with [`Self::store_path`]
+    /// to enable worktree binding; when unset, a `session.new` carrying a
+    /// repo+branch fails (no silent default).
     pub worktree_root: Option<PathBuf>,
-    /// Backing file for the minimal worktree-binding store. Set together with
-    /// [`Self::worktree_root`].
-    pub worktree_store_path: Option<PathBuf>,
+    /// Directory for the append-only event log (`<data_dir>/events`). `None`
+    /// disables event logging. Started via [`SessionRegistry::spawn_event_log`].
+    pub event_log_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,9 +154,9 @@ impl Default for SessionRegistryConfig {
             output_history_limit_bytes: DEFAULT_OUTPUT_HISTORY_LIMIT_BYTES,
             claude_submit_delay: crate::agent::DEFAULT_CLAUDE_SUBMIT_DELAY,
             socket_path: None,
-            resume_store_path: None,
+            store_path: None,
             worktree_root: None,
-            worktree_store_path: None,
+            event_log_dir: None,
         }
     }
 }
@@ -171,8 +176,10 @@ struct SessionRegistryInner {
     next_stream_id: AtomicU64,
     config: SessionRegistryConfig,
     events: broadcast::Sender<Event>,
-    /// Minimal resume-binding store, present when persistence is configured.
-    resume_store: Option<ResumeStore>,
+    /// Unified metadata store (resume + worktree bindings), present when
+    /// persistence is configured. Shared (`Arc`) with [`Self::worktree`] so both
+    /// record kinds live in one file behind one serialization point.
+    store: Option<Arc<Store>>,
     /// Serializes resume-binding persistence so a resize and a native-id capture
     /// (or two resizes) racing on the same session cannot leave a stale binding:
     /// each persister re-reads current state under this lock, so the last writer
@@ -182,6 +189,12 @@ struct SessionRegistryInner {
     /// Per-session worktree binder, present when worktree binding is configured.
     /// Shared into `spawn_blocking` for the (blocking) git subprocesses.
     worktree: Option<Arc<WorktreeManager>>,
+    /// Cancellation signal for the event-log drain, fired by
+    /// [`SessionRegistry::shutdown_event_log`] so the drain flushes its backlog
+    /// and exits cleanly at shutdown.
+    event_log_shutdown: CancellationToken,
+    /// Join handle of the spawned event-log drain task, awaited at shutdown.
+    event_log_task: std::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -229,14 +242,19 @@ impl SessionRegistry {
     #[must_use]
     pub fn new(config: SessionRegistryConfig) -> Self {
         let (events, _) = broadcast::channel(128);
-        let resume_store = config.resume_store_path.clone().map(ResumeStore::new);
-        // Worktree binding needs both a root for the trees and a store file; it
-        // is enabled only when both are configured (no silent default path).
-        let worktree = match (&config.worktree_root, &config.worktree_store_path) {
-            (Some(root), Some(store_path)) => Some(Arc::new(WorktreeManager::new(
-                root.clone(),
-                WorktreeStore::new(store_path.clone()),
-            ))),
+        // One unified store instance, shared (`Arc`) with the worktree manager so
+        // resume and worktree records live in one file behind one serialization
+        // point.
+        let store = config
+            .store_path
+            .clone()
+            .map(|path| Arc::new(Store::new(path)));
+        // Worktree binding needs both a root for the trees and the shared store;
+        // it is enabled only when both are configured (no silent default path).
+        let worktree = match (&config.worktree_root, &store) {
+            (Some(root), Some(store)) => {
+                Some(Arc::new(WorktreeManager::new(root.clone(), store.clone())))
+            }
             _ => None,
         };
         Self {
@@ -248,9 +266,11 @@ impl SessionRegistry {
                 next_stream_id: AtomicU64::new(1),
                 config,
                 events,
-                resume_store,
+                store,
                 persist_lock: Mutex::new(()),
                 worktree,
+                event_log_shutdown: CancellationToken::new(),
+                event_log_task: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -259,6 +279,57 @@ impl SessionRegistry {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.inner.events.subscribe()
+    }
+
+    /// Start the append-only event log, if [`SessionRegistryConfig::event_log_dir`]
+    /// is configured.
+    ///
+    /// Opens the log (creating the events directory `0700` and the file `0600`)
+    /// and spawns a background task draining this registry's event broadcast into
+    /// it. Call once at startup, **before** any session is created or resumed, so
+    /// every lifecycle event is captured. A no-op when no event-log dir is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns the open error so the daemon can fail fast on a misconfigured log
+    /// location.
+    pub fn spawn_event_log(&self) -> std::io::Result<()> {
+        let Some(dir) = &self.inner.config.event_log_dir else {
+            return Ok(());
+        };
+        let log = Arc::new(crate::events::EventLog::open(dir)?);
+        let handle =
+            crate::events::spawn_drain(log, self.subscribe(), self.inner.event_log_shutdown.clone());
+        *self
+            .inner
+            .event_log_task
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = Some(handle);
+        Ok(())
+    }
+
+    /// Flush and stop the event-log drain at shutdown.
+    ///
+    /// Cancels the drain so it makes a final pass over any buffered events, then
+    /// awaits the task (bounded by [`EVENT_LOG_FLUSH_TIMEOUT`]) so the process
+    /// does not exit while audit lines are still unwritten. A no-op when no event
+    /// log was started.
+    pub async fn shutdown_event_log(&self) {
+        self.inner.event_log_shutdown.cancel();
+        let handle = self
+            .inner
+            .event_log_task
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take();
+        if let Some(handle) = handle {
+            if tokio::time::timeout(EVENT_LOG_FLUSH_TIMEOUT, handle)
+                .await
+                .is_err()
+            {
+                warn!("event-log drain did not finish flushing within the shutdown timeout");
+            }
+        }
     }
 
     /// Create a new PTY-backed session.
@@ -579,7 +650,7 @@ impl SessionRegistry {
     /// `persist_lock` alone. Best-effort: an unconfigured store or a failed
     /// write is non-fatal and only impairs restart-resume, surfaced via a warn.
     async fn persist_resume_binding(&self, id: &SessionId) {
-        let Some(store) = &self.inner.resume_store else {
+        let Some(store) = &self.inner.store else {
             return;
         };
         let _persist = self.inner.persist_lock.lock().await;
@@ -605,8 +676,8 @@ impl SessionRegistry {
             })
         };
         let result = match &desired {
-            Some(binding) => store.record(binding),
-            None => store.remove(&id.0),
+            Some(binding) => store.record_resume(binding),
+            None => store.remove_resume(&id.0),
         };
         if let Err(err) = result {
             warn!(
@@ -624,10 +695,10 @@ impl SessionRegistry {
     /// native id was captured are persisted, so only those come back here. A
     /// per-session resume failure is logged and skipped, never fatal.
     pub async fn load_and_resume(&self) {
-        let Some(store) = &self.inner.resume_store else {
+        let Some(store) = &self.inner.store else {
             return;
         };
-        let bindings = match store.load() {
+        let bindings = match store.load_resume() {
             Ok(bindings) => bindings,
             Err(err) => {
                 warn!(error = %err, "failed to load resume-binding store; skipping resume");
@@ -697,8 +768,10 @@ impl SessionRegistry {
         let command = resume_pty_command(binding.agent, &session_ref, &opts)?;
         // A resumed session relaunches in its recorded cwd, which already is the
         // worktree path for worktree sessions (the worktree persists on disk
-        // across a daemon restart). M8 does not re-restore the worktree metadata
-        // fields here; the M9 SQLite store unifies the two records.
+        // across a daemon restart). With the unified store the session's worktree
+        // metadata (repo/branch/worktree_path) is restored too, so inspect/list
+        // show it again after a restart.
+        let (repo, branch, worktree_path) = self.restore_worktree_metadata(&binding.session_id);
         self.register_pty_session(PtySessionSpec {
             id,
             agent: binding.agent,
@@ -707,12 +780,42 @@ impl SessionRegistry {
             rows: binding.rows,
             command,
             native_session_id: binding.native_session_id,
-            repo: None,
-            branch: None,
-            worktree_path: None,
+            repo,
+            branch,
+            worktree_path,
             warnings: Vec::new(),
         })
         .await
+    }
+
+    /// Look up a resumed session's worktree binding in the unified store and
+    /// return its `(repo, branch, worktree_path)` so the restored session shows
+    /// its worktree metadata again. Best-effort: a missing store, a read error,
+    /// or no binding yields all-`None` — the session still resumes (its cwd is the
+    /// worktree path either way); only the display metadata is absent.
+    fn restore_worktree_metadata(
+        &self,
+        session_id: &str,
+    ) -> (Option<PathBuf>, Option<String>, Option<PathBuf>) {
+        let Some(store) = &self.inner.store else {
+            return (None, None, None);
+        };
+        match store.find_worktree_for_session(session_id) {
+            Ok(Some(binding)) => (
+                Some(binding.repository),
+                Some(binding.branch),
+                Some(binding.path),
+            ),
+            Ok(None) => (None, None, None),
+            Err(err) => {
+                warn!(
+                    session_id = %session_id,
+                    error = %err,
+                    "failed to read worktree metadata during resume"
+                );
+                (None, None, None)
+            }
+        }
     }
 
     /// Advance the session-id counter past a restored `s-<N>` id so a freshly
@@ -1375,7 +1478,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir.join("resume-bindings.jsonl")
+        dir.join("metadata.jsonl")
     }
 
     #[tokio::test]
@@ -1549,7 +1652,7 @@ mod tests {
         let registry = SessionRegistry::new(SessionRegistryConfig {
             shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
             stop_grace: Duration::from_millis(50),
-            resume_store_path: Some(store_path.clone()),
+            store_path: Some(store_path.clone()),
             ..SessionRegistryConfig::default()
         });
 
@@ -1571,8 +1674,8 @@ mod tests {
         assert_eq!(inspected.native_session_id.as_deref(), Some("native-abc"));
 
         // The binding was persisted to the store.
-        let persisted = crate::store::ResumeStore::new(store_path)
-            .load()
+        let persisted = crate::store::Store::new(store_path)
+            .load_resume()
             .expect("load store");
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].session_id, created.id.0);
@@ -1587,7 +1690,7 @@ mod tests {
         let registry = SessionRegistry::new(SessionRegistryConfig {
             shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
             stop_grace: Duration::from_millis(50),
-            resume_store_path: Some(store_path.clone()),
+            store_path: Some(store_path.clone()),
             ..SessionRegistryConfig::default()
         });
 
@@ -1602,8 +1705,8 @@ mod tests {
             .await;
         assert!(recorded.recorded);
         assert_eq!(
-            crate::store::ResumeStore::new(store_path.clone())
-                .load()
+            crate::store::Store::new(store_path.clone())
+                .load_resume()
                 .expect("load")
                 .len(),
             1
@@ -1614,8 +1717,8 @@ mod tests {
         let stopped = registry.stop(&created.id).await.expect("stop");
         assert!(stopped.stopped);
         assert!(
-            crate::store::ResumeStore::new(store_path)
-                .load()
+            crate::store::Store::new(store_path)
+                .load_resume()
                 .expect("load")
                 .is_empty(),
             "stopped session must not leave a resume binding"
@@ -1628,7 +1731,7 @@ mod tests {
         let registry = SessionRegistry::new(SessionRegistryConfig {
             shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
             stop_grace: Duration::from_millis(50),
-            resume_store_path: Some(store_path.clone()),
+            store_path: Some(store_path.clone()),
             ..SessionRegistryConfig::default()
         });
 
@@ -1643,8 +1746,8 @@ mod tests {
             })
             .await;
         assert!(recorded.recorded);
-        let before = crate::store::ResumeStore::new(store_path.clone())
-            .load()
+        let before = crate::store::Store::new(store_path.clone())
+            .load_resume()
             .expect("load before");
         assert_eq!(before.len(), 1);
         assert_eq!((before[0].cols, before[0].rows), (80, 24));
@@ -1656,8 +1759,8 @@ mod tests {
             .await
             .expect("resize session");
 
-        let after = crate::store::ResumeStore::new(store_path)
-            .load()
+        let after = crate::store::Store::new(store_path)
+            .load_resume()
             .expect("load after");
         assert_eq!(
             after.len(),
@@ -1681,7 +1784,7 @@ mod tests {
         let registry = SessionRegistry::new(SessionRegistryConfig {
             shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
             stop_grace: Duration::from_millis(50),
-            resume_store_path: Some(store_path.clone()),
+            store_path: Some(store_path.clone()),
             ..SessionRegistryConfig::default()
         });
 
@@ -1694,8 +1797,8 @@ mod tests {
             .expect("resize session");
 
         assert!(
-            crate::store::ResumeStore::new(store_path)
-                .load()
+            crate::store::Store::new(store_path)
+                .load_resume()
                 .expect("load")
                 .is_empty(),
             "resize without a native id must not create a resume binding"
@@ -1708,9 +1811,9 @@ mod tests {
     async fn load_and_resume_prunes_structurally_unresumable_bindings() {
         let store_path = temp_store_path("prune-corrupt");
         // A hand-corrupted binding with no native id or path can never resume.
-        let store = crate::store::ResumeStore::new(store_path.clone());
+        let store = crate::store::Store::new(store_path.clone());
         store
-            .record(&crate::store::ResumeBinding {
+            .record_resume(&crate::store::ResumeBinding {
                 session_id: "s-corrupt".to_owned(),
                 agent: AgentKind::Claude,
                 cwd: PathBuf::from("/tmp"),
@@ -1722,14 +1825,14 @@ mod tests {
             .expect("seed corrupt binding");
 
         let registry = SessionRegistry::new(SessionRegistryConfig {
-            resume_store_path: Some(store_path.clone()),
+            store_path: Some(store_path.clone()),
             ..SessionRegistryConfig::default()
         });
         registry.load_and_resume().await;
 
         assert!(
-            crate::store::ResumeStore::new(store_path)
-                .load()
+            crate::store::Store::new(store_path)
+                .load_resume()
                 .expect("load")
                 .is_empty(),
             "an unresumable binding must be pruned, not retried forever"
@@ -1742,7 +1845,7 @@ mod tests {
         let registry = SessionRegistry::new(SessionRegistryConfig {
             shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
             stop_grace: Duration::from_millis(50),
-            resume_store_path: Some(store_path.clone()),
+            store_path: Some(store_path.clone()),
             ..SessionRegistryConfig::default()
         });
 
@@ -1788,8 +1891,8 @@ mod tests {
 
         let inspected = registry.inspect(&created.id).await.expect("inspect");
         assert_eq!((inspected.cols, inspected.rows), (200, 60));
-        let persisted = crate::store::ResumeStore::new(store_path)
-            .load()
+        let persisted = crate::store::Store::new(store_path)
+            .load_resume()
             .expect("load");
         assert_eq!(persisted.len(), 1, "no duplicate binding: {persisted:?}");
         assert_eq!(
@@ -1807,7 +1910,7 @@ mod tests {
         let registry = SessionRegistry::new(SessionRegistryConfig {
             shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
             stop_grace: Duration::from_millis(50),
-            resume_store_path: Some(store_path.clone()),
+            store_path: Some(store_path.clone()),
             ..SessionRegistryConfig::default()
         });
 
@@ -1826,8 +1929,8 @@ mod tests {
             .await
             .expect("resize session");
         assert_eq!(
-            crate::store::ResumeStore::new(store_path.clone())
-                .load()
+            crate::store::Store::new(store_path.clone())
+                .load_resume()
                 .expect("load")
                 .len(),
             1,
@@ -1838,8 +1941,8 @@ mod tests {
         let stopped = registry.stop(&created.id).await.expect("stop");
         assert!(stopped.stopped);
         assert!(
-            crate::store::ResumeStore::new(store_path)
-                .load()
+            crate::store::Store::new(store_path)
+                .load_resume()
                 .expect("load")
                 .is_empty(),
             "a resized-then-stopped session must not leave a resume binding"

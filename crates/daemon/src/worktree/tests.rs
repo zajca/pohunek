@@ -6,14 +6,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::SessionWarningKind;
 
-use super::{
-    branch_slug, is_valid_worktree, WorktreeBinding, WorktreeManager, WorktreeRequest,
-    WorktreeStatus, WorktreeStore,
-};
+use super::{branch_slug, is_valid_worktree, WorktreeManager, WorktreeRequest};
+use crate::store::{Store, WorktreeStatus};
 
 fn unique_dir(tag: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -66,8 +65,8 @@ fn init_repo(tag: &str) -> PathBuf {
 
 fn manager(tag: &str) -> WorktreeManager {
     let root = unique_dir(&format!("{tag}-root"));
-    let store = unique_dir(&format!("{tag}-store")).join("worktree-bindings.jsonl");
-    WorktreeManager::new(root, WorktreeStore::new(store))
+    let store = unique_dir(&format!("{tag}-store")).join("metadata.jsonl");
+    WorktreeManager::new(root, Arc::new(Store::new(store)))
 }
 
 /// Run git in `dir` and return trimmed stdout (asserting success).
@@ -163,7 +162,7 @@ fn bind_creates_a_valid_worktree_and_records_a_binding() {
 
     let binding = mgr
         .store()
-        .find("s-1", &bound.repository, &branch_slug("feat/x"))
+        .find_worktree("s-1", &bound.repository, &branch_slug("feat/x"))
         .expect("load store")
         .expect("binding recorded");
     assert_eq!(binding.path, bound.path);
@@ -509,75 +508,48 @@ fn cleanup_session_removes_only_owned_worktrees() {
     assert!(!bound.path.exists(), "owned worktree directory removed");
     assert!(
         mgr.store()
-            .find("s-1", &bound.repository, &branch_slug("feat/x"))
+            .find_worktree("s-1", &bound.repository, &branch_slug("feat/x"))
             .expect("load store")
             .is_none(),
         "binding dropped after cleanup"
     );
 }
 
-// --- store round-trip -----------------------------------------------------
+// The worktree-binding store round-trip, two-branch coexistence, and
+// owner-private file mode are now covered by the unified store's own unit tests
+// in `crate::store` (the binding records and store moved there in M9).
+
+// --- credential redaction -------------------------------------------------
 
 #[test]
-fn store_round_trips_find_and_remove() {
-    let path = unique_dir("store").join("worktree-bindings.jsonl");
-    let store = WorktreeStore::new(path.clone());
-    assert!(store.load().expect("empty load").is_empty());
+fn redact_url_credentials_strips_userinfo_from_git_error_output() {
+    use super::redact_url_credentials;
 
-    let binding = WorktreeBinding {
-        session_id: "s-1".to_owned(),
-        repository: PathBuf::from("/workspace/project"),
-        branch: "feat/x".to_owned(),
-        base_branch: "main".to_owned(),
-        branch_slug: "feat-x".to_owned(),
-        path: PathBuf::from("/data/worktrees/s-1-project-feat-x"),
-        status: WorktreeStatus::Active,
-        created_at: "2026-06-18T00:00:00Z".to_owned(),
-        updated_at: "2026-06-18T00:00:00Z".to_owned(),
-    };
-    store.record(&binding).expect("record");
+    // The dominant real-world leak: a PAT as the URL username (git does NOT
+    // redact this) echoed in a "could not read Password" failure.
+    let token = "https://ghp_SUPERSECRETTOKEN@github.com";
+    let msg = format!("fatal: could not read Password for '{token}': terminal prompts disabled");
+    let redacted = redact_url_credentials(&msg);
+    assert!(
+        !redacted.contains("ghp_SUPERSECRETTOKEN"),
+        "token must be redacted: {redacted}"
+    );
+    assert!(
+        redacted.contains("https://<redacted>@github.com"),
+        "host must survive redaction: {redacted}"
+    );
 
-    let found = store
-        .find("s-1", Path::new("/workspace/project"), "feat-x")
-        .expect("find")
-        .expect("present");
-    assert_eq!(found, binding);
+    // user:password form is also scrubbed.
+    let userpass = redact_url_credentials("clone of https://alice:hunter2@example.com/x.git failed");
+    assert!(!userpass.contains("hunter2"), "password redacted: {userpass}");
+    assert!(!userpass.contains("alice"), "username redacted: {userpass}");
+    assert!(userpass.contains("https://<redacted>@example.com/x.git"));
 
-    // A second branch of the same (session, repo) must coexist, not overwrite.
-    let other = WorktreeBinding {
-        branch: "feat/y".to_owned(),
-        branch_slug: "feat-y".to_owned(),
-        path: PathBuf::from("/data/worktrees/s-1-project-feat-y"),
-        ..binding.clone()
-    };
-    store.record(&other).expect("record other");
-    assert_eq!(store.load().expect("load").len(), 2, "two branches coexist");
+    // A credential-free URL is left untouched.
+    let clean = "fatal: repository 'https://github.com/org/repo' not found";
+    assert_eq!(redact_url_credentials(clean), clean);
 
-    let removed = store.remove_session("s-1").expect("remove session");
-    assert_eq!(removed, 2);
-    assert!(store.load().expect("load").is_empty());
-}
-
-#[cfg(unix)]
-#[test]
-fn store_file_is_owner_private() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let path = unique_dir("store-perms").join("worktree-bindings.jsonl");
-    let store = WorktreeStore::new(path.clone());
-    store
-        .record(&WorktreeBinding {
-            session_id: "s-1".to_owned(),
-            repository: PathBuf::from("/workspace/project"),
-            branch: "feat/x".to_owned(),
-            base_branch: "main".to_owned(),
-            branch_slug: "feat-x".to_owned(),
-            path: PathBuf::from("/data/worktrees/s-1-project-feat-x"),
-            status: WorktreeStatus::Active,
-            created_at: "2026-06-18T00:00:00Z".to_owned(),
-            updated_at: "2026-06-18T00:00:00Z".to_owned(),
-        })
-        .expect("record");
-    let mode = fs::metadata(&path).expect("metadata").permissions().mode();
-    assert_eq!(mode & 0o777, 0o600, "store file must be owner-private");
+    // A message with no URL is left untouched.
+    let plain = "fatal: not a git repository";
+    assert_eq!(redact_url_credentials(plain), plain);
 }

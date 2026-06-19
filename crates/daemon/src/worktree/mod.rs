@@ -23,24 +23,25 @@
 //! mapping); the on-disk validity gate (a worktree has a `.git` *file* whose
 //! content starts with `gitdir:`) follows Kandev `manager_state.go` `IsValid`.
 //!
-//! TODO(milestone 9): the full SQLite `worktree` table (see
-//! `docs/plan-phase-1.md` "SQLite Schema") absorbs the minimal binding store
-//! below, exactly as it absorbs the M7 resume-binding store. The columns
-//! persisted here (`session_id`, `repository`, `branch`, `base_branch`,
-//! `branch_slug`, `path`, `status`, timestamps) are the `worktree` table's
-//! columns, so this is a direct precursor, not a parallel design.
+//! The worktree-binding records and their store now live in the unified
+//! [`crate::store::Store`] (milestone 9): one owner-private file holds both the
+//! resume bindings and the worktree bindings behind a single serialization point,
+//! so a session's two records stay mutually consistent. This module owns only the
+//! git mechanics (path computation, `git worktree add`, the non-fatal warning
+//! paths, the ownership gate) and persists through that shared store.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::Arc;
 
 use protocol::{ErrorClass, ProtocolError, SessionWarning, SessionWarningKind};
-use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tracing::{debug, warn};
+
+use crate::store::{Store, WorktreeBinding, WorktreeStatus};
 
 /// Relative path of the optional per-repository setup script, run inside a
 /// freshly created worktree. A non-zero exit (or any spawn failure) is recorded
@@ -54,46 +55,6 @@ const SETUP_SCRIPT_INTERPRETER: &str = "sh";
 /// Fallback directory-name component when a repository path has no usable file
 /// name (e.g. the filesystem root) or it sanitizes to empty.
 const REPO_NAME_FALLBACK: &str = "repo";
-
-/// Lifecycle status of a worktree binding.
-///
-/// Mirrors Kandev's `active`/`merged`/`deleted` status strings. Milestone 8
-/// only ever sets `Active` (on bind) and `Deleted` (on cleanup); `Merged` is
-/// defined for forward-compatibility with the M9 `worktree` table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorktreeStatus {
-    /// The worktree is bound and in use.
-    Active,
-    /// The worktree's branch was merged (reserved for later milestones).
-    Merged,
-    /// The worktree was cleaned up.
-    Deleted,
-}
-
-/// One bound worktree: the persisted record plus the daemon's ownership proof.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorktreeBinding {
-    /// The zagentmesh session id that owns this worktree.
-    pub session_id: String,
-    /// Canonicalized path of the source repository.
-    pub repository: PathBuf,
-    /// Branch checked out in the worktree.
-    pub branch: String,
-    /// Base branch the worktree's branch was created from.
-    pub base_branch: String,
-    /// Filesystem-safe branch slug used to disambiguate two branches of one
-    /// `(session, repository)` pair so they never collapse onto one path.
-    pub branch_slug: String,
-    /// Absolute path of the worktree directory.
-    pub path: PathBuf,
-    /// Lifecycle status.
-    pub status: WorktreeStatus,
-    /// Creation timestamp (RFC3339).
-    pub created_at: String,
-    /// Last-update timestamp (RFC3339).
-    pub updated_at: String,
-}
 
 /// Inputs for binding a worktree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,162 +86,28 @@ pub struct WorktreeBound {
     pub warnings: Vec<SessionWarning>,
 }
 
-/// File-backed minimal worktree-binding store.
-///
-/// Same shape as the M7 [`crate::store::ResumeStore`]: newline-delimited JSON
-/// (one binding per line) under the data dir, rewritten atomically via a temp
-/// file + rename, owner-private (`0600`). Writes are serialized by an internal
-/// lock. No secrets are written (a repo path, branch, and worktree path are not
-/// secrets).
-#[derive(Debug)]
-pub struct WorktreeStore {
-    path: PathBuf,
-    write_lock: Mutex<()>,
-}
-
-impl WorktreeStore {
-    /// Open a store at `path`. The file is created lazily on first `record`.
-    #[must_use]
-    pub fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            write_lock: Mutex::new(()),
-        }
-    }
-
-    /// The backing file path.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Load all bindings. A missing file yields an empty list; malformed lines
-    /// are skipped so one corrupt line cannot hide the rest.
-    pub fn load(&self) -> io::Result<Vec<WorktreeBinding>> {
-        let content = match fs::read_to_string(&self.path) {
-            Ok(content) => content,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(err),
-        };
-        Ok(content
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| serde_json::from_str::<WorktreeBinding>(line).ok())
-            .collect())
-    }
-
-    /// Find the active binding for a `(session_id, repository, branch_slug)`
-    /// triple, if one exists. Deleted/merged rows are invisible (like Kandev's
-    /// `status = 'active'` reuse filter), so a cleaned-up session re-binds fresh.
-    pub fn find(
-        &self,
-        session_id: &str,
-        repository: &Path,
-        branch_slug: &str,
-    ) -> io::Result<Option<WorktreeBinding>> {
-        Ok(self.load()?.into_iter().find(|binding| {
-            binding.status == WorktreeStatus::Active
-                && binding.session_id == session_id
-                && binding.repository == repository
-                && binding.branch_slug == branch_slug
-        }))
-    }
-
-    /// Upsert a binding (keyed by `(session_id, repository, branch_slug)`) and
-    /// rewrite the file atomically. The triple key is what stops two branches of
-    /// one `(session, repository)` pair from collapsing onto a single row.
-    pub fn record(&self, binding: &WorktreeBinding) -> io::Result<()> {
-        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut bindings = self.load()?;
-        if let Some(existing) = bindings.iter_mut().find(|existing| {
-            existing.session_id == binding.session_id
-                && existing.repository == binding.repository
-                && existing.branch_slug == binding.branch_slug
-        }) {
-            *existing = binding.clone();
-        } else {
-            bindings.push(binding.clone());
-        }
-        self.write_all(&bindings)
-    }
-
-    /// Remove every binding owned by `session_id` and rewrite the file. Returns
-    /// the number of bindings removed (`0` is a no-op success).
-    pub fn remove_session(&self, session_id: &str) -> io::Result<usize> {
-        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut bindings = self.load()?;
-        let before = bindings.len();
-        bindings.retain(|binding| binding.session_id != session_id);
-        let removed = before - bindings.len();
-        if removed > 0 {
-            self.write_all(&bindings)?;
-        }
-        Ok(removed)
-    }
-
-    /// Serialize all bindings to a temp file and rename it over the store path.
-    fn write_all(&self, bindings: &[WorktreeBinding]) -> io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut body = String::new();
-        for binding in bindings {
-            let line = serde_json::to_string(binding)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-            body.push_str(&line);
-            body.push('\n');
-        }
-
-        let tmp = self.temp_path();
-        write_owner_private(&tmp, body.as_bytes())?;
-        fs::rename(&tmp, &self.path)
-    }
-
-    fn temp_path(&self) -> PathBuf {
-        let mut name = self
-            .path
-            .file_name()
-            .map(|name| name.to_os_string())
-            .unwrap_or_else(|| "worktree-bindings.jsonl".into());
-        name.push(format!(".tmp.{}", std::process::id()));
-        match self.path.parent() {
-            Some(parent) => parent.join(name),
-            None => PathBuf::from(name),
-        }
-    }
-}
-
-/// Write a file with owner-only permissions (`0600`).
-fn write_owner_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    fs::write(path, bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
-
 /// Binds and cleans up per-session worktrees under a single root directory.
 #[derive(Debug)]
 pub struct WorktreeManager {
     /// Root under which worktrees are created (`<data_dir>/worktrees`).
     root: PathBuf,
-    /// Minimal binding store (the M9 SQLite-table precursor).
-    store: WorktreeStore,
+    /// Shared unified metadata store holding the worktree bindings. Shared
+    /// (`Arc`) with the session registry so resume and worktree records live in
+    /// one file behind one serialization point.
+    store: Arc<Store>,
 }
 
 impl WorktreeManager {
     /// Build a manager that creates worktrees under `root` and persists bindings
-    /// to `store`.
+    /// to the shared `store`.
     #[must_use]
-    pub fn new(root: PathBuf, store: WorktreeStore) -> Self {
+    pub fn new(root: PathBuf, store: Arc<Store>) -> Self {
         Self { root, store }
     }
 
-    /// The minimal binding store, for inspection/tests.
+    /// The shared metadata store, for inspection/tests.
     #[must_use]
-    pub fn store(&self) -> &WorktreeStore {
+    pub fn store(&self) -> &Store {
         &self.store
     }
 
@@ -347,9 +174,10 @@ impl WorktreeManager {
         }
 
         let path = self.path_for(&req.session_id, &repository, &slug);
-        let owned = self.store.find(&req.session_id, &repository, &slug).map_err(
-            |err| store_error("read worktree binding store", &err),
-        )?;
+        let owned = self
+            .store
+            .find_worktree(&req.session_id, &repository, &slug)
+            .map_err(|err| store_error("read worktree binding store", &err))?;
 
         // Reuse / recreate / refuse-foreign decision (Kandev tryReuseExisting).
         if path.exists() {
@@ -429,7 +257,7 @@ impl WorktreeManager {
             updated_at: now,
         };
         self.store
-            .record(&binding)
+            .record_worktree(&binding)
             .map_err(|err| store_error("persist worktree binding", &err))?;
 
         Ok(WorktreeBound {
@@ -457,7 +285,7 @@ impl WorktreeManager {
     pub fn cleanup_session(&self, session_id: &str) -> Result<usize, ProtocolError> {
         let bindings = self
             .store
-            .load()
+            .load_worktrees()
             .map_err(|err| store_error("read worktree binding store", &err))?;
         let mut removed = 0;
         for binding in bindings
@@ -477,7 +305,7 @@ impl WorktreeManager {
         }
         if removed > 0 {
             self.store
-                .remove_session(session_id)
+                .remove_worktree_session(session_id)
                 .map_err(|err| store_error("drop worktree bindings", &err))?;
         }
         Ok(removed)
@@ -882,7 +710,9 @@ fn run_setup_script(worktree: &Path, warnings: &mut Vec<SessionWarning>) {
                 detail: Some(if stderr.is_empty() {
                     format!("{} exited with status {}", script.display(), output.status)
                 } else {
-                    stderr
+                    // The script's stderr is arbitrary user output; scrub any
+                    // URL-embedded credential before it reaches the event log.
+                    redact_url_credentials(&stderr)
                 }),
             });
         }
@@ -931,16 +761,57 @@ fn git_capture(repo: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 /// herdr-style failure message: prefer trimmed stderr, then stdout, then a
-/// synthetic status line.
+/// synthetic status line. Credentials embedded in a remote URL are redacted: git
+/// error output for a credentials-in-URL remote echoes the token verbatim, and
+/// this message can be persisted (event log) or returned on the wire, so it must
+/// never carry a secret.
 fn output_failure_message(output: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let message = if stderr.is_empty() { stdout } else { stderr };
-    if message.is_empty() {
+    let message = if message.is_empty() {
         format!("git exited with status {}", output.status)
     } else {
         message
+    };
+    redact_url_credentials(&message)
+}
+
+/// Strip `scheme://userinfo@host` credentials from a message before it is
+/// persisted to the event log or surfaced on the wire.
+///
+/// Git error output for a credentials-in-URL remote echoes the userinfo verbatim
+/// — notably the `https://<token>@host` PAT form, which git does **not** redact —
+/// so a captured failure message can carry a secret. This replaces the userinfo
+/// component of every URL-shaped substring with `<redacted>`, leaving the scheme
+/// and host intact. A URL without credentials (no `@` in the authority) is
+/// unchanged.
+fn redact_url_credentials(message: &str) -> String {
+    const SCHEME_SEP: &str = "://";
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(idx) = rest.find(SCHEME_SEP) {
+        let after = idx + SCHEME_SEP.len();
+        out.push_str(&rest[..after]);
+        let authority = &rest[after..];
+        // The authority runs until the first character that cannot belong to it
+        // (path/query/fragment delimiter, whitespace, or a surrounding quote).
+        let auth_end = authority
+            .find(|c: char| {
+                matches!(c, '/' | '?' | '#' | '\'' | '"') || c.is_whitespace()
+            })
+            .unwrap_or(authority.len());
+        let auth = &authority[..auth_end];
+        if let Some(at) = auth.rfind('@') {
+            out.push_str("<redacted>");
+            out.push_str(&auth[at..]);
+        } else {
+            out.push_str(auth);
+        }
+        rest = &authority[auth_end..];
     }
+    out.push_str(rest);
+    out
 }
 
 fn git_failure_message(args: &[&str], output: &std::process::Output) -> String {

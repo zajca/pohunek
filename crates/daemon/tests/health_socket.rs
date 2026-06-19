@@ -27,6 +27,7 @@ use tokio_util::codec::{Framed, LinesCodec};
 
 use zagentmesh_daemon::api::{ControlServer, DaemonState, HealthInfo};
 use zagentmesh_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
+use zagentmesh_daemon::store::Store;
 
 static PATH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -613,7 +614,7 @@ async fn assert_resume_round_trip(
     let bin_dir = temp_dir(&format!("{bin_name}-resume-bin"));
     let cwd = temp_dir(&format!("{bin_name}-resume-cwd"));
     let state_dir = temp_dir(&format!("{bin_name}-resume-state"));
-    let store_path = state_dir.join("resume-bindings.jsonl");
+    let store_path = state_dir.join("metadata.jsonl");
     let argv_log = temp_dir(&format!("{bin_name}-resume-argv")).join("argv.log");
     let reporter_py = temp_dir(&format!("{bin_name}-resume-reporter")).join("reporter.py");
     write_executable(&reporter_py, STUB_REPORTER_PY);
@@ -625,7 +626,7 @@ async fn assert_resume_round_trip(
     let socket = temp_socket(&format!("{bin_name}-resume"));
     let make_config = || SessionRegistryConfig {
         socket_path: Some(socket.clone()),
-        resume_store_path: Some(store_path.clone()),
+        store_path: Some(store_path.clone()),
         stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
@@ -1468,7 +1469,7 @@ async fn detector_tick_publishes_debounced_static_osc_title_activity() {
 async fn two_sessions_on_one_repo_get_distinct_worktrees() {
     let repo = init_git_repo("two-wt-repo");
     let worktree_root = temp_dir("two-wt-root");
-    let worktree_store = temp_dir("two-wt-store").join("worktree-bindings.jsonl");
+    let store_path = temp_dir("two-wt-store").join("metadata.jsonl");
     let socket = temp_socket("two-worktrees");
 
     let config = SessionRegistryConfig {
@@ -1480,7 +1481,7 @@ async fn two_sessions_on_one_repo_get_distinct_worktrees() {
         ),
         stop_grace: Duration::from_millis(50),
         worktree_root: Some(worktree_root.clone()),
-        worktree_store_path: Some(worktree_store.clone()),
+        store_path: Some(store_path.clone()),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
@@ -1537,10 +1538,13 @@ async fn two_sessions_on_one_repo_get_distinct_worktrees() {
         );
     }
 
-    // The minimal worktree-binding store persisted both bindings.
-    let bindings = std::fs::read_to_string(&worktree_store).expect("read worktree store");
+    // The unified metadata store persisted both worktree bindings.
+    let bindings = std::fs::read_to_string(&store_path).expect("read metadata store");
     assert_eq!(
-        bindings.lines().filter(|l| !l.trim().is_empty()).count(),
+        bindings
+            .lines()
+            .filter(|l| l.contains("\"kind\":\"worktree\""))
+            .count(),
         2,
         "two worktree bindings persisted: {bindings}"
     );
@@ -1556,6 +1560,170 @@ async fn two_sessions_on_one_repo_get_distinct_worktrees() {
                 .expect("stop result");
     }
 
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Milestone-9 checkpoint (event log): the daemon's append-only event log records
+/// the session lifecycle and NEVER contains raw terminal output.
+#[tokio::test]
+async fn event_log_records_lifecycle_and_never_terminal_bytes() {
+    const SENTINEL: &str = "SENTINEL_TERMINAL_OUTPUT_DEADBEEF";
+    let events_dir = temp_dir("eventlog-data").join("events");
+    let socket = temp_socket("eventlog");
+
+    // The shell prints a unique sentinel to its PTY; that raw output must never
+    // reach the event log, which records only structured control events.
+    let shell_cmd = format!("printf '{SENTINEL}\\n'; exec sleep 30");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c".to_owned(), shell_cmd]),
+        stop_grace: Duration::from_millis(50),
+        event_log_dir: Some(events_dir.clone()),
+        ..SessionRegistryConfig::default()
+    };
+    let registry = SessionRegistry::new(config);
+    registry.spawn_event_log().expect("start event log");
+    let (shutdown, handle) = spawn_server_owned(&socket, registry).await;
+
+    let mut control = connect(&socket).await;
+    let created = create_session(&mut control).await;
+    // Drive a second lifecycle event, then stop to produce session_stopped.
+    let _ = resize_session(&mut control, &created.id, 100, 40).await;
+    let stop_req = Request::new(
+        "stop-eventlog",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _ = exchange(&mut control, &stop_req).await;
+
+    // Wait until the drain records the stop (the final lifecycle event).
+    let log_path = events_dir.join("events.jsonl");
+    let bytes = read_file_until(&log_path, b"session_stopped").await;
+    let text = String::from_utf8_lossy(&bytes);
+
+    // Every non-empty line is exactly one JSON event carrying a protocol version.
+    let mut saw_created = false;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let parsed: Value =
+            serde_json::from_str(line).unwrap_or_else(|err| panic!("invalid event line {line:?}: {err}"));
+        assert!(parsed.get("v").is_some(), "event line carries a protocol version: {line}");
+        assert!(parsed.get("event").is_some(), "event line carries an event name: {line}");
+        if parsed["event"].as_str() == Some(event::SESSION_CREATED) {
+            saw_created = true;
+        }
+    }
+    assert!(saw_created, "event log must record session_created: {text}");
+    assert!(
+        !text.contains(SENTINEL),
+        "event log must never contain raw terminal output: {text}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Milestone-9 checkpoint (unified store survives a restart): a worktree-bound
+/// stub agent records BOTH a worktree binding and a resume binding in one
+/// metadata file; after a simulated daemon kill + registry rebuild against the
+/// same data dir, both bindings survive, the session relaunches via its resume
+/// argv, and its worktree metadata (repo/branch/worktree_path) is restored.
+#[tokio::test]
+async fn worktree_session_resumes_with_metadata_after_restart() {
+    let agent = AgentKind::Claude;
+    let bin_name = "claude";
+    let native_id = "native-claude-wt-1";
+    let expected_resume_argv = "--resume native-claude-wt-1";
+
+    let repo = init_git_repo("wt-resume-repo");
+    let bin_dir = temp_dir("wt-resume-bin");
+    let data_dir = temp_dir("wt-resume-state");
+    let store_path = data_dir.join("metadata.jsonl");
+    let worktree_root = data_dir.join("worktrees");
+    let argv_log = temp_dir("wt-resume-argv").join("argv.log");
+    let reporter_py = temp_dir("wt-resume-reporter").join("reporter.py");
+    write_executable(&reporter_py, STUB_REPORTER_PY);
+    write_executable(
+        &bin_dir.join(bin_name),
+        &stub_agent_script(&argv_log, &reporter_py, bin_name, native_id),
+    );
+
+    let socket = temp_socket("wt-resume");
+    let make_config = || SessionRegistryConfig {
+        socket_path: Some(socket.clone()),
+        store_path: Some(store_path.clone()),
+        worktree_root: Some(worktree_root.clone()),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    };
+
+    let _path = PathGuard::prepend(&bin_dir).await;
+
+    // --- Create phase: a worktree-bound stub agent reports its native id. ---
+    let registry = SessionRegistry::new(make_config());
+    let (shutdown, handle) = spawn_server_owned(&socket, registry).await;
+    let mut control = connect(&socket).await;
+    let created: SessionInfo = serde_json::from_value(ok_payload(
+        create_worktree_session(&mut control, agent, repo.clone(), "feat/x").await,
+    ))
+    .expect("worktree stub session info");
+    let worktree_path = created.worktree_path.clone().expect("worktree bound");
+    assert_eq!(created.branch.as_deref(), Some("feat/x"));
+    assert_eq!(created.cwd, worktree_path);
+
+    let captured = wait_for_native_id(&mut control, &created.id, native_id).await;
+    assert_eq!(captured.native_session_id.as_deref(), Some(native_id));
+
+    drop(control);
+    let _ = shutdown.send(());
+    let _ = handle.await;
+
+    // --- Both records survived the kill in ONE unified metadata file. ---
+    let store = Store::new(store_path.clone());
+    let resume_before = store.load_resume().expect("load resume");
+    let worktrees_before = store.load_worktrees().expect("load worktrees");
+    assert_eq!(resume_before.len(), 1, "resume binding persisted: {resume_before:?}");
+    assert_eq!(
+        worktrees_before.len(),
+        1,
+        "worktree binding persisted: {worktrees_before:?}"
+    );
+    assert_eq!(resume_before[0].session_id, created.id.0);
+    assert_eq!(worktrees_before[0].session_id, created.id.0);
+    let repository = worktrees_before[0].repository.clone();
+
+    // --- Restart: rebuild a fresh registry against the SAME data dir. ---
+    let registry = SessionRegistry::new(make_config());
+    let (shutdown, handle) = spawn_server_owned(&socket, registry.clone()).await;
+    registry.load_and_resume().await;
+
+    // The relaunched stub logged the resume argv built by the M6 builder.
+    let logged = read_file_until(&argv_log, expected_resume_argv.as_bytes()).await;
+    assert!(
+        logged
+            .windows(expected_resume_argv.len())
+            .any(|window| window == expected_resume_argv.as_bytes()),
+        "resumed stub did not receive resume argv {expected_resume_argv:?}; argv log: {}",
+        String::from_utf8_lossy(&logged)
+    );
+
+    // The resumed session restored its worktree metadata from the unified store.
+    let mut control = connect(&socket).await;
+    let resumed = wait_for_state(&mut control, &created.id, SessionState::Running).await;
+    assert_eq!(resumed.worktree_path.as_deref(), Some(worktree_path.as_path()));
+    assert_eq!(resumed.branch.as_deref(), Some("feat/x"));
+    assert_eq!(resumed.repo.as_deref(), Some(repository.as_path()));
+    assert_eq!(resumed.native_session_id.as_deref(), Some(native_id));
+
+    // Both bindings still present after the restart.
+    assert_eq!(store.load_resume().expect("resume after").len(), 1);
+    assert_eq!(store.load_worktrees().expect("worktrees after").len(), 1);
+
+    let stop_req = Request::new(
+        "session-stop-wt-resume",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _ = exchange(&mut control, &stop_req).await;
     let _ = shutdown.send(());
     let _ = handle.await;
 }
