@@ -220,7 +220,15 @@ impl IntegrationAction {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // Parse manually (not `Cli::parse`) so a clap usage error can be rendered as a
+    // structured `--json` document instead of clap's human text + hard process
+    // exit. We keep the raw argv to recover the `--json` intent: parsing fails
+    // before a typed `Cli` exists, so `wants_json` is unavailable on that path.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(err) => return error::render_clap_error(err, error::args_request_json(&args)),
+    };
     // Capture whether the active command requested `--json` before `run` consumes
     // `cli`, so a failure is rendered in the same mode a success would have been.
     let json = cli.command.wants_json();

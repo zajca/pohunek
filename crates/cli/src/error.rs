@@ -4,9 +4,16 @@
 //! protocol errors returned by the daemon, and version mismatch. They are
 //! rendered for humans on stderr and, where a command supports `--json`, can be
 //! surfaced as structured error output.
+//!
+//! Argument-parse failures from clap are handled here too: under `--json` they
+//! are mapped to the same `{class, code, msg, recover?}` envelope (see
+//! [`render_clap_error`]) so that *every* failure a script can hit — including a
+//! mis-typed command — is machine-readable, not just the ones that occur after a
+//! successful parse.
 
 use std::io;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use protocol::{ErrorClass, ProtocolError};
 
@@ -144,16 +151,104 @@ pub(crate) fn human_error_text(err: &CliError) -> String {
 /// recovery hint — to stderr. The caller exits non-zero either way.
 pub(crate) fn render(err: &CliError, json: bool) {
     if json {
-        match serde_json::to_string_pretty(&err.to_protocol_error()) {
-            Ok(doc) => println!("{doc}"),
-            // Serializing our own typed error cannot fail in practice; fall back
-            // to a minimal hand-built document rather than printing nothing.
-            Err(_) => println!(
-                r#"{{"class":"daemon","code":"serialize_failed","msg":"failed to serialize error"}}"#
-            ),
-        }
+        print_json_error(&err.to_protocol_error());
     } else {
         eprint!("{}", human_error_text(err));
+    }
+}
+
+/// Print a structured error document (`{class, code, msg, recover?}`) to stdout.
+///
+/// The single `--json` error sink: every JSON failure path (typed [`CliError`]
+/// and clap usage errors alike) funnels through here so automation always
+/// receives exactly one parseable document on stdout and nothing human leaks.
+fn print_json_error(err: &ProtocolError) {
+    match serde_json::to_string_pretty(err) {
+        Ok(doc) => println!("{doc}"),
+        // Serializing our own typed error cannot fail in practice; fall back
+        // to a minimal hand-built document rather than printing nothing.
+        Err(_) => println!(
+            r#"{{"class":"daemon","code":"serialize_failed","msg":"failed to serialize error"}}"#
+        ),
+    }
+}
+
+/// Process exit code for a CLI usage error.
+///
+/// Mirrors clap's own usage exit status (`2`) so that toggling `--json` changes
+/// only the output *format*, never the exit code a script observes.
+const CLI_USAGE_EXIT_CODE: u8 = 2;
+
+/// Whether a raw argv requested `--json`.
+///
+/// `--json` is a per-command flag, so on a *successful* parse we read it from the
+/// typed [`crate::Commands`]. But a clap parse failure aborts before a typed
+/// `Cli` exists, yet we still want to honor `--json` when rendering that failure.
+/// We therefore scan the raw arguments. Scanning stops at the `--` end-of-options
+/// separator so a literal `--json` *value* (e.g. the text passed to `session
+/// input`) is never mistaken for the flag.
+pub(crate) fn args_request_json<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let json_flag = std::ffi::OsStr::new("--json");
+    let end_of_opts = std::ffi::OsStr::new("--");
+    args.into_iter()
+        .skip(1) // argv[0] is the program name, never a flag.
+        .take_while(|arg| arg.as_ref() != end_of_opts)
+        .any(|arg| arg.as_ref() == json_flag)
+}
+
+/// Whether a clap error is a help/version *display*, not a usage failure.
+///
+/// `--help` and `--version` make clap return an `Err` whose kind is one of these;
+/// clap prints them to stdout and exits 0. They are explicit, successful requests
+/// and must never be rendered as an error document, even under `--json`.
+fn clap_kind_is_display(kind: clap::error::ErrorKind) -> bool {
+    matches!(
+        kind,
+        clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+    )
+}
+
+/// Map a clap argument-parse failure into the structured `{class, code, msg,
+/// recover}` envelope.
+///
+/// A single stable `code` (`cli_usage`) lets a script branch on "I mis-invoked
+/// the CLI" without string-matching the message; the specific problem (missing
+/// argument, bad value, unknown command) stays in `msg`. The class is
+/// `configuration` — a usage error is a client-side invocation problem, the same
+/// family as [`CliError::MissingEnv`].
+fn clap_error_to_protocol_error(err: &clap::Error) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Configuration,
+        "cli_usage",
+        // clap's `color` feature is not enabled and `StyledStr`'s `Display` never
+        // emits ANSI escapes, so this rendered message is plain text safe to
+        // embed in JSON. Trim the trailing newline clap appends.
+        err.render().to_string().trim_end().to_owned(),
+        Some(
+            "check the command syntax; run `zagentmesh --help` or `<command> --help` for usage"
+                .to_owned(),
+        ),
+    )
+}
+
+/// Render a clap argument-parse failure, honoring `--json`.
+///
+/// `--help`/`--version` are delegated to clap unchanged (printed to stdout,
+/// exit 0). A genuine usage error is emitted as a structured JSON document on
+/// stdout under `--json` (exit [`CLI_USAGE_EXIT_CODE`]); otherwise it falls back
+/// to clap's native human rendering (stderr, exit 2), so the human experience is
+/// identical to a plain `Cli::parse()`. Returns the process exit code.
+pub(crate) fn render_clap_error(err: clap::Error, json: bool) -> ExitCode {
+    if json && !clap_kind_is_display(err.kind()) {
+        print_json_error(&clap_error_to_protocol_error(&err));
+        ExitCode::from(CLI_USAGE_EXIT_CODE)
+    } else {
+        // `clap::Error::exit` prints to the correct stream and never returns.
+        err.exit()
     }
 }
 
@@ -222,5 +317,103 @@ mod tests {
     fn human_error_without_hint_has_no_hint_line() {
         let text = human_error_text(&CliError::Framing("bad frame".to_owned()));
         assert!(!text.contains("hint:"), "text: {text}");
+    }
+
+    // --- clap usage-error handling --------------------------------------------
+
+    use clap::Parser;
+
+    #[test]
+    fn args_request_json_detects_the_flag() {
+        assert!(args_request_json([
+            "zagentmesh",
+            "session",
+            "inspect",
+            "s-1",
+            "--json"
+        ]));
+        assert!(args_request_json(["zagentmesh", "doctor", "--json"]));
+    }
+
+    #[test]
+    fn args_request_json_is_false_when_absent() {
+        assert!(!args_request_json(["zagentmesh", "session", "inspect", "s-1"]));
+        assert!(!args_request_json(["zagentmesh"]));
+    }
+
+    #[test]
+    fn args_request_json_ignores_program_name() {
+        // argv[0] is the program name, not a flag — even if it were `--json`.
+        assert!(!args_request_json(["--json"]));
+    }
+
+    #[test]
+    fn args_request_json_ignores_value_after_double_dash() {
+        // `--json` after `--` is a positional value (e.g. `session input` text),
+        // not the flag, so it must not flip the rendering mode.
+        assert!(!args_request_json([
+            "zagentmesh",
+            "session",
+            "input",
+            "s-1",
+            "--",
+            "--json"
+        ]));
+    }
+
+    #[test]
+    fn clap_missing_required_arg_maps_to_cli_usage() {
+        // `session inspect` without its required <target> — the exact case from
+        // the finding (`session inspect --json`).
+        let err = crate::Cli::try_parse_from(["zagentmesh", "session", "inspect"])
+            .expect_err("missing <target> must fail to parse");
+        let pe = clap_error_to_protocol_error(&err);
+        assert_eq!(pe.class, ErrorClass::Configuration);
+        assert_eq!(pe.code, "cli_usage");
+        assert!(pe.recover.is_some(), "usage error carries a recover hint");
+        assert!(!pe.msg.is_empty(), "usage error has a message");
+        // The structured message must be plain text: no ANSI escape may leak
+        // into the JSON document.
+        assert!(
+            !pe.msg.contains('\u{1b}'),
+            "msg must be ANSI-free: {:?}",
+            pe.msg
+        );
+    }
+
+    #[test]
+    fn clap_invalid_value_maps_to_cli_usage_and_round_trips() {
+        // `session new --agent nonsense` — the second case from the finding.
+        let err = crate::Cli::try_parse_from(["zagentmesh", "session", "new", "--agent", "nonsense"])
+            .expect_err("invalid --agent value must fail to parse");
+        let pe = clap_error_to_protocol_error(&err);
+        assert_eq!(pe.code, "cli_usage");
+        // Round-trips through serde like every other structured error, so a
+        // script can deserialize and branch on `code`.
+        let doc = serde_json::to_string(&pe).expect("serialize structured usage error");
+        let parsed: ProtocolError = serde_json::from_str(&doc).expect("parse structured usage error");
+        assert_eq!(parsed.code, "cli_usage");
+        assert_eq!(parsed.class, ErrorClass::Configuration);
+        assert!(parsed.recover.is_some());
+    }
+
+    #[test]
+    fn help_and_version_are_display_kinds_but_usage_errors_are_not() {
+        let help = crate::Cli::try_parse_from(["zagentmesh", "--help"]).expect_err("help");
+        let version = crate::Cli::try_parse_from(["zagentmesh", "--version"]).expect_err("version");
+        assert!(clap_kind_is_display(help.kind()), "help is a display kind");
+        assert!(
+            clap_kind_is_display(version.kind()),
+            "version is a display kind"
+        );
+
+        // A genuine usage error is NOT a display kind, so under `--json` it
+        // renders as a structured document rather than being delegated to clap.
+        let usage = crate::Cli::try_parse_from(["zagentmesh", "session", "inspect"])
+            .expect_err("usage error");
+        assert!(
+            !clap_kind_is_display(usage.kind()),
+            "missing-arg usage error is not a display kind"
+        );
     }
 }
