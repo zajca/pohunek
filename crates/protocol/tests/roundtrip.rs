@@ -872,6 +872,46 @@ fn negotiate_mismatched_versions_returns_typed_error() {
 }
 
 #[test]
+fn agent_binary_missing_names_binary_and_carries_recover_hint() {
+    let err = ProtocolError::agent_binary_missing("claude");
+    assert_eq!(err.class, ErrorClass::Runtime);
+    assert_eq!(err.code, "agent_binary_missing");
+    assert!(
+        err.msg.contains("claude"),
+        "message must name the missing binary: {}",
+        err.msg
+    );
+    let recover = err.recover.as_deref().expect("recover hint present");
+    assert!(
+        recover.contains("claude"),
+        "recover hint must name the binary: {recover}"
+    );
+
+    // The error round-trips as an error response body, recover hint included.
+    let back = line_roundtrip(&err);
+    assert_eq!(back, err);
+}
+
+#[test]
+fn version_mismatch_message_names_both_versions_and_recover_hint() {
+    let err = ProtocolError::version_mismatch(ProtocolVersion(1), ProtocolVersion(2));
+    assert_eq!(err.code, "version_mismatch");
+    // Both versions must appear so the operator sees exactly what to upgrade.
+    assert!(
+        err.msg.contains('1') && err.msg.contains('2'),
+        "msg: {}",
+        err.msg
+    );
+    assert!(
+        err.recover
+            .as_deref()
+            .is_some_and(|hint| hint.contains("upgrade")),
+        "recover hint must mention upgrading: {:?}",
+        err.recover
+    );
+}
+
+#[test]
 fn protocol_version_serializes_as_bare_integer() {
     // The `v` field must be a plain integer on the wire, not an object.
     let line = serde_json::to_string(&PROTOCOL_VERSION).expect("serialize");

@@ -285,12 +285,10 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 fn missing_binary(name: &str) -> ProtocolError {
-    ProtocolError::new(
-        ErrorClass::Runtime,
-        "agent_binary_missing",
-        format!("agent binary not found on PATH: {name}"),
-        Some(format!("install {name} or add it to PATH")),
-    )
+    // The canonical constructor lives in the protocol crate so this PATH-resolution
+    // path and the daemon's PTY-spawn ENOENT path produce one identical error
+    // (same stable code, message shape, and recover hint).
+    ProtocolError::agent_binary_missing(name)
 }
 
 fn invalid_session_ref(message: &'static str) -> ProtocolError {

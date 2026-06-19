@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -98,8 +98,15 @@ pub enum PtyError {
     #[error("failed to allocate PTY: {0}")]
     Allocate(String),
     /// Spawning the child command failed.
-    #[error("failed to spawn PTY command: {0}")]
-    Spawn(String),
+    #[error("failed to spawn PTY command: {message}")]
+    Spawn {
+        /// Stringified underlying error.
+        message: String,
+        /// Whether the spawn failed because the program was not found (ENOENT).
+        /// Carried so the session layer can upgrade a missing-binary failure to a
+        /// precise `agent_binary_missing` diagnostic instead of a generic one.
+        not_found: bool,
+    },
     /// The child process has no OS pid.
     #[error("PTY child did not expose a process id")]
     MissingPid,
@@ -165,10 +172,22 @@ impl PtyHandle {
         }
         builder.cwd(&command.cwd);
 
-        let mut child = pair
-            .slave
-            .spawn_command(builder)
-            .map_err(|source| PtyError::Spawn(source.to_string()))?;
+        let mut child = pair.slave.spawn_command(builder).map_err(|source| {
+            // portable-pty resolves the launch program itself and reports a
+            // missing one as a formatted (non-io) error, so we classify a
+            // not-found spawn by checking the program directly: an absolute
+            // path that no longer resolves to a file is missing. Agents pass
+            // an already-resolved absolute path, so in practice this only
+            // fires for a misconfigured shell or a TOCTOU removal between PATH
+            // resolution and spawn. The session layer turns this into a
+            // precise `agent_binary_missing` diagnostic.
+            let program = Path::new(&command.program);
+            let not_found = program.is_absolute() && !program.exists();
+            PtyError::Spawn {
+                message: source.to_string(),
+                not_found,
+            }
+        })?;
         let pid = child.process_id().ok_or(PtyError::MissingPid)?;
         let killer = child.clone_killer();
         drop(pair.slave);

@@ -525,11 +525,14 @@ impl SessionRegistry {
         } = spec;
 
         let history_limit_bytes = self.inner.config.output_history_limit_bytes;
+        // Keep the program name for diagnostics: a spawn failure should name what
+        // could not be launched (see `spawn_error_to_protocol`).
+        let program = command.program.clone();
         let pty =
             tokio::task::spawn_blocking(move || PtyHandle::spawn(command, history_limit_bytes))
                 .await
                 .map_err(|_| runtime_error("spawn_failed", "PTY spawn task panicked"))?
-                .map_err(pty_error_to_protocol)?;
+                .map_err(|err| spawn_error_to_protocol(err, &program))?;
         let detector_output = pty.subscribe_output();
         let detector_cancel = CancellationToken::new();
         let (detector_resize, detector_resize_rx) = watch::channel((rows, cols));
@@ -1481,13 +1484,26 @@ fn attach_token_error(code: &'static str, stream_id: &str) -> ProtocolError {
 fn pty_error_to_protocol(err: PtyError) -> ProtocolError {
     let code = match err {
         PtyError::Allocate(_) => "pty_alloc_failed",
-        PtyError::Spawn(_) => "spawn_failed",
+        PtyError::Spawn { .. } => "spawn_failed",
         PtyError::MissingPid => "spawn_failed",
         PtyError::Io(_) | PtyError::Poisoned | PtyError::ThreadPanicked | PtyError::ExitTimeout => {
             "pty_error"
         }
     };
     ProtocolError::new(ErrorClass::Runtime, code, err.to_string(), None)
+}
+
+/// Map a PTY *spawn* failure to a typed protocol error, upgrading a missing-binary
+/// (ENOENT) failure to the precise `agent_binary_missing` diagnostic naming the
+/// program. Agent launches resolve the binary on `PATH` first (so claude/codex
+/// surface `agent_binary_missing` before spawn), but a shell session — or a binary
+/// removed between resolution and spawn — only fails here; this gives those the
+/// same clear, recoverable diagnostic instead of a generic `spawn_failed`.
+fn spawn_error_to_protocol(err: PtyError, program: &str) -> ProtocolError {
+    if matches!(err, PtyError::Spawn { not_found: true, .. }) {
+        return ProtocolError::agent_binary_missing(program);
+    }
+    pty_error_to_protocol(err)
 }
 
 fn runtime_error(code: impl Into<String>, msg: impl Into<String>) -> ProtocolError {
@@ -1611,7 +1627,18 @@ mod tests {
             .create(create_params)
             .await
             .expect_err("launch must fail with a missing shell program");
-        assert_eq!(err.code, "spawn_failed", "got: {err:?}");
+        // A missing program (ENOENT) at spawn surfaces the precise
+        // `agent_binary_missing` diagnostic naming the program, with a recover
+        // hint — not the generic `spawn_failed`.
+        assert_eq!(err.code, "agent_binary_missing", "got: {err:?}");
+        assert!(
+            err.msg.contains("zagentmesh-no-such-shell"),
+            "error must name the missing program: {err:?}"
+        );
+        assert!(
+            err.recover.is_some(),
+            "missing-binary error carries a hint: {err:?}"
+        );
 
         // The worktree bound before the failed spawn must be gone, so its branch
         // is freed for a retry.
@@ -1636,6 +1663,32 @@ mod tests {
             !listing.contains("feat/x"),
             "branch checkout must be pruned from git's worktree list: {listing}"
         );
+    }
+
+    #[tokio::test]
+    async fn missing_program_spawn_returns_agent_binary_missing() {
+        // A plain shell session whose program does not exist fails at the PTY
+        // spawn (ENOENT). That must map to the typed `agent_binary_missing` error
+        // naming the program and carrying a recover hint, not `spawn_failed`.
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new(
+                "/nonexistent/zagentmesh-missing-program",
+                std::iter::empty::<String>(),
+            ),
+            ..SessionRegistryConfig::default()
+        });
+
+        let err = registry
+            .create(params())
+            .await
+            .expect_err("missing program must fail to spawn");
+
+        assert_eq!(err.code, "agent_binary_missing", "got: {err:?}");
+        assert!(
+            err.msg.contains("zagentmesh-missing-program"),
+            "error must name the missing program: {err:?}"
+        );
+        assert!(err.recover.is_some(), "must carry a recover hint: {err:?}");
     }
 
     #[tokio::test]

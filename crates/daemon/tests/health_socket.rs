@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use protocol::{
-    event, method, AgentActivity, AgentKind, AttachHeader, Event, Request, Response,
+    event, method, AgentActivity, AgentKind, AttachHeader, ErrorClass, Event, Request, Response,
     SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
     SessionInfo, SessionInputParams, SessionInputResult, SessionNewParams, SessionResizeParams,
     SessionResizeResult, SessionState, SessionStopResult, StateSource, PROTOCOL_VERSION,
@@ -51,6 +51,42 @@ impl PathGuard {
             old_path,
         }
     }
+
+    /// Replace PATH with an isolated directory that contains NONE of the agent
+    /// binaries, so agent resolution deterministically fails regardless of what
+    /// is installed on the host (claude/codex may well be on the developer's
+    /// PATH).
+    ///
+    /// The rest of the suite runs concurrently and resolves a few tools through
+    /// PATH (`git`, `python3`, `sh`); the isolated dir is seeded with symlinks to
+    /// those, resolved from the current PATH, so replacing PATH cannot starve a
+    /// sibling test of them. PATH is restored on drop; PATH_LOCK serializes this
+    /// against the other PATH-mutating tests.
+    async fn isolated_without_agents(tag: &str) -> Self {
+        let guard = PATH_LOCK.lock().await;
+        let old_path = std::env::var_os("PATH");
+        let dir = temp_dir(tag);
+        if let Some(old_path) = &old_path {
+            for tool in ["git", "python3", "sh"] {
+                if let Some(real) = which_in(old_path, tool) {
+                    let _ = std::os::unix::fs::symlink(&real, dir.join(tool));
+                }
+            }
+        }
+        std::env::set_var("PATH", &dir);
+        Self {
+            _guard: guard,
+            old_path,
+        }
+    }
+}
+
+/// Resolve `name` to its first existing entry across the directories in a PATH
+/// value. A dependency-free `which` for [`PathGuard::isolated_without_agents`].
+fn which_in(path_var: &OsString, name: &str) -> Option<PathBuf> {
+    std::env::split_paths(path_var)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
 }
 
 impl Drop for PathGuard {
@@ -747,6 +783,42 @@ async fn unknown_method_returns_typed_error() {
             assert_eq!(err.code, "method_not_found");
         }
         Response::Ok { .. } => panic!("expected an error for an unknown method"),
+    }
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn session_new_for_missing_agent_binary_returns_typed_error() {
+    let cwd = temp_dir("missing-agent-cwd");
+    let socket = temp_socket("missing-agent");
+    let (shutdown, handle) = spawn_server(&socket, "0.0.0").await;
+
+    let mut control = connect(&socket).await;
+    // Claude is resolved from PATH at launch. With PATH isolated so no `claude`
+    // binary is present, `session.new --agent claude` must fail with the typed,
+    // recoverable `agent_binary_missing` error (stable code a script can branch
+    // on) rather than a generic spawn failure.
+    let resp = {
+        let _path = PathGuard::isolated_without_agents("missing-agent-path").await;
+        create_session_with_agent(&mut control, AgentKind::Claude, cwd).await
+    };
+
+    match resp {
+        Response::Err { err, .. } => {
+            assert_eq!(err.class, ErrorClass::Runtime);
+            assert_eq!(err.code, "agent_binary_missing");
+            assert!(
+                err.msg.contains("claude"),
+                "error must name the missing binary: {err:?}"
+            );
+            assert!(
+                err.recover.is_some(),
+                "missing-binary error must carry a recover hint: {err:?}"
+            );
+        }
+        Response::Ok { .. } => panic!("expected agent_binary_missing error, got ok"),
     }
 
     let _ = shutdown.send(());

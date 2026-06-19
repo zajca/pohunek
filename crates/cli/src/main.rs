@@ -95,6 +95,9 @@ enum IntegrationAction {
         /// Restrict installation to a single agent.
         #[arg(long, value_enum)]
         agent: Option<commands::integration::HookAgentArg>,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -135,6 +138,9 @@ enum SessionAction {
         /// branch when missing.
         #[arg(long)]
         base_branch: Option<String>,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
     },
 
     /// List known sessions.
@@ -157,6 +163,9 @@ enum SessionAction {
     Stop {
         /// Session target: `session-id` or `local/session-id`.
         target: Target,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Send text to one session.
@@ -165,16 +174,60 @@ enum SessionAction {
         target: Target,
         /// Text to inject into the session.
         text: String,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
     },
+}
+
+impl Commands {
+    /// Whether the active command requested machine-readable `--json` output.
+    ///
+    /// Lets the top-level error sink render a failure in the same mode the
+    /// command would have used on success. `attach` (raw stream) and `daemon
+    /// start` (process control) have no `--json` and always report `false`.
+    fn wants_json(&self) -> bool {
+        match self {
+            Commands::Doctor { json } | Commands::Health { json } | Commands::Status { json } => {
+                *json
+            }
+            Commands::Session { action } => action.wants_json(),
+            Commands::Integration { action } => action.wants_json(),
+            Commands::Attach { .. } | Commands::Daemon { .. } => false,
+        }
+    }
+}
+
+impl SessionAction {
+    fn wants_json(&self) -> bool {
+        match self {
+            SessionAction::New { json, .. }
+            | SessionAction::List { json }
+            | SessionAction::Inspect { json, .. }
+            | SessionAction::Stop { json, .. }
+            | SessionAction::Input { json, .. } => *json,
+        }
+    }
+}
+
+impl IntegrationAction {
+    fn wants_json(&self) -> bool {
+        match self {
+            IntegrationAction::Install { json, .. } => *json,
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    // Capture whether the active command requested `--json` before `run` consumes
+    // `cli`, so a failure is rendered in the same mode a success would have been.
+    let json = cli.command.wants_json();
     match run(cli).await {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("zagentmesh: {err}");
+            error::render(&err, json);
             ExitCode::FAILURE
         }
     }
@@ -221,6 +274,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     repo,
                     branch,
                     base_branch,
+                    json,
                 } => {
                     commands::session::run_new(
                         &paths,
@@ -233,6 +287,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                             branch,
                             base_branch,
                         },
+                        json,
                     )
                     .await?
                 }
@@ -240,11 +295,11 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 SessionAction::Inspect { target, json } => {
                     commands::session::run_inspect(&paths, &target, json).await?
                 }
-                SessionAction::Stop { target } => {
-                    commands::session::run_stop(&paths, &target).await?
+                SessionAction::Stop { target, json } => {
+                    commands::session::run_stop(&paths, &target, json).await?
                 }
-                SessionAction::Input { target, text } => {
-                    commands::session::run_input(&paths, &target, &text).await?
+                SessionAction::Input { target, text, json } => {
+                    commands::session::run_input(&paths, &target, &text, json).await?
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -252,8 +307,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         Commands::Integration { action } => {
             let paths = Paths::resolve()?;
             match action {
-                IntegrationAction::Install { agent } => {
-                    commands::integration::run_install(&paths, agent).await?;
+                IntegrationAction::Install { agent, json } => {
+                    commands::integration::run_install(&paths, agent, json).await?;
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -310,6 +365,7 @@ mod tests {
                         repo,
                         branch,
                         base_branch,
+                        json,
                     },
             } => {
                 assert_eq!(agent, commands::session::AgentArg::Shell);
@@ -319,6 +375,7 @@ mod tests {
                 assert_eq!(repo, None);
                 assert_eq!(branch, None);
                 assert_eq!(base_branch, None);
+                assert!(!json, "json defaults to false");
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -404,11 +461,12 @@ mod tests {
 
         match cli.command {
             Commands::Session {
-                action: SessionAction::Input { target, text },
+                action: SessionAction::Input { target, text, json },
             } => {
                 assert_eq!(target.session_id, "s-42");
                 assert_eq!(target.host.as_deref(), Some("local"));
                 assert_eq!(text, "write tests first");
+                assert!(!json, "json defaults to false");
             }
             other => panic!("unexpected command: {other:?}"),
         }

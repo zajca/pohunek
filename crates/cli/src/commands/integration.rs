@@ -40,6 +40,7 @@ impl From<HookAgentArg> for AgentKind {
 pub(crate) async fn run_install(
     paths: &Paths,
     agent: Option<HookAgentArg>,
+    json: bool,
 ) -> Result<(), CliError> {
     let params = IntegrationInstallParams {
         agent: agent.map(Into::into),
@@ -53,7 +54,11 @@ pub(crate) async fn run_install(
     let result = client.request(&request).await?;
     let result: IntegrationInstallResult = serde_json::from_value(result)?;
 
-    print!("{}", render_install_human(&result));
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        print!("{}", render_install_human(&result));
+    }
     Ok(())
 }
 
@@ -131,5 +136,20 @@ mod tests {
     fn renders_empty_install_result() {
         let output = render_install_human(&IntegrationInstallResult { installed: vec![] });
         assert_eq!(output, "no agent hooks installed\n");
+    }
+
+    #[test]
+    fn renders_install_result_as_json_that_deserializes() {
+        let result = IntegrationInstallResult {
+            installed: vec![IntegrationInstallReport {
+                agent: AgentKind::Claude,
+                hook_path: "/home/u/.claude/hooks/zagentmesh-agent-state.sh".to_owned(),
+                config_paths: vec!["/home/u/.claude/settings.json".to_owned()],
+            }],
+        };
+        let doc = crate::commands::render_json(&result).expect("json doc");
+        let parsed: IntegrationInstallResult =
+            serde_json::from_str(&doc).expect("parse install result");
+        assert_eq!(parsed, result);
     }
 }

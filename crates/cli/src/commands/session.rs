@@ -67,13 +67,17 @@ pub(crate) struct NewArgs {
 ///
 /// Returns [`CliError`] if the daemon is unreachable, rejects the request, or
 /// returns a payload that does not match the session contract.
-pub(crate) async fn run_new(paths: &Paths, args: NewArgs) -> Result<(), CliError> {
+pub(crate) async fn run_new(paths: &Paths, args: NewArgs, json: bool) -> Result<(), CliError> {
     let mut client = LocalClient::connect(&paths.socket).await?;
     let request = build_new_request(&args)?;
     let result = client.request(&request).await?;
     let info: SessionInfo = serde_json::from_value(result)?;
 
-    print!("{}", render_new_human(&info));
+    if json {
+        print!("{}", crate::commands::render_json(&info)?);
+    } else {
+        print!("{}", render_new_human(&info));
+    }
     Ok(())
 }
 
@@ -90,7 +94,7 @@ pub(crate) async fn run_list(paths: &Paths, json: bool) -> Result<(), CliError> 
     let sessions: Vec<SessionInfo> = serde_json::from_value(result)?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&sessions)?);
+        print!("{}", crate::commands::render_json(&sessions)?);
     } else {
         print!("{}", render_list_human(&sessions));
     }
@@ -115,7 +119,7 @@ pub(crate) async fn run_inspect(
     let info: SessionInfo = serde_json::from_value(result)?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&info)?);
+        print!("{}", crate::commands::render_json(&info)?);
     } else {
         print!("{}", render_inspect_human(&info));
     }
@@ -129,13 +133,17 @@ pub(crate) async fn run_inspect(
 ///
 /// Returns [`CliError`] if the target is remote, the daemon is unreachable,
 /// rejects the request, or returns a payload that does not match the contract.
-pub(crate) async fn run_stop(paths: &Paths, target: &Target) -> Result<(), CliError> {
+pub(crate) async fn run_stop(paths: &Paths, target: &Target, json: bool) -> Result<(), CliError> {
     let request = build_stop_request(target)?;
     let mut client = LocalClient::connect(&paths.socket).await?;
     let result = client.request(&request).await?;
     let stop: SessionStopResult = serde_json::from_value(result)?;
 
-    print!("{}", render_stop_human(&target.session_id, &stop));
+    if json {
+        print!("{}", crate::commands::render_json(&stop)?);
+    } else {
+        print!("{}", render_stop_human(&target.session_id, &stop));
+    }
     Ok(())
 }
 
@@ -145,13 +153,22 @@ pub(crate) async fn run_stop(paths: &Paths, target: &Target) -> Result<(), CliEr
 ///
 /// Returns [`CliError`] if the target is remote, the daemon is unreachable,
 /// rejects the request, or returns a payload that does not match the contract.
-pub(crate) async fn run_input(paths: &Paths, target: &Target, text: &str) -> Result<(), CliError> {
+pub(crate) async fn run_input(
+    paths: &Paths,
+    target: &Target,
+    text: &str,
+    json: bool,
+) -> Result<(), CliError> {
     let request = build_input_request(target, text)?;
     let mut client = LocalClient::connect(&paths.socket).await?;
     let result = client.request(&request).await?;
     let input: SessionInputResult = serde_json::from_value(result)?;
 
-    print!("{}", render_input_human(&target.session_id, &input));
+    if json {
+        print!("{}", crate::commands::render_json(&input)?);
+    } else {
+        print!("{}", render_input_human(&target.session_id, &input));
+    }
     Ok(())
 }
 
@@ -941,5 +958,47 @@ mod tests {
         let output = render_stop_human("s-42", &protocol::SessionStopResult { stopped: true });
 
         assert_eq!(output, "session s-42: stopped=true\n");
+    }
+
+    #[test]
+    fn renders_new_session_as_json_that_deserializes() {
+        let info = running_session("s-42");
+        let doc = crate::commands::render_json(&info).expect("json doc");
+        let parsed: SessionInfo = serde_json::from_str(&doc).expect("parse session info");
+        assert_eq!(parsed, info);
+    }
+
+    #[test]
+    fn renders_session_list_as_json_that_deserializes() {
+        let sessions = vec![running_session("s-1"), running_session("s-2")];
+        let doc = crate::commands::render_json(&sessions).expect("json doc");
+        let parsed: Vec<SessionInfo> = serde_json::from_str(&doc).expect("parse list");
+        assert_eq!(parsed, sessions);
+    }
+
+    #[test]
+    fn renders_inspect_as_json_that_deserializes() {
+        let info = running_session("s-42");
+        let doc = crate::commands::render_json(&info).expect("json doc");
+        let parsed: SessionInfo = serde_json::from_str(&doc).expect("parse inspect");
+        assert_eq!(parsed, info);
+    }
+
+    #[test]
+    fn renders_stop_result_as_json_that_deserializes() {
+        let result = protocol::SessionStopResult { stopped: true };
+        let doc = crate::commands::render_json(&result).expect("json doc");
+        let parsed: protocol::SessionStopResult =
+            serde_json::from_str(&doc).expect("parse stop result");
+        assert_eq!(parsed, result);
+    }
+
+    #[test]
+    fn renders_input_result_as_json_that_deserializes() {
+        let result = protocol::SessionInputResult { accepted: true };
+        let doc = crate::commands::render_json(&result).expect("json doc");
+        let parsed: protocol::SessionInputResult =
+            serde_json::from_str(&doc).expect("parse input result");
+        assert_eq!(parsed, result);
     }
 }

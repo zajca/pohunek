@@ -114,4 +114,23 @@ impl ProtocolError {
     pub fn bad_request(msg: impl Into<String>) -> Self {
         Self::new(ErrorClass::Daemon, "bad_request", msg, None)
     }
+
+    /// The canonical `runtime/agent_binary_missing` error.
+    ///
+    /// Names the missing binary so the operator (or an operator agent) sees
+    /// exactly what to install, and carries a `recover` hint pointing at the fix.
+    /// Raised both when resolving an agent binary on `PATH` before launch and when
+    /// a PTY spawn fails because the program is absent (ENOENT). Code is stable:
+    /// `agent_binary_missing`.
+    #[must_use]
+    pub fn agent_binary_missing(binary: &str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "agent_binary_missing",
+            format!("agent binary not found on PATH: {binary}"),
+            Some(format!(
+                "install the {binary} CLI and ensure it is on PATH; run `zagentmesh doctor` to verify"
+            )),
+        )
+    }
 }
