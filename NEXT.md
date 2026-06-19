@@ -1,174 +1,178 @@
-# NEXT STEP — Milestone 8: Worktree-per-Session
+# NEXT STEP — Milestone 10: `--json` everywhere + error/recovery-hint polish
 
 This file describes, in detail, the immediate next step. It is a handoff for
 whoever picks up the work (you, a subagent, or a fresh session).
 
-- Authoritative spec: [`docs/plan-phase-1.md`](docs/plan-phase-1.md) — see
-  "Worktree-per-Session", the "SQLite Schema" `worktree` table (which lands in
-  milestone 9, not here — M8 uses a minimal precursor like M7 did for resume
-  bindings), and Build-Order milestone 8 ("Worktree-per-session: bind/ownership/
-  warnings"; *Check:* two sessions, two worktrees, no shared tree).
-- Phase scope: [`docs/phases/01-core-local-sessions.md`](docs/phases/01-core-local-sessions.md).
-- Reference source (vendored locally): **Kandev**
-  `/tmp/kandev/apps/backend/internal/worktree/worktree.go:24-115` (the `Worktree`
-  record + non-fatal warning fields: `FetchWarning`, `BaseBranchFallbackWarning`,
-  `SetupScriptWarning`), plus `store.go` / `recreator_test.go` in the same dir
-  (ownership + reuse + recreate). **herdr** `/tmp/herdr/src/worktree.rs` is a
-  second reference. **herdr integration** is not needed this milestone.
+## Goal of milestone 10 (closes Phase 1)
+
+Two polish steps that make the CLI safe to automate and pleasant to debug. No new
+runtime capabilities, no new wire types — this is the last Phase 1 milestone
+before the Phase 2 remote transport.
+
+1. **`--json` everywhere.** Stable, machine-readable output on every read and
+   automation command, not just the few that have it today. Under `--json` the
+   command prints exactly one JSON document to stdout (nothing human on stdout)
+   and a non-zero exit on failure carries a structured error.
+2. **Error / recovery-hint polish.** Clear typed diagnostics for the two failure
+   modes a user actually hits at this stage — a **missing agent binary** and a
+   **protocol version mismatch** — and the human CLI must surface the
+   `ProtocolError.recover` hint that today it silently drops.
+
+### Definition of done (testable)
+
+1. **`--json` coverage is complete.** Every read/automation command accepts
+   `--json` and emits valid JSON that round-trips through `serde`:
+   - already done: `doctor`, `health`, `status`, `session list`, `session inspect`
+     (`crates/cli/src/main.rs` — each has `#[arg(long)] json: bool`);
+   - add it to: `session new`, `session stop`, `session input`, and
+     `integration install` (today these only render human text via
+     `render_new_human` / `render_install_human` and the stop/input result
+     structs).
+   *Check:* for each command, `--json` output parses as JSON and deserializes
+   back into the corresponding protocol result type; `attach` (raw stream) and
+   `daemon start` are explicitly excluded.
+2. **`--json` is clean and structured on failure.** Under `--json`, stdout
+   carries only the JSON document (no human lines leak onto stdout), and a failing
+   command prints a structured error object (`{class, code, msg, recover?}`)
+   and exits non-zero, so a script can branch on `code`. *Check:* a forced
+   failure (e.g. `session inspect missing --json`) prints parseable error JSON
+   with the stable `code` and exits non-zero.
+3. **Missing agent binary is a clear typed diagnostic.** `session new --agent
+   claude` when `claude` is not on `PATH` fails with a typed error that names the
+   missing binary, uses a stable code (e.g. `agent_binary_missing`), and carries
+   a `recover` hint (e.g. "install the claude CLI and ensure it is on PATH; see
+   `zagentmesh doctor`"). Today a spawn failure maps to the generic
+   `spawn_failed` with the raw OS error and no hint
+   (`session/mod.rs::pty_error_to_protocol`). *Check:* with `claude` absent,
+   `session new --agent claude` returns `agent_binary_missing` and the CLI prints
+   the recovery hint; `doctor` still flags the same gap.
+4. **Version mismatch is surfaced clearly.** The daemon already enforces version
+   negotiation at dispatch (`crates/daemon/src/api/handler.rs:109,133` call
+   `negotiate(request.v, PROTOCOL_VERSION)`), returning the typed
+   `daemon/version_mismatch` error (both versions named, recover hint set —
+   `crates/protocol/src/error.rs::version_mismatch`). The remaining work is
+   CLI-side: render that error and its hint clearly (see DoD #5). *Check:* a unit
+   test asserting the rendered message names both versions and the upgrade hint.
+5. **The human CLI renders `recover` hints.** `ProtocolError`'s `Display` is
+   `"{class}/{code}: {msg}"` and omits `recover`
+   (`crates/protocol/src/error.rs`), so the CLI's
+   `eprintln!("zagentmesh: {err}")` (`crates/cli/src/main.rs`) drops every
+   recovery hint today. The CLI must print the `recover` line when present (for
+   both human and `--json` paths). *Check:* a `version_mismatch` and an
+   `agent_binary_missing` surfaced through the CLI both show their hint.
+6. `cargo build`, `cargo clippy --all-targets --workspace -- -D warnings`, and
+   `cargo test --workspace` stay clean.
+
+### Explicitly OUT of scope (do NOT build here)
+
+- **Remote transport / NetBird discovery** → **Phase 2** (the next step; the
+  product's unique value). `--host` already parses but execution stays local
+  (`ensure_local_host` in `crates/cli/src/main.rs`).
+- **SQLite `state.db` + `user_version` migrations** → deferred backlog (see the
+  M9 decision, preserved in `docs/plan-phase-1.md` "Deferred: SQLite Schema").
+- **New session lifecycle features** (worktree cleanup-on-stop, merge flows,
+  etc.). Worktree bindings intentionally outlive a stopped session today; do not
+  change that here.
 
 ---
 
 ## Where we are now (done, verified)
 
-Milestones 1–7 are complete (`cargo build`,
-`cargo clippy --all-targets --workspace -D warnings`, `cargo test --workspace`
-= 244 passed):
+Milestones 1–9 are complete. `cargo build`, `cargo clippy --all-targets
+--workspace -- -D warnings`, and `cargo test --workspace` = **291 passed** (the
+integration `health_socket` suite has one pre-existing parallel-socket flake,
+`stale_socket_is_recovered_on_bind`, that passes single-threaded — unrelated to
+this work).
 
-- `crates/protocol` — typed control envelopes; session lifecycle + attach types;
-  `AgentKind`; `AgentActivity` + `SessionInfo.activity`; `StateSource`;
-  `agent_state` event; `session.input`. **M7 added:** `session.report_native_id`
-  (`SessionReportNativeIdParams`/`Result`), `integration.install`
-  (`IntegrationInstall{Params,Result,Report}`), and `SessionInfo.native_session_id`
-  (additive, serde skip-if-None).
-- `crates/daemon` (`zagentmeshd`) — Unix-socket server; full `session.*`
+- `crates/protocol` — typed control envelopes; full session lifecycle + attach
+  types; `AgentKind`; `AgentActivity` + `SessionInfo.activity`; `StateSource`;
+  `agent_state`; `session.input`; M7 `session.report_native_id` +
+  `integration.install`; M8 worktree fields + `SessionWarning`. Errors are typed
+  (`ProtocolError { class, code, msg, recover }`) with canonical constructors
+  (`version_mismatch`, `method_not_found`, `bad_request`). Version negotiation:
+  `negotiate()` / `PROTOCOL_VERSION` (`version.rs`).
+- `crates/daemon` (`zagentmeshd`) — Unix-socket control server; full `session.*`
   lifecycle; attach bridge; `subscribe` event stream; in-memory `SessionRegistry`
-  owning one PTY per session; per-session detection task (state engine).
-- `crates/cli` (`zagentmesh`) — `doctor`, `daemon`, `health`/`status`, `session`
-  group (`new --agent shell|codex|claude`, `list`, `inspect`, `stop`, `input`),
-  `attach <target>`, and **M7's** `integration install [--agent claude|codex]`
-  (`inspect` now surfaces `native_session_id` + `resumable`).
-- **State engine (M5):** `daemon/src/detect/` (`osc`, `screen`, `manifest`,
-  `machine`); per-agent manifests selected by `AgentKind`.
-- **Agent adapters (M6):** `daemon/src/agent/` — the `AgentAdapter` trait +
-  `codex.rs`/`claude.rs`; input injection honors `InputRules`; resume-argv
-  builders (`claude --resume <id>` / `codex resume <id>`).
-- **Session-ID hook + resume (M7):** `daemon/src/integration/` installs the
-  per-agent `SessionStart` hook (idempotent settings/hooks/config merge; assets
-  fire `session.report_native_id`, fire-and-forget, exit 0 on any failure). The
-  daemon injects `ZAGENTMESH_ENV/SOCKET_PATH/SESSION_ID/PROTOCOL_VERSION` for
-  Codex/Claude; `report_native_id` captures the native id, updates `SessionInfo`,
-  and persists a `ResumeBinding`. `daemon/src/store/mod.rs` is a **minimal
-  JSON-lines resume-binding store** (the M9 SQLite precursor). On startup the
-  daemon `load_and_resume()`s captured sessions; terminal/unresumable bindings
-  are pruned so a stopped session never resurrects. `SessionRef { kind: Id|Path }`
-  validates id ≤512 / path ≤4096-absolute, no control chars, **no leading `-`**
-  (argv-flag-injection guard).
-- Stubs (TODO doc-comment only, NOT implemented): `daemon/src/events/mod.rs`
-  (append-only event log, milestone 9). `daemon/src/store/mod.rs` now holds the
-  minimal resume-binding store with a `TODO(milestone 9)` that SQLite absorbs it.
+  + per-session detection (state engine); agent adapters; session-id hook +
+  resume; worktree-per-session; **M9 unified metadata store + append-only event
+  log**.
+- `crates/cli` (`zagentmesh`) — `doctor`, `daemon start`, `health`/`status`,
+  `session new/list/inspect/stop/input`, `attach`, `integration install`. A
+  global `--host` arg parses (local-only execution). `--json` exists on `doctor`,
+  `health`, `status`, `session list`, `session inspect`.
+- **M9 (just landed):**
+  - `daemon/src/store/mod.rs` — unified `Store` over one `metadata.jsonl`
+    (tagged `Record::{Resume,Worktree}`, one lock, one atomic temp+rename).
+  - `daemon/src/events/mod.rs` — append-only `EventLog` under `events/`,
+    `spawn_drain` + graceful `shutdown_event_log` flush; never secrets/terminal
+    bytes; git stderr is credential-scrubbed before it reaches a `SessionWarning`.
 
-### Seams milestone 8 builds on (already in place)
+### Seams milestone 10 builds on (already in place)
 
-- `crates/protocol` — `SessionNewParams` has `agent`, `cwd`, `cols`, `rows`.
-  Worktree binding wants a repo + branch + base-branch. M8 adds **optional**
-  `repo`/`branch`/`base_branch` (all `#[serde(default, skip_serializing_if)]`)
-  to `SessionNewParams`, and `SessionInfo` gains optional `repo`/`branch`/
-  `worktree_path` + non-fatal `warnings` (mirror how M7 added `native_session_id`
-  additively). The SQLite schema's `session` row already names `repo`,
-  `base_branch`, `branch`, `worktree_path`.
-- `daemon/src/session/mod.rs` — `create` resolves a `cwd` today. M8 inserts a
-  worktree-resolution step: when a repo+branch is requested, bind/create the
-  worktree and launch the agent **in the worktree path** instead of the raw cwd.
-  `register_pty_session` already takes a resolved `cwd` — feed it the worktree.
-- `daemon/src/store/mod.rs` — the minimal-store pattern (load/save a small file
-  under the data dir, atomic temp+rename, 0600) is the model for a **minimal
-  worktree-binding store** (precursor to the M9 `worktree` table). Do **not**
-  build the full SQLite `worktree` table here.
-- `crates/cli` — the `session new` command and the `inspect`/`list` formatters
-  are where repo/branch/worktree + warnings surface.
-
----
-
-## Goal of milestone 8
-
-Bind **one git worktree per `(session_id, repository, branch)`** so concurrent
-sessions on the same repo never share a working tree. Track `path`, `branch`,
-`base_branch`, `status` (`active`/`merged`/`deleted`); check ownership before
-reuse or cleanup; and treat fetch / base-branch / setup-script failures as
-**non-fatal warnings** (keep the worktree, surface the warning, let the user
-decide). **Still local, single-host.**
-
-> **Scope note on persistence (read this).** Like M7's resume-binding store, M8
-> ships a **minimal worktree-binding store** (a small file under the data dir:
-> `session_id`, `repository`, `branch`, `base_branch`, `path`, `status`,
-> timestamps), an explicit **precursor** to the M9 `worktree` table. Do **not**
-> build the full SQLite schema or the event log here.
-
-### Definition of done (testable)
-
-1. `SessionNewParams` gains optional `repo`/`branch`/`base_branch`; `SessionInfo`
-   gains optional `repo`/`branch`/`worktree_path` + a `warnings: Vec<…>` of
-   non-fatal warnings. Additive serde (omitted when absent). Round-trip tests.
-2. A worktree module (`daemon/src/worktree/`) that, given a repo + branch +
-   base-branch, binds an existing owned worktree or creates a new one under the
-   data dir (`worktrees/<session>-<repo>-<branch-slug>/`), running
-   `git worktree add`. Ownership check before reuse/cleanup (don't adopt or
-   delete a tree this daemon does not own). Branch-slug disambiguation so two
-   branches of one `(session, repo)` don't collapse (Kandev `BranchSlug`).
-3. Non-fatal warnings: a failed `git fetch` falls back to a local branch with a
-   `fetch_warning`; a missing base-branch falls back to the default branch with
-   a `base_branch_fallback_warning`; a failing setup script keeps the worktree
-   with a `setup_script_warning`. None of these abort session creation.
-4. `create_session` launches Codex/Claude in the bound worktree path when a
-   repo+branch is requested; a plain `cwd` (no repo) keeps today's behavior.
-5. Minimal worktree-binding store under the data dir (load/save, atomic write,
-   `TODO(milestone 9)` that SQLite absorbs it). No secrets written.
-6. CLI: `session new --repo <path> --branch <name> [--base-branch <name>]`;
-   `inspect`/`list` surface the worktree path + branch + any warnings.
-7. End-to-end (extend `crates/daemon/tests/health_socket.rs`): create two
-   sessions on the same repo with different branches; assert two distinct
-   worktree paths (no shared tree) and that each session launched in its own
-   worktree. Cover the fetch / base-branch / setup-script warning paths.
-8. `cargo build`, `cargo clippy --all-targets --workspace -D warnings`, and
-   `cargo test --workspace` stay clean.
-
-### Explicitly OUT of scope (later milestones — do NOT build here)
-
-- **Full SQLite persistence + `events/` append-only log + migration test** →
-  **milestone 9** (absorbs both the M7 resume-binding store and the M8 worktree
-  store into `state.db`).
-- **`--json` everywhere + error/recovery polish** → milestone 10.
-- **Remote transport / NetBird** → Phase 2.
+- `crates/cli/src/main.rs` — the clap `Commands` / `SessionAction` enums (where
+  `--json` flags are declared) and `run()` (where each command dispatches). The
+  top-level error sink is `eprintln!("zagentmesh: {err}")` in `main()`.
+- `crates/cli/src/commands/` — per-command `run` fns and the human renderers
+  (`health::run`, `doctor::print_human`, `session::render_new_human`,
+  `integration::render_install_human`). Mirror the existing `if json { … } else {
+  … }` shape (see `health.rs:35` / `doctor.rs:107`).
+- `crates/cli/src/error.rs` — `CliError`; `Protocol(ProtocolError)` is the
+  variant whose rendering must grow a `recover` line.
+- `crates/protocol/src/error.rs` — `ProtocolError` + `recover` field +
+  `version_mismatch`. Add an `agent_binary_missing` constructor here (stable code
+  + recover hint) for DoD #3.
+- `crates/daemon/src/session/mod.rs` — `pty_error_to_protocol` and the
+  `register_pty_session` spawn path: detect a missing-binary spawn failure
+  (ENOENT) and map it to the new typed error naming the agent's binary. The agent
+  adapters (`daemon/src/agent/`) know each agent's binary name.
+- `crates/daemon/src/api/handler.rs:109,133` — version negotiation is already
+  enforced; no daemon change needed for DoD #4.
 
 ---
 
 ## Implementation tasks
 
-1. `crates/protocol` — additive `SessionNewParams`/`SessionInfo` fields +
-   round-trip tests (mirror M7's `native_session_id` additive pattern).
-2. `crates/daemon/src/worktree/` (new module) — the worktree binder/creator
-   (model: Kandev `worktree.go`/`store.go`), ownership check, branch-slug,
-   non-fatal warning collection. Unit-test slug, ownership, and warning mapping
-   against temp git repos.
-3. `crates/daemon/src/session/` + `store/` — resolve the worktree in
-   `create_session`, launch in its path; minimal worktree-binding store.
-4. `crates/cli` — `session new` repo/branch flags; surface worktree + warnings.
+1. `crates/protocol/src/error.rs` — add an `agent_binary_missing(binary)`
+   constructor (class `runtime`, stable code `agent_binary_missing`, recover
+   hint). No wire-shape change (still `{class,code,msg,recover}`).
+2. `crates/daemon/src/session/mod.rs` — when the PTY spawn fails because the
+   agent binary is absent (ENOENT), return the new typed error naming the
+   binary instead of the generic `spawn_failed`.
+3. `crates/cli/src/main.rs` + `crates/cli/src/commands/session.rs` +
+   `integration.rs` — add `--json` to `session new`, `session stop`,
+   `session input`, `integration install`; each prints the result struct as JSON
+   under `--json` and the existing human text otherwise.
+4. `crates/cli/src/error.rs` + `main.rs` — render `ProtocolError.recover` on a
+   separate `hint:` line for human output; under `--json`, emit the structured
+   error object and exit non-zero.
+5. Keep `attach` and `daemon start` free of `--json` (raw stream / process
+   control — JSON is meaningless there); document the exclusion.
 
 ---
 
 ## Tests (must pass before done)
 
-- protocol: round-trip for the new optional `SessionNewParams`/`SessionInfo`
-  fields (present and absent).
-- worktree: slug disambiguation; ownership check rejects a foreign tree; the
-  three warning paths (fetch / base-branch / setup-script) keep the worktree.
-- session/store: a repo+branch session launches in the worktree; the minimal
-  store round-trips; two branches of one repo bind two trees.
-- daemon integration (extend `crates/daemon/tests/health_socket.rs`): two
-  sessions, two worktrees, no shared tree (the Build-Order checkpoint).
-- Keep `cargo build`, `cargo clippy --all-targets --workspace -D warnings`, and
-  `cargo test --workspace` clean.
+- CLI unit tests: each `--json` command's output parses and deserializes into its
+  protocol result type; a failing `--json` command emits a structured error
+  object with the expected stable `code` and exits non-zero.
+- protocol: `agent_binary_missing` carries the binary name + a recover hint;
+  `version_mismatch` names both versions (already) + hint.
+- daemon integration (`crates/daemon/tests/health_socket.rs`): `session new` for
+  an agent whose binary is absent from `PATH` returns `agent_binary_missing`
+  (reuse the `PathGuard` machinery already in the suite).
+- CLI rendering: a `ProtocolError` with a `recover` hint renders the `hint:` line
+  (covers both `version_mismatch` and `agent_binary_missing`).
+- Keep `cargo build`, `cargo clippy --all-targets --workspace -- -D warnings`,
+  and `cargo test --workspace` clean.
 
 ---
 
 ## After this milestone
 
-Milestone 9 = **SQLite persistence + append-only event log + `user_version`
-1→2 migration test**: absorb the minimal M7 resume-binding store and the M8
-worktree store into the `session` + `worktree` tables; `state.db` rebuildable
-from sources; the event log is the audit trail. Then milestone 10 = **`--json`
-everywhere + error/recovery polish**.
-
-Do not pull milestone 9 SQLite work into this step — keep M8 proven: two
-sessions on one repo get two worktrees, ownership is checked before reuse/
-cleanup, and fetch/base-branch/setup-script failures are non-fatal warnings.
+Phase 1 is complete. **Phase 2 = remote transport over NetBird** — the product's
+unique value, and the reason SQLite was deprioritized: a TCP listener bound only
+to the NetBird interface, tokenless discovery (`netbird status --json`), `host
+discover`/`list`/`inspect`, and remote session lifecycle, all reusing the Phase 1
+control + attach protocol unchanged. Multi-host display is client-side fan-out of
+live per-host queries — no shared/replicated state. See
+[`docs/phases/02-remote-netbird.md`](docs/phases/02-remote-netbird.md).
