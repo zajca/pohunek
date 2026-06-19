@@ -33,8 +33,10 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use protocol::{ErrorClass, ProtocolError, SessionWarning, SessionWarningKind};
 use time::format_description::well_known::Rfc3339;
@@ -51,6 +53,11 @@ const SETUP_SCRIPT_REL: &str = ".zagentmesh/setup";
 /// Interpreter used to run the setup script, so a script without an executable
 /// bit (the common case for a committed `.zagentmesh/setup`) still runs.
 const SETUP_SCRIPT_INTERPRETER: &str = "sh";
+
+/// How often [`wait_with_timeout`] polls a running setup script for completion.
+/// Small enough that a quick script returns promptly, large enough that the busy
+/// loop is negligible against the (much larger) setup-script timeout.
+const SETUP_SCRIPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Fallback directory-name component when a repository path has no usable file
 /// name (e.g. the filesystem root) or it sanitizes to empty.
@@ -95,14 +102,22 @@ pub struct WorktreeManager {
     /// (`Arc`) with the session registry so resume and worktree records live in
     /// one file behind one serialization point.
     store: Arc<Store>,
+    /// Wall-clock bound on a per-repository setup script. A script that does not
+    /// finish within this window is terminated and recorded as a non-fatal
+    /// `setup_script` warning, so a hanging script can never wedge `session.new`.
+    setup_script_timeout: Duration,
 }
 
 impl WorktreeManager {
-    /// Build a manager that creates worktrees under `root` and persists bindings
-    /// to the shared `store`.
+    /// Build a manager that creates worktrees under `root`, persists bindings to
+    /// the shared `store`, and bounds each setup script by `setup_script_timeout`.
     #[must_use]
-    pub fn new(root: PathBuf, store: Arc<Store>) -> Self {
-        Self { root, store }
+    pub fn new(root: PathBuf, store: Arc<Store>, setup_script_timeout: Duration) -> Self {
+        Self {
+            root,
+            store,
+            setup_script_timeout,
+        }
     }
 
     /// The shared metadata store, for inspection/tests.
@@ -242,7 +257,7 @@ impl WorktreeManager {
         // `git worktree add` actually branches from.
         let start_point = self.fetch_start_point(&repository, &base_branch, &mut warnings);
         self.create_worktree(&repository, &path, &req.branch, &start_point)?;
-        run_setup_script(&path, &mut warnings);
+        run_setup_script(&path, self.setup_script_timeout, &mut warnings);
 
         let now = timestamp_now();
         let binding = WorktreeBinding {
@@ -256,9 +271,21 @@ impl WorktreeManager {
             created_at: now.clone(),
             updated_at: now,
         };
-        self.store
-            .record_worktree(&binding)
-            .map_err(|err| store_error("persist worktree binding", &err))?;
+        self.store.record_worktree(&binding).map_err(|err| {
+            // The worktree directory and branch checkout already exist. If the
+            // binding cannot be persisted we would orphan them: with no binding
+            // the ownership gate can never reclaim the tree, and the branch stays
+            // checked out, blocking the next `session.new` on it with
+            // `worktree_branch_in_use`. Roll the checkout back before erroring.
+            if let Err(message) = worktree_remove(&repository, &path) {
+                warn!(
+                    path = %path.display(),
+                    error = %message,
+                    "failed to remove worktree after a failed binding persist"
+                );
+            }
+            store_error("persist worktree binding", &err)
+        })?;
 
         Ok(WorktreeBound {
             path,
@@ -686,36 +713,54 @@ fn worktree_prune(repo: &Path) -> Result<(), String> {
     git_run(repo, &["worktree", "prune"]).map(|_| ())
 }
 
-/// Run `<repo>/.zagentmesh/setup` inside `worktree` if present; a failure is a
-/// non-fatal `setup_script` warning (the worktree is kept).
-fn run_setup_script(worktree: &Path, warnings: &mut Vec<SessionWarning>) {
+/// Outcome of supervising a setup script to (possibly forced) completion.
+enum SetupOutcome {
+    /// The script exited on its own with this status.
+    Exited(ExitStatus),
+    /// The script outlived `setup_script_timeout` and was terminated.
+    TimedOut,
+    /// Waiting on the child failed (an OS error, not a script failure).
+    WaitError(io::Error),
+}
+
+/// Run `<repo>/.zagentmesh/setup` inside `worktree` if present, bounded by
+/// `timeout`. A non-zero exit, a spawn failure, or a timeout is recorded as a
+/// non-fatal `setup_script` warning; the worktree is kept in every case.
+///
+/// **Security:** the warning `detail` carries only the exit status / a generic
+/// reason — never the script's output. Setup-script output is arbitrary process
+/// output that can contain secrets (e.g. `echo $TOKEN`), and this warning rides
+/// on `SessionInfo` into the append-only event log, whose invariant is that it
+/// never holds a secret (and `redact_url_credentials` only catches URL-embedded
+/// ones). So the script's stdout/stderr are discarded outright (`/dev/null`) —
+/// the script never feeds any daemon-side sink. It is the user's own committed
+/// file, debuggable by running it directly in the worktree.
+///
+/// **Robustness:** the script runs in its own process group so a timeout can kill
+/// the whole subtree — a multi-command script forks children (`npm`, `sleep`, …)
+/// that killing only the direct `sh` would leave as runaways (see
+/// [`terminate_setup_script`]).
+fn run_setup_script(worktree: &Path, timeout: Duration, warnings: &mut Vec<SessionWarning>) {
     let script = worktree.join(SETUP_SCRIPT_REL);
     if !script.is_file() {
         return;
     }
-    // TODO(milestone 9+): bound the script with a timeout; M8 keeps it minimal
-    // and the script is the user's own committed file.
-    let result = Command::new(SETUP_SCRIPT_INTERPRETER)
+    let mut builder = Command::new(SETUP_SCRIPT_INTERPRETER);
+    builder
         .arg(&script)
         .current_dir(worktree)
-        .output();
-    match result {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            warnings.push(SessionWarning {
-                kind: SessionWarningKind::SetupScript,
-                message: "Repository setup script failed; the worktree was kept without it."
-                    .to_owned(),
-                detail: Some(if stderr.is_empty() {
-                    format!("{} exited with status {}", script.display(), output.status)
-                } else {
-                    // The script's stderr is arbitrary user output; scrub any
-                    // URL-embedded credential before it reaches the event log.
-                    redact_url_credentials(&stderr)
-                }),
-            });
-        }
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // pgid := child pid, so a timeout can signal the whole group at once.
+        builder.process_group(0);
+    }
+
+    let mut child = match builder.spawn() {
+        Ok(child) => child,
         Err(err) => {
             warnings.push(SessionWarning {
                 kind: SessionWarningKind::SetupScript,
@@ -723,8 +768,95 @@ fn run_setup_script(worktree: &Path, warnings: &mut Vec<SessionWarning>) {
                     .to_owned(),
                 detail: Some(format!("failed to spawn {}: {err}", script.display())),
             });
+            return;
+        }
+    };
+
+    let warning = match wait_with_timeout(&mut child, timeout) {
+        SetupOutcome::Exited(status) if status.success() => return,
+        SetupOutcome::Exited(status) => {
+            debug!(script = %script.display(), %status, "setup script failed");
+            SessionWarning {
+                kind: SessionWarningKind::SetupScript,
+                message: "Repository setup script failed; the worktree was kept without it."
+                    .to_owned(),
+                detail: Some(format!("{} exited with status {status}", script.display())),
+            }
+        }
+        SetupOutcome::TimedOut => {
+            warn!(
+                script = %script.display(),
+                timeout_secs = timeout.as_secs(),
+                "setup script timed out; terminated"
+            );
+            SessionWarning {
+                kind: SessionWarningKind::SetupScript,
+                message:
+                    "Repository setup script timed out; it was terminated and the worktree was kept without it."
+                        .to_owned(),
+                detail: Some(format!(
+                    "{} did not finish within {}s and was terminated",
+                    script.display(),
+                    timeout.as_secs()
+                )),
+            }
+        }
+        SetupOutcome::WaitError(err) => SessionWarning {
+            kind: SessionWarningKind::SetupScript,
+            message:
+                "Repository setup script could not be supervised; the worktree was kept without it."
+                    .to_owned(),
+            detail: Some(format!("failed to wait for {}: {err}", script.display())),
+        },
+    };
+    warnings.push(warning);
+}
+
+/// Poll `child` to completion, terminating it if `timeout` elapses first.
+///
+/// Runs on the (blocking) worktree-bind thread, so a simple `try_wait` poll loop
+/// is appropriate and keeps the daemon dependency-free.
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> SetupOutcome {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return SetupOutcome::Exited(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    terminate_setup_script(child);
+                    return SetupOutcome::TimedOut;
+                }
+                thread::sleep(SETUP_SCRIPT_POLL_INTERVAL);
+            }
+            Err(err) => return SetupOutcome::WaitError(err),
         }
     }
+}
+
+/// Kill a timed-out setup script and reap it, leaving no zombie or runaway child.
+///
+/// On Unix the whole process group (created via `process_group(0)`) is signalled
+/// so children the script forked die too; the direct child is then reaped. The
+/// child is not yet reaped when this is called, so its pid — and thus the pgid —
+/// cannot have been recycled, making the group-directed kill safe.
+#[allow(unsafe_code)]
+fn terminate_setup_script(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let pgid = child.id() as libc::pid_t;
+        // SAFETY: `kill(2)` is a plain syscall with no memory-safety contract. A
+        // negative pid targets the process group created by `process_group(0)`;
+        // `child` is not yet reaped here, so its pid (hence the pgid) cannot have
+        // been recycled. An already-dead group yields `ESRCH`, which we ignore.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
 }
 
 /// A `git` command scoped to `repo` via `-C` (passed as an `OsStr` so non-UTF-8

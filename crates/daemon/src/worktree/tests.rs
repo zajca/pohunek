@@ -7,12 +7,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::SessionWarningKind;
 
 use super::{branch_slug, is_valid_worktree, WorktreeManager, WorktreeRequest};
 use crate::store::{Store, WorktreeStatus};
+
+/// Generous setup-script timeout for tests whose script finishes promptly; long
+/// enough that it never trips on a slow CI box.
+const TEST_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn unique_dir(tag: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -64,9 +68,13 @@ fn init_repo(tag: &str) -> PathBuf {
 }
 
 fn manager(tag: &str) -> WorktreeManager {
+    manager_with_timeout(tag, TEST_SETUP_TIMEOUT)
+}
+
+fn manager_with_timeout(tag: &str, setup_timeout: Duration) -> WorktreeManager {
     let root = unique_dir(&format!("{tag}-root"));
     let store = unique_dir(&format!("{tag}-store")).join("metadata.jsonl");
-    WorktreeManager::new(root, Arc::new(Store::new(store)))
+    WorktreeManager::new(root, Arc::new(Store::new(store)), setup_timeout)
 }
 
 /// Run git in `dir` and return trimmed stdout (asserting success).
@@ -485,6 +493,181 @@ fn successful_setup_script_produces_no_warning() {
         bound.warnings.is_empty(),
         "a passing setup script must not warn: {:?}",
         bound.warnings
+    );
+}
+
+#[test]
+fn failing_setup_script_warning_detail_excludes_script_stderr() {
+    // The event log claims to never hold a secret, but a setup script's stderr is
+    // arbitrary process output (e.g. `echo $TOKEN`). The warning detail — which
+    // rides into the event log — must therefore carry only the exit status, not
+    // the script's stderr, even though the script is the user's own committed file.
+    let mgr = manager("setup-secret");
+    let repo = init_repo("setup-secret-repo");
+    let secret = "SUPER_SECRET_TOKEN_abc123";
+    fs::create_dir_all(repo.join(".zagentmesh")).expect("create .zagentmesh");
+    fs::write(
+        repo.join(".zagentmesh/setup"),
+        format!("#!/bin/sh\necho '{secret}' >&2\nexit 7\n"),
+    )
+    .expect("write setup script");
+    git_in(&repo, &["add", "."]);
+    git_in(&repo, &["commit", "-q", "-m", "add leaking setup"]);
+
+    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind keeps worktree");
+    let warning = bound
+        .warnings
+        .iter()
+        .find(|w| w.kind == SessionWarningKind::SetupScript)
+        .expect("setup-script warning present");
+    let detail = warning.detail.as_deref().unwrap_or_default();
+    assert!(
+        !detail.contains(secret),
+        "setup-script stderr must not leak into the warning detail (event log): {detail:?}"
+    );
+    assert!(
+        !warning.message.contains(secret),
+        "setup-script stderr must not leak into the warning message: {:?}",
+        warning.message
+    );
+}
+
+#[test]
+fn hanging_setup_script_is_terminated_with_its_forked_children() {
+    // A script that never exits must not wedge `bind`/`session.new`, and killing
+    // it must take its forked children with it — killing only the direct shell
+    // would leave them as runaway processes. The script forks a `sleep`, records
+    // its pid, then blocks; after the timeout the whole process group is killed,
+    // so that child must be gone too.
+    let mgr = manager_with_timeout("setup-timeout", Duration::from_secs(1));
+    let repo = init_repo("setup-timeout-repo");
+    fs::create_dir_all(repo.join(".zagentmesh")).expect("create .zagentmesh");
+    // `sleep 30` is bounded so a regression that leaves a runaway self-terminates
+    // rather than lingering for the box's lifetime. No shell exec-optimization
+    // (the shell stays a real parent of a real child) thanks to the trailing
+    // `wait`. The pid is written into the (kept) worktree for the test to probe.
+    fs::write(
+        repo.join(".zagentmesh/setup"),
+        "#!/bin/sh\nsleep 30 &\necho \"$!\" > setup-child.pid\nwait\n",
+    )
+    .expect("write setup");
+    git_in(&repo, &["add", "."]);
+    git_in(&repo, &["commit", "-q", "-m", "add hanging setup"]);
+
+    let started = Instant::now();
+    let bound = mgr
+        .bind(&request("s-1", &repo, "feat/x"))
+        .expect("bind returns despite a hanging setup script");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "bind must return shortly after the timeout, took {elapsed:?}"
+    );
+    assert!(is_valid_worktree(&bound.path), "worktree kept after a setup timeout");
+
+    let warning = bound
+        .warnings
+        .iter()
+        .find(|w| w.kind == SessionWarningKind::SetupScript)
+        .expect("setup-script timeout warning present");
+    let detail = warning.detail.as_deref().unwrap_or_default();
+    assert!(
+        detail.contains("did not finish") || detail.contains("terminated"),
+        "timeout warning detail should explain the termination: {detail:?}"
+    );
+
+    // The forked child must have been killed with the process group — a regression
+    // that signalled only the direct shell would leave it alive as a runaway.
+    let child_pid = read_setup_child_pid(&bound.path);
+    assert!(
+        wait_until_process_gone(child_pid, Duration::from_secs(10)),
+        "setup script's forked child (pid {child_pid}) survived the timeout kill as a runaway"
+    );
+}
+
+/// Read the pid the timed-out setup script recorded for its forked child, polling
+/// briefly for the file to settle on disk.
+fn read_setup_child_pid(worktree: &Path) -> i32 {
+    let pid_file = worktree.join("setup-child.pid");
+    for _ in 0..50 {
+        if let Ok(contents) = fs::read_to_string(&pid_file) {
+            if let Ok(pid) = contents.trim().parse::<i32>() {
+                return pid;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "setup script never recorded its child pid at {}",
+        pid_file.display()
+    );
+}
+
+/// Whether `pid` has disappeared within `budget`. Uses `kill -0`, which succeeds
+/// while the pid exists (briefly true for a zombie awaiting reaping) and fails
+/// once it is gone, so a short poll absorbs the reap window without flaking.
+fn wait_until_process_gone(pid: i32, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        let alive = Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !alive {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn binding_persist_failure_rolls_back_the_worktree() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // bind() persists the worktree binding only after the git worktree and its
+    // branch checkout already exist. If that persist fails it must roll the
+    // checkout back (the sibling of the create() orphan fix), or the branch stays
+    // checked out and blocks the next session.new with `worktree_branch_in_use`.
+    let root = unique_dir("persist-fail-root");
+    let store_dir = unique_dir("persist-fail-store");
+    let store_path = store_dir.join("metadata.jsonl");
+    let mgr = WorktreeManager::new(root, Arc::new(Store::new(store_path)), TEST_SETUP_TIMEOUT);
+    let repo = init_repo("persist-fail-repo");
+
+    // Force the persist to fail by making the store directory read-only: the store
+    // writes via a temp file + atomic rename inside it, which then fails with
+    // EACCES. Root bypasses directory permission bits, so skip there.
+    fs::set_permissions(&store_dir, fs::Permissions::from_mode(0o500))
+        .expect("make store dir read-only");
+    let probe = store_dir.join(".probe");
+    if fs::write(&probe, b"x").is_ok() {
+        let _ = fs::remove_file(&probe);
+        fs::set_permissions(&store_dir, fs::Permissions::from_mode(0o755)).ok();
+        eprintln!("skipping binding_persist_failure_rolls_back_the_worktree: perms not enforced (root?)");
+        return;
+    }
+
+    let result = mgr.bind(&request("s-1", &repo, "feat/x"));
+
+    // Restore perms first so the temp dir is cleanable regardless of the outcome.
+    fs::set_permissions(&store_dir, fs::Permissions::from_mode(0o755))
+        .expect("restore store dir perms");
+
+    let err = result.expect_err("bind must fail when the binding cannot be persisted");
+    assert_eq!(err.code, "worktree_store_error", "got: {err:?}");
+
+    // The worktree and its branch checkout must have been rolled back, freeing the
+    // branch for a retry rather than orphaning it.
+    let listing = git_stdout(&repo, &["worktree", "list", "--porcelain"]);
+    assert!(
+        !listing.contains("feat/x"),
+        "binding-persist failure must roll back the checkout: {listing}"
     );
 }
 

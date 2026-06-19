@@ -46,6 +46,13 @@ const SUBMIT: &[u8] = b"\r";
 /// [`SessionRegistryConfig::output_history_limit_bytes`].
 const DEFAULT_OUTPUT_HISTORY_LIMIT_BYTES: usize = 10_000_000;
 
+/// Default wall-clock bound on a per-repository worktree setup script
+/// (`.zagentmesh/setup`). It is a safety cap on a *hang*, not a tight budget — a
+/// legitimate script may install dependencies — so it is generous; a script that
+/// exceeds it is terminated and surfaced as a non-fatal `setup_script` warning.
+/// Overridable via [`SessionRegistryConfig::setup_script_timeout`].
+const DEFAULT_SETUP_SCRIPT_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Shell command configuration used for `AgentKind::Shell`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellCommand {
@@ -112,6 +119,11 @@ pub struct SessionRegistryConfig {
     /// to enable worktree binding; when unset, a `session.new` carrying a
     /// repo+branch fails (no silent default).
     pub worktree_root: Option<PathBuf>,
+    /// Wall-clock bound on a per-repository worktree setup script. A script that
+    /// exceeds it is terminated and recorded as a non-fatal `setup_script`
+    /// warning, so a hanging script can never wedge `session.new`. Defaults to
+    /// [`DEFAULT_SETUP_SCRIPT_TIMEOUT`].
+    pub setup_script_timeout: Duration,
     /// Directory for the append-only event log (`<data_dir>/events`). `None`
     /// disables event logging. Started via [`SessionRegistry::spawn_event_log`].
     pub event_log_dir: Option<PathBuf>,
@@ -156,6 +168,7 @@ impl Default for SessionRegistryConfig {
             socket_path: None,
             store_path: None,
             worktree_root: None,
+            setup_script_timeout: DEFAULT_SETUP_SCRIPT_TIMEOUT,
             event_log_dir: None,
         }
     }
@@ -252,9 +265,11 @@ impl SessionRegistry {
         // Worktree binding needs both a root for the trees and the shared store;
         // it is enabled only when both are configured (no silent default path).
         let worktree = match (&config.worktree_root, &store) {
-            (Some(root), Some(store)) => {
-                Some(Arc::new(WorktreeManager::new(root.clone(), store.clone())))
-            }
+            (Some(root), Some(store)) => Some(Arc::new(WorktreeManager::new(
+                root.clone(),
+                store.clone(),
+                config.setup_script_timeout,
+            ))),
             _ => None,
         };
         Self {
@@ -360,6 +375,7 @@ impl SessionRegistry {
         // Bind a worktree when a repo+branch was requested; launch there instead
         // of the plain cwd. A plain cwd (no repo) keeps today's behavior.
         let bound = self.resolve_worktree(&id, &params).await?;
+        let worktree_bound = bound.is_some();
         let (launch_cwd, repo, branch, worktree_path, warnings) = match bound {
             Some(bound) => (
                 bound.path.clone(),
@@ -371,30 +387,77 @@ impl SessionRegistry {
             None => (cwd, None, None, None, Vec::new()),
         };
 
-        let env_extra = self.hook_env(params.agent, &id);
-        let command = build_launch_command(
-            params.agent,
-            &self.inner.config.shell_command,
-            launch_cwd.clone(),
-            params.cols,
-            params.rows,
-            env_extra,
-        )?;
+        // The worktree is now bound and its branch is checked out. Any failure
+        // building the launch command or spawning the PTY must roll that back: a
+        // leftover worktree keeps the branch checked out and blocks the next
+        // `session.new` on it with `worktree_branch_in_use` (an orphan a fresh
+        // session id would never reuse). Compensate here — not in
+        // `register_pty_session`, which `resume_binding` shares and where the
+        // worktree must be kept.
+        let launch = async {
+            let env_extra = self.hook_env(params.agent, &id);
+            let command = build_launch_command(
+                params.agent,
+                &self.inner.config.shell_command,
+                launch_cwd.clone(),
+                params.cols,
+                params.rows,
+                env_extra,
+            )?;
 
-        self.register_pty_session(PtySessionSpec {
-            id,
-            agent: params.agent,
-            cwd: launch_cwd,
-            cols: params.cols,
-            rows: params.rows,
-            command,
-            native_session_id: None,
-            repo,
-            branch,
-            worktree_path,
-            warnings,
-        })
-        .await
+            self.register_pty_session(PtySessionSpec {
+                id: id.clone(),
+                agent: params.agent,
+                cwd: launch_cwd,
+                cols: params.cols,
+                rows: params.rows,
+                command,
+                native_session_id: None,
+                repo,
+                branch,
+                worktree_path,
+                warnings,
+            })
+            .await
+        }
+        .await;
+
+        if launch.is_err() && worktree_bound {
+            self.cleanup_bound_worktree(&id).await;
+        }
+        launch
+    }
+
+    /// Roll back a worktree bound earlier in [`Self::create`] when the session
+    /// then fails to launch, removing the checkout (and its binding) so the
+    /// branch is freed for a retry. Best-effort and non-fatal: a rollback failure
+    /// is logged and never masks the original launch error. A no-op when worktree
+    /// binding is not configured.
+    async fn cleanup_bound_worktree(&self, id: &SessionId) {
+        let Some(manager) = self.inner.worktree.clone() else {
+            return;
+        };
+        let session_id = id.0.clone();
+        match tokio::task::spawn_blocking(move || manager.cleanup_session(&session_id)).await {
+            Ok(Ok(removed)) => {
+                if removed > 0 {
+                    debug!(
+                        session_id = %id.0,
+                        removed,
+                        "rolled back worktree after a failed launch"
+                    );
+                }
+            }
+            Ok(Err(err)) => warn!(
+                session_id = %id.0,
+                error = %err,
+                "failed to roll back worktree after a failed launch"
+            ),
+            Err(_) => warn!(
+                session_id = %id.0,
+                "worktree rollback task panicked"
+            ),
+        }
     }
 
     /// Bind a worktree for this session when `params` requests one.
@@ -1479,6 +1542,100 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir.join("metadata.jsonl")
+    }
+
+    /// Run git in `dir`, asserting success (test helper for the worktree path).
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Initialize a throwaway git repo on `main` with one commit, for the
+    /// worktree-binding path in `create`.
+    fn init_git_repo(tag: &str) -> PathBuf {
+        let dir = temp_store_path(tag)
+            .parent()
+            .expect("store parent")
+            .join("repo");
+        std::fs::create_dir_all(&dir).expect("create repo dir");
+        let init = std::process::Command::new("git")
+            .args(["-c", "init.defaultBranch=main", "init", "-q"])
+            .arg(&dir)
+            .output()
+            .expect("git init");
+        assert!(init.status.success(), "git init failed");
+        git_in(&dir, &["config", "user.email", "test@example.com"]);
+        git_in(&dir, &["config", "user.name", "Test"]);
+        git_in(&dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("README.md"), "init\n").expect("write README");
+        git_in(&dir, &["add", "."]);
+        git_in(&dir, &["commit", "-q", "-m", "init"]);
+        dir
+    }
+
+    #[tokio::test]
+    async fn failed_launch_rolls_back_the_bound_worktree() {
+        // Worktree binding persists the branch checkout before the PTY is spawned.
+        // A spawn failure (here: a missing shell program) must roll that back, or
+        // the orphan worktree keeps the branch checked out and blocks the next
+        // `session.new` on it with `worktree_branch_in_use`.
+        let repo = init_git_repo("rollback");
+        let store = temp_store_path("rollback");
+        let worktree_root = store.parent().expect("store parent").join("worktrees");
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new(
+                "/nonexistent/zagentmesh-no-such-shell",
+                std::iter::empty::<String>(),
+            ),
+            store_path: Some(store),
+            worktree_root: Some(worktree_root.clone()),
+            ..SessionRegistryConfig::default()
+        });
+
+        let create_params = SessionNewParams {
+            cwd: None,
+            repo: Some(repo.clone()),
+            branch: Some("feat/x".to_owned()),
+            ..params()
+        };
+        let err = registry
+            .create(create_params)
+            .await
+            .expect_err("launch must fail with a missing shell program");
+        assert_eq!(err.code, "spawn_failed", "got: {err:?}");
+
+        // The worktree bound before the failed spawn must be gone, so its branch
+        // is freed for a retry.
+        let leftover: Vec<_> = std::fs::read_dir(&worktree_root)
+            .map(|rd| rd.filter_map(Result::ok).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(
+            leftover.is_empty(),
+            "a failed launch must leave no orphan worktree under {}: {leftover:?}",
+            worktree_root.display()
+        );
+
+        // And git no longer holds feat/x in any worktree, so a fresh bind succeeds.
+        let listing = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .expect("git worktree list");
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        assert!(
+            !listing.contains("feat/x"),
+            "branch checkout must be pruned from git's worktree list: {listing}"
+        );
     }
 
     #[tokio::test]
