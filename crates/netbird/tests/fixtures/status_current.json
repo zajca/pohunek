@@ -1,0 +1,34 @@
+{
+  "netbirdIp": "100.92.10.20",
+  "fqdn": "my-laptop.netbird.cloud",
+  "daemonVersion": "0.30.0",
+  "daemonStatus": "Connected",
+  "management": { "connected": true },
+  "signal": { "connected": true },
+  "peers": {
+    "connected": 1,
+    "total": 2,
+    "details": [
+      {
+        "fqdn": "host-b.netbird.cloud",
+        "netbirdIp": "100.92.30.40",
+        "publicKey": "pubkey-b",
+        "status": "Connected",
+        "connectionType": "P2P",
+        "lastStatusUpdate": "2026-06-19T10:00:00Z",
+        "latency": 12000000,
+        "networks": []
+      },
+      {
+        "fqdn": "host-c.netbird.cloud",
+        "netbirdIp": "100.92.50.60",
+        "publicKey": "pubkey-c",
+        "status": "Idle",
+        "connectionType": "Relayed",
+        "lastStatusUpdate": "2026-06-19T09:55:00Z",
+        "latency": 45000000,
+        "networks": []
+      }
+    ]
+  }
+}

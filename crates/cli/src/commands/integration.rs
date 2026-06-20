@@ -9,9 +9,11 @@
 use clap::ValueEnum;
 use protocol::{method, AgentKind, IntegrationInstallParams, IntegrationInstallResult, Request};
 
-use crate::client::LocalClient;
+use crate::client::Client;
+use crate::commands::request_id;
 use crate::error::CliError;
 use crate::paths::Paths;
+use crate::target::LOCAL_HOST;
 
 /// Agent selector accepted by `integration install --agent`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -46,11 +48,14 @@ pub(crate) async fn run_install(
         agent: agent.map(Into::into),
     };
     let request = Request::new(
-        format!("cli-{}", method::INTEGRATION_INSTALL),
+        request_id(method::INTEGRATION_INSTALL),
         method::INTEGRATION_INSTALL,
         serde_json::to_value(params)?,
     );
-    let mut client = LocalClient::connect(&paths.socket).await?;
+    // Installing hooks is inherently a *local* daemon operation: it writes into
+    // this machine's agent config dirs. Always use the local transport regardless
+    // of any `--host` flag.
+    let mut client = Client::connect(LOCAL_HOST, paths).await?;
     let result = client.request(&request).await?;
     let result: IntegrationInstallResult = serde_json::from_value(result)?;
 

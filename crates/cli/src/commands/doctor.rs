@@ -88,6 +88,9 @@ pub(crate) fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
         check_dir_writable("state_dir_writable", &paths.data_dir, "state data directory"),
         // Log dir writability.
         check_dir_writable("log_dir_writable", &paths.log_dir, "log directory"),
+        // NetBird: optional. Its absence is a warning (local-only use is valid),
+        // never a hard failure.
+        check_netbird(),
         // Schema version: deferred to the SQLite milestone. Reported honestly as
         // unavailable rather than invented.
         Check::new(
@@ -132,6 +135,43 @@ fn check_binary(name: &str, required: bool) -> Check {
                 format!("'{name}' not found on PATH"),
             )
         }
+    }
+}
+
+/// Check NetBird availability.
+///
+/// NetBird is *optional*: remote hosts need it, but local-only use is fully
+/// valid, so its absence is a `warn`, never a `fail`. When the CLI is present we
+/// additionally probe local state — a resolvable self NetBird IP yields `ok`
+/// (this host is on the mesh); an unreadable state (daemon down / not logged in)
+/// is a `warn`, not a failure.
+fn check_netbird() -> Check {
+    if which_on_path("netbird").is_none() {
+        return Check::new(
+            "netbird_cli",
+            Status::Warn,
+            "'netbird' not found on PATH; NetBird is optional (remote hosts need it)",
+        );
+    }
+
+    match netbird::run_status() {
+        Ok(status) => match status.self_netbird_ip() {
+            Some(ip) => Check::new(
+                "netbird_cli",
+                Status::Ok,
+                format!("found; this host's NetBird IP is {ip}"),
+            ),
+            None => Check::new(
+                "netbird_cli",
+                Status::Warn,
+                "found, but no NetBird IP resolved (not logged in or daemon down)",
+            ),
+        },
+        Err(err) => Check::new(
+            "netbird_cli",
+            Status::Warn,
+            format!("found, but local state is unavailable: {err}"),
+        ),
     }
 }
 

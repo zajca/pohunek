@@ -3,13 +3,20 @@
 //! Milestone 2: resolve XDG paths, initialize JSON logging, acquire the
 //! single-instance lock, bind the control socket (with stale-socket recovery and
 //! owner-private permissions), and serve `daemon.health` until SIGINT/SIGTERM.
+//!
+//! Milestone 11: when NetBird is available and reports a self IP, additionally
+//! bind a TCP control listener on that NetBird address and serve it alongside the
+//! local Unix socket under one shutdown. NetBird being absent or its local state
+//! being unavailable is not an error: the daemon stays local-only and logs why.
 
+use std::net::SocketAddr;
 use std::process::ExitCode;
 
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{error, info};
+use tokio::sync::oneshot;
+use tracing::{error, info, warn};
 
-use zagentmesh_daemon::api::{ControlServer, DaemonState, HealthInfo};
+use zagentmesh_daemon::api::{ControlServer, DaemonState, HealthInfo, RemoteServer};
 use zagentmesh_daemon::lock::InstanceLock;
 use zagentmesh_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use zagentmesh_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
@@ -98,15 +105,104 @@ async fn run() -> Result<(), DaemonError> {
     //    logged, never fatal.
     sessions.load_and_resume().await;
 
-    // 9. Serve until a termination signal.
-    server.serve(shutdown_signal()).await;
+    // 9. Optionally bind a NetBird TCP control listener alongside the Unix
+    //    socket. NetBird absent / not logged in / no self IP => stay local-only.
+    let remote_state = DaemonState::new(HealthInfo::new(DAEMON_VERSION), sessions.clone());
+    let remote_server = bind_remote_server(remote_state).await;
 
-    // 10. Flush the append-only event log before exit so events buffered at
+    // 10. Serve both transports under ONE shutdown signal. A small task awaits
+    //     the OS signal once and fans it out to each server via a oneshot so they
+    //     stop together.
+    let (unix_tx, unix_rx) = oneshot::channel::<()>();
+    let (remote_tx, remote_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = unix_tx.send(());
+        let _ = remote_tx.send(());
+    });
+
+    let unix_serve = server.serve(async move {
+        let _ = unix_rx.await;
+    });
+    match remote_server {
+        Some(remote) => {
+            let remote_serve = remote.serve(async move {
+                let _ = remote_rx.await;
+            });
+            tokio::join!(unix_serve, remote_serve);
+        }
+        None => {
+            // Drop the unused remote receiver so the fan-out send is a no-op.
+            drop(remote_rx);
+            unix_serve.await;
+        }
+    }
+
+    // 11. Flush the append-only event log before exit so events buffered at
     //     shutdown are not lost (bounded so a wedged write cannot hang exit).
     sessions.shutdown_event_log().await;
 
     info!("zagentmeshd stopped");
     Ok(())
+}
+
+/// Bind the optional NetBird TCP control listener.
+///
+/// Queries NetBird state, decides the bind address from it ([`remote_bind_addr`])
+/// and the resolved remote port, and binds a [`RemoteServer`] when an address
+/// resolves. Returns `None` (daemon stays local-only) when NetBird is
+/// unavailable, reports no self IP, the remote port is misconfigured, or the bind
+/// itself fails. Every local-only path logs the reason; a bind failure is logged
+/// but never fatal, so the local control plane always comes up.
+async fn bind_remote_server(state: DaemonState) -> Option<RemoteServer> {
+    let status = match netbird::run_status() {
+        Ok(status) => status,
+        Err(err) => {
+            info!(reason = %err, "NetBird state unavailable; serving local-only");
+            return None;
+        }
+    };
+
+    let port = match netbird::remote_port() {
+        Ok(port) => port,
+        Err(err) => {
+            warn!(reason = %err, "invalid remote port configuration; serving local-only");
+            return None;
+        }
+    };
+
+    let addr = match remote_bind_addr(&status, port) {
+        Some(addr) => addr,
+        None => {
+            info!("NetBird present but no self IP resolved; serving local-only");
+            return None;
+        }
+    };
+
+    match RemoteServer::bind(addr, state).await {
+        Ok(remote) => {
+            info!(addr = %remote.local_addr(), "serving control protocol over NetBird");
+            Some(remote)
+        }
+        Err(err) => {
+            // Fail-closed validation or an OS bind error: log and stay local-only
+            // rather than aborting the whole daemon.
+            warn!(reason = %err, "remote control listener not bound; serving local-only");
+            None
+        }
+    }
+}
+
+/// Decide the remote TCP bind address from parsed NetBird state.
+///
+/// Returns `Some((self_ip, port))` when NetBird reports this host's own IP, else
+/// `None`. `NetbirdStatus::self_netbird_ip` already filters to the NetBird CGNAT
+/// range, and the authoritative fail-closed gate is [`RemoteServer::bind`]'s
+/// validation, so this helper does not re-validate the range (which would only
+/// risk diverging from that single source of truth). Pure and unit-tested.
+#[must_use]
+fn remote_bind_addr(status: &netbird::NetbirdStatus, port: u16) -> Option<SocketAddr> {
+    status.self_netbird_ip().map(|ip| SocketAddr::new(ip, port))
 }
 
 /// Create a directory (and parents) with mode 0700 if it does not exist.
@@ -144,5 +240,41 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = sigint.recv() => info!("received SIGINT"),
         _ = sigterm.recv() => info!("received SIGTERM"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remote_bind_addr;
+
+    /// A remote bind port distinct from the production default, so the test
+    /// asserts the helper threads the passed-in port rather than a constant.
+    const TEST_PORT: u16 = 19000;
+
+    #[test]
+    fn remote_bind_addr_is_none_when_self_ip_absent() {
+        // Empty status: no root netbirdIp and no localPeerState => no self IP.
+        let status = netbird::parse_status("{}").expect("parse empty status");
+        assert!(remote_bind_addr(&status, TEST_PORT).is_none());
+    }
+
+    #[test]
+    fn remote_bind_addr_is_none_when_offline_without_self_ip() {
+        // Daemon present but not connected and reporting no self IP.
+        let status = netbird::parse_status(
+            r#"{"daemonStatus":"NeedsLogin","peers":{"connected":0,"total":0,"details":[]}}"#,
+        )
+        .expect("parse offline status");
+        assert!(remote_bind_addr(&status, TEST_PORT).is_none());
+    }
+
+    #[test]
+    fn remote_bind_addr_uses_self_netbird_ip_and_port() {
+        let status =
+            netbird::parse_status(r#"{"netbirdIp":"100.92.10.20","daemonStatus":"Connected"}"#)
+                .expect("parse current status");
+        let addr = remote_bind_addr(&status, TEST_PORT).expect("self IP resolves to a bind addr");
+        assert_eq!(addr.ip().to_string(), "100.92.10.20");
+        assert_eq!(addr.port(), TEST_PORT);
     }
 }

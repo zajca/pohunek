@@ -1,15 +1,17 @@
 //! Host-aware target parsing.
 //!
-//! Phase 2 will address sessions as `<host>/<session-id>` and add `--host` on
-//! commands (see `docs/plan-phase-1.md` "CLI Grammar (forward-compatible with
-//! Phase 2)"). The parser is host-aware *now* so Phase 2 adds transport without
-//! changing the grammar, but only the local form is *executable* in Phase 1.
+//! Sessions are addressed as `<host>/<session-id>` (or a bare `<session-id>` for
+//! the implicit local host). The parser only extracts the two parts; the
+//! *effective host* (which selects the transport) is decided by `main::
+//! effective_host`, and whether a host string is local is decided by the
+//! transport (`client::Client::connect`). Keeping `Target` a pure parse holder
+//! avoids two competing notions of "is this local".
 //!
 //! Grammar:
-//! - `s-42`            → local session `s-42`
+//! - `s-42`            → local session `s-42` (host `None`, falls back to the
+//!   global `--host` flag)
 //! - `local/s-42`      → explicit local host, session `s-42`
-//! - `host-b/s-42`     → remote host `host-b`, session `s-42` (parses; not yet
-//!   executable — returns a typed `RemoteNotSupported`).
+//! - `host-b/s-42`     → remote host `host-b`, session `s-42`
 
 use std::fmt;
 
@@ -19,29 +21,11 @@ pub(crate) const LOCAL_HOST: &str = "local";
 /// A parsed session target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Target {
-    /// `None` for an implicit/explicit local target; `Some(host)` for a remote.
+    /// `None` for an implicit local target; `Some(host)` for an explicit host
+    /// (which may itself be the reserved `local` name).
     pub(crate) host: Option<String>,
     /// The session identifier portion.
     pub(crate) session_id: String,
-}
-
-impl Target {
-    /// Whether this target refers to the local host.
-    ///
-    /// True when no host was given or the host is the reserved `local` name.
-    #[must_use]
-    pub(crate) fn is_local(&self) -> bool {
-        match &self.host {
-            None => true,
-            Some(h) => h == LOCAL_HOST,
-        }
-    }
-
-    /// The host name, or `local` when implicit.
-    #[must_use]
-    pub(crate) fn host_or_local(&self) -> &str {
-        self.host.as_deref().unwrap_or(LOCAL_HOST)
-    }
 }
 
 /// Error parsing a target string.
@@ -112,12 +96,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_bare_session_id_as_local() {
+    fn parses_bare_session_id_as_implicit_local() {
         let t: Target = "s-42".parse().expect("parse");
         assert_eq!(t.host, None);
         assert_eq!(t.session_id, "s-42");
-        assert!(t.is_local());
-        assert_eq!(t.host_or_local(), "local");
     }
 
     #[test]
@@ -125,7 +107,6 @@ mod tests {
         let t: Target = "local/s-42".parse().expect("parse");
         assert_eq!(t.host.as_deref(), Some("local"));
         assert_eq!(t.session_id, "s-42");
-        assert!(t.is_local());
     }
 
     #[test]
@@ -133,8 +114,6 @@ mod tests {
         let t: Target = "host-b/s-42".parse().expect("parse");
         assert_eq!(t.host.as_deref(), Some("host-b"));
         assert_eq!(t.session_id, "s-42");
-        assert!(!t.is_local());
-        assert_eq!(t.host_or_local(), "host-b");
     }
 
     #[test]

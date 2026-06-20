@@ -49,11 +49,74 @@ pub(crate) enum CliError {
     #[error("daemon error: {0}")]
     Protocol(#[from] ProtocolError),
 
-    /// A remote (non-local) target was requested before Phase 2 transport
-    /// exists. Parsing is host-aware now; execution is local-only.
-    #[error("remote target '{host}' is not supported yet (Phase 1 is local-only)")]
-    RemoteNotSupported {
+    /// The local `netbird` CLI was not found on `PATH`, so a remote host could
+    /// not be resolved. NetBird is optional (local-only use is fine); this only
+    /// surfaces when a remote target is actually requested.
+    #[error("the `netbird` CLI was not found on PATH")]
+    NetbirdCliMissing,
+
+    /// The `netbird` CLI is present but its local state could not be read (the
+    /// NetBird daemon is down, or this host is not logged in).
+    #[error("NetBird local state is unavailable: {detail}")]
+    NetbirdStateUnavailable {
+        /// A short, non-secret detail describing why the state was unreadable.
+        detail: String,
+    },
+
+    /// The requested host name did not match any NetBird peer.
+    #[error("host '{host}' was not found among NetBird peers")]
+    HostUnknown {
         /// The requested host name.
+        host: String,
+    },
+
+    /// A NetBird TCP connection to the host's daemon port could not be opened
+    /// (the peer is offline or the control port is closed).
+    #[error("could not open a NetBird connection to host '{host}': {source}")]
+    HostUnreachable {
+        /// The requested host name.
+        host: String,
+        /// Underlying connection error (a connect failure; carries no secrets).
+        #[source]
+        source: io::Error,
+    },
+
+    /// A NetBird TCP connection to the host opened, but no usable zagentmesh
+    /// daemon answered the request — the connection closed without a reply or the
+    /// daemon did not respond in time. Distinct from [`CliError::HostUnreachable`]
+    /// (which is a failure to *connect*): here the transport succeeded but the
+    /// remote daemon layer did not. Names the host so the operator knows which
+    /// peer to investigate.
+    #[error("connected to host '{host}' but no compatible zagentmesh daemon answered")]
+    RemoteDaemonUnavailable {
+        /// The host whose daemon did not answer.
+        host: String,
+    },
+
+    /// A daemon on a *remote* host returned a typed protocol error. Wraps the
+    /// canonical [`ProtocolError`] with the host so the human message names which
+    /// peer failed, while preserving the daemon's stable `class`/`code`/`recover`
+    /// (e.g. a remote `version_mismatch` stays `daemon/version_mismatch` but now
+    /// names the host). A *local* daemon error keeps using [`CliError::Protocol`].
+    #[error("host '{host}': {source}")]
+    RemoteProtocol {
+        /// The host whose daemon returned the error.
+        host: String,
+        /// The daemon's typed error, relayed unchanged except for host context.
+        #[source]
+        source: ProtocolError,
+    },
+
+    /// A remote `session new` was requested under `--json` without `--yes`. The
+    /// machine path must not block on an interactive prompt, so it fails fast and
+    /// asks the caller to pass `--yes` explicitly.
+    #[error("starting a session on a remote host requires explicit confirmation: pass --yes")]
+    RemoteConfirmationRequired,
+
+    /// The interactive confirmation for a remote `session new` was declined.
+    #[error("remote session on host '{host}' was not confirmed")]
+    RemoteConfirmationDeclined {
+        /// The host the session would have been started on.
         host: String,
     },
 
@@ -98,11 +161,48 @@ impl CliError {
                 format!("protocol framing error: {msg}"),
                 None,
             ),
-            CliError::RemoteNotSupported { host } => ProtocolError::new(
-                ErrorClass::Transport,
-                "remote_not_supported",
-                format!("remote target '{host}' is not supported yet (Phase 1 is local-only)"),
-                None,
+            // NetBird/remote-resolution failures reuse the canonical protocol
+            // constructors so the {class, code, recover} envelope is identical
+            // whether the error originates in the CLI or is relayed from a daemon.
+            CliError::NetbirdCliMissing => ProtocolError::netbird_cli_missing(),
+            CliError::NetbirdStateUnavailable { detail } => {
+                ProtocolError::netbird_state_unavailable(detail.clone())
+            }
+            CliError::HostUnknown { host } => ProtocolError::host_unknown(host),
+            CliError::HostUnreachable { host, source } => {
+                // The canonical constructor names the host and carries the
+                // recover hint; append the underlying connect error to the
+                // message so the operator sees *why* the dial failed. A connect
+                // error never carries secret material.
+                let mut err = ProtocolError::host_unreachable(host);
+                err.msg = format!("{}: {source}", err.msg);
+                err
+            }
+            // TCP connected but the remote daemon layer did not answer: the
+            // canonical daemon-class error names the host and carries the hint.
+            CliError::RemoteDaemonUnavailable { host } => {
+                ProtocolError::remote_daemon_unavailable(host)
+            }
+            // A daemon on a remote host errored: relay the canonical class/code/
+            // recover unchanged, but prepend the host so the message says which
+            // peer failed (the daemon's own message — e.g. version_mismatch —
+            // does not know the caller's host name).
+            CliError::RemoteProtocol { host, source } => {
+                let mut err = source.clone();
+                err.msg = format!("host '{host}': {}", err.msg);
+                err
+            }
+            CliError::RemoteConfirmationRequired => ProtocolError::new(
+                ErrorClass::Configuration,
+                "confirmation_required",
+                "starting a session on a remote host requires explicit confirmation".to_owned(),
+                Some("re-run with `--yes` to confirm the remote session".to_owned()),
+            ),
+            CliError::RemoteConfirmationDeclined { host } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "confirmation_declined",
+                format!("remote session on host '{host}' was not confirmed"),
+                Some("re-run and confirm, or pass `--yes` to skip the prompt".to_owned()),
             ),
             CliError::Spawn(msg) => ProtocolError::new(
                 ErrorClass::Daemon,
@@ -279,6 +379,129 @@ mod tests {
             .recover
             .expect("daemon-unreachable carries a hint");
         assert!(hint.contains("daemon start"), "hint: {hint}");
+    }
+
+    #[test]
+    fn remote_resolution_errors_map_to_distinct_stable_codes_and_classes() {
+        // Each NetBird/remote-resolution failure must surface a distinct, stable
+        // code so a script can branch on it, with the class the DoD #7 layering
+        // prescribes (discovery vs transport).
+        let cases: Vec<(CliError, ErrorClass, &str)> = vec![
+            (
+                CliError::NetbirdCliMissing,
+                ErrorClass::Discovery,
+                "netbird_cli_missing",
+            ),
+            (
+                CliError::NetbirdStateUnavailable {
+                    detail: "not logged in".to_owned(),
+                },
+                ErrorClass::Discovery,
+                "netbird_state_unavailable",
+            ),
+            (
+                CliError::HostUnknown {
+                    host: "host-b".to_owned(),
+                },
+                ErrorClass::Discovery,
+                "host_unknown",
+            ),
+            (
+                CliError::HostUnreachable {
+                    host: "host-b".to_owned(),
+                    source: io::Error::new(io::ErrorKind::ConnectionRefused, "refused"),
+                },
+                ErrorClass::Transport,
+                "host_unreachable",
+            ),
+        ];
+
+        let mut codes = std::collections::HashSet::new();
+        for (err, class, code) in cases {
+            let pe = err.to_protocol_error();
+            assert_eq!(pe.class, class, "class for {code}");
+            assert_eq!(pe.code, code, "code mismatch");
+            assert!(codes.insert(pe.code.clone()), "duplicate code {code}");
+        }
+    }
+
+    #[test]
+    fn remote_daemon_unavailable_is_daemon_class_names_host_and_distinct_from_connect_failure() {
+        // Distinct from HostUnreachable (a *connect* failure): here the TCP dial
+        // succeeded but the daemon layer did not answer (DoD #7 layering).
+        let unavailable = CliError::RemoteDaemonUnavailable {
+            host: "build-box".to_owned(),
+        }
+        .to_protocol_error();
+        assert_eq!(unavailable.class, ErrorClass::Daemon);
+        assert_eq!(unavailable.code, "remote_daemon_unavailable");
+        assert!(unavailable.msg.contains("build-box"), "msg: {}", unavailable.msg);
+        assert!(unavailable.recover.is_some());
+
+        let connect_failure = CliError::HostUnreachable {
+            host: "build-box".to_owned(),
+            source: io::Error::new(io::ErrorKind::ConnectionRefused, "refused"),
+        }
+        .to_protocol_error();
+        assert_eq!(connect_failure.class, ErrorClass::Transport);
+        assert_ne!(
+            unavailable.code, connect_failure.code,
+            "transport-connect and daemon-no-answer must be distinguishable"
+        );
+    }
+
+    #[test]
+    fn remote_protocol_names_host_while_preserving_source_code_and_class() {
+        // A remote daemon error is relayed with the daemon's stable class/code/
+        // recover; only the message gains host context.
+        let source = ProtocolError::version_mismatch(ProtocolVersion(1), ProtocolVersion(2));
+        let wrapped = CliError::RemoteProtocol {
+            host: "build-box".to_owned(),
+            source: source.clone(),
+        }
+        .to_protocol_error();
+        assert_eq!(wrapped.class, source.class);
+        assert_eq!(wrapped.code, source.code);
+        assert_eq!(wrapped.recover, source.recover);
+        assert!(wrapped.msg.contains("build-box"), "names host: {}", wrapped.msg);
+        // The daemon's own message detail is retained alongside the host.
+        assert!(
+            wrapped.msg.contains("incompatible"),
+            "keeps source detail: {}",
+            wrapped.msg
+        );
+    }
+
+    #[test]
+    fn host_unreachable_message_names_host_and_appends_source() {
+        let err = CliError::HostUnreachable {
+            host: "host-b".to_owned(),
+            source: io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused"),
+        };
+        let pe = err.to_protocol_error();
+        assert!(pe.msg.contains("host-b"), "msg names the host: {}", pe.msg);
+        assert!(
+            pe.msg.contains("connection refused"),
+            "msg appends the source: {}",
+            pe.msg
+        );
+        assert!(pe.recover.is_some(), "host_unreachable carries a hint");
+    }
+
+    #[test]
+    fn confirmation_errors_are_configuration_class_with_distinct_codes() {
+        let required = CliError::RemoteConfirmationRequired.to_protocol_error();
+        let declined = CliError::RemoteConfirmationDeclined {
+            host: "host-b".to_owned(),
+        }
+        .to_protocol_error();
+        assert_eq!(required.class, ErrorClass::Configuration);
+        assert_eq!(required.code, "confirmation_required");
+        assert!(required.recover.is_some());
+        assert_eq!(declined.class, ErrorClass::Configuration);
+        assert_eq!(declined.code, "confirmation_declined");
+        assert!(declined.msg.contains("host-b"));
+        assert_ne!(required.code, declined.code);
     }
 
     #[test]

@@ -148,6 +148,7 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
             handle_session_report_native_id(request, &state.sessions).await
         }
         method::INTEGRATION_INSTALL => handle_integration_install(request),
+        method::HOST_INSPECT => handle_host_inspect(request, &state.health),
         other => Response::err(request.id.clone(), ProtocolError::method_not_found(other)),
     }
 }
@@ -161,6 +162,19 @@ fn handle_health(request: &Request, health: &HealthInfo) -> Response {
             "daemon_version": health.daemon_version,
             "protocol_version": PROTOCOL_VERSION,
         }),
+    )
+}
+
+/// `host.inspect`: report this host's live capability snapshot.
+///
+/// The snapshot is built fresh on each request (agent runtimes are probed
+/// against `PATH`), so it always reflects the host as it is now. Transport
+/// agnostic: the same handler answers over the local Unix socket and over a
+/// NetBird TCP connection.
+fn handle_host_inspect(request: &Request, health: &HealthInfo) -> Response {
+    ok_value(
+        request,
+        &crate::capabilities::host_capabilities(&health.daemon_version),
     )
 }
 

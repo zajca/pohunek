@@ -1,4 +1,4 @@
-//! Unix-socket control server.
+//! Control server (local Unix socket + NetBird TCP).
 //!
 //! Binds the control socket with owner-private permissions, recovers from a
 //! stale socket left by a previous run, and serves newline-delimited JSON
@@ -7,11 +7,17 @@
 //! cannot take down the daemon (per `docs/architecture.md` "Concurrency and
 //! supervision").
 //!
-//! The server handles `daemon.health` (milestone 2) and the `session.*`
-//! lifecycle methods (milestone 3), and a `subscribe` request turns the
-//! connection into a one-way stream of session lifecycle events. Unknown methods
-//! receive a typed `method_not_found` error (the contract for later milestones is
-//! already in the `protocol` crate).
+//! The same connection-serving code drives two transports: the local
+//! [`ControlServer`] over a Unix socket and the [`RemoteServer`] over a NetBird
+//! TCP listener (milestone 11). Everything below the accept loop is generic over
+//! any `AsyncRead + AsyncWrite` stream, so the protocol and attach semantics are
+//! identical across transports.
+//!
+//! The server handles `daemon.health` (milestone 2), the `session.*` lifecycle
+//! methods (milestone 3), and `host.inspect` (milestone 11), and a `subscribe`
+//! request turns the connection into a one-way stream of session lifecycle
+//! events. Unknown methods receive a typed `method_not_found` error (the contract
+//! for later milestones is already in the `protocol` crate).
 //!
 //! Attach streaming uses a separate connection: the first line carries an attach
 //! prelude, then the connection switches from newline JSON to raw PTY bytes.
@@ -19,16 +25,19 @@
 mod handler;
 
 use std::io;
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use futures::{SinkExt, StreamExt};
 use protocol::{Event, Response};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::broadcast;
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 use tracing::{error, info, warn};
+
+use netbird::validate_netbird_bind_addr;
 
 use crate::error::DaemonError;
 use crate::session::{RedeemedAttach, SessionRegistry};
@@ -152,13 +161,141 @@ impl ControlServer {
     }
 }
 
+/// The bound remote (NetBird TCP) control server, ready to accept connections.
+///
+/// Identical protocol and attach semantics to [`ControlServer`]; only the
+/// transport differs. Binding is gated by [`validate_netbird_bind_addr`] so the
+/// daemon never exposes the control port on a non-NetBird interface (it fails
+/// closed — see [`RemoteServer::bind`]).
+#[derive(Debug)]
+pub struct RemoteServer {
+    listener: TcpListener,
+    local_addr: SocketAddr,
+    state: DaemonState,
+}
+
+impl RemoteServer {
+    /// Bind a TCP control listener at `addr`.
+    ///
+    /// FAILS CLOSED: `addr.ip()` is validated as a NetBird address
+    /// ([`validate_netbird_bind_addr`]) **before** the socket is opened, so an
+    /// invalid or non-NetBird address never reaches the OS bind. This is the
+    /// authoritative gate that keeps the control port off public, RFC1918, and
+    /// loopback interfaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaemonError::NetbirdBind`] when the address is not a valid
+    /// NetBird bind address, or [`DaemonError::Socket`] on an OS bind failure.
+    pub async fn bind(addr: SocketAddr, state: DaemonState) -> Result<Self, DaemonError> {
+        if let Err(err) = validate_netbird_bind_addr(addr.ip()) {
+            return Err(DaemonError::NetbirdBind {
+                addr: addr.ip(),
+                reason: err.to_string(),
+            });
+        }
+
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|source| DaemonError::Socket {
+                path: PathBuf::from(addr.to_string()),
+                source,
+            })?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|source| DaemonError::Socket {
+                path: PathBuf::from(addr.to_string()),
+                source,
+            })?;
+
+        info!(addr = %local_addr, "remote control listener bound");
+        Ok(Self {
+            listener,
+            local_addr,
+            state,
+        })
+    }
+
+    /// Wrap an already-bound listener WITHOUT NetBird validation.
+    ///
+    /// For tests and internal use only: the loopback-TCP stand-in in CI binds
+    /// `127.0.0.1:0` and wraps it here, which the production [`bind`](Self::bind)
+    /// path would (correctly) refuse. Production code must use
+    /// [`bind`](Self::bind) so the fail-closed validation runs.
+    #[must_use]
+    pub fn from_listener(listener: TcpListener, state: DaemonState) -> Self {
+        // local_addr() on an already-bound listener is infallible in practice;
+        // fall back to the unspecified address rather than panicking if the OS
+        // ever surprises us, so a test helper cannot bring down the process.
+        let local_addr = listener.local_addr().unwrap_or_else(|err| {
+            warn!(error = %err, "remote listener local_addr unavailable; reporting 0.0.0.0:0");
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        });
+        Self {
+            listener,
+            local_addr,
+            state,
+        }
+    }
+
+    /// The bound local address.
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Run the accept loop until `shutdown` resolves.
+    ///
+    /// Each accepted connection is served on its own task via the same
+    /// [`serve_connection`] used by the Unix server. The loop never returns an
+    /// error for a single bad connection; transient accept errors are logged and
+    /// the loop continues. The peer address is logged at info on each accept.
+    pub async fn serve(self, shutdown: impl std::future::Future<Output = ()>) {
+        tokio::pin!(shutdown);
+        let state = self.state.clone();
+        loop {
+            tokio::select! {
+                () = &mut shutdown => {
+                    info!("shutdown signal received; stopping remote accept loop");
+                    break;
+                }
+                accepted = self.listener.accept() => {
+                    match accepted {
+                        Ok((stream, peer)) => {
+                            info!(peer = %peer, "remote control connection accepted");
+                            let state = state.clone();
+                            tokio::spawn(async move {
+                                if let Err(err) = serve_connection(stream, state).await {
+                                    warn!(error = %err, "remote control connection ended with error");
+                                }
+                            });
+                        }
+                        Err(err) => {
+                            // A failed accept is transient (e.g. fd limit); log
+                            // and keep serving rather than crashing the daemon.
+                            error!(error = %err, "remote accept failed");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Serve one control connection: read newline-delimited JSON requests, dispatch
 /// each, and write back one response line per request.
+///
+/// Generic over the underlying stream so the same logic serves a local Unix
+/// connection ([`ControlServer`]) and a NetBird TCP connection ([`RemoteServer`])
+/// without divergence.
 ///
 /// A `subscribe` request is the exception: after its OK ack the connection turns
 /// into a one-way stream of session lifecycle events ([`run_event_subscription`])
 /// and is consumed there until the client disconnects.
-async fn serve_connection(stream: UnixStream, state: DaemonState) -> Result<(), io::Error> {
+async fn serve_connection<S>(stream: S, state: DaemonState) -> Result<(), io::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let codec = LinesCodec::new_with_max_length(MAX_LINE_BYTES);
     let mut framed = Framed::new(stream, codec);
 
@@ -194,11 +331,14 @@ async fn serve_connection(stream: UnixStream, state: DaemonState) -> Result<(), 
     Ok(())
 }
 
-async fn run_attach_connection(
-    mut framed: Framed<UnixStream, LinesCodec>,
+async fn run_attach_connection<S>(
+    mut framed: Framed<S, LinesCodec>,
     registry: SessionRegistry,
     stream_id: String,
-) -> Result<(), io::Error> {
+) -> Result<(), io::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let attach = match registry.redeem_attach(&stream_id).await {
         Ok(attach) => attach,
         Err(err) => {
@@ -231,10 +371,10 @@ async fn run_attach_connection(
     bridge_result
 }
 
-async fn run_attach_bridge(
-    stream: &mut UnixStream,
-    attach: &RedeemedAttach,
-) -> Result<(), io::Error> {
+async fn run_attach_bridge<S>(stream: &mut S, attach: &RedeemedAttach) -> Result<(), io::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // Atomically snapshot recent output and subscribe to live output so the new
     // client sees every byte exactly once across the handoff.
     let (replay, mut output) = attach.pty.attach_snapshot_and_subscribe();
@@ -324,10 +464,13 @@ async fn run_attach_bridge(
 /// client is ignored (a subscription is one-way in this milestone); a closed or
 /// broken connection ends the stream. A lagging subscriber (slow reader) drops
 /// the oldest events with a warning rather than tearing down the connection.
-async fn run_event_subscription(
-    framed: &mut Framed<UnixStream, LinesCodec>,
+async fn run_event_subscription<S>(
+    framed: &mut Framed<S, LinesCodec>,
     events: &mut broadcast::Receiver<Event>,
-) -> Result<(), io::Error> {
+) -> Result<(), io::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     loop {
         tokio::select! {
             incoming = framed.next() => match incoming {

@@ -1,0 +1,16 @@
+{
+  "netbirdIp": "100.92.10.20",
+  "daemonVersion": "0.30.0",
+  "daemonStatus": "Connected",
+  "peers": {
+    "connected": 0,
+    "total": 1,
+    "details": [
+      {
+        "fqdn": "host-c.netbird.cloud",
+        "status": "Idle",
+        "connectionType": "Relayed"
+      }
+    ]
+  }
+}

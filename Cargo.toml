@@ -11,6 +11,7 @@
 resolver = "2"
 members = [
     "crates/protocol",
+    "crates/netbird",
     "crates/daemon",
     "crates/cli",
 ]

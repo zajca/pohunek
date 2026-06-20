@@ -4,13 +4,14 @@
 use std::path::PathBuf;
 
 use protocol::{
-    event, method, negotiate, AgentActivity, AgentKind, AttachHeader, ErrorClass, Event,
-    IntegrationInstallParams, IntegrationInstallReport, IntegrationInstallResult, ProtocolError,
-    ProtocolVersion, Request, Response, SessionAttachParams, SessionAttachResult,
-    SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionNewParams, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, SessionWarning,
-    SessionWarningKind, StateSource, PROTOCOL_VERSION,
+    event, method, negotiate, AgentActivity, AgentKind, AgentRuntime, AttachHeader, ErrorClass,
+    Event, HostCapabilities, IntegrationInstallParams, IntegrationInstallReport,
+    IntegrationInstallResult, ProtocolError, ProtocolVersion, Request, Response,
+    SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
+    SessionInfo, SessionInputParams, SessionInputResult, SessionNewParams,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionState, SessionStopResult, SessionWarning, SessionWarningKind,
+    StateSource, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 
@@ -916,4 +917,223 @@ fn protocol_version_serializes_as_bare_integer() {
     // The `v` field must be a plain integer on the wire, not an object.
     let line = serde_json::to_string(&PROTOCOL_VERSION).expect("serialize");
     assert_eq!(line, "1");
+}
+
+#[test]
+fn host_inspect_method_name_is_stable() {
+    assert_eq!(method::HOST_INSPECT, "host.inspect");
+}
+
+#[test]
+fn agent_runtime_json_shape_roundtrips_with_path() {
+    let runtime = AgentRuntime {
+        agent: AgentKind::Codex,
+        available: true,
+        path: Some("/usr/local/bin/codex".to_owned()),
+    };
+
+    let value = serde_json::to_value(&runtime).expect("serialize agent runtime");
+    assert_eq!(
+        value,
+        json!({
+            "agent": "codex",
+            "available": true,
+            "path": "/usr/local/bin/codex"
+        })
+    );
+
+    let back = line_roundtrip(&runtime);
+    assert_eq!(back, runtime);
+}
+
+#[test]
+fn agent_runtime_omits_absent_path() {
+    let runtime = AgentRuntime {
+        agent: AgentKind::Shell,
+        available: true,
+        path: None,
+    };
+
+    let value = serde_json::to_value(&runtime).expect("serialize agent runtime");
+    assert_eq!(
+        value,
+        json!({
+            "agent": "shell",
+            "available": true
+        })
+    );
+    assert!(
+        !value
+            .as_object()
+            .expect("runtime object")
+            .contains_key("path"),
+        "absent path must be omitted: {value}"
+    );
+
+    let back = line_roundtrip(&runtime);
+    assert_eq!(back, runtime);
+}
+
+#[test]
+fn host_capabilities_json_shape_roundtrips() {
+    let caps = HostCapabilities {
+        daemon_version: "0.1.0".to_owned(),
+        protocol_version: PROTOCOL_VERSION,
+        supported_agents: vec![AgentKind::Shell, AgentKind::Codex, AgentKind::Claude],
+        runtimes: vec![
+            AgentRuntime {
+                agent: AgentKind::Shell,
+                available: true,
+                path: None,
+            },
+            AgentRuntime {
+                agent: AgentKind::Codex,
+                available: true,
+                path: Some("/usr/local/bin/codex".to_owned()),
+            },
+            AgentRuntime {
+                agent: AgentKind::Claude,
+                available: false,
+                path: None,
+            },
+        ],
+        git_available: true,
+        worktree_supported: true,
+    };
+
+    let value = serde_json::to_value(&caps).expect("serialize host capabilities");
+    assert_eq!(
+        value,
+        json!({
+            "daemon_version": "0.1.0",
+            "protocol_version": PROTOCOL_VERSION,
+            "supported_agents": ["shell", "codex", "claude"],
+            "runtimes": [
+                { "agent": "shell", "available": true },
+                { "agent": "codex", "available": true, "path": "/usr/local/bin/codex" },
+                { "agent": "claude", "available": false }
+            ],
+            "git_available": true,
+            "worktree_supported": true
+        })
+    );
+
+    let back = line_roundtrip(&caps);
+    assert_eq!(back, caps);
+}
+
+#[test]
+fn host_capabilities_ignores_unknown_fields_for_additive_evolution() {
+    // A newer host may add capability fields; an older peer must still parse it.
+    let raw = r#"{
+        "daemon_version": "0.2.0",
+        "protocol_version": 1,
+        "supported_agents": ["shell"],
+        "runtimes": [],
+        "git_available": false,
+        "worktree_supported": false,
+        "future_capability": true
+    }"#;
+    let caps: HostCapabilities = serde_json::from_str(raw).expect("must ignore unknown fields");
+    assert_eq!(caps.daemon_version, "0.2.0");
+    assert_eq!(caps.protocol_version, PROTOCOL_VERSION);
+    assert!(!caps.git_available);
+    assert!(caps.runtimes.is_empty());
+}
+
+#[test]
+fn netbird_cli_missing_has_discovery_class_stable_code_and_recover() {
+    let err = ProtocolError::netbird_cli_missing();
+    assert_eq!(err.class, ErrorClass::Discovery);
+    assert_eq!(err.code, "netbird_cli_missing");
+    assert!(
+        err.recover.is_some(),
+        "missing CLI should suggest a recovery: {err:?}"
+    );
+    let back = line_roundtrip(&err);
+    assert_eq!(back, err);
+}
+
+#[test]
+fn netbird_state_unavailable_has_discovery_class_stable_code_and_detail() {
+    let err = ProtocolError::netbird_state_unavailable("daemon not running");
+    assert_eq!(err.class, ErrorClass::Discovery);
+    assert_eq!(err.code, "netbird_state_unavailable");
+    assert!(
+        err.msg.contains("daemon not running"),
+        "message must carry the detail: {}",
+        err.msg
+    );
+    assert!(
+        err.recover.is_some(),
+        "unavailable state should suggest a recovery: {err:?}"
+    );
+    let back = line_roundtrip(&err);
+    assert_eq!(back, err);
+}
+
+#[test]
+fn host_unknown_has_discovery_class_stable_code_and_names_host() {
+    let err = ProtocolError::host_unknown("build-box");
+    assert_eq!(err.class, ErrorClass::Discovery);
+    assert_eq!(err.code, "host_unknown");
+    assert!(
+        err.msg.contains("build-box"),
+        "message must name the host: {}",
+        err.msg
+    );
+    let back = line_roundtrip(&err);
+    assert_eq!(back, err);
+}
+
+#[test]
+fn host_unreachable_has_transport_class_stable_code_names_host_and_recover() {
+    let err = ProtocolError::host_unreachable("build-box");
+    assert_eq!(err.class, ErrorClass::Transport);
+    assert_eq!(err.code, "host_unreachable");
+    assert!(
+        err.msg.contains("build-box"),
+        "message must name the host: {}",
+        err.msg
+    );
+    assert!(
+        err.recover.is_some(),
+        "unreachable host should suggest a recovery: {err:?}"
+    );
+    let back = line_roundtrip(&err);
+    assert_eq!(back, err);
+}
+
+#[test]
+fn remote_daemon_unavailable_has_daemon_class_stable_code_and_names_host() {
+    let err = ProtocolError::remote_daemon_unavailable("build-box");
+    assert_eq!(err.class, ErrorClass::Daemon);
+    assert_eq!(err.code, "remote_daemon_unavailable");
+    assert!(
+        err.msg.contains("build-box"),
+        "message must name the host: {}",
+        err.msg
+    );
+    let back = line_roundtrip(&err);
+    assert_eq!(back, err);
+}
+
+#[test]
+fn new_remote_error_codes_are_distinct() {
+    // Every milestone-11 error code (plus the reused version_mismatch) must be a
+    // distinct, stable string so `--json` consumers can branch on it.
+    let codes = [
+        ProtocolError::netbird_cli_missing().code,
+        ProtocolError::netbird_state_unavailable("x").code,
+        ProtocolError::host_unknown("h").code,
+        ProtocolError::host_unreachable("h").code,
+        ProtocolError::remote_daemon_unavailable("h").code,
+        ProtocolError::version_mismatch(ProtocolVersion(1), ProtocolVersion(2)).code,
+    ];
+    let unique: std::collections::HashSet<&str> = codes.iter().map(String::as_str).collect();
+    assert_eq!(
+        unique.len(),
+        codes.len(),
+        "error codes must all be distinct: {codes:?}"
+    );
 }

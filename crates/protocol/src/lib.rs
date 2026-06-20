@@ -22,12 +22,14 @@
 #![warn(unreachable_pub)]
 #![forbid(unsafe_code)]
 
+mod capabilities;
 mod envelope;
 mod error;
 mod integration;
 mod session;
 mod version;
 
+pub use capabilities::{AgentRuntime, HostCapabilities};
 pub use envelope::{Event, Request, Response, StateSource};
 pub use error::{ErrorClass, ProtocolError};
 pub use integration::{
@@ -71,6 +73,9 @@ pub mod method {
     pub const SESSION_REPORT_NATIVE_ID: &str = "session.report_native_id";
     /// Install the per-agent `SessionStart` hook that captures the native id.
     pub const INTEGRATION_INSTALL: &str = "integration.install";
+    /// Live host capability probe (Phase 2 / remote hosts over NetBird). Returns
+    /// a [`HostCapabilities`](crate::HostCapabilities) snapshot.
+    pub const HOST_INSPECT: &str = "host.inspect";
 }
 
 /// Control-protocol event names.

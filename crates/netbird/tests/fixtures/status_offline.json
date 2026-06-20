@@ -1,0 +1,18 @@
+{
+  "daemonVersion": "0.30.0",
+  "daemonStatus": "NeedsLogin",
+  "management": { "connected": false },
+  "signal": { "connected": false },
+  "peers": {
+    "connected": 0,
+    "total": 1,
+    "details": [
+      {
+        "fqdn": "host-b.netbird.cloud",
+        "netbirdIp": "100.92.30.40",
+        "status": "Idle",
+        "connectionType": "Relayed"
+      }
+    ]
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "netbirdIp": "100.92.10.20",
+  "fqdn": "my-laptop.netbird.cloud",
+  "daemonVersion": "0.31.0",
+  "daemonStatus": "Connected",
+  "someFutureRootField": { "nested": [1, 2, 3] },
+  "anotherUnknownTopLevelKey": "ignored",
+  "management": { "connected": true, "extra": "ignored" },
+  "peers": {
+    "connected": 1,
+    "total": 1,
+    "details": [
+      {
+        "fqdn": "host-b.netbird.cloud",
+        "netbirdIp": "100.92.30.40",
+        "status": "Connected",
+        "connectionType": "P2P",
+        "futurePerPeerField": true,
+        "anotherUnknownPeerKey": { "deep": "value" },
+        "networks": [],
+        "latency": 12000000
+      }
+    ]
+  }
+}

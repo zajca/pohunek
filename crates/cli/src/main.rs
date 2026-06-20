@@ -1,9 +1,10 @@
 //! `zagentmesh` — the CLI control plane.
 //!
-//! Milestone 2 commands: `doctor`, `daemon start`, and `health`/`status`. The
-//! grammar is host-aware now (a `--host` flag and `<host>/<session-id>` targets)
-//! so Phase 2 adds remote transport without breaking the CLI surface, but only
-//! the local form executes in Phase 1 (see `docs/plan-phase-1.md` "CLI Grammar").
+//! Commands: `doctor`, `daemon start`, `health`/`status`, `session`, `attach`,
+//! `integration`, and `host` (discover/list/inspect). The grammar is host-aware
+//! (a `--host` flag and `<host>/<session-id>` targets); the *effective host*
+//! selects the transport, so local and remote (over NetBird) execute through one
+//! surface. Local behavior is unchanged from the local-only phase.
 
 #![warn(missing_debug_implementations)]
 #![warn(rust_2018_idioms)]
@@ -29,9 +30,9 @@ use crate::target::{Target, LOCAL_HOST};
 #[derive(Debug, Parser)]
 #[command(name = "zagentmesh", version, about, long_about = None)]
 struct Cli {
-    /// Target host for the command. Phase 1 accepts only the local host; this
-    /// flag is parsed now so Phase 2 can add remote transport without changing
-    /// the CLI surface.
+    /// Target host for the command. `local` (the default) uses this machine; any
+    /// other name is resolved to a NetBird peer and dialed over the mesh. A
+    /// `<host>/<session-id>` target's host overrides this flag for that command.
     #[arg(long, global = true, default_value = LOCAL_HOST)]
     host: String,
 
@@ -84,6 +85,38 @@ enum Commands {
     Integration {
         #[command(subcommand)]
         action: IntegrationAction,
+    },
+
+    /// Discover, list, and inspect remote hosts over NetBird.
+    Host {
+        #[command(subcommand)]
+        action: HostAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HostAction {
+    /// Enumerate NetBird peers and probe their daemons.
+    Discover {
+        /// Emit machine-readable JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List known hosts (live NetBird peers) with their classification.
+    List {
+        /// Emit machine-readable JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Inspect one host's live capabilities (a direct daemon query).
+    Inspect {
+        /// Host name to inspect (a NetBird peer name, or `local`).
+        host: String,
+        /// Emit machine-readable JSON instead of a table.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -138,6 +171,11 @@ enum SessionAction {
         /// branch when missing.
         #[arg(long)]
         base_branch: Option<String>,
+        /// Skip the confirmation prompt when starting a session on a remote
+        /// host. Required on the `--json` path for a remote host (the machine
+        /// path must not block on a prompt). Ignored for local sessions.
+        #[arg(long)]
+        yes: bool,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -193,7 +231,18 @@ impl Commands {
             }
             Commands::Session { action } => action.wants_json(),
             Commands::Integration { action } => action.wants_json(),
+            Commands::Host { action } => action.wants_json(),
             Commands::Attach { .. } | Commands::Daemon { .. } => false,
+        }
+    }
+}
+
+impl HostAction {
+    fn wants_json(&self) -> bool {
+        match self {
+            HostAction::Discover { json }
+            | HostAction::List { json }
+            | HostAction::Inspect { json, .. } => *json,
         }
     }
 }
@@ -242,16 +291,17 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode, CliError> {
-    // Reject remote targets early: parsing is host-aware, execution is local.
-    ensure_local_host(&cli.host)?;
+    let global_host = cli.host;
 
     match cli.command {
         Commands::Attach { target } => {
             let paths = Paths::resolve()?;
-            commands::attach::run_attach(&paths, &target).await?;
+            let host = effective_host(&global_host, Some(&target));
+            commands::attach::run_attach(&host, &paths, &target).await?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Doctor { json } => {
+            // Doctor is purely a local environment check; it ignores `--host`.
             let paths = Paths::resolve()?;
             let healthy = commands::doctor::run(&paths, json)?;
             Ok(if healthy {
@@ -261,6 +311,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             })
         }
         Commands::Daemon { action } => match action {
+            // Starting the daemon is inherently local (this machine's process).
             DaemonAction::Start { detach } => {
                 commands::daemon::start(detach)?;
                 Ok(ExitCode::SUCCESS)
@@ -268,7 +319,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         },
         Commands::Health { json } | Commands::Status { json } => {
             let paths = Paths::resolve()?;
-            commands::health::run(&paths, json).await?;
+            let host = effective_host(&global_host, None);
+            commands::health::run(&host, &paths, json).await?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Session { action } => {
@@ -282,9 +334,12 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     repo,
                     branch,
                     base_branch,
+                    yes,
                     json,
                 } => {
+                    let host = effective_host(&global_host, None);
                     commands::session::run_new(
+                        &host,
                         &paths,
                         commands::session::NewArgs {
                             agent,
@@ -296,23 +351,32 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                             base_branch,
                         },
                         json,
+                        yes,
                     )
                     .await?
                 }
-                SessionAction::List { json } => commands::session::run_list(&paths, json).await?,
+                SessionAction::List { json } => {
+                    let host = effective_host(&global_host, None);
+                    commands::session::run_list(&host, &paths, json).await?
+                }
                 SessionAction::Inspect { target, json } => {
-                    commands::session::run_inspect(&paths, &target, json).await?
+                    let host = effective_host(&global_host, Some(&target));
+                    commands::session::run_inspect(&host, &paths, &target, json).await?
                 }
                 SessionAction::Stop { target, json } => {
-                    commands::session::run_stop(&paths, &target, json).await?
+                    let host = effective_host(&global_host, Some(&target));
+                    commands::session::run_stop(&host, &paths, &target, json).await?
                 }
                 SessionAction::Input { target, text, json } => {
-                    commands::session::run_input(&paths, &target, &text, json).await?
+                    let host = effective_host(&global_host, Some(&target));
+                    commands::session::run_input(&host, &paths, &target, &text, json).await?
                 }
             }
             Ok(ExitCode::SUCCESS)
         }
         Commands::Integration { action } => {
+            // Installing hooks is a local daemon op (writes this machine's agent
+            // config); the command stays local regardless of `--host`.
             let paths = Paths::resolve()?;
             match action {
                 IntegrationAction::Install { agent, json } => {
@@ -321,34 +385,37 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Host { action } => match action {
+            // discover/list enumerate the mesh and ignore `--host`.
+            HostAction::Discover { json } => {
+                commands::host::run_discover(json).await?;
+                Ok(ExitCode::SUCCESS)
+            }
+            HostAction::List { json } => {
+                commands::host::run_list(json).await?;
+                Ok(ExitCode::SUCCESS)
+            }
+            HostAction::Inspect { host, json } => {
+                // `inspect` uses its positional host arg, not the global flag.
+                let paths = Paths::resolve()?;
+                commands::host::run_inspect(&host, &paths, json).await?;
+                Ok(ExitCode::SUCCESS)
+            }
+        },
     }
 }
 
-/// Ensure the requested host is local; reject remote targets until Phase 2.
+/// Resolve the effective host for a command.
 ///
-/// The `--host` flag carries a host name. We normalize it through the host-aware
-/// [`Target`] grammar so the same parsing rules apply everywhere: a bare value
-/// is the host name, and an accidental `host/session` slip is interpreted
-/// consistently. Remote hosts parse fine but are not yet executable.
-fn ensure_local_host(host: &str) -> Result<(), CliError> {
-    // A bare `--host foo` parses as a session id with no host; for the flag's
-    // purpose the bare value *is* the host name. Build a Target accordingly so
-    // `is_local` / `host_or_local` carry the host-resolution logic in one place.
-    let target = match host.parse::<Target>() {
-        Ok(t) if t.host.is_some() => t,
-        // Bare value (or parse error): treat the raw string as the host name.
-        _ => Target {
-            host: Some(host.to_owned()),
-            session_id: String::new(),
-        },
-    };
-
-    if target.is_local() {
-        Ok(())
-    } else {
-        Err(CliError::RemoteNotSupported {
-            host: target.host_or_local().to_owned(),
-        })
+/// A positional [`Target`]'s host (when present) wins over the global `--host`
+/// flag; otherwise the global flag is used. `None` (no target) means "use the
+/// global flag" (commands that take only the flag). The returned string is the
+/// host name the transport selects on (`local`, or a NetBird peer name).
+#[must_use]
+fn effective_host(global: &str, target: Option<&Target>) -> String {
+    match target.and_then(|t| t.host.as_deref()) {
+        Some(host) => host.to_owned(),
+        None => global.to_owned(),
     }
 }
 
@@ -373,6 +440,7 @@ mod tests {
                         repo,
                         branch,
                         base_branch,
+                        yes,
                         json,
                     },
             } => {
@@ -383,6 +451,7 @@ mod tests {
                 assert_eq!(repo, None);
                 assert_eq!(branch, None);
                 assert_eq!(base_branch, None);
+                assert!(!yes, "yes defaults to false");
                 assert!(!json, "json defaults to false");
             }
             other => panic!("unexpected command: {other:?}"),
@@ -521,5 +590,94 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    // --- effective-host routing -----------------------------------------------
+
+    fn target(host: Option<&str>, id: &str) -> Target {
+        Target {
+            host: host.map(str::to_owned),
+            session_id: id.to_owned(),
+        }
+    }
+
+    #[test]
+    fn effective_host_uses_global_when_no_target() {
+        assert_eq!(effective_host(LOCAL_HOST, None), "local");
+        assert_eq!(effective_host("host-b", None), "host-b");
+    }
+
+    #[test]
+    fn effective_host_target_host_wins_over_global() {
+        // A `<host>/<id>` target's host overrides the global `--host` flag.
+        assert_eq!(
+            effective_host("host-b", Some(&target(Some("host-c"), "s-1"))),
+            "host-c"
+        );
+        // An explicit `local/` target forces local even with a remote global.
+        assert_eq!(
+            effective_host("host-b", Some(&target(Some("local"), "s-1"))),
+            "local"
+        );
+    }
+
+    #[test]
+    fn effective_host_bare_target_falls_back_to_global() {
+        // A bare `s-1` target (no host) falls back to the global flag.
+        assert_eq!(
+            effective_host("host-b", Some(&target(None, "s-1"))),
+            "host-b"
+        );
+        assert_eq!(
+            effective_host(LOCAL_HOST, Some(&target(None, "s-1"))),
+            "local"
+        );
+    }
+
+    #[test]
+    fn parses_session_new_yes_flag() {
+        let cli = Cli::try_parse_from(["zagentmesh", "--host", "host-b", "session", "new", "--yes"])
+            .expect("parse");
+        match cli.command {
+            Commands::Session {
+                action: SessionAction::New { yes, .. },
+            } => assert!(yes, "--yes sets the flag"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert_eq!(cli.host, "host-b");
+    }
+
+    #[test]
+    fn parses_host_inspect_with_positional_host() {
+        let cli = Cli::try_parse_from(["zagentmesh", "host", "inspect", "host-b", "--json"])
+            .expect("parse");
+        match cli.command {
+            Commands::Host {
+                action: HostAction::Inspect { host, json },
+            } => {
+                assert_eq!(host, "host-b");
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_host_discover_and_list() {
+        let discover =
+            Cli::try_parse_from(["zagentmesh", "host", "discover", "--json"]).expect("parse");
+        assert!(matches!(
+            discover.command,
+            Commands::Host {
+                action: HostAction::Discover { json: true }
+            }
+        ));
+        let list = Cli::try_parse_from(["zagentmesh", "host", "list"]).expect("parse");
+        assert!(matches!(
+            list.command,
+            Commands::Host {
+                action: HostAction::List { json: false }
+            }
+        ));
     }
 }

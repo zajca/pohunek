@@ -133,4 +133,93 @@ impl ProtocolError {
             )),
         )
     }
+
+    /// The canonical `discovery/netbird_cli_missing` error.
+    ///
+    /// Raised when the local `netbird` CLI cannot be found on `PATH`, so remote
+    /// host discovery and remote sessions over NetBird are unavailable. Carries a
+    /// `recover` hint pointing at installing NetBird and verifying with the
+    /// doctor. Code is stable: `netbird_cli_missing`.
+    #[must_use]
+    pub fn netbird_cli_missing() -> Self {
+        Self::new(
+            ErrorClass::Discovery,
+            "netbird_cli_missing",
+            "the `netbird` CLI was not found on PATH".to_owned(),
+            Some(
+                "install the NetBird CLI and ensure it is on PATH; run `zagentmesh doctor` to verify"
+                    .to_owned(),
+            ),
+        )
+    }
+
+    /// The canonical `discovery/netbird_state_unavailable` error.
+    ///
+    /// Raised when the `netbird` CLI is present but its local state could not be
+    /// read (the NetBird daemon is down, or this host is not logged in). Carries a
+    /// short `detail` in the message and a `recover` hint. Code is stable:
+    /// `netbird_state_unavailable`.
+    #[must_use]
+    pub fn netbird_state_unavailable(detail: impl Into<String>) -> Self {
+        Self::new(
+            ErrorClass::Discovery,
+            "netbird_state_unavailable",
+            format!("NetBird local state is unavailable: {}", detail.into()),
+            Some(
+                "ensure the NetBird daemon is running and this host is logged in; run `zagentmesh doctor` to verify"
+                    .to_owned(),
+            ),
+        )
+    }
+
+    /// The canonical `discovery/host_unknown` error.
+    ///
+    /// Raised when the requested host name did not match any NetBird peer (by
+    /// fqdn, short hostname, or NetBird IP). Names the host so the operator sees
+    /// exactly what failed to resolve. Code is stable: `host_unknown`.
+    #[must_use]
+    pub fn host_unknown(host: &str) -> Self {
+        Self::new(
+            ErrorClass::Discovery,
+            "host_unknown",
+            format!("host '{host}' was not found among NetBird peers"),
+            Some(
+                "run `zagentmesh host list` to see reachable peers and check the host name"
+                    .to_owned(),
+            ),
+        )
+    }
+
+    /// The canonical `transport/host_unreachable` error.
+    ///
+    /// Raised when a NetBird TCP connection to the host's daemon control port
+    /// could not be opened (the peer is offline or the port is closed). Names the
+    /// host and carries a `recover` hint. Code is stable: `host_unreachable`.
+    #[must_use]
+    pub fn host_unreachable(host: &str) -> Self {
+        Self::new(
+            ErrorClass::Transport,
+            "host_unreachable",
+            format!("could not open a NetBird connection to host '{host}'"),
+            Some(
+                "check that the host is online and its zagentmesh daemon is running".to_owned(),
+            ),
+        )
+    }
+
+    /// The canonical `daemon/remote_daemon_unavailable` error.
+    ///
+    /// Raised when a NetBird TCP connection to the host opened, but no compatible
+    /// zagentmesh daemon answered on the control port. Names the host so the
+    /// operator can investigate that specific peer. Code is stable:
+    /// `remote_daemon_unavailable`.
+    #[must_use]
+    pub fn remote_daemon_unavailable(host: &str) -> Self {
+        Self::new(
+            ErrorClass::Daemon,
+            "remote_daemon_unavailable",
+            format!("connected to host '{host}' but no compatible zagentmesh daemon answered"),
+            Some("ensure a matching zagentmesh daemon is running on the host".to_owned()),
+        )
+    }
 }

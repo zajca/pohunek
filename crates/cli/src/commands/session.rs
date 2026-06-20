@@ -1,9 +1,12 @@
-//! `zagentmesh session` — manage local PTY-backed sessions.
+//! `zagentmesh session` — manage PTY-backed sessions on a local or remote host.
 //!
-//! Phase 1 only supports the local transport. The CLI
-//! grammar is host-aware through [`crate::target::Target`], but remote targets
-//! are rejected before any daemon request is sent.
+//! The CLI grammar is host-aware through [`crate::target::Target`]; the effective
+//! host selects the transport ([`Client`] dials the local Unix socket or a remote
+//! NetBird TCP connection). The session-id is the same on either side, so the
+//! request-building functions are transport-agnostic. Starting a session on a
+//! *remote* host goes through a confirmation gate (see [`confirmation_decision`]).
 
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use clap::ValueEnum;
@@ -15,10 +18,11 @@ use protocol::{
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::client::LocalClient;
+use crate::client::Client;
+use crate::commands::request_id;
 use crate::error::CliError;
 use crate::paths::Paths;
-use crate::target::Target;
+use crate::target::{Target, LOCAL_HOST};
 
 /// Agent selector accepted by `session new`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -61,14 +65,69 @@ pub(crate) struct NewArgs {
     pub base_branch: Option<String>,
 }
 
-/// Run `session new`.
+/// The decision the confirmation gate makes before a `session new` connects.
+///
+/// Factored out as a pure function ([`confirmation_decision`]) so the policy is
+/// unit-testable without a daemon or a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfirmDecision {
+    /// Start the session without confirmation (local, or remote with `--yes`).
+    Proceed,
+    /// Remote on the machine path (`--json`) and no `--yes`: fail fast, do not
+    /// silently block on an interactive prompt.
+    RequireYes,
+    /// Remote on the human path and no `--yes`: prompt interactively.
+    Prompt,
+}
+
+/// Decide whether starting a session on `host` needs confirmation.
+///
+/// Local sessions always [`Proceed`](ConfirmDecision::Proceed). A remote session
+/// requires either `--yes` (proceed), or — when no `--yes` — a machine path
+/// (`json`) fails fast with [`RequireYes`](ConfirmDecision::RequireYes) while a
+/// human path [`Prompt`](ConfirmDecision::Prompt)s.
+#[must_use]
+pub(crate) fn confirmation_decision(host: &str, json: bool, yes: bool) -> ConfirmDecision {
+    let remote = !host.is_empty() && host != LOCAL_HOST;
+    if !remote || yes {
+        ConfirmDecision::Proceed
+    } else if json {
+        ConfirmDecision::RequireYes
+    } else {
+        ConfirmDecision::Prompt
+    }
+}
+
+/// Run `session new` on `host`.
+///
+/// Remote starts pass through the confirmation gate ([`confirmation_decision`])
+/// *before* any connection is opened; local starts are unaffected.
 ///
 /// # Errors
 ///
-/// Returns [`CliError`] if the daemon is unreachable, rejects the request, or
-/// returns a payload that does not match the session contract.
-pub(crate) async fn run_new(paths: &Paths, args: NewArgs, json: bool) -> Result<(), CliError> {
-    let mut client = LocalClient::connect(&paths.socket).await?;
+/// Returns [`CliError`] if the remote start is unconfirmed, the daemon is
+/// unreachable, the host cannot be resolved, the daemon rejects the request, or
+/// the payload does not match the session contract.
+pub(crate) async fn run_new(
+    host: &str,
+    paths: &Paths,
+    args: NewArgs,
+    json: bool,
+    yes: bool,
+) -> Result<(), CliError> {
+    match confirmation_decision(host, json, yes) {
+        ConfirmDecision::Proceed => {}
+        ConfirmDecision::RequireYes => return Err(CliError::RemoteConfirmationRequired),
+        ConfirmDecision::Prompt => {
+            if !prompt_confirm(host)? {
+                return Err(CliError::RemoteConfirmationDeclined {
+                    host: host.to_owned(),
+                });
+            }
+        }
+    }
+
+    let mut client = Client::connect(host, paths).await?;
     let request = build_new_request(&args)?;
     let result = client.request(&request).await?;
     let info: SessionInfo = serde_json::from_value(result)?;
@@ -81,14 +140,34 @@ pub(crate) async fn run_new(paths: &Paths, args: NewArgs, json: bool) -> Result<
     Ok(())
 }
 
-/// Run `session list`.
+/// Prompt on stderr and read a yes/no answer from stdin.
+///
+/// Returns `true` only when the answer is `y`/`yes` (case-insensitive). The
+/// prompt and echo go to stderr so a `--json` consumer is never affected (this
+/// path is only reached when `json` is false). Dependency-free.
+fn prompt_confirm(host: &str) -> Result<bool, CliError> {
+    let mut stderr = std::io::stderr();
+    write!(
+        stderr,
+        "Start a new session on remote host '{host}'? [y/N] "
+    )?;
+    stderr.flush()?;
+
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    let answer = answer.trim();
+    Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
+}
+
+/// Run `session list` against the daemon for `host`.
 ///
 /// # Errors
 ///
-/// Returns [`CliError`] if the daemon is unreachable, rejects the request, or
-/// returns a payload that does not match the session contract.
-pub(crate) async fn run_list(paths: &Paths, json: bool) -> Result<(), CliError> {
-    let mut client = LocalClient::connect(&paths.socket).await?;
+/// Returns [`CliError`] if the daemon is unreachable, the host cannot be
+/// resolved, the daemon rejects the request, or the payload does not match the
+/// session contract.
+pub(crate) async fn run_list(host: &str, paths: &Paths, json: bool) -> Result<(), CliError> {
+    let mut client = Client::connect(host, paths).await?;
     let request = build_list_request();
     let result = client.request(&request).await?;
     let sessions: Vec<SessionInfo> = serde_json::from_value(result)?;
@@ -102,19 +181,21 @@ pub(crate) async fn run_list(paths: &Paths, json: bool) -> Result<(), CliError> 
     Ok(())
 }
 
-/// Run `session inspect`.
+/// Run `session inspect` against the daemon for `host`.
 ///
 /// # Errors
 ///
-/// Returns [`CliError`] if the target is remote, the daemon is unreachable,
-/// rejects the request, or returns a payload that does not match the contract.
+/// Returns [`CliError`] if the daemon is unreachable, the host cannot be
+/// resolved, the daemon rejects the request, or the payload does not match the
+/// contract.
 pub(crate) async fn run_inspect(
+    host: &str,
     paths: &Paths,
     target: &Target,
     json: bool,
 ) -> Result<(), CliError> {
     let request = build_inspect_request(target)?;
-    let mut client = LocalClient::connect(&paths.socket).await?;
+    let mut client = Client::connect(host, paths).await?;
     let result = client.request(&request).await?;
     let info: SessionInfo = serde_json::from_value(result)?;
 
@@ -127,15 +208,21 @@ pub(crate) async fn run_inspect(
     Ok(())
 }
 
-/// Run `session stop`.
+/// Run `session stop` against the daemon for `host`.
 ///
 /// # Errors
 ///
-/// Returns [`CliError`] if the target is remote, the daemon is unreachable,
-/// rejects the request, or returns a payload that does not match the contract.
-pub(crate) async fn run_stop(paths: &Paths, target: &Target, json: bool) -> Result<(), CliError> {
+/// Returns [`CliError`] if the daemon is unreachable, the host cannot be
+/// resolved, the daemon rejects the request, or the payload does not match the
+/// contract.
+pub(crate) async fn run_stop(
+    host: &str,
+    paths: &Paths,
+    target: &Target,
+    json: bool,
+) -> Result<(), CliError> {
     let request = build_stop_request(target)?;
-    let mut client = LocalClient::connect(&paths.socket).await?;
+    let mut client = Client::connect(host, paths).await?;
     let result = client.request(&request).await?;
     let stop: SessionStopResult = serde_json::from_value(result)?;
 
@@ -147,20 +234,22 @@ pub(crate) async fn run_stop(paths: &Paths, target: &Target, json: bool) -> Resu
     Ok(())
 }
 
-/// Run `session input`.
+/// Run `session input` against the daemon for `host`.
 ///
 /// # Errors
 ///
-/// Returns [`CliError`] if the target is remote, the daemon is unreachable,
-/// rejects the request, or returns a payload that does not match the contract.
+/// Returns [`CliError`] if the daemon is unreachable, the host cannot be
+/// resolved, the daemon rejects the request, or the payload does not match the
+/// contract.
 pub(crate) async fn run_input(
+    host: &str,
     paths: &Paths,
     target: &Target,
     text: &str,
     json: bool,
 ) -> Result<(), CliError> {
     let request = build_input_request(target, text)?;
-    let mut client = LocalClient::connect(&paths.socket).await?;
+    let mut client = Client::connect(host, paths).await?;
     let result = client.request(&request).await?;
     let input: SessionInputResult = serde_json::from_value(result)?;
 
@@ -170,10 +259,6 @@ pub(crate) async fn run_input(
         print!("{}", render_input_human(&target.session_id, &input));
     }
     Ok(())
-}
-
-fn request_id(method: &str) -> String {
-    format!("cli-{method}")
 }
 
 fn request_with_params<T>(method: &str, params: &T) -> Result<Request, CliError>
@@ -210,35 +295,27 @@ fn build_list_request() -> Request {
     )
 }
 
+// Host routing is handled by the transport ([`Client`]); these requests carry
+// only the session id (identical on either side), never the host.
 fn build_inspect_request(target: &Target) -> Result<Request, CliError> {
-    let session_id = local_session_id(target)?;
-    request_with_params(method::SESSION_INSPECT, &SessionId(session_id.to_owned()))
-}
-
-fn build_stop_request(target: &Target) -> Result<Request, CliError> {
-    let session_id = local_session_id(target)?;
-    request_with_params(method::SESSION_STOP, &SessionId(session_id.to_owned()))
-}
-
-fn build_input_request(target: &Target, text: &str) -> Result<Request, CliError> {
-    let session_id = local_session_id(target)?;
     request_with_params(
-        method::SESSION_INPUT,
-        &SessionInputParams {
-            session_id: SessionId(session_id.to_owned()),
-            text: text.to_owned(),
-        },
+        method::SESSION_INSPECT,
+        &SessionId(target.session_id.clone()),
     )
 }
 
-fn local_session_id(target: &Target) -> Result<&str, CliError> {
-    if target.is_local() {
-        Ok(&target.session_id)
-    } else {
-        Err(CliError::RemoteNotSupported {
-            host: target.host_or_local().to_owned(),
-        })
-    }
+fn build_stop_request(target: &Target) -> Result<Request, CliError> {
+    request_with_params(method::SESSION_STOP, &SessionId(target.session_id.clone()))
+}
+
+fn build_input_request(target: &Target, text: &str) -> Result<Request, CliError> {
+    request_with_params(
+        method::SESSION_INPUT,
+        &SessionInputParams {
+            session_id: SessionId(target.session_id.clone()),
+            text: text.to_owned(),
+        },
+    )
 }
 
 fn render_new_human(info: &SessionInfo) -> String {
@@ -499,7 +576,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::error::CliError;
     use crate::target::Target;
 
     fn running_session(id: &str) -> SessionInfo {
@@ -537,15 +613,15 @@ mod tests {
     }
 
     fn assert_request(request: &Request, method_name: &str, params: serde_json::Value) {
-        let value = serde_json::to_value(request).expect("serialize request");
-        assert_eq!(
-            value,
-            json!({
-                "v": 1,
-                "id": format!("cli-{method_name}"),
-                "method": method_name,
-                "params": params
-            })
+        assert_eq!(request.v.get(), 1, "envelope version");
+        assert_eq!(request.method, method_name, "method");
+        assert_eq!(request.params, params, "params");
+        // The id is now a unique per-call correlation id, not a fixed string;
+        // assert only its stable, log-greppable `cli-<method>-` prefix.
+        assert!(
+            request.id.starts_with(&format!("cli-{method_name}-")),
+            "id {:?} must be prefixed by the method",
+            request.id
         );
     }
 
@@ -669,20 +745,25 @@ mod tests {
     }
 
     #[test]
-    fn input_request_rejects_remote_target() {
-        let target: Target = "host-b/s-42".parse().expect("target");
+    fn input_request_extracts_session_id_regardless_of_host() {
+        // Remote is now supported: the request carries only the session id (host
+        // routing is the transport's job), and it is extracted identically from a
+        // remote target as from a local one.
+        let remote: Target = "host-b/s-42".parse().expect("target");
+        let request = build_input_request(&remote, "write tests first").expect("request");
 
-        let err =
-            build_input_request(&target, "write tests first").expect_err("remote target must fail");
-
-        match err {
-            CliError::RemoteNotSupported { host } => assert_eq!(host, "host-b"),
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert_request(
+            &request,
+            method::SESSION_INPUT,
+            json!({
+                "session_id": "s-42",
+                "text": "write tests first"
+            }),
+        );
     }
 
     #[test]
-    fn inspect_request_sends_only_local_session_id() {
+    fn inspect_request_sends_only_session_id() {
         let target: Target = "local/s-42".parse().expect("target");
         let request = build_inspect_request(&target).expect("request");
 
@@ -690,15 +771,60 @@ mod tests {
     }
 
     #[test]
-    fn stop_request_rejects_remote_target() {
-        let target: Target = "host-b/s-42".parse().expect("target");
+    fn stop_request_extracts_session_id_regardless_of_host() {
+        // A remote target's session id is sent unchanged; the host never leaks
+        // into the request body.
+        let remote: Target = "host-b/s-42".parse().expect("target");
+        let request = build_stop_request(&remote).expect("request");
 
-        let err = build_stop_request(&target).expect_err("remote target must fail");
+        assert_request(&request, method::SESSION_STOP, json!("s-42"));
+    }
 
-        match err {
-            CliError::RemoteNotSupported { host } => assert_eq!(host, "host-b"),
-            other => panic!("unexpected error: {other:?}"),
+    #[test]
+    fn confirmation_gate_local_always_proceeds() {
+        // Local `session new` is never gated, regardless of json/yes.
+        for json in [false, true] {
+            for yes in [false, true] {
+                assert_eq!(
+                    confirmation_decision(LOCAL_HOST, json, yes),
+                    ConfirmDecision::Proceed,
+                    "local must proceed (json={json}, yes={yes})"
+                );
+                assert_eq!(
+                    confirmation_decision("", json, yes),
+                    ConfirmDecision::Proceed,
+                    "empty host (implicit local) must proceed"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn confirmation_gate_remote_requires_yes_on_json_path() {
+        // Machine path (json) without --yes must fail fast, never block on a
+        // prompt.
+        assert_eq!(
+            confirmation_decision("host-b", true, false),
+            ConfirmDecision::RequireYes
+        );
+        // With --yes the machine path proceeds.
+        assert_eq!(
+            confirmation_decision("host-b", true, true),
+            ConfirmDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn confirmation_gate_remote_prompts_on_human_path() {
+        // Human path without --yes prompts; with --yes it proceeds.
+        assert_eq!(
+            confirmation_decision("host-b", false, false),
+            ConfirmDecision::Prompt
+        );
+        assert_eq!(
+            confirmation_decision("host-b", false, true),
+            ConfirmDecision::Proceed
+        );
     }
 
     #[test]

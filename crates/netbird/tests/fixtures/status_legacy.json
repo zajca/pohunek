@@ -1,0 +1,22 @@
+{
+  "status": "Connected",
+  "daemonVersion": "0.27.0",
+  "managementState": { "connected": true },
+  "signalState": { "connected": true },
+  "localPeerState": {
+    "IP": "100.64.0.10/16",
+    "pubKey": "pubkey-self",
+    "fqdn": "my-laptop.netbird.cloud"
+  },
+  "peers": [
+    {
+      "fqdn": "host-b.netbird.cloud",
+      "netbirdIp": "100.64.0.20",
+      "connectionStatus": "Connected",
+      "connType": "P2P",
+      "lastSeen": "2026-06-19T10:00:00Z",
+      "direct": true,
+      "latency": 12000000
+    }
+  ]
+}
