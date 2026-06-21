@@ -161,8 +161,8 @@ fn map_codec_err_for(remote_host: Option<&str>, err: LinesCodecError) -> CliErro
 /// Map a failure to parse a reply line as a control [`Response`].
 ///
 /// Over a remote transport, a peer that answers with something that is not a
-/// valid control response is not a compatible zagentmesh daemon — the original
-/// finding's "non-zagent service" case — so it becomes a host-named
+/// valid control response is not a compatible pohunek daemon — the original
+/// finding's "non-pohunek service" case — so it becomes a host-named
 /// [`CliError::RemoteDaemonUnavailable`] rather than an opaque, host-less JSON
 /// error. Locally it stays a [`CliError::Json`]: a real local daemon answering
 /// unparseable JSON is a genuine bug, surfaced as-is.
@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn remote_daemon_error_is_wrapped_with_host_but_keeps_stable_code() {
-        use protocol::{ProtocolVersion, ProtocolError};
+        use protocol::{ProtocolError, ProtocolVersion};
 
         // A version_mismatch returned by a remote daemon: the human message must
         // name the host while the machine code/class/recover stay canonical so a
@@ -406,7 +406,11 @@ mod tests {
         assert_eq!(pe.class, protocol::ErrorClass::Runtime);
         assert_eq!(pe.code, "agent_binary_missing");
         assert!(pe.msg.contains("build-box"), "names host: {}", pe.msg);
-        assert!(pe.msg.contains("claude"), "keeps the binary name: {}", pe.msg);
+        assert!(
+            pe.msg.contains("claude"),
+            "keeps the binary name: {}",
+            pe.msg
+        );
     }
 
     #[test]
@@ -420,9 +424,9 @@ mod tests {
 
     #[test]
     fn remote_garbled_reply_is_host_named_daemon_unavailable() {
-        // A non-zagent service answering with a non-control line must name the
+        // A non-pohunek service answering with a non-control line must name the
         // host and use the daemon-class code, not leak as a host-less json_error
-        // (the original finding's "non-zagent service" case).
+        // (the original finding's "non-pohunek service" case).
         let parse_err = serde_json::from_str::<Response>("definitely not json").unwrap_err();
         let err = unparseable_reply_error(Some("build-box"), parse_err);
         match &err {

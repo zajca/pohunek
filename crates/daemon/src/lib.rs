@@ -1,8 +1,8 @@
-//! zagentmesh host daemon library.
+//! pohunek host daemon library.
 //!
 //! The daemon owns OS PTYs and agent processes and serves the control protocol
 //! over a local Unix socket (and, in Phase 2, NetBird TCP). This crate exposes
-//! the daemon's runtime so the `zagentmeshd` binary and integration tests can
+//! the daemon's runtime so the `pohunekd` binary and integration tests can
 //! drive it.
 //!
 //! Current scope (see `docs/plan-phase-1.md` "Build Order"): bind the Unix

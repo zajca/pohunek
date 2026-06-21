@@ -22,7 +22,7 @@ pub enum DaemonError {
     },
 
     /// Another daemon already holds the single-instance lock.
-    #[error("another zagentmesh daemon is already running (lock held: {lock})")]
+    #[error("another pohunek daemon is already running (lock held: {lock})")]
     AlreadyRunning {
         /// The lock file path.
         lock: PathBuf,

@@ -9,13 +9,13 @@ use std::path::PathBuf;
 
 use crate::error::CliError;
 
-const APP_DIR: &str = "zagentmesh";
+const APP_DIR: &str = "pohunek";
 const SOCKET_NAME: &str = "daemon.sock";
 
 /// Resolved CLI paths.
 #[derive(Debug, Clone)]
 pub(crate) struct Paths {
-    /// `$XDG_RUNTIME_DIR/zagentmesh` runtime dir.
+    /// `$XDG_RUNTIME_DIR/pohunek` runtime dir.
     pub(crate) runtime_dir: PathBuf,
     /// The control Unix socket path.
     pub(crate) socket: PathBuf,

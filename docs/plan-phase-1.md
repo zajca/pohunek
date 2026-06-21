@@ -15,9 +15,9 @@ the original.
 
 ## Definition of Done
 
-- `zagentmesh daemon start` runs as a systemd user service; `zagentmesh doctor`
+- `pohunek daemon start` runs as a systemd user service; `pohunek doctor`
   reports health.
-- `zagentmesh session new --agent {codex|claude}` starts the agent in a
+- `pohunek session new --agent {codex|claude}` starts the agent in a
   daemon-owned PTY; `attach`/detach/reattach work without killing it, and a
   reattaching client is replayed the recent screen + scrollback.
 - Agent state (`working` / `blocked` / `idle` / `done` / `failed`) is visible in
@@ -52,11 +52,11 @@ the original.
 ## Cargo Workspace Layout
 
 ```text
-zagentmesh/
+pohunek/
   Cargo.toml                 # workspace
   crates/
     protocol/                # shared: envelopes, request/response/event types, versioning
-    daemon/                  # the host daemon (bin: zagentmeshd)
+    daemon/                  # the host daemon (bin: pohunekd)
       src/
         pty/                 # PTY actor (thread-per-PTY, resize, reader bridge)
         session/             # session model + supervisor
@@ -65,7 +65,7 @@ zagentmesh/
         store/               # file-based metadata stores (resume + worktree bindings)
         api/                 # Unix socket server, control protocol handler, attach stream
         events/              # append-only event log
-    cli/                     # zagentmesh CLI (bin: zagentmesh)
+    cli/                     # pohunek CLI (bin: pohunek)
 ```
 
 Rationale: `protocol` is shared so the CLI and daemon cannot drift, and Phase 2's
@@ -74,7 +74,7 @@ NetBird transport reuses it unchanged.
 ## Control Protocol (Local Unix Socket)
 
 Newline-delimited JSON. One JSON value per line. Socket at
-`$XDG_RUNTIME_DIR/zagentmesh/daemon.sock` (`0700` dir, `0600` socket).
+`$XDG_RUNTIME_DIR/pohunek/daemon.sock` (`0700` dir, `0600` socket).
 
 Envelope sketch (illustrative):
 
@@ -232,14 +232,14 @@ Each published state carries `source` ∈ {`osc_title`, `osc_progress`, `screen`
 Hooks do **not** report live state. They capture the native session ID for
 resume (herdr `src/integration/`, `assets/claude/herdr-agent-state.sh`):
 
-- The daemon injects env before spawning the agent: `ZAGENTMESH_SOCKET_PATH`,
-  `ZAGENTMESH_SESSION_ID`.
+- The daemon injects env before spawning the agent: `POHUNEK_SOCKET_PATH`,
+  `POHUNEK_SESSION_ID`.
 - Claude: install a `SessionStart` hook in `~/.claude/settings.json` pointing at
   a small script; remove any stale lifecycle hooks. Codex: configure `notify`
   equivalently.
 - The hook reads its stdin JSON (`session_id`, `transcript_path`), then sends one
   fire-and-forget RPC (0.5 s timeout) to the socket:
-  `session.report_native_id {session_id(zagentmesh), agent, native_session_id, transcript_path?}`.
+  `session.report_native_id {session_id(pohunek), agent, native_session_id, transcript_path?}`.
 - The daemon stores it as the session's resume binding.
 
 ## Resume Model
@@ -296,17 +296,17 @@ is the (non-rebuildable) audit/debug trail.
 
 ## CLI Grammar (forward-compatible with Phase 2)
 
-- Local now: `zagentmesh session new --agent claude`, `zagentmesh attach s-42`.
+- Local now: `pohunek session new --agent claude`, `pohunek attach s-42`.
 - Design the host-target syntax now so Phase 2 adds it without breaking:
-  `zagentmesh attach <host>/<session-id>`, `--host <host>` on commands. Phase 1
+  `pohunek attach <host>/<session-id>`, `--host <host>` on commands. Phase 1
   accepts only the local form but the parser is host-aware.
 - `--json` on `list`, `inspect`, `status`, and all automation commands.
-- `zagentmesh doctor`: check Codex/Claude binaries, git, socket dir perms,
+- `pohunek doctor`: check Codex/Claude binaries, git, socket dir perms,
   state-dir writability, metadata-store health.
 
 ## Logging and Observability
 
-- `tracing` JSON logs under `~/.local/state/zagentmesh/logs/`, redacting secrets
+- `tracing` JSON logs under `~/.local/state/pohunek/logs/`, redacting secrets
   and terminal content.
 - Log: daemon start/stop, single-instance/socket recovery, control requests (with
   `id`) + status, session start/attach/detach/stop/exit/resume, PTY

@@ -1,4 +1,4 @@
-//! `zagentmesh doctor` — environment health checks.
+//! `pohunek doctor` — environment health checks.
 //!
 //! Per `docs/plan-phase-1.md` "CLI Grammar": check Codex/Claude binaries, git,
 //! socket-dir perms, and state-dir writability. (Schema-version check is part of
@@ -85,7 +85,11 @@ pub(crate) fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
             "control socket directory",
         ),
         // State dir writability (state.db / events / worktrees live here).
-        check_dir_writable("state_dir_writable", &paths.data_dir, "state data directory"),
+        check_dir_writable(
+            "state_dir_writable",
+            &paths.data_dir,
+            "state data directory",
+        ),
         // Log dir writability.
         check_dir_writable("log_dir_writable", &paths.log_dir, "log directory"),
         // NetBird: optional. Its absence is a warning (local-only use is valid),
@@ -201,7 +205,7 @@ fn check_dir_writable(name: &str, dir: &Path, label: &str) -> Check {
             format!("cannot create {label} {}: {err}", dir.display()),
         );
     }
-    let probe = dir.join(".zagentmesh-doctor-probe");
+    let probe = dir.join(".pohunek-doctor-probe");
     match std::fs::write(&probe, b"probe") {
         Ok(()) => {
             // Best-effort cleanup; a leftover probe is harmless.

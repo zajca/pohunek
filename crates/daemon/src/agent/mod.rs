@@ -81,9 +81,7 @@ impl SessionRef {
     pub fn id(value: impl Into<String>) -> Result<Self, ProtocolError> {
         let value = value.into();
         if value.is_empty() {
-            return Err(invalid_session_ref(
-                "native session id cannot be empty",
-            ));
+            return Err(invalid_session_ref("native session id cannot be empty"));
         }
         if value.len() > MAX_SESSION_ID_LEN {
             return Err(invalid_session_ref(
@@ -118,9 +116,7 @@ impl SessionRef {
     pub fn path(value: impl Into<String>) -> Result<Self, ProtocolError> {
         let value = value.into();
         if value.is_empty() {
-            return Err(invalid_session_ref(
-                "native session path cannot be empty",
-            ));
+            return Err(invalid_session_ref("native session path cannot be empty"));
         }
         if value.len() > MAX_SESSION_PATH_LEN {
             return Err(invalid_session_ref(
@@ -133,9 +129,7 @@ impl SessionRef {
             ));
         }
         if !Path::new(&value).is_absolute() {
-            return Err(invalid_session_ref(
-                "native session path must be absolute",
-            ));
+            return Err(invalid_session_ref("native session path must be absolute"));
         }
 
         Ok(Self {
@@ -304,7 +298,9 @@ mod tests {
 
     use protocol::{AgentActivity, ErrorClass};
 
-    use super::{AgentAdapter, ClaudeAdapter, CodexAdapter, LaunchOpts, SessionRef, SessionRefKind};
+    use super::{
+        AgentAdapter, ClaudeAdapter, CodexAdapter, LaunchOpts, SessionRef, SessionRefKind,
+    };
     use crate::detect::{ManifestRegion, MatchContext};
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -314,7 +310,7 @@ mod tests {
             cwd,
             cols: 120,
             rows: 40,
-            env_extra: vec![("ZAGENTMESH_SESSION_ID".to_owned(), "s-42".to_owned())],
+            env_extra: vec![("POHUNEK_SESSION_ID".to_owned(), "s-42".to_owned())],
         }
     }
 
@@ -324,7 +320,7 @@ mod tests {
             .expect("system time is after epoch")
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "zagentmesh-agent-test-{tag}-{}-{nanos}",
+            "pohunek-agent-test-{tag}-{}-{nanos}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).expect("create temp dir");
@@ -378,7 +374,7 @@ mod tests {
         assert_eq!(command.rows, 40);
         assert_eq!(
             command.env,
-            vec![("ZAGENTMESH_SESSION_ID".to_owned(), "s-42".to_owned())]
+            vec![("POHUNEK_SESSION_ID".to_owned(), "s-42".to_owned())]
         );
     }
 
@@ -401,7 +397,7 @@ mod tests {
         assert_eq!(command.rows, 40);
         assert_eq!(
             command.env,
-            vec![("ZAGENTMESH_SESSION_ID".to_owned(), "s-42".to_owned())]
+            vec![("POHUNEK_SESSION_ID".to_owned(), "s-42".to_owned())]
         );
     }
 
@@ -470,7 +466,9 @@ mod tests {
             "invalid_session_ref"
         );
         assert_eq!(
-            SessionRef::id("-x").expect_err("single-dash id rejected").code,
+            SessionRef::id("-x")
+                .expect_err("single-dash id rejected")
+                .code,
             "invalid_session_ref"
         );
         // A dash elsewhere is fine (real native ids contain hyphens).
@@ -479,8 +477,8 @@ mod tests {
 
     #[test]
     fn session_ref_path_accepts_absolute_path_and_reports_kind() {
-        let session = SessionRef::path("/home/user/.claude/transcripts/abc.jsonl")
-            .expect("path session ref");
+        let session =
+            SessionRef::path("/home/user/.claude/transcripts/abc.jsonl").expect("path session ref");
         assert_eq!(session.kind(), SessionRefKind::Path);
         assert_eq!(session.value(), "/home/user/.claude/transcripts/abc.jsonl");
     }
@@ -542,7 +540,7 @@ mod tests {
         assert_eq!(command.cwd, cwd);
         assert_eq!(
             command.env,
-            vec![("ZAGENTMESH_SESSION_ID".to_owned(), "s-42".to_owned())]
+            vec![("POHUNEK_SESSION_ID".to_owned(), "s-42".to_owned())]
         );
     }
 
@@ -550,12 +548,9 @@ mod tests {
     fn resume_pty_command_rejects_shell_agent() {
         let cwd = temp_dir("resume-shell-cwd");
         let session = SessionRef::id("native-123").expect("session ref");
-        let err = super::resume_pty_command(
-            protocol::AgentKind::Shell,
-            &session,
-            &launch_opts(cwd),
-        )
-        .expect_err("shell is not resumable");
+        let err =
+            super::resume_pty_command(protocol::AgentKind::Shell, &session, &launch_opts(cwd))
+                .expect_err("shell is not resumable");
         assert_eq!(err.code, "agent_not_resumable");
     }
 

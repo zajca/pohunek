@@ -101,13 +101,13 @@ pub struct SessionInputResult {
 /// Parameters for `session.report_native_id`.
 ///
 /// Fire-and-forget capture sent by an agent's `SessionStart` hook (see
-/// `docs/plan-phase-1.md` "Hook Integration"). The hook learns the zagentmesh
+/// `docs/plan-phase-1.md` "Hook Integration"). The hook learns the pohunek
 /// `session_id` and `agent` from the launch-time handshake env and reads the
 /// agent's own `native_session_id` (and optional `transcript_path`) from its
 /// stdin JSON. The daemon records it as the session's resume binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionReportNativeIdParams {
-    /// The zagentmesh session id the agent was launched under.
+    /// The pohunek session id the agent was launched under.
     pub session_id: SessionId,
     /// Agent kind reporting its native session id.
     pub agent: AgentKind,

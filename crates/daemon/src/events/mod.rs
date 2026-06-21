@@ -189,7 +189,7 @@ mod tests {
             .expect("system time after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "zagentmesh-events-{tag}-{}-{nanos}",
+            "pohunek-events-{tag}-{}-{nanos}",
             std::process::id()
         ))
     }
@@ -208,12 +208,18 @@ mod tests {
         let dir = temp_events_dir("append");
         let log = EventLog::open(&dir).expect("open log");
         let events = [
-            Event::new(event::SESSION_CREATED, json!({ "session": { "id": "s-1" } })),
+            Event::new(
+                event::SESSION_CREATED,
+                json!({ "session": { "id": "s-1" } }),
+            ),
             Event::new(
                 event::AGENT_STATE,
                 json!({ "session_id": "s-1", "activity": "working" }),
             ),
-            Event::new(event::SESSION_STOPPED, json!({ "session": { "id": "s-1" } })),
+            Event::new(
+                event::SESSION_STOPPED,
+                json!({ "session": { "id": "s-1" } }),
+            ),
         ];
         for e in &events {
             log.append(e).expect("append");
@@ -224,7 +230,10 @@ mod tests {
         for (line, expected) in lines.iter().zip(events.iter()) {
             let parsed: Value = serde_json::from_str(line).expect("each line is valid JSON");
             assert_eq!(parsed["event"], json!(expected.event));
-            assert!(parsed.get("v").is_some(), "each line carries a protocol version");
+            assert!(
+                parsed.get("v").is_some(),
+                "each line carries a protocol version"
+            );
         }
     }
 
@@ -236,9 +245,18 @@ mod tests {
         let handle = spawn_drain(log.clone(), rx, CancellationToken::new());
 
         let sent = [
-            Event::new(event::SESSION_CREATED, json!({ "session": { "id": "s-1" } })),
-            Event::new(event::SESSION_UPDATED, json!({ "session": { "id": "s-1" } })),
-            Event::new(event::SESSION_STOPPED, json!({ "session": { "id": "s-1" } })),
+            Event::new(
+                event::SESSION_CREATED,
+                json!({ "session": { "id": "s-1" } }),
+            ),
+            Event::new(
+                event::SESSION_UPDATED,
+                json!({ "session": { "id": "s-1" } }),
+            ),
+            Event::new(
+                event::SESSION_STOPPED,
+                json!({ "session": { "id": "s-1" } }),
+            ),
         ];
         for e in &sent {
             tx.send(e.clone()).expect("broadcast send");
@@ -262,7 +280,10 @@ mod tests {
         log.append(&Event::new(event::SESSION_CREATED, json!({})))
             .expect("append");
 
-        let dir_mode = fs::metadata(&dir).expect("dir metadata").permissions().mode();
+        let dir_mode = fs::metadata(&dir)
+            .expect("dir metadata")
+            .permissions()
+            .mode();
         assert_eq!(dir_mode & 0o777, 0o700, "events dir must be owner-private");
         let file_mode = fs::metadata(log.path())
             .expect("file metadata")

@@ -10,7 +10,7 @@ use crate::status::NetbirdError;
 pub const DEFAULT_REMOTE_PORT: u16 = 18722;
 
 /// Environment variable that overrides [`DEFAULT_REMOTE_PORT`].
-pub const REMOTE_PORT_ENV: &str = "ZAGENTMESH_REMOTE_PORT";
+pub const REMOTE_PORT_ENV: &str = "POHUNEK_REMOTE_PORT";
 
 /// Resolve the remote control port.
 ///
@@ -66,7 +66,16 @@ mod tests {
 
     #[test]
     fn rejects_invalid_port_values() {
-        for bad in ["", "   ", "0", "-1", "not-a-number", "70000", "80.5", "18722x"] {
+        for bad in [
+            "",
+            "   ",
+            "0",
+            "-1",
+            "not-a-number",
+            "70000",
+            "80.5",
+            "18722x",
+        ] {
             let err = parse_port(bad).unwrap_err();
             assert!(
                 matches!(err, NetbirdError::StateUnavailable(_)),

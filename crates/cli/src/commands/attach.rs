@@ -1,4 +1,4 @@
-//! `zagentmesh attach` — attach the local terminal to a PTY-backed session.
+//! `pohunek attach` — attach the local terminal to a PTY-backed session.
 //!
 //! Works against a local or remote host: the control RPCs go through the
 //! transport-agnostic [`Client`], and the raw second connection (the attach byte

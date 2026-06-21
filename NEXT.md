@@ -24,14 +24,14 @@ From your laptop, drive agent sessions on another of your machines on the NetBir
 (WireGuard) mesh, using the same CLI as local sessions:
 
 ```bash
-zagentmesh host discover                       # peers from `netbird status --json`
-zagentmesh host list                           # known/reachable hosts + daemon status
-zagentmesh host inspect <host>                 # live capability query over NetBird
-zagentmesh session new --host <host> --agent claude
-zagentmesh session list --host <host>
-zagentmesh attach <host>/<session-id>          # Ctrl-] detaches; remote process survives
-zagentmesh status --host <host>
-zagentmesh session stop <host>/<session-id>
+pohunek host discover                       # peers from `netbird status --json`
+pohunek host list                           # known/reachable hosts + daemon status
+pohunek host inspect <host>                 # live capability query over NetBird
+pohunek session new --host <host> --agent claude
+pohunek session list --host <host>
+pohunek attach <host>/<session-id>          # Ctrl-] detaches; remote process survives
+pohunek status --host <host>
+pohunek session stop <host>/<session-id>
 ```
 
 Each host stays authoritative for its own daemon, PTYs, metadata, logs, and live
@@ -169,12 +169,12 @@ together** and the end-to-end criterion (#9) passes.
   **already including `Transport` and `Discovery`** (the two classes Phase 2
   needs) and canonical constructors (`version_mismatch`, `agent_binary_missing`,
   `bad_request`, `method_not_found`).
-- `crates/daemon` (`zagentmeshd`) — Unix-socket control server; full `session.*`
+- `crates/daemon` (`pohunekd`) — Unix-socket control server; full `session.*`
   lifecycle; attach bridge; `subscribe` event stream; per-session state engine;
   agent adapters (codex/claude/shell); session-id hook + resume;
   worktree-per-session; M9 unified metadata store + append-only event log; M10
   typed `agent_binary_missing` on ENOENT spawn.
-- `crates/cli` (`zagentmesh`) — `doctor`, `daemon start`, `health`/`status`,
+- `crates/cli` (`pohunek`) — `doctor`, `daemon start`, `health`/`status`,
   `session new/list/inspect/stop/input`, `attach`, `integration install`. Global
   `--host` parses (local-only execution). `--json` everywhere, incl. clap usage
   errors (M10 + the `cli_usage` fix). `recover` hints rendered for human + JSON.
@@ -272,7 +272,7 @@ for the parser; bump it deliberately when NetBird changes shape.
    generic serving code. In `main.rs`, resolve + validate the NetBird IP, bind the
    `RemoteServer`, and serve it alongside the Unix `ControlServer`; degrade to
    local-only when NetBird is absent. Default port is a **named const with an env
-   override** (e.g. `ZAGENTMESH_REMOTE_PORT`) — no bare literal (project rule:
+   override** (e.g. `POHUNEK_REMOTE_PORT`) — no bare literal (project rule:
    zero hardcoded values).
 3. **`host.inspect` capability method (Slice B/C boundary).** Add an additive
    control method + typed result (daemon version, supported agents, present agent

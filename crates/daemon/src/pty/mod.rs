@@ -211,7 +211,7 @@ impl PtyHandle {
         let history_for_thread = Arc::clone(&history);
 
         let reader_thread = thread::Builder::new()
-            .name(format!("zagentmesh-pty-{pid}"))
+            .name(format!("pohunek-pty-{pid}"))
             .spawn(move || {
                 let mut buf = vec![0_u8; READ_CHUNK_BYTES];
                 loop {

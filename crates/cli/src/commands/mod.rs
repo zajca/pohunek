@@ -34,7 +34,7 @@ pub(crate) fn render_json<T: Serialize + ?Sized>(value: &T) -> Result<String, Cl
 /// from any other.
 ///
 /// Derived from the process id and the process-start wall-clock time so two
-/// separate `zagentmesh` runs — even of the same command at the "same" second —
+/// separate `pohunek` runs — even of the same command at the "same" second —
 /// get different tokens. It carries no secret material (a pid and a timestamp).
 fn run_token() -> &'static str {
     static TOKEN: OnceLock<String> = OnceLock::new();

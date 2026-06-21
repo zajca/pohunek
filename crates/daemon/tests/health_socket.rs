@@ -25,9 +25,9 @@ use tokio::net::UnixStream;
 use tokio::sync::{oneshot, Mutex, MutexGuard};
 use tokio_util::codec::{Framed, LinesCodec};
 
-use zagentmesh_daemon::api::{ControlServer, DaemonState, HealthInfo};
-use zagentmesh_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
-use zagentmesh_daemon::store::Store;
+use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo};
+use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
+use pohunek_daemon::store::Store;
 
 static PATH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -103,7 +103,7 @@ impl Drop for PathGuard {
 /// The server enforces the directory's mode on bind, so the socket must live in
 /// a directory we own (not `/tmp` itself, which is root-owned with the sticky
 /// bit). This mirrors the real daemon, which always binds inside its own
-/// `zagentmesh` runtime subdir.
+/// `pohunek` runtime subdir.
 fn temp_socket(tag: &str) -> std::path::PathBuf {
     temp_dir(tag).join("daemon.sock")
 }
@@ -113,10 +113,8 @@ fn temp_dir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!(
-        "zagentmesh-test-{tag}-{}-{nanos}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("pohunek-test-{tag}-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create test socket dir");
     dir
 }
@@ -262,11 +260,7 @@ fn session_params_for_agent(agent: AgentKind, cwd: PathBuf) -> SessionNewParams 
 }
 
 /// `session.new` params binding a worktree for `repo` + `branch`.
-fn session_params_for_worktree(
-    agent: AgentKind,
-    repo: PathBuf,
-    branch: &str,
-) -> SessionNewParams {
+fn session_params_for_worktree(agent: AgentKind, repo: PathBuf, branch: &str) -> SessionNewParams {
     SessionNewParams {
         agent,
         cwd: None,
@@ -569,11 +563,11 @@ const STUB_REPORTER_PY: &str = r#"import json
 import os
 import socket
 
-session_id = os.environ.get("ZAGENTMESH_SESSION_ID")
-socket_path = os.environ.get("ZAGENTMESH_SOCKET_PATH")
-protocol_raw = os.environ.get("ZAGENTMESH_PROTOCOL_VERSION")
-native = os.environ.get("ZAGENTMESH_STUB_NATIVE_ID")
-agent = os.environ.get("ZAGENTMESH_STUB_AGENT")
+session_id = os.environ.get("POHUNEK_SESSION_ID")
+socket_path = os.environ.get("POHUNEK_SOCKET_PATH")
+protocol_raw = os.environ.get("POHUNEK_PROTOCOL_VERSION")
+native = os.environ.get("POHUNEK_STUB_NATIVE_ID")
+agent = os.environ.get("POHUNEK_STUB_AGENT")
 
 if not (session_id and socket_path and protocol_raw and native and agent):
     raise SystemExit(0)
@@ -610,8 +604,8 @@ fn stub_agent_script(argv_log: &Path, reporter_py: &Path, agent: &str, native_id
     format!(
         "#!/bin/sh\n\
 printf '%s\\n' \"$*\" >> '{argv}'\n\
-if [ \"${{ZAGENTMESH_ENV:-}}\" = \"1\" ] && command -v python3 >/dev/null 2>&1; then\n\
-  ZAGENTMESH_STUB_NATIVE_ID='{native}' ZAGENTMESH_STUB_AGENT='{agent}' python3 '{reporter}' || true\n\
+if [ \"${{POHUNEK_ENV:-}}\" = \"1\" ] && command -v python3 >/dev/null 2>&1; then\n\
+  POHUNEK_STUB_NATIVE_ID='{native}' POHUNEK_STUB_AGENT='{agent}' python3 '{reporter}' || true\n\
 fi\n\
 /bin/sleep 30\n",
         argv = argv_log.display(),
@@ -634,7 +628,10 @@ async fn wait_for_native_id(
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("native id {native_id} was not captured for session {}", id.0);
+    panic!(
+        "native id {native_id} was not captured for session {}",
+        id.0
+    );
 }
 
 /// End-to-end: a stub agent installs (simulated) its hook by reporting a native
@@ -1547,10 +1544,7 @@ async fn two_sessions_on_one_repo_get_distinct_worktrees() {
     let config = SessionRegistryConfig {
         // Each shell records its working directory into its own worktree, which
         // proves the process was launched *inside* the bound tree.
-        shell_command: ShellCommand::new(
-            "/bin/sh",
-            ["-c", "pwd > zagentmesh-pwd.txt; exec sleep 30"],
-        ),
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "pwd > pohunek-pwd.txt; exec sleep 30"]),
         stop_grace: Duration::from_millis(50),
         worktree_root: Some(worktree_root.clone()),
         store_path: Some(store_path.clone()),
@@ -1560,7 +1554,13 @@ async fn two_sessions_on_one_repo_get_distinct_worktrees() {
 
     let mut control = connect(&socket).await;
     let alpha: SessionInfo = serde_json::from_value(ok_payload(
-        create_worktree_session(&mut control, AgentKind::Shell, repo.clone(), "feature/alpha").await,
+        create_worktree_session(
+            &mut control,
+            AgentKind::Shell,
+            repo.clone(),
+            "feature/alpha",
+        )
+        .await,
     ))
     .expect("alpha session info");
     let beta: SessionInfo = serde_json::from_value(ok_payload(
@@ -1572,7 +1572,10 @@ async fn two_sessions_on_one_repo_get_distinct_worktrees() {
     let beta_path = beta.worktree_path.clone().expect("beta worktree path");
 
     // Two distinct trees — no shared working tree.
-    assert_ne!(alpha_path, beta_path, "two branches must not share a worktree");
+    assert_ne!(
+        alpha_path, beta_path,
+        "two branches must not share a worktree"
+    );
     assert!(alpha_path.starts_with(&worktree_root));
     assert!(beta_path.starts_with(&worktree_root));
 
@@ -1602,9 +1605,11 @@ async fn two_sessions_on_one_repo_get_distinct_worktrees() {
             .expect("worktree dir name")
             .as_bytes()
             .to_vec();
-        let recorded = read_file_until(&path.join("zagentmesh-pwd.txt"), &marker).await;
+        let recorded = read_file_until(&path.join("pohunek-pwd.txt"), &marker).await;
         assert!(
-            recorded.windows(marker.len()).any(|w| w == marker.as_slice()),
+            recorded
+                .windows(marker.len())
+                .any(|w| w == marker.as_slice()),
             "pwd recorded in {} must contain the worktree dir name",
             path.display()
         );
@@ -1676,10 +1681,16 @@ async fn event_log_records_lifecycle_and_never_terminal_bytes() {
     // Every non-empty line is exactly one JSON event carrying a protocol version.
     let mut saw_created = false;
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let parsed: Value =
-            serde_json::from_str(line).unwrap_or_else(|err| panic!("invalid event line {line:?}: {err}"));
-        assert!(parsed.get("v").is_some(), "event line carries a protocol version: {line}");
-        assert!(parsed.get("event").is_some(), "event line carries an event name: {line}");
+        let parsed: Value = serde_json::from_str(line)
+            .unwrap_or_else(|err| panic!("invalid event line {line:?}: {err}"));
+        assert!(
+            parsed.get("v").is_some(),
+            "event line carries a protocol version: {line}"
+        );
+        assert!(
+            parsed.get("event").is_some(),
+            "event line carries an event name: {line}"
+        );
         if parsed["event"].as_str() == Some(event::SESSION_CREATED) {
             saw_created = true;
         }
@@ -1753,7 +1764,11 @@ async fn worktree_session_resumes_with_metadata_after_restart() {
     let store = Store::new(store_path.clone());
     let resume_before = store.load_resume().expect("load resume");
     let worktrees_before = store.load_worktrees().expect("load worktrees");
-    assert_eq!(resume_before.len(), 1, "resume binding persisted: {resume_before:?}");
+    assert_eq!(
+        resume_before.len(),
+        1,
+        "resume binding persisted: {resume_before:?}"
+    );
     assert_eq!(
         worktrees_before.len(),
         1,
@@ -1781,7 +1796,10 @@ async fn worktree_session_resumes_with_metadata_after_restart() {
     // The resumed session restored its worktree metadata from the unified store.
     let mut control = connect(&socket).await;
     let resumed = wait_for_state(&mut control, &created.id, SessionState::Running).await;
-    assert_eq!(resumed.worktree_path.as_deref(), Some(worktree_path.as_path()));
+    assert_eq!(
+        resumed.worktree_path.as_deref(),
+        Some(worktree_path.as_path())
+    );
     assert_eq!(resumed.branch.as_deref(), Some("feat/x"));
     assert_eq!(resumed.repo.as_deref(), Some(repository.as_path()));
     assert_eq!(resumed.native_session_id.as_deref(), Some(native_id));

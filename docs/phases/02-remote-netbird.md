@@ -2,7 +2,7 @@
 
 ## Objective
 
-Extend `zagentmesh` from durable local sessions to your other machines on a
+Extend `pohunek` from durable local sessions to your other machines on a
 NetBird (WireGuard) network. The CLI connects directly to a remote host's daemon
 over NetBird, reusing the Phase 1 protocol unchanged. Hosts are discovered from
 local NetBird state with no provider API token.
@@ -20,7 +20,7 @@ SSH bridge, or any cloud API token.
 - CLI remote targeting using a consistent grammar (`host/session-id`), so every
   local command works against a remote host.
 - NetBird discovery: enumerate peers from `netbird status --json` (tokenless),
-  probe which peers run a reachable `zagentmesh` daemon, and obtain capabilities
+  probe which peers run a reachable `pohunek` daemon, and obtain capabilities
   by a live `host inspect` query.
 - Host commands: `host list`, `host discover`, `host inspect`.
 - Remote session lifecycle: new, list, inspect, attach, detach, stop, status —
@@ -40,13 +40,13 @@ SSH bridge, or any cloud API token.
   attach protocol; bind validated to refuse non-NetBird interfaces.
 - CLI host targeting:
   ```bash
-  zagentmesh host discover            # peers from `netbird status --json`
-  zagentmesh host list                # known/reachable hosts + daemon status
-  zagentmesh host inspect <host>      # live capability query over NetBird
-  zagentmesh session new --host <host> --agent <codex|claude>
-  zagentmesh attach <host>/<session-id>
-  zagentmesh status --host <host>
-  zagentmesh session stop <host>/<session-id>
+  pohunek host discover            # peers from `netbird status --json`
+  pohunek host list                # known/reachable hosts + daemon status
+  pohunek host inspect <host>      # live capability query over NetBird
+  pohunek session new --host <host> --agent <codex|claude>
+  pohunek attach <host>/<session-id>
+  pohunek status --host <host>
+  pohunek session stop <host>/<session-id>
   ```
 - NetBird discovery adapter: defensive parsing of `netbird status --json`
   (optional fields default, unknown fields ignored), pinned with fixtures.
@@ -105,7 +105,7 @@ now over NetBird TCP.
 ## Success Criteria
 
 - Discover your NetBird peers with no provider API token and see which run a
-  `zagentmesh` daemon.
+  `pohunek` daemon.
 - Start a Codex or Claude Code PTY/TUI session on a selected remote host.
 - Attach, detach, and reattach to a remote session without killing the remote
   process.

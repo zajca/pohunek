@@ -1,12 +1,12 @@
-//! `zagentmesh daemon start` — launch the host daemon.
+//! `pohunek daemon start` — launch the host daemon.
 //!
 //! Per `docs/plan-phase-1.md` "Build Order" step 2: `daemon start` runs the
 //! daemon. Two modes:
-//! - foreground (default): replace the CLI process with `zagentmeshd` so logs
+//! - foreground (default): replace the CLI process with `pohunekd` so logs
 //!   stream to the terminal and Ctrl-C stops it. This is the natural mode for
 //!   `systemd --user` (it execs the daemon as the service process) and for
 //!   manual debugging.
-//! - `--detach`: spawn `zagentmeshd` in the background and return immediately.
+//! - `--detach`: spawn `pohunekd` in the background and return immediately.
 //!
 //! The daemon binary is located next to the CLI binary first (the normal install
 //! layout), then on `PATH`. We never invent a path: if it cannot be found, fail
@@ -18,7 +18,7 @@ use std::process::Command;
 use crate::error::CliError;
 
 /// The daemon binary name.
-const DAEMON_BIN: &str = "zagentmeshd";
+const DAEMON_BIN: &str = "pohunekd";
 
 /// Run `daemon start`.
 ///
@@ -41,11 +41,7 @@ pub(crate) fn start(detach: bool) -> Result<(), CliError> {
             .stderr(std::process::Stdio::null())
             .spawn()
             .map_err(|e| CliError::Spawn(format!("{}: {e}", bin.display())))?;
-        println!(
-            "started {} in background (pid {})",
-            DAEMON_BIN,
-            child.id()
-        );
+        println!("started {} in background (pid {})", DAEMON_BIN, child.id());
         Ok(())
     } else {
         // Foreground: replace this process image with the daemon so signals and
@@ -64,7 +60,7 @@ fn foreground_exec(bin: &PathBuf) -> Result<(), CliError> {
     Err(CliError::Spawn(format!("exec {}: {err}", bin.display())))
 }
 
-/// Locate the `zagentmeshd` binary: sibling of the running CLI, then `PATH`.
+/// Locate the `pohunekd` binary: sibling of the running CLI, then `PATH`.
 fn locate_daemon() -> Result<PathBuf, CliError> {
     if let Ok(current) = std::env::current_exe() {
         if let Some(dir) = current.parent() {

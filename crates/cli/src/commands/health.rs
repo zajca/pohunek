@@ -1,4 +1,4 @@
-//! `zagentmesh health` (alias `status`) — query a daemon over the control plane.
+//! `pohunek health` (alias `status`) — query a daemon over the control plane.
 //!
 //! Connects to the daemon for the effective host (local Unix socket or a remote
 //! NetBird TCP connection), issues `daemon.health`, and prints the daemon and

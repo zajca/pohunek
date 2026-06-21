@@ -1,10 +1,10 @@
 [package]
-name = "zagentmesh-netbird"
+name = "pohunek-netbird"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "NetBird status parsing, host resolution, and bind-address validation for zagentmesh remote hosts."
+description = "NetBird status parsing, host resolution, and bind-address validation for pohunek remote hosts."
 
 [lib]
 name = "netbird"

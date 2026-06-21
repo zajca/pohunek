@@ -1,4 +1,4 @@
-//! `zagentmesh host` — discover, list, and inspect remote hosts over NetBird.
+//! `pohunek host` — discover, list, and inspect remote hosts over NetBird.
 //!
 //! `discover` and `list` enumerate NetBird peers and classify each by probing its
 //! daemon control port (so the operator sees which peers run a compatible
@@ -138,11 +138,7 @@ async fn discover_records() -> Result<Vec<HostRecord>, CliError> {
     // than one at a time.
     let mut probes = Vec::new();
     for peer in status.peers() {
-        let name = peer
-            .fqdn
-            .as_deref()
-            .map(short_hostname)
-            .map(str::to_owned);
+        let name = peer.fqdn.as_deref().map(short_hostname).map(str::to_owned);
         let fqdn = peer.fqdn.clone();
         let netbird_ip = peer.netbird_ip.clone();
         let target = probe_target(peer, port);
@@ -351,10 +347,7 @@ fn class_columns(class: &HostClass) -> (&'static str, String) {
         HostClass::ReachableDaemon { daemon_version } => ("reachable", daemon_version.clone()),
         HostClass::VersionMismatch {
             daemon_protocol_version,
-        } => (
-            "version_skew",
-            format!("proto {daemon_protocol_version}"),
-        ),
+        } => ("version_skew", format!("proto {daemon_protocol_version}")),
         HostClass::Unreachable => ("unreachable", "-".to_owned()),
         HostClass::Candidate => ("candidate", "-".to_owned()),
     }

@@ -415,6 +415,63 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "pohunek-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "futures",
+ "libc",
+ "pohunek-netbird",
+ "pohunek-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "pohunek-daemon"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "libc",
+ "pohunek-netbird",
+ "pohunek-protocol",
+ "portable-pty",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "vt100",
+]
+
+[[package]]
+name = "pohunek-netbird"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "pohunek-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "portable-pty"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -983,63 +1040,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "80d0f4e272c85def139476380b12f9ac60926689dd2e01d4923222f40580869d"
 dependencies = [
  "winapi",
-]
-
-[[package]]
-name = "zagentmesh-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "futures",
- "libc",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "zagentmesh-netbird",
- "zagentmesh-protocol",
-]
-
-[[package]]
-name = "zagentmesh-daemon"
-version = "0.1.0"
-dependencies = [
- "futures",
- "libc",
- "portable-pty",
- "regex",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "vt100",
- "zagentmesh-netbird",
- "zagentmesh-protocol",
-]
-
-[[package]]
-name = "zagentmesh-netbird"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "zagentmesh-protocol"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.18",
 ]
 
 [[package]]

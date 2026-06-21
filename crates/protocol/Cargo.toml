@@ -1,10 +1,10 @@
 [package]
-name = "zagentmesh-protocol"
+name = "pohunek-protocol"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Shared control-protocol envelopes and version negotiation for zagentmesh."
+description = "Shared control-protocol envelopes and version negotiation for pohunek."
 
 [lib]
 name = "protocol"

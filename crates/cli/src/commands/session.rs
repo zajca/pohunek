@@ -1,4 +1,4 @@
-//! `zagentmesh session` — manage PTY-backed sessions on a local or remote host.
+//! `pohunek session` — manage PTY-backed sessions on a local or remote host.
 //!
 //! The CLI grammar is host-aware through [`crate::target::Target`]; the effective
 //! host selects the transport ([`Client`] dials the local Unix socket or a remote
@@ -925,8 +925,7 @@ mod tests {
         assert_eq!(row[7], "feature/login", "branch column: {row:?}");
         assert_eq!(row[8], "1", "warning-count column: {row:?}");
         assert_eq!(
-            row[9],
-            "/data/worktrees/s-42-project-feature-login",
+            row[9], "/data/worktrees/s-42-project-feature-login",
             "cwd is the worktree path: {row:?}"
         );
     }
@@ -936,9 +935,7 @@ mod tests {
     fn has_row(output: &str, field: &str, value: &str) -> bool {
         output.lines().any(|line| {
             let mut parts = line.split_whitespace();
-            parts.next() == Some(field)
-                && parts.next() == Some(value)
-                && parts.next().is_none()
+            parts.next() == Some(field) && parts.next() == Some(value) && parts.next().is_none()
         })
     }
 
@@ -1063,7 +1060,9 @@ mod tests {
 
         assert!(output.contains("session s-42 created"));
         assert!(
-            output.contains("worktree: /data/worktrees/s-42-project-feature-login (branch feature/login)"),
+            output.contains(
+                "worktree: /data/worktrees/s-42-project-feature-login (branch feature/login)"
+            ),
             "new summary must mention the worktree: {output}"
         );
         assert!(

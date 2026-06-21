@@ -1,18 +1,18 @@
 [package]
-name = "zagentmesh-daemon"
+name = "pohunek-daemon"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "zagentmesh host daemon: owns PTYs and serves the control protocol."
+description = "pohunek host daemon: owns PTYs and serves the control protocol."
 
 [[bin]]
-name = "zagentmeshd"
+name = "pohunekd"
 path = "src/main.rs"
 
 [dependencies]
-zagentmesh-protocol = { path = "../protocol" }
-zagentmesh-netbird = { path = "../netbird" }
+pohunek-protocol = { path = "../protocol" }
+pohunek-netbird = { path = "../netbird" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

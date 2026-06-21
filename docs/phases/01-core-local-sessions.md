@@ -2,7 +2,7 @@
 
 ## Objective
 
-Build the first functional `zagentmesh` daemon and CLI for durable local PTY
+Build the first functional `pohunek` daemon and CLI for durable local PTY
 sessions. The daemon owns agent processes; the CLI starts, lists, inspects,
 attaches, detaches, and stops sessions through a local Unix socket. Both Codex
 and Claude Code run as PTY/TUI agents, with state detected from the terminal
@@ -22,7 +22,7 @@ usable for daily agent work before any remote capability exists.
 
 - Rust daemon owning PTYs and child processes (Tokio, `portable-pty`,
   thread-per-PTY blocking reader bridged to async).
-- Rust `zagentmesh` CLI as the primary control surface.
+- Rust `pohunek` CLI as the primary control surface.
 - Local Unix socket control protocol: newline-delimited JSON requests, responses,
   and subscription events (Serde-typed envelopes), with `request_id` and protocol
   version.
@@ -62,14 +62,14 @@ usable for daily agent work before any remote capability exists.
   systemd user service, with single-instance lock and stale-socket recovery.
 - CLI commands:
   ```bash
-  zagentmesh doctor
-  zagentmesh daemon start
-  zagentmesh session new --agent <codex|claude> [--repo <path>] [--branch <name>]
-  zagentmesh session list
-  zagentmesh session inspect <session-id>
-  zagentmesh attach <session-id>
-  zagentmesh session stop <session-id>
-  zagentmesh status
+  pohunek doctor
+  pohunek daemon start
+  pohunek session new --agent <codex|claude> [--repo <path>] [--branch <name>]
+  pohunek session list
+  pohunek session inspect <session-id>
+  pohunek attach <session-id>
+  pohunek session stop <session-id>
+  pohunek status
   ```
 - Control protocol implementation (newline-JSON) with typed envelopes and version
   negotiation.

@@ -21,25 +21,25 @@ use protocol::{
 };
 use serde_json::{json, Map, Value};
 
-/// Gate flag the daemon sets so the hook knows it was launched by zagentmesh.
-pub const ENV_FLAG: &str = "ZAGENTMESH_ENV";
+/// Gate flag the daemon sets so the hook knows it was launched by pohunek.
+pub const ENV_FLAG: &str = "POHUNEK_ENV";
 /// Control-socket path the hook dials to report the native session id.
-pub const ENV_SOCKET_PATH: &str = "ZAGENTMESH_SOCKET_PATH";
-/// The zagentmesh session id the agent was launched under.
-pub const ENV_SESSION_ID: &str = "ZAGENTMESH_SESSION_ID";
+pub const ENV_SOCKET_PATH: &str = "POHUNEK_SOCKET_PATH";
+/// The pohunek session id the agent was launched under.
+pub const ENV_SESSION_ID: &str = "POHUNEK_SESSION_ID";
 /// Wire protocol version the hook must stamp on its request envelope.
 ///
 /// Injected (rather than baked into the asset) so the hook never hardcodes the
 /// protocol version: the daemon, which owns `PROTOCOL_VERSION`, is the single
 /// source of truth.
-pub const ENV_PROTOCOL_VERSION: &str = "ZAGENTMESH_PROTOCOL_VERSION";
+pub const ENV_PROTOCOL_VERSION: &str = "POHUNEK_PROTOCOL_VERSION";
 
 /// Installed hook script file name (shared by both agents).
-const HOOK_INSTALL_NAME: &str = "zagentmesh-agent-state.sh";
+const HOOK_INSTALL_NAME: &str = "pohunek-agent-state.sh";
 /// The Claude hook script, embedded at compile time.
-const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/zagentmesh-agent-state.sh");
+const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/pohunek-agent-state.sh");
 /// The Codex hook script, embedded at compile time.
-const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/zagentmesh-agent-state.sh");
+const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/pohunek-agent-state.sh");
 /// Per-hook timeout (seconds) recorded in the agent's hook config.
 const HOOK_TIMEOUT_SECS: u64 = 10;
 /// Action argument passed to the hook script for the `SessionStart` event.
@@ -75,10 +75,16 @@ pub struct InstallPaths {
 pub fn install(agent: Option<AgentKind>) -> Result<IntegrationInstallResult, ProtocolError> {
     let installed = match agent {
         Some(AgentKind::Claude) => {
-            vec![report(AgentKind::Claude, install_claude(&claude_config_dir()?)?)]
+            vec![report(
+                AgentKind::Claude,
+                install_claude(&claude_config_dir()?)?,
+            )]
         }
         Some(AgentKind::Codex) => {
-            vec![report(AgentKind::Codex, install_codex(&codex_config_dir()?)?)]
+            vec![report(
+                AgentKind::Codex,
+                install_codex(&codex_config_dir()?)?,
+            )]
         }
         Some(AgentKind::Shell) => {
             return Err(ProtocolError::new(
@@ -143,7 +149,7 @@ pub fn codex_config_dir() -> Result<PathBuf, ProtocolError> {
 
 /// Install the Claude `SessionStart` hook into `claude_dir`.
 ///
-/// Writes `hooks/zagentmesh-agent-state.sh` and merges a `SessionStart` hook
+/// Writes `hooks/pohunek-agent-state.sh` and merges a `SessionStart` hook
 /// (matcher `*`) into `settings.json`, stripping any hooks this installer owns
 /// first so reinstall is idempotent.
 ///
@@ -177,7 +183,7 @@ pub fn install_claude(claude_dir: &Path) -> Result<InstallPaths, ProtocolError> 
 
 /// Install the Codex `SessionStart` hook into `codex_dir`.
 ///
-/// Writes `zagentmesh-agent-state.sh`, merges a `SessionStart` hook into
+/// Writes `pohunek-agent-state.sh`, merges a `SessionStart` hook into
 /// `hooks.json`, and enables `[features] hooks = true` in `config.toml`,
 /// idempotently.
 ///
@@ -417,14 +423,16 @@ fn config_dir(env_var: &str, home_relative: &str) -> Result<PathBuf, ProtocolErr
     if let Some(value) = std::env::var_os(env_var).filter(|value| !value.is_empty()) {
         return Ok(expand_tilde(PathBuf::from(value)));
     }
-    let home = std::env::var_os("HOME").filter(|value| !value.is_empty()).ok_or_else(|| {
-        ProtocolError::new(
-            ErrorClass::Configuration,
-            "missing_env",
-            format!("cannot resolve agent config dir: neither {env_var} nor HOME is set"),
-            None,
-        )
-    })?;
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ProtocolError::new(
+                ErrorClass::Configuration,
+                "missing_env",
+                format!("cannot resolve agent config dir: neither {env_var} nor HOME is set"),
+                None,
+            )
+        })?;
     Ok(PathBuf::from(home).join(home_relative))
 }
 
@@ -535,7 +543,7 @@ mod tests {
             .expect("system time after epoch")
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "zagentmesh-integration-{tag}-{}-{nanos}",
+            "pohunek-integration-{tag}-{}-{nanos}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).expect("create temp dir");
@@ -564,12 +572,20 @@ mod tests {
     #[test]
     fn assets_fire_our_method_with_our_env_and_exit_zero_on_missing_env() {
         for asset in [CLAUDE_HOOK_ASSET, CODEX_HOOK_ASSET] {
-            assert!(asset.starts_with("#!/bin/sh"), "hook must be a POSIX sh script");
+            assert!(
+                asset.starts_with("#!/bin/sh"),
+                "hook must be a POSIX sh script"
+            );
             assert!(
                 asset.contains(method::SESSION_REPORT_NATIVE_ID),
                 "hook must fire our native-id method"
             );
-            for env_name in [ENV_FLAG, ENV_SOCKET_PATH, ENV_SESSION_ID, ENV_PROTOCOL_VERSION] {
+            for env_name in [
+                ENV_FLAG,
+                ENV_SOCKET_PATH,
+                ENV_SESSION_ID,
+                ENV_PROTOCOL_VERSION,
+            ] {
                 assert!(
                     asset.contains(env_name),
                     "hook must reference handshake env {env_name}"
@@ -615,10 +631,7 @@ mod tests {
         assert_eq!(commands.len(), 1, "exactly one SessionStart hook");
         assert!(commands[0].contains(paths.hook_path.to_str().unwrap()));
         // matcher is "*"
-        assert_eq!(
-            settings["hooks"]["SessionStart"][0]["matcher"],
-            json!("*")
-        );
+        assert_eq!(settings["hooks"]["SessionStart"][0]["matcher"], json!("*"));
     }
 
     #[test]
@@ -664,9 +677,12 @@ mod tests {
         assert!(commands.contains(&"echo user-sessionstart".to_owned()));
         let ours = commands
             .iter()
-            .filter(|command| command.contains("zagentmesh-agent-state.sh"))
+            .filter(|command| command.contains("pohunek-agent-state.sh"))
             .count();
-        assert_eq!(ours, 1, "reinstall must not duplicate our hook: {commands:?}");
+        assert_eq!(
+            ours, 1,
+            "reinstall must not duplicate our hook: {commands:?}"
+        );
     }
 
     #[test]

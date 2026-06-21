@@ -302,10 +302,7 @@ fn session_input_result_json_shape_roundtrips() {
 
 #[test]
 fn session_report_native_id_method_name_is_stable() {
-    assert_eq!(
-        method::SESSION_REPORT_NATIVE_ID,
-        "session.report_native_id"
-    );
+    assert_eq!(method::SESSION_REPORT_NATIVE_ID, "session.report_native_id");
 }
 
 #[test]
@@ -465,9 +462,7 @@ fn session_info_roundtrips_with_worktree_fields_and_warnings() {
         cwd: PathBuf::from("/data/worktrees/s-42-project-feature-login"),
         repo: Some(PathBuf::from("/workspace/project")),
         branch: Some("feature/login".to_owned()),
-        worktree_path: Some(PathBuf::from(
-            "/data/worktrees/s-42-project-feature-login",
-        )),
+        worktree_path: Some(PathBuf::from("/data/worktrees/s-42-project-feature-login")),
         warnings: vec![SessionWarning {
             kind: SessionWarningKind::BaseBranchFallback,
             message: "Requested base branch \"release\" not found; used \"main\".".to_owned(),
@@ -540,12 +535,12 @@ fn integration_install_result_roundtrips() {
         installed: vec![
             IntegrationInstallReport {
                 agent: AgentKind::Claude,
-                hook_path: "/home/user/.claude/hooks/zagentmesh-agent-state.sh".to_owned(),
+                hook_path: "/home/user/.claude/hooks/pohunek-agent-state.sh".to_owned(),
                 config_paths: vec!["/home/user/.claude/settings.json".to_owned()],
             },
             IntegrationInstallReport {
                 agent: AgentKind::Codex,
-                hook_path: "/home/user/.codex/zagentmesh-agent-state.sh".to_owned(),
+                hook_path: "/home/user/.codex/pohunek-agent-state.sh".to_owned(),
                 config_paths: vec![
                     "/home/user/.codex/hooks.json".to_owned(),
                     "/home/user/.codex/config.toml".to_owned(),

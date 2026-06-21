@@ -1,4 +1,4 @@
-//! `zagentmeshd` — the zagentmesh host daemon binary.
+//! `pohunekd` — the pohunek host daemon binary.
 //!
 //! Milestone 2: resolve XDG paths, initialize JSON logging, acquire the
 //! single-instance lock, bind the control socket (with stale-socket recovery and
@@ -16,10 +16,10 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
-use zagentmesh_daemon::api::{ControlServer, DaemonState, HealthInfo, RemoteServer};
-use zagentmesh_daemon::lock::InstanceLock;
-use zagentmesh_daemon::session::{SessionRegistry, SessionRegistryConfig};
-use zagentmesh_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
+use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo, RemoteServer};
+use pohunek_daemon::lock::InstanceLock;
+use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
+use pohunek_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
 
 /// File name of the unified metadata store (resume + worktree bindings) under
 /// the data dir.
@@ -38,7 +38,7 @@ async fn main() -> ExitCode {
         Err(err) => {
             // Logging may not be initialized yet (e.g. missing env), so also
             // print to stderr to guarantee the operator sees the failure.
-            eprintln!("zagentmeshd: fatal: {err}");
+            eprintln!("pohunekd: fatal: {err}");
             error!(error = %err, "daemon exited with error");
             ExitCode::FAILURE
         }
@@ -55,7 +55,7 @@ async fn run() -> Result<(), DaemonError> {
         daemon_version = DAEMON_VERSION,
         runtime_dir = %paths.runtime_dir.display(),
         log_dir = %paths.log_dir.display(),
-        "zagentmeshd starting"
+        "pohunekd starting"
     );
 
     // 3. Ensure the runtime dir exists (0700) before taking the lock in it.
@@ -142,7 +142,7 @@ async fn run() -> Result<(), DaemonError> {
     //     shutdown are not lost (bounded so a wedged write cannot hang exit).
     sessions.shutdown_event_log().await;
 
-    info!("zagentmeshd stopped");
+    info!("pohunekd stopped");
     Ok(())
 }
 

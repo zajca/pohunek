@@ -5,8 +5,8 @@
 //! second acquire on the same path fails with `AlreadyRunning`. After the first
 //! is dropped, acquisition succeeds again.
 
-use zagentmesh_daemon::error::DaemonError;
-use zagentmesh_daemon::lock::InstanceLock;
+use pohunek_daemon::error::DaemonError;
+use pohunek_daemon::lock::InstanceLock;
 
 fn temp_lock(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
@@ -14,7 +14,10 @@ fn temp_lock(tag: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    p.push(format!("zagentmesh-test-{tag}-{}-{nanos}.lock", std::process::id()));
+    p.push(format!(
+        "pohunek-test-{tag}-{}-{nanos}.lock",
+        std::process::id()
+    ));
     p
 }
 

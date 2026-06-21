@@ -1,4 +1,4 @@
-//! zagentmesh control protocol.
+//! pohunek control protocol.
 //!
 //! This crate defines the typed control envelopes exchanged between the CLI and
 //! the daemon over the local Unix socket (and, in Phase 2, over NetBird TCP).

@@ -129,7 +129,7 @@ impl ProtocolError {
             "agent_binary_missing",
             format!("agent binary not found on PATH: {binary}"),
             Some(format!(
-                "install the {binary} CLI and ensure it is on PATH; run `zagentmesh doctor` to verify"
+                "install the {binary} CLI and ensure it is on PATH; run `pohunek doctor` to verify"
             )),
         )
     }
@@ -147,7 +147,7 @@ impl ProtocolError {
             "netbird_cli_missing",
             "the `netbird` CLI was not found on PATH".to_owned(),
             Some(
-                "install the NetBird CLI and ensure it is on PATH; run `zagentmesh doctor` to verify"
+                "install the NetBird CLI and ensure it is on PATH; run `pohunek doctor` to verify"
                     .to_owned(),
             ),
         )
@@ -166,7 +166,7 @@ impl ProtocolError {
             "netbird_state_unavailable",
             format!("NetBird local state is unavailable: {}", detail.into()),
             Some(
-                "ensure the NetBird daemon is running and this host is logged in; run `zagentmesh doctor` to verify"
+                "ensure the NetBird daemon is running and this host is logged in; run `pohunek doctor` to verify"
                     .to_owned(),
             ),
         )
@@ -184,8 +184,7 @@ impl ProtocolError {
             "host_unknown",
             format!("host '{host}' was not found among NetBird peers"),
             Some(
-                "run `zagentmesh host list` to see reachable peers and check the host name"
-                    .to_owned(),
+                "run `pohunek host list` to see reachable peers and check the host name".to_owned(),
             ),
         )
     }
@@ -201,16 +200,14 @@ impl ProtocolError {
             ErrorClass::Transport,
             "host_unreachable",
             format!("could not open a NetBird connection to host '{host}'"),
-            Some(
-                "check that the host is online and its zagentmesh daemon is running".to_owned(),
-            ),
+            Some("check that the host is online and its pohunek daemon is running".to_owned()),
         )
     }
 
     /// The canonical `daemon/remote_daemon_unavailable` error.
     ///
     /// Raised when a NetBird TCP connection to the host opened, but no compatible
-    /// zagentmesh daemon answered on the control port. Names the host so the
+    /// pohunek daemon answered on the control port. Names the host so the
     /// operator can investigate that specific peer. Code is stable:
     /// `remote_daemon_unavailable`.
     #[must_use]
@@ -218,8 +215,8 @@ impl ProtocolError {
         Self::new(
             ErrorClass::Daemon,
             "remote_daemon_unavailable",
-            format!("connected to host '{host}' but no compatible zagentmesh daemon answered"),
-            Some("ensure a matching zagentmesh daemon is running on the host".to_owned()),
+            format!("connected to host '{host}' but no compatible pohunek daemon answered"),
+            Some("ensure a matching pohunek daemon is running on the host".to_owned()),
         )
     }
 }

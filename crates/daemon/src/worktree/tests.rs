@@ -23,10 +23,7 @@ fn unique_dir(tag: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system time after epoch")
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "zagentmesh-wt-{tag}-{}-{nanos}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("pohunek-wt-{tag}-{}-{nanos}", std::process::id()));
     fs::create_dir_all(&dir).expect("create temp dir");
     dir
 }
@@ -164,8 +161,15 @@ fn bind_creates_a_valid_worktree_and_records_a_binding() {
         .expect("bind worktree");
 
     assert!(!bound.reused);
-    assert!(bound.warnings.is_empty(), "clean create: {:?}", bound.warnings);
-    assert!(is_valid_worktree(&bound.path), "bound path must be a git worktree");
+    assert!(
+        bound.warnings.is_empty(),
+        "clean create: {:?}",
+        bound.warnings
+    );
+    assert!(
+        is_valid_worktree(&bound.path),
+        "bound path must be a git worktree"
+    );
     assert_eq!(bound.base_branch, "main");
 
     let binding = mgr
@@ -182,7 +186,9 @@ fn bind_creates_a_valid_worktree_and_records_a_binding() {
 fn bind_reuses_an_owned_valid_worktree() {
     let mgr = manager("reuse");
     let repo = init_repo("reuse-repo");
-    let first = mgr.bind(&request("s-1", &repo, "feat/x")).expect("first bind");
+    let first = mgr
+        .bind(&request("s-1", &repo, "feat/x"))
+        .expect("first bind");
     assert!(!first.reused);
 
     // Re-binding the same (session, repo, branch) must reuse, not re-run
@@ -228,7 +234,9 @@ fn bind_refuses_a_foreign_directory_at_the_target_path() {
 fn bind_recreates_when_owned_directory_was_lost() {
     let mgr = manager("recreate");
     let repo = init_repo("recreate-repo");
-    let first = mgr.bind(&request("s-1", &repo, "feat/x")).expect("first bind");
+    let first = mgr
+        .bind(&request("s-1", &repo, "feat/x"))
+        .expect("first bind");
 
     // Simulate the worktree directory being lost while the binding remains.
     fs::remove_dir_all(&first.path).expect("remove worktree dir");
@@ -281,7 +289,10 @@ fn bind_rejects_flag_injecting_default_branch_from_crafted_head() {
     // Configure an origin so the fetch path would be reached if validation
     // failed to catch the crafted HEAD.
     let bogus = unique_dir("crafted-head-origin").join("missing.git");
-    git_in(&repo, &["remote", "add", "origin", &bogus.to_string_lossy()]);
+    git_in(
+        &repo,
+        &["remote", "add", "origin", &bogus.to_string_lossy()],
+    );
     // Craft HEAD to a dash-leading ref directly (a real attacker controls the
     // repo's .git contents).
     fs::write(
@@ -314,7 +325,8 @@ fn detached_head_binds_with_explicit_base_but_fails_without() {
     let with_base = {
         let mut req = request("s-1", &repo, "feat/x");
         req.base_branch = Some("main".to_owned());
-        mgr.bind(&req).expect("bind with explicit base on detached HEAD")
+        mgr.bind(&req)
+            .expect("bind with explicit base on detached HEAD")
     };
     assert!(is_valid_worktree(&with_base.path));
     assert_eq!(with_base.base_branch, "main");
@@ -359,7 +371,10 @@ fn successful_fetch_starts_the_worktree_from_the_fetched_commit() {
     git_in(&upstream, &["commit", "-q", "-m", "v2"]);
     let upstream_tip = git_stdout(&upstream, &["rev-parse", "HEAD"]);
     let stale_local = git_stdout(&downstream, &["rev-parse", "refs/heads/main"]);
-    assert_ne!(upstream_tip, stale_local, "local must be stale before fetch");
+    assert_ne!(
+        upstream_tip, stale_local,
+        "local must be stale before fetch"
+    );
 
     let mgr = manager("fetch-success");
     let mut req = request("s-1", &downstream, "feat/x");
@@ -382,7 +397,9 @@ fn successful_fetch_starts_the_worktree_from_the_fetched_commit() {
 fn second_session_on_same_branch_gets_a_clear_in_use_error() {
     let mgr = manager("same-branch");
     let repo = init_repo("same-branch-repo");
-    let first = mgr.bind(&request("s-1", &repo, "feat/shared")).expect("first bind");
+    let first = mgr
+        .bind(&request("s-1", &repo, "feat/shared"))
+        .expect("first bind");
     assert!(is_valid_worktree(&first.path));
 
     // A different session requesting the SAME branch cannot get a second
@@ -403,7 +420,10 @@ fn base_branch_fallback_keeps_the_worktree_with_a_warning() {
     req.base_branch = Some("release/does-not-exist".to_owned());
 
     let bound = mgr.bind(&req).expect("bind falls back, does not abort");
-    assert!(is_valid_worktree(&bound.path), "worktree must survive fallback");
+    assert!(
+        is_valid_worktree(&bound.path),
+        "worktree must survive fallback"
+    );
     assert_eq!(bound.base_branch, "main", "fell back to the default branch");
     let warning = bound
         .warnings
@@ -421,12 +441,18 @@ fn fetch_failure_keeps_the_worktree_with_a_warning() {
     // Configure an origin remote that cannot be fetched from: `git fetch origin
     // main` fails, but the local `main` exists, so binding falls back to it.
     let bogus = unique_dir("fetch-warn-bogus").join("missing.git");
-    git_in(&repo, &["remote", "add", "origin", &bogus.to_string_lossy()]);
+    git_in(
+        &repo,
+        &["remote", "add", "origin", &bogus.to_string_lossy()],
+    );
 
     let bound = mgr
         .bind(&request("s-1", &repo, "feat/x"))
         .expect("bind falls back when fetch fails");
-    assert!(is_valid_worktree(&bound.path), "worktree must survive fetch failure");
+    assert!(
+        is_valid_worktree(&bound.path),
+        "worktree must survive fetch failure"
+    );
     assert!(
         bound
             .warnings
@@ -458,9 +484,9 @@ fn failing_setup_script_keeps_the_worktree_with_a_warning() {
     let repo = init_repo("setup-warn-repo");
     // Commit a setup script on main that exits non-zero; the worktree (created
     // from main) inherits it.
-    fs::create_dir_all(repo.join(".zagentmesh")).expect("create .zagentmesh");
+    fs::create_dir_all(repo.join(".pohunek")).expect("create .pohunek");
     fs::write(
-        repo.join(".zagentmesh/setup"),
+        repo.join(".pohunek/setup"),
         "#!/bin/sh\necho 'boom' >&2\nexit 3\n",
     )
     .expect("write setup script");
@@ -470,7 +496,10 @@ fn failing_setup_script_keeps_the_worktree_with_a_warning() {
     let bound = mgr
         .bind(&request("s-1", &repo, "feat/x"))
         .expect("bind keeps worktree despite setup failure");
-    assert!(is_valid_worktree(&bound.path), "worktree must survive setup failure");
+    assert!(
+        is_valid_worktree(&bound.path),
+        "worktree must survive setup failure"
+    );
     let warning = bound
         .warnings
         .iter()
@@ -483,8 +512,8 @@ fn failing_setup_script_keeps_the_worktree_with_a_warning() {
 fn successful_setup_script_produces_no_warning() {
     let mgr = manager("setup-ok");
     let repo = init_repo("setup-ok-repo");
-    fs::create_dir_all(repo.join(".zagentmesh")).expect("create .zagentmesh");
-    fs::write(repo.join(".zagentmesh/setup"), "#!/bin/sh\nexit 0\n").expect("write setup");
+    fs::create_dir_all(repo.join(".pohunek")).expect("create .pohunek");
+    fs::write(repo.join(".pohunek/setup"), "#!/bin/sh\nexit 0\n").expect("write setup");
     git_in(&repo, &["add", "."]);
     git_in(&repo, &["commit", "-q", "-m", "add ok setup"]);
 
@@ -505,16 +534,18 @@ fn failing_setup_script_warning_detail_excludes_script_stderr() {
     let mgr = manager("setup-secret");
     let repo = init_repo("setup-secret-repo");
     let secret = "SUPER_SECRET_TOKEN_abc123";
-    fs::create_dir_all(repo.join(".zagentmesh")).expect("create .zagentmesh");
+    fs::create_dir_all(repo.join(".pohunek")).expect("create .pohunek");
     fs::write(
-        repo.join(".zagentmesh/setup"),
+        repo.join(".pohunek/setup"),
         format!("#!/bin/sh\necho '{secret}' >&2\nexit 7\n"),
     )
     .expect("write setup script");
     git_in(&repo, &["add", "."]);
     git_in(&repo, &["commit", "-q", "-m", "add leaking setup"]);
 
-    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind keeps worktree");
+    let bound = mgr
+        .bind(&request("s-1", &repo, "feat/x"))
+        .expect("bind keeps worktree");
     let warning = bound
         .warnings
         .iter()
@@ -541,13 +572,13 @@ fn hanging_setup_script_is_terminated_with_its_forked_children() {
     // so that child must be gone too.
     let mgr = manager_with_timeout("setup-timeout", Duration::from_secs(1));
     let repo = init_repo("setup-timeout-repo");
-    fs::create_dir_all(repo.join(".zagentmesh")).expect("create .zagentmesh");
+    fs::create_dir_all(repo.join(".pohunek")).expect("create .pohunek");
     // `sleep 30` is bounded so a regression that leaves a runaway self-terminates
     // rather than lingering for the box's lifetime. No shell exec-optimization
     // (the shell stays a real parent of a real child) thanks to the trailing
     // `wait`. The pid is written into the (kept) worktree for the test to probe.
     fs::write(
-        repo.join(".zagentmesh/setup"),
+        repo.join(".pohunek/setup"),
         "#!/bin/sh\nsleep 30 &\necho \"$!\" > setup-child.pid\nwait\n",
     )
     .expect("write setup");
@@ -563,7 +594,10 @@ fn hanging_setup_script_is_terminated_with_its_forked_children() {
         elapsed < Duration::from_secs(20),
         "bind must return shortly after the timeout, took {elapsed:?}"
     );
-    assert!(is_valid_worktree(&bound.path), "worktree kept after a setup timeout");
+    assert!(
+        is_valid_worktree(&bound.path),
+        "worktree kept after a setup timeout"
+    );
 
     let warning = bound
         .warnings
@@ -649,7 +683,9 @@ fn binding_persist_failure_rolls_back_the_worktree() {
     if fs::write(&probe, b"x").is_ok() {
         let _ = fs::remove_file(&probe);
         fs::set_permissions(&store_dir, fs::Permissions::from_mode(0o755)).ok();
-        eprintln!("skipping binding_persist_failure_rolls_back_the_worktree: perms not enforced (root?)");
+        eprintln!(
+            "skipping binding_persist_failure_rolls_back_the_worktree: perms not enforced (root?)"
+        );
         return;
     }
 
@@ -683,7 +719,10 @@ fn cleanup_session_removes_only_owned_worktrees() {
     // Unknown session: nothing owned, nothing removed.
     let none = mgr.cleanup_session("s-unknown").expect("cleanup unknown");
     assert_eq!(none, 0);
-    assert!(bound.path.exists(), "an unowned session must not touch our tree");
+    assert!(
+        bound.path.exists(),
+        "an unowned session must not touch our tree"
+    );
 
     // Owned session: the tree and its binding are removed.
     let removed = mgr.cleanup_session("s-1").expect("cleanup owned");
@@ -723,8 +762,12 @@ fn redact_url_credentials_strips_userinfo_from_git_error_output() {
     );
 
     // user:password form is also scrubbed.
-    let userpass = redact_url_credentials("clone of https://alice:hunter2@example.com/x.git failed");
-    assert!(!userpass.contains("hunter2"), "password redacted: {userpass}");
+    let userpass =
+        redact_url_credentials("clone of https://alice:hunter2@example.com/x.git failed");
+    assert!(
+        !userpass.contains("hunter2"),
+        "password redacted: {userpass}"
+    );
     assert!(!userpass.contains("alice"), "username redacted: {userpass}");
     assert!(userpass.contains("https://<redacted>@example.com/x.git"));
 

@@ -1,6 +1,6 @@
-# zagentmesh Architecture
+# pohunek Architecture
 
-This document describes the application architecture for `zagentmesh`.
+This document describes the application architecture for `pohunek`.
 
 ## Status and Scope of This Revision
 
@@ -20,7 +20,7 @@ Key consequences of that scope, decided explicitly:
   from the original plan are **out of scope**. The network (NetBird/WireGuard)
   and ordinary filesystem permissions are the trust boundary.
 - **Remote transport is direct over NetBird**, not an SSH bridge.
-- **Agents run PTY/TUI-first** (real terminals). `zagentmesh` is a
+- **Agents run PTY/TUI-first** (real terminals). `pohunek` is a
   terminal multiplexer for agents, not a re-rendered control plane.
 - **Discovery is tokenless NetBird-local**, with live capability queries instead
   of signed manifest exchange.
@@ -34,7 +34,7 @@ Key consequences of that scope, decided explicitly:
 
 - Provide a CLI-first control plane for durable coding-agent work across your own
   machines on a NetBird network.
-- Keep every meaningful workflow available through `zagentmesh` commands with
+- Keep every meaningful workflow available through `pohunek` commands with
   human-readable defaults and machine-readable `--json` output.
 - Run without a central application server. The CLI talks directly to a daemon on
   each host (locally over a Unix socket, remotely over NetBird).
@@ -127,7 +127,7 @@ error rather than falling back to unsafe defaults.
 
 There is one logical protocol exposed over two transports:
 
-- **Local:** Unix domain socket at `$XDG_RUNTIME_DIR/zagentmesh/daemon.sock`
+- **Local:** Unix domain socket at `$XDG_RUNTIME_DIR/pohunek/daemon.sock`
   (directory mode `0700`, socket mode `0600`). This is the only access control
   needed for the single-user model: the socket is owner-private.
 - **Remote:** TCP listener bound **only** to the host's NetBird address
@@ -242,7 +242,7 @@ Discovery is tokenless and NetBird-local. There is no signed manifest exchange.
 
 1. The daemon/CLI reads local NetBird state via `netbird status --json` (no
    management-API token) to enumerate peers, NetBird addresses, and names.
-2. Candidate peers are probed to see which run a reachable `zagentmesh` daemon.
+2. Candidate peers are probed to see which run a reachable `pohunek` daemon.
 3. Capabilities are obtained by a **live query** to the target daemon over the
    direct NetBird connection (`host inspect`), not from a cached manifest.
 
@@ -293,14 +293,14 @@ Resume safety rules:
 Configuration under the user config directory:
 
 ```text
-~/.config/zagentmesh/
+~/.config/pohunek/
   config.toml
 ```
 
 Runtime state under the user data directory:
 
 ```text
-~/.local/share/zagentmesh/
+~/.local/share/pohunek/
   resume-bindings.jsonl    # sessions + resume metadata (JSON lines, 0600)
   worktree-bindings.jsonl  # worktree bindings (JSON lines, 0600)
   events/                  # local append-only event log (audit/debug, not replicated)
@@ -310,7 +310,7 @@ Runtime state under the user data directory:
 Structured logs under the user state directory:
 
 ```text
-~/.local/state/zagentmesh/logs/
+~/.local/state/pohunek/logs/
 ```
 
 The metadata stores are file-based (JSON lines, atomic temp+rename, `0600`); the
@@ -341,7 +341,7 @@ cheap, free-by-default, or inherited:
   operator agent that reads attacker-influenced text (a malicious issue, PR, or
   repository content) and then acts is a risk you already accept by running Codex
   / Claude Code. It is mitigated by those agents' own approval gates, not by a
-  new authorization layer in `zagentmesh`. Dangerous operations (e.g. starting
+  new authorization layer in `pohunek`. Dangerous operations (e.g. starting
   sessions on other hosts) stay behind explicit, per-action confirmation.
 - **Secrets in terminal output are accepted, not guaranteed-redacted.** Agents
   may print tokens to the PTY; scrollback on your own disk may therefore contain
@@ -354,7 +354,7 @@ to the control plane.
 
 ## Observability
 
-Structured logs under `~/.local/state/zagentmesh/logs/`, redacting secrets and
+Structured logs under `~/.local/state/pohunek/logs/`, redacting secrets and
 sensitive terminal content. Useful signals:
 
 - Daemon startup/shutdown and single-instance/socket recovery.
@@ -365,7 +365,7 @@ sensitive terminal content. Useful signals:
 - Agent state transitions with their `source`.
 - Latency for CLI commands, attach, discovery, and remote connections.
 
-`zagentmesh doctor` reports environment, daemon, NetBird, agent CLI, and storage
+`pohunek doctor` reports environment, daemon, NetBird, agent CLI, and storage
 health for humans and operator agents.
 
 ## Error Handling

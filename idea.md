@@ -1,4 +1,4 @@
-# zagentmesh Idea
+# pohunek Idea
 
 > **Status / Revised Direction (current).** This file is the original, broad
 > brainstorm and is kept for context. The **committed direction** is narrower and
@@ -15,7 +15,7 @@
 
 ## Working Name
 
-zagentmesh. The product name and prototype CLI binary name are both `zagentmesh`.
+pohunek. The product name and prototype CLI binary name are both `pohunek`.
 
 ## One-Line Vision
 
@@ -112,7 +112,7 @@ How to adapt it:
 
 ## Resolved Early Decisions
 
-- Product and CLI name: `zagentmesh`.
+- Product and CLI name: `pohunek`.
 - First implementation stack: Rust daemon and Rust CLI first; GUI comes later.
 - GUI platform target: the GUI is Linux-first. macOS and Windows compatibility can be explored later, but they should not shape the first GUI architecture or block the Linux client.
 - libghostty strategy: build a small Linux-first mini GUI proof of concept early to validate integration risk and basic UX, but do not block the daemon/CLI MVP on a full GUI client.
@@ -133,21 +133,21 @@ The CLI should be the primary product surface, not a thin admin tool.
 Example commands:
 
 ```bash
-zagentmesh doctor
-zagentmesh init
-zagentmesh host list
-zagentmesh host discover --vpn tailscale
-zagentmesh host discover --vpn netbird
-zagentmesh host join ssh://workbox
-zagentmesh host inspect workbox
-zagentmesh session new --host workbox --repo github.com/acme/api --work-item LIN-123
-zagentmesh agent run codex --host workbox --instructions plan.md
-zagentmesh attach workbox/session-42
-zagentmesh status
-zagentmesh inbox
-zagentmesh task list --provider linear
-zagentmesh pr open --provider github --session session-42
-zagentmesh review session-42
+pohunek doctor
+pohunek init
+pohunek host list
+pohunek host discover --vpn tailscale
+pohunek host discover --vpn netbird
+pohunek host join ssh://workbox
+pohunek host inspect workbox
+pohunek session new --host workbox --repo github.com/acme/api --work-item LIN-123
+pohunek agent run codex --host workbox --instructions plan.md
+pohunek attach workbox/session-42
+pohunek status
+pohunek inbox
+pohunek task list --provider linear
+pohunek pr open --provider github --session session-42
+pohunek review session-42
 ```
 
 CLI requirements:
@@ -209,7 +209,7 @@ Discovery uses provider adapters:
 
 - Tailscale: tailnet device inventory, MagicDNS names, tags, and Tailscale SSH where enabled.
 - NetBird: peer inventory, DNS/names, ACL-aware private addresses, and standard OpenSSH over the NetBird network unless a stronger provider-native SSH identity layer is available.
-- Generic SSH: `~/.ssh/config`, static inventory files, and explicit `zagentmesh host join ssh://...`.
+- Generic SSH: `~/.ssh/config`, static inventory files, and explicit `pohunek host join ssh://...`.
 
 Discovery must work without cloud API tokens for the normal single-user path. The first layer should inspect local VPN state, local DNS names, SSH config, known hosts, and explicitly joined hosts. Provider cloud APIs can be configured later to enrich metadata, validate policy, or import team inventory, but they should not be required to discover and trust reachable hosts inside a private network.
 
@@ -290,7 +290,7 @@ Provider API posture:
 - default discovery must not require Tailscale, NetBird, or other cloud API tokens;
 - local provider CLIs and OS/network state are preferred where available;
 - cloud API tokens are opt-in and only unlock richer inventory, tags, ACL context, and team policy checks;
-- absence of provider API access should never block explicit `zagentmesh host join ssh://...`.
+- absence of provider API access should never block explicit `pohunek host join ssh://...`.
 
 ### Agent Runtime Layer
 
@@ -394,9 +394,9 @@ Resume safety rules:
 ### First Host
 
 ```bash
-zagentmesh init
-zagentmesh daemon start
-zagentmesh doctor
+pohunek init
+pohunek daemon start
+pohunek doctor
 ```
 
 This creates local configuration, starts the daemon, creates a local trust root, and checks available agent CLIs, Git, SSH, Docker, Tailscale, NetBird, and provider credentials.
@@ -404,7 +404,7 @@ This creates local configuration, starts the daemon, creates a local trust root,
 ### Additional Host
 
 ```bash
-zagentmesh host join ssh://workbox
+pohunek host join ssh://workbox
 ```
 
 The joining flow should:
@@ -420,9 +420,9 @@ The joining flow should:
 ### VPN Discovery
 
 ```bash
-zagentmesh host discover --vpn tailscale
-zagentmesh host discover --vpn netbird
-zagentmesh host trust workbox
+pohunek host discover --vpn tailscale
+pohunek host discover --vpn netbird
+pohunek host trust workbox
 ```
 
 Discovery finds candidates, but trust is explicit. A discovered host should not receive commands until trusted.
@@ -464,7 +464,7 @@ Audit posture:
 Configuration should live in a dedicated config directory, likely:
 
 ```text
-~/.config/zagentmesh/
+~/.config/pohunek/
   config.toml
   hosts.toml
   providers/
@@ -475,7 +475,7 @@ Configuration should live in a dedicated config directory, likely:
 Local runtime state should live separately, likely:
 
 ```text
-~/.local/share/zagentmesh/
+~/.local/share/pohunek/
   state.db
   events/
   sessions/
@@ -485,7 +485,7 @@ Local runtime state should live separately, likely:
 Logs should be structured and written to:
 
 ```text
-~/.local/state/zagentmesh/logs/
+~/.local/state/pohunek/logs/
 ```
 
 Secrets should be stored in the OS keychain, provider CLIs, SSH agent, or explicit environment files that are never committed.

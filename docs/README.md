@@ -1,4 +1,4 @@
-# zagentmesh Documentation
+# pohunek Documentation
 
 This directory turns the product idea into implementation-oriented planning.
 
@@ -10,7 +10,7 @@ This directory turns the product idea into implementation-oriented planning.
 
 ## Committed Direction (summary)
 
-`zagentmesh` is a **single-user, personal multi-host tool**: durable coding-agent
+`pohunek` is a **single-user, personal multi-host tool**: durable coding-agent
 sessions across your own machines on a NetBird (WireGuard) network.
 
 - CLI-first; Rust daemon + Rust CLI.

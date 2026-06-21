@@ -48,10 +48,10 @@ use crate::store::{Store, WorktreeBinding, WorktreeStatus};
 /// Relative path of the optional per-repository setup script, run inside a
 /// freshly created worktree. A non-zero exit (or any spawn failure) is recorded
 /// as a [`SessionWarningKind::SetupScript`] warning and never aborts binding.
-const SETUP_SCRIPT_REL: &str = ".zagentmesh/setup";
+const SETUP_SCRIPT_REL: &str = ".pohunek/setup";
 
 /// Interpreter used to run the setup script, so a script without an executable
-/// bit (the common case for a committed `.zagentmesh/setup`) still runs.
+/// bit (the common case for a committed `.pohunek/setup`) still runs.
 const SETUP_SCRIPT_INTERPRETER: &str = "sh";
 
 /// How often [`wait_with_timeout`] polls a running setup script for completion.
@@ -180,10 +180,7 @@ impl WorktreeManager {
             return Err(error(
                 ErrorClass::Runtime,
                 "not_a_git_repo",
-                format!(
-                    "{} is not a git repository",
-                    repository.display()
-                ),
+                format!("{} is not a git repository", repository.display()),
                 Some("pass --repo pointing at a git working tree".to_owned()),
             ));
         }
@@ -244,9 +241,8 @@ impl WorktreeManager {
         }
 
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|err| {
-                store_error("create the worktrees root directory", &err)
-            })?;
+            fs::create_dir_all(parent)
+                .map_err(|err| store_error("create the worktrees root directory", &err))?;
         }
 
         let mut warnings = Vec::new();
@@ -366,7 +362,11 @@ impl WorktreeManager {
         req: &WorktreeRequest,
         warnings: &mut Vec<SessionWarning>,
     ) -> Result<String, ProtocolError> {
-        let Some(requested) = req.base_branch.as_deref().map(str::trim).filter(|b| !b.is_empty())
+        let Some(requested) = req
+            .base_branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
         else {
             // No base requested: branch from the repository's current branch.
             return self.default_branch(repository);
@@ -678,7 +678,12 @@ fn fetch_origin(repo: &Path, base_branch: &str) -> Result<(), String> {
 /// `git worktree add -b <branch> <path> <start_point>` — new branch from a
 /// start-point ref. `--end-of-options` forces the path and start-point to be
 /// parsed positionally (the branch is validated by the caller).
-fn worktree_add_new(repo: &Path, path: &Path, branch: &str, start_point: &str) -> Result<(), String> {
+fn worktree_add_new(
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+    start_point: &str,
+) -> Result<(), String> {
     let mut cmd = git_command(repo);
     cmd.arg("worktree")
         .arg("add")
@@ -723,7 +728,7 @@ enum SetupOutcome {
     WaitError(io::Error),
 }
 
-/// Run `<repo>/.zagentmesh/setup` inside `worktree` if present, bounded by
+/// Run `<repo>/.pohunek/setup` inside `worktree` if present, bounded by
 /// `timeout`. A non-zero exit, a spawn failure, or a timeout is recorded as a
 /// non-fatal `setup_script` warning; the worktree is kept in every case.
 ///
@@ -764,8 +769,9 @@ fn run_setup_script(worktree: &Path, timeout: Duration, warnings: &mut Vec<Sessi
         Err(err) => {
             warnings.push(SessionWarning {
                 kind: SessionWarningKind::SetupScript,
-                message: "Repository setup script could not be run; the worktree was kept without it."
-                    .to_owned(),
+                message:
+                    "Repository setup script could not be run; the worktree was kept without it."
+                        .to_owned(),
                 detail: Some(format!("failed to spawn {}: {err}", script.display())),
             });
             return;
@@ -929,9 +935,7 @@ fn redact_url_credentials(message: &str) -> String {
         // The authority runs until the first character that cannot belong to it
         // (path/query/fragment delimiter, whitespace, or a surrounding quote).
         let auth_end = authority
-            .find(|c: char| {
-                matches!(c, '/' | '?' | '#' | '\'' | '"') || c.is_whitespace()
-            })
+            .find(|c: char| matches!(c, '/' | '?' | '#' | '\'' | '"') || c.is_whitespace())
             .unwrap_or(authority.len());
         let auth = &authority[..auth_end];
         if let Some(at) = auth.rfind('@') {
@@ -952,12 +956,7 @@ fn git_failure_message(args: &[&str], output: &std::process::Output) -> String {
 }
 
 /// Build a typed worktree error.
-fn error(
-    class: ErrorClass,
-    code: &str,
-    msg: String,
-    recover: Option<String>,
-) -> ProtocolError {
+fn error(class: ErrorClass, code: &str, msg: String, recover: Option<String>) -> ProtocolError {
     ProtocolError::new(class, code, msg, recover)
 }
 

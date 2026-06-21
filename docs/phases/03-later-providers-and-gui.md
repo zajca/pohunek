@@ -20,7 +20,7 @@ adapters. GitHub goes through `gh`; Linear through its MCP or GraphQL API.
 
 - **No in-tree provider adapters in the core path.** The daemon shells out to
   battle-tested tools (`gh` for GitHub; Linear via MCP/API) so provider API and
-  permission churn is not zagentmesh's maintenance burden.
+  permission churn is not pohunek's maintenance burden.
 - Worktree-per-session isolation already lives in the core (Phase 1) and is the
   foundation this builds on — provider linking is metadata on top of an existing
   session+worktree.
@@ -28,16 +28,16 @@ adapters. GitHub goes through `gh`; Linear through its MCP or GraphQL API.
 ### Likely commands
 
 ```bash
-zagentmesh session link --work-item <id> --session <session>   # store link metadata
-zagentmesh pr open --session <session>                          # -> `gh pr create`
-zagentmesh pr status --session <session>                        # -> `gh pr view`
-zagentmesh review <session>                                     # diff + linked task/PR/checks
+pohunek session link --work-item <id> --session <session>   # store link metadata
+pohunek pr open --session <session>                          # -> `gh pr create`
+pohunek pr status --session <session>                        # -> `gh pr view`
+pohunek review <session>                                     # diff + linked task/PR/checks
 ```
 
 ### Notes
 
 - Provider actions are recorded in the local event log (no secrets).
-- Credentials stay in `gh`'s own auth / OS keychain / env — never in zagentmesh
+- Credentials stay in `gh`'s own auth / OS keychain / env — never in pohunek
   state.
 - Session metadata gains optional `work_item` and `pr` link fields; these are not
   required for core sessions to work.
@@ -54,7 +54,7 @@ remains the intended rendering technology.
 
 ### Why deferred
 
-- The core PTY/TUI choice means `zagentmesh attach <session>` already renders the
+- The core PTY/TUI choice means `pohunek attach <session>` already renders the
   agent's TUI in your existing terminal. A native GUI is needed only for the
   multi-pane workspace (multiple sessions, sidebar, state badges), which is a
   nice-to-have, not a functional requirement.

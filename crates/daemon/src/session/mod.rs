@@ -47,7 +47,7 @@ const SUBMIT: &[u8] = b"\r";
 const DEFAULT_OUTPUT_HISTORY_LIMIT_BYTES: usize = 10_000_000;
 
 /// Default wall-clock bound on a per-repository worktree setup script
-/// (`.zagentmesh/setup`). It is a safety cap on a *hang*, not a tight budget — a
+/// (`.pohunek/setup`). It is a safety cap on a *hang*, not a tight budget — a
 /// legitimate script may install dependencies — so it is generous; a script that
 /// exceeds it is terminated and surfaced as a non-fatal `setup_script` warning.
 /// Overridable via [`SessionRegistryConfig::setup_script_timeout`].
@@ -313,8 +313,11 @@ impl SessionRegistry {
             return Ok(());
         };
         let log = Arc::new(crate::events::EventLog::open(dir)?);
-        let handle =
-            crate::events::spawn_drain(log, self.subscribe(), self.inner.event_log_shutdown.clone());
+        let handle = crate::events::spawn_drain(
+            log,
+            self.subscribe(),
+            self.inner.event_log_shutdown.clone(),
+        );
         *self
             .inner
             .event_log_task
@@ -497,7 +500,9 @@ impl SessionRegistry {
                 };
                 let bound = tokio::task::spawn_blocking(move || manager.bind(&request))
                     .await
-                    .map_err(|_| runtime_error("worktree_bind_failed", "worktree bind task panicked"))??;
+                    .map_err(|_| {
+                        runtime_error("worktree_bind_failed", "worktree bind task panicked")
+                    })??;
                 Ok(Some(bound))
             }
         }
@@ -775,7 +780,10 @@ impl SessionRegistry {
             return;
         }
 
-        info!(count = bindings.len(), "resuming sessions after daemon restart");
+        info!(
+            count = bindings.len(),
+            "resuming sessions after daemon restart"
+        );
         for binding in bindings {
             let session_id = binding.session_id.clone();
             let agent = binding.agent;
@@ -1500,7 +1508,13 @@ fn pty_error_to_protocol(err: PtyError) -> ProtocolError {
 /// removed between resolution and spawn — only fails here; this gives those the
 /// same clear, recoverable diagnostic instead of a generic `spawn_failed`.
 fn spawn_error_to_protocol(err: PtyError, program: &str) -> ProtocolError {
-    if matches!(err, PtyError::Spawn { not_found: true, .. }) {
+    if matches!(
+        err,
+        PtyError::Spawn {
+            not_found: true,
+            ..
+        }
+    ) {
         return ProtocolError::agent_binary_missing(program);
     }
     pty_error_to_protocol(err)
@@ -1553,7 +1567,7 @@ mod tests {
             .expect("system time after epoch")
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "zagentmesh-session-{tag}-{}-{nanos}",
+            "pohunek-session-{tag}-{}-{nanos}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -1609,7 +1623,7 @@ mod tests {
         let worktree_root = store.parent().expect("store parent").join("worktrees");
         let registry = SessionRegistry::new(SessionRegistryConfig {
             shell_command: ShellCommand::new(
-                "/nonexistent/zagentmesh-no-such-shell",
+                "/nonexistent/pohunek-no-such-shell",
                 std::iter::empty::<String>(),
             ),
             store_path: Some(store),
@@ -1632,7 +1646,7 @@ mod tests {
         // hint — not the generic `spawn_failed`.
         assert_eq!(err.code, "agent_binary_missing", "got: {err:?}");
         assert!(
-            err.msg.contains("zagentmesh-no-such-shell"),
+            err.msg.contains("pohunek-no-such-shell"),
             "error must name the missing program: {err:?}"
         );
         assert!(
@@ -1672,7 +1686,7 @@ mod tests {
         // naming the program and carrying a recover hint, not `spawn_failed`.
         let registry = SessionRegistry::new(SessionRegistryConfig {
             shell_command: ShellCommand::new(
-                "/nonexistent/zagentmesh-missing-program",
+                "/nonexistent/pohunek-missing-program",
                 std::iter::empty::<String>(),
             ),
             ..SessionRegistryConfig::default()
@@ -1685,7 +1699,7 @@ mod tests {
 
         assert_eq!(err.code, "agent_binary_missing", "got: {err:?}");
         assert!(
-            err.msg.contains("zagentmesh-missing-program"),
+            err.msg.contains("pohunek-missing-program"),
             "error must name the missing program: {err:?}"
         );
         assert!(err.recover.is_some(), "must carry a recover hint: {err:?}");
@@ -1820,7 +1834,7 @@ mod tests {
     #[test]
     fn hook_env_injected_for_agents_with_socket_and_absent_for_shell() {
         let registry = SessionRegistry::new(SessionRegistryConfig {
-            socket_path: Some(PathBuf::from("/run/zagentmesh/daemon.sock")),
+            socket_path: Some(PathBuf::from("/run/pohunek/daemon.sock")),
             ..SessionRegistryConfig::default()
         });
         let id = SessionId("s-7".to_owned());
@@ -1830,15 +1844,11 @@ mod tests {
 
         for agent in [AgentKind::Codex, AgentKind::Claude] {
             let env = registry.hook_env(agent, &id);
-            let lookup = |key: &str| {
-                env.iter()
-                    .find(|(k, _)| k == key)
-                    .map(|(_, v)| v.clone())
-            };
+            let lookup = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
             assert_eq!(lookup(ENV_FLAG).as_deref(), Some("1"));
             assert_eq!(
                 lookup(ENV_SOCKET_PATH).as_deref(),
-                Some("/run/zagentmesh/daemon.sock")
+                Some("/run/pohunek/daemon.sock")
             );
             assert_eq!(lookup(ENV_SESSION_ID).as_deref(), Some("s-7"));
             assert_eq!(
@@ -1889,7 +1899,10 @@ mod tests {
             .expect("load store");
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].session_id, created.id.0);
-        assert_eq!(persisted[0].native_session_id.as_deref(), Some("native-abc"));
+        assert_eq!(
+            persisted[0].native_session_id.as_deref(),
+            Some("native-abc")
+        );
 
         let _ = registry.stop(&created.id).await;
     }

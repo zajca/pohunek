@@ -1,4 +1,4 @@
-//! `zagentmesh integration install` — install per-agent `SessionStart` hooks.
+//! `pohunek integration install` — install per-agent `SessionStart` hooks.
 //!
 //! The hook captures each agent's native session id so a session can be resumed
 //! after a daemon restart (see `docs/plan-phase-1.md` "Hook Integration"). The
@@ -111,12 +111,12 @@ mod tests {
             installed: vec![
                 IntegrationInstallReport {
                     agent: AgentKind::Claude,
-                    hook_path: "/home/u/.claude/hooks/zagentmesh-agent-state.sh".to_owned(),
+                    hook_path: "/home/u/.claude/hooks/pohunek-agent-state.sh".to_owned(),
                     config_paths: vec!["/home/u/.claude/settings.json".to_owned()],
                 },
                 IntegrationInstallReport {
                     agent: AgentKind::Codex,
-                    hook_path: "/home/u/.codex/zagentmesh-agent-state.sh".to_owned(),
+                    hook_path: "/home/u/.codex/pohunek-agent-state.sh".to_owned(),
                     config_paths: vec![
                         "/home/u/.codex/hooks.json".to_owned(),
                         "/home/u/.codex/config.toml".to_owned(),
@@ -127,12 +127,10 @@ mod tests {
 
         let output = render_install_human(&result);
 
-        assert!(output.contains(
-            "installed claude hook: /home/u/.claude/hooks/zagentmesh-agent-state.sh\n"
-        ));
-        assert!(output.contains("  config: /home/u/.claude/settings.json\n"));
         assert!(output
-            .contains("installed codex hook: /home/u/.codex/zagentmesh-agent-state.sh\n"));
+            .contains("installed claude hook: /home/u/.claude/hooks/pohunek-agent-state.sh\n"));
+        assert!(output.contains("  config: /home/u/.claude/settings.json\n"));
+        assert!(output.contains("installed codex hook: /home/u/.codex/pohunek-agent-state.sh\n"));
         assert!(output.contains("  config: /home/u/.codex/hooks.json\n"));
         assert!(output.contains("  config: /home/u/.codex/config.toml\n"));
     }
@@ -148,7 +146,7 @@ mod tests {
         let result = IntegrationInstallResult {
             installed: vec![IntegrationInstallReport {
                 agent: AgentKind::Claude,
-                hook_path: "/home/u/.claude/hooks/zagentmesh-agent-state.sh".to_owned(),
+                hook_path: "/home/u/.claude/hooks/pohunek-agent-state.sh".to_owned(),
                 config_paths: vec!["/home/u/.claude/settings.json".to_owned()],
             }],
         };

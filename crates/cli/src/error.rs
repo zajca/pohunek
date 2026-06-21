@@ -81,13 +81,13 @@ pub(crate) enum CliError {
         source: io::Error,
     },
 
-    /// A NetBird TCP connection to the host opened, but no usable zagentmesh
+    /// A NetBird TCP connection to the host opened, but no usable pohunek
     /// daemon answered the request — the connection closed without a reply or the
     /// daemon did not respond in time. Distinct from [`CliError::HostUnreachable`]
     /// (which is a failure to *connect*): here the transport succeeded but the
     /// remote daemon layer did not. Names the host so the operator knows which
     /// peer to investigate.
-    #[error("connected to host '{host}' but no compatible zagentmesh daemon answered")]
+    #[error("connected to host '{host}' but no compatible pohunek daemon answered")]
     RemoteDaemonUnavailable {
         /// The host whose daemon did not answer.
         host: String,
@@ -153,7 +153,7 @@ impl CliError {
                 ErrorClass::Daemon,
                 "daemon_unreachable",
                 format!("cannot reach the daemon at {}: {source}", socket.display()),
-                Some("start the daemon with `zagentmesh daemon start`".to_owned()),
+                Some("start the daemon with `pohunek daemon start`".to_owned()),
             ),
             CliError::Framing(msg) => ProtocolError::new(
                 ErrorClass::Transport,
@@ -236,7 +236,7 @@ impl CliError {
 /// Returned as a string (rather than printed inline) so it is unit-testable;
 /// [`render`] writes it to stderr.
 pub(crate) fn human_error_text(err: &CliError) -> String {
-    let mut text = format!("zagentmesh: {err}\n");
+    let mut text = format!("pohunek: {err}\n");
     if let Some(hint) = err.recover_hint() {
         text.push_str(&format!("hint: {hint}\n"));
     }
@@ -329,7 +329,7 @@ fn clap_error_to_protocol_error(err: &clap::Error) -> ProtocolError {
         // embed in JSON. Trim the trailing newline clap appends.
         err.render().to_string().trim_end().to_owned(),
         Some(
-            "check the command syntax; run `zagentmesh --help` or `<command> --help` for usage"
+            "check the command syntax; run `pohunek --help` or `<command> --help` for usage"
                 .to_owned(),
         ),
     )
@@ -369,7 +369,7 @@ mod tests {
     #[test]
     fn daemon_unreachable_maps_to_structured_error_with_hint() {
         let err = CliError::DaemonUnreachable {
-            socket: PathBuf::from("/run/zagentmesh/daemon.sock"),
+            socket: PathBuf::from("/run/pohunek/daemon.sock"),
             source: io::Error::new(io::ErrorKind::NotFound, "no such file"),
         };
         let structured = err.to_protocol_error();
@@ -435,7 +435,11 @@ mod tests {
         .to_protocol_error();
         assert_eq!(unavailable.class, ErrorClass::Daemon);
         assert_eq!(unavailable.code, "remote_daemon_unavailable");
-        assert!(unavailable.msg.contains("build-box"), "msg: {}", unavailable.msg);
+        assert!(
+            unavailable.msg.contains("build-box"),
+            "msg: {}",
+            unavailable.msg
+        );
         assert!(unavailable.recover.is_some());
 
         let connect_failure = CliError::HostUnreachable {
@@ -463,7 +467,11 @@ mod tests {
         assert_eq!(wrapped.class, source.class);
         assert_eq!(wrapped.code, source.code);
         assert_eq!(wrapped.recover, source.recover);
-        assert!(wrapped.msg.contains("build-box"), "names host: {}", wrapped.msg);
+        assert!(
+            wrapped.msg.contains("build-box"),
+            "names host: {}",
+            wrapped.msg
+        );
         // The daemon's own message detail is retained alongside the host.
         assert!(
             wrapped.msg.contains("incompatible"),
@@ -549,19 +557,15 @@ mod tests {
     #[test]
     fn args_request_json_detects_the_flag() {
         assert!(args_request_json([
-            "zagentmesh",
-            "session",
-            "inspect",
-            "s-1",
-            "--json"
+            "pohunek", "session", "inspect", "s-1", "--json"
         ]));
-        assert!(args_request_json(["zagentmesh", "doctor", "--json"]));
+        assert!(args_request_json(["pohunek", "doctor", "--json"]));
     }
 
     #[test]
     fn args_request_json_is_false_when_absent() {
-        assert!(!args_request_json(["zagentmesh", "session", "inspect", "s-1"]));
-        assert!(!args_request_json(["zagentmesh"]));
+        assert!(!args_request_json(["pohunek", "session", "inspect", "s-1"]));
+        assert!(!args_request_json(["pohunek"]));
     }
 
     #[test]
@@ -575,12 +579,7 @@ mod tests {
         // `--json` after `--` is a positional value (e.g. `session input` text),
         // not the flag, so it must not flip the rendering mode.
         assert!(!args_request_json([
-            "zagentmesh",
-            "session",
-            "input",
-            "s-1",
-            "--",
-            "--json"
+            "pohunek", "session", "input", "s-1", "--", "--json"
         ]));
     }
 
@@ -588,7 +587,7 @@ mod tests {
     fn clap_missing_required_arg_maps_to_cli_usage() {
         // `session inspect` without its required <target> — the exact case from
         // the finding (`session inspect --json`).
-        let err = crate::Cli::try_parse_from(["zagentmesh", "session", "inspect"])
+        let err = crate::Cli::try_parse_from(["pohunek", "session", "inspect"])
             .expect_err("missing <target> must fail to parse");
         let pe = clap_error_to_protocol_error(&err);
         assert_eq!(pe.class, ErrorClass::Configuration);
@@ -607,14 +606,15 @@ mod tests {
     #[test]
     fn clap_invalid_value_maps_to_cli_usage_and_round_trips() {
         // `session new --agent nonsense` — the second case from the finding.
-        let err = crate::Cli::try_parse_from(["zagentmesh", "session", "new", "--agent", "nonsense"])
+        let err = crate::Cli::try_parse_from(["pohunek", "session", "new", "--agent", "nonsense"])
             .expect_err("invalid --agent value must fail to parse");
         let pe = clap_error_to_protocol_error(&err);
         assert_eq!(pe.code, "cli_usage");
         // Round-trips through serde like every other structured error, so a
         // script can deserialize and branch on `code`.
         let doc = serde_json::to_string(&pe).expect("serialize structured usage error");
-        let parsed: ProtocolError = serde_json::from_str(&doc).expect("parse structured usage error");
+        let parsed: ProtocolError =
+            serde_json::from_str(&doc).expect("parse structured usage error");
         assert_eq!(parsed.code, "cli_usage");
         assert_eq!(parsed.class, ErrorClass::Configuration);
         assert!(parsed.recover.is_some());
@@ -622,8 +622,8 @@ mod tests {
 
     #[test]
     fn help_and_version_are_display_kinds_but_usage_errors_are_not() {
-        let help = crate::Cli::try_parse_from(["zagentmesh", "--help"]).expect_err("help");
-        let version = crate::Cli::try_parse_from(["zagentmesh", "--version"]).expect_err("version");
+        let help = crate::Cli::try_parse_from(["pohunek", "--help"]).expect_err("help");
+        let version = crate::Cli::try_parse_from(["pohunek", "--version"]).expect_err("version");
         assert!(clap_kind_is_display(help.kind()), "help is a display kind");
         assert!(
             clap_kind_is_display(version.kind()),
@@ -632,8 +632,8 @@ mod tests {
 
         // A genuine usage error is NOT a display kind, so under `--json` it
         // renders as a structured document rather than being delegated to clap.
-        let usage = crate::Cli::try_parse_from(["zagentmesh", "session", "inspect"])
-            .expect_err("usage error");
+        let usage =
+            crate::Cli::try_parse_from(["pohunek", "session", "inspect"]).expect_err("usage error");
         assert!(
             !clap_kind_is_display(usage.kind()),
             "missing-arg usage error is not a display kind"

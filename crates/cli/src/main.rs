@@ -1,4 +1,4 @@
-//! `zagentmesh` — the CLI control plane.
+//! `pohunek` — the CLI control plane.
 //!
 //! Commands: `doctor`, `daemon start`, `health`/`status`, `session`, `attach`,
 //! `integration`, and `host` (discover/list/inspect). The grammar is host-aware
@@ -26,9 +26,9 @@ use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::{Target, LOCAL_HOST};
 
-/// zagentmesh: durable coding-agent sessions across your own machines.
+/// pohunek: durable coding-agent sessions across your own machines.
 #[derive(Debug, Parser)]
-#[command(name = "zagentmesh", version, about, long_about = None)]
+#[command(name = "pohunek", version, about, long_about = None)]
 struct Cli {
     /// Target host for the command. `local` (the default) uses this machine; any
     /// other name is resolved to a NetBird peer and dialed over the mesh. A
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn parses_session_new_defaults() {
-        let cli = Cli::try_parse_from(["zagentmesh", "session", "new"]).expect("parse");
+        let cli = Cli::try_parse_from(["pohunek", "session", "new"]).expect("parse");
 
         match cli.command {
             Commands::Session {
@@ -460,8 +460,8 @@ mod tests {
 
     #[test]
     fn parses_session_new_codex_agent() {
-        let cli = Cli::try_parse_from(["zagentmesh", "session", "new", "--agent", "codex"])
-            .expect("parse");
+        let cli =
+            Cli::try_parse_from(["pohunek", "session", "new", "--agent", "codex"]).expect("parse");
 
         match cli.command {
             Commands::Session {
@@ -475,8 +475,8 @@ mod tests {
 
     #[test]
     fn parses_session_new_claude_agent() {
-        let cli = Cli::try_parse_from(["zagentmesh", "session", "new", "--agent", "claude"])
-            .expect("parse");
+        let cli =
+            Cli::try_parse_from(["pohunek", "session", "new", "--agent", "claude"]).expect("parse");
 
         match cli.command {
             Commands::Session {
@@ -491,7 +491,7 @@ mod tests {
     #[test]
     fn parses_session_new_worktree_flags() {
         let cli = Cli::try_parse_from([
-            "zagentmesh",
+            "pohunek",
             "session",
             "new",
             "--agent",
@@ -517,7 +517,10 @@ mod tests {
                     },
             } => {
                 assert_eq!(agent, commands::session::AgentArg::Claude);
-                assert_eq!(repo.as_deref(), Some(std::path::Path::new("/workspace/project")));
+                assert_eq!(
+                    repo.as_deref(),
+                    Some(std::path::Path::new("/workspace/project"))
+                );
                 assert_eq!(branch.as_deref(), Some("feature/login"));
                 assert_eq!(base_branch.as_deref(), Some("main"));
             }
@@ -528,7 +531,7 @@ mod tests {
     #[test]
     fn parses_session_input_target_and_text() {
         let cli = Cli::try_parse_from([
-            "zagentmesh",
+            "pohunek",
             "session",
             "input",
             "local/s-42",
@@ -551,7 +554,7 @@ mod tests {
 
     #[test]
     fn parses_session_inspect_target_and_json_flag() {
-        let cli = Cli::try_parse_from(["zagentmesh", "session", "inspect", "local/s-42", "--json"])
+        let cli = Cli::try_parse_from(["pohunek", "session", "inspect", "local/s-42", "--json"])
             .expect("parse");
 
         match cli.command {
@@ -568,7 +571,7 @@ mod tests {
 
     #[test]
     fn parses_attach_bare_target() {
-        let cli = Cli::try_parse_from(["zagentmesh", "attach", "s-42"]).expect("parse");
+        let cli = Cli::try_parse_from(["pohunek", "attach", "s-42"]).expect("parse");
 
         match cli.command {
             Commands::Attach { target } => {
@@ -581,7 +584,7 @@ mod tests {
 
     #[test]
     fn parses_attach_explicit_local_target() {
-        let cli = Cli::try_parse_from(["zagentmesh", "attach", "local/s-42"]).expect("parse");
+        let cli = Cli::try_parse_from(["pohunek", "attach", "local/s-42"]).expect("parse");
 
         match cli.command {
             Commands::Attach { target } => {
@@ -636,7 +639,7 @@ mod tests {
 
     #[test]
     fn parses_session_new_yes_flag() {
-        let cli = Cli::try_parse_from(["zagentmesh", "--host", "host-b", "session", "new", "--yes"])
+        let cli = Cli::try_parse_from(["pohunek", "--host", "host-b", "session", "new", "--yes"])
             .expect("parse");
         match cli.command {
             Commands::Session {
@@ -649,8 +652,8 @@ mod tests {
 
     #[test]
     fn parses_host_inspect_with_positional_host() {
-        let cli = Cli::try_parse_from(["zagentmesh", "host", "inspect", "host-b", "--json"])
-            .expect("parse");
+        let cli =
+            Cli::try_parse_from(["pohunek", "host", "inspect", "host-b", "--json"]).expect("parse");
         match cli.command {
             Commands::Host {
                 action: HostAction::Inspect { host, json },
@@ -665,14 +668,14 @@ mod tests {
     #[test]
     fn parses_host_discover_and_list() {
         let discover =
-            Cli::try_parse_from(["zagentmesh", "host", "discover", "--json"]).expect("parse");
+            Cli::try_parse_from(["pohunek", "host", "discover", "--json"]).expect("parse");
         assert!(matches!(
             discover.command,
             Commands::Host {
                 action: HostAction::Discover { json: true }
             }
         ));
-        let list = Cli::try_parse_from(["zagentmesh", "host", "list"]).expect("parse");
+        let list = Cli::try_parse_from(["pohunek", "host", "list"]).expect("parse");
         assert!(matches!(
             list.command,
             Commands::Host {

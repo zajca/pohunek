@@ -1,4 +1,4 @@
-# zagentmesh Cargo workspace.
+# pohunek Cargo workspace.
 #
 # Single-user, CLI-first tool: a daemon owns PTYs running coding agents; a CLI
 # controls it over a local Unix socket using newline-delimited JSON.

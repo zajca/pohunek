@@ -1,4 +1,4 @@
-//! NetBird adapter for zagentmesh remote hosts.
+//! NetBird adapter for pohunek remote hosts.
 //!
 //! This crate is the foundation shared by the daemon and the CLI for the
 //! "remote hosts over NetBird" feature (Phase 2). It is deliberately small,
@@ -101,7 +101,10 @@ mod tests {
             parse_addr_strip_cidr("100.92.10.20"),
             Some("100.92.10.20".parse::<IpAddr>().unwrap())
         );
-        assert_eq!(parse_addr_strip_cidr("  100.64.0.1 "), Some("100.64.0.1".parse().unwrap()));
+        assert_eq!(
+            parse_addr_strip_cidr("  100.64.0.1 "),
+            Some("100.64.0.1".parse().unwrap())
+        );
         assert_eq!(parse_addr_strip_cidr("not-an-ip"), None);
         assert_eq!(parse_addr_strip_cidr(""), None);
     }

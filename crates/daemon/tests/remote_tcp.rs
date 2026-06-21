@@ -17,10 +17,10 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use protocol::{
-    method, AgentKind, AttachHeader, HostCapabilities, Request, Response, SessionAttachParams,
-    SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId, SessionInfo,
-    SessionInputParams, SessionInputResult, SessionNewParams, SessionState, SessionStopResult,
-    ProtocolVersion, PROTOCOL_VERSION,
+    method, AgentKind, AttachHeader, HostCapabilities, ProtocolVersion, Request, Response,
+    SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
+    SessionInfo, SessionInputParams, SessionInputResult, SessionNewParams, SessionState,
+    SessionStopResult, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,9 +28,9 @@ use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::sync::oneshot;
 use tokio_util::codec::{Framed, LinesCodec};
 
-use zagentmesh_daemon::api::{ControlServer, DaemonState, HealthInfo, RemoteServer};
-use zagentmesh_daemon::error::DaemonError;
-use zagentmesh_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
+use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo, RemoteServer};
+use pohunek_daemon::error::DaemonError;
+use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 
 /// A unique temp directory inside the test temp root.
 ///
@@ -41,10 +41,8 @@ fn temp_dir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!(
-        "zagentmesh-test-{tag}-{}-{nanos}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("pohunek-test-{tag}-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create test dir");
     dir
 }

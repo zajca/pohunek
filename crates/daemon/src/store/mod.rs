@@ -37,7 +37,7 @@ use tracing::warn;
 /// One session's resume binding: everything needed to relaunch-and-resume.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeBinding {
-    /// The zagentmesh session id (stable across restart).
+    /// The pohunek session id (stable across restart).
     pub session_id: String,
     /// Agent kind backing the session.
     pub agent: AgentKind,
@@ -74,7 +74,7 @@ pub enum WorktreeStatus {
 /// One bound worktree: the persisted record plus the daemon's ownership proof.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorktreeBinding {
-    /// The zagentmesh session id that owns this worktree.
+    /// The pohunek session id that owns this worktree.
     pub session_id: String,
     /// Canonicalized path of the source repository.
     pub repository: PathBuf,
@@ -332,7 +332,7 @@ mod tests {
             .expect("system time after epoch")
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "zagentmesh-store-{tag}-{}-{nanos}",
+            "pohunek-store-{tag}-{}-{nanos}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).expect("create temp dir");
@@ -375,8 +375,12 @@ mod tests {
     #[test]
     fn resume_round_trips_and_upserts_by_session_id() {
         let store = Store::new(temp_store_path("resume-roundtrip"));
-        store.record_resume(&resume("s-1", "native-1")).expect("record 1");
-        store.record_resume(&resume("s-2", "native-2")).expect("record 2");
+        store
+            .record_resume(&resume("s-1", "native-1"))
+            .expect("record 1");
+        store
+            .record_resume(&resume("s-2", "native-2"))
+            .expect("record 2");
         store
             .record_resume(&resume("s-1", "native-1-updated"))
             .expect("re-record 1");
@@ -421,8 +425,12 @@ mod tests {
         // The core M9 consistency guarantee: writing one kind never drops the
         // other; the two records for a session live in one file written atomically.
         let store = Store::new(temp_store_path("coexist"));
-        store.record_resume(&resume("s-1", "native-1")).expect("resume");
-        store.record_worktree(&worktree("s-1", "x")).expect("worktree");
+        store
+            .record_resume(&resume("s-1", "native-1"))
+            .expect("resume");
+        store
+            .record_worktree(&worktree("s-1", "x"))
+            .expect("worktree");
 
         assert_eq!(store.load_resume().expect("resume").len(), 1);
         assert_eq!(store.load_worktrees().expect("worktree").len(), 1);
@@ -465,7 +473,9 @@ mod tests {
     #[test]
     fn remove_resume_missing_is_noop() {
         let store = Store::new(temp_store_path("remove-missing"));
-        store.record_worktree(&worktree("s-1", "x")).expect("worktree");
+        store
+            .record_worktree(&worktree("s-1", "x"))
+            .expect("worktree");
         store.remove_resume("s-unknown").expect("remove missing");
         assert_eq!(store.load_worktrees().expect("worktree").len(), 1);
     }
@@ -477,7 +487,9 @@ mod tests {
 
         let path = temp_store_path("perms");
         let store = Store::new(path.clone());
-        store.record_resume(&resume("s-1", "native-1")).expect("record");
+        store
+            .record_resume(&resume("s-1", "native-1"))
+            .expect("record");
         let mode = fs::metadata(&path).expect("metadata").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "store file must be owner-private");
     }

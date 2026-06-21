@@ -6,10 +6,10 @@
 //! silent fallback path.
 //!
 //! Resolved paths (Linux-first):
-//! - control socket:  `$XDG_RUNTIME_DIR/zagentmesh/daemon.sock`   (dir 0700)
-//! - single-instance lock: `$XDG_RUNTIME_DIR/zagentmesh/daemon.lock`
-//! - logs:            `$XDG_STATE_HOME` or `~/.local/state` + `/zagentmesh/logs`
-//! - data dir:        `$XDG_DATA_HOME`  or `~/.local/share` + `/zagentmesh`
+//! - control socket:  `$XDG_RUNTIME_DIR/pohunek/daemon.sock`   (dir 0700)
+//! - single-instance lock: `$XDG_RUNTIME_DIR/pohunek/daemon.lock`
+//! - logs:            `$XDG_STATE_HOME` or `~/.local/state` + `/pohunek/logs`
+//! - data dir:        `$XDG_DATA_HOME`  or `~/.local/share` + `/pohunek`
 //!   (state.db, events/, worktrees/ live here in later milestones)
 
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ use crate::error::DaemonError;
 
 /// Subdirectory/name constants. Centralized so there are no scattered string
 /// literals for the on-disk layout.
-const APP_DIR: &str = "zagentmesh";
+const APP_DIR: &str = "pohunek";
 const SOCKET_NAME: &str = "daemon.sock";
 const LOCK_NAME: &str = "daemon.lock";
 const LOGS_SUBDIR: &str = "logs";
@@ -26,7 +26,7 @@ const LOGS_SUBDIR: &str = "logs";
 /// Resolved set of daemon paths.
 #[derive(Debug, Clone)]
 pub struct Paths {
-    /// `$XDG_RUNTIME_DIR/zagentmesh` — owner-private (0700) runtime dir.
+    /// `$XDG_RUNTIME_DIR/pohunek` — owner-private (0700) runtime dir.
     pub runtime_dir: PathBuf,
     /// The control Unix socket path.
     pub socket: PathBuf,
