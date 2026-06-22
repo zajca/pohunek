@@ -240,7 +240,7 @@ async fn handle_session_attach(request: &Request, sessions: &SessionRegistry) ->
         Ok(params) => params,
         Err(err) => return Response::err(request.id.clone(), err),
     };
-    match sessions.attach(&params.session_id).await {
+    match sessions.attach(&params).await {
         Ok(result) => ok_value(request, &result),
         Err(err) => Response::err(request.id.clone(), err),
     }

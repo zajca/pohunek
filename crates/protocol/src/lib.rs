@@ -33,7 +33,8 @@ pub use capabilities::{AgentRuntime, HostCapabilities};
 pub use envelope::{Event, Request, Response, StateSource};
 pub use error::{ErrorClass, ProtocolError};
 pub use integration::{
-    IntegrationInstallParams, IntegrationInstallReport, IntegrationInstallResult,
+    IntegrationInstallParams, IntegrationInstallReport, IntegrationInstallResult, ENV_DAEMON_ID,
+    ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
 pub use session::{
     AgentActivity, AgentKind, AttachHeader, SessionAttachParams, SessionAttachResult,

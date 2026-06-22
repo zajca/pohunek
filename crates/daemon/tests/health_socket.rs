@@ -385,6 +385,8 @@ async fn attach_session(
         method::SESSION_ATTACH,
         serde_json::to_value(SessionAttachParams {
             session_id: id.clone(),
+            origin_session_id: None,
+            origin_daemon_id: None,
         })
         .expect("serialize attach params"),
     );
@@ -843,6 +845,79 @@ async fn session_list_with_malformed_filter_returns_typed_error() {
             panic!("an out-of-range filter value must be a typed usage error, got ok: {ok:?}")
         }
     }
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn attach_reporting_its_own_session_as_origin_is_rejected_over_the_socket() {
+    // End-to-end: the CLI sets `origin_session_id`/`origin_daemon_id` from the
+    // PTY env when it runs inside a session. An attach whose origin matches the
+    // target session AND this daemon instance would loop the PTY's output into its
+    // own input, so the daemon must reject it at the wire boundary with a typed,
+    // stable error — proving the handler threads the origin through to the guard
+    // (not just the unit path). Own the registry so the test knows the instance id
+    // the CLI would have inherited via POHUNEK_DAEMON_ID.
+    let socket = temp_socket("attach-self-feedback");
+    let registry = SessionRegistry::new(SessionRegistryConfig::default());
+    let daemon_id = registry.daemon_instance_id().to_owned();
+    let (shutdown, handle) = spawn_server_owned(&socket, registry).await;
+    let mut control = connect(&socket).await;
+
+    let created = create_session(&mut control).await;
+
+    let self_attach = Request::new(
+        "attach-self",
+        method::SESSION_ATTACH,
+        serde_json::json!({
+            "session_id": created.id,
+            "origin_session_id": created.id,
+            "origin_daemon_id": daemon_id,
+        }),
+    );
+    match exchange(&mut control, &self_attach).await {
+        Response::Err { id, err, .. } => {
+            assert_eq!(id, "attach-self");
+            assert_eq!(err.code, "attach_self_feedback");
+            assert!(
+                err.recover.is_some(),
+                "self-feedback error must carry a recovery hint: {err:?}"
+            );
+        }
+        Response::Ok { ok, .. } => {
+            panic!("a self-feeding attach must be a typed error, got ok: {ok:?}")
+        }
+    }
+
+    // Same session id reported from a DIFFERENT daemon instance (a colliding id or
+    // a stale env from a prior process): no loop, so it must be accepted.
+    let other_daemon = Request::new(
+        "attach-other-daemon",
+        method::SESSION_ATTACH,
+        serde_json::json!({
+            "session_id": created.id,
+            "origin_session_id": created.id,
+            "origin_daemon_id": "some-other-daemon",
+        }),
+    );
+    let ok = ok_payload(exchange(&mut control, &other_daemon).await);
+    assert!(
+        ok.get("stream_id").and_then(Value::as_str).is_some(),
+        "a matching id on a different daemon instance must still attach: {ok:?}"
+    );
+
+    // An attach from a different terminal (no origin reported) still works.
+    let plain_attach = Request::new(
+        "attach-plain",
+        method::SESSION_ATTACH,
+        serde_json::json!({ "session_id": created.id }),
+    );
+    let ok = ok_payload(exchange(&mut control, &plain_attach).await);
+    assert!(
+        ok.get("stream_id").and_then(Value::as_str).is_some(),
+        "a plain attach must still mint a stream id: {ok:?}"
+    );
 
     let _ = shutdown.send(());
     let _ = handle.await;

@@ -113,6 +113,29 @@ pub struct SessionId(pub String);
 pub struct SessionAttachParams {
     /// Session to attach to.
     pub session_id: SessionId,
+    /// Session the attaching client is itself running inside, when known.
+    ///
+    /// Set by the CLI from `POHUNEK_SESSION_ID` (see
+    /// [`ENV_SESSION_ID`](crate::ENV_SESSION_ID)): a process running inside a
+    /// session's own PTY carries that session's id here. Paired with
+    /// [`Self::origin_daemon_id`], it lets the daemon reject an attach that would
+    /// pipe a PTY's output back into its own input (an infinite loop). Sent for
+    /// every transport (the loop is reachable even over a same-host loopback TCP
+    /// attach); the daemon-id pairing prevents a false positive against a
+    /// different daemon that reuses the same id string. Additive: an older daemon
+    /// ignores it; an older CLI omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_session_id: Option<SessionId>,
+    /// Daemon instance the [`Self::origin_session_id`] belongs to, from
+    /// `POHUNEK_DAEMON_ID` (see [`ENV_DAEMON_ID`](crate::ENV_DAEMON_ID)).
+    ///
+    /// The daemon rejects the attach as self-feeding only when **both** the
+    /// session id matches the target **and** this equals its own live instance id.
+    /// That scopes the guard to the exact PTY the client sits inside: a colliding
+    /// id on another daemon, or a stale value from a previous daemon process, has
+    /// a different instance id and is correctly allowed. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_daemon_id: Option<String>,
 }
 
 /// Result returned by `session.attach`.
@@ -404,5 +427,42 @@ mod tests {
         s.activity = None;
         assert!(!SessionListFilter::Activity(AgentActivity::Working).matches(&s));
         assert!(!SessionListFilter::Activity(AgentActivity::Idle).matches(&s));
+    }
+
+    #[test]
+    fn attach_params_origin_is_additive_and_omitted_when_absent() {
+        // Without an origin the wire form is exactly the pre-guard shape, so an
+        // older daemon still parses it and a newer daemon sees `None` for both.
+        let bare = SessionAttachParams {
+            session_id: SessionId("s-1".to_owned()),
+            origin_session_id: None,
+            origin_daemon_id: None,
+        };
+        let value = serde_json::to_value(&bare).expect("serialize");
+        assert_eq!(value, serde_json::json!({ "session_id": "s-1" }));
+        // A pre-guard daemon's reply shape (no origin keys) still deserializes.
+        let parsed: SessionAttachParams =
+            serde_json::from_value(serde_json::json!({ "session_id": "s-1" })).expect("parse");
+        assert_eq!(parsed, bare);
+    }
+
+    #[test]
+    fn attach_params_origin_round_trips_when_present() {
+        let with_origin = SessionAttachParams {
+            session_id: SessionId("s-1".to_owned()),
+            origin_session_id: Some(SessionId("s-1".to_owned())),
+            origin_daemon_id: Some("daemon-abc".to_owned()),
+        };
+        let value = serde_json::to_value(&with_origin).expect("serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "session_id": "s-1",
+                "origin_session_id": "s-1",
+                "origin_daemon_id": "daemon-abc",
+            })
+        );
+        let parsed: SessionAttachParams = serde_json::from_value(value).expect("parse");
+        assert_eq!(parsed, with_origin);
     }
 }

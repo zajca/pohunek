@@ -21,18 +21,14 @@ use protocol::{
 };
 use serde_json::{json, Map, Value};
 
-/// Gate flag the daemon sets so the hook knows it was launched by pohunek.
-pub const ENV_FLAG: &str = "POHUNEK_ENV";
-/// Control-socket path the hook dials to report the native session id.
-pub const ENV_SOCKET_PATH: &str = "POHUNEK_SOCKET_PATH";
-/// The pohunek session id the agent was launched under.
-pub const ENV_SESSION_ID: &str = "POHUNEK_SESSION_ID";
-/// Wire protocol version the hook must stamp on its request envelope.
-///
-/// Injected (rather than baked into the asset) so the hook never hardcodes the
-/// protocol version: the daemon, which owns `PROTOCOL_VERSION`, is the single
-/// source of truth.
-pub const ENV_PROTOCOL_VERSION: &str = "POHUNEK_PROTOCOL_VERSION";
+// The agent-handshake env var names are defined once in `protocol` (the shared
+// contract crate) so the daemon (which injects them), the installed hook (which
+// reads them), and the CLI (which reads `ENV_SESSION_ID` for the
+// self-feeding-attach guard) cannot drift. Re-exported here so existing daemon
+// call sites and tests keep referring to `integration::ENV_*` unchanged.
+pub use protocol::{
+    ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
+};
 
 /// Installed hook script file name (shared by both agents).
 const HOOK_INSTALL_NAME: &str = "pohunek-agent-state.sh";

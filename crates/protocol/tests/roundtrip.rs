@@ -665,8 +665,12 @@ fn session_stop_result_roundtrips() {
 fn session_attach_params_json_shape_roundtrips() {
     let params = SessionAttachParams {
         session_id: SessionId("s-42".to_owned()),
+        origin_session_id: None,
+        origin_daemon_id: None,
     };
 
+    // The origin is omitted from the wire when absent, so the on-the-wire shape
+    // is unchanged from before the self-feeding-attach guard (additive).
     let value = serde_json::to_value(&params).expect("serialize attach params");
     assert_eq!(value, json!({ "session_id": "s-42" }));
 

@@ -7,12 +7,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    event, AgentKind, ErrorClass, Event, ProtocolError, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionNewParams, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionState, SessionStopResult, SessionWarning, StateSource, PROTOCOL_VERSION,
+    event, AgentKind, ErrorClass, Event, ProtocolError, SessionAttachParams, SessionId,
+    SessionInfo, SessionInputParams, SessionInputResult, SessionNewParams,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionState, SessionStopResult,
+    SessionWarning, StateSource, PROTOCOL_VERSION,
 };
 use serde_json::json;
 use time::format_description::well_known::Rfc3339;
@@ -27,7 +28,9 @@ use crate::agent::{
     SessionRef,
 };
 use crate::detect::{ActivityTransition, Detector, DetectorConfig};
-use crate::integration::{ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH};
+use crate::integration::{
+    ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
+};
 use crate::pty::{PtyCommand, PtyError, PtyExit, PtyHandle};
 use crate::store::{ResumeBinding, Store};
 use crate::worktree::{WorktreeManager, WorktreeRequest};
@@ -61,6 +64,15 @@ const DEFAULT_SETUP_SCRIPT_TIMEOUT: Duration = Duration::from_secs(300);
 /// [`SessionRegistryConfig::initial_input_startup_grace`].
 const DEFAULT_INITIAL_INPUT_STARTUP_GRACE: Duration = Duration::from_millis(500);
 
+/// Default minimum interval between detector "PTY output lag" WARN logs per
+/// session. The first lag in a window logs immediately; further lags are counted
+/// and folded into one summary WARN once the window elapses. A runaway session
+/// (e.g. a self-feeding attach loop) overflows the detector's broadcast channel
+/// continuously, so unthrottled logging would flood the log; the detector still
+/// resyncs on every lag — only the logging is rate-limited. Overridable via
+/// [`SessionRegistryConfig::detector_lag_warn_interval`].
+const DEFAULT_DETECTOR_LAG_WARN_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Shell command configuration used for `AgentKind::Shell`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellCommand {
@@ -82,11 +94,17 @@ impl ShellCommand {
         }
     }
 
-    fn to_pty_command(&self, cwd: PathBuf, cols: u16, rows: u16) -> PtyCommand {
+    fn to_pty_command(
+        &self,
+        cwd: PathBuf,
+        cols: u16,
+        rows: u16,
+        env: Vec<(String, String)>,
+    ) -> PtyCommand {
         PtyCommand {
             program: self.program.clone(),
             args: self.args.clone(),
-            env: Vec::new(),
+            env,
             cwd,
             cols,
             rows,
@@ -144,12 +162,170 @@ pub struct SessionRegistryConfig {
     /// Directory for the append-only event log (`<data_dir>/events`). `None`
     /// disables event logging. Started via [`SessionRegistry::spawn_event_log`].
     pub event_log_dir: Option<PathBuf>,
+    /// Minimum interval between per-session "PTY output lag" WARN logs. The first
+    /// lag in each window logs immediately; further lags are folded into one
+    /// summary WARN when the window elapses, so a runaway session cannot flood the
+    /// log. Defaults to [`DEFAULT_DETECTOR_LAG_WARN_INTERVAL`].
+    pub detector_lag_warn_interval: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InputWritePlan {
     immediate: Vec<u8>,
     delayed_submit: Option<(Duration, Vec<u8>)>,
+}
+
+/// Rate limiter for the per-session "PTY output lag" WARN.
+///
+/// A runaway session (e.g. a self-feeding attach loop, before the
+/// [`attach_self_feedback`] guard catches it, or any other output storm)
+/// overflows the detector's bounded broadcast channel continuously, so logging
+/// every overflow would bury the log. The first lag of a *storm* logs
+/// immediately; every further lag less than `interval` after the previous one is
+/// folded into the storm and reported as ONE summary per window — flushed by
+/// [`Self::poll`] (the detector's periodic tick, once the window elapses) or by
+/// [`Self::flush`] (session teardown), so a quiesced or killed-mid-storm session
+/// still reports its trailing batch instead of silently dropping it. A lag that
+/// arrives at least `interval` after the previous one starts a *new* storm and so
+/// logs immediately again. At most one line per `interval`. It is pure and
+/// `Instant`-fed, so it is unit-testable without real time; the detector still
+/// calls `resync_after_lag()` on every lag, so only the logging is throttled,
+/// never the recovery.
+#[derive(Debug)]
+struct LagWarnThrottle {
+    interval: Duration,
+    /// Start of the current summary window; `None` when no window is open (before
+    /// the first lag, and after a window is flushed/closed). Drives [`Self::poll`]
+    /// timing only — *not* the first-vs-fold decision, which uses
+    /// [`Self::last_lag_at`] so a fresh storm after a quiet gap still logs a
+    /// `First` even while a previous window is technically still open.
+    window_started: Option<Instant>,
+    /// Instant of the most recently observed lag; `None` until the first. Used to
+    /// decide whether a lag continues the current storm (gap `< interval`) or
+    /// starts a new one (gap `>= interval`).
+    last_lag_at: Option<Instant>,
+    /// Lag events folded into the current window since its first (already-logged)
+    /// lag.
+    pending_events: u64,
+    /// Total chunks skipped across [`Self::pending_events`].
+    pending_skipped: u64,
+}
+
+/// A line the detector loop should log for PTY output lag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LagWarn {
+    /// First lag of a storm: log it immediately with its own skip count.
+    First { skipped: u64 },
+    /// One summary of the lags folded into a window after its first.
+    Summary { events: u64, skipped: u64 },
+}
+
+impl LagWarnThrottle {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            window_started: None,
+            last_lag_at: None,
+            pending_events: 0,
+            pending_skipped: 0,
+        }
+    }
+
+    /// Record one lag observed at `now` that dropped `skipped` chunks.
+    ///
+    /// Returns the line to log, if any: the first lag of a storm logs immediately;
+    /// later lags (less than `interval` after the previous one) fold silently and
+    /// are reported by [`Self::poll`] or [`Self::flush`]. A lag at least `interval`
+    /// after the previous one is treated as a new storm and logs immediately. A
+    /// zero interval disables folding entirely (every lag logs immediately).
+    fn observe(&mut self, now: Instant, skipped: u64) -> Option<LagWarn> {
+        if self.interval.is_zero() {
+            return Some(LagWarn::First { skipped });
+        }
+        // A lag continues the current storm only if the previous lag is less than
+        // one interval old; otherwise (no prior lag, or a long quiet gap) it is the
+        // first lag of a fresh storm and must log immediately. Keying this on the
+        // last lag — not on `window_started` — means a new burst after silence is
+        // never mislabeled as a continuation just because `poll` left a window open.
+        let continues_storm = match self.last_lag_at {
+            Some(last) => now.saturating_duration_since(last) < self.interval,
+            None => false,
+        };
+        self.last_lag_at = Some(now);
+        if continues_storm {
+            self.pending_events = self.pending_events.saturating_add(1);
+            self.pending_skipped = self.pending_skipped.saturating_add(skipped);
+            if self.window_started.is_none() {
+                self.window_started = Some(now);
+            }
+            None
+        } else {
+            self.window_started = Some(now);
+            self.pending_events = 0;
+            self.pending_skipped = 0;
+            Some(LagWarn::First { skipped })
+        }
+    }
+
+    /// Flush a window whose `interval` has elapsed, called on the detector's
+    /// periodic tick so a folded batch is reported even when no further lag
+    /// arrives. Emits a summary if any lags were folded, then opens a fresh
+    /// window; if the elapsed window folded nothing it is simply closed (its first
+    /// lag was already logged), so the next lag logs as a fresh `First`.
+    fn poll(&mut self, now: Instant) -> Option<LagWarn> {
+        let started = self.window_started?;
+        if now.saturating_duration_since(started) < self.interval {
+            return None;
+        }
+        if self.pending_events > 0 {
+            let summary = LagWarn::Summary {
+                events: self.pending_events,
+                skipped: self.pending_skipped,
+            };
+            self.window_started = Some(now);
+            self.pending_events = 0;
+            self.pending_skipped = 0;
+            Some(summary)
+        } else {
+            self.window_started = None;
+            None
+        }
+    }
+
+    /// Flush any folded lags unconditionally (used at session teardown, when the
+    /// window may never elapse because the session died mid-storm). Emits the
+    /// trailing summary if any lags were folded, then resets.
+    fn flush(&mut self) -> Option<LagWarn> {
+        if self.pending_events > 0 {
+            let summary = LagWarn::Summary {
+                events: self.pending_events,
+                skipped: self.pending_skipped,
+            };
+            self.window_started = None;
+            self.pending_events = 0;
+            self.pending_skipped = 0;
+            Some(summary)
+        } else {
+            None
+        }
+    }
+}
+
+/// Emit the WARN line for one [`LagWarn`] decision, tagged with the session id.
+fn log_lag_warn(session_id: &SessionId, warn_kind: LagWarn) {
+    match warn_kind {
+        LagWarn::First { skipped } => warn!(
+            session_id = %session_id.0,
+            skipped,
+            "resyncing detector state after PTY output lag"
+        ),
+        LagWarn::Summary { events, skipped } => warn!(
+            session_id = %session_id.0,
+            lag_events = events,
+            skipped,
+            "PTY output lag persisting; detector kept resyncing (summary since last log)"
+        ),
+    }
 }
 
 /// Everything needed to spawn and register one PTY-backed session, shared by
@@ -188,6 +364,7 @@ impl Default for SessionRegistryConfig {
             worktree_root: None,
             setup_script_timeout: DEFAULT_SETUP_SCRIPT_TIMEOUT,
             event_log_dir: None,
+            detector_lag_warn_interval: DEFAULT_DETECTOR_LAG_WARN_INTERVAL,
         }
     }
 }
@@ -205,6 +382,11 @@ struct SessionRegistryInner {
     active_attaches: Mutex<HashMap<String, ActiveAttach>>,
     next_id: AtomicU64,
     next_stream_id: AtomicU64,
+    /// Opaque id unique to this daemon process instance, injected into every
+    /// session PTY as `POHUNEK_DAEMON_ID` and compared against the attach origin
+    /// so the self-feeding-attach guard fires only for this instance's own PTYs
+    /// (see [`SessionRegistry::attach`]). Regenerated each start; never persisted.
+    daemon_instance_id: String,
     config: SessionRegistryConfig,
     events: broadcast::Sender<Event>,
     /// Unified metadata store (resume + worktree bindings), present when
@@ -297,6 +479,7 @@ impl SessionRegistry {
                 active_attaches: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(1),
                 next_stream_id: AtomicU64::new(1),
+                daemon_instance_id: generate_daemon_instance_id(),
                 config,
                 events,
                 store,
@@ -312,6 +495,15 @@ impl SessionRegistry {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.inner.events.subscribe()
+    }
+
+    /// This daemon process instance's opaque id, injected into every session PTY
+    /// as `POHUNEK_DAEMON_ID` and matched against the attach origin by the
+    /// self-feeding-attach guard (see [`Self::attach`]). Exposed so a client (and
+    /// tests) can correlate an origin to this instance.
+    #[must_use]
+    pub fn daemon_instance_id(&self) -> &str {
+        &self.inner.daemon_instance_id
     }
 
     /// Start the append-only event log, if [`SessionRegistryConfig::event_log_dir`]
@@ -417,7 +609,7 @@ impl SessionRegistry {
         // `register_pty_session`, which `resume_binding` shares and where the
         // worktree must be kept.
         let launch = async {
-            let env_extra = self.hook_env(params.agent, &id);
+            let env_extra = self.session_pty_env(params.agent, &id);
             let command = build_launch_command(
                 params.agent,
                 &self.inner.config.shell_command,
@@ -715,6 +907,29 @@ impl SessionRegistry {
         }
     }
 
+    /// Build the full env injected into a session's PTY.
+    ///
+    /// Always carries `POHUNEK_SESSION_ID` ([`ENV_SESSION_ID`]) and
+    /// `POHUNEK_DAEMON_ID` ([`ENV_DAEMON_ID`]) for **every** agent kind —
+    /// including a plain shell — so a `pohunek attach` launched inside the PTY can
+    /// be recognized as a self-feeding loop and rejected (see
+    /// [`SessionRegistry::attach`]); the daemon id scopes that decision to this
+    /// instance regardless of which transport delivers the attach. For
+    /// Codex/Claude it additionally carries the hook handshake from
+    /// [`Self::hook_env`] (which already includes the session id, so it is not
+    /// duplicated here).
+    fn session_pty_env(&self, agent: AgentKind, session_id: &SessionId) -> Vec<(String, String)> {
+        let mut env = self.hook_env(agent, session_id);
+        if !env.iter().any(|(key, _)| key == ENV_SESSION_ID) {
+            env.push((ENV_SESSION_ID.to_owned(), session_id.0.clone()));
+        }
+        env.push((
+            ENV_DAEMON_ID.to_owned(),
+            self.inner.daemon_instance_id.clone(),
+        ));
+        env
+    }
+
     /// Inject text into a running session using the agent's input framing rules.
     pub async fn input(
         &self,
@@ -942,7 +1157,7 @@ impl SessionRegistry {
 
         let id = SessionId(binding.session_id.clone());
         self.bump_next_id_past(&id);
-        let env_extra = self.hook_env(binding.agent, &id);
+        let env_extra = self.session_pty_env(binding.agent, &id);
         let opts = LaunchOpts {
             cwd: binding.cwd.clone(),
             cols: binding.cols,
@@ -1051,10 +1266,23 @@ impl SessionRegistry {
     }
 
     /// Mint a one-shot raw attach stream token for a running session.
+    ///
+    /// Rejects a *self-feeding* attach: when the client reports (via the
+    /// `POHUNEK_SESSION_ID` / `POHUNEK_DAEMON_ID` it inherited from a PTY) that it
+    /// is running inside this very session of this very daemon, its stdout is the
+    /// session's own PTY slave, so streaming the PTY's output to it would be
+    /// written straight back into the PTY as input and re-read as output — an
+    /// infinite, log-flooding loop. Both the session id **and** the daemon
+    /// instance id must match: a colliding id on a different daemon, or a stale
+    /// value from a previous daemon process, has a different instance id and is
+    /// correctly allowed. The existence/running check runs first so a stale origin
+    /// pointing at a gone/stopped session yields the truthful `session_not_found`/
+    /// `session_not_running` rather than a misleading self-feedback error.
     pub async fn attach(
         &self,
-        id: &SessionId,
+        params: &SessionAttachParams,
     ) -> Result<protocol::SessionAttachResult, ProtocolError> {
+        let id = &params.session_id;
         self.prune_expired_pending_attaches().await;
         {
             let sessions = self.inner.sessions.lock().await;
@@ -1062,6 +1290,13 @@ impl SessionRegistry {
             if entry.info.state != SessionState::Running {
                 return Err(session_not_running(id));
             }
+        }
+
+        // The session exists and is running; only now is a self-feed possible.
+        if params.origin_session_id.as_ref() == Some(id)
+            && params.origin_daemon_id.as_deref() == Some(self.daemon_instance_id())
+        {
+            return Err(attach_self_feedback(id));
         }
 
         let stream_id = format!(
@@ -1317,6 +1552,8 @@ impl SessionRegistry {
             tick.tick().await;
             let (rows, cols) = size;
             let mut detector = Detector::new(rows, cols, Instant::now(), detector_config);
+            let mut lag_warn =
+                LagWarnThrottle::new(registry.inner.config.detector_lag_warn_interval);
 
             loop {
                 tokio::select! {
@@ -1324,6 +1561,11 @@ impl SessionRegistry {
                     _ = tick.tick() => {
                         for transition in detector.tick(Instant::now()) {
                             registry.record_activity(&id, transition).await;
+                        }
+                        // Flush a folded lag batch whose window has elapsed, so a
+                        // session that stopped lagging still reports its summary.
+                        if let Some(warn_kind) = lag_warn.poll(Instant::now()) {
+                            log_lag_warn(&id, warn_kind);
                         }
                     }
                     changed = resize_rx.changed() => {
@@ -1341,17 +1583,24 @@ impl SessionRegistry {
                                 }
                             }
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                                warn!(
-                                    session_id = %id.0,
-                                    skipped,
-                                    "resyncing detector state after PTY output lag"
-                                );
+                                // Always resync; only the logging is rate-limited
+                                // so a runaway session cannot flood the log.
+                                if let Some(warn_kind) = lag_warn.observe(Instant::now(), skipped) {
+                                    log_lag_warn(&id, warn_kind);
+                                }
                                 detector.resync_after_lag();
                             }
                             Err(broadcast::error::RecvError::Closed) => break,
                         }
                     }
                 }
+            }
+
+            // The loop exited (cancel / resize-closed / output-closed): flush any
+            // lags folded into the final, not-yet-elapsed window so a session torn
+            // down mid-storm still reports its trailing batch instead of dropping it.
+            if let Some(warn_kind) = lag_warn.flush() {
+                log_lag_warn(&id, warn_kind);
             }
         });
     }
@@ -1511,8 +1760,10 @@ fn build_launch_command(
     env_extra: Vec<(String, String)>,
 ) -> Result<PtyCommand, ProtocolError> {
     match agent {
-        // Shell sessions get no hook env; `to_pty_command` carries no env.
-        AgentKind::Shell => Ok(shell_command.to_pty_command(cwd, cols, rows)),
+        // A shell gets no agent-hook handshake, but it does carry the universal
+        // `POHUNEK_SESSION_ID` marker (see `session_pty_env`) so a `pohunek attach`
+        // launched inside it is still caught as a self-feeding loop.
+        AgentKind::Shell => Ok(shell_command.to_pty_command(cwd, cols, rows, env_extra)),
         AgentKind::Codex => CodexAdapter.launch(&LaunchOpts {
             cwd,
             cols,
@@ -1590,6 +1841,27 @@ fn session_not_running(id: &SessionId) -> ProtocolError {
     )
 }
 
+/// The attach would feed the session's PTY output back into its own input.
+///
+/// Raised when the attaching client reports (via `POHUNEK_SESSION_ID` +
+/// `POHUNEK_DAEMON_ID`) that it is running inside the very session of this very
+/// daemon instance it is attaching to. Stable code: `attach_self_feedback`.
+fn attach_self_feedback(id: &SessionId) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Daemon,
+        "attach_self_feedback",
+        format!(
+            "refusing to attach to session {} from inside its own terminal: \
+             that would loop the session's output back into its own input",
+            id.0
+        ),
+        Some(
+            "run the attach from a different terminal (one not already inside this session)"
+                .to_owned(),
+        ),
+    )
+}
+
 fn attach_token_error(code: &'static str, stream_id: &str) -> ProtocolError {
     ProtocolError::new(
         ErrorClass::Runtime,
@@ -1634,6 +1906,32 @@ fn runtime_error(code: impl Into<String>, msg: impl Into<String>) -> ProtocolErr
     ProtocolError::new(ErrorClass::Runtime, code, msg, None)
 }
 
+/// Generate an opaque id distinguishing this daemon process instance.
+///
+/// Combines the pid, the wall clock's distance from the epoch, and a process-wide
+/// monotonic counter. Two live instances always differ (distinct live pids); a
+/// restart on a recycled pid differs as long as the wall clock advances between
+/// the two starts; the counter disambiguates registries built within one process
+/// at the same instant (e.g. tests). The clock distance is taken in *either*
+/// direction so the id never collapses to a fixed value when the clock is set
+/// before 1970 (an RTC-less boot before NTP). Used to scope the
+/// self-feeding-attach guard to this instance's own PTYs and to keep a stale
+/// `POHUNEK_DAEMON_ID` from a previous daemon from matching (see
+/// [`SessionAttachParams::origin_daemon_id`]); a residual collision only
+/// false-rejects an attach (never lets a loop through) and the lag-warn throttle
+/// still bounds any such loop's log output. Not a secret.
+fn generate_daemon_instance_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(elapsed) => elapsed.as_nanos(),
+        // Clock is before the epoch: use how far before, so the value still varies
+        // with the clock instead of pinning to a fixed 0.
+        Err(before_epoch) => before_epoch.duration().as_nanos(),
+    };
+    format!("d-{}-{nanos}-{seq}", std::process::id())
+}
+
 /// Current UTC time as an RFC3339 string for session metadata.
 ///
 /// Uses `now_utc()` (not `now_local()`, which can fail to resolve the local
@@ -1651,13 +1949,17 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use protocol::{
-        AgentKind, SessionId, SessionNewParams, SessionReportNativeIdParams, SessionState,
+        AgentKind, SessionAttachParams, SessionId, SessionNewParams, SessionReportNativeIdParams,
+        SessionState,
     };
 
     use crate::agent::InputRules;
-    use crate::integration::{ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH};
+    use crate::integration::{
+        ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
+    };
 
-    use super::{SessionRegistry, SessionRegistryConfig, ShellCommand};
+    use super::{LagWarn, LagWarnThrottle, SessionRegistry, SessionRegistryConfig, ShellCommand};
+    use std::time::Instant;
 
     fn params() -> SessionNewParams {
         SessionNewParams {
@@ -1669,6 +1971,15 @@ mod tests {
             branch: None,
             base_branch: None,
             input: None,
+        }
+    }
+
+    /// A plain attach (no self-feed origin) for the given session id.
+    fn attach_params(id: &SessionId) -> SessionAttachParams {
+        SessionAttachParams {
+            session_id: id.clone(),
+            origin_session_id: None,
+            origin_daemon_id: None,
         }
     }
 
@@ -1920,10 +2231,13 @@ mod tests {
         });
 
         let created = registry.create(params()).await.expect("create session");
-        let expired = registry.attach(&created.id).await.expect("attach token");
+        let expired = registry
+            .attach(&attach_params(&created.id))
+            .await
+            .expect("attach token");
         tokio::time::sleep(Duration::from_millis(5)).await;
         let fresh = registry
-            .attach(&created.id)
+            .attach(&attach_params(&created.id))
             .await
             .expect("fresh attach token");
 
@@ -1952,6 +2266,179 @@ mod tests {
         registry.finish_attach(&redeemed.stream_id).await;
         let stopped = registry.stop(&created.id).await.expect("stop session");
         assert!(stopped.stopped);
+    }
+
+    #[tokio::test]
+    async fn attach_from_inside_the_same_session_is_rejected() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry.create(params()).await.expect("create session");
+        let daemon_id = registry.daemon_instance_id().to_owned();
+
+        let self_feed = |session: &SessionId, daemon: Option<&str>| SessionAttachParams {
+            session_id: session.clone(),
+            origin_session_id: Some(session.clone()),
+            origin_daemon_id: daemon.map(str::to_owned),
+        };
+
+        // Origin id AND daemon id both match this instance: the client is inside
+        // this session's own PTY, so attaching would loop its output into its own
+        // input. Reject it.
+        let err = registry
+            .attach(&self_feed(&created.id, Some(&daemon_id)))
+            .await
+            .expect_err("self-feeding attach must be rejected");
+        assert_eq!(err.code, "attach_self_feedback");
+        assert_eq!(err.class, protocol::ErrorClass::Daemon);
+        assert!(
+            err.recover.is_some(),
+            "self-feedback error must carry a recovery hint: {err:?}"
+        );
+        // The rejected attach mints no pending token.
+        assert!(
+            registry.inner.pending_attaches.lock().await.is_empty(),
+            "a rejected self-feeding attach must not leave a pending token"
+        );
+
+        // Same session id but a DIFFERENT daemon instance (a colliding id on
+        // another daemon, or a stale value from a previous process): no loop, so
+        // it must be allowed, not falsely rejected.
+        registry
+            .attach(&self_feed(&created.id, Some("some-other-daemon")))
+            .await
+            .expect("matching id on a different daemon instance is allowed");
+        // Origin id without any daemon id cannot be pinned to this instance.
+        registry
+            .attach(&self_feed(&created.id, None))
+            .await
+            .expect("origin id without a daemon id is allowed");
+        // A different session's terminal (this daemon) is a legitimate origin.
+        registry
+            .attach(&SessionAttachParams {
+                session_id: created.id.clone(),
+                origin_session_id: Some(SessionId("s-other".to_owned())),
+                origin_daemon_id: Some(daemon_id.clone()),
+            })
+            .await
+            .expect("attach from a different session's terminal is allowed");
+        // A plain terminal (no origin reported) is allowed.
+        registry
+            .attach(&attach_params(&created.id))
+            .await
+            .expect("attach with no origin is allowed");
+
+        registry.stop(&created.id).await.expect("stop session");
+    }
+
+    #[test]
+    fn lag_warn_throttle_logs_first_then_flushes_one_summary_per_window() {
+        let interval = Duration::from_secs(5);
+        let mut throttle = LagWarnThrottle::new(interval);
+        let t0 = Instant::now();
+
+        // First lag of a window logs immediately with its own skip count.
+        assert_eq!(throttle.observe(t0, 2), Some(LagWarn::First { skipped: 2 }));
+        // Further lags inside the window fold silently.
+        assert_eq!(throttle.observe(t0 + Duration::from_secs(1), 3), None);
+        assert_eq!(throttle.observe(t0 + Duration::from_secs(2), 4), None);
+        // A tick before the window elapses flushes nothing.
+        assert_eq!(throttle.poll(t0 + Duration::from_secs(3)), None);
+        // Once the window elapses, the tick flushes ONE summary of the folded lags
+        // (events 2 = the two folded; skipped 3 + 4), excluding the already-logged
+        // first.
+        assert_eq!(
+            throttle.poll(t0 + interval),
+            Some(LagWarn::Summary {
+                events: 2,
+                skipped: 7,
+            })
+        );
+        // The window reopens at the flush; with nothing folded yet, the next tick
+        // past the interval just closes it (no spurious summary)...
+        assert_eq!(throttle.poll(t0 + interval + interval), None);
+        // ...and the next lag after a closed window logs as a fresh First.
+        assert_eq!(
+            throttle.observe(t0 + interval + interval + Duration::from_secs(1), 9),
+            Some(LagWarn::First { skipped: 9 })
+        );
+    }
+
+    #[test]
+    fn lag_warn_throttle_flush_emits_trailing_batch_on_teardown() {
+        let interval = Duration::from_secs(5);
+        let mut throttle = LagWarnThrottle::new(interval);
+        let t0 = Instant::now();
+
+        assert_eq!(throttle.observe(t0, 1), Some(LagWarn::First { skipped: 1 }));
+        assert_eq!(throttle.observe(t0 + Duration::from_secs(1), 2), None);
+        assert_eq!(throttle.observe(t0 + Duration::from_secs(2), 3), None);
+        // Session torn down mid-window: flush reports the folded tail (events 2,
+        // skipped 2 + 3) instead of silently dropping it.
+        assert_eq!(
+            throttle.flush(),
+            Some(LagWarn::Summary {
+                events: 2,
+                skipped: 5,
+            })
+        );
+        // A second flush with nothing pending is a no-op.
+        assert_eq!(throttle.flush(), None);
+    }
+
+    #[test]
+    fn lag_warn_throttle_zero_interval_logs_every_lag() {
+        let mut throttle = LagWarnThrottle::new(Duration::ZERO);
+        let t0 = Instant::now();
+        // Folding disabled: every lag logs immediately, never folded or dropped.
+        assert_eq!(throttle.observe(t0, 1), Some(LagWarn::First { skipped: 1 }));
+        assert_eq!(throttle.observe(t0, 7), Some(LagWarn::First { skipped: 7 }));
+        assert_eq!(throttle.flush(), None);
+    }
+
+    #[test]
+    fn lag_warn_throttle_relogs_first_after_a_quiet_gap() {
+        let interval = Duration::from_secs(5);
+        let mut throttle = LagWarnThrottle::new(interval);
+        let t0 = Instant::now();
+
+        // A storm: first lag logged, a second folded within the window.
+        assert_eq!(throttle.observe(t0, 1), Some(LagWarn::First { skipped: 1 }));
+        assert_eq!(throttle.observe(t0 + Duration::from_secs(1), 2), None);
+        // The window elapses and the tick flushes the folded lag, reopening it.
+        assert_eq!(
+            throttle.poll(t0 + interval),
+            Some(LagWarn::Summary {
+                events: 1,
+                skipped: 2,
+            })
+        );
+
+        // A long silence, then a brand-new lag more than an interval after the
+        // previous one: it is a fresh storm and must log as a First again — never
+        // folded/mislabeled as a continuation just because poll left a window open.
+        let later = t0 + interval + interval + Duration::from_secs(1);
+        assert_eq!(
+            throttle.observe(later, 4),
+            Some(LagWarn::First { skipped: 4 })
+        );
+    }
+
+    #[test]
+    fn daemon_instance_ids_are_distinct_per_registry() {
+        // Two registries built in this one process must still get distinct ids
+        // (the process-local counter disambiguates same-instant construction), so
+        // the self-feeding-attach guard never conflates two daemon instances.
+        let a = SessionRegistry::default();
+        let b = SessionRegistry::default();
+        assert_ne!(
+            a.daemon_instance_id(),
+            b.daemon_instance_id(),
+            "each registry must get a distinct daemon instance id"
+        );
+        assert!(a.daemon_instance_id().starts_with("d-"));
     }
 
     #[tokio::test]
@@ -2032,6 +2519,51 @@ mod tests {
         let id = SessionId("s-1".to_owned());
         assert!(registry.hook_env(AgentKind::Claude, &id).is_empty());
         assert!(registry.hook_env(AgentKind::Codex, &id).is_empty());
+    }
+
+    #[test]
+    fn session_pty_env_marks_session_id_for_every_agent_kind() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            socket_path: Some(PathBuf::from("/run/pohunek/daemon.sock")),
+            ..SessionRegistryConfig::default()
+        });
+        let id = SessionId("s-7".to_owned());
+
+        // Every kind — including a plain shell, which gets no hook handshake —
+        // carries POHUNEK_SESSION_ID and POHUNEK_DAEMON_ID so a self-feeding
+        // attach is detectable and pinned to this daemon instance.
+        for agent in [AgentKind::Shell, AgentKind::Codex, AgentKind::Claude] {
+            let env = registry.session_pty_env(agent, &id);
+            let session_ids: Vec<&str> = env
+                .iter()
+                .filter(|(k, _)| k == ENV_SESSION_ID)
+                .map(|(_, v)| v.as_str())
+                .collect();
+            // Present exactly once (agents must not get it duplicated on top of
+            // the hook env that already carries it).
+            assert_eq!(
+                session_ids,
+                vec!["s-7"],
+                "{agent:?} must carry POHUNEK_SESSION_ID exactly once"
+            );
+            let daemon_ids: Vec<&str> = env
+                .iter()
+                .filter(|(k, _)| k == ENV_DAEMON_ID)
+                .map(|(_, v)| v.as_str())
+                .collect();
+            assert_eq!(
+                daemon_ids,
+                vec![registry.daemon_instance_id()],
+                "{agent:?} must carry POHUNEK_DAEMON_ID once, equal to this instance's id"
+            );
+        }
+
+        // The shell carries *only* the session-id marker, not the agent handshake.
+        let shell_env = registry.session_pty_env(AgentKind::Shell, &id);
+        assert!(
+            !shell_env.iter().any(|(k, _)| k == ENV_FLAG),
+            "a shell must not get the agent-hook gate flag: {shell_env:?}"
+        );
     }
 
     #[tokio::test]

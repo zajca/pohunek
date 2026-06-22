@@ -234,6 +234,8 @@ where
         method::SESSION_ATTACH,
         serde_json::to_value(SessionAttachParams {
             session_id: id.clone(),
+            origin_session_id: None,
+            origin_daemon_id: None,
         })
         .expect("serialize attach params"),
     );

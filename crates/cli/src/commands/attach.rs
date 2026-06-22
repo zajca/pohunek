@@ -10,7 +10,7 @@ use std::os::fd::RawFd;
 
 use protocol::{
     method, AttachHeader, Request, SessionAttachParams, SessionAttachResult, SessionDetachParams,
-    SessionId, SessionResizeParams,
+    SessionId, SessionResizeParams, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -33,7 +33,13 @@ const IO_BUFFER_BYTES: usize = 8192;
 /// resolved, attach negotiation fails, terminal raw mode cannot be configured, or
 /// raw I/O fails.
 pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Result<(), CliError> {
-    let attach_request = build_attach_request(target)?;
+    // Tell the daemon which session+instance this client is itself running inside,
+    // so it can refuse a self-feeding attach loop before it starts. Reported for
+    // every transport: the loop is reachable even over a same-host loopback TCP
+    // attach, and the daemon-id pairing prevents a false positive against a
+    // different daemon that reuses the same session-id string.
+    let (origin_session_id, origin_daemon_id) = self_feedback_origin();
+    let attach_request = build_attach_request(target, origin_session_id, origin_daemon_id)?;
     let mut client = Client::connect(host, paths).await?;
     let result = client.request(&attach_request).await?;
     let attach: SessionAttachResult = serde_json::from_value(result)?;
@@ -89,14 +95,50 @@ where
 }
 
 // Host routing is the transport's job; the request carries only the session id
-// (identical on either side), never the host.
-fn build_attach_request(target: &Target) -> Result<Request, CliError> {
+// (identical on either side), never the host. The `origin_*` pair is the
+// session+daemon this client runs inside; reporting it lets the daemon reject a
+// self-feeding attach (see [`self_feedback_origin`]).
+fn build_attach_request(
+    target: &Target,
+    origin_session_id: Option<SessionId>,
+    origin_daemon_id: Option<String>,
+) -> Result<Request, CliError> {
     request_with_params(
         method::SESSION_ATTACH,
         &SessionAttachParams {
             session_id: SessionId(target.session_id.clone()),
+            origin_session_id,
+            origin_daemon_id,
         },
     )
+}
+
+/// The (session, daemon instance) this attach is being launched from, when
+/// reporting it lets the daemon refuse a self-feeding loop (attaching to a
+/// session from inside its own terminal pipes its output back into its input).
+///
+/// Read from `POHUNEK_SESSION_ID` / `POHUNEK_DAEMON_ID`, which the daemon injects
+/// into every session PTY, so both are present exactly when this process runs
+/// inside a session's PTY. Reported regardless of the target host: the daemon
+/// compares them against its OWN live instance, so a remote/loopback attach to a
+/// *different* daemon (which reuses the same id string) is not falsely rejected,
+/// while a same-host loopback to this daemon is correctly caught.
+fn self_feedback_origin() -> (Option<SessionId>, Option<String>) {
+    self_feedback_origin_from(
+        std::env::var(ENV_SESSION_ID).ok(),
+        std::env::var(ENV_DAEMON_ID).ok(),
+    )
+}
+
+/// Pure core of [`self_feedback_origin`], split out so empty-value filtering is
+/// unit-testable without touching the process env.
+fn self_feedback_origin_from(
+    raw_session_id: Option<String>,
+    raw_daemon_id: Option<String>,
+) -> (Option<SessionId>, Option<String>) {
+    let session_id = raw_session_id.filter(|id| !id.is_empty()).map(SessionId);
+    let daemon_id = raw_daemon_id.filter(|id| !id.is_empty());
+    (session_id, daemon_id)
 }
 
 fn build_detach_request(stream_id: &str) -> Result<Request, CliError> {
@@ -331,7 +373,7 @@ mod tests {
     #[test]
     fn attach_request_sends_session_id() {
         let target: Target = "local/s-42".parse().expect("target");
-        let request = build_attach_request(&target).expect("request");
+        let request = build_attach_request(&target, None, None).expect("request");
 
         assert_request(
             &request,
@@ -339,6 +381,51 @@ mod tests {
             json!({
                 "session_id": "s-42"
             }),
+        );
+    }
+
+    #[test]
+    fn attach_request_includes_origin_when_present() {
+        let target: Target = "local/s-42".parse().expect("target");
+        let request = build_attach_request(
+            &target,
+            Some(SessionId("s-42".to_owned())),
+            Some("daemon-xyz".to_owned()),
+        )
+        .expect("request");
+
+        assert_request(
+            &request,
+            method::SESSION_ATTACH,
+            json!({
+                "session_id": "s-42",
+                "origin_session_id": "s-42",
+                "origin_daemon_id": "daemon-xyz"
+            }),
+        );
+    }
+
+    #[test]
+    fn self_feedback_origin_reports_session_and_daemon_when_present() {
+        // Inside a session's PTY: report both so the daemon can pin the loop.
+        assert_eq!(
+            self_feedback_origin_from(Some("s-7".to_owned()), Some("daemon-1".to_owned())),
+            (
+                Some(SessionId("s-7".to_owned())),
+                Some("daemon-1".to_owned())
+            )
+        );
+        // Not inside any session (env unset or empty): nothing to report.
+        assert_eq!(self_feedback_origin_from(None, None), (None, None));
+        assert_eq!(
+            self_feedback_origin_from(Some(String::new()), Some(String::new())),
+            (None, None)
+        );
+        // A session id without a daemon id cannot be pinned to an instance; it is
+        // still forwarded, and the daemon declines to reject without a daemon id.
+        assert_eq!(
+            self_feedback_origin_from(Some("s-7".to_owned()), None),
+            (Some(SessionId("s-7".to_owned())), None)
         );
     }
 
@@ -376,7 +463,7 @@ mod tests {
         // Remote is now supported: the attach request carries only the session
         // id; the host selects the transport, it never enters the request body.
         let remote: Target = "host-b/s-42".parse().expect("target");
-        let request = build_attach_request(&remote).expect("request");
+        let request = build_attach_request(&remote, None, None).expect("request");
 
         assert_request(
             &request,
