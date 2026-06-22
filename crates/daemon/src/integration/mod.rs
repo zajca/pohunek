@@ -19,7 +19,9 @@ use std::path::{Path, PathBuf};
 use protocol::{
     AgentKind, ErrorClass, IntegrationInstallReport, IntegrationInstallResult, ProtocolError,
 };
+use serde::Serialize;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 // The agent-handshake env var names are defined once in `protocol` (the shared
 // contract crate) so the daemon (which injects them), the installed hook (which
@@ -200,7 +202,14 @@ pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
     let mut hooks_file = read_json_object_or_empty(&hooks_path)?;
     let hooks = ensure_hooks_object(&mut hooks_file, &hooks_path)?;
     remove_owned_command_hooks(hooks, &hook_path);
-    ensure_command_hook(hooks, hook_command(&hook_path), None)?;
+    let command = hook_command(&hook_path);
+    ensure_command_hook(hooks, command.clone(), None)?;
+    let (group_index, handler_index) = command_hook_position(hooks, &command).ok_or_else(|| {
+        settings_invalid(
+            &hooks_path,
+            "installed Codex SessionStart hook was not found after merge",
+        )
+    })?;
     write_json_pretty(&hooks_path, &hooks_file)?;
 
     let config_path = codex_dir.join("config.toml");
@@ -209,7 +218,13 @@ pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(io_error("read", &config_path, &err)),
     };
-    let updated = enable_codex_hooks_feature(&existing);
+    let trust_key = codex_hook_trust_key(&hooks_path, group_index, handler_index);
+    let trusted_hash = codex_command_hook_trusted_hash(&command, HOOK_TIMEOUT_SECS, None)?;
+    let updated = ensure_codex_hook_trust_state(
+        &enable_codex_hooks_feature(&existing),
+        &trust_key,
+        &trusted_hash,
+    );
     if updated != existing {
         write_file(&config_path, &updated)?;
     }
@@ -218,6 +233,126 @@ pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
         hook_path,
         config_paths: vec![hooks_path, config_path],
     })
+}
+
+fn command_hook_position(hooks: &Map<String, Value>, command: &str) -> Option<(usize, usize)> {
+    hooks
+        .get(SESSION_START_EVENT)?
+        .as_array()?
+        .iter()
+        .enumerate()
+        .find_map(|(group_index, group)| {
+            group
+                .get("hooks")?
+                .as_array()?
+                .iter()
+                .enumerate()
+                .find_map(|(handler_index, hook)| {
+                    (hook.get("type").and_then(Value::as_str) == Some("command")
+                        && hook.get("command").and_then(Value::as_str) == Some(command))
+                    .then_some((group_index, handler_index))
+                })
+        })
+}
+
+fn codex_hook_trust_key(hooks_path: &Path, group_index: usize, handler_index: usize) -> String {
+    format!(
+        "{}:session_start:{group_index}:{handler_index}",
+        hooks_path.display()
+    )
+}
+
+#[derive(Serialize)]
+struct CodexNormalizedHookIdentity {
+    event_name: &'static str,
+    #[serde(flatten)]
+    group: CodexMatcherGroup,
+}
+
+#[derive(Clone, Serialize)]
+struct CodexMatcherGroup {
+    #[serde(default)]
+    matcher: Option<String>,
+    #[serde(default)]
+    hooks: Vec<CodexHookHandlerConfig>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(tag = "type")]
+enum CodexHookHandlerConfig {
+    #[serde(rename = "command")]
+    Command {
+        command: String,
+        #[serde(default, rename = "commandWindows", alias = "command_windows")]
+        command_windows: Option<String>,
+        #[serde(default, rename = "timeout")]
+        timeout_sec: Option<u64>,
+        #[serde(default)]
+        r#async: bool,
+        #[serde(default, rename = "statusMessage")]
+        status_message: Option<String>,
+    },
+}
+
+fn codex_command_hook_trusted_hash(
+    command: &str,
+    timeout_sec: u64,
+    matcher: Option<&str>,
+) -> Result<String, ProtocolError> {
+    let identity = CodexNormalizedHookIdentity {
+        event_name: "session_start",
+        group: CodexMatcherGroup {
+            matcher: matcher.map(ToOwned::to_owned),
+            hooks: vec![CodexHookHandlerConfig::Command {
+                command: command.to_owned(),
+                command_windows: None,
+                timeout_sec: Some(timeout_sec),
+                r#async: false,
+                status_message: None,
+            }],
+        },
+    };
+    let value = toml::Value::try_from(identity).map_err(|err| {
+        ProtocolError::new(
+            ErrorClass::Runtime,
+            "integration_settings_invalid",
+            format!("failed to serialize Codex hook trust identity: {err}"),
+            None,
+        )
+    })?;
+    Ok(version_for_toml(&value))
+}
+
+fn version_for_toml(value: &toml::Value) -> String {
+    let json = serde_json::to_value(value).unwrap_or(Value::Null);
+    let canonical = canonical_json(&json);
+    let serialized = serde_json::to_vec(&canonical).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(serialized);
+    let hash = hasher.finalize();
+    let hex = hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sha256:{hex}")
+}
+
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut sorted = Map::new();
+            let mut keys = map.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                if let Some(value) = map.get(&key) {
+                    sorted.insert(key, canonical_json(value));
+                }
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical_json).collect()),
+        other => other.clone(),
+    }
 }
 
 /// Build the shell command string that runs our hook for the `SessionStart`
@@ -381,6 +516,69 @@ fn enable_codex_hooks_feature(content: &str) -> String {
     result
 }
 
+fn ensure_codex_hook_trust_state(content: &str, trust_key: &str, trusted_hash: &str) -> String {
+    let state_header = format!("[hooks.state.{}]", toml_basic_string(trust_key));
+    let trusted_hash_line = format!("trusted_hash = {}", toml_basic_string(trusted_hash));
+    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+    let trailing_newline = content.ends_with('\n');
+
+    if let Some(header_index) = lines
+        .iter()
+        .position(|line| toml_table_header(line) == Some(state_header.as_str()))
+    {
+        let table_end = lines
+            .iter()
+            .enumerate()
+            .skip(header_index + 1)
+            .find_map(|(index, line)| toml_table_header(line).map(|_| index))
+            .unwrap_or(lines.len());
+        if let Some(trusted_hash_index) =
+            (header_index + 1..table_end).find(|index| is_toml_key(&lines[*index], "trusted_hash"))
+        {
+            lines[trusted_hash_index] = trusted_hash_line;
+        } else {
+            lines.insert(header_index + 1, trusted_hash_line);
+        }
+        return join_toml_lines(lines, trailing_newline);
+    }
+
+    let mut result = content.trim_end_matches('\n').to_string();
+    if !result.is_empty() {
+        result.push_str("\n\n");
+    }
+    if !has_toml_table(content, "[hooks.state]") {
+        result.push_str("[hooks.state]\n\n");
+    }
+    result.push_str(&state_header);
+    result.push('\n');
+    result.push_str(&trusted_hash_line);
+    result.push('\n');
+    result
+}
+
+fn has_toml_table(content: &str, header: &str) -> bool {
+    content
+        .lines()
+        .any(|line| toml_table_header(line) == Some(header))
+}
+
+fn toml_basic_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped.push('"');
+    escaped
+}
+
 fn join_toml_lines(lines: Vec<String>, trailing_newline: bool) -> String {
     let mut result = lines.join("\n");
     if trailing_newline || result.is_empty() {
@@ -529,8 +727,9 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        install_claude, install_codex, CLAUDE_HOOK_ASSET, CODEX_HOOK_ASSET, ENV_FLAG,
-        ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
+        codex_command_hook_trusted_hash, codex_hook_trust_key, install_claude, install_codex,
+        toml_basic_string, CLAUDE_HOOK_ASSET, CODEX_HOOK_ASSET, ENV_FLAG, ENV_PROTOCOL_VERSION,
+        ENV_SESSION_ID, ENV_SOCKET_PATH, HOOK_TIMEOUT_SECS,
     };
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -563,6 +762,18 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn codex_hook_trust_hash_matches_codex_normalized_identity() {
+        let hash =
+            codex_command_hook_trusted_hash("sh '/tmp/pohunek-agent-state.sh' session", 10, None)
+                .expect("hash Codex hook identity");
+
+        assert_eq!(
+            hash,
+            "sha256:93067e645008b68a24d9341f188d245c8491bf9667f89b470391737e93dbe0d4"
+        );
     }
 
     #[test]
@@ -696,6 +907,21 @@ mod tests {
         let config = fs::read_to_string(codex_dir.join("config.toml")).expect("config.toml");
         assert!(config.contains("[features]"), "config: {config}");
         assert!(config.contains("hooks = true"), "config: {config}");
+
+        let trust_key = codex_hook_trust_key(&codex_dir.join("hooks.json"), 0, 0);
+        let trusted_hash = codex_command_hook_trusted_hash(&commands[0], HOOK_TIMEOUT_SECS, None)
+            .expect("hash installed Codex hook");
+        assert!(
+            config.contains(&format!("[hooks.state.{}]", toml_basic_string(&trust_key))),
+            "config: {config}"
+        );
+        assert!(
+            config.contains(&format!(
+                "trusted_hash = {}",
+                toml_basic_string(&trusted_hash)
+            )),
+            "config: {config}"
+        );
     }
 
     #[test]

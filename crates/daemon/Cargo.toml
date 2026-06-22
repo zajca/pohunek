@@ -15,6 +15,7 @@ pohunek-protocol = { path = "../protocol" }
 pohunek-netbird = { path = "../netbird" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 regex = { workspace = true }
