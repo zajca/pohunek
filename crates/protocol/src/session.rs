@@ -61,6 +61,46 @@ pub struct SessionNewParams {
     /// branch and records a non-fatal warning. Requires `repo` + `branch`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_branch: Option<String>,
+    /// Initial text to inject into the freshly spawned PTY in the same
+    /// `session.new` round-trip. The daemon applies the same agent-specific
+    /// submit framing used by `session.input`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+}
+
+/// Parameters for `session.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SessionListParams {
+    /// Exact-match filters applied with AND semantics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filters: Vec<SessionListFilter>,
+}
+
+/// A single exact-match session-list filter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "key", content = "value", rename_all = "snake_case")]
+pub enum SessionListFilter {
+    /// Match [`SessionInfo::state`].
+    State(SessionState),
+    /// Match [`SessionInfo::activity`].
+    Activity(AgentActivity),
+    /// Match [`SessionInfo::agent`].
+    Agent(AgentKind),
+    /// Match [`SessionInfo::id`].
+    Id(String),
+}
+
+impl SessionListFilter {
+    /// Whether this filter matches `session` exactly.
+    #[must_use]
+    pub fn matches(&self, session: &SessionInfo) -> bool {
+        match self {
+            Self::State(state) => session.state == *state,
+            Self::Activity(activity) => session.activity == Some(*activity),
+            Self::Agent(agent) => session.agent == *agent,
+            Self::Id(id) => session.id.0 == *id,
+        }
+    }
 }
 
 /// Opaque session identifier.
@@ -264,6 +304,30 @@ pub struct SessionInfo {
     pub exit_code: Option<i32>,
 }
 
+/// Result returned by `session.new`.
+///
+/// The created session is flattened so the wire shape is a superset of
+/// [`SessionInfo`]: a pre-`input` daemon (or any peer that does not understand
+/// the field) still produces a plain `SessionInfo` object, and an older client
+/// deserializing a newer daemon's reply simply ignores the extra
+/// `applied_input` key — fully additive in both directions.
+///
+/// `applied_input` lets a client that sent [`SessionNewParams::input`] tell
+/// whether the daemon actually injected it: a daemon that predates initial-input
+/// support silently drops the field and returns `None` here, so the client can
+/// warn instead of falsely reporting an injected prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionNewResult {
+    /// The freshly created session.
+    #[serde(flatten)]
+    pub session: SessionInfo,
+    /// `Some(true)` when the daemon applied an initial `input` in this same
+    /// round-trip; absent when no initial input was requested or the daemon does
+    /// not support it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_input: Option<bool>,
+}
+
 /// Result returned by `session.stop`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionStopResult {
@@ -276,4 +340,69 @@ pub struct SessionStopResult {
 pub struct SessionResizeResult {
     /// Updated session summary after the resize.
     pub session: SessionInfo,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `running`, `claude`, `working` session with the given id, for filter
+    /// matching tests. This is the predicate the daemon actually runs
+    /// (`handle_session_list`), so it is pinned directly here, not only through
+    /// the daemon's socket/TCP integration tests.
+    fn session(id: &str) -> SessionInfo {
+        SessionInfo {
+            id: SessionId(id.to_owned()),
+            agent: AgentKind::Claude,
+            cwd: PathBuf::from("/workspace"),
+            pid: 4242,
+            cols: 80,
+            rows: 24,
+            state: SessionState::Running,
+            state_source: StateSource::Process,
+            activity: Some(AgentActivity::Working),
+            native_session_id: None,
+            repo: None,
+            branch: None,
+            worktree_path: None,
+            warnings: Vec::new(),
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            exit_code: None,
+        }
+    }
+
+    #[test]
+    fn filter_matches_each_field() {
+        let s = session("s-42");
+        assert!(SessionListFilter::State(SessionState::Running).matches(&s));
+        assert!(SessionListFilter::Agent(AgentKind::Claude).matches(&s));
+        assert!(SessionListFilter::Activity(AgentActivity::Working).matches(&s));
+        assert!(SessionListFilter::Id("s-42".to_owned()).matches(&s));
+    }
+
+    #[test]
+    fn filter_rejects_non_matching_field() {
+        let s = session("s-42");
+        assert!(!SessionListFilter::State(SessionState::Stopped).matches(&s));
+        assert!(!SessionListFilter::Agent(AgentKind::Codex).matches(&s));
+        assert!(!SessionListFilter::Activity(AgentActivity::Blocked).matches(&s));
+    }
+
+    #[test]
+    fn id_filter_is_exact_not_prefix() {
+        // Documented decision: id matching is exact, no prefix/glob in v1.
+        let s = session("s-42");
+        assert!(SessionListFilter::Id("s-42".to_owned()).matches(&s));
+        assert!(!SessionListFilter::Id("s-4".to_owned()).matches(&s));
+        assert!(!SessionListFilter::Id("s-420".to_owned()).matches(&s));
+    }
+
+    #[test]
+    fn activity_filter_does_not_match_absent_activity() {
+        let mut s = session("s-42");
+        s.activity = None;
+        assert!(!SessionListFilter::Activity(AgentActivity::Working).matches(&s));
+        assert!(!SessionListFilter::Activity(AgentActivity::Idle).matches(&s));
+    }
 }

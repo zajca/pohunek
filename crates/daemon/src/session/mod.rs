@@ -53,6 +53,14 @@ const DEFAULT_OUTPUT_HISTORY_LIMIT_BYTES: usize = 10_000_000;
 /// Overridable via [`SessionRegistryConfig::setup_script_timeout`].
 const DEFAULT_SETUP_SCRIPT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Default grace period to wait for a freshly spawned agent to produce its first
+/// PTY output before injecting a `session.new --input` prompt. It is an upper
+/// bound, not a fixed delay: the input is sent as soon as the agent emits any
+/// output (proxy for "TUI started, stdin reader ready") or this elapses,
+/// whichever comes first. Overridable via
+/// [`SessionRegistryConfig::initial_input_startup_grace`].
+const DEFAULT_INITIAL_INPUT_STARTUP_GRACE: Duration = Duration::from_millis(500);
+
 /// Shell command configuration used for `AgentKind::Shell`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellCommand {
@@ -106,6 +114,15 @@ pub struct SessionRegistryConfig {
     pub output_history_limit_bytes: usize,
     /// Delay before sending Claude Code's Ink submit byte as a separate write.
     pub claude_submit_delay: Duration,
+    /// Upper bound on how long [`SessionRegistry::create`] waits for a freshly
+    /// spawned agent to emit its first PTY output before injecting a
+    /// `session.new --input` prompt. The wait short-circuits as soon as the
+    /// agent produces any output, so this caps the delay rather than imposing
+    /// it; a value of `Duration::ZERO` disables the gate and injects
+    /// immediately. Prevents the prompt from being delivered to a TUI that has
+    /// not yet entered raw/bracketed-paste input mode (Codex has a zero submit
+    /// delay, so without this its bracketed-paste prompt can race startup).
+    pub initial_input_startup_grace: Duration,
     /// Control socket path injected into Codex/Claude agents so their hook can
     /// call home. `None` disables hook-handshake env injection (e.g. in unit
     /// tests that do not exercise the hook).
@@ -165,6 +182,7 @@ impl Default for SessionRegistryConfig {
             attach_token_ttl: DEFAULT_ATTACH_TOKEN_TTL,
             output_history_limit_bytes: DEFAULT_OUTPUT_HISTORY_LIMIT_BYTES,
             claude_submit_delay: crate::agent::DEFAULT_CLAUDE_SUBMIT_DELAY,
+            initial_input_startup_grace: DEFAULT_INITIAL_INPUT_STARTUP_GRACE,
             socket_path: None,
             store_path: None,
             worktree_root: None,
@@ -358,6 +376,7 @@ impl SessionRegistry {
     /// warnings ride along on the returned [`SessionInfo`].
     pub async fn create(&self, params: SessionNewParams) -> Result<SessionInfo, ProtocolError> {
         validate_new_params(&params)?;
+        let initial_input = params.input.clone();
         let cwd = match params.cwd.clone() {
             Some(cwd) => cwd,
             None => std::env::current_dir().map_err(|source| {
@@ -428,7 +447,88 @@ impl SessionRegistry {
         if launch.is_err() && worktree_bound {
             self.cleanup_bound_worktree(&id).await;
         }
-        launch
+        let info = launch?;
+        if let Some(input) = initial_input {
+            // Wait for the agent to come up before injecting the first prompt so
+            // the bytes are not delivered to a stdin reader that has not yet
+            // entered raw/bracketed-paste mode (and would drop or mis-frame
+            // them). Bounded, so a silent agent can never wedge `session.new`.
+            self.await_initial_input_readiness(&info.id).await;
+            if let Err(err) = self.write_input_to_session(&info.id, &input).await {
+                // A failed initial input must roll the session back completely.
+                // `stop()` alone does not free a bound worktree, so a leftover
+                // checkout would keep the branch checked out and block the next
+                // `session.new` on it with `worktree_branch_in_use` — exactly
+                // the orphan the launch-failure path above compensates for.
+                self.rollback_failed_initial_input(&info.id, worktree_bound)
+                    .await;
+                return Err(err);
+            }
+        }
+        Ok(info)
+    }
+
+    /// Wait for a freshly spawned agent to produce its first PTY output before a
+    /// `session.new --input` prompt is injected, capped at
+    /// [`SessionRegistryConfig::initial_input_startup_grace`].
+    ///
+    /// First output is a robust, agent-agnostic proxy for "the TUI has started
+    /// and its stdin reader is in raw/bracketed-paste mode". The wait
+    /// short-circuits the instant any output arrives (or has already arrived),
+    /// and returns after the grace period even if the agent stays silent, so it
+    /// only ever delays — never blocks — the create round-trip. A zero grace
+    /// disables the gate.
+    async fn await_initial_input_readiness(&self, session_id: &SessionId) {
+        let grace = self.inner.config.initial_input_startup_grace;
+        if grace.is_zero() {
+            return;
+        }
+        let mut output = {
+            let sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get(session_id) else {
+                return;
+            };
+            // Atomic snapshot + subscribe: if the agent has already emitted
+            // output it is up, so inject immediately; otherwise wait for the
+            // first live chunk.
+            let (history, receiver) = entry.pty.attach_snapshot_and_subscribe();
+            if !history.is_empty() {
+                return;
+            }
+            receiver
+        };
+        let _ = tokio::time::timeout(grace, async {
+            loop {
+                match output.recv().await {
+                    Ok(_) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+        .await;
+    }
+
+    /// Roll back a session whose initial `--input` injection failed: stop the
+    /// PTY and, when the session bound a worktree, free that worktree too.
+    ///
+    /// `stop()` only terminates the PTY and records the exit; it never releases
+    /// a bound worktree (that is `cleanup_bound_worktree`'s job, otherwise only
+    /// reached by the launch-failure path). Skipping it here would leak the
+    /// checkout and block the branch's next `session.new`. Best-effort: a stop
+    /// failure is logged, never propagated, so the caller still returns the
+    /// original input error.
+    async fn rollback_failed_initial_input(&self, id: &SessionId, worktree_bound: bool) {
+        if let Err(err) = self.stop(id).await {
+            warn!(
+                session_id = %id.0,
+                error = %err,
+                "failed to stop session while rolling back a failed initial input"
+            );
+        }
+        if worktree_bound {
+            self.cleanup_bound_worktree(id).await;
+        }
     }
 
     /// Roll back a worktree bound earlier in [`Self::create`] when the session
@@ -620,13 +720,23 @@ impl SessionRegistry {
         &self,
         params: SessionInputParams,
     ) -> Result<SessionInputResult, ProtocolError> {
+        self.write_input_to_session(&params.session_id, &params.text)
+            .await?;
+        Ok(SessionInputResult { accepted: true })
+    }
+
+    async fn write_input_to_session(
+        &self,
+        session_id: &SessionId,
+        text: &str,
+    ) -> Result<(), ProtocolError> {
         let (pty, rules) = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions
-                .get(&params.session_id)
-                .ok_or_else(|| session_not_found(&params.session_id.0))?;
+                .get(session_id)
+                .ok_or_else(|| session_not_found(&session_id.0))?;
             if entry.info.state != SessionState::Running {
-                return Err(session_not_running(&params.session_id));
+                return Err(session_not_running(session_id));
             }
             (
                 entry.pty.clone(),
@@ -634,7 +744,7 @@ impl SessionRegistry {
             )
         };
 
-        let writes = build_input_writes(&params.text, rules);
+        let writes = build_input_writes(text, rules);
         pty.write_user_input(writes.immediate)
             .await
             .map_err(pty_error_to_protocol)?;
@@ -649,7 +759,7 @@ impl SessionRegistry {
             });
         }
 
-        Ok(SessionInputResult { accepted: true })
+        Ok(())
     }
 
     /// Record an agent's native session id as the session's resume binding.
@@ -1558,6 +1668,7 @@ mod tests {
             repo: None,
             branch: None,
             base_branch: None,
+            input: None,
         }
     }
 
@@ -1676,6 +1787,63 @@ mod tests {
         assert!(
             !listing.contains("feat/x"),
             "branch checkout must be pruned from git's worktree list: {listing}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_initial_input_rollback_frees_the_bound_worktree() {
+        // A worktree-bound session whose `--input` injection fails must roll the
+        // worktree back, not just the PTY: `stop()` alone leaves the checkout in
+        // place, blocking the next `session.new` on the branch with
+        // `worktree_branch_in_use`. Drive the exact rollback the failed-input
+        // branch of `create` performs and assert the branch is freed.
+        let repo = init_git_repo("input-rollback");
+        let store = temp_store_path("input-rollback");
+        let worktree_root = store.parent().expect("store parent").join("worktrees");
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            store_path: Some(store),
+            worktree_root: Some(worktree_root.clone()),
+            ..SessionRegistryConfig::default()
+        });
+
+        // A real worktree-bound session (launch succeeds, branch checked out).
+        let info = registry
+            .create(SessionNewParams {
+                cwd: None,
+                repo: Some(repo.clone()),
+                branch: Some("feat/x".to_owned()),
+                ..params()
+            })
+            .await
+            .expect("worktree-bound session is created");
+        assert!(
+            info.worktree_path.is_some(),
+            "session must be worktree-bound for this test: {info:?}"
+        );
+
+        registry.rollback_failed_initial_input(&info.id, true).await;
+
+        // The worktree bound for this session must be gone so its branch is free.
+        let leftover: Vec<_> = std::fs::read_dir(&worktree_root)
+            .map(|rd| rd.filter_map(Result::ok).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(
+            leftover.is_empty(),
+            "rollback must leave no orphan worktree under {}: {leftover:?}",
+            worktree_root.display()
+        );
+
+        // git no longer holds feat/x in any worktree, so a fresh bind succeeds.
+        let listing = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .expect("git worktree list");
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        assert!(
+            !listing.contains("feat/x"),
+            "branch checkout must be pruned so a fresh bind succeeds: {listing}"
         );
     }
 

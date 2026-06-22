@@ -8,10 +8,10 @@ use protocol::{
     Event, HostCapabilities, IntegrationInstallParams, IntegrationInstallReport,
     IntegrationInstallResult, ProtocolError, ProtocolVersion, Request, Response,
     SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
-    SessionInfo, SessionInputParams, SessionInputResult, SessionNewParams,
-    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
-    SessionResizeResult, SessionState, SessionStopResult, SessionWarning, SessionWarningKind,
-    StateSource, PROTOCOL_VERSION,
+    SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
+    SessionNewParams, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, SessionWarning,
+    SessionWarningKind, StateSource, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 
@@ -94,6 +94,7 @@ fn session_new_params_json_shape_roundtrips() {
         repo: None,
         branch: None,
         base_branch: None,
+        input: None,
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -121,6 +122,7 @@ fn session_new_params_roundtrips_with_worktree_fields() {
         repo: Some(PathBuf::from("/workspace/project")),
         branch: Some("feature/login".to_owned()),
         base_branch: Some("main".to_owned()),
+        input: None,
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -150,11 +152,12 @@ fn session_new_params_omits_absent_worktree_fields() {
         repo: None,
         branch: None,
         base_branch: None,
+        input: None,
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
     let object = value.as_object().expect("params object");
-    for absent in ["cwd", "repo", "branch", "base_branch"] {
+    for absent in ["cwd", "repo", "branch", "base_branch", "input"] {
         assert!(
             !object.contains_key(absent),
             "absent {absent} must be omitted: {value}"
@@ -163,6 +166,97 @@ fn session_new_params_omits_absent_worktree_fields() {
 
     let back = line_roundtrip(&params);
     assert_eq!(back, params);
+}
+
+#[test]
+fn session_new_params_roundtrips_with_initial_input() {
+    let params = SessionNewParams {
+        agent: AgentKind::Shell,
+        cwd: Some(PathBuf::from("/workspace/project")),
+        cols: 120,
+        rows: 40,
+        repo: None,
+        branch: None,
+        base_branch: None,
+        input: Some("run tests".to_owned()),
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize params");
+    assert_eq!(
+        value,
+        json!({
+            "agent": "shell",
+            "cwd": "/workspace/project",
+            "cols": 120,
+            "rows": 40,
+            "input": "run tests"
+        })
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn session_list_params_roundtrips_with_filters() {
+    let params = SessionListParams {
+        filters: vec![
+            SessionListFilter::State(SessionState::Running),
+            SessionListFilter::Agent(AgentKind::Codex),
+            SessionListFilter::Activity(AgentActivity::Blocked),
+            SessionListFilter::Id("s-42".to_owned()),
+        ],
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize params");
+    assert_eq!(
+        value,
+        json!({
+            "filters": [
+                { "key": "state", "value": "running" },
+                { "key": "agent", "value": "codex" },
+                { "key": "activity", "value": "blocked" },
+                { "key": "id", "value": "s-42" }
+            ]
+        })
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn session_list_params_omits_empty_filters() {
+    let params = SessionListParams::default();
+
+    let value = serde_json::to_value(&params).expect("serialize params");
+    assert_eq!(value, json!({}));
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn session_list_filter_unknown_key_is_a_deserialization_error() {
+    // An unknown filter key must fail to deserialize (the adjacently-tagged enum
+    // rejects it), so the daemon answers with a typed usage error rather than
+    // silently dropping the filter and returning every session.
+    let value = json!({ "filters": [{ "key": "cwd", "value": "/workspace" }] });
+    assert!(
+        serde_json::from_value::<SessionListParams>(value).is_err(),
+        "an unknown filter key must be a deserialization error, not a dropped filter"
+    );
+}
+
+#[test]
+fn session_list_filter_bad_value_is_a_deserialization_error() {
+    // A known key with a value outside the closed enum (here an invalid state)
+    // must also fail to deserialize, not match nothing silently.
+    let value = json!({ "filters": [{ "key": "state", "value": "paused" }] });
+    assert!(
+        serde_json::from_value::<SessionListParams>(value).is_err(),
+        "an out-of-range filter value must be a deserialization error"
+    );
 }
 
 #[test]

@@ -1,0 +1,35 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$script_dir/lib.sh"
+
+[ "$#" -eq 1 ] || pohunek_fail "usage: pohunek-launch-issue <linear-issue-id>"
+issue_id="$1"
+
+pohunek_bin="$(pohunek_optional_config pohunek_bin pohunek)"
+linear_cli="$(pohunek_required_config linear_cli)"
+agent="$(pohunek_required_config agent)"
+host="$(pohunek_required_config host)"
+repo="$(pohunek_required_config repo)"
+yes="$(pohunek_optional_config yes false)"
+template="$(pohunek_template_path issue)"
+
+pohunek_need_cmd "$linear_cli"
+
+context_json="$("$linear_cli" issue view "$issue_id" --json)"
+prompt="$(pohunek_render_provider_prompt "$template" linear_issue "$issue_id" "$context_json")"
+branch="$(python3 - "$context_json" <<'PY'
+import json
+import sys
+
+data = json.loads(sys.argv[1])
+branch = data.get("branchName") or data.get("branch")
+if not isinstance(branch, str) or not branch:
+    raise SystemExit("Linear issue JSON missing branchName")
+sys.stdout.write(branch)
+PY
+)"
+
+pohunek_run_session_new "$pohunek_bin" "$host" "$agent" "$repo" "$branch" "$prompt" "$yes"

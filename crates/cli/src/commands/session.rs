@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use clap::ValueEnum;
 use protocol::{
     method, AgentActivity, AgentKind, Request, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionNewParams, SessionState, SessionStopResult, SessionWarningKind,
-    StateSource,
+    SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams, SessionNewResult,
+    SessionState, SessionStopResult, SessionWarningKind, StateSource,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -63,6 +63,8 @@ pub(crate) struct NewArgs {
     pub branch: Option<String>,
     /// Base branch the worktree's branch is created from.
     pub base_branch: Option<String>,
+    /// Initial text to inject into the spawned PTY.
+    pub input: Option<String>,
 }
 
 /// The decision the confirmation gate makes before a `session new` connects.
@@ -78,6 +80,121 @@ pub(crate) enum ConfirmDecision {
     RequireYes,
     /// Remote on the human path and no `--yes`: prompt interactively.
     Prompt,
+}
+
+/// Output mode for `session list`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListOutputMode {
+    /// Human-readable table.
+    Human,
+    /// Stable machine-readable JSON.
+    Json,
+    /// One session id per line.
+    Quiet,
+}
+
+/// A single exact-match `session list --filter key=value` predicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ListFilter {
+    /// Match the session id.
+    Id(String),
+    /// Match the session lifecycle state.
+    State(SessionState),
+    /// Match the detected activity.
+    Activity(AgentActivity),
+    /// Match the agent kind.
+    Agent(AgentKind),
+}
+
+impl ListFilter {
+    /// Whether this filter matches one session exactly.
+    #[must_use]
+    pub(crate) fn matches(&self, session: &SessionInfo) -> bool {
+        match self {
+            ListFilter::Id(id) => session.id.0 == *id,
+            ListFilter::State(state) => session.state == *state,
+            ListFilter::Activity(activity) => session.activity == Some(*activity),
+            ListFilter::Agent(agent) => session.agent == *agent,
+        }
+    }
+
+    fn to_protocol_filter(&self) -> SessionListFilter {
+        match self {
+            ListFilter::Id(id) => SessionListFilter::Id(id.clone()),
+            ListFilter::State(state) => SessionListFilter::State(*state),
+            ListFilter::Activity(activity) => SessionListFilter::Activity(*activity),
+            ListFilter::Agent(agent) => SessionListFilter::Agent(*agent),
+        }
+    }
+}
+
+/// Parse one `session list --filter key=value` argument.
+///
+/// The parser is intentionally owned by the session command, but clap uses it as
+/// a value parser so invalid filters go through the existing usage-error sink.
+pub(crate) fn parse_list_filter(input: &str) -> Result<ListFilter, String> {
+    let (key, value) = input
+        .split_once('=')
+        .ok_or_else(|| format!("invalid filter {input:?}: expected key=value"))?;
+    if key.is_empty() {
+        return Err(format!(
+            "invalid filter {input:?}: filter key cannot be empty"
+        ));
+    }
+    if value.is_empty() {
+        return Err(format!(
+            "invalid filter {input:?}: filter value cannot be empty"
+        ));
+    }
+
+    match key {
+        "id" => Ok(ListFilter::Id(value.to_owned())),
+        "state" => parse_state_filter(value).map(ListFilter::State),
+        "activity" => parse_activity_filter(value).map(ListFilter::Activity),
+        "agent" => parse_agent_filter(value).map(ListFilter::Agent),
+        other => Err(format!(
+            "unknown filter key {other:?}; expected one of: state, activity, agent, id"
+        )),
+    }
+}
+
+fn parse_state_filter(value: &str) -> Result<SessionState, String> {
+    match value {
+        "starting" => Ok(SessionState::Starting),
+        "running" => Ok(SessionState::Running),
+        "stopped" => Ok(SessionState::Stopped),
+        "done" => Ok(SessionState::Done),
+        "failed" => Ok(SessionState::Failed),
+        other => Err(format!(
+            "invalid state filter value {other:?}; expected one of: starting, running, stopped, done, failed"
+        )),
+    }
+}
+
+fn parse_activity_filter(value: &str) -> Result<AgentActivity, String> {
+    match value {
+        "working" => Ok(AgentActivity::Working),
+        "blocked" => Ok(AgentActivity::Blocked),
+        "idle" => Ok(AgentActivity::Idle),
+        other => Err(format!(
+            "invalid activity filter value {other:?}; expected one of: working, blocked, idle"
+        )),
+    }
+}
+
+fn parse_agent_filter(value: &str) -> Result<AgentKind, String> {
+    match value {
+        "shell" => Ok(AgentKind::Shell),
+        "codex" => Ok(AgentKind::Codex),
+        "claude" => Ok(AgentKind::Claude),
+        other => Err(format!(
+            "invalid agent filter value {other:?}; expected one of: shell, codex, claude"
+        )),
+    }
+}
+
+fn session_matches_filters(session: &SessionInfo, filters: &[ListFilter]) -> bool {
+    filters.iter().all(|filter| filter.matches(session))
 }
 
 /// Decide whether starting a session on `host` needs confirmation.
@@ -130,12 +247,26 @@ pub(crate) async fn run_new(
     let mut client = Client::connect(host, paths).await?;
     let request = build_new_request(&args)?;
     let result = client.request(&request).await?;
-    let info: SessionInfo = serde_json::from_value(result)?;
+    let result: SessionNewResult = serde_json::from_value(result)?;
+    let info = &result.session;
+
+    // We asked the daemon to inject an initial prompt but it did not confirm
+    // doing so: it likely predates `session.new --input` support and silently
+    // ignored the field. Warn on stderr (which never corrupts a `--json`
+    // consumer's stdout) so a launcher does not falsely report a delivered
+    // prompt; the session is still running, just without the preset input.
+    if args.input.is_some() && result.applied_input != Some(true) {
+        eprintln!(
+            "pohunek: warning: host '{host}' did not confirm the initial --input was delivered; \
+             it may be an older daemon that ignored it. The session is running without the preset \
+             prompt."
+        );
+    }
 
     if json {
-        print!("{}", crate::commands::render_json(&info)?);
+        print!("{}", crate::commands::render_json(info)?);
     } else {
-        print!("{}", render_new_human(&info));
+        print!("{}", render_new_human(info));
     }
     Ok(())
 }
@@ -166,17 +297,18 @@ fn prompt_confirm(host: &str) -> Result<bool, CliError> {
 /// Returns [`CliError`] if the daemon is unreachable, the host cannot be
 /// resolved, the daemon rejects the request, or the payload does not match the
 /// session contract.
-pub(crate) async fn run_list(host: &str, paths: &Paths, json: bool) -> Result<(), CliError> {
+pub(crate) async fn run_list(
+    host: &str,
+    paths: &Paths,
+    filters: &[ListFilter],
+    output_mode: ListOutputMode,
+) -> Result<(), CliError> {
     let mut client = Client::connect(host, paths).await?;
-    let request = build_list_request();
+    let request = build_list_request(filters)?;
     let result = client.request(&request).await?;
     let sessions: Vec<SessionInfo> = serde_json::from_value(result)?;
 
-    if json {
-        print!("{}", crate::commands::render_json(&sessions)?);
-    } else {
-        print!("{}", render_list_human(&sessions));
-    }
+    print!("{}", render_list_output(&sessions, filters, output_mode)?);
 
     Ok(())
 }
@@ -283,16 +415,26 @@ fn build_new_request(args: &NewArgs) -> Result<Request, CliError> {
             repo: args.repo.clone(),
             branch: args.branch.clone(),
             base_branch: args.base_branch.clone(),
+            input: args.input.clone(),
         },
     )
 }
 
-fn build_list_request() -> Request {
-    Request::new(
-        request_id(method::SESSION_LIST),
-        method::SESSION_LIST,
-        Value::Null,
-    )
+fn build_list_request(filters: &[ListFilter]) -> Result<Request, CliError> {
+    if filters.is_empty() {
+        Ok(Request::new(
+            request_id(method::SESSION_LIST),
+            method::SESSION_LIST,
+            Value::Null,
+        ))
+    } else {
+        request_with_params(
+            method::SESSION_LIST,
+            &SessionListParams {
+                filters: filters.iter().map(ListFilter::to_protocol_filter).collect(),
+            },
+        )
+    }
 }
 
 // Host routing is handled by the transport ([`Client`]); these requests carry
@@ -397,6 +539,40 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
         ));
     }
     output
+}
+
+fn render_list_quiet(sessions: &[SessionInfo]) -> String {
+    let mut output = String::new();
+    for session in sessions {
+        output.push_str(&session.id.0);
+        output.push('\n');
+    }
+    output
+}
+
+fn render_list_output(
+    sessions: &[SessionInfo],
+    filters: &[ListFilter],
+    output_mode: ListOutputMode,
+) -> Result<String, CliError> {
+    // Defense-in-depth re-filter: the daemon already applies these filters
+    // (`build_list_request` sends them as typed params), but a daemon that
+    // predates the filter API ignores unknown params and returns every session.
+    // Re-applying the predicate here guarantees a correctly filtered set against
+    // such a peer. `ListFilter::matches` mirrors `protocol::SessionListFilter::matches`
+    // exactly (a unit test pins that they agree), so this never narrows further
+    // than the daemon would.
+    let filtered: Vec<SessionInfo> = sessions
+        .iter()
+        .filter(|session| session_matches_filters(session, filters))
+        .cloned()
+        .collect();
+
+    match output_mode {
+        ListOutputMode::Human => Ok(render_list_human(&filtered)),
+        ListOutputMode::Json => crate::commands::render_json(&filtered),
+        ListOutputMode::Quiet => Ok(render_list_quiet(&filtered)),
+    }
 }
 
 /// Branch column value: the bound branch, or `-` for a plain session.
@@ -609,6 +785,7 @@ mod tests {
             repo: None,
             branch: None,
             base_branch: None,
+            input: None,
         }
     }
 
@@ -680,6 +857,7 @@ mod tests {
             repo: Some(PathBuf::from("/workspace/project")),
             branch: Some("feature/login".to_owned()),
             base_branch: Some("main".to_owned()),
+            input: None,
         };
         let request = build_new_request(&args).expect("request");
 
@@ -707,6 +885,7 @@ mod tests {
             repo: None,
             branch: None,
             base_branch: None,
+            input: None,
         })
         .expect("request");
 
@@ -723,10 +902,157 @@ mod tests {
     }
 
     #[test]
+    fn new_request_carries_initial_input() {
+        let mut args = new_args(AgentArg::Shell, None);
+        args.input = Some("Fix #1234".to_owned());
+        let request = build_new_request(&args).expect("request");
+
+        assert_request(
+            &request,
+            method::SESSION_NEW,
+            json!({
+                "agent": "shell",
+                "cols": 80,
+                "rows": 24,
+                "input": "Fix #1234"
+            }),
+        );
+    }
+
+    #[test]
     fn list_request_uses_null_params() {
-        let request = build_list_request();
+        let request = build_list_request(&[]).expect("request");
 
         assert_request(&request, method::SESSION_LIST, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn list_request_sends_typed_filters() {
+        let request = build_list_request(&[
+            parse_list_filter("state=running").expect("state filter"),
+            parse_list_filter("agent=claude").expect("agent filter"),
+            parse_list_filter("id=s-42").expect("id filter"),
+        ])
+        .expect("request");
+
+        assert_request(
+            &request,
+            method::SESSION_LIST,
+            json!({
+                "filters": [
+                    { "key": "state", "value": "running" },
+                    { "key": "agent", "value": "claude" },
+                    { "key": "id", "value": "s-42" }
+                ]
+            }),
+        );
+    }
+
+    #[test]
+    fn list_filter_matches_single_field() {
+        let filter = parse_list_filter("state=running").expect("filter");
+
+        assert!(filter.matches(&running_session("s-42")));
+    }
+
+    #[test]
+    fn list_filter_rejects_non_matching_field() {
+        let filter = parse_list_filter("agent=codex").expect("filter");
+
+        assert!(!filter.matches(&running_session("s-42")));
+    }
+
+    #[test]
+    fn list_filters_are_anded() {
+        let mut codex = running_session("s-codex");
+        codex.agent = protocol::AgentKind::Codex;
+        codex.activity = Some(AgentActivity::Working);
+        let filters = vec![
+            parse_list_filter("state=running").expect("state filter"),
+            parse_list_filter("agent=codex").expect("agent filter"),
+            parse_list_filter("activity=working").expect("activity filter"),
+        ];
+
+        assert!(session_matches_filters(&codex, &filters));
+        assert!(!session_matches_filters(
+            &running_session("s-shell"),
+            &filters
+        ));
+    }
+
+    #[test]
+    fn client_and_protocol_filter_predicates_agree() {
+        // The client re-filters what the daemon already filtered, using a second
+        // predicate (`ListFilter::matches`). It MUST agree with the predicate the
+        // daemon runs (`protocol::SessionListFilter::matches`) for every variant
+        // and outcome, or the defense-in-depth re-filter could narrow the set
+        // differently from the daemon. Pin them together so they cannot drift.
+        let mut codex = running_session("s-codex");
+        codex.agent = protocol::AgentKind::Codex;
+        codex.activity = Some(AgentActivity::Working);
+        let sessions = [running_session("s-42"), codex];
+
+        let filters = [
+            parse_list_filter("state=running").expect("state"),
+            parse_list_filter("state=stopped").expect("state"),
+            parse_list_filter("agent=claude").expect("agent"),
+            parse_list_filter("agent=codex").expect("agent"),
+            parse_list_filter("activity=working").expect("activity"),
+            parse_list_filter("activity=blocked").expect("activity"),
+            parse_list_filter("id=s-42").expect("id"),
+            parse_list_filter("id=s-codex").expect("id"),
+            parse_list_filter("id=s-4").expect("id"),
+        ];
+
+        for session in &sessions {
+            for filter in &filters {
+                assert_eq!(
+                    filter.matches(session),
+                    filter.to_protocol_filter().matches(session),
+                    "client and protocol predicates disagree for {filter:?} on {:?}",
+                    session.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn list_filter_unknown_key_is_error() {
+        let err = parse_list_filter("cwd=/workspace/project").expect_err("unknown key");
+
+        assert!(err.contains("unknown filter key"), "{err}");
+    }
+
+    #[test]
+    fn list_filter_bad_value_is_error() {
+        let err = parse_list_filter("state=paused").expect_err("bad value");
+
+        assert!(err.contains("invalid state filter value"), "{err}");
+    }
+
+    #[test]
+    fn json_and_quiet_list_outputs_use_the_same_filtered_sessions() {
+        let mut codex = running_session("s-codex");
+        codex.agent = protocol::AgentKind::Codex;
+        let mut claude = running_session("s-claude");
+        claude.agent = protocol::AgentKind::Claude;
+        claude.state = SessionState::Stopped;
+        let sessions = vec![running_session("s-shell"), codex, claude];
+        let filters = vec![parse_list_filter("state=running").expect("filter")];
+
+        let json_output =
+            render_list_output(&sessions, &filters, ListOutputMode::Json).expect("json output");
+        let quiet_output =
+            render_list_output(&sessions, &filters, ListOutputMode::Quiet).expect("quiet output");
+        let json_ids: Vec<String> = serde_json::from_str::<Vec<SessionInfo>>(&json_output)
+            .expect("json sessions")
+            .into_iter()
+            .map(|session| session.id.0)
+            .collect();
+        let quiet_ids: Vec<&str> = quiet_output.lines().collect();
+
+        assert_eq!(quiet_ids, json_ids);
+        assert_eq!(json_ids, vec!["s-shell", "s-codex"]);
     }
 
     #[test]

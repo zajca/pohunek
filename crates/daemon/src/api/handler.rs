@@ -12,8 +12,9 @@
 
 use protocol::{
     method, negotiate, IntegrationInstallParams, ProtocolError, Request, Response,
-    SessionAttachParams, SessionDetachParams, SessionId, SessionInputParams, SessionNewParams,
-    SessionReportNativeIdParams, SessionResizeParams, PROTOCOL_VERSION,
+    SessionAttachParams, SessionDetachParams, SessionId, SessionInputParams, SessionListParams,
+    SessionNewParams, SessionNewResult, SessionReportNativeIdParams, SessionResizeParams,
+    PROTOCOL_VERSION,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -183,14 +184,32 @@ async fn handle_session_new(request: &Request, sessions: &SessionRegistry) -> Re
         Ok(params) => params,
         Err(err) => return Response::err(request.id.clone(), err),
     };
+    // `create` only returns `Ok` after a requested initial input was injected
+    // (it rolls back and errors otherwise), so a successful create with input
+    // set means the input was applied. Echoing this lets a client detect an
+    // older daemon that silently ignored `input` (which returns no flag).
+    let requested_input = params.input.is_some();
     match sessions.create(params).await {
-        Ok(info) => ok_value(request, &info),
+        Ok(session) => {
+            let result = SessionNewResult {
+                session,
+                applied_input: requested_input.then_some(true),
+            };
+            ok_value(request, &result)
+        }
         Err(err) => Response::err(request.id.clone(), err),
     }
 }
 
 async fn handle_session_list(request: &Request, sessions: &SessionRegistry) -> Response {
-    let list = sessions.list().await;
+    let params = match parse_optional_params::<SessionListParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    let mut list = sessions.list().await;
+    if !params.filters.is_empty() {
+        list.retain(|session| params.filters.iter().all(|filter| filter.matches(session)));
+    }
     ok_value(request, &list)
 }
 
@@ -291,6 +310,17 @@ where
     serde_json::from_value::<T>(request.params.clone()).map_err(|err| {
         ProtocolError::bad_request(format!("invalid params for {}: {err}", request.method))
     })
+}
+
+fn parse_optional_params<T>(request: &Request) -> Result<T, ProtocolError>
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    if request.params.is_null() {
+        Ok(T::default())
+    } else {
+        parse_params(request)
+    }
 }
 
 fn ok_value<T>(request: &Request, value: &T) -> Response

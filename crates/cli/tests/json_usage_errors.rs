@@ -60,6 +60,72 @@ fn invalid_enum_value_under_json_is_structured() {
 }
 
 #[test]
+fn invalid_session_list_filter_under_json_is_structured() {
+    let out = pohunek()
+        .args(["session", "list", "--filter", "state=paused", "--json"])
+        .output()
+        .expect("spawn pohunek");
+
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stderr.is_empty());
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let doc: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be JSON ({e}): {stdout:?}"));
+    assert_eq!(doc["code"], "cli_usage");
+    assert_eq!(doc["class"], "configuration");
+    assert!(
+        doc["msg"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("invalid state filter value")),
+        "usage message should name the filter value problem: {doc:?}"
+    );
+}
+
+#[test]
+fn unknown_session_list_filter_key_under_json_is_structured() {
+    let out = pohunek()
+        .args(["session", "list", "--filter", "cwd=/workspace", "--json"])
+        .output()
+        .expect("spawn pohunek");
+
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stderr.is_empty());
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let doc: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be JSON ({e}): {stdout:?}"));
+    assert_eq!(doc["code"], "cli_usage");
+    assert_eq!(doc["class"], "configuration");
+    assert!(
+        doc["msg"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("unknown filter key")),
+        "usage message should name the unknown filter key: {doc:?}"
+    );
+}
+
+#[test]
+fn session_list_json_and_quiet_conflict_under_json_is_structured() {
+    let out = pohunek()
+        .args(["session", "list", "--json", "-q"])
+        .output()
+        .expect("spawn pohunek");
+
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stderr.is_empty());
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let doc: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be JSON ({e}): {stdout:?}"));
+    assert_eq!(doc["code"], "cli_usage");
+    assert_eq!(doc["class"], "configuration");
+    assert!(
+        doc["msg"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("cannot be used with")),
+        "usage message should name the argument conflict: {doc:?}"
+    );
+}
+
+#[test]
 fn usage_error_without_json_stays_human_on_stderr() {
     // No `--json`: behavior must be identical to a plain `Cli::parse()` — human
     // error on stderr, nothing on stdout, exit 2.

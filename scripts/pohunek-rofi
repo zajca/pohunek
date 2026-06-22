@@ -1,0 +1,282 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$script_dir/lib.sh"
+
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/pohunek-rofi.XXXXXX")"
+trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+filters_file="$tmp_dir/filters"
+: >"$filters_file"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --filter)
+      [ "$#" -ge 2 ] || pohunek_fail "--filter requires key=value"
+      printf '%s\n' "$2" >>"$filters_file"
+      shift 2
+      ;;
+    *)
+      pohunek_fail "usage: pohunek-rofi [--filter key=value ...]"
+      ;;
+  esac
+done
+
+pohunek_bin="$(pohunek_optional_config pohunek_bin pohunek)"
+rofi_bin="$(pohunek_optional_config rofi_bin rofi)"
+swaymsg_bin="$(pohunek_optional_config swaymsg_bin swaymsg)"
+terminal_bin="$(pohunek_optional_config terminal "${TERMINAL:-}")"
+timeout_seconds="$(pohunek_required_config list_timeout_seconds)"
+banner_enabled="$(pohunek_optional_config banner false)"
+banner_height_px="$(pohunek_optional_config banner_height_px 24)"
+mark_retry_count="$(pohunek_optional_config mark_retry_count 20)"
+mark_retry_interval_seconds="$(pohunek_optional_config mark_retry_interval_seconds 0.1)"
+
+[ -n "$terminal_bin" ] || pohunek_fail "missing terminal config key and TERMINAL is unset"
+pohunek_need_cmd "$pohunek_bin"
+pohunek_need_cmd "$rofi_bin"
+pohunek_need_cmd "$swaymsg_bin"
+pohunek_need_cmd timeout
+pohunek_need_cmd python3
+
+# Mark a freshly spawned window by its (unique) title, retrying until sway's tree
+# actually shows the mark. A terminal sets its OSC title only after it maps and
+# starts, so a single fixed-delay mark can miss the window — leaving an unmarked
+# pane the next switch can neither find nor close. Polling until the mark lands
+# (bounded by mark_retry_count) is race-free and terminal-agnostic.
+pohunek_mark_window() {
+  mark_title="$1"
+  mark_name="$2"
+  attempt=0
+  while [ "$attempt" -lt "$mark_retry_count" ]; do
+    "$swaymsg_bin" "[title=\"$mark_title\"]" mark --add "$mark_name" >/dev/null 2>&1 || true
+    if "$swaymsg_bin" -t get_tree 2>/dev/null | grep -qF "\"$mark_name\""; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep "$mark_retry_interval_seconds"
+  done
+  return 1
+}
+
+hosts_file="$tmp_dir/hosts"
+discover_file="$tmp_dir/discover.json"
+"$pohunek_bin" host discover --json >"$discover_file"
+python3 - "$hosts_file" "$discover_file" <<'PY'
+import json
+import sys
+
+out_path, discover_path = sys.argv[1:3]
+with open(discover_path, encoding="utf-8") as handle:
+    records = json.load(handle)
+# `host discover` enumerates NetBird PEERS only; it never lists the local
+# daemon. But `--host local` is a first-class target (the CLI dials the local
+# unix socket), so seed it explicitly or local sessions would be silently
+# missing from the switcher. De-duplicate in case the local machine also appears
+# as its own NetBird peer.
+hosts = ["local"]
+for record in records:
+    if record.get("classification") != "reachable_daemon":
+        continue
+    name = record.get("name") or record.get("fqdn")
+    if isinstance(name, str) and name and name not in hosts:
+        hosts.append(name)
+with open(out_path, "w", encoding="utf-8") as handle:
+    for host in hosts:
+        handle.write(host + "\n")
+PY
+
+map_file="$tmp_dir/host-map"
+: >"$map_file"
+index=0
+while IFS= read -r host; do
+  [ -n "$host" ] || continue
+  index=$((index + 1))
+  printf '%s\t%s\n' "$index" "$host" >>"$map_file"
+  (
+    set -- "$pohunek_bin" --host "$host" session list --json
+    while IFS= read -r filter; do
+      [ -n "$filter" ] || continue
+      set -- "$@" --filter "$filter"
+    done <"$filters_file"
+    if ! timeout "$timeout_seconds" "$@" >"$tmp_dir/$index.json" 2>"$tmp_dir/$index.err"; then
+      printf 'error\n' >"$tmp_dir/$index.status"
+    fi
+  ) &
+done <"$hosts_file"
+wait
+
+rows_file="$tmp_dir/rows"
+python3 - "$tmp_dir" "$map_file" >"$rows_file" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+# A session id and host name both flow unsanitized into sway criteria strings
+# (`[con_mark="pohunek:$target"]`, `[title=...]`). A remote daemon's session id
+# is an opaque, attacker-influenceable string, so restrict the target to a safe
+# charset before it can reach sway's criteria mini-language (a `"` or regex
+# metachar there would break or broaden the kill/mark criteria). Local ids are
+# `s-<N>` so this rejects nothing legitimate.
+SAFE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+tmp = pathlib.Path(sys.argv[1])
+hosts = []
+with open(sys.argv[2], encoding="utf-8") as handle:
+    for line in handle:
+        idx, host = line.rstrip("\n").split("\t", 1)
+        hosts.append((idx, host))
+
+for idx, host in hosts:
+    if (tmp / f"{idx}.status").exists():
+        detail = (tmp / f"{idx}.err").read_text(encoding="utf-8", errors="replace").strip()
+        print(f"!{host}\tERROR\t{detail or 'session list failed'}")
+        continue
+    if not SAFE.match(host):
+        print(f"!{host}\tERROR\tunsafe host name skipped")
+        continue
+    try:
+        sessions = json.loads((tmp / f"{idx}.json").read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"!{host}\tERROR\tinvalid JSON: {exc}")
+        continue
+    for session in sessions:
+        session_id = session.get("id")
+        if isinstance(session_id, dict):
+            session_id = session_id.get("0")
+        if not isinstance(session_id, str) or not SAFE.match(session_id):
+            continue
+        agent = session.get("agent", "-")
+        state = session.get("state", "-")
+        activity = session.get("activity") or "-"
+        print(f"{host}/{session_id}\t{agent}\t{state}\t{activity}")
+PY
+
+if [ ! -s "$rows_file" ]; then
+  exit 0
+fi
+
+selection_file="$tmp_dir/selection"
+if ! "$rofi_bin" -dmenu -multi-select -p pohunek <"$rows_file" >"$selection_file"; then
+  exit 0
+fi
+
+targets_file="$tmp_dir/targets"
+python3 - "$selection_file" >"$targets_file" <<'PY'
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    for line in handle:
+        first = line.rstrip("\n").split("\t", 1)[0]
+        if first and not first.startswith("!"):
+            print(first)
+PY
+
+marks_file="$tmp_dir/marks"
+tree_file="$tmp_dir/tree.json"
+banner_marks_file="$tmp_dir/banner-marks"
+# Pre-create the mark files so the read-redirects below can never abort the
+# script under `set -eu` if the tree enumeration exits before writing them.
+: >"$marks_file"
+: >"$banner_marks_file"
+tree_ok=true
+if "$swaymsg_bin" -t get_tree >"$tree_file" 2>/dev/null && python3 - "$tree_file" "$marks_file" "$banner_marks_file" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        tree = json.load(handle)
+except Exception as exc:
+    # Exit non-zero so the shell can distinguish a failed enumeration from a
+    # genuinely empty tree and skip the reconcile rather than guess with no marks.
+    sys.stderr.write(f"pohunek-rofi: cannot parse sway tree: {exc}\n")
+    raise SystemExit(1)
+
+attach = []
+banner = []
+
+def walk(node):
+    for mark in node.get("marks", []) or []:
+        if isinstance(mark, str) and mark.startswith("pohunek:"):
+            attach.append(mark[len("pohunek:"):])
+        elif isinstance(mark, str) and mark.startswith("pohunek-banner:"):
+            banner.append(mark[len("pohunek-banner:"):])
+    for child in (node.get("nodes", []) or []) + (node.get("floating_nodes", []) or []):
+        walk(child)
+
+walk(tree)
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    for target in attach:
+        handle.write(target + "\n")
+with open(sys.argv[3], "w", encoding="utf-8") as handle:
+    for target in banner:
+        handle.write(target + "\n")
+PY
+then
+  :
+else
+  tree_ok=false
+fi
+
+if [ "$tree_ok" != "true" ]; then
+  # Without a readable tree we know neither which windows exist nor their marks.
+  # Reconciling anyway would BOTH leak the deselected windows (no marks to close)
+  # AND spawn duplicate attach windows (the dedup check would match nothing), so
+  # skip this round safely and tell the user rather than degrade silently.
+  printf 'pohunek-rofi: cannot read the sway tree; skipping window reconcile this round\n' >&2
+  cat "$targets_file"
+  exit 0
+fi
+
+while IFS= read -r existing; do
+  [ -n "$existing" ] || continue
+  if ! grep -Fxq "$existing" "$targets_file"; then
+    "$swaymsg_bin" "[con_mark=\"pohunek:$existing\"]" kill >/dev/null 2>&1 || true
+  fi
+done <"$marks_file"
+
+while IFS= read -r existing; do
+  [ -n "$existing" ] || continue
+  if ! grep -Fxq "$existing" "$targets_file"; then
+    "$swaymsg_bin" "[con_mark=\"pohunek-banner:$existing\"]" kill >/dev/null 2>&1 || true
+  fi
+done <"$banner_marks_file"
+
+while IFS= read -r target; do
+  [ -n "$target" ] || continue
+  attach_exists=false
+  if grep -Fxq "$target" "$marks_file"; then
+    attach_exists=true
+  fi
+  banner_exists=false
+  if grep -Fxq "$target" "$banner_marks_file"; then
+    banner_exists=true
+  fi
+
+  if [ "$attach_exists" != "true" ]; then
+    "$terminal_bin" -e sh -c 'printf "\033]0;pohunek:%s\007" "$1"; exec "$2" attach "$1"' sh "$target" "$pohunek_bin" &
+    # Mark synchronously so a later switch can find and close this window
+    # (close == detach; the session keeps running on its host).
+    pohunek_mark_window "pohunek:$target" "pohunek:$target" || true
+  fi
+
+  # Decide the banner independently of the attach window: an attach pane may
+  # already exist while its banner died or never got marked, so (re)create it.
+  if [ "$banner_enabled" = "true" ] && [ "$banner_exists" != "true" ]; then
+    # Anchor the split on this session's attach window (now marked) so the banner
+    # lands beside its own session rather than whatever rofi happened to leave
+    # focused. Exact above/below placement stays best-effort (sway-version
+    # dependent); the banner is opt-in.
+    "$swaymsg_bin" "[con_mark=\"pohunek:$target\"]" focus >/dev/null 2>&1 || true
+    "$swaymsg_bin" splitv >/dev/null 2>&1 || true
+    "$terminal_bin" -e "$script_dir/pohunek-session-banner" "$target" &
+    pohunek_mark_window "pohunek-banner:$target" "pohunek-banner:$target" || true
+    "$swaymsg_bin" "[con_mark=\"pohunek-banner:$target\"]" move up >/dev/null 2>&1 || true
+    "$swaymsg_bin" "[con_mark=\"pohunek-banner:$target\"]" resize set height "$banner_height_px" px >/dev/null 2>&1 || true
+  fi
+done <"$targets_file"
+
+cat "$targets_file"

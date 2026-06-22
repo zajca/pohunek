@@ -19,8 +19,8 @@ use futures::{SinkExt, StreamExt};
 use protocol::{
     method, AgentKind, AttachHeader, HostCapabilities, ProtocolVersion, Request, Response,
     SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
-    SessionInfo, SessionInputParams, SessionInputResult, SessionNewParams, SessionState,
-    SessionStopResult, PROTOCOL_VERSION,
+    SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
+    SessionNewParams, SessionState, SessionStopResult, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -179,6 +179,7 @@ fn session_params() -> SessionNewParams {
         repo: None,
         branch: None,
         base_branch: None,
+        input: None,
     }
 }
 
@@ -192,6 +193,21 @@ where
         serde_json::to_value(session_params()).expect("serialize params"),
     );
     serde_json::from_value(ok_payload(exchange(framed, &req).await)).expect("session info")
+}
+
+async fn create_session_with_params<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    params: SessionNewParams,
+) -> Response
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let req = Request::new(
+        "session-new-custom",
+        method::SESSION_NEW,
+        serde_json::to_value(params).expect("serialize params"),
+    );
+    exchange(framed, &req).await
 }
 
 async fn inspect_session<S>(framed: &mut Framed<S, LinesCodec>, id: &SessionId) -> SessionInfo
@@ -319,6 +335,30 @@ async fn session_lifecycle_over_tcp() {
         "created session should appear in list over TCP: {list:?}"
     );
 
+    let second = create_session(&mut client).await;
+    let filtered_list_req = Request::new(
+        "session-list-filtered",
+        method::SESSION_LIST,
+        serde_json::to_value(SessionListParams {
+            filters: vec![
+                SessionListFilter::State(SessionState::Running),
+                SessionListFilter::Id(created.id.0.clone()),
+            ],
+        })
+        .expect("serialize list params"),
+    );
+    let filtered: Vec<SessionInfo> =
+        serde_json::from_value(ok_payload(exchange(&mut client, &filtered_list_req).await))
+            .expect("filtered session list");
+    assert_eq!(
+        filtered
+            .iter()
+            .map(|session| &session.id)
+            .collect::<Vec<_>>(),
+        vec![&created.id],
+        "TCP filtered list must return only the exact AND match, not {second:?}: {filtered:?}"
+    );
+
     let inspected = inspect_session(&mut client, &created.id).await;
     assert_eq!(inspected.id, created.id);
     assert_eq!(inspected.pid, created.pid);
@@ -337,6 +377,70 @@ async fn session_lifecycle_over_tcp() {
     assert!(stopped.stopped);
     let stopped_info = inspect_session(&mut client, &created.id).await;
     assert_eq!(stopped_info.state, SessionState::Stopped);
+    let stop_second_req = Request::new(
+        "session-stop-second",
+        method::SESSION_STOP,
+        serde_json::to_value(&second.id).expect("serialize second id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut client, &stop_second_req).await))
+            .expect("stop second result");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn session_new_with_input_over_tcp_writes_text_to_shell_pty() {
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new(
+            "/bin/sh",
+            [
+                "-c",
+                "IFS= read -r line; printf 'got:%s\\n' \"$line\"; sleep 30",
+            ],
+        ),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    };
+    let (addr, _socket, shutdown, handle) =
+        spawn_dual_servers("remote-session-new-input", "0.0.0", config).await;
+
+    let mut control = connect_tcp(addr).await;
+    let mut params = session_params();
+    params.input = Some("hello from tcp create".to_owned());
+    let ok = ok_payload(create_session_with_params(&mut control, params).await);
+    assert!(
+        !ok.as_object()
+            .expect("session.new response object")
+            .contains_key("accepted"),
+        "session.new must keep returning SessionInfo, not SessionInputResult: {ok}"
+    );
+    let created: SessionInfo = serde_json::from_value(ok).expect("session info");
+    assert_eq!(created.agent, AgentKind::Shell);
+    assert_eq!(created.state, SessionState::Running);
+
+    let attach = attach_session(&mut control, &created.id).await;
+    let mut raw = open_attach_stream_tcp(addr, &attach.stream_id).await;
+    let output = read_until_marker(&mut raw, b"got:hello from tcp create").await;
+    assert!(
+        output
+            .windows(b"got:hello from tcp create".len())
+            .any(|window| window == b"got:hello from tcp create"),
+        "create-time input should reach a TCP-created session: {}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let detached = detach_stream(&mut control, &attach.stream_id).await;
+    assert!(detached.detached);
+    let stop_req = Request::new(
+        "session-new-input-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
 
     let _ = shutdown.send(());
     let _ = handle.await;

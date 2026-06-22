@@ -1,0 +1,146 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$script_dir/lib.sh"
+
+[ "$#" -eq 1 ] || pohunek_fail "usage: pohunek-session-banner <host/session-id>"
+target="$1"
+case "$target" in
+  */*)
+    target_host="${target%%/*}"
+    target_session="${target#*/}"
+    ;;
+  *)
+    target_host="local"
+    target_session="$target"
+    ;;
+esac
+
+pohunek_bin="$(pohunek_optional_config pohunek_bin pohunek)"
+interval="$(pohunek_optional_config banner_interval_seconds 1)"
+
+render_polling_banner() {
+  while :; do
+    if info="$("$pohunek_bin" session inspect "$target" --json 2>/dev/null)"; then
+      python3 - "$target_host" "$info" <<'PY'
+import json
+import sys
+
+host = sys.argv[1]
+data = json.loads(sys.argv[2])
+session_id = data.get("id", "<unknown>")
+agent = data.get("agent", "<unknown>")
+state = data.get("state", "<unknown>")
+activity = data.get("activity") or "-"
+print(f"{host}/{session_id}  agent={agent}  state={state}  activity={activity}", flush=True)
+PY
+    else
+      printf 'session unavailable: %s\n' "$target"
+    fi
+    sleep "$interval"
+  done
+}
+
+printf '\033]0;pohunek-banner:%s\007' "$target"
+
+initial="$("$pohunek_bin" session inspect "$target" --json 2>/dev/null || true)"
+
+if [ "$target_host" = "local" ] || [ -z "$target_host" ]; then
+  set -- "$pohunek_bin" subscribe --json
+else
+  set -- "$pohunek_bin" --host "$target_host" subscribe --json
+fi
+
+python3 - "$target_host" "$target_session" "$initial" "$@" <<'PY' || render_polling_banner
+import json
+import subprocess
+import sys
+
+host, session_id, initial_raw = sys.argv[1:4]
+subscribe_cmd = sys.argv[4:]
+state = {
+    "id": session_id,
+    "agent": "<unknown>",
+    "state": "<unknown>",
+    "activity": "-",
+}
+
+def update_from_info(info):
+    if not isinstance(info, dict):
+        return
+    raw_id = info.get("id")
+    if isinstance(raw_id, str):
+        state["id"] = raw_id
+    if isinstance(info.get("agent"), str):
+        state["agent"] = info["agent"]
+    if isinstance(info.get("state"), str):
+        state["state"] = info["state"]
+    activity = info.get("activity")
+    if isinstance(activity, str) and activity:
+        state["activity"] = activity
+
+def render():
+    print(
+        f"{host}/{state['id']}  agent={state['agent']}  "
+        f"state={state['state']}  activity={state['activity']}",
+        flush=True,
+    )
+
+if initial_raw:
+    try:
+        update_from_info(json.loads(initial_raw))
+    except json.JSONDecodeError:
+        pass
+render()
+
+process = subprocess.Popen(
+    subscribe_cmd,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    text=True,
+    encoding="utf-8",
+)
+assert process.stdout is not None
+try:
+    for line in process.stdout:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            # A non-object event line (e.g. a bare number/string) has no .get();
+            # skip it instead of crashing the banner with an AttributeError.
+            continue
+        name = event.get("event")
+        if name == "agent_state":
+            if event.get("session_id") != session_id:
+                continue
+            activity = event.get("activity")
+            if isinstance(activity, str) and activity:
+                state["activity"] = activity
+            render()
+        elif name in {"session_created", "session_updated", "session_stopped"}:
+            info = event.get("session")
+            if not isinstance(info, dict) or info.get("id") != session_id:
+                continue
+            update_from_info(info)
+            render()
+finally:
+    # Always tear down the subscribe child so a connection is never left open if
+    # this loop exits abnormally (the child does not die on its own when the
+    # interpreter unwinds via an exception).
+    process.terminate()
+    try:
+        process.wait(timeout=2)
+    except Exception:
+        process.kill()
+
+# Reaching here means the subscribe stream ended while the banner window is
+# still open, i.e. the connection was lost (e.g. the daemon restarted) — not a
+# normal exit. Return non-zero so the shell wrapper falls back to
+# render_polling_banner instead of freezing on the last-known line.
+code = process.returncode if process.returncode is not None else 0
+raise SystemExit(code if code != 0 else 1)
+PY

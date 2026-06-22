@@ -38,9 +38,9 @@ pub use integration::{
 pub use session::{
     AgentActivity, AgentKind, AttachHeader, SessionAttachParams, SessionAttachResult,
     SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionNewParams, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, SessionWarning,
-    SessionWarningKind,
+    SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams, SessionNewResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionState, SessionStopResult, SessionWarning, SessionWarningKind,
 };
 pub use version::{negotiate, ProtocolVersion, PROTOCOL_VERSION};
 

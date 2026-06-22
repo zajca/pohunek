@@ -80,6 +80,39 @@ where
         }
     }
 
+    /// Send a subscription request, verify the OK ack, then print event lines
+    /// until the daemon closes the stream.
+    async fn subscribe(&mut self, request: &Request) -> Result<(), CliError> {
+        let host = self.remote_host.as_deref();
+        let line = serde_json::to_string(request)?;
+        self.framed
+            .send(line)
+            .await
+            .map_err(|err| map_codec_err_for(host, err))?;
+
+        let ack = match self.framed.next().await {
+            Some(reply) => reply.map_err(|err| map_codec_err_for(host, err))?,
+            None => {
+                return Err(no_response_error(
+                    host,
+                    "daemon closed the connection without a subscription ack",
+                ));
+            }
+        };
+        let response: Response = match serde_json::from_str(&ack) {
+            Ok(response) => response,
+            Err(err) => return Err(unparseable_reply_error(host, err)),
+        };
+        if let Response::Err { err, .. } = response {
+            return Err(map_daemon_error(host, err));
+        }
+
+        while let Some(line) = self.framed.next().await {
+            println!("{}", line.map_err(|err| map_codec_err_for(host, err))?);
+        }
+        Ok(())
+    }
+
     /// Perform one line send + one line receive.
     async fn exchange(&mut self, line: String) -> Result<Value, CliError> {
         let host = self.remote_host.as_deref();
@@ -96,7 +129,7 @@ where
                 return Err(no_response_error(
                     host,
                     "daemon closed the connection without a response",
-                ))
+                ));
             }
         };
 
@@ -217,6 +250,14 @@ impl Client {
         match self {
             Client::Local(conn) => conn.request(request).await,
             Client::Remote(conn) => conn.request(request).await,
+        }
+    }
+
+    /// Subscribe to daemon events and print one JSON event per line.
+    pub(crate) async fn subscribe(&mut self, request: &Request) -> Result<(), CliError> {
+        match self {
+            Client::Local(conn) => conn.subscribe(request).await,
+            Client::Remote(conn) => conn.subscribe(request).await,
         }
     }
 }

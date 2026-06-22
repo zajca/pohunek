@@ -302,7 +302,10 @@ mod tests {
         // First peer: Connected P2P.
         assert!(peers[0].is_connected());
         assert_eq!(peers[0].connection_type.as_deref(), Some("P2P"));
-        assert_eq!(peers[0].ip(), Some("100.92.30.40".parse::<IpAddr>().unwrap()));
+        assert_eq!(
+            peers[0].ip(),
+            Some("100.92.30.40".parse::<IpAddr>().unwrap())
+        );
         // Second peer: Idle -> not connected.
         assert!(!peers[1].is_connected());
         assert_eq!(peers[1].connection_status.as_deref(), Some("Idle"));
@@ -323,7 +326,10 @@ mod tests {
         assert!(peers[0].is_connected());
         // Shape B uses connType / connectionStatus.
         assert_eq!(peers[0].connection_type.as_deref(), Some("P2P"));
-        assert_eq!(peers[0].ip(), Some("100.64.0.20".parse::<IpAddr>().unwrap()));
+        assert_eq!(
+            peers[0].ip(),
+            Some("100.64.0.20".parse::<IpAddr>().unwrap())
+        );
         assert_eq!(peers[0].fqdn.as_deref(), Some("host-b.netbird.cloud"));
     }
 
@@ -375,13 +381,28 @@ mod tests {
         let err = parse_status("{ this is not json ]").unwrap_err();
         assert!(matches!(err, NetbirdError::Parse(_)));
         // Empty input is not valid JSON.
-        assert!(matches!(parse_status("").unwrap_err(), NetbirdError::Parse(_)));
+        assert!(matches!(
+            parse_status("").unwrap_err(),
+            NetbirdError::Parse(_)
+        ));
         // Scalar root types cannot deserialize into the struct.
-        assert!(matches!(parse_status("\"hello\"").unwrap_err(), NetbirdError::Parse(_)));
-        assert!(matches!(parse_status("42").unwrap_err(), NetbirdError::Parse(_)));
-        assert!(matches!(parse_status("true").unwrap_err(), NetbirdError::Parse(_)));
+        assert!(matches!(
+            parse_status("\"hello\"").unwrap_err(),
+            NetbirdError::Parse(_)
+        ));
+        assert!(matches!(
+            parse_status("42").unwrap_err(),
+            NetbirdError::Parse(_)
+        ));
+        assert!(matches!(
+            parse_status("true").unwrap_err(),
+            NetbirdError::Parse(_)
+        ));
         // A non-empty array cannot map to the struct's fields positionally.
-        assert!(matches!(parse_status("[1, 2, 3]").unwrap_err(), NetbirdError::Parse(_)));
+        assert!(matches!(
+            parse_status("[1, 2, 3]").unwrap_err(),
+            NetbirdError::Parse(_)
+        ));
     }
 
     #[test]

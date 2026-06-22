@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::ProtocolError;
-use crate::version::{PROTOCOL_VERSION, ProtocolVersion};
+use crate::version::{ProtocolVersion, PROTOCOL_VERSION};
 
 /// A control request: `{v, id, method, params}`.
 ///

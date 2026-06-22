@@ -150,7 +150,10 @@ mod tests {
 
         for name in ["evil", "evil.netbird.cloud", "169.254.169.254"] {
             assert!(
-                matches!(resolve_host(&status, name), Err(NetbirdError::HostUnknown(_))),
+                matches!(
+                    resolve_host(&status, name),
+                    Err(NetbirdError::HostUnknown(_))
+                ),
                 "name {name} must not resolve to a non-NetBird IP"
             );
         }

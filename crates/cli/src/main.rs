@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use protocol::{method, Request};
 
 use crate::error::CliError;
 use crate::paths::Paths;
@@ -79,6 +80,17 @@ enum Commands {
     Session {
         #[command(subcommand)]
         action: SessionAction,
+    },
+
+    /// Stream daemon events as newline-delimited JSON.
+    #[command(hide = true)]
+    Subscribe {
+        /// Emit machine-readable JSON event lines. The event stream is already
+        /// newline-delimited JSON, so this does not change the streamed output;
+        /// it is accepted for forward-compat and to keep error rendering in JSON
+        /// (via `wants_json`) consistent with the other commands.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Manage agent integrations (session-id capture hooks).
@@ -171,6 +183,9 @@ enum SessionAction {
         /// branch when missing.
         #[arg(long)]
         base_branch: Option<String>,
+        /// Initial text to inject into the session after the PTY is spawned.
+        #[arg(long)]
+        input: Option<String>,
         /// Skip the confirmation prompt when starting a session on a remote
         /// host. Required on the `--json` path for a remote host (the machine
         /// path must not block on a prompt). Ignored for local sessions.
@@ -186,6 +201,13 @@ enum SessionAction {
         /// Emit machine-readable JSON instead of a table.
         #[arg(long)]
         json: bool,
+        /// Emit only session ids, one per line.
+        #[arg(short = 'q', long = "quiet", conflicts_with = "json")]
+        quiet: bool,
+        /// Exact-match filter in key=value form. May be repeated and filters
+        /// are ANDed. Supported keys: state, activity, agent, id.
+        #[arg(long = "filter", value_name = "key=value", value_parser = commands::session::parse_list_filter)]
+        filters: Vec<commands::session::ListFilter>,
     },
 
     /// Inspect one session.
@@ -232,6 +254,7 @@ impl Commands {
             Commands::Session { action } => action.wants_json(),
             Commands::Integration { action } => action.wants_json(),
             Commands::Host { action } => action.wants_json(),
+            Commands::Subscribe { json } => *json,
             Commands::Attach { .. } | Commands::Daemon { .. } => false,
         }
     }
@@ -251,7 +274,7 @@ impl SessionAction {
     fn wants_json(&self) -> bool {
         match self {
             SessionAction::New { json, .. }
-            | SessionAction::List { json }
+            | SessionAction::List { json, .. }
             | SessionAction::Inspect { json, .. }
             | SessionAction::Stop { json, .. }
             | SessionAction::Input { json, .. } => *json,
@@ -334,6 +357,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     repo,
                     branch,
                     base_branch,
+                    input,
                     yes,
                     json,
                 } => {
@@ -349,15 +373,27 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                             repo,
                             branch,
                             base_branch,
+                            input,
                         },
                         json,
                         yes,
                     )
                     .await?
                 }
-                SessionAction::List { json } => {
+                SessionAction::List {
+                    json,
+                    quiet,
+                    filters,
+                } => {
                     let host = effective_host(&global_host, None);
-                    commands::session::run_list(&host, &paths, json).await?
+                    let output_mode = if quiet {
+                        commands::session::ListOutputMode::Quiet
+                    } else if json {
+                        commands::session::ListOutputMode::Json
+                    } else {
+                        commands::session::ListOutputMode::Human
+                    };
+                    commands::session::run_list(&host, &paths, &filters, output_mode).await?
                 }
                 SessionAction::Inspect { target, json } => {
                     let host = effective_host(&global_host, Some(&target));
@@ -372,6 +408,21 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     commands::session::run_input(&host, &paths, &target, &text, json).await?
                 }
             }
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Subscribe { json: _ } => {
+            // `json` is intentionally not read here: the daemon's event stream is
+            // already NDJSON, so success output is the same with or without the
+            // flag. It still governs error rendering through `wants_json` above.
+            let paths = Paths::resolve()?;
+            let host = effective_host(&global_host, None);
+            let mut client = crate::client::Client::connect(&host, &paths).await?;
+            let request = Request::new(
+                commands::request_id(method::SUBSCRIBE),
+                method::SUBSCRIBE,
+                serde_json::Value::Null,
+            );
+            client.subscribe(&request).await?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Integration { action } => {
@@ -440,6 +491,7 @@ mod tests {
                         repo,
                         branch,
                         base_branch,
+                        input,
                         yes,
                         json,
                     },
@@ -451,6 +503,7 @@ mod tests {
                 assert_eq!(repo, None);
                 assert_eq!(branch, None);
                 assert_eq!(base_branch, None);
+                assert_eq!(input, None);
                 assert!(!yes, "yes defaults to false");
                 assert!(!json, "json defaults to false");
             }
@@ -513,6 +566,7 @@ mod tests {
                         repo,
                         branch,
                         base_branch,
+                        input,
                         ..
                     },
             } => {
@@ -523,7 +577,31 @@ mod tests {
                 );
                 assert_eq!(branch.as_deref(), Some("feature/login"));
                 assert_eq!(base_branch.as_deref(), Some("main"));
+                assert_eq!(input, None);
             }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_session_new_initial_input() {
+        let cli = Cli::try_parse_from(["pohunek", "session", "new", "--input", "Fix #1234"])
+            .expect("parse");
+
+        match cli.command {
+            Commands::Session {
+                action: SessionAction::New { input, .. },
+            } => assert_eq!(input.as_deref(), Some("Fix #1234")),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_hidden_subscribe_json() {
+        let cli = Cli::try_parse_from(["pohunek", "subscribe", "--json"]).expect("parse");
+
+        match cli.command {
+            Commands::Subscribe { json } => assert!(json),
             other => panic!("unexpected command: {other:?}"),
         }
     }
@@ -567,6 +645,51 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_session_list_repeatable_filters_and_quiet() {
+        let cli = Cli::try_parse_from([
+            "pohunek",
+            "session",
+            "list",
+            "--filter",
+            "state=running",
+            "--filter",
+            "agent=codex",
+            "-q",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Commands::Session {
+                action:
+                    SessionAction::List {
+                        json,
+                        quiet,
+                        filters,
+                    },
+            } => {
+                assert!(!json);
+                assert!(quiet);
+                assert_eq!(
+                    filters,
+                    vec![
+                        commands::session::parse_list_filter("state=running").expect("state"),
+                        commands::session::parse_list_filter("agent=codex").expect("agent"),
+                    ]
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_session_list_json_and_quiet_together() {
+        let err = Cli::try_parse_from(["pohunek", "session", "list", "--json", "-q"])
+            .expect_err("json and quiet conflict");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

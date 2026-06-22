@@ -136,7 +136,10 @@ impl ScreenTracker {
     /// marker is present.
     pub fn after_last_prompt_marker(&self) -> String {
         let lines = self.visible_lines();
-        match lines.iter().rposition(|line| Self::is_prompt_marker_line(line)) {
+        match lines
+            .iter()
+            .rposition(|line| Self::is_prompt_marker_line(line))
+        {
             Some(index) => lines[index + 1..].join("\n"),
             None => lines.join("\n"),
         }
@@ -168,7 +171,10 @@ impl ScreenTracker {
     /// last horizontal rule, or the whole visible text when no rule is present.
     pub fn after_last_horizontal_rule(&self) -> String {
         let lines = self.visible_lines();
-        match lines.iter().rposition(|line| Self::is_horizontal_rule(line)) {
+        match lines
+            .iter()
+            .rposition(|line| Self::is_horizontal_rule(line))
+        {
             Some(index) => lines[index + 1..].join("\n"),
             None => lines.join("\n"),
         }
@@ -394,10 +400,7 @@ mod tests {
 
         tracker.feed("preamble\r\n\u{203a} run tests\r\napproval required".as_bytes());
 
-        assert_eq!(
-            tracker.after_last_prompt_marker(),
-            "approval required\n"
-        );
+        assert_eq!(tracker.after_last_prompt_marker(), "approval required\n");
     }
 
     #[test]
