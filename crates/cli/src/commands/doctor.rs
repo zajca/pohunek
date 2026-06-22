@@ -102,6 +102,16 @@ pub(crate) fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
             Status::Warn,
             "not available yet (SQLite store is a later milestone)",
         ),
+        // Launcher prerequisites: the sway/rofi launcher (materialized by
+        // `pohunek setup`) is OPTIONAL, so every check below is `warn` at worst
+        // and never flips `overall` to fail.
+        check_binary("rofi", false),
+        check_binary("swaymsg", false),
+        check_binary("python3", false),
+        check_binary("timeout", false),
+        check_terminal(),
+        check_launcher_scripts(paths),
+        check_sway_include(paths),
     ];
 
     let overall = if checks.iter().any(|c| c.status == Status::Fail) {
@@ -179,6 +189,85 @@ fn check_netbird() -> Check {
     }
 }
 
+/// Check that a terminal emulator is configured for the rofi launcher.
+///
+/// The launcher needs a terminal to spawn agent sessions in. `ok` when
+/// `$TERMINAL` is set and non-empty; otherwise `warn` (the launcher also reads
+/// a `terminal=` key from `launcher.conf`, so this is optional).
+fn check_terminal() -> Check {
+    match std::env::var("TERMINAL") {
+        Ok(value) if !value.is_empty() => {
+            Check::new("terminal", Status::Ok, format!("TERMINAL={value}"))
+        }
+        _ => Check::new(
+            "terminal",
+            Status::Warn,
+            "set $TERMINAL or 'terminal=' in launcher.conf (the rofi launcher needs a terminal)",
+        ),
+    }
+}
+
+/// Check whether the launcher scripts have been materialized by
+/// `pohunek setup scripts`. `ok` when the `pohunek-rofi` entrypoint is present;
+/// otherwise `warn` (the launcher is optional).
+fn check_launcher_scripts(paths: &Paths) -> Check {
+    let bin_dir = paths.launcher_bin_dir();
+    if bin_dir.join("pohunek-rofi").is_file() {
+        Check::new(
+            "launcher_scripts",
+            Status::Ok,
+            format!("installed at {}", bin_dir.display()),
+        )
+    } else {
+        Check::new(
+            "launcher_scripts",
+            Status::Warn,
+            "not installed; run 'pohunek setup scripts'",
+        )
+    }
+}
+
+/// Check whether the user's sway config includes a `config.d` drop-in dir, which
+/// is where `pohunek setup sway` writes its launcher keybinding drop-in.
+///
+/// `ok` when the main config exists and has a non-comment line mentioning
+/// `config.d`; `warn` when the config exists without such a line, or when it is
+/// absent entirely. The launcher is optional, so this is never fatal.
+fn check_sway_include(paths: &Paths) -> Check {
+    let config = paths.sway_config_dir().join("config");
+    match std::fs::read_to_string(&config) {
+        Ok(contents) => {
+            // A "non-comment line mentioning config.d": trim each line, skip
+            // comment lines, and look for the `config.d` token.
+            let includes = contents.lines().any(|line| {
+                let trimmed = line.trim();
+                !trimmed.starts_with('#') && trimmed.contains("config.d")
+            });
+            if includes {
+                Check::new(
+                    "sway_include",
+                    Status::Ok,
+                    "sway config includes config.d",
+                )
+            } else {
+                Check::new(
+                    "sway_include",
+                    Status::Warn,
+                    format!(
+                        "add 'include {}/config.d/*' to your sway config (see 'pohunek setup sway')",
+                        paths.sway_config_dir().display()
+                    ),
+                )
+            }
+        }
+        Err(_) => Check::new(
+            "sway_include",
+            Status::Warn,
+            format!("sway config not found at {}", config.display()),
+        ),
+    }
+}
+
 /// Resolve a binary name against the `PATH` environment variable.
 ///
 /// A small dependency-free `which`: splits `PATH`, joins the name, and returns
@@ -242,4 +331,77 @@ fn print_human(report: &Report) {
     }
     println!();
     println!("overall: {}", report.overall.symbol());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+
+    /// Per-test unique temp dir, namespaced by pid + a monotonic counter so
+    /// parallel tests never collide.
+    fn unique_temp_dir() -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("pohunek-doctor-test-{pid}-{n}"))
+    }
+
+    /// Build a `Paths` rooted at `base` (same-crate `pub(crate)` fields). Only
+    /// `config_home` matters for `check_sway_include`, but all fields are filled
+    /// with sensible temp paths.
+    fn paths_at(base: &Path) -> Paths {
+        Paths {
+            runtime_dir: base.join("runtime"),
+            socket: base.join("runtime").join("daemon.sock"),
+            data_dir: base.join("data"),
+            log_dir: base.join("logs"),
+            config_home: base.join("config"),
+            config_dir: base.join("config").join("pohunek"),
+        }
+    }
+
+    /// Write the sway main config under `<config_home>/sway/config`.
+    fn write_sway_config(paths: &Paths, contents: &str) {
+        let dir = paths.sway_config_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config"), contents).unwrap();
+    }
+
+    #[test]
+    fn sway_include_warns_when_config_absent() {
+        let base = unique_temp_dir();
+        let paths = paths_at(&base);
+
+        let check = check_sway_include(&paths);
+        assert_eq!(check.status, Status::Warn);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sway_include_ok_when_config_includes_config_d() {
+        let base = unique_temp_dir();
+        let paths = paths_at(&base);
+        write_sway_config(&paths, "include ~/.config/sway/config.d/*\n");
+
+        let check = check_sway_include(&paths);
+        assert_eq!(check.status, Status::Ok);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sway_include_warns_when_only_commented_config_d() {
+        let base = unique_temp_dir();
+        let paths = paths_at(&base);
+        write_sway_config(&paths, "# include ~/.config/sway/config.d/*\n");
+
+        let check = check_sway_include(&paths);
+        assert_eq!(check.status, Status::Warn);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

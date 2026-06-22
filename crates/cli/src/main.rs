@@ -99,6 +99,19 @@ enum Commands {
         action: IntegrationAction,
     },
 
+    /// Set up the sway/rofi launcher integration on this machine.
+    ///
+    /// With no subcommand, runs the full setup (scripts + config + sway
+    /// drop-in). Subcommands apply one part at a time. All operations are
+    /// local filesystem writes; `--host` is ignored.
+    Setup {
+        #[command(subcommand)]
+        action: Option<SetupAction>,
+        /// Emit machine-readable JSON instead of human text (bare `setup`).
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Discover, list, and inspect remote hosts over NetBird.
     Host {
         #[command(subcommand)]
@@ -140,6 +153,40 @@ enum IntegrationAction {
         /// Restrict installation to a single agent.
         #[arg(long, value_enum)]
         agent: Option<commands::integration::HookAgentArg>,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SetupAction {
+    /// Materialize the launcher scripts into the data dir's `bin/`.
+    Scripts {
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Write a default `launcher.conf` and prompt templates (never overwrites
+    /// existing files unless `--force`).
+    Config {
+        /// Overwrite existing config files instead of skipping them.
+        #[arg(long)]
+        force: bool,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Write (or print) the sway drop-in that binds a key to the launcher.
+    Sway {
+        /// Print the snippet to stdout instead of writing the drop-in file.
+        #[arg(long)]
+        print: bool,
+        /// Sway keybind to bind the launcher to.
+        #[arg(long, default_value = "$mod+p")]
+        keybind: String,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -253,9 +300,20 @@ impl Commands {
             }
             Commands::Session { action } => action.wants_json(),
             Commands::Integration { action } => action.wants_json(),
+            Commands::Setup { action, json } => action.as_ref().map_or(*json, SetupAction::wants_json),
             Commands::Host { action } => action.wants_json(),
             Commands::Subscribe { json } => *json,
             Commands::Attach { .. } | Commands::Daemon { .. } => false,
+        }
+    }
+}
+
+impl SetupAction {
+    fn wants_json(&self) -> bool {
+        match self {
+            SetupAction::Scripts { json }
+            | SetupAction::Config { json, .. }
+            | SetupAction::Sway { json, .. } => *json,
         }
     }
 }
@@ -432,6 +490,28 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             match action {
                 IntegrationAction::Install { agent, json } => {
                     commands::integration::run_install(&paths, agent, json).await?;
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Setup { action, json } => {
+            // Setup is purely local: it writes this machine's scripts, config,
+            // and sway drop-in. It ignores `--host`.
+            let paths = Paths::resolve()?;
+            match action {
+                None => commands::setup::run_all(&paths, json)?,
+                Some(SetupAction::Scripts { json }) => {
+                    commands::setup::run_scripts(&paths, json)?;
+                }
+                Some(SetupAction::Config { force, json }) => {
+                    commands::setup::run_config(&paths, force, json)?;
+                }
+                Some(SetupAction::Sway {
+                    print,
+                    keybind,
+                    json,
+                }) => {
+                    commands::setup::run_sway(&paths, print, &keybind, json)?;
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -714,6 +794,73 @@ mod tests {
                 assert_eq!(target.session_id, "s-42");
                 assert_eq!(target.host.as_deref(), Some("local"));
             }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    // --- setup ----------------------------------------------------------------
+
+    #[test]
+    fn parses_bare_setup_as_no_action() {
+        let cli = Cli::try_parse_from(["pohunek", "setup"]).expect("parse");
+
+        match cli.command {
+            Commands::Setup { action, json } => {
+                assert!(action.is_none(), "bare setup has no subcommand");
+                assert!(!json, "json defaults to false");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_setup_config_force() {
+        let cli = Cli::try_parse_from(["pohunek", "setup", "config", "--force"]).expect("parse");
+
+        match cli.command {
+            Commands::Setup {
+                action: Some(SetupAction::Config { force, json }),
+                ..
+            } => {
+                assert!(force);
+                assert!(!json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_setup_sway_keybind_and_print() {
+        let cli =
+            Cli::try_parse_from(["pohunek", "setup", "sway", "--print", "--keybind", "$mod+a"])
+                .expect("parse");
+
+        match cli.command {
+            Commands::Setup {
+                action: Some(SetupAction::Sway {
+                    print,
+                    keybind,
+                    json,
+                }),
+                ..
+            } => {
+                assert!(print);
+                assert_eq!(keybind, "$mod+a");
+                assert!(!json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn setup_sway_keybind_defaults_to_mod_p() {
+        let cli = Cli::try_parse_from(["pohunek", "setup", "sway"]).expect("parse");
+
+        match cli.command {
+            Commands::Setup {
+                action: Some(SetupAction::Sway { keybind, .. }),
+                ..
+            } => assert_eq!(keybind, "$mod+p"),
             other => panic!("unexpected command: {other:?}"),
         }
     }

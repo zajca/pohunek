@@ -23,6 +23,12 @@ pub(crate) struct Paths {
     pub(crate) data_dir: PathBuf,
     /// The structured-log directory.
     pub(crate) log_dir: PathBuf,
+    /// The XDG config base (`$XDG_CONFIG_HOME` or `$HOME/.config`). Used to
+    /// derive both pohunek's own config dir and the sway config dir.
+    pub(crate) config_home: PathBuf,
+    /// pohunek's config dir (`<config_home>/pohunek`) — holds `launcher.conf`
+    /// and `prompts/*.tmpl` consumed by the launcher scripts.
+    pub(crate) config_dir: PathBuf,
 }
 
 impl Paths {
@@ -44,12 +50,34 @@ impl Paths {
         let state_home = xdg_or_home_relative("XDG_STATE_HOME", &[".local", "state"])?;
         let log_dir = state_home.join(APP_DIR).join("logs");
 
+        let config_home = xdg_or_home_relative("XDG_CONFIG_HOME", &[".config"])?;
+        let config_dir = config_home.join(APP_DIR);
+
         Ok(Self {
             runtime_dir,
             socket,
             data_dir,
             log_dir,
+            config_home,
+            config_dir,
         })
+    }
+
+    /// Directory the launcher scripts (`pohunek-rofi`, `pohunek-launch-*`,
+    /// `pohunek-session-banner`, `lib.sh`) are materialized into by
+    /// `pohunek setup scripts`. They must be siblings: `pohunek-rofi` sources
+    /// `lib.sh` and spawns `pohunek-session-banner` from its own directory.
+    #[must_use]
+    pub(crate) fn launcher_bin_dir(&self) -> PathBuf {
+        self.data_dir.join("bin")
+    }
+
+    /// The user's sway config dir (`<config_home>/sway`). `pohunek setup sway`
+    /// writes a drop-in under `<sway_config_dir>/config.d/`; it never edits the
+    /// main sway config.
+    #[must_use]
+    pub(crate) fn sway_config_dir(&self) -> PathBuf {
+        self.config_home.join("sway")
     }
 }
 

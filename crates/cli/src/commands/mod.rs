@@ -19,6 +19,7 @@ pub(crate) mod health;
 pub(crate) mod host;
 pub(crate) mod integration;
 pub(crate) mod session;
+pub(crate) mod setup;
 
 /// Render a command result as the pretty-printed JSON document (with a trailing
 /// newline) emitted under `--json`.
