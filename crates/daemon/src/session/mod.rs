@@ -934,19 +934,19 @@ impl SessionRegistry {
         let reference = params.project.clone();
         let repo = params.repo.clone();
         let cwd = params.cwd.clone();
-        let now = timestamp_now();
         tokio::task::spawn_blocking(move || -> Result<_, ProtocolError> {
             // 1. Reference resolves against the store; a session start bumps recency.
             if let Some(reference) = reference {
                 let record = projects.resolve(&reference)?;
-                let record = projects.touch(&record.git_common_dir, &now)?.unwrap_or(record);
+                let record = projects.touch(&record.git_common_dir)?.unwrap_or(record);
                 return Ok((Some(record), None));
             }
             // 2. Explicit --repo: must be a git work tree, else error — never
             // silently launch somewhere else (no-silent-defaults).
             if let Some(repo) = repo {
-                let detected = detect_at(&repo)?.ok_or_else(|| not_a_git_repo(&repo))?;
-                let record = projects.register(&detected, &now, false)?;
+                let detected =
+                    detect_at(&repo)?.ok_or_else(|| crate::project::not_a_git_repo(&repo))?;
+                let record = projects.register(&detected, false)?;
                 return Ok((Some(record), Some(detected)));
             }
             // 3. Implicit --cwd (local): a non-git cwd is the normal plain shell.
@@ -956,7 +956,7 @@ impl SessionRegistry {
             let Some(detected) = detect_at(&cwd)? else {
                 return Ok((None, None));
             };
-            let record = projects.register(&detected, &now, false)?;
+            let record = projects.register(&detected, false)?;
             Ok((Some(record), Some(detected)))
         })
         .await
@@ -1977,16 +1977,6 @@ fn validate_new_params(params: &SessionNewParams) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-/// An explicitly named path is not a git work tree (no silent fallback elsewhere).
-fn not_a_git_repo(path: &Path) -> ProtocolError {
-    ProtocolError::new(
-        ErrorClass::Runtime,
-        "not_a_git_repo",
-        format!("{} is not a git repository", path.display()),
-        Some("point --repo at a git work tree, or omit it to use the current directory".to_owned()),
-    )
-}
-
 fn build_launch_command(
     agent: AgentKind,
     shell_command: &ShellCommand,
@@ -2656,10 +2646,7 @@ mod tests {
             })
             .await
             .expect_err("--project and --repo together must be rejected");
-        assert!(
-            err.msg.contains("mutually exclusive"),
-            "got: {err:?}"
-        );
+        assert!(err.msg.contains("mutually exclusive"), "got: {err:?}");
     }
 
     #[tokio::test]

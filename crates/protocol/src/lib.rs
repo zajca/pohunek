@@ -39,7 +39,11 @@ pub use integration::{
     IntegrationInstallParams, IntegrationInstallReport, IntegrationInstallResult, ENV_DAEMON_ID,
     ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
-pub use project::ProjectSource;
+pub use project::{
+    ProjectAddParams, ProjectInfo, ProjectListFilter, ProjectListParams, ProjectRemoveParams,
+    ProjectRemoveResult, ProjectRenameParams, ProjectShowParams, ProjectShowResult, ProjectSource,
+    ProjectWorktree,
+};
 pub use session::{
     AgentActivity, AgentKind, AttachHeader, SessionAttachParams, SessionAttachResult,
     SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
@@ -85,6 +89,23 @@ pub mod method {
     /// local daemon, which caches the result for a short TTL. Returns a
     /// `Vec<`[`HostRecord`](crate::HostRecord)`>`.
     pub const HOST_DISCOVER: &str = "host.discover";
+
+    // --- Projects (git-repo awareness). Resolved per host against its own store.
+    /// List known projects on the target host. Returns
+    /// `Vec<`[`ProjectInfo`](crate::ProjectInfo)`>`.
+    pub const PROJECT_LIST: &str = "project.list";
+    /// Register (or re-add) a project by host-local path. Returns a
+    /// [`ProjectInfo`](crate::ProjectInfo).
+    pub const PROJECT_ADD: &str = "project.add";
+    /// Show a project plus its live worktrees. Returns a
+    /// [`ProjectShowResult`](crate::ProjectShowResult).
+    pub const PROJECT_SHOW: &str = "project.show";
+    /// Set a project's custom display name. Returns a
+    /// [`ProjectInfo`](crate::ProjectInfo).
+    pub const PROJECT_RENAME: &str = "project.rename";
+    /// Forget a project record (optionally pruning owned worktrees). Returns a
+    /// [`ProjectRemoveResult`](crate::ProjectRemoveResult).
+    pub const PROJECT_REMOVE: &str = "project.remove";
 }
 
 /// Control-protocol event names.

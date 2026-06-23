@@ -204,8 +204,10 @@ fn main_worktree(cwd: &Path) -> Option<PathBuf> {
 }
 
 /// Run `git -C <cwd> <args>` bounded by [`DETECT_GIT_TIMEOUT`], returning trimmed
-/// stdout on a zero exit and `None` on any failure (see [`run_bounded`]).
-fn git(cwd: &Path, args: &[&str]) -> Option<String> {
+/// stdout on a zero exit and `None` on any failure (see [`run_bounded`]). Shared
+/// with [`crate::project`] so `project show`'s live `git worktree list` is bound
+/// by the same hot-path discipline as detection.
+pub(crate) fn git(cwd: &Path, args: &[&str]) -> Option<String> {
     let mut command = Command::new("git");
     command.arg("-C").arg(cwd).args(args);
     run_bounded(command, DETECT_GIT_TIMEOUT)

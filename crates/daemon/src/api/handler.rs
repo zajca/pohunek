@@ -11,16 +11,20 @@
 //! methods.
 
 use protocol::{
-    method, negotiate, HostDiscoverParams, IntegrationInstallParams, ProtocolError, Request,
-    Response, SessionAttachParams, SessionDetachParams, SessionId, SessionInputParams,
-    SessionListParams, SessionNewParams, SessionNewResult, SessionReportNativeIdParams,
-    SessionResizeParams, PROTOCOL_VERSION,
+    method, negotiate, HostDiscoverParams, IntegrationInstallParams, ProjectAddParams,
+    ProjectListParams, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
+    ProjectShowParams, ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams,
+    SessionId, SessionInputParams, SessionListParams, SessionNewParams, SessionNewResult,
+    SessionReportNativeIdParams, SessionResizeParams, PROTOCOL_VERSION,
 };
+use std::sync::Arc;
+
 use serde::Serialize;
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 use crate::discovery::DiscoveryCache;
+use crate::project::{LiveSession, ProjectManager};
 use crate::session::SessionRegistry;
 
 /// Static facts the daemon reports from `daemon.health`.
@@ -158,6 +162,11 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::INTEGRATION_INSTALL => handle_integration_install(request),
         method::HOST_INSPECT => handle_host_inspect(request, &state.health),
         method::HOST_DISCOVER => handle_host_discover(request, &state.discovery).await,
+        method::PROJECT_LIST => handle_project_list(request, &state.sessions).await,
+        method::PROJECT_ADD => handle_project_add(request, &state.sessions).await,
+        method::PROJECT_SHOW => handle_project_show(request, &state.sessions).await,
+        method::PROJECT_RENAME => handle_project_rename(request, &state.sessions).await,
+        method::PROJECT_REMOVE => handle_project_remove(request, &state.sessions).await,
         other => Response::err(request.id.clone(), ProtocolError::method_not_found(other)),
     }
 }
@@ -206,6 +215,143 @@ async fn handle_host_discover(request: &Request, discovery: &DiscoveryCache) -> 
             ProtocolError::netbird_state_unavailable(err.to_string()),
         ),
     }
+}
+
+/// Resolve the project manager, or a typed error response when the daemon has no
+/// metadata store configured (so projects are unavailable).
+fn require_projects(
+    request: &Request,
+    sessions: &SessionRegistry,
+) -> Result<Arc<ProjectManager>, Response> {
+    sessions.projects().ok_or_else(|| {
+        Response::err(
+            request.id.clone(),
+            ProtocolError::new(
+                protocol::ErrorClass::Daemon,
+                "projects_not_configured",
+                "the daemon is not configured for projects (no metadata store)".to_owned(),
+                None,
+            ),
+        )
+    })
+}
+
+/// Run a blocking project operation off the async runtime and build its response.
+async fn run_project_blocking<T, F>(request: &Request, op: F) -> Response
+where
+    T: Serialize + Send + 'static,
+    F: FnOnce() -> Result<T, ProtocolError> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(op).await {
+        Ok(Ok(value)) => ok_value(request, &value),
+        Ok(Err(err)) => Response::err(request.id.clone(), err),
+        Err(_) => Response::err(
+            request.id.clone(),
+            ProtocolError::new(
+                protocol::ErrorClass::Daemon,
+                "project_task_panicked",
+                "project operation task panicked".to_owned(),
+                None,
+            ),
+        ),
+    }
+}
+
+/// `project.list`: known projects on this host, AND-filtered.
+async fn handle_project_list(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_optional_params::<ProjectListParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    let pm = match require_projects(request, sessions) {
+        Ok(pm) => pm,
+        Err(resp) => return resp,
+    };
+    let filters = params.filters;
+    run_project_blocking(request, move || pm.list(&filters)).await
+}
+
+/// `project.add`: register (or re-add) a project by host-local path.
+async fn handle_project_add(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_params::<ProjectAddParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    let pm = match require_projects(request, sessions) {
+        Ok(pm) => pm,
+        Err(resp) => return resp,
+    };
+    // The path is host-local; the CLI sends its own cwd for a local `add` with no
+    // PATH, so a missing path here is a contract violation, not a default.
+    let Some(path) = params.path else {
+        return Response::err(
+            request.id.clone(),
+            ProtocolError::bad_request("project.add requires a host-local path"),
+        );
+    };
+    let (name, base_branch) = (params.name, params.base_branch);
+    run_project_blocking(request, move || pm.add(&path, name, base_branch)).await
+}
+
+/// `project.show`: a project plus its live worktrees, enriched with which ones
+/// pohunek owns and which host a live session.
+async fn handle_project_show(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_params::<ProjectShowParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    let pm = match require_projects(request, sessions) {
+        Ok(pm) => pm,
+        Err(resp) => return resp,
+    };
+    // Snapshot live sessions so `show` can mark which worktrees currently host one.
+    let live: Vec<LiveSession> = sessions
+        .list()
+        .await
+        .into_iter()
+        .map(|session| LiveSession {
+            session_id: session.id.0,
+            cwd: session.cwd,
+            worktree_path: session.worktree_path,
+        })
+        .collect();
+    let reference = params.reference;
+    run_project_blocking(request, move || pm.show(&reference, &live)).await
+}
+
+/// `project.rename`: set a project's custom display name.
+async fn handle_project_rename(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_params::<ProjectRenameParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    let pm = match require_projects(request, sessions) {
+        Ok(pm) => pm,
+        Err(resp) => return resp,
+    };
+    let (reference, name) = (params.reference, params.name);
+    run_project_blocking(request, move || pm.rename(&reference, name)).await
+}
+
+/// `project.remove`: forget a project record. `prune_worktrees` is honored from
+/// the worktree-linkage milestone; here the record is removed and nothing pruned.
+async fn handle_project_remove(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_params::<ProjectRemoveParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    let pm = match require_projects(request, sessions) {
+        Ok(pm) => pm,
+        Err(resp) => return resp,
+    };
+    let reference = params.reference;
+    run_project_blocking(request, move || {
+        pm.remove(&reference).map(|removed| ProjectRemoveResult {
+            removed,
+            pruned_worktrees: 0,
+        })
+    })
+    .await
 }
 
 async fn handle_session_new(request: &Request, sessions: &SessionRegistry) -> Response {

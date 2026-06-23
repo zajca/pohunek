@@ -117,6 +117,12 @@ pub(crate) enum CliError {
     )]
     RemoteTargetRequired,
 
+    /// A remote `project add` named no PATH. A local path is meaningless on
+    /// another host, so a remote add must give a path valid on that host; fails
+    /// fast before any connection is dialed.
+    #[error("adding a project on a remote host requires a PATH valid on that host")]
+    RemoteAddPathRequired,
+
     /// A remote `session new` was requested under `--json` without `--yes`. The
     /// machine path must not block on an interactive prompt, so it fails fast and
     /// asks the caller to pass `--yes` explicitly.
@@ -211,6 +217,12 @@ impl CliError {
                      (or --repo with a path valid on that host the first time)"
                         .to_owned(),
                 ),
+            ),
+            CliError::RemoteAddPathRequired => ProtocolError::new(
+                ErrorClass::Configuration,
+                "remote_add_path_required",
+                "adding a project on a remote host requires a PATH valid on that host".to_owned(),
+                Some("pass `pohunek --host <host> project add <path-on-that-host>`".to_owned()),
             ),
             CliError::RemoteConfirmationRequired => ProtocolError::new(
                 ErrorClass::Configuration,

@@ -117,6 +117,71 @@ enum Commands {
         #[command(subcommand)]
         action: HostAction,
     },
+
+    /// List, add, show, rename, and forget projects (git-repo awareness) on a host.
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectAction {
+    /// List known projects on the target host.
+    List {
+        /// Exact-match filter in key=value form. May be repeated and filters are
+        /// ANDed. Supported keys: source, label, id.
+        #[arg(long = "filter", value_name = "key=value", value_parser = commands::project::parse_project_filter)]
+        filters: Vec<protocol::ProjectListFilter>,
+        /// Emit machine-readable JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Register a project by path (on the target host; defaults to the cwd locally).
+    Add {
+        /// Path to register, valid on the target host. Omit to use the current
+        /// directory (local only).
+        path: Option<PathBuf>,
+        /// Custom display name to set on the project.
+        #[arg(long)]
+        name: Option<String>,
+        /// Default base branch for worktrees created against this project.
+        #[arg(long)]
+        base_branch: Option<String>,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show a project and its live worktrees.
+    Show {
+        /// Project reference: `<id|label>` on the target host.
+        reference: String,
+        /// Emit machine-readable JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Set a project's custom display name.
+    Rename {
+        /// Project reference: `<id|label>` on the target host.
+        reference: String,
+        /// The new display name.
+        name: String,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Forget a project record (never deletes the repository).
+    Rm {
+        /// Project reference: `<id|label>` on the target host.
+        reference: String,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -315,8 +380,21 @@ impl Commands {
                 action.as_ref().map_or(*json, SetupAction::wants_json)
             }
             Commands::Host { action } => action.wants_json(),
+            Commands::Project { action } => action.wants_json(),
             Commands::Subscribe { json } => *json,
             Commands::Attach { .. } | Commands::Daemon { .. } => false,
+        }
+    }
+}
+
+impl ProjectAction {
+    fn wants_json(&self) -> bool {
+        match self {
+            ProjectAction::List { json, .. }
+            | ProjectAction::Add { json, .. }
+            | ProjectAction::Show { json, .. }
+            | ProjectAction::Rename { json, .. }
+            | ProjectAction::Rm { json, .. } => *json,
         }
     }
 }
@@ -552,6 +630,40 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 Ok(ExitCode::SUCCESS)
             }
         },
+        Commands::Project { action } => {
+            // Projects are per-host; references resolve daemon-side, so the whole
+            // surface routes through the effective host like `session`.
+            let paths = Paths::resolve()?;
+            let host = effective_host(&global_host, None);
+            match action {
+                ProjectAction::List { filters, json } => {
+                    commands::project::run_list(&host, &paths, &filters, json).await?;
+                }
+                ProjectAction::Add {
+                    path,
+                    name,
+                    base_branch,
+                    json,
+                } => {
+                    commands::project::run_add(&host, &paths, path, name, base_branch, json)
+                        .await?;
+                }
+                ProjectAction::Show { reference, json } => {
+                    commands::project::run_show(&host, &paths, &reference, json).await?;
+                }
+                ProjectAction::Rename {
+                    reference,
+                    name,
+                    json,
+                } => {
+                    commands::project::run_rename(&host, &paths, &reference, &name, json).await?;
+                }
+                ProjectAction::Rm { reference, json } => {
+                    commands::project::run_rm(&host, &paths, &reference, json).await?;
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 
@@ -689,7 +801,13 @@ mod tests {
         // --project and --repo both name the target repository; clap rejects them
         // together so the daemon never has to reconcile an incoherent pair.
         let err = Cli::try_parse_from([
-            "pohunek", "session", "new", "--project", "ui", "--repo", "/x",
+            "pohunek",
+            "session",
+            "new",
+            "--project",
+            "ui",
+            "--repo",
+            "/x",
         ])
         .expect_err("project and repo conflict");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
@@ -697,8 +815,8 @@ mod tests {
 
     #[test]
     fn parses_session_new_project_reference() {
-        let cli = Cli::try_parse_from(["pohunek", "session", "new", "--project", "ui"])
-            .expect("parse");
+        let cli =
+            Cli::try_parse_from(["pohunek", "session", "new", "--project", "ui"]).expect("parse");
         match cli.command {
             Commands::Session {
                 action: SessionAction::New { project, repo, .. },
@@ -1018,5 +1136,113 @@ mod tests {
                 action: HostAction::List { json: false }
             }
         ));
+    }
+
+    // --- project ----------------------------------------------------------------
+
+    #[test]
+    fn parses_project_list_with_filters_and_json() {
+        let cli = Cli::try_parse_from([
+            "pohunek",
+            "project",
+            "list",
+            "--filter",
+            "source=manual",
+            "--filter",
+            "label=ui",
+            "--json",
+        ])
+        .expect("parse");
+        match cli.command {
+            Commands::Project {
+                action: ProjectAction::List { filters, json },
+            } => {
+                assert!(json);
+                assert_eq!(
+                    filters,
+                    vec![
+                        protocol::ProjectListFilter::Source(protocol::ProjectSource::Manual),
+                        protocol::ProjectListFilter::Label("ui".to_owned()),
+                    ]
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_project_add_with_path_name_and_base_branch() {
+        let cli = Cli::try_parse_from([
+            "pohunek",
+            "project",
+            "add",
+            "/code/ui",
+            "--name",
+            "dashboard",
+            "--base-branch",
+            "develop",
+        ])
+        .expect("parse");
+        match cli.command {
+            Commands::Project {
+                action:
+                    ProjectAction::Add {
+                        path,
+                        name,
+                        base_branch,
+                        json,
+                    },
+            } => {
+                assert_eq!(path.as_deref(), Some(std::path::Path::new("/code/ui")));
+                assert_eq!(name.as_deref(), Some("dashboard"));
+                assert_eq!(base_branch.as_deref(), Some("develop"));
+                assert!(!json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_project_add_without_path() {
+        let cli = Cli::try_parse_from(["pohunek", "project", "add"]).expect("parse");
+        match cli.command {
+            Commands::Project {
+                action: ProjectAction::Add { path, .. },
+            } => assert_eq!(path, None, "no PATH means the cwd (filled by the command)"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_project_show_rename_rm_references() {
+        let show = Cli::try_parse_from(["pohunek", "project", "show", "ui", "--json"])
+            .expect("parse show");
+        assert!(matches!(
+            show.command,
+            Commands::Project { action: ProjectAction::Show { reference, json: true } } if reference == "ui"
+        ));
+
+        let rename = Cli::try_parse_from(["pohunek", "project", "rename", "p-abc", "dashboard"])
+            .expect("parse rename");
+        match rename.command {
+            Commands::Project {
+                action:
+                    ProjectAction::Rename {
+                        reference, name, ..
+                    },
+            } => {
+                assert_eq!(reference, "p-abc");
+                assert_eq!(name, "dashboard");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let rm = Cli::try_parse_from(["pohunek", "--host", "host-b", "project", "rm", "ui"])
+            .expect("parse rm");
+        assert!(matches!(
+            rm.command,
+            Commands::Project { action: ProjectAction::Rm { reference, json: false } } if reference == "ui"
+        ));
+        assert_eq!(rm.host, "host-b", "project rm honors the global --host");
     }
 }
