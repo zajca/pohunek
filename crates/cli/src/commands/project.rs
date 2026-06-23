@@ -196,18 +196,26 @@ pub(crate) async fn run_rm(
     Ok(())
 }
 
-/// Resolve the host-local path for `project add`: an explicit PATH wins; otherwise
-/// a local add uses the CLI's own cwd, and a remote add (which cannot see a local
-/// path) fails fast asking for a host-valid PATH.
+/// Resolve the host-local path for `project add`.
+///
+/// Local: an explicit PATH is resolved to absolute against the CLI's **own** cwd
+/// (so a relative `./repo` means the same thing the user sees, not whatever the
+/// daemon's cwd happens to be); with no PATH the CLI's cwd is used. Remote: the
+/// PATH is host-local, so it must be an explicit **absolute** path — a relative
+/// path (or none) is meaningless on another host and fails fast before dialing.
 fn resolve_add_path(host: &str, path: Option<PathBuf>) -> Result<PathBuf, CliError> {
-    if let Some(path) = path {
-        return Ok(path);
-    }
     let remote = !host.is_empty() && host != LOCAL_HOST;
-    if remote {
-        Err(CliError::RemoteAddPathRequired)
-    } else {
-        Ok(std::env::current_dir()?)
+    match path {
+        Some(path) if remote => {
+            if path.is_relative() {
+                return Err(CliError::RemoteAddPathRequired);
+            }
+            Ok(path)
+        }
+        Some(path) if path.is_relative() => Ok(std::env::current_dir()?.join(path)),
+        Some(path) => Ok(path),
+        None if remote => Err(CliError::RemoteAddPathRequired),
+        None => Ok(std::env::current_dir()?),
     }
 }
 
@@ -398,17 +406,34 @@ mod tests {
     }
 
     #[test]
-    fn add_path_defaults_to_cwd_locally_and_requires_a_path_remotely() {
-        // Local: the CLI fills its own cwd.
-        let local = resolve_add_path(LOCAL_HOST, None).expect("local add");
-        assert_eq!(local, std::env::current_dir().expect("cwd"));
-        // Explicit path is honored on either side.
-        let explicit =
-            resolve_add_path("host-b", Some(PathBuf::from("/on/remote"))).expect("explicit");
-        assert_eq!(explicit, PathBuf::from("/on/remote"));
-        // Remote with no path fails fast.
+    fn add_path_resolves_locally_and_requires_an_absolute_path_remotely() {
+        let cwd = std::env::current_dir().expect("cwd");
+        // Local, no path: the CLI fills its own cwd.
+        assert_eq!(resolve_add_path(LOCAL_HOST, None).expect("local add"), cwd);
+        // Local, relative path: absolutized against the CLI's own cwd (not the
+        // daemon's), so `./repo` means what the user sees.
+        assert_eq!(
+            resolve_add_path(LOCAL_HOST, Some(PathBuf::from("subdir"))).expect("local rel"),
+            cwd.join("subdir")
+        );
+        // Local, absolute path: honored verbatim.
+        assert_eq!(
+            resolve_add_path(LOCAL_HOST, Some(PathBuf::from("/abs/repo"))).expect("local abs"),
+            PathBuf::from("/abs/repo")
+        );
+        // Remote, absolute host-local path: honored verbatim.
+        assert_eq!(
+            resolve_add_path("host-b", Some(PathBuf::from("/on/remote"))).expect("remote abs"),
+            PathBuf::from("/on/remote")
+        );
+        // Remote with no path — or a relative path — fails fast (a local path is
+        // meaningless on another host).
         assert!(matches!(
             resolve_add_path("host-b", None),
+            Err(CliError::RemoteAddPathRequired)
+        ));
+        assert!(matches!(
+            resolve_add_path("host-b", Some(PathBuf::from("rel"))),
             Err(CliError::RemoteAddPathRequired)
         ));
     }

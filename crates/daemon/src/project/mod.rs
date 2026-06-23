@@ -26,6 +26,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::store::{ProjectRecord, ProjectResolution, Store, WorktreeStatus};
+use crate::worktree::canonical_or_original;
 
 use detect::DetectedProject;
 
@@ -91,6 +92,24 @@ impl ProjectManager {
         detected: &DetectedProject,
         manual: bool,
     ) -> Result<ProjectRecord, ProtocolError> {
+        self.upsert(detected, manual, None, None)
+    }
+
+    /// The upsert primitive behind [`Self::register`] and [`Self::add`]: detect's
+    /// observed fields are refreshed, operator-owned fields preserved, and any
+    /// explicit `name`/`base_branch` overrides applied — all in **one**
+    /// `record_project` write, so an `add` with overrides cannot lose a concurrent
+    /// edit in a second-write window.
+    fn upsert(
+        &self,
+        detected: &DetectedProject,
+        manual: bool,
+        name: Option<String>,
+        base_branch: Option<String>,
+    ) -> Result<ProjectRecord, ProtocolError> {
+        if let Some(name) = &name {
+            validate_project_name(name)?;
+        }
         let now = now_rfc3339();
         let existing = self
             .store
@@ -99,7 +118,7 @@ impl ProjectManager {
             .into_iter()
             .find(|project| project.git_common_dir == detected.git_common_dir);
 
-        let record = match existing {
+        let mut record = match existing {
             Some(mut prev) => {
                 prev.repo_root = detected.repo_root.clone();
                 prev.origin_url = detected.origin_url.clone();
@@ -128,6 +147,13 @@ impl ProjectManager {
                 last_used_at: now,
             },
         };
+        // Explicit overrides win over the preserved/default values.
+        if let Some(name) = name {
+            record.custom_name = Some(name);
+        }
+        if let Some(base_branch) = base_branch {
+            record.default_base_branch = Some(base_branch);
+        }
         self.store.record_project(&record).map_err(store_error)?;
         Ok(record)
     }
@@ -169,9 +195,9 @@ impl ProjectManager {
     }
 
     /// Register a project explicitly (`project add`): detect at `path`, upsert as
-    /// [`ProjectSource::Manual`] (re-adding promotes an auto record), and apply any
-    /// explicit `name` / `base_branch` overrides. Erros when `path` is not a git
-    /// work tree (the operator named it deliberately).
+    /// [`ProjectSource::Manual`] (re-adding promotes an auto record), applying any
+    /// explicit `name`/`base_branch` overrides in one write. Errors when `path` is
+    /// not a git work tree (the operator named it deliberately) or `name` is blank.
     pub fn add(
         &self,
         path: &Path,
@@ -179,25 +205,16 @@ impl ProjectManager {
         base_branch: Option<String>,
     ) -> Result<ProjectInfo, ProtocolError> {
         let detected = detect_at(path)?.ok_or_else(|| not_a_git_repo(path))?;
-        let mut record = self.register(&detected, true)?;
-        let mut changed = false;
-        if let Some(name) = name {
-            record.custom_name = Some(name);
-            changed = true;
-        }
-        if let Some(base_branch) = base_branch {
-            record.default_base_branch = Some(base_branch);
-            changed = true;
-        }
-        if changed {
-            self.store.record_project(&record).map_err(store_error)?;
-        }
+        let record = self.upsert(&detected, true, name, base_branch)?;
         Ok(to_info(&record))
     }
 
     /// Set a project's custom display name (`project rename`). Does not bump
-    /// `last_used_at` — renaming is not a session start.
+    /// `last_used_at` — renaming is not a session start. A blank name is rejected
+    /// so the label can never be emptied (which would make the project
+    /// referenceable only by its id).
     pub fn rename(&self, reference: &str, name: String) -> Result<ProjectInfo, ProtocolError> {
+        validate_project_name(&name)?;
         let mut record = self.resolve(reference)?;
         record.custom_name = Some(name);
         self.store.record_project(&record).map_err(store_error)?;
@@ -225,6 +242,10 @@ impl ProjectManager {
     ) -> Result<ProjectShowResult, ProtocolError> {
         let record = self.resolve(reference)?;
         let info = to_info(&record);
+        // `git worktree list` reports fully symlink-resolved paths, while a stored
+        // binding path / session path is the un-canonicalized join. Compare both
+        // sides through `canonical_or_original` so a symlinked worktree-root (e.g.
+        // a symlinked data dir) does not silently mis-mark ownership or sessions.
         let owned: Vec<PathBuf> = self
             .store
             .load_worktrees()
@@ -234,19 +255,29 @@ impl ProjectManager {
                 binding.status == WorktreeStatus::Active
                     && binding.project_id.as_deref() == Some(info.id.as_str())
             })
-            .map(|binding| binding.path)
+            .map(|binding| canonical_or_original(&binding.path))
+            .collect();
+        // Each live session matches a worktree at its bound worktree path (worktree
+        // session) or its cwd (in-place), canonicalized once here.
+        let session_paths: Vec<(String, Vec<PathBuf>)> = live
+            .iter()
+            .map(|session| {
+                let mut paths = vec![canonical_or_original(&session.cwd)];
+                if let Some(worktree_path) = &session.worktree_path {
+                    paths.push(canonical_or_original(worktree_path));
+                }
+                (session.session_id.clone(), paths)
+            })
             .collect();
         let worktrees = git_worktrees(&record.git_common_dir)
             .into_iter()
             .map(|raw| {
-                let owned = owned.contains(&raw.path);
-                let session_id = live
+                let canonical = canonical_or_original(&raw.path);
+                let owned = owned.contains(&canonical);
+                let session_id = session_paths
                     .iter()
-                    .find(|session| {
-                        session.worktree_path.as_deref() == Some(raw.path.as_path())
-                            || session.cwd == raw.path
-                    })
-                    .map(|session| session.session_id.clone());
+                    .find(|(_, paths)| paths.contains(&canonical))
+                    .map(|(id, _)| id.clone());
                 ProjectWorktree {
                     path: raw.path,
                     branch: raw.branch,
@@ -375,6 +406,17 @@ fn store_error(err: io::Error) -> ProtocolError {
         format!("project store I/O failed: {err}"),
         None,
     )
+}
+
+/// Reject a blank custom name (empty or whitespace-only): a blank label leaves a
+/// project referenceable only by its `p-…` id, so it is a usage error.
+fn validate_project_name(name: &str) -> Result<(), ProtocolError> {
+    if name.trim().is_empty() {
+        return Err(ProtocolError::bad_request(
+            "project name cannot be empty or whitespace",
+        ));
+    }
+    Ok(())
 }
 
 /// An explicitly named path is not a git work tree (no silent fallback). Shared
@@ -608,6 +650,24 @@ mod tests {
         // The label is now resolvable.
         let shown = pm.show("dashboard", &[]).expect("show by new label");
         assert_eq!(shown.project.id, added.id);
+    }
+
+    #[test]
+    fn rename_and_add_reject_a_blank_name() {
+        let (pm, _store) = manager("blank-name");
+        let repo = init_repo("blank-name");
+        let added = pm.add(&repo, None, None).expect("add");
+        // A whitespace-only rename is rejected (would blank the label).
+        let err = pm
+            .rename(&added.id, "   ".to_owned())
+            .expect_err("blank rename");
+        assert_eq!(err.code, "bad_request", "got: {err:?}");
+        // A blank --name on add is rejected too, before any write.
+        let repo2 = init_repo("blank-name-2");
+        let err = pm
+            .add(&repo2, Some(String::new()), None)
+            .expect_err("blank add name");
+        assert_eq!(err.code, "bad_request", "got: {err:?}");
     }
 
     #[test]
