@@ -264,6 +264,9 @@ impl WorktreeManager {
             branch_slug: slug,
             path: path.clone(),
             status: WorktreeStatus::Active,
+            // The project this worktree belongs to is threaded in by the worktree
+            // linkage milestone (M5); the binder is project-agnostic until then.
+            project_id: None,
             created_at: now.clone(),
             updated_at: now,
         };

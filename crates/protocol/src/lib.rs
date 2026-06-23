@@ -27,6 +27,7 @@ mod discovery;
 mod envelope;
 mod error;
 mod integration;
+mod project;
 mod session;
 mod version;
 
@@ -38,6 +39,7 @@ pub use integration::{
     IntegrationInstallParams, IntegrationInstallReport, IntegrationInstallResult, ENV_DAEMON_ID,
     ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
+pub use project::ProjectSource;
 pub use session::{
     AgentActivity, AgentKind, AttachHeader, SessionAttachParams, SessionAttachResult,
     SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
