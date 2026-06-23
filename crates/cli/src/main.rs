@@ -179,14 +179,17 @@ enum SetupAction {
         json: bool,
     },
 
-    /// Write (or print) the sway drop-in that binds a key to the launcher.
+    /// Write (or print) the sway drop-in that binds keys to the launchers.
     Sway {
         /// Print the snippet to stdout instead of writing the drop-in file.
         #[arg(long)]
         print: bool,
-        /// Sway keybind to bind the launcher to.
+        /// Sway keybind to bind the session switcher to.
         #[arg(long, default_value = "$mod+p")]
         keybind: String,
+        /// Sway keybind to bind the Linear issue picker to.
+        #[arg(long, default_value = "$mod+i")]
+        issue_keybind: String,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -511,9 +514,10 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 Some(SetupAction::Sway {
                     print,
                     keybind,
+                    issue_keybind,
                     json,
                 }) => {
-                    commands::setup::run_sway(&paths, print, &keybind, json)?;
+                    commands::setup::run_sway(&paths, print, &keybind, &issue_keybind, json)?;
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -836,9 +840,17 @@ mod tests {
 
     #[test]
     fn parses_setup_sway_keybind_and_print() {
-        let cli =
-            Cli::try_parse_from(["pohunek", "setup", "sway", "--print", "--keybind", "$mod+a"])
-                .expect("parse");
+        let cli = Cli::try_parse_from([
+            "pohunek",
+            "setup",
+            "sway",
+            "--print",
+            "--keybind",
+            "$mod+a",
+            "--issue-keybind",
+            "$mod+b",
+        ])
+        .expect("parse");
 
         match cli.command {
             Commands::Setup {
@@ -846,12 +858,14 @@ mod tests {
                     Some(SetupAction::Sway {
                         print,
                         keybind,
+                        issue_keybind,
                         json,
                     }),
                 ..
             } => {
                 assert!(print);
                 assert_eq!(keybind, "$mod+a");
+                assert_eq!(issue_keybind, "$mod+b");
                 assert!(!json);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -859,14 +873,22 @@ mod tests {
     }
 
     #[test]
-    fn setup_sway_keybind_defaults_to_mod_p() {
+    fn setup_sway_keybinds_default_to_mod_p_and_mod_i() {
         let cli = Cli::try_parse_from(["pohunek", "setup", "sway"]).expect("parse");
 
         match cli.command {
             Commands::Setup {
-                action: Some(SetupAction::Sway { keybind, .. }),
+                action:
+                    Some(SetupAction::Sway {
+                        keybind,
+                        issue_keybind,
+                        ..
+                    }),
                 ..
-            } => assert_eq!(keybind, "$mod+p"),
+            } => {
+                assert_eq!(keybind, "$mod+p");
+                assert_eq!(issue_keybind, "$mod+i");
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }

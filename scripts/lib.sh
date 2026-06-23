@@ -77,6 +77,32 @@ pohunek_template_path() {
   printf '%s\n' "$path"
 }
 
+# Resolve the authenticated user's Linear display name (the value the issue
+# picker filters `--assignee` on) from `linear auth whoami`. whoami has no
+# machine-readable mode, so parse its labelled output, stripping any ANSI the
+# CLI may emit. Prints nothing (exit 0) when the name cannot be found, leaving
+# the caller to fail fast or fall back to an explicit config value.
+pohunek_linear_assignee() {
+  linear_cli="$1"
+  pohunek_need_cmd python3
+  # Capture into a variable and pass via argv: the program is supplied on stdin
+  # via the heredoc, so whoami's output cannot also come through stdin.
+  whoami_out="$("$linear_cli" auth whoami 2>/dev/null || true)"
+  python3 - "$whoami_out" <<'PY'
+import re
+import sys
+
+text = re.sub(r"\x1b\[[0-9;]*m", "", sys.argv[1])
+for line in text.splitlines():
+    key, sep, value = line.partition(":")
+    if sep and key.strip().lower() == "display name":
+        value = value.strip()
+        if value:
+            sys.stdout.write(value)
+        break
+PY
+}
+
 pohunek_render_provider_prompt() {
   pohunek_need_cmd python3
   template="$1"

@@ -25,10 +25,15 @@ Key consequences of that scope, decided explicitly:
 - **Discovery is tokenless NetBird-local**, with live capability queries instead
   of signed manifest exchange.
 - **The GUI is deferred.** Interactive control happens by attaching to a session
-  from your existing terminal. A native libghostty GUI remains the eventual
-  target but is built only after the core is in daily use.
+  from your existing terminal. The eventual GUI is a **browser control center**
+  reached through a standalone TypeScript aggregator backend (see
+  `docs/phases/04-browser-control-center.md`); the daemon gains no GUI surface. A
+  native libghostty GUI was the earlier target and is **dropped**. Either way the
+  GUI is built only after the core is in daily use.
 - **Provider integration (Linear/GitHub) is deferred and shell-out based**
-  (`gh`, Linear MCP/API), not maintained in-tree adapters.
+  (`gh`, Linear GraphQL/MCP), not maintained in-tree adapters, and lives in the
+  client surfaces (the Phase 5 sway scripts and the Phase 4 browser backend),
+  never in the chassis.
 
 ## Goals
 
@@ -53,11 +58,16 @@ Key consequences of that scope, decided explicitly:
 ## Non-Goals
 
 - Multi-user authorization or a shared-host trust model. Single operator only.
-- A central coordinator, SaaS control plane, or hosted dashboard.
+- A central coordinator, SaaS control plane, or hosted dashboard. (The eventual
+  browser GUI's aggregator backend is a **user-run client** on a mesh host that
+  holds no authoritative state — not a central coordinator; each host's daemon
+  stays authoritative, and the CLI keeps working directly without it.)
 - SSH bridging as the remote transport (NetBird direct transport replaces it).
 - A cryptographic mesh: signed manifests, snapshot reconciliation, key rotation.
 - In-tree provider adapters in the core path (shell-out instead).
-- A native GUI in the first version (deferred; libghostty remains the target).
+- A GUI in the first version (deferred; the eventual GUI is a browser control
+  center via a standalone TS backend — see Phase 4. A native libghostty GUI is
+  dropped).
 - ACP as the first agent runtime (deferred; PTY/TUI-first).
 - WebSocket as the core daemon protocol.
 
@@ -434,7 +444,7 @@ Integration tests:
 | Mesh trust | Signed manifests, key rotation, snapshot sync | Dropped (NetBird + fs perms) |
 | Audit | Tamper-evident considered | Plain local event log (debug) |
 | Agent state | Terminal heuristics | OSC title + screen-manifest + PTY activity (per herdr); hooks only capture the session ID for resume |
-| Providers | In-tree Linear/GitHub adapters | Deferred, shell-out (`gh`, Linear) |
-| GUI | libghostty client (MVP5) + spike (MVP0) | Deferred; libghostty still the target |
+| Providers | In-tree Linear/GitHub adapters | Deferred, shell-out (`gh`, Linear GraphQL/MCP) in the client surfaces, not the chassis |
+| GUI | libghostty client (MVP5) + spike (MVP0) | Deferred; browser control center via a standalone TS aggregator backend (Phase 4). libghostty dropped |
 | Attach framing | "separate stream mode" (unspecified) | Separate connection per PTY (specified) |
 | Agents | Codex + Claude Code | Codex + Claude Code (unchanged) |

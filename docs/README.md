@@ -24,15 +24,29 @@ sessions across your own machines on a NetBird (WireGuard) network.
   raw-byte connection** per PTY.
 - No multi-user authorization (single operator; socket perms + NetBird are the
   boundary).
-- Providers (Linear/GitHub) and a libghostty GUI are **deferred**; libghostty
-  remains the eventual GUI target.
+- Providers (Linear/GitHub) and a GUI are **deferred**; the eventual GUI is a
+  **browser control center** served by a standalone TS aggregator backend
+  (Phase 4), not a native libghostty client (dropped).
 
 ## Phases
 
 - [Phase 1: Core Local Sessions](phases/01-core-local-sessions.md)
 - [Phase 2: Remote Hosts over NetBird](phases/02-remote-netbird.md)
-- [Later (Deferred): Providers and libghostty GUI](phases/03-later-providers-and-gui.md)
+- [Phase 3 (superseded): Later Providers and libghostty GUI](phases/03-later-providers-and-gui.md)
+  — the GUI direction is replaced by Phase 4; its provider track is absorbed there.
+- [Phase 4: Browser Control Center](phases/04-browser-control-center.md)
+  — browser GUI via a standalone TS aggregator backend, with Linear/GitHub support.
+- [Phase 5: rofi / sway Launcher](phases/05-rofi-sway-launcher.md)
+  — keyboard-driven launcher; the thinnest proof the chassis is an API.
 
 ## Detailed Plans
 
 - [Phase 1 implementation plan](plan-phase-1.md)
+
+## Design Notes (proposals, pre-phase)
+
+- [Projects: automatic git-repo awareness](design/projects.md) — detect the repo
+  / worktree a session runs in and record lightweight projects; auto on session
+  start or manual via CLI, no filesystem scan.
+  - [Implementation plan](design/projects-plan.md) — milestones M1–M5, code
+    touch-points, protocol compatibility.

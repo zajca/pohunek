@@ -217,6 +217,187 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
 }
 
 #[test]
+fn rofi_issue_lists_my_issues_and_hands_selection_to_launch_issue() {
+    let root = temp_dir("rofi-issue");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("create bin dir");
+    let linear = bin.join("linear-wrapper");
+    let rofi = bin.join("rofi");
+    let terminal = bin.join("terminal");
+    let linear_args = root.join("linear.args");
+    let rofi_stdin = root.join("rofi.stdin");
+    let terminal_args = root.join("terminal.args");
+
+    // The issue query logs its args (so we can assert the assignee/state filter)
+    // and returns two issues. The second title carries a JSON-escaped tab to prove
+    // the picker flattens it rather than letting it forge an extra rofi column.
+    write_executable(
+        &linear,
+        r#"#!/bin/sh
+for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_LINEAR_ARGS"; done
+if [ "$1" = "issue" ] && [ "$2" = "query" ]; then
+  printf '[{"identifier":"AI-1","title":"First issue","state":{"name":"Todo"}},{"identifier":"AI-2","title":"Second\\ttab","state":{"name":"In Progress"}}]\n'
+fi
+"#,
+    );
+    // rofi: capture the offered rows, then "select" the first one.
+    write_executable(
+        &rofi,
+        "#!/bin/sh
+cat >\"$POHUNEK_TEST_ROFI_STDIN\"
+head -n 1 \"$POHUNEK_TEST_ROFI_STDIN\"
+",
+    );
+    write_executable(
+        &terminal,
+        "#!/bin/sh
+for arg in \"$@\"; do printf '%s\\n' \"$arg\" >>\"$POHUNEK_TEST_TERMINAL_ARGS\"; done
+",
+    );
+
+    let config_dir = write_config(
+        &root,
+        &[
+            ("linear_cli", linear.to_str().expect("utf8 path")),
+            ("rofi_bin", rofi.to_str().expect("utf8 path")),
+            ("terminal", terminal.to_str().expect("utf8 path")),
+            // Explicit assignee avoids depending on a `linear auth whoami` stub.
+            ("linear_assignee", "zajca"),
+            // pohunek-launch-issue config keys (the launcher resolves them even
+            // though the mock terminal never actually runs the script).
+            ("agent", "claude"),
+            ("host", "local"),
+            ("repo", "/workspace/project"),
+        ],
+    );
+
+    let out = Command::new("sh")
+        .arg(script_path("pohunek-rofi-issue"))
+        .env("POHUNEK_CONFIG_DIR", &config_dir)
+        .env("POHUNEK_TEST_LINEAR_ARGS", &linear_args)
+        .env("POHUNEK_TEST_ROFI_STDIN", &rofi_stdin)
+        .env("POHUNEK_TEST_TERMINAL_ARGS", &terminal_args)
+        .env("LINEAR_API_KEY", "lin_secret_should_not_leak")
+        .output()
+        .expect("run rofi-issue");
+
+    assert!(
+        out.status.success(),
+        "rofi-issue failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The query targets my issues across teams, filtered to the actionable states.
+    let largs = read(&linear_args);
+    assert!(largs.contains("query\n"), "{largs}");
+    assert!(largs.contains("--all-teams\n"), "{largs}");
+    assert!(largs.contains("--assignee\nzajca\n"), "{largs}");
+    assert!(largs.contains("--state\nstarted\n"), "{largs}");
+    assert!(largs.contains("--state\nunstarted\n"), "{largs}");
+
+    // Rows are "identifier<TAB>state<TAB>title"; the tab inside the second title
+    // is flattened, and the workflow state is surfaced as its own column.
+    let rows = read(&rofi_stdin);
+    assert!(rows.contains("AI-1\tTodo\tFirst issue"), "{rows}");
+    assert!(rows.contains("AI-2\tIn Progress\tSecond tab"), "{rows}");
+
+    // The selected identifier is handed to pohunek-launch-issue inside a terminal.
+    // The launch runs in the background, so poll for the spawned args.
+    wait_for_file_contains(
+        &terminal_args,
+        &["pohunek-launch-issue", "AI-1"],
+        "rofi-issue terminal",
+    );
+    // The Linear token never reaches the spawned command line.
+    assert!(
+        !read(&terminal_args).contains("lin_secret_should_not_leak"),
+        "{}",
+        read(&terminal_args)
+    );
+}
+
+#[test]
+fn rofi_issue_derives_assignee_from_whoami_when_unset() {
+    let root = temp_dir("rofi-issue-derive");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("create bin dir");
+    let linear = bin.join("linear-wrapper");
+    let rofi = bin.join("rofi");
+    let terminal = bin.join("terminal");
+    let linear_args = root.join("linear.args");
+    let terminal_args = root.join("terminal.args");
+
+    // `auth whoami` carries the display name in its labelled output (it has no
+    // --json mode); the picker must derive "zajca" from it and feed --assignee.
+    write_executable(
+        &linear,
+        r#"#!/bin/sh
+for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_LINEAR_ARGS"; done
+if [ "$1" = "auth" ] && [ "$2" = "whoami" ]; then
+  printf 'Workspace: Keboola\n  Display name: zajca\n  Email: x@example.test\n'
+  exit 0
+fi
+if [ "$1" = "issue" ] && [ "$2" = "query" ]; then
+  printf '[{"identifier":"AI-9","title":"Derived"}]\n'
+fi
+"#,
+    );
+    write_executable(
+        &rofi,
+        r#"#!/bin/sh
+cat >/dev/null
+printf 'AI-9\tDerived\n'
+"#,
+    );
+    write_executable(
+        &terminal,
+        r#"#!/bin/sh
+for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_TERMINAL_ARGS"; done
+"#,
+    );
+
+    // No linear_assignee key → the picker must derive it.
+    let config_dir = write_config(
+        &root,
+        &[
+            ("linear_cli", linear.to_str().expect("utf8 path")),
+            ("rofi_bin", rofi.to_str().expect("utf8 path")),
+            ("terminal", terminal.to_str().expect("utf8 path")),
+            ("agent", "claude"),
+            ("host", "local"),
+            ("repo", "/workspace/project"),
+        ],
+    );
+
+    let out = Command::new("sh")
+        .arg(script_path("pohunek-rofi-issue"))
+        .env("POHUNEK_CONFIG_DIR", &config_dir)
+        .env("POHUNEK_TEST_LINEAR_ARGS", &linear_args)
+        .env("POHUNEK_TEST_TERMINAL_ARGS", &terminal_args)
+        .output()
+        .expect("run rofi-issue");
+
+    assert!(
+        out.status.success(),
+        "rofi-issue failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let largs = read(&linear_args);
+    assert!(largs.contains("whoami\n"), "must call whoami: {largs}");
+    assert!(
+        largs.contains("--assignee\nzajca\n"),
+        "derived assignee must reach the query: {largs}"
+    );
+    wait_for_file_contains(
+        &terminal_args,
+        &["pohunek-launch-issue", "AI-9"],
+        "rofi-issue derive terminal",
+    );
+}
+
+#[test]
 fn rofi_merges_local_and_remote_hosts_multi_selects_and_reconciles_marks() {
     let root = temp_dir("rofi");
     let bin = root.join("bin");

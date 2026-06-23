@@ -1,0 +1,122 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$script_dir/lib.sh"
+
+# Pick one of *my* actionable Linear issues in rofi, then hand it to
+# pohunek-launch-issue (which renders the prompt template and creates the
+# session). Kept separate from `pohunek-rofi` (the running-session switcher):
+# that one attaches to existing sessions, this one starts a new one from a work
+# item, so they earn their own keybinds.
+
+linear_cli="$(pohunek_required_config linear_cli)"
+rofi_bin="$(pohunek_optional_config rofi_bin rofi)"
+terminal_bin="$(pohunek_optional_config terminal "${TERMINAL:-}")"
+# Which Linear workflow-state *types* count as "actionable". Space-separated;
+# valid values mirror `linear issue query --state`: triage backlog unstarted
+# started completed canceled.
+states="$(pohunek_optional_config linear_issue_states 'started unstarted')"
+# Assignee (Linear display name) whose issues are listed. Empty = derive from
+# the authenticated user so a fresh install needs no manual step.
+assignee="$(pohunek_optional_config linear_assignee '')"
+
+[ -n "$terminal_bin" ] || pohunek_fail "missing terminal config key and TERMINAL is unset"
+pohunek_need_cmd "$linear_cli"
+pohunek_need_cmd "$rofi_bin"
+pohunek_need_cmd python3
+
+# Resolve the assignee. An explicit config value wins; otherwise derive it from
+# the authenticated user. Fail fast (never silently widen to *everyone's*
+# issues) if neither yields a name.
+if [ -z "$assignee" ]; then
+  assignee="$(pohunek_linear_assignee "$linear_cli")"
+fi
+[ -n "$assignee" ] || pohunek_fail "cannot determine Linear assignee; set 'linear_assignee' in launcher.conf"
+
+# Build the query: one --state flag per configured state. The unquoted $states
+# expansion is the intended word-split of the space-separated state list.
+set -- "$linear_cli" issue query --all-teams --assignee "$assignee" --sort priority --json
+for state in $states; do
+  set -- "$@" --state "$state"
+done
+issues_json="$("$@")"
+
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/pohunek-rofi-issue.XXXXXX")"
+trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+rows_file="$tmp_dir/rows"
+
+# Render "identifier<TAB>state<TAB>title" rows. The identifier flows into a later
+# argv to pohunek-launch-issue (and, downstream, into sway criteria via session
+# ids), so restrict it to a safe charset here — Linear ids look like "ABC-123",
+# so this rejects nothing legitimate while refusing anything carrying a
+# metacharacter. The state column lets the user narrow by typing it in rofi.
+python3 - "$issues_json" >"$rows_file" <<'PY'
+import json
+import re
+import sys
+
+
+def flatten(value):
+    # rofi rows are one-per-line, tab-delimited; flatten embedded control chars
+    # so a crafted field cannot inject an extra row or forge a column.
+    text = value if isinstance(value, str) else ""
+    return text.replace("\t", " ").replace("\n", " ").replace("\r", " ")
+
+
+SAFE = re.compile(r"^[A-Za-z0-9._-]+$")
+data = json.loads(sys.argv[1])
+items = data if isinstance(data, list) else (data.get("issues") or data.get("nodes") or [])
+for item in items:
+    if not isinstance(item, dict):
+        continue
+    ident = item.get("identifier") or item.get("id")
+    if not isinstance(ident, str) or not SAFE.match(ident):
+        continue
+    state = item.get("state")
+    if isinstance(state, dict):
+        state_name = state.get("name") or state.get("type") or "-"
+    elif isinstance(state, str) and state:
+        state_name = state
+    else:
+        state_name = "-"
+    print(f"{ident}\t{flatten(state_name)}\t{flatten(item.get('title'))}")
+PY
+
+# No issues (or all filtered out): nothing to launch.
+[ -s "$rows_file" ] || exit 0
+
+# Show the distinct states present as a hint, so the user knows what to type to
+# narrow the list (rofi matches against the whole row, state column included).
+states_present="$(cut -f2 "$rows_file" | sort -u | paste -sd ',' - | sed 's/,/, /g')"
+
+selection_file="$tmp_dir/selection"
+if ! "$rofi_bin" -dmenu -p "linear issue" -mesg "states: $states_present" <"$rows_file" >"$selection_file"; then
+  # Non-zero from rofi means the user dismissed it (Esc); start nothing.
+  exit 0
+fi
+selection="$(cat "$selection_file")"
+[ -n "$selection" ] || exit 0
+
+# Take the identifier (first tab-separated field) and re-validate before handing
+# it to the launcher — defence in depth against a hand-typed rofi entry.
+issue_id="$(printf '%s\n' "$selection" | cut -f1)"
+printf '%s' "$issue_id" | grep -Eq '^[A-Za-z0-9._-]+$' || pohunek_fail "invalid issue id: $issue_id"
+
+launch_issue="$script_dir/pohunek-launch-issue"
+
+# Run the launch in a terminal: `session new` may prompt for confirmation on a
+# remote host (needs a tty), and the user — who triggered this from a keybind
+# with no controlling terminal — should see the created-session id (or any
+# error). Keep the window open after it finishes so a fast local create does not
+# just flash and vanish.
+"$terminal_bin" -e sh -c '
+  "$1" "$2"
+  status=$?
+  printf "\n[pohunek] launch finished (exit %s); press Enter to close..." "$status"
+  read _ignored
+  exit "$status"
+' sh "$launch_issue" "$issue_id" &
+
+exit 0
