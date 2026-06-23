@@ -517,13 +517,16 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Host { action } => match action {
-            // discover/list enumerate the mesh and ignore `--host`.
+            // discover/list enumerate the local host's mesh view via the local
+            // daemon (which caches the probe); they ignore `--host`.
             HostAction::Discover { json } => {
-                commands::host::run_discover(json).await?;
+                let paths = Paths::resolve()?;
+                commands::host::run_discover(&paths, json).await?;
                 Ok(ExitCode::SUCCESS)
             }
             HostAction::List { json } => {
-                commands::host::run_list(json).await?;
+                let paths = Paths::resolve()?;
+                commands::host::run_list(&paths, json).await?;
                 Ok(ExitCode::SUCCESS)
             }
             HostAction::Inspect { host, json } => {

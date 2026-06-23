@@ -26,6 +26,7 @@ pub mod paths;
 
 pub mod api;
 pub mod capabilities;
+pub mod discovery;
 
 // PTY ownership, the session registry/supervisor, and raw attach streaming are
 // implemented; the remaining modules are future-milestone stubs (see plan

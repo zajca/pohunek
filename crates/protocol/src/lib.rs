@@ -23,6 +23,7 @@
 #![forbid(unsafe_code)]
 
 mod capabilities;
+mod discovery;
 mod envelope;
 mod error;
 mod integration;
@@ -30,6 +31,7 @@ mod session;
 mod version;
 
 pub use capabilities::{AgentRuntime, HostCapabilities};
+pub use discovery::{HostClass, HostDiscoverParams, HostRecord};
 pub use envelope::{Event, Request, Response, StateSource};
 pub use error::{ErrorClass, ProtocolError};
 pub use integration::{
@@ -77,6 +79,10 @@ pub mod method {
     /// Live host capability probe (Phase 2 / remote hosts over NetBird). Returns
     /// a [`HostCapabilities`](crate::HostCapabilities) snapshot.
     pub const HOST_INSPECT: &str = "host.inspect";
+    /// Enumerate and classify the local host's NetBird peers. Handled by the
+    /// local daemon, which caches the result for a short TTL. Returns a
+    /// `Vec<`[`HostRecord`](crate::HostRecord)`>`.
+    pub const HOST_DISCOVER: &str = "host.discover";
 }
 
 /// Control-protocol event names.
