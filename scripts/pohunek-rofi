@@ -151,7 +151,13 @@ for idx, host in hosts:
         agent = session.get("agent", "-")
         state = session.get("state", "-")
         activity = session.get("activity") or "-"
-        print(f"{host}/{session_id}\t{agent}\t{state}\t{activity}")
+        # `session list --json` enriches the project label; fall back to the id,
+        # then `-` for a session with no git project.
+        project = session.get("project_label") or session.get("project_id") or "-"
+        branch = session.get("branch") or "-"
+        # The first field (host/session_id) stays the selection key; the project
+        # and branch columns are context only.
+        print(f"{host}/{session_id}\t{project}\t{branch}\t{agent}\t{state}\t{activity}")
 PY
 
 if [ ! -s "$rows_file" ]; then

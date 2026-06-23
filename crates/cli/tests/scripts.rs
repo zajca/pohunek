@@ -425,7 +425,7 @@ if [ "$1" = "host" ] && [ "$2" = "discover" ]; then
 fi
 if [ "$1" = "--host" ] && [ "$3" = "session" ] && [ "$4" = "list" ]; then
   case "$2" in
-    local) printf '[{"id":"s-1","agent":"claude","state":"running","activity":"blocked"}]\n' ;;
+    local) printf '[{"id":"s-1","agent":"claude","state":"running","activity":"blocked","project_id":"p-ui","project_label":"ui","branch":"feat/x"}]\n' ;;
     box) printf '[{"id":"s-2","agent":"codex","state":"running","activity":"working"}]\n' ;;
     down) printf 'host down\n' >&2; exit 9 ;;
     *) printf '[]\n' ;;
@@ -509,11 +509,17 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_TERMINAL_ARGS"; done
     // The local daemon is enumerated even though `host discover` omits it: the
     // mock discover returns only box+down, so a local/s-1 row can ONLY appear if
     // the switcher queried `--host local` on its own (the F2 guarantee).
+    // Row columns: host/session  PROJECT  BRANCH  agent  state  activity. The
+    // local session carries a project label + branch; box has neither, so both
+    // fall back to `-`. The first field stays the selection key.
     assert!(
-        rows.contains("local/s-1\tclaude\trunning\tblocked"),
+        rows.contains("local/s-1\tui\tfeat/x\tclaude\trunning\tblocked"),
         "{rows}"
     );
-    assert!(rows.contains("box/s-2\tcodex\trunning\tworking"), "{rows}");
+    assert!(
+        rows.contains("box/s-2\t-\t-\tcodex\trunning\tworking"),
+        "{rows}"
+    );
     assert!(rows.contains("!down\tERROR\t"), "{rows}");
     // NOTE: do not assert on the per-host `pohunek ... session list` lines in the
     // calls log — those queries run as concurrent background subshells appending

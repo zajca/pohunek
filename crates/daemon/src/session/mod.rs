@@ -1117,6 +1117,8 @@ impl SessionRegistry {
             activity: None,
             native_session_id,
             project_id,
+            // Denormalized for display, resolved fresh at `session.list` time.
+            project_label: None,
             is_linked_worktree,
             repo,
             branch,
@@ -1531,7 +1533,10 @@ impl SessionRegistry {
         }
     }
 
-    /// List all known sessions.
+    /// List all known sessions, with each session's `project_label` enriched from
+    /// the project store (so the switcher and `session list` show the project by
+    /// name, and `--filter project=<label>` resolves). Enrichment is best-effort:
+    /// a missing store or read error simply leaves labels unset.
     pub async fn list(&self) -> Vec<SessionInfo> {
         let mut sessions = self
             .inner
@@ -1542,7 +1547,33 @@ impl SessionRegistry {
             .map(|entry| entry.info.clone())
             .collect::<Vec<_>>();
         sessions.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+        self.enrich_project_labels(&mut sessions).await;
         sessions
+    }
+
+    /// Set each session's `project_label` from the current store (resolved fresh,
+    /// so a rename shows immediately). The blocking store read runs on a blocking
+    /// thread; any failure leaves labels unset (the project id is still present).
+    async fn enrich_project_labels(&self, sessions: &mut [SessionInfo]) {
+        if !sessions.iter().any(|session| session.project_id.is_some()) {
+            return;
+        }
+        let Some(projects) = self.inner.projects.clone() else {
+            return;
+        };
+        let labels = match tokio::task::spawn_blocking(move || projects.label_map()).await {
+            Ok(Ok(labels)) => labels,
+            Ok(Err(err)) => {
+                warn!(error = %err, "failed to load project labels for session list");
+                return;
+            }
+            Err(_) => return,
+        };
+        for session in sessions.iter_mut() {
+            if let Some(id) = &session.project_id {
+                session.project_label = labels.get(id).cloned();
+            }
+        }
     }
 
     /// Inspect a session by id.

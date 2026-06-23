@@ -106,6 +106,8 @@ pub(crate) enum ListFilter {
     Activity(AgentActivity),
     /// Match the agent kind.
     Agent(AgentKind),
+    /// Match the session's project by `<id|label>` reference.
+    Project(String),
 }
 
 impl ListFilter {
@@ -117,6 +119,10 @@ impl ListFilter {
             ListFilter::State(state) => session.state == *state,
             ListFilter::Activity(activity) => session.activity == Some(*activity),
             ListFilter::Agent(agent) => session.agent == *agent,
+            ListFilter::Project(reference) => {
+                session.project_id.as_deref() == Some(reference)
+                    || session.project_label.as_deref() == Some(reference)
+            }
         }
     }
 
@@ -126,6 +132,7 @@ impl ListFilter {
             ListFilter::State(state) => SessionListFilter::State(*state),
             ListFilter::Activity(activity) => SessionListFilter::Activity(*activity),
             ListFilter::Agent(agent) => SessionListFilter::Agent(*agent),
+            ListFilter::Project(reference) => SessionListFilter::Project(reference.clone()),
         }
     }
 }
@@ -154,8 +161,9 @@ pub(crate) fn parse_list_filter(input: &str) -> Result<ListFilter, String> {
         "state" => parse_state_filter(value).map(ListFilter::State),
         "activity" => parse_activity_filter(value).map(ListFilter::Activity),
         "agent" => parse_agent_filter(value).map(ListFilter::Agent),
+        "project" => Ok(ListFilter::Project(value.to_owned())),
         other => Err(format!(
-            "unknown filter key {other:?}; expected one of: state, activity, agent, id"
+            "unknown filter key {other:?}; expected one of: state, activity, agent, id, project"
         )),
     }
 }
@@ -528,6 +536,12 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
         .max()
         .unwrap_or(0)
         .max("AGENT".len());
+    let project_width = sessions
+        .iter()
+        .map(|s| project_label(s).len())
+        .max()
+        .unwrap_or(0)
+        .max("PROJECT".len());
     let branch_width = sessions
         .iter()
         .map(|s| branch_label(s).len())
@@ -537,7 +551,7 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
 
     let mut output = String::new();
     output.push_str(&format!(
-        "{:<id_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<branch_width$}  {:<4}  CWD\n",
+        "{:<id_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  CWD\n",
         "ID",
         "AGENT",
         "STATE",
@@ -545,15 +559,17 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
         "SOURCE",
         "PID",
         "SIZE",
+        "PROJECT",
         "BRANCH",
         "WARN",
         id_width = id_width,
         agent_width = agent_width,
+        project_width = project_width,
         branch_width = branch_width
     ));
     for session in sessions {
         output.push_str(&format!(
-            "{:<id_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<branch_width$}  {:<4}  {}\n",
+            "{:<id_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {}\n",
             session.id.0,
             agent_label(session.agent),
             state_label(session.state),
@@ -561,11 +577,13 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
             state_source_label(session.state_source),
             session.pid,
             format!("{}x{}", session.cols, session.rows),
+            project_label(session),
             branch_label(session),
             warn_count_label(session),
             session.cwd.display(),
             id_width = id_width,
             agent_width = agent_width,
+            project_width = project_width,
             branch_width = branch_width
         ));
     }
@@ -604,6 +622,16 @@ fn render_list_output(
         ListOutputMode::Json => crate::commands::render_json(&filtered),
         ListOutputMode::Quiet => Ok(render_list_quiet(&filtered)),
     }
+}
+
+/// Project column value: the project's display label, falling back to its derived
+/// id when the label is unresolved (e.g. the project was removed), or `-` for a
+/// session with no git project.
+fn project_label(info: &SessionInfo) -> String {
+    info.project_label
+        .clone()
+        .or_else(|| info.project_id.clone())
+        .unwrap_or_else(|| "-".to_owned())
 }
 
 /// Branch column value: the bound branch, or `-` for a plain session.
@@ -798,6 +826,7 @@ mod tests {
             activity: None,
             native_session_id: None,
             project_id: None,
+            project_label: None,
             is_linked_worktree: None,
             repo: None,
             branch: None,
@@ -1026,6 +1055,8 @@ mod tests {
         let mut codex = running_session("s-codex");
         codex.agent = protocol::AgentKind::Codex;
         codex.activity = Some(AgentActivity::Working);
+        codex.project_id = Some("p-aaa".to_owned());
+        codex.project_label = Some("ui".to_owned());
         let sessions = [running_session("s-42"), codex];
 
         let filters = [
@@ -1038,6 +1069,9 @@ mod tests {
             parse_list_filter("id=s-42").expect("id"),
             parse_list_filter("id=s-codex").expect("id"),
             parse_list_filter("id=s-4").expect("id"),
+            parse_list_filter("project=ui").expect("project label"),
+            parse_list_filter("project=p-aaa").expect("project id"),
+            parse_list_filter("project=nope").expect("project miss"),
         ];
 
         for session in &sessions {
@@ -1050,6 +1084,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn project_filter_matches_by_label_or_id_and_column_falls_back() {
+        let mut session = running_session("s-42");
+        session.project_id = Some("p-abc123".to_owned());
+        session.project_label = Some("ui".to_owned());
+
+        // The PROJECT column prefers the label.
+        assert_eq!(project_label(&session), "ui");
+        // A project filter matches by label OR by id.
+        assert!(parse_list_filter("project=ui")
+            .expect("label")
+            .matches(&session));
+        assert!(parse_list_filter("project=p-abc123")
+            .expect("id")
+            .matches(&session));
+        assert!(!parse_list_filter("project=other")
+            .expect("miss")
+            .matches(&session));
+
+        // With the label unresolved, the column falls back to the id; a no-project
+        // session shows `-` and matches no project filter.
+        session.project_label = None;
+        assert_eq!(project_label(&session), "p-abc123");
+        let plain = running_session("s-plain");
+        assert_eq!(project_label(&plain), "-");
+        assert!(!parse_list_filter("project=ui").expect("f").matches(&plain));
     }
 
     #[test]
@@ -1287,9 +1349,10 @@ mod tests {
         let output = render_list_human(&[running_session("s-42")]);
 
         let header = output.lines().next().expect("header line");
-        for column in ["ID", "AGENT", "STATE", "BRANCH", "WARN", "CWD"] {
+        for column in ["ID", "AGENT", "STATE", "PROJECT", "BRANCH", "WARN", "CWD"] {
             assert!(header.contains(column), "header missing {column}: {header}");
         }
+        // Columns: ID AGENT STATE ACTIVITY SOURCE PID SIZE PROJECT BRANCH WARN CWD.
         assert_eq!(
             list_row(&output, "s-42"),
             vec![
@@ -1300,8 +1363,9 @@ mod tests {
                 "process",
                 "4242",
                 "120x40",
-                "-",
-                "-",
+                "-", // PROJECT
+                "-", // BRANCH
+                "-", // WARN
                 "/workspace/project",
             ]
         );
@@ -1325,8 +1389,9 @@ mod tests {
                 "osc_title",
                 "4242",
                 "120x40",
-                "-",
-                "-",
+                "-", // PROJECT
+                "-", // BRANCH
+                "-", // WARN
                 "/workspace/project",
             ]
         );
@@ -1357,13 +1422,20 @@ mod tests {
             detail: None,
         }];
 
+        session.project_id = Some("p-abc123".to_owned());
+        session.project_label = Some("login-ui".to_owned());
+
         let output = render_list_human(&[session]);
         let row = list_row(&output, "s-42");
-        // Columns: ID AGENT STATE ACTIVITY SOURCE PID SIZE BRANCH WARN CWD.
-        assert_eq!(row[7], "feature/login", "branch column: {row:?}");
-        assert_eq!(row[8], "1", "warning-count column: {row:?}");
+        // Columns: ID AGENT STATE ACTIVITY SOURCE PID SIZE PROJECT BRANCH WARN CWD.
         assert_eq!(
-            row[9], "/data/worktrees/s-42-project-feature-login",
+            row[7], "login-ui",
+            "project column shows the label: {row:?}"
+        );
+        assert_eq!(row[8], "feature/login", "branch column: {row:?}");
+        assert_eq!(row[9], "1", "warning-count column: {row:?}");
+        assert_eq!(
+            row[10], "/data/worktrees/s-42-project-feature-login",
             "cwd is the worktree path: {row:?}"
         );
     }

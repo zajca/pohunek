@@ -96,6 +96,11 @@ pub enum SessionListFilter {
     Agent(AgentKind),
     /// Match [`SessionInfo::id`].
     Id(String),
+    /// Match the session's project by `<id|label>` reference — its derived id
+    /// ([`SessionInfo::project_id`]) or its enriched label
+    /// ([`SessionInfo::project_label`]). Requires the list to be project-enriched
+    /// (it is, by `session.list`).
+    Project(String),
 }
 
 impl SessionListFilter {
@@ -107,6 +112,10 @@ impl SessionListFilter {
             Self::Activity(activity) => session.activity == Some(*activity),
             Self::Agent(agent) => session.agent == *agent,
             Self::Id(id) => session.id.0 == *id,
+            Self::Project(reference) => {
+                session.project_id.as_deref() == Some(reference)
+                    || session.project_label.as_deref() == Some(reference)
+            }
         }
     }
 }
@@ -316,6 +325,12 @@ pub struct SessionInfo {
     /// git identity (a plain shell in a non-git directory).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// Current display label of [`Self::project_id`]'s project, **denormalized for
+    /// display** and populated only by `session.list` (resolved fresh from the
+    /// store at list time, so it reflects a rename). `None` for a session with no
+    /// project or on responses that do not enrich it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_label: Option<String>,
     /// Whether the session's checkout is a linked git worktree rather than the
     /// repository's main checkout. `Some(true)` for a worktree-per-session, the
     /// detected value for an in-place session in a linked worktree, `Some(false)`
@@ -405,6 +420,7 @@ mod tests {
             activity: Some(AgentActivity::Working),
             native_session_id: None,
             project_id: None,
+            project_label: None,
             is_linked_worktree: None,
             repo: None,
             branch: None,
@@ -418,11 +434,16 @@ mod tests {
 
     #[test]
     fn filter_matches_each_field() {
-        let s = session("s-42");
+        let mut s = session("s-42");
+        s.project_id = Some("p-abc".to_owned());
+        s.project_label = Some("ui".to_owned());
         assert!(SessionListFilter::State(SessionState::Running).matches(&s));
         assert!(SessionListFilter::Agent(AgentKind::Claude).matches(&s));
         assert!(SessionListFilter::Activity(AgentActivity::Working).matches(&s));
         assert!(SessionListFilter::Id("s-42".to_owned()).matches(&s));
+        // A project filter matches the derived id or the enriched label.
+        assert!(SessionListFilter::Project("p-abc".to_owned()).matches(&s));
+        assert!(SessionListFilter::Project("ui".to_owned()).matches(&s));
     }
 
     #[test]
@@ -431,6 +452,8 @@ mod tests {
         assert!(!SessionListFilter::State(SessionState::Stopped).matches(&s));
         assert!(!SessionListFilter::Agent(AgentKind::Codex).matches(&s));
         assert!(!SessionListFilter::Activity(AgentActivity::Blocked).matches(&s));
+        // No project on this session ⇒ a project filter never matches.
+        assert!(!SessionListFilter::Project("ui".to_owned()).matches(&s));
     }
 
     #[test]

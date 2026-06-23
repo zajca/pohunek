@@ -41,6 +41,7 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         activity: None,
         native_session_id: None,
         project_id: None,
+        project_label: None,
         is_linked_worktree: None,
         repo: None,
         branch: None,

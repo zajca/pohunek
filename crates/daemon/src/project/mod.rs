@@ -179,6 +179,19 @@ impl ProjectManager {
         Ok(Some(record))
     }
 
+    /// A map from each known project's derived id to its current display label,
+    /// for enriching `session.list` rows with the project label (resolved fresh,
+    /// so it reflects a rename). Blocking store read; call from `spawn_blocking`.
+    pub fn label_map(&self) -> Result<std::collections::HashMap<String, String>, ProtocolError> {
+        Ok(self
+            .store
+            .load_projects()
+            .map_err(store_error)?
+            .into_iter()
+            .map(|project| (project.id(), project.label()))
+            .collect())
+    }
+
     /// All known projects (display shape), AND-filtered and sorted by label then
     /// id for a stable, low-noise inventory.
     pub fn list(&self, filters: &[ProjectListFilter]) -> Result<Vec<ProjectInfo>, ProtocolError> {
