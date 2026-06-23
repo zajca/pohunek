@@ -1,0 +1,139 @@
+#!/bin/sh
+
+# Cut a new release: bump the workspace version, refresh the lockfile, commit,
+# tag `vX.Y.Z`, and push. Pushing the tag triggers .github/workflows/release.yml,
+# which builds the binaries and publishes the GitHub Release.
+#
+# Usage:
+#   scripts/release patch        # 0.1.0 -> 0.1.1
+#   scripts/release minor        # 0.1.0 -> 0.2.0
+#   scripts/release major        # 0.1.0 -> 1.0.0
+#   scripts/release 1.4.2        # explicit version
+#
+# Options:
+#   --dry-run    Show what would happen without changing anything.
+#   --no-push    Commit and tag locally, but do not push.
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$script_dir/lib.sh"
+
+repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+manifest="$repo_root/Cargo.toml"
+release_branch="${POHUNEK_RELEASE_BRANCH:-main}"
+
+dry_run=false
+push=true
+bump=""
+
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) dry_run=true ;;
+    --no-push) push=false ;;
+    patch | minor | major) bump="$arg" ;;
+    [0-9]*.[0-9]*.[0-9]*) bump="$arg" ;;
+    -h | --help)
+      sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *) pohunek_fail "unknown argument: $arg (use patch|minor|major|X.Y.Z, --dry-run, --no-push)" ;;
+  esac
+done
+
+[ -n "$bump" ] || pohunek_fail "usage: scripts/release <patch|minor|major|X.Y.Z> [--dry-run] [--no-push]"
+
+pohunek_need_cmd git
+pohunek_need_cmd cargo
+
+# Read the current version from the [workspace.package] table.
+current="$(awk '
+  /^\[workspace\.package\]/ { in_pkg = 1; next }
+  /^\[/ { in_pkg = 0 }
+  in_pkg && /^version[[:space:]]*=/ {
+    gsub(/[^0-9.]/, "")
+    print
+    exit
+  }
+' "$manifest")"
+
+[ -n "$current" ] || pohunek_fail "could not read version from [workspace.package] in $manifest"
+
+case "$current" in
+  [0-9]*.[0-9]*.[0-9]*) ;;
+  *) pohunek_fail "current version is not semver: $current" ;;
+esac
+
+# Compute the target version.
+case "$bump" in
+  patch | minor | major)
+    major=${current%%.*}
+    rest=${current#*.}
+    minor=${rest%%.*}
+    patch=${rest#*.}
+    case "$bump" in
+      major) major=$((major + 1)); minor=0; patch=0 ;;
+      minor) minor=$((minor + 1)); patch=0 ;;
+      patch) patch=$((patch + 1)) ;;
+    esac
+    next="$major.$minor.$patch"
+    ;;
+  *)
+    next="$bump"
+    ;;
+esac
+
+tag="v$next"
+
+pohunek_info() { printf 'release: %s\n' "$*"; }
+
+pohunek_info "current version: $current"
+pohunek_info "next version:    $next  (tag $tag)"
+
+if [ "$dry_run" = true ]; then
+  pohunek_info "dry run: would bump $manifest to $next, refresh Cargo.lock, commit, tag $tag$( [ "$push" = true ] && printf ', and push' )"
+  exit 0
+fi
+
+# Safety checks: clean tree, on the release branch, tag not already used.
+branch="$(git -C "$repo_root" rev-parse --abbrev-ref HEAD)"
+[ "$branch" = "$release_branch" ] || pohunek_fail "not on $release_branch (on $branch); set POHUNEK_RELEASE_BRANCH to override"
+
+if [ -n "$(git -C "$repo_root" status --porcelain)" ]; then
+  pohunek_fail "working tree is dirty; commit or stash before releasing"
+fi
+
+if git -C "$repo_root" rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+  pohunek_fail "tag $tag already exists"
+fi
+
+# Bump the version in [workspace.package] (only that table's `version` line).
+tmp="$manifest.tmp"
+awk -v next="$next" '
+  /^\[workspace\.package\]/ { in_pkg = 1; print; next }
+  /^\[/ { in_pkg = 0 }
+  in_pkg && /^version[[:space:]]*=/ {
+    print "version = \"" next "\""
+    in_pkg = 0
+    next
+  }
+  { print }
+' "$manifest" > "$tmp"
+mv "$tmp" "$manifest"
+
+# Refresh Cargo.lock so the workspace members record the new version.
+( cd "$repo_root" && cargo update --workspace --offline >/dev/null 2>&1 || cargo update --workspace >/dev/null )
+
+git -C "$repo_root" add Cargo.toml Cargo.lock
+git -C "$repo_root" commit -m "Release $tag"
+git -C "$repo_root" tag -a "$tag" -m "Release $tag"
+
+pohunek_info "committed and tagged $tag"
+
+if [ "$push" = true ]; then
+  git -C "$repo_root" push origin "$release_branch"
+  git -C "$repo_root" push origin "$tag"
+  pohunek_info "pushed $release_branch and $tag; the Release workflow will build and publish the binaries"
+else
+  pohunek_info "skipped push (--no-push); run: git push origin $release_branch && git push origin $tag"
+fi

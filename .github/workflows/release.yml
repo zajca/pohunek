@@ -1,0 +1,78 @@
+name: Release
+
+# Triggered by pushing a `vX.Y.Z` tag (created by `scripts/release`). Builds the
+# `pohunek` (CLI) and `pohunekd` (daemon) binaries for each target on a native
+# runner, packages them into per-target tarballs with sha256 checksums, and
+# attaches everything to a GitHub Release for that tag.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Dynamically linked glibc build (primary target).
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          # Fully static musl build: a single self-contained binary that runs on
+          # any x86_64 Linux regardless of the host glibc version.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binaries
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin pohunek --bin pohunekd
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="pohunek-${version}-${{ matrix.target }}"
+          staging="dist/${name}"
+          mkdir -p "${staging}"
+          bindir="target/${{ matrix.target }}/release"
+          cp "${bindir}/pohunek" "${bindir}/pohunekd" "${staging}/"
+          for extra in README.md LICENSE; do
+            [ -f "${extra}" ] && cp "${extra}" "${staging}/" || true
+          done
+          tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+          ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          echo "archive=dist/${name}.tar.gz" >> "${GITHUB_OUTPUT}"
+          echo "checksum=dist/${name}.tar.gz.sha256" >> "${GITHUB_OUTPUT}"
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          files: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}

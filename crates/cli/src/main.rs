@@ -300,7 +300,9 @@ impl Commands {
             }
             Commands::Session { action } => action.wants_json(),
             Commands::Integration { action } => action.wants_json(),
-            Commands::Setup { action, json } => action.as_ref().map_or(*json, SetupAction::wants_json),
+            Commands::Setup { action, json } => {
+                action.as_ref().map_or(*json, SetupAction::wants_json)
+            }
             Commands::Host { action } => action.wants_json(),
             Commands::Subscribe { json } => *json,
             Commands::Attach { .. } | Commands::Daemon { .. } => false,
@@ -840,11 +842,12 @@ mod tests {
 
         match cli.command {
             Commands::Setup {
-                action: Some(SetupAction::Sway {
-                    print,
-                    keybind,
-                    json,
-                }),
+                action:
+                    Some(SetupAction::Sway {
+                        print,
+                        keybind,
+                        json,
+                    }),
                 ..
             } => {
                 assert!(print);

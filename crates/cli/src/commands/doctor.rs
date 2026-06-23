@@ -244,11 +244,7 @@ fn check_sway_include(paths: &Paths) -> Check {
                 !trimmed.starts_with('#') && trimmed.contains("config.d")
             });
             if includes {
-                Check::new(
-                    "sway_include",
-                    Status::Ok,
-                    "sway config includes config.d",
-                )
+                Check::new("sway_include", Status::Ok, "sway config includes config.d")
             } else {
                 Check::new(
                     "sway_include",

@@ -301,7 +301,10 @@ fn install_sway(paths: &Paths, print: bool, keybind: &str) -> Result<SwayResult,
         // Print-only: emit the snippet and touch nothing on disk. `path` reports
         // where it *would* be written so the caller can wire up the include.
         print!("{snippet}");
-        let dropin = paths.sway_config_dir().join("config.d").join(SWAY_DROPIN_FILE);
+        let dropin = paths
+            .sway_config_dir()
+            .join("config.d")
+            .join(SWAY_DROPIN_FILE);
         return Ok(SwayResult {
             path: dropin.display().to_string(),
             printed: true,
@@ -429,11 +432,8 @@ mod tests {
     /// write real files without touching the user's environment.
     fn temp_paths() -> TempPaths {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "pohunek-setup-test-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let root =
+            std::env::temp_dir().join(format!("pohunek-setup-test-{}-{}", std::process::id(), n));
         let config_home = root.join("config");
         let data_dir = root.join("data");
         let paths = Paths {
@@ -457,11 +457,7 @@ mod tests {
         for (name, _) in SCRIPTS {
             let path = dir.join(name);
             assert!(path.is_file(), "missing script: {}", path.display());
-            let mode = fs::metadata(&path)
-                .expect("metadata")
-                .permissions()
-                .mode()
-                & 0o777;
+            let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
             assert_eq!(mode, SCRIPT_MODE, "mode for {name}: {mode:o}");
         }
     }
@@ -488,8 +484,18 @@ mod tests {
 
         let conf = tp.paths.config_dir.join("launcher.conf");
         assert!(conf.is_file());
-        assert!(tp.paths.config_dir.join("prompts").join("issue.tmpl").is_file());
-        assert!(tp.paths.config_dir.join("prompts").join("pr.tmpl").is_file());
+        assert!(tp
+            .paths
+            .config_dir
+            .join("prompts")
+            .join("issue.tmpl")
+            .is_file());
+        assert!(tp
+            .paths
+            .config_dir
+            .join("prompts")
+            .join("pr.tmpl")
+            .is_file());
 
         // A user edit must survive a non-forced re-run.
         fs::write(&conf, "user-edited").expect("user edit");
