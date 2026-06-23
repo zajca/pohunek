@@ -168,4 +168,9 @@ pub struct ProjectRemoveResult {
     pub removed: bool,
     /// Number of pohunek-owned worktrees pruned (`0` unless `prune_worktrees`).
     pub pruned_worktrees: usize,
+    /// Ids of live sessions whose worktrees were **skipped** by the prune (a
+    /// running session was using the worktree, so it was left in place). Empty
+    /// unless `prune_worktrees` and a session was live in an owned worktree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_worktrees: Vec<String>,
 }

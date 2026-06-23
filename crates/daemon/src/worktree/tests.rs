@@ -3,6 +3,7 @@
 //! throwaway git repo under the system temp dir (git is required, as it is for
 //! the daemon at runtime).
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -753,10 +754,12 @@ fn cleanup_project_removes_only_the_projects_owned_worktrees() {
     let b = bind_owned("s-2", "feat/b", "p-1");
     let c = bind_owned("s-3", "feat/c", "p-2");
     assert!(a.path.exists() && b.path.exists() && c.path.exists());
+    let no_skip = HashSet::new();
 
-    // Pruning p-1 removes both of its worktrees, never p-2's.
-    let removed = mgr.cleanup_project("p-1").expect("cleanup p-1");
-    assert_eq!(removed, 2);
+    // Pruning p-1 (nothing skipped) removes both of its worktrees, never p-2's.
+    let prune = mgr.cleanup_project("p-1", &no_skip).expect("cleanup p-1");
+    assert_eq!(prune.removed, 2);
+    assert!(prune.skipped.is_empty());
     assert!(!a.path.exists(), "p-1 worktree a removed");
     assert!(!b.path.exists(), "p-1 worktree b removed");
     assert!(c.path.exists(), "p-2 worktree must be untouched");
@@ -770,9 +773,37 @@ fn cleanup_project_removes_only_the_projects_owned_worktrees() {
     );
     assert_eq!(remaining[0].project_id.as_deref(), Some("p-2"));
 
+    // Skipping p-2's worktree (a live session is using it) leaves it AND its
+    // binding in place, removing nothing.
+    let skip: HashSet<PathBuf> = [super::canonical_or_original(&c.path)]
+        .into_iter()
+        .collect();
+    let prune = mgr
+        .cleanup_project("p-2", &skip)
+        .expect("cleanup p-2 skipping c");
+    assert_eq!(prune.removed, 0, "the live worktree was skipped");
+    assert_eq!(prune.skipped.len(), 1);
+    assert!(c.path.exists(), "a skipped worktree is left on disk");
+    assert_eq!(
+        mgr.store().load_worktrees().expect("load").len(),
+        1,
+        "a skipped worktree keeps its binding"
+    );
+
+    // With nothing skipped, p-2 is finally removed.
+    assert_eq!(
+        mgr.cleanup_project("p-2", &no_skip)
+            .expect("cleanup p-2")
+            .removed,
+        1
+    );
+    assert!(!c.path.exists());
+
     // Pruning a project with no owned worktrees is a no-op.
     assert_eq!(
-        mgr.cleanup_project("p-unknown").expect("cleanup unknown"),
+        mgr.cleanup_project("p-unknown", &no_skip)
+            .expect("cleanup unknown")
+            .removed,
         0
     );
 }

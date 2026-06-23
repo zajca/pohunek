@@ -97,6 +97,15 @@ pub struct WorktreeBound {
     pub warnings: Vec<SessionWarning>,
 }
 
+/// Outcome of [`WorktreeManager::cleanup_project`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectPrune {
+    /// Number of owned worktrees removed.
+    pub removed: usize,
+    /// Canonical paths of owned worktrees skipped (a live session was using them).
+    pub skipped: Vec<PathBuf>,
+}
+
 /// Binds and cleans up per-session worktrees under a single root directory.
 #[derive(Debug)]
 pub struct WorktreeManager {
@@ -339,11 +348,13 @@ impl WorktreeManager {
         Ok(removed)
     }
 
-    /// Remove every worktree pohunek created for `project_id` (`project rm
-    /// --prune-worktrees`), then drop their bindings. Same ownership rule as
-    /// [`Self::cleanup_session`]: only paths recorded in a binding are touched, so
-    /// the repository's **main checkout and any worktree pohunek did not create**
-    /// (no binding for this project) are never removed. Returns the number removed.
+    /// Remove the worktrees pohunek created for `project_id` (`project rm
+    /// --prune-worktrees`), **skipping** any whose canonical path is in `skip`
+    /// (a worktree with a live session — left in place so the session keeps its
+    /// checkout), then drop the dropped worktrees' bindings. Same ownership rule
+    /// as [`Self::cleanup_session`]: only paths recorded in a binding are touched,
+    /// so the main checkout and any worktree pohunek did not create are never
+    /// removed. Returns the count removed and the canonical paths skipped.
     ///
     /// Best-effort by design — a `git worktree remove` failure is logged and the
     /// binding is still dropped so a half-removed tree does not wedge the prune.
@@ -352,16 +363,27 @@ impl WorktreeManager {
     ///
     /// Only the binding-store read/write can fail with a [`ProtocolError`]; git
     /// failures are non-fatal.
-    pub fn cleanup_project(&self, project_id: &str) -> Result<usize, ProtocolError> {
+    pub fn cleanup_project(
+        &self,
+        project_id: &str,
+        skip: &std::collections::HashSet<PathBuf>,
+    ) -> Result<ProjectPrune, ProtocolError> {
         let bindings = self
             .store
             .load_worktrees()
             .map_err(|err| store_error("read worktree binding store", &err))?;
-        let mut removed = 0;
+        let mut prune = ProjectPrune::default();
+        let mut removed_sessions = Vec::new();
         for binding in bindings
             .into_iter()
             .filter(|binding| binding.project_id.as_deref() == Some(project_id))
         {
+            let canonical = canonical_or_original(&binding.path);
+            if skip.contains(&canonical) {
+                // A live session is using this worktree; leave it and its binding.
+                prune.skipped.push(canonical);
+                continue;
+            }
             // The binding is the ownership proof; only an owned worktree is removed.
             if let Err(message) = worktree_remove(&binding.repository, &binding.path) {
                 warn!(
@@ -371,14 +393,17 @@ impl WorktreeManager {
                     "git worktree remove failed during project prune; dropping binding anyway"
                 );
             }
-            removed += 1;
+            // A session binds at most one worktree, so dropping by session id drops
+            // exactly this binding and never a skipped (live) one.
+            removed_sessions.push(binding.session_id);
+            prune.removed += 1;
         }
-        if removed > 0 {
+        for session_id in &removed_sessions {
             self.store
-                .remove_worktrees_for_project(project_id)
+                .remove_worktree_session(session_id)
                 .map_err(|err| store_error("drop worktree bindings", &err))?;
         }
-        Ok(removed)
+        Ok(prune)
     }
 
     /// Prune a stale git admin entry and remove any leftover directory so a

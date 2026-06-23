@@ -3,7 +3,7 @@
 //! Milestone 3 keeps session metadata in memory only. Each session owns a PTY
 //! handle and has a watcher task that records process exit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -35,7 +35,7 @@ use crate::project::detect::DetectedProject;
 use crate::project::{detect_at, ProjectManager};
 use crate::pty::{PtyCommand, PtyError, PtyExit, PtyHandle};
 use crate::store::{ProjectRecord, ResumeBinding, Store};
-use crate::worktree::{WorktreeManager, WorktreeRequest};
+use crate::worktree::{canonical_or_original, WorktreeManager, WorktreeRequest};
 
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
 /// Bound on how long a graceful shutdown waits for the event-log drain to flush
@@ -572,24 +572,59 @@ impl SessionRegistry {
             ));
         };
         let worktree = self.inner.worktree.clone();
+        // Gather the worktree paths of LIVE sessions up front (the session map is
+        // an async lock we cannot take inside `spawn_blocking`). The prune skips a
+        // worktree a running session is still using, so its checkout is not pulled
+        // out from under it; an in-place session (no worktree path) never blocks a
+        // prune. Keyed canonical so it matches the binder's canonicalized paths.
+        let live: Vec<(PathBuf, String)> = if prune_worktrees {
+            self.list()
+                .await
+                .into_iter()
+                .filter(|session| session.state == SessionState::Running)
+                .filter_map(|session| {
+                    session
+                        .worktree_path
+                        .map(|path| (canonical_or_original(&path), session.id.0))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let reference = reference.to_owned();
         tokio::task::spawn_blocking(move || -> Result<ProjectRemoveResult, ProtocolError> {
             // Resolve first so a missing/ambiguous reference errors before any
             // worktree is touched, and so we have the id to scope the prune.
             let record = projects.resolve(&reference)?;
-            let pruned_worktrees = if prune_worktrees {
+            let (pruned_worktrees, skipped_worktrees) = if prune_worktrees {
                 match &worktree {
-                    Some(manager) => manager.cleanup_project(&record.id())?,
+                    Some(manager) => {
+                        let skip: HashSet<PathBuf> =
+                            live.iter().map(|(path, _)| path.clone()).collect();
+                        let prune = manager.cleanup_project(&record.id(), &skip)?;
+                        // Map each skipped worktree path back to its live session id.
+                        let skipped = prune
+                            .skipped
+                            .iter()
+                            .filter_map(|path| {
+                                live.iter()
+                                    .find(|(live_path, _)| live_path == path)
+                                    .map(|(_, id)| id.clone())
+                            })
+                            .collect();
+                        (prune.removed, skipped)
+                    }
                     // No worktree manager ⇒ no worktrees were ever created.
-                    None => 0,
+                    None => (0, Vec::new()),
                 }
             } else {
-                0
+                (0, Vec::new())
             };
             let removed = projects.remove(&reference)?;
             Ok(ProjectRemoveResult {
                 removed,
                 pruned_worktrees,
+                skipped_worktrees,
             })
         })
         .await
@@ -2725,6 +2760,43 @@ mod tests {
                 .expect("load")
                 .is_empty(),
             "the project record is forgotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_project_prune_skips_a_worktree_with_a_live_session() {
+        // A worktree a RUNNING session is using must not be pruned out from under
+        // it; it is skipped and reported, while the record is still forgotten.
+        let (registry, repo) = project_registry("prune-skip");
+        let info = registry
+            .create(SessionNewParams {
+                cwd: Some(repo.clone()),
+                branch: Some("feat/x".to_owned()),
+                ..params()
+            })
+            .await
+            .expect("worktree session created");
+        let worktree = info.worktree_path.clone().expect("worktree path");
+        let project_id = info.project_id.clone().expect("project stamped");
+        // The session is left RUNNING (not stopped) — it is live in the worktree.
+
+        let result = registry
+            .remove_project(&project_id, true)
+            .await
+            .expect("remove with prune");
+        assert!(result.removed, "the record is still forgotten");
+        assert_eq!(
+            result.pruned_worktrees, 0,
+            "the live worktree is not pruned"
+        );
+        assert_eq!(
+            result.skipped_worktrees,
+            vec![info.id.0.clone()],
+            "the live session is reported as skipped"
+        );
+        assert!(
+            worktree.exists(),
+            "a live session's worktree is left on disk"
         );
     }
 

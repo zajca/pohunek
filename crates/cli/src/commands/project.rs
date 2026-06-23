@@ -188,6 +188,15 @@ pub(crate) async fn run_rm(
     if json {
         print!("{}", crate::commands::render_json(&result)?);
     } else {
+        // A live session was using a worktree the prune would have removed; it was
+        // left in place. Warn on stderr (never pollutes a --json stdout consumer).
+        if !result.skipped_worktrees.is_empty() {
+            eprintln!(
+                "pohunek: warning: skipped {} worktree(s) with a live session ({})",
+                result.skipped_worktrees.len(),
+                result.skipped_worktrees.join(", ")
+            );
+        }
         println!(
             "project {reference}: removed={}, pruned_worktrees={}",
             result.removed, result.pruned_worktrees
