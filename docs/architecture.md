@@ -109,9 +109,11 @@ Core responsibilities:
 
 - Own OS PTYs, agent processes, and session lifecycle.
 - Keep sessions alive when foreground clients disconnect.
-- Track session metadata, worktree bindings, agent type, and runtime state.
-- Store local metadata in file-based stores (JSON-lines today; an embedded SQLite
-  store is a deferred optimization — see "Configuration, State, and Log Storage").
+- Track session metadata, project records, worktree bindings, agent type, and
+  runtime state.
+- Store local metadata in one file-based store (JSON-lines today; an embedded
+  SQLite store is a deferred optimization — see "Configuration, State, and Log
+  Storage").
 - Write structured logs and append session-lifecycle events to a local event log.
 - Record and use native agent session IDs for resume.
 - Serve two listeners with one protocol:
@@ -193,8 +195,8 @@ Runtime responsibilities:
 - Track `idle`, `working`, `blocked`, `done`, and `failed` states.
 - Store native agent session IDs and prefer native resume over replaying
   commands.
-- Bind each session to host, repository, worktree, branch, agent type, logs,
-  events, and resume metadata.
+- Bind each session to host, project, repository, worktree, branch, agent type,
+  logs, events, and resume metadata.
 
 ### Agent state detection
 
@@ -261,22 +263,38 @@ defensively (optional fields default, unknown fields ignored) and pinned with
 recorded fixtures in tests. NetBird/VPN names and addresses are display and
 routing hints only.
 
-## Worktree Isolation
+## Projects and Worktree Isolation
 
-Concurrent agent work uses git worktrees. A session binds:
+The daemon understands *where* a session runs without being told: when a PTY
+starts in a git work tree it feels out git and records a lightweight **project**,
+keyed by the canonical `git_common_dir` so a repository's main checkout and all
+its linked worktrees collapse to one logical project. Projects accrue as a side
+effect of working (or via `pohunek project add`); there is no filesystem scan. A
+session references a project by `<id|label>` — resolved by the daemon against
+**its own** per-host store — so no filesystem path ever crosses the wire to a
+remote host. See [`docs/design/projects.md`](design/projects.md) for the full
+design and the three resolved decisions.
+
+A session binds:
 
 - host;
+- project (when started in / pointed at a git repository);
 - repository;
 - base branch;
 - working branch;
-- worktree path;
+- worktree path (worktree sessions only);
 - assigned agent;
 - logs and events;
 - resume binding.
 
-Worktree-per-session prevents two agents from sharing one working tree by
-accident. Session ownership of a worktree is explicit and recorded in metadata;
-the daemon checks ownership before reusing or cleaning up a worktree.
+**Isolation is intent-driven.** Without `--branch`, the agent runs **in place**
+in the project's checkout as-is — "open a terminal here, work here." With
+`--branch`, the daemon creates a **worktree-per-session** off the project's base
+branch, so two agents never share one working tree by accident. Worktree
+ownership is explicit and recorded in metadata (the binding carries the owning
+session and its project); the daemon checks ownership before reusing or cleaning
+up a worktree, and `project rm --prune-worktrees` removes only the worktrees
+pohunek itself created — never the main checkout or worktrees it did not create.
 
 ## State and Resume Model
 
@@ -311,8 +329,7 @@ Runtime state under the user data directory:
 
 ```text
 ~/.local/share/pohunek/
-  resume-bindings.jsonl    # sessions + resume metadata (JSON lines, 0600)
-  worktree-bindings.jsonl  # worktree bindings (JSON lines, 0600)
+  metadata.jsonl           # one store, three record kinds (JSON lines, 0600)
   events/                  # local append-only event log (audit/debug, not replicated)
   worktrees/               # managed git worktrees
 ```
@@ -323,13 +340,17 @@ Structured logs under the user state directory:
 ~/.local/state/pohunek/logs/
 ```
 
-The metadata stores are file-based (JSON lines, atomic temp+rename, `0600`); the
-event log is the local audit/debug trail. None of these is replicated across
-hosts — each host's daemon is authoritative and is answered live (see "High-Level
-Architecture"). An embedded SQLite `state.db` (schema-versioned, with forward
-migrations) is a **deferred** option, to be adopted only if scale or query needs
-justify it; the schema is sketched in `docs/plan-phase-1.md` ("Deferred: SQLite
-Schema").
+The metadata store is a **single** owner-private JSON-lines file whose lines are
+internally tagged by `kind` — `resume` (sessions + resume metadata), `worktree`
+(worktree bindings), and `project` (known repositories) — sharing one
+serialization lock and one atomic temp+rename write path, so a write of one
+record kind can never corrupt or drop another and any single update is
+crash-atomic. The event log is the local audit/debug trail. None of these is
+replicated across hosts — each host's daemon is authoritative and is answered
+live (see "High-Level Architecture"). An embedded SQLite `state.db`
+(schema-versioned, with forward migrations) is a **deferred** option, to be
+adopted only if scale or query needs justify it; the schema is sketched in
+`docs/plan-phase-1.md` ("Deferred: SQLite Schema").
 
 Secrets are never written to the metadata stores, the event log, or session
 metadata. They
