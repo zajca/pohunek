@@ -109,11 +109,11 @@ fi
 
 # Bump the version in [workspace.package] (only that table's `version` line).
 tmp="$manifest.tmp"
-awk -v next="$next" '
+awk -v nextver="$next" '
   /^\[workspace\.package\]/ { in_pkg = 1; print; next }
   /^\[/ { in_pkg = 0 }
   in_pkg && /^version[[:space:]]*=/ {
-    print "version = \"" next "\""
+    print "version = \"" nextver "\""
     in_pkg = 0
     next
   }
