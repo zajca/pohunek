@@ -514,8 +514,16 @@ mod tests {
     fn run_bounded_times_out_and_kills_a_slow_child() {
         // A wedged subprocess must be bounded by the timeout and killed, not
         // waited on — detection runs on the session-start hot path.
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("sleep 30");
+        //
+        // Spawn `sleep` DIRECTLY (no `sh -c`): `run_bounded` kills the child and
+        // joins the stdout reader, which only unblocks once the pipe's write end
+        // is closed. A shell wrapper can fork the real command (dash on CI does),
+        // so killing the shell would orphan `sleep` holding the pipe and the
+        // reader would block for the full 30s. The direct child IS `sleep`, so the
+        // kill closes the pipe at once — matching how `run_bounded` is really used
+        // (it execs `git` directly, never through a shell).
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
         let start = Instant::now();
         let out = run_bounded(cmd, Duration::from_millis(200));
         assert!(out.is_none(), "a timed-out call yields None");
