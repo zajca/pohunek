@@ -609,7 +609,10 @@ fn repo_name_slug(repo: &Path) -> String {
 }
 
 /// Best-effort path canonicalization that never fails (herdr `canonical_or_original`).
-fn canonical_or_original(path: &Path) -> PathBuf {
+///
+/// Shared with [`crate::project::detect`], which keys a project on the canonical
+/// `git_common_dir` so symlinked checkouts converge to one record.
+pub(crate) fn canonical_or_original(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
@@ -924,7 +927,7 @@ fn output_failure_message(output: &std::process::Output) -> String {
 /// component of every URL-shaped substring with `<redacted>`, leaving the scheme
 /// and host intact. A URL without credentials (no `@` in the authority) is
 /// unchanged.
-fn redact_url_credentials(message: &str) -> String {
+pub(crate) fn redact_url_credentials(message: &str) -> String {
     const SCHEME_SEP: &str = "://";
     let mut out = String::with_capacity(message.len());
     let mut rest = message;
