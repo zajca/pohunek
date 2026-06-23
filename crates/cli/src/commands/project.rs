@@ -168,19 +168,19 @@ pub(crate) async fn run_rename(
     Ok(())
 }
 
-/// Run `project rm <reference>` against the daemon for `host`.
+/// Run `project rm <reference> [--prune-worktrees]` against the daemon for `host`.
 pub(crate) async fn run_rm(
     host: &str,
     paths: &Paths,
     reference: &str,
+    prune_worktrees: bool,
     json: bool,
 ) -> Result<(), CliError> {
     let request = request_with_params(
         method::PROJECT_REMOVE,
         &ProjectRemoveParams {
             reference: reference.to_owned(),
-            // Pruning owned worktrees lands in the worktree-linkage milestone.
-            prune_worktrees: false,
+            prune_worktrees,
         },
     )?;
     let mut client = Client::connect(host, paths).await?;
@@ -188,7 +188,10 @@ pub(crate) async fn run_rm(
     if json {
         print!("{}", crate::commands::render_json(&result)?);
     } else {
-        println!("project {reference}: removed={}", result.removed);
+        println!(
+            "project {reference}: removed={}, pruned_worktrees={}",
+            result.removed, result.pruned_worktrees
+        );
     }
     Ok(())
 }

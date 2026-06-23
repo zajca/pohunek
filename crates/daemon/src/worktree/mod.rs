@@ -339,6 +339,48 @@ impl WorktreeManager {
         Ok(removed)
     }
 
+    /// Remove every worktree pohunek created for `project_id` (`project rm
+    /// --prune-worktrees`), then drop their bindings. Same ownership rule as
+    /// [`Self::cleanup_session`]: only paths recorded in a binding are touched, so
+    /// the repository's **main checkout and any worktree pohunek did not create**
+    /// (no binding for this project) are never removed. Returns the number removed.
+    ///
+    /// Best-effort by design — a `git worktree remove` failure is logged and the
+    /// binding is still dropped so a half-removed tree does not wedge the prune.
+    ///
+    /// # Errors
+    ///
+    /// Only the binding-store read/write can fail with a [`ProtocolError`]; git
+    /// failures are non-fatal.
+    pub fn cleanup_project(&self, project_id: &str) -> Result<usize, ProtocolError> {
+        let bindings = self
+            .store
+            .load_worktrees()
+            .map_err(|err| store_error("read worktree binding store", &err))?;
+        let mut removed = 0;
+        for binding in bindings
+            .into_iter()
+            .filter(|binding| binding.project_id.as_deref() == Some(project_id))
+        {
+            // The binding is the ownership proof; only an owned worktree is removed.
+            if let Err(message) = worktree_remove(&binding.repository, &binding.path) {
+                warn!(
+                    project_id = %project_id,
+                    path = %binding.path.display(),
+                    error = %message,
+                    "git worktree remove failed during project prune; dropping binding anyway"
+                );
+            }
+            removed += 1;
+        }
+        if removed > 0 {
+            self.store
+                .remove_worktrees_for_project(project_id)
+                .map_err(|err| store_error("drop worktree bindings", &err))?;
+        }
+        Ok(removed)
+    }
+
     /// Prune a stale git admin entry and remove any leftover directory so a
     /// fresh `git worktree add` can reuse the path.
     fn reset_stale_worktree(&self, repository: &Path, path: &Path) -> Result<(), ProtocolError> {

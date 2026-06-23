@@ -738,6 +738,45 @@ fn cleanup_session_removes_only_owned_worktrees() {
     );
 }
 
+#[test]
+fn cleanup_project_removes_only_the_projects_owned_worktrees() {
+    let mgr = manager("cleanup-project");
+    let repo = init_repo("cleanup-project-repo");
+
+    // Two worktrees owned by project p-1, one by p-2 (all in one repo).
+    let bind_owned = |session: &str, branch: &str, project: &str| {
+        let mut req = request(session, &repo, branch);
+        req.project_id = Some(project.to_owned());
+        mgr.bind(&req).expect("bind")
+    };
+    let a = bind_owned("s-1", "feat/a", "p-1");
+    let b = bind_owned("s-2", "feat/b", "p-1");
+    let c = bind_owned("s-3", "feat/c", "p-2");
+    assert!(a.path.exists() && b.path.exists() && c.path.exists());
+
+    // Pruning p-1 removes both of its worktrees, never p-2's.
+    let removed = mgr.cleanup_project("p-1").expect("cleanup p-1");
+    assert_eq!(removed, 2);
+    assert!(!a.path.exists(), "p-1 worktree a removed");
+    assert!(!b.path.exists(), "p-1 worktree b removed");
+    assert!(c.path.exists(), "p-2 worktree must be untouched");
+
+    // Only p-2's binding remains in the store.
+    let remaining = mgr.store().load_worktrees().expect("load store");
+    assert_eq!(
+        remaining.len(),
+        1,
+        "only p-2 binding remains: {remaining:?}"
+    );
+    assert_eq!(remaining[0].project_id.as_deref(), Some("p-2"));
+
+    // Pruning a project with no owned worktrees is a no-op.
+    assert_eq!(
+        mgr.cleanup_project("p-unknown").expect("cleanup unknown"),
+        0
+    );
+}
+
 // The worktree-binding store round-trip, two-branch coexistence, and
 // owner-private file mode are now covered by the unified store's own unit tests
 // in `crate::store` (the binding records and store moved there in M9).

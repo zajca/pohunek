@@ -12,10 +12,10 @@
 
 use protocol::{
     method, negotiate, HostDiscoverParams, IntegrationInstallParams, ProjectAddParams,
-    ProjectListParams, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
-    ProjectShowParams, ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams,
-    SessionId, SessionInputParams, SessionListParams, SessionNewParams, SessionNewResult,
-    SessionReportNativeIdParams, SessionResizeParams, PROTOCOL_VERSION,
+    ProjectListParams, ProjectRemoveParams, ProjectRenameParams, ProjectShowParams, ProtocolError,
+    Request, Response, SessionAttachParams, SessionDetachParams, SessionId, SessionInputParams,
+    SessionListParams, SessionNewParams, SessionNewResult, SessionReportNativeIdParams,
+    SessionResizeParams, PROTOCOL_VERSION,
 };
 use std::sync::Arc;
 
@@ -333,25 +333,34 @@ async fn handle_project_rename(request: &Request, sessions: &SessionRegistry) ->
     run_project_blocking(request, move || pm.rename(&reference, name)).await
 }
 
-/// `project.remove`: forget a project record. `prune_worktrees` is honored from
-/// the worktree-linkage milestone; here the record is removed and nothing pruned.
+/// `project.remove`: forget a project record, optionally pruning pohunek-owned
+/// worktrees for it (`--prune-worktrees`); never touches the main checkout or
+/// unowned worktrees.
 async fn handle_project_remove(request: &Request, sessions: &SessionRegistry) -> Response {
     let params = match parse_params::<ProjectRemoveParams>(request) {
         Ok(params) => params,
         Err(err) => return Response::err(request.id.clone(), err),
     };
-    let pm = match require_projects(request, sessions) {
-        Ok(pm) => pm,
-        Err(resp) => return resp,
-    };
-    let reference = params.reference;
-    run_project_blocking(request, move || {
-        pm.remove(&reference).map(|removed| ProjectRemoveResult {
-            removed,
-            pruned_worktrees: 0,
-        })
-    })
-    .await
+    // The registry owns both the project store and the worktree manager, so the
+    // prune-then-forget orchestration lives there; this guards the no-store case.
+    if sessions.projects().is_none() {
+        return Response::err(
+            request.id.clone(),
+            ProtocolError::new(
+                protocol::ErrorClass::Daemon,
+                "projects_not_configured",
+                "the daemon is not configured for projects (no metadata store)".to_owned(),
+                None,
+            ),
+        );
+    }
+    match sessions
+        .remove_project(&params.reference, params.prune_worktrees)
+        .await
+    {
+        Ok(result) => ok_value(request, &result),
+        Err(err) => Response::err(request.id.clone(), err),
+    }
 }
 
 async fn handle_session_new(request: &Request, sessions: &SessionRegistry) -> Response {

@@ -178,6 +178,10 @@ enum ProjectAction {
     Rm {
         /// Project reference: `<id|label>` on the target host.
         reference: String,
+        /// Also remove the worktrees pohunek created for this project (never the
+        /// main checkout or worktrees it did not create).
+        #[arg(long)]
+        prune_worktrees: bool,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -658,8 +662,13 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 } => {
                     commands::project::run_rename(&host, &paths, &reference, &name, json).await?;
                 }
-                ProjectAction::Rm { reference, json } => {
-                    commands::project::run_rm(&host, &paths, &reference, json).await?;
+                ProjectAction::Rm {
+                    reference,
+                    prune_worktrees,
+                    json,
+                } => {
+                    commands::project::run_rm(&host, &paths, &reference, prune_worktrees, json)
+                        .await?;
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -1241,8 +1250,22 @@ mod tests {
             .expect("parse rm");
         assert!(matches!(
             rm.command,
-            Commands::Project { action: ProjectAction::Rm { reference, json: false } } if reference == "ui"
+            Commands::Project {
+                action: ProjectAction::Rm { reference, prune_worktrees: false, json: false }
+            } if reference == "ui"
         ));
         assert_eq!(rm.host, "host-b", "project rm honors the global --host");
+
+        let prune = Cli::try_parse_from(["pohunek", "project", "rm", "ui", "--prune-worktrees"])
+            .expect("parse rm --prune-worktrees");
+        assert!(matches!(
+            prune.command,
+            Commands::Project {
+                action: ProjectAction::Rm {
+                    prune_worktrees: true,
+                    ..
+                }
+            }
+        ));
     }
 }

@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    event, AgentKind, ErrorClass, Event, ProtocolError, SessionAttachParams, SessionId,
-    SessionInfo, SessionInputParams, SessionInputResult, SessionNewParams,
+    event, AgentKind, ErrorClass, Event, ProjectRemoveResult, ProtocolError, SessionAttachParams,
+    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionNewParams,
     SessionReportNativeIdParams, SessionReportNativeIdResult, SessionState, SessionStopResult,
     SessionWarning, StateSource, PROTOCOL_VERSION,
 };
@@ -552,6 +552,48 @@ impl SessionRegistry {
     #[must_use]
     pub fn projects(&self) -> Option<Arc<ProjectManager>> {
         self.inner.projects.clone()
+    }
+
+    /// Forget a project (`project rm`), optionally pruning the worktrees pohunek
+    /// created for it (`--prune-worktrees`). Orchestrates the two subsystems this
+    /// registry owns — the project store and the worktree manager — on a blocking
+    /// thread: resolve the reference, prune owned worktrees (only those with a
+    /// binding for the project; never the main checkout or unowned trees), then
+    /// remove the record. A plain `rm` (no prune) only forgets the record.
+    pub async fn remove_project(
+        &self,
+        reference: &str,
+        prune_worktrees: bool,
+    ) -> Result<ProjectRemoveResult, ProtocolError> {
+        let Some(projects) = self.inner.projects.clone() else {
+            return Err(runtime_error(
+                "projects_not_configured",
+                "the daemon is not configured for projects (no metadata store)",
+            ));
+        };
+        let worktree = self.inner.worktree.clone();
+        let reference = reference.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<ProjectRemoveResult, ProtocolError> {
+            // Resolve first so a missing/ambiguous reference errors before any
+            // worktree is touched, and so we have the id to scope the prune.
+            let record = projects.resolve(&reference)?;
+            let pruned_worktrees = if prune_worktrees {
+                match &worktree {
+                    Some(manager) => manager.cleanup_project(&record.id())?,
+                    // No worktree manager ⇒ no worktrees were ever created.
+                    None => 0,
+                }
+            } else {
+                0
+            };
+            let removed = projects.remove(&reference)?;
+            Ok(ProjectRemoveResult {
+                removed,
+                pruned_worktrees,
+            })
+        })
+        .await
+        .map_err(|_| runtime_error("project_remove_failed", "project remove task panicked"))?
     }
 
     /// Start the append-only event log, if [`SessionRegistryConfig::event_log_dir`]
@@ -2647,6 +2689,73 @@ mod tests {
             .await
             .expect_err("--project and --repo together must be rejected");
         assert!(err.msg.contains("mutually exclusive"), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn remove_project_with_prune_removes_owned_worktrees_and_forgets_the_record() {
+        let (registry, repo) = project_registry("prune");
+        // A worktree session: its binding carries the project id.
+        let info = registry
+            .create(SessionNewParams {
+                cwd: Some(repo.clone()),
+                branch: Some("feat/x".to_owned()),
+                ..params()
+            })
+            .await
+            .expect("worktree session created");
+        let worktree = info.worktree_path.clone().expect("worktree path");
+        let project_id = info.project_id.clone().expect("project stamped");
+        assert!(worktree.exists());
+        // Stop the session first; its worktree binding is intentionally kept.
+        registry.stop(&info.id).await.expect("stop session");
+
+        let result = registry
+            .remove_project(&project_id, true)
+            .await
+            .expect("remove with prune");
+        assert!(result.removed, "the project record was removed");
+        assert_eq!(result.pruned_worktrees, 1, "the owned worktree was pruned");
+        assert!(!worktree.exists(), "pruned worktree directory is gone");
+        assert!(
+            registry
+                .projects()
+                .expect("projects")
+                .store()
+                .load_projects()
+                .expect("load")
+                .is_empty(),
+            "the project record is forgotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_project_without_prune_leaves_worktrees_intact() {
+        let (registry, repo) = project_registry("no-prune");
+        let info = registry
+            .create(SessionNewParams {
+                cwd: Some(repo.clone()),
+                branch: Some("feat/x".to_owned()),
+                ..params()
+            })
+            .await
+            .expect("worktree session created");
+        let worktree = info.worktree_path.clone().expect("worktree path");
+        let project_id = info.project_id.clone().expect("project stamped");
+        registry.stop(&info.id).await.expect("stop session");
+
+        let result = registry
+            .remove_project(&project_id, false)
+            .await
+            .expect("remove without prune");
+        assert!(result.removed);
+        assert_eq!(
+            result.pruned_worktrees, 0,
+            "nothing pruned without the flag"
+        );
+        assert!(
+            worktree.exists(),
+            "a plain rm must leave the worktree on disk"
+        );
     }
 
     #[tokio::test]

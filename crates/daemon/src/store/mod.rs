@@ -383,6 +383,22 @@ impl Store {
         })
     }
 
+    /// Remove every worktree binding belonging to `project_id`, preserving every
+    /// resume and project record. Returns the number removed (`0` is a no-op
+    /// success). Used by `project rm --prune-worktrees` to drop the bindings whose
+    /// on-disk worktrees it has removed.
+    pub fn remove_worktrees_for_project(&self, project_id: &str) -> io::Result<usize> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (resume, mut worktrees, projects) = self.read_all()?;
+        let before = worktrees.len();
+        worktrees.retain(|binding| binding.project_id.as_deref() != Some(project_id));
+        let removed = before - worktrees.len();
+        if removed > 0 {
+            self.write_all(&resume, &worktrees, &projects)?;
+        }
+        Ok(removed)
+    }
+
     /// Read and partition every record. A missing file yields three empty lists;
     /// malformed lines are skipped (a corrupt line must not block loading the
     /// rest).
@@ -850,6 +866,39 @@ mod tests {
                 .remove_project(&PathBuf::from("/code/ui/.git"))
                 .expect("remove missing"),
             "removing an absent project is a no-op false"
+        );
+    }
+
+    #[test]
+    fn remove_worktrees_for_project_removes_only_matching_bindings() {
+        let store = Store::new(temp_store_path("rm-wt-project"));
+        let mut a = worktree("s-1", "a");
+        a.project_id = Some("p-1".to_owned());
+        let mut b = worktree("s-2", "b");
+        b.project_id = Some("p-2".to_owned());
+        let unowned = worktree("s-3", "c"); // project_id None
+        store.record_worktree(&a).expect("a");
+        store.record_worktree(&b).expect("b");
+        store.record_worktree(&unowned).expect("unowned");
+
+        let removed = store
+            .remove_worktrees_for_project("p-1")
+            .expect("remove p-1");
+        assert_eq!(removed, 1);
+        let remaining = store.load_worktrees().expect("load");
+        assert_eq!(remaining.len(), 2, "only p-1 removed: {remaining:?}");
+        assert!(
+            remaining
+                .iter()
+                .all(|w| w.project_id.as_deref() != Some("p-1")),
+            "no p-1 binding remains"
+        );
+        // Unknown project is a no-op.
+        assert_eq!(
+            store
+                .remove_worktrees_for_project("p-unknown")
+                .expect("remove unknown"),
+            0
         );
     }
 
