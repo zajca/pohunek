@@ -1,9 +1,14 @@
 name: Release
 
-# Triggered by pushing a `vX.Y.Z` tag (created by `scripts/release`). Builds the
-# `pohunek` (CLI) and `pohunekd` (daemon) binaries for each target on a native
-# runner, packages them into per-target tarballs with sha256 checksums, and
-# attaches everything to a GitHub Release for that tag.
+# Triggered by pushing a `vX.Y.Z` tag (created by `scripts/release`). First runs
+# the full quality gate (fmt/clippy/test) on the tagged commit, and only if that
+# passes builds the `pohunek` (CLI) and `pohunekd` (daemon) binaries for each
+# target on a native runner, packages them into per-target tarballs with sha256
+# checksums, and attaches everything to a GitHub Release for that tag.
+#
+# A tag push does NOT run the CI workflow (CI runs on branch pushes and PRs), so
+# the gate is duplicated here: no binary is published from a commit that fails
+# fmt, clippy, or tests.
 on:
   push:
     tags:
@@ -16,8 +21,34 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  gate:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features
+
+      - name: Test
+        run: cargo test --workspace --all-features
+
   build:
     name: Build ${{ matrix.target }}
+    needs: gate
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
