@@ -16,7 +16,10 @@
 //! Requires **git >= 2.31** for `rev-parse --path-format=absolute`. On an older
 //! git that flag errors, [`detect`] returns `Ok(None)`, and the directory is
 //! simply left unregistered — consistent with the non-fatal contract, but no
-//! project ever auto-registers on such a host until git is upgraded.
+//! project ever auto-registers on such a host until git is upgraded. To keep that
+//! diagnosable rather than silent, the first time the flag fails inside a
+//! confirmed work tree a one-time `warn!` fires (see `warn_git_too_old`); behavior
+//! is unchanged.
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -24,7 +27,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::worktree::{canonical_or_original, redact_url_credentials};
 
@@ -118,6 +121,11 @@ pub fn detect(cwd: &Path) -> io::Result<Option<DetectedProject>> {
         cwd,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     ) else {
+        // Step 1 already confirmed a work tree (git is present and this is a repo),
+        // yet `--path-format=absolute` failed: almost certainly git < 2.31, on which
+        // no project ever auto-registers. Warn once so it is diagnosable; stay
+        // non-fatal (return `Ok(None)`, the session still starts).
+        warn_git_too_old();
         return Ok(None);
     };
     let git_common_dir = canonical_or_original(Path::new(&common_dir));
@@ -165,10 +173,15 @@ pub fn detect(cwd: &Path) -> io::Result<Option<DetectedProject>> {
 /// repository itself, so `repo_root` and `checkout_path` both point at it; the
 /// `is_bare` flag tells the UI not to promise an in-place checkout.
 fn detect_bare(cwd: &Path) -> Option<DetectedProject> {
-    let common_dir = git(
+    let Some(common_dir) = git(
         cwd,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?;
+    ) else {
+        // Same too-old-git signal as in `detect`: `--is-bare-repository` answered
+        // "true" (so git ran), but the absolute-path query failed. Warn once.
+        warn_git_too_old();
+        return None;
+    };
     let git_common_dir = canonical_or_original(Path::new(&common_dir));
     Some(DetectedProject {
         repo_root: git_common_dir.clone(),
@@ -201,6 +214,28 @@ fn main_worktree(cwd: &Path) -> Option<PathBuf> {
         .split('\0')
         .find_map(|field| field.strip_prefix("worktree "))
         .map(PathBuf::from)
+}
+
+/// Warn — at most once per process — that git's `--path-format=absolute` query
+/// failed inside a confirmed git repository, which almost always means git is
+/// older than 2.31 (the flag's introduction). On such a host no project ever
+/// auto-registers, and without this the failure is silent (detection just keeps
+/// returning `None`, indistinguishable from a non-git directory). The one-time
+/// guard keeps it off the per-session hot path's log while still making a too-old
+/// git diagnosable; it never changes behavior — detection stays non-fatal.
+fn warn_git_too_old() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        warn!(
+            "git `rev-parse --path-format=absolute` failed inside a git work tree; \
+             git is likely older than 2.31 — projects will not auto-register on this \
+             host until git is upgraded (detection stays non-fatal; sessions still start)"
+        );
+    }
 }
 
 /// Run `git -C <cwd> <args>` bounded by [`DETECT_GIT_TIMEOUT`], returning trimmed

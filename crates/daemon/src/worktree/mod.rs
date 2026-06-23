@@ -701,12 +701,16 @@ fn is_valid_worktree(path: &Path) -> bool {
     }
 }
 
-/// Whether `repo` is inside a git working tree.
+/// Whether `repo` is a git repository pohunek can add a worktree to — a normal
+/// working tree **or** a bare repo. `git worktree add` works on both; only a
+/// non-repo directory is rejected. Accepting bare here is what makes the worktree
+/// path the valid escape hatch for a bare project (an in-place session is refused
+/// on a bare repo precisely because it has no working tree to run in).
 fn is_git_repo(repo: &Path) -> bool {
-    matches!(
-        git_capture(repo, &["rev-parse", "--is-inside-work-tree"]),
-        Ok(out) if out.trim() == "true"
-    )
+    let answers_true =
+        |args: &[&str]| matches!(git_capture(repo, args), Ok(out) if out.trim() == "true");
+    answers_true(&["rev-parse", "--is-inside-work-tree"])
+        || answers_true(&["rev-parse", "--is-bare-repository"])
 }
 
 /// The repository's current branch (used as the default base ref).
@@ -999,6 +1003,18 @@ fn output_failure_message(output: &std::process::Output) -> String {
 /// component of every URL-shaped substring with `<redacted>`, leaving the scheme
 /// and host intact. A URL without credentials (no `@` in the authority) is
 /// unchanged.
+///
+/// **Scope (security boundary).** This redacts exactly the RFC 3986 `userinfo`
+/// component (`user`, `user:password`, or a bare `token`, all before the `@`),
+/// which is the *only* place native git carries a secret in a URL. Deliberately
+/// out of scope, because git never authenticates through them:
+/// - SCP-form `git@host:org/repo` — no `://`, and the `git@` is a username, not a
+///   secret (SSH auth is key-based);
+/// - query/fragment (`?token=…`, `#…`) — the authority ends at `?`/`#`, so they
+///   are not touched; git does not pass credentials there.
+///
+/// A non-standard credential helper that smuggled a token into a query string
+/// would fall outside this; nothing in pohunek does. See the redaction tests.
 pub(crate) fn redact_url_credentials(message: &str) -> String {
     const SCHEME_SEP: &str = "://";
     let mut out = String::with_capacity(message.len());

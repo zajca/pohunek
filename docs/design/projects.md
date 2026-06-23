@@ -147,10 +147,13 @@ local additionally gets the cwd shortcut.
 
 Resolution order for the target project:
 1. `--project <id|label>` (works for any host; the only option for remote).
-2. local cwd auto-detection (local sessions only — you can't "stand in" a remote
-   dir).
-3. explicit `--repo <path>` (low-level escape hatch; also how a brand-new project
-   is first introduced on a host).
+2. explicit `--repo <path>` (low-level escape hatch; also how a brand-new project
+   is first introduced on a host). An **explicit** `--repo` is honored over the
+   **implicitly-sent** `--cwd`: naming a repo wins, so the worktree source stays
+   coherent with the project identity (and `--repo` "still wins", as above).
+   `--project` and `--repo` are mutually exclusive.
+3. local cwd auto-detection (local sessions only — you can't "stand in" a remote
+   dir): the everyday shortcut when neither `--project` nor `--repo` is given.
 
 Required CLI fix for the cwd shortcut: today an omitted `cwd` falls back to the
 **daemon's** `current_dir` (`crates/daemon/src/session/mod.rs:572`). For **local**

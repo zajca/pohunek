@@ -5,12 +5,24 @@ Tracking list of open items from implementing the Projects feature
 block the milestones; each is a decision or a deferred refinement to resolve
 later. Recorded so they are not lost. Severity is the impact if left as-is.
 
-Status legend: **open** (needs a decision) · **deferred** (decided to do later).
+Status legend: **open** (needs a decision) · **deferred** (decided to do later) ·
+**resolved** (done; resolution noted under the heading).
+
+> **All items below are now resolved** (2026-06-23). Each heading keeps its
+> original write-up for context; the **Status** line records the decision taken
+> and where it landed in the code.
 
 ---
 
 ## F1 — `project rm --prune-worktrees` forgets the record even when a worktree is skipped
-**Severity:** low–medium · **Status:** open (behavior chosen, edge to confirm)
+**Severity:** low–medium · **Status:** resolved — option (b)
+
+Resolution: `remove_project` (`crates/daemon/src/session/mod.rs`) now removes the
+record only when nothing was skipped; a skipped worktree keeps the record
+(`removed: false`) with the skipped list, so no binding is left dangling. The
+live-session filter was also aligned to the non-terminal set (`is_terminal`),
+matching `project show`, so a `Starting` session's worktree is protected too.
+Covered by `remove_project_prune_skips_a_worktree_with_a_live_session`.
 
 `--prune-worktrees` skips a worktree that a *running* session is using (chosen
 behavior: skip + warn) — but the project **record is still removed**. The skipped
@@ -32,7 +44,14 @@ so the operator can finish), and keeps bindings consistent with records.
 ---
 
 ## F2 — Store read-modify-write is not atomic across load→write
-**Severity:** low (single-operator) · **Status:** deferred
+**Severity:** low (single-operator) · **Status:** resolved
+
+Resolution: `Store::mutate_project` (`crates/daemon/src/store/mod.rs`) does the
+read-modify-write entirely under the write lock, with a closure that receives the
+freshest record and returns the value to upsert (or `None` to decline). `upsert`,
+`touch`, and `rename` (`crates/daemon/src/project/mod.rs`) all route through it,
+so a concurrent edit is merged, not clobbered. (`rename` had the same race and was
+fixed too.) Covered by the three `mutate_project_*` store tests.
 
 `ProjectManager::register` and `touch` do `load_projects()` then `record_project()`
 as two separate locked operations; the write lock is held only inside
@@ -49,7 +68,13 @@ a closure, and writes — all under the existing write lock — and route
 ---
 
 ## F3 — Too-old git (< 2.31) fails detection silently
-**Severity:** low · **Status:** deferred
+**Severity:** low · **Status:** resolved (warn; `host inspect` git version deferred)
+
+Resolution: when `rev-parse --path-format=absolute` fails *inside a confirmed work
+tree* (the too-old-git signal, since Step 1 already proved git ran), detection
+emits a one-time `tracing::warn!` via `warn_git_too_old`
+(`crates/daemon/src/project/detect.rs`) and stays non-fatal (`Ok(None)`). The
+optional `host inspect` git-version surfacing is left as a nice-to-have.
 
 Detection uses `git rev-parse --path-format=absolute` (git ≥ 2.31, 2021). On an
 older git the call errors, `detect()` returns `Ok(None)` (non-fatal by design),
@@ -63,7 +88,17 @@ contract. Optionally surface git version in `host inspect`.
 ---
 
 ## F4 — Bare-repo in-place session launches in the bare git dir
-**Severity:** low · **Status:** open
+**Severity:** low · **Status:** resolved — refuse + steer to `--branch`
+
+Resolution: `resolve_target` (`crates/daemon/src/session/mod.rs`) refuses an
+in-place session on a bare project with a `bad_request` steering the operator to
+`--branch`. For that steer to be truthful, worktree binding had to accept a bare
+source: `is_git_repo` (`crates/daemon/src/worktree/mod.rs`) now treats a bare repo
+as a valid source (`git worktree add` works on bare repos), so `--branch` on a
+bare project creates a usable worktree. Covered by
+`in_place_session_on_a_bare_project_is_refused`,
+`worktree_session_on_a_bare_project_is_allowed`, and
+`bind_creates_a_worktree_on_a_bare_repo`.
 
 An in-place session resolved to a **bare** project launches the agent in the bare
 repo's directory (there is no working tree). It keeps the `project_id` association
@@ -77,7 +112,16 @@ worktree). Resolve once we see whether bare projects occur in practice.
 ---
 
 ## F5 — Resume re-detects every resumable session at startup
-**Severity:** low · **Status:** deferred
+**Severity:** low · **Status:** resolved — persist on the binding
+
+Resolution: `ResumeBinding` (`crates/daemon/src/store/mod.rs`) now carries
+`project_id` / `is_linked_worktree` (serde-default, so an old line still loads).
+`persist_resume_binding` captures them from the live session, and `resume_binding`
+restores them directly instead of re-running `detect_at` — so a daemon restart
+does no per-session git detection, and a detection failure can no longer silently
+drop the metadata. `restore_project_metadata` was removed. No migration (the store
+may be wiped on upgrade). Covered by
+`resume_binding_persists_project_context_for_restart`.
 
 On daemon restart, `resume_binding` re-runs git detection on each resumable
 session's cwd to restore `project_id`/`is_linked_worktree` (they are not persisted
@@ -91,7 +135,14 @@ migration needed).
 ---
 
 ## F6 — `--repo` beats implicit `--cwd` (deviates from design prose)
-**Severity:** none (deliberate) · **Status:** open (confirm)
+**Severity:** none (deliberate) · **Status:** resolved — keep code, fix prose
+
+Resolution: the code's order (explicit `--repo` over implicit `--cwd`) is the
+intended one — it keeps the worktree source coherent with the project identity and
+matches the existing "`--repo` still wins" note. The design prose in
+[`projects.md`](projects.md) ("Resolution order for the target project") was
+updated to list `--repo` (2) before cwd (3), removing the inconsistency. No code
+change.
 
 The design's resolution prose lists `cwd` (2) before `--repo` (3). The
 implementation makes an **explicit** `--repo` win over the **implicitly-sent**
@@ -103,7 +154,17 @@ are given. Confirm this is the intended order, or flip to match the prose.
 ---
 
 ## F7 — `origin_url` redaction coverage
-**Severity:** low · **Status:** open (confirm)
+**Severity:** low · **Status:** resolved — security confirmed
+
+Resolution: reviewed and signed off. `redact_url_credentials`
+(`crates/daemon/src/worktree/mod.rs`) strips exactly the RFC 3986 `userinfo`
+component — the only place native git carries a secret in a URL — covering the
+`https://<token>@host` PAT, `user:password@`, and `ssh://user@` forms, including
+multiple URLs in one message. SCP-form `git@host:path` (no secret) and
+query/fragment tokens (git never authenticates through them) are intentionally out
+of scope. The security boundary is now stated in the function doc and pinned by
+`redact_url_credentials_covers_ssh_and_multiple_urls` and
+`redact_url_credentials_security_boundary_scp_and_query_are_out_of_scope`.
 
 `origin_url` is captured at detection and run through the worktree module's
 `redact_url_credentials`, which strips `scheme://userinfo@host` (incl. the

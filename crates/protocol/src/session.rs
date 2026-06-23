@@ -256,6 +256,19 @@ pub enum SessionState {
     Failed,
 }
 
+impl SessionState {
+    /// Whether this is a **terminal** state — the session has stopped, completed,
+    /// or failed and no longer holds resources (its worktree is free again, no
+    /// process is attached). `Starting` and `Running` are the non-terminal,
+    /// **live** states. Centralizing the set here keeps every "is this session
+    /// still live?" check (daemon lifecycle guards, `project show` worktree
+    /// enrichment) in agreement.
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Stopped | Self::Done | Self::Failed)
+    }
+}
+
 /// The kind of a non-fatal worktree-setup warning.
 ///
 /// Each variant mirrors a Kandev worktree warning field (see
@@ -430,6 +443,18 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_owned(),
             exit_code: None,
         }
+    }
+
+    #[test]
+    fn session_state_terminal_set_is_exactly_stopped_done_failed() {
+        // The live states keep a worktree occupied; the terminal states free it.
+        // `project show`'s worktree enrichment and the daemon lifecycle guards
+        // both depend on this split, so pin it directly.
+        assert!(!SessionState::Starting.is_terminal());
+        assert!(!SessionState::Running.is_terminal());
+        assert!(SessionState::Stopped.is_terminal());
+        assert!(SessionState::Done.is_terminal());
+        assert!(SessionState::Failed.is_terminal());
     }
 
     #[test]

@@ -57,6 +57,19 @@ pub struct ResumeBinding {
     /// Captured native session path, for agents that resume from a path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_path: Option<String>,
+    /// Project this session belongs to ([`ProjectRecord::id`]), captured here so a
+    /// daemon restart restores the resumed session's project context directly
+    /// instead of re-running git detection on its cwd. `None` for a plain-shell
+    /// (non-project) session. Serde default so an older line (no field) still
+    /// loads; the store carries no compatibility guarantee beyond that (it may be
+    /// wiped on upgrade).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Whether the session's cwd is a linked worktree (vs the main checkout),
+    /// captured alongside `project_id` for the same restart-without-redetect
+    /// reason. `None` when there is no project / it was never known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_linked_worktree: Option<bool>,
 }
 
 /// Lifecycle status of a worktree binding.
@@ -326,6 +339,45 @@ impl Store {
         Ok(removed)
     }
 
+    /// Atomically read-modify-write the project keyed by canonical
+    /// `git_common_dir`, **entirely under the store write lock** so a concurrent
+    /// edit cannot be clobbered by a stale snapshot. This is the safe alternative
+    /// to the `load_projects()` → mutate a detached copy → `record_project()`
+    /// pattern, which reads outside the lock and so races: two callers can each
+    /// read the same record, each mutate a different field, and the second write
+    /// reverts the first.
+    ///
+    /// `mutate` receives the current record (`None` when the project is absent)
+    /// and returns the record to store, or `None` to leave the store untouched.
+    /// A returned record is upserted by `git_common_dir` (inserted when absent),
+    /// so the closure expresses both create-if-missing (return `Some` for a
+    /// `None` input) and update-only (return `None` for a `None` input) policies.
+    /// Returns the stored record, or `None` when `mutate` declined to write.
+    pub fn mutate_project<F>(
+        &self,
+        git_common_dir: &Path,
+        mutate: F,
+    ) -> io::Result<Option<ProjectRecord>>
+    where
+        F: FnOnce(Option<ProjectRecord>) -> Option<ProjectRecord>,
+    {
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (resume, worktrees, mut projects) = self.read_all()?;
+        let pos = projects
+            .iter()
+            .position(|existing| existing.git_common_dir == git_common_dir);
+        let current = pos.map(|index| projects[index].clone());
+        let Some(updated) = mutate(current) else {
+            return Ok(None);
+        };
+        match pos {
+            Some(index) => projects[index] = updated.clone(),
+            None => projects.push(updated.clone()),
+        }
+        self.write_all(&resume, &worktrees, &projects)?;
+        Ok(Some(updated))
+    }
+
     /// Upsert a project record (keyed by canonical `git_common_dir`), preserving
     /// every resume and worktree record, and rewrite the file atomically.
     /// Re-detecting (or re-adding) the same repository updates the existing record
@@ -333,6 +385,10 @@ impl Store {
     /// key. The caller supplies an already-canonical key (detection and
     /// `project add` both canonicalize), so matching is exact-path, mirroring how
     /// worktree records key on the canonicalized repository.
+    ///
+    /// Prefer [`Self::mutate_project`] when the new value depends on the current
+    /// record (read-modify-write); this whole-record overwrite is for callers that
+    /// already hold the complete intended record.
     pub fn record_project(&self, record: &ProjectRecord) -> io::Result<()> {
         let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let (resume, worktrees, mut projects) = self.read_all()?;
@@ -514,6 +570,8 @@ mod tests {
             rows: 40,
             native_session_id: Some(native.to_owned()),
             native_session_path: None,
+            project_id: None,
+            is_linked_worktree: None,
         }
     }
 
@@ -702,6 +760,98 @@ mod tests {
         assert_eq!(ui.custom_name.as_deref(), Some("dashboard"));
         assert_eq!(ui.source, ProjectSource::Manual);
         assert_eq!(ui.last_used_at, "2026-06-20T00:00:00Z");
+    }
+
+    #[test]
+    fn mutate_project_creates_when_absent_and_preserves_other_kinds() {
+        let store = Store::new(temp_store_path("mutate-create"));
+        store.record_resume(&resume("s-1", "native-1")).expect("r");
+        store.record_worktree(&worktree("s-1", "x")).expect("w");
+
+        // Absent project: the closure receives `None` and a create-if-missing
+        // policy returns `Some`, so the record is inserted.
+        let created = store
+            .mutate_project(Path::new("/code/ui/.git"), |existing| {
+                assert!(existing.is_none(), "project is absent");
+                Some(project("/code/ui/.git", "/code/ui", None))
+            })
+            .expect("mutate")
+            .expect("a record was written");
+        assert_eq!(created.git_common_dir, PathBuf::from("/code/ui/.git"));
+        assert_eq!(store.load_projects().expect("p").len(), 1);
+        // The atomic rewrite preserves the other record kinds.
+        assert_eq!(store.load_resume().expect("r").len(), 1, "resume kept");
+        assert_eq!(store.load_worktrees().expect("w").len(), 1, "worktree kept");
+    }
+
+    #[test]
+    fn mutate_project_passes_current_record_and_merges_edits() {
+        // This is the fix for the metadata-clobber race: each edit reads the
+        // freshest record *under the write lock* and mutates only its own field,
+        // so a later edit cannot revert an earlier one from a stale snapshot.
+        let store = Store::new(temp_store_path("mutate-merge"));
+        store
+            .record_project(&project("/code/ui/.git", "/code/ui", None))
+            .expect("seed");
+
+        // Edit A: set the default base branch (as `project add --base-branch`).
+        store
+            .mutate_project(Path::new("/code/ui/.git"), |existing| {
+                let mut record = existing.expect("present");
+                record.default_base_branch = Some("develop".to_owned());
+                Some(record)
+            })
+            .expect("edit A");
+
+        // Edit B: set the custom name (as `project rename`). Because the closure
+        // reads the freshest record, it observes edit A's base branch and keeps it.
+        let after = store
+            .mutate_project(Path::new("/code/ui/.git"), |existing| {
+                let mut record = existing.expect("present");
+                record.custom_name = Some("dashboard".to_owned());
+                Some(record)
+            })
+            .expect("edit B")
+            .expect("written");
+
+        assert_eq!(after.custom_name.as_deref(), Some("dashboard"));
+        assert_eq!(
+            after.default_base_branch.as_deref(),
+            Some("develop"),
+            "edit B must not revert edit A's field"
+        );
+        assert_eq!(store.load_projects().expect("p").len(), 1, "no duplicate");
+    }
+
+    #[test]
+    fn mutate_project_declining_writes_nothing() {
+        let store = Store::new(temp_store_path("mutate-decline"));
+        store
+            .record_project(&project("/code/ui/.git", "/code/ui", Some("dash")))
+            .expect("seed");
+
+        // An update-only policy on a present record may still decline (return
+        // `None`); nothing is written and the result is `None`.
+        let result = store
+            .mutate_project(Path::new("/code/ui/.git"), |_existing| None)
+            .expect("mutate present");
+        assert!(result.is_none(), "declined ⇒ no record returned");
+        let loaded = store.load_projects().expect("p");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].custom_name.as_deref(), Some("dash"), "untouched");
+
+        // Update-only on an *absent* project writes nothing and returns `None`
+        // (the `touch`/`rename`-on-a-removed-project path).
+        let missing = store
+            .mutate_project(Path::new("/code/gone/.git"), |existing| {
+                existing.map(|mut record| {
+                    record.custom_name = Some("never".to_owned());
+                    record
+                })
+            })
+            .expect("mutate absent");
+        assert!(missing.is_none(), "absent + update-only ⇒ None");
+        assert_eq!(store.load_projects().expect("p").len(), 1, "nothing added");
     }
 
     #[test]

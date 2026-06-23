@@ -111,50 +111,52 @@ impl ProjectManager {
             validate_project_name(name)?;
         }
         let now = now_rfc3339();
-        let existing = self
+        // Read-modify-write under the store lock so a concurrent rename / add /
+        // touch is merged, not clobbered by a stale snapshot. The closure always
+        // returns `Some`, so a record is always written.
+        let record = self
             .store
-            .load_projects()
-            .map_err(store_error)?
-            .into_iter()
-            .find(|project| project.git_common_dir == detected.git_common_dir);
-
-        let mut record = match existing {
-            Some(mut prev) => {
-                prev.repo_root = detected.repo_root.clone();
-                prev.origin_url = detected.origin_url.clone();
-                prev.is_bare = detected.is_bare;
-                prev.last_used_at = now;
-                // A manual (re-)add promotes an auto record; auto-registration
-                // never demotes a manual one.
-                if manual {
-                    prev.source = ProjectSource::Manual;
+            .mutate_project(&detected.git_common_dir, |existing| {
+                let mut record = match existing {
+                    Some(mut prev) => {
+                        prev.repo_root = detected.repo_root.clone();
+                        prev.origin_url = detected.origin_url.clone();
+                        prev.is_bare = detected.is_bare;
+                        prev.last_used_at = now.clone();
+                        // A manual (re-)add promotes an auto record;
+                        // auto-registration never demotes a manual one.
+                        if manual {
+                            prev.source = ProjectSource::Manual;
+                        }
+                        prev
+                    }
+                    None => ProjectRecord {
+                        git_common_dir: detected.git_common_dir.clone(),
+                        repo_root: detected.repo_root.clone(),
+                        custom_name: None,
+                        origin_url: detected.origin_url.clone(),
+                        default_base_branch: None,
+                        is_bare: detected.is_bare,
+                        source: if manual {
+                            ProjectSource::Manual
+                        } else {
+                            ProjectSource::Auto
+                        },
+                        added_at: now.clone(),
+                        last_used_at: now.clone(),
+                    },
+                };
+                // Explicit overrides win over the preserved/default values.
+                if let Some(name) = name {
+                    record.custom_name = Some(name);
                 }
-                prev
-            }
-            None => ProjectRecord {
-                git_common_dir: detected.git_common_dir.clone(),
-                repo_root: detected.repo_root.clone(),
-                custom_name: None,
-                origin_url: detected.origin_url.clone(),
-                default_base_branch: None,
-                is_bare: detected.is_bare,
-                source: if manual {
-                    ProjectSource::Manual
-                } else {
-                    ProjectSource::Auto
-                },
-                added_at: now.clone(),
-                last_used_at: now,
-            },
-        };
-        // Explicit overrides win over the preserved/default values.
-        if let Some(name) = name {
-            record.custom_name = Some(name);
-        }
-        if let Some(base_branch) = base_branch {
-            record.default_base_branch = Some(base_branch);
-        }
-        self.store.record_project(&record).map_err(store_error)?;
+                if let Some(base_branch) = base_branch {
+                    record.default_base_branch = Some(base_branch);
+                }
+                Some(record)
+            })
+            .map_err(store_error)?
+            .expect("upsert closure always returns Some, so a record is written");
         Ok(record)
     }
 
@@ -165,18 +167,18 @@ impl ProjectManager {
     /// The data model defines `last_used_at` as bumped on each session start, so
     /// the `--project` reference path must do this too — not only auto-detection.
     pub fn touch(&self, git_common_dir: &Path) -> Result<Option<ProjectRecord>, ProtocolError> {
-        let existing = self
-            .store
-            .load_projects()
-            .map_err(store_error)?
-            .into_iter()
-            .find(|project| project.git_common_dir == git_common_dir);
-        let Some(mut record) = existing else {
-            return Ok(None);
-        };
-        record.last_used_at = now_rfc3339();
-        self.store.record_project(&record).map_err(store_error)?;
-        Ok(Some(record))
+        let now = now_rfc3339();
+        // Update-only read-modify-write under the store lock: a missing project
+        // (returning `None`) writes nothing, and the bump merges with any
+        // concurrent edit rather than reverting it from a stale snapshot.
+        self.store
+            .mutate_project(git_common_dir, |existing| {
+                existing.map(|mut record| {
+                    record.last_used_at = now;
+                    record
+                })
+            })
+            .map_err(store_error)
     }
 
     /// A map from each known project's derived id to its current display label,
@@ -228,10 +230,22 @@ impl ProjectManager {
     /// referenceable only by its id).
     pub fn rename(&self, reference: &str, name: String) -> Result<ProjectInfo, ProtocolError> {
         validate_project_name(&name)?;
-        let mut record = self.resolve(reference)?;
-        record.custom_name = Some(name);
-        self.store.record_project(&record).map_err(store_error)?;
-        Ok(to_info(&record))
+        // Resolve the reference (id/label) to its immutable `git_common_dir` key,
+        // then apply the rename via an update-only read-modify-write under the
+        // store lock so a concurrent `add`/`touch` is merged, not clobbered.
+        let record = self.resolve(reference)?;
+        self.store
+            .mutate_project(&record.git_common_dir, |existing| {
+                existing.map(|mut record| {
+                    record.custom_name = Some(name);
+                    record
+                })
+            })
+            .map_err(store_error)?
+            // The project resolved a moment ago; only a racing `project rm` could
+            // have removed it before the locked write. Surface that as not-found.
+            .map(|record| to_info(&record))
+            .ok_or_else(|| project_not_found(reference))
     }
 
     /// Forget a project record (`project rm`). Only removes the record; it never

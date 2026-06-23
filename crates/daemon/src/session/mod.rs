@@ -4,7 +4,7 @@
 //! handle and has a watcher task that records process exit.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -559,7 +559,10 @@ impl SessionRegistry {
     /// registry owns — the project store and the worktree manager — on a blocking
     /// thread: resolve the reference, prune owned worktrees (only those with a
     /// binding for the project; never the main checkout or unowned trees), then
-    /// remove the record. A plain `rm` (no prune) only forgets the record.
+    /// remove the record — **unless** a worktree was skipped because a live session
+    /// is still using it, in which case the record is kept (`removed: false`) so its
+    /// surviving bindings keep pointing at a real project; a later `rm` succeeds
+    /// once those sessions stop. A plain `rm` (no prune) only forgets the record.
     pub async fn remove_project(
         &self,
         reference: &str,
@@ -574,14 +577,16 @@ impl SessionRegistry {
         let worktree = self.inner.worktree.clone();
         // Gather the worktree paths of LIVE sessions up front (the session map is
         // an async lock we cannot take inside `spawn_blocking`). The prune skips a
-        // worktree a running session is still using, so its checkout is not pulled
-        // out from under it; an in-place session (no worktree path) never blocks a
-        // prune. Keyed canonical so it matches the binder's canonicalized paths.
+        // worktree a live session is still using, so its checkout is not pulled out
+        // from under it; an in-place session (no worktree path) never blocks a
+        // prune. "Live" is the non-terminal set (`Starting`/`Running`) — a session
+        // still starting up holds its worktree too — matching `project show`'s own
+        // live-session filter. Keyed canonical so it matches the binder's paths.
         let live: Vec<(PathBuf, String)> = if prune_worktrees {
             self.list()
                 .await
                 .into_iter()
-                .filter(|session| session.state == SessionState::Running)
+                .filter(|session| !session.state.is_terminal())
                 .filter_map(|session| {
                     session
                         .worktree_path
@@ -620,7 +625,17 @@ impl SessionRegistry {
             } else {
                 (0, Vec::new())
             };
-            let removed = projects.remove(&reference)?;
+            // Option (b): a skipped worktree means a live session still depends on
+            // this project, so forgetting the record would leave that worktree's
+            // binding pointing at a project that no longer exists. Keep the record
+            // (removed = false) and report the skips; the operator retries `rm`
+            // once those sessions stop. Only when nothing was skipped is the record
+            // actually forgotten.
+            let removed = if skipped_worktrees.is_empty() {
+                projects.remove(&reference)?
+            } else {
+                false
+            };
             Ok(ProjectRemoveResult {
                 removed,
                 pruned_worktrees,
@@ -905,6 +920,18 @@ impl SessionRegistry {
 
         // Phase 2: isolation (Decision 3).
         let Some(branch) = params.branch.clone() else {
+            // A bare project has no working tree, so an in-place agent would land
+            // in the bare git dir (objects/refs, no files) — useless. Refuse and
+            // steer to `--branch`, which takes the worktree path below (a worktree
+            // can be added off a bare repo). Detection auto-registers a bare repo
+            // with `is_bare`, and a `--project` reference carries it too, so this
+            // one check covers both ways a bare project reaches an in-place start.
+            if project.as_ref().is_some_and(|record| record.is_bare) {
+                return Err(ProtocolError::bad_request(
+                    "cannot start an in-place session in a bare repository; \
+                     use --branch to create a worktree",
+                ));
+            }
             return Ok(self.in_place_target(project, detected, fallback_cwd));
         };
 
@@ -944,9 +971,9 @@ impl SessionRegistry {
     /// Build the in-place (no-worktree) target: run the agent in the project's
     /// checkout as-is (Decision 3), or in `fallback_cwd` when no project resolved.
     ///
-    /// A bare project keeps its association (it launches in the bare repo's dir,
-    /// stamped with the project id); it is not blocked — `is_bare` is a UI flag
-    /// (`project show`), and detection is non-fatal by design.
+    /// A bare project never reaches here: [`Self::resolve_target`] refuses an
+    /// in-place start on a bare repo (no working tree to run in) and steers the
+    /// caller to `--branch`. So every project passed in has a real checkout.
     fn in_place_target(
         &self,
         project: Option<ProjectRecord>,
@@ -1342,6 +1369,10 @@ impl SessionRegistry {
                         rows: entry.info.rows,
                         native_session_id: Some(native.clone()),
                         native_session_path: None,
+                        // Capture the project context so resume restores it without
+                        // re-detecting (F5): a restart reads these back verbatim.
+                        project_id: entry.info.project_id.clone(),
+                        is_linked_worktree: entry.info.is_linked_worktree,
                     })
             })
         };
@@ -1445,11 +1476,13 @@ impl SessionRegistry {
         // metadata (repo/branch/worktree_path) is restored too, so inspect/list
         // show it again after a restart.
         let (repo, branch, worktree_path) = self.restore_worktree_metadata(&binding.session_id);
-        // Re-derive the project metadata from the recorded cwd (the worktree path
-        // for worktree sessions, the checkout for in-place): it is not persisted on
-        // the resume binding, but detection on the same cwd reproduces it, so a
-        // resumed session shows its project/branch context again in list/inspect.
-        let (project_id, is_linked_worktree) = self.restore_project_metadata(&binding.cwd);
+        // The project context was captured on the binding when it was persisted
+        // (F5), so restore it directly — no git re-detection on the cwd at startup,
+        // and a detection failure can no longer silently drop the metadata. An
+        // older binding (pre-F5) carries `None`, leaving the resumed session
+        // without project context until its next persist.
+        let project_id = binding.project_id.clone();
+        let is_linked_worktree = binding.is_linked_worktree;
         self.register_pty_session(PtySessionSpec {
             id,
             agent: binding.agent,
@@ -1466,21 +1499,6 @@ impl SessionRegistry {
             warnings: Vec::new(),
         })
         .await
-    }
-
-    /// Re-derive a resumed session's `(project_id, is_linked_worktree)` from its
-    /// recorded cwd. Read-only: detection never resurrects a `project rm`-ed
-    /// record (the id is derived from the path, not looked up). Best-effort — a
-    /// non-git cwd or any detection failure yields `(None, None)` and resume still
-    /// proceeds; only the display metadata is absent.
-    fn restore_project_metadata(&self, cwd: &Path) -> (Option<String>, Option<bool>) {
-        match detect_at(cwd) {
-            Ok(Some(detected)) => (
-                Some(crate::project::detect::project_id(&detected.git_common_dir)),
-                Some(detected.is_linked_worktree),
-            ),
-            _ => (None, None),
-        }
     }
 
     /// Look up a resumed session's worktree binding in the unified store and
@@ -2151,10 +2169,7 @@ fn build_input_writes(text: &str, rules: InputRules) -> InputWritePlan {
 }
 
 fn is_terminal(state: SessionState) -> bool {
-    matches!(
-        state,
-        SessionState::Stopped | SessionState::Done | SessionState::Failed
-    )
+    state.is_terminal()
 }
 
 fn session_not_found(id: &str) -> ProtocolError {
@@ -2369,6 +2384,29 @@ mod tests {
         dir
     }
 
+    /// Initialize a throwaway **bare** repo (no working tree) carrying a commit and
+    /// HEAD, for the bare-project paths. A `--bare` clone of a normal repo gives a
+    /// bare repo that still has a `main` branch, so `git worktree add` off it works.
+    fn init_bare_git_repo(tag: &str) -> PathBuf {
+        let source = init_git_repo(&format!("{tag}-src"));
+        let bare = temp_store_path(tag)
+            .parent()
+            .expect("store parent")
+            .join("bare.git");
+        let clone = std::process::Command::new("git")
+            .args(["clone", "--bare", "-q"])
+            .arg(&source)
+            .arg(&bare)
+            .output()
+            .expect("git clone --bare");
+        assert!(
+            clone.status.success(),
+            "git clone --bare failed: {}",
+            String::from_utf8_lossy(&clone.stderr)
+        );
+        bare
+    }
+
     #[tokio::test]
     async fn failed_launch_rolls_back_the_bound_worktree() {
         // Worktree binding persists the branch checkout before the PTY is spawned.
@@ -2544,6 +2582,55 @@ mod tests {
             projects[0].git_common_dir,
             std::fs::canonicalize(repo.join(".git")).expect("canonical .git")
         );
+    }
+
+    #[tokio::test]
+    async fn in_place_session_on_a_bare_project_is_refused() {
+        // A bare repo has no working tree; an in-place agent would land in the bare
+        // git dir. The default (no --branch) start must be refused with a message
+        // steering the operator to --branch, not silently launched in the git dir.
+        let (registry, _repo) = project_registry("bare-inplace");
+        let bare = init_bare_git_repo("bare-inplace");
+
+        let err = registry
+            .create(SessionNewParams {
+                cwd: Some(bare.clone()),
+                ..params()
+            })
+            .await
+            .expect_err("in-place on a bare repo must be refused");
+        assert!(
+            err.msg.contains("bare repository") && err.msg.contains("--branch"),
+            "error must explain the bare repo and steer to --branch: {err:?}"
+        );
+        // Nothing was launched.
+        assert!(
+            registry.list().await.is_empty(),
+            "no session is created for a refused in-place bare start"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_session_on_a_bare_project_is_allowed() {
+        // The steer in `in_place_session_on_a_bare_project_is_refused` is only valid
+        // if --branch actually works on a bare repo: a worktree is added off it.
+        let (registry, _repo) = project_registry("bare-worktree");
+        let bare = init_bare_git_repo("bare-worktree");
+
+        let info = registry
+            .create(SessionNewParams {
+                cwd: Some(bare.clone()),
+                branch: Some("feat/x".to_owned()),
+                base_branch: Some("main".to_owned()),
+                ..params()
+            })
+            .await
+            .expect("a worktree session is allowed on a bare repo");
+        assert!(
+            info.worktree_path.is_some(),
+            "a worktree was bound off the bare repo: {info:?}"
+        );
+        assert_eq!(info.branch.as_deref(), Some("feat/x"));
     }
 
     #[tokio::test]
@@ -2797,7 +2884,9 @@ mod tests {
     #[tokio::test]
     async fn remove_project_prune_skips_a_worktree_with_a_live_session() {
         // A worktree a RUNNING session is using must not be pruned out from under
-        // it; it is skipped and reported, while the record is still forgotten.
+        // it; it is skipped and reported. Because a worktree was skipped, the
+        // record is KEPT (removed = false) so its surviving binding keeps pointing
+        // at a real project (Option (b)); a later `rm` forgets it once idle.
         let (registry, repo) = project_registry("prune-skip");
         let info = registry
             .create(SessionNewParams {
@@ -2815,7 +2904,10 @@ mod tests {
             .remove_project(&project_id, true)
             .await
             .expect("remove with prune");
-        assert!(result.removed, "the record is still forgotten");
+        assert!(
+            !result.removed,
+            "the record is kept while a live worktree remains"
+        );
         assert_eq!(
             result.pruned_worktrees, 0,
             "the live worktree is not pruned"
@@ -2828,6 +2920,16 @@ mod tests {
         assert!(
             worktree.exists(),
             "a live session's worktree is left on disk"
+        );
+        assert!(
+            !registry
+                .projects()
+                .expect("projects")
+                .store()
+                .load_projects()
+                .expect("load")
+                .is_empty(),
+            "the record stays so the skipped worktree's binding is not dangling"
         );
     }
 
@@ -3447,6 +3549,8 @@ mod tests {
                 rows: 24,
                 native_session_id: None,
                 native_session_path: None,
+                project_id: None,
+                is_linked_worktree: None,
             })
             .expect("seed corrupt binding");
 
@@ -3462,6 +3566,54 @@ mod tests {
                 .expect("load")
                 .is_empty(),
             "an unresumable binding must be pruned, not retried forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_binding_persists_project_context_for_restart() {
+        // F5: a resumed session's project context is restored from the persisted
+        // binding, not re-detected. So the binding must carry `project_id` /
+        // `is_linked_worktree` captured from the live session — verified here by
+        // round-tripping through the store (record on native-id capture, read back
+        // via load_resume), which is exactly what `load_and_resume` reads at start.
+        let (registry, repo) = project_registry("resume-project-ctx");
+        let info = registry
+            .create(SessionNewParams {
+                cwd: Some(repo.clone()),
+                ..params()
+            })
+            .await
+            .expect("in-place session in the repo");
+        let project_id = info.project_id.clone().expect("a project was stamped");
+        assert_eq!(info.is_linked_worktree, Some(false), "the main checkout");
+
+        // Capturing the native id persists the resume binding from live state.
+        let recorded = registry
+            .report_native_id(SessionReportNativeIdParams {
+                session_id: info.id.clone(),
+                agent: AgentKind::Shell,
+                native_session_id: "native-resume".to_owned(),
+                transcript_path: None,
+            })
+            .await;
+        assert!(recorded.recorded, "native id captured");
+
+        let bindings = registry
+            .projects()
+            .expect("projects")
+            .store()
+            .load_resume()
+            .expect("load resume bindings");
+        assert_eq!(bindings.len(), 1, "exactly one resume binding persisted");
+        assert_eq!(
+            bindings[0].project_id.as_deref(),
+            Some(project_id.as_str()),
+            "project id is persisted so restart restores it without re-detecting"
+        );
+        assert_eq!(
+            bindings[0].is_linked_worktree,
+            Some(false),
+            "the main-checkout flag is persisted too"
         );
     }
 

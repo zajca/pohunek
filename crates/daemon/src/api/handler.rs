@@ -293,6 +293,26 @@ async fn handle_project_add(request: &Request, sessions: &SessionRegistry) -> Re
     run_project_blocking(request, move || pm.add(&path, name, base_branch)).await
 }
 
+/// Build the live-session snapshot `project show` consumes from the registry's
+/// session list: drop terminal sessions, then project each survivor to the
+/// path-only [`LiveSession`] shape.
+///
+/// The registry retains terminal sessions — `record_exit` flips the state, it
+/// does not evict the entry — so without this filter a stopped/done/failed
+/// session would keep marking its worktree as occupied in `project show`. Only
+/// non-terminal (`Starting`/`Running`) sessions actually hold a worktree.
+fn live_sessions(infos: Vec<protocol::SessionInfo>) -> Vec<LiveSession> {
+    infos
+        .into_iter()
+        .filter(|session| !session.state.is_terminal())
+        .map(|session| LiveSession {
+            session_id: session.id.0,
+            cwd: session.cwd,
+            worktree_path: session.worktree_path,
+        })
+        .collect()
+}
+
 /// `project.show`: a project plus its live worktrees, enriched with which ones
 /// pohunek owns and which host a live session.
 async fn handle_project_show(request: &Request, sessions: &SessionRegistry) -> Response {
@@ -305,16 +325,7 @@ async fn handle_project_show(request: &Request, sessions: &SessionRegistry) -> R
         Err(resp) => return resp,
     };
     // Snapshot live sessions so `show` can mark which worktrees currently host one.
-    let live: Vec<LiveSession> = sessions
-        .list()
-        .await
-        .into_iter()
-        .map(|session| LiveSession {
-            session_id: session.id.0,
-            cwd: session.cwd,
-            worktree_path: session.worktree_path,
-        })
-        .collect();
+    let live = live_sessions(sessions.list().await);
     let reference = params.reference;
     run_project_blocking(request, move || pm.show(&reference, &live)).await
 }
@@ -555,7 +566,57 @@ fn parse_attach_prelude(line: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_attach_prelude;
+    use std::path::PathBuf;
+
+    use protocol::{AgentKind, SessionId, SessionInfo, SessionState, StateSource};
+
+    use super::{live_sessions, parse_attach_prelude};
+
+    /// A minimal `SessionInfo` for the given id/state with a worktree path, so a
+    /// test can assert which sessions survive the `project show` live filter.
+    fn session(id: &str, state: SessionState) -> SessionInfo {
+        let path = PathBuf::from(format!("/work/{id}"));
+        SessionInfo {
+            id: SessionId(id.to_owned()),
+            agent: AgentKind::Shell,
+            cwd: path.clone(),
+            pid: 0,
+            cols: 80,
+            rows: 24,
+            state,
+            state_source: StateSource::Process,
+            activity: None,
+            native_session_id: None,
+            project_id: None,
+            project_label: None,
+            is_linked_worktree: Some(true),
+            repo: None,
+            branch: None,
+            worktree_path: Some(path),
+            warnings: Vec::new(),
+            created_at: "2026-06-23T00:00:00Z".to_owned(),
+            updated_at: "2026-06-23T00:00:00Z".to_owned(),
+            exit_code: None,
+        }
+    }
+
+    #[test]
+    fn live_sessions_keeps_only_non_terminal_sessions() {
+        let infos = vec![
+            session("starting", SessionState::Starting),
+            session("running", SessionState::Running),
+            session("stopped", SessionState::Stopped),
+            session("done", SessionState::Done),
+            session("failed", SessionState::Failed),
+        ];
+
+        let live = live_sessions(infos);
+
+        // Starting + Running survive; the three terminal states are dropped, so a
+        // stopped session can no longer mark its worktree as occupied in `show`.
+        let ids: Vec<&str> = live.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["starting", "running"]);
+    }
 
     #[test]
     fn attach_prelude_requires_exact_one_field_shape() {

@@ -65,6 +65,25 @@ fn init_repo(tag: &str) -> PathBuf {
     dir
 }
 
+/// Initialize a **bare** repo (no working tree) carrying a commit and HEAD, via a
+/// `--bare` clone of a normal repo so `git worktree add` off it has a base ref.
+fn init_bare_repo(tag: &str) -> PathBuf {
+    let source = init_repo(&format!("{tag}-src"));
+    let bare = unique_dir(&format!("{tag}-bare")).join("repo.git");
+    let clone = Command::new("git")
+        .args(["clone", "--bare", "-q"])
+        .arg(&source)
+        .arg(&bare)
+        .output()
+        .expect("git clone --bare");
+    assert!(
+        clone.status.success(),
+        "git clone --bare failed: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    bare
+}
+
 fn manager(tag: &str) -> WorktreeManager {
     manager_with_timeout(tag, TEST_SETUP_TIMEOUT)
 }
@@ -182,6 +201,28 @@ fn bind_creates_a_valid_worktree_and_records_a_binding() {
     assert_eq!(binding.path, bound.path);
     assert_eq!(binding.branch, "feat/x");
     assert_eq!(binding.status, WorktreeStatus::Active);
+}
+
+#[test]
+fn bind_creates_a_worktree_on_a_bare_repo() {
+    // A bare repo has no working tree, so an in-place session is refused and the
+    // caller is steered to --branch. That steer is only valid if the manager
+    // accepts a bare repo as the worktree source: `git worktree add` works on bare
+    // repos, so `is_git_repo` (the bind gate) must accept them too.
+    let mgr = manager("bare-bind");
+    let bare = init_bare_repo("bare-bind");
+    let bound = mgr
+        .bind(&request("s-1", &bare, "feat/x"))
+        .expect("a worktree can be bound off a bare repo");
+    assert!(
+        is_valid_worktree(&bound.path),
+        "a real worktree is created off the bare repo"
+    );
+    assert_eq!(bound.branch, "feat/x");
+    assert_eq!(
+        bound.base_branch, "main",
+        "branched off the bare repo's HEAD"
+    );
 }
 
 #[test]
@@ -849,4 +890,48 @@ fn redact_url_credentials_strips_userinfo_from_git_error_output() {
     // A message with no URL is left untouched.
     let plain = "fatal: not a git repository";
     assert_eq!(redact_url_credentials(plain), plain);
+}
+
+#[test]
+fn redact_url_credentials_covers_ssh_and_multiple_urls() {
+    use super::redact_url_credentials;
+
+    // `ssh://user@host` userinfo is redacted (the user can be a sensitive login).
+    let ssh = redact_url_credentials("ssh://deploybot@git.example.com:22/org/repo.git");
+    assert!(!ssh.contains("deploybot"), "ssh userinfo redacted: {ssh}");
+    assert!(ssh.contains("ssh://<redacted>@git.example.com:22/org/repo.git"));
+
+    // Every URL-shaped substring in one message is scrubbed independently.
+    let many = redact_url_credentials(
+        "tried https://tok1@a.example.com/x then https://u:tok2@b.example.com/y",
+    );
+    assert!(!many.contains("tok1") && !many.contains("tok2"), "{many}");
+    assert!(many.contains("https://<redacted>@a.example.com/x"));
+    assert!(many.contains("https://<redacted>@b.example.com/y"));
+}
+
+#[test]
+fn redact_url_credentials_security_boundary_scp_and_query_are_out_of_scope() {
+    use super::redact_url_credentials;
+
+    // SCP-form `git@host:path` is left verbatim ON PURPOSE: it has no `://`, and
+    // the `git@` is a username for key-based SSH auth, never a secret. Pinning it
+    // documents the boundary so a future change does not "helpfully" mangle it.
+    let scp = "git@github.com:org/repo.git";
+    assert_eq!(redact_url_credentials(scp), scp, "SCP form is not a secret");
+
+    // Query/fragment tokens are NOT redacted: the authority ends at `?`/`#` and
+    // native git never authenticates through them. This asserts the *intentional*
+    // gap so it is a conscious, reviewed boundary — not an accident. Should a real
+    // query-string-credential integration ever appear, this test must change first.
+    let query = redact_url_credentials("https://example.com/x?token=SECRET");
+    assert!(
+        query.contains("token=SECRET"),
+        "query token out of scope: {query}"
+    );
+    let fragment = redact_url_credentials("https://example.com/x#SECRET");
+    assert!(
+        fragment.contains("#SECRET"),
+        "fragment out of scope: {fragment}"
+    );
 }

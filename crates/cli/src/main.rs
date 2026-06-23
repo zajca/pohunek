@@ -302,12 +302,14 @@ enum SessionAction {
         /// exclusive with `--project` (both name the target repository).
         #[arg(long)]
         repo: Option<PathBuf>,
-        /// Branch to check out in the bound worktree. Requires `--repo`.
+        /// Branch to check out in a dedicated bound worktree. Requires a source
+        /// repository: either an explicit `--repo` or a resolvable `--project`
+        /// (whose checkout is used). Without it the session runs in-place.
         #[arg(long)]
         branch: Option<String>,
         /// Base branch the worktree's branch is created from. Requires
-        /// `--repo` and `--branch`; falls back to the repository's default
-        /// branch when missing.
+        /// `--branch`; falls back to the project's configured default base
+        /// branch, then the repository's HEAD, when missing.
         #[arg(long)]
         base_branch: Option<String>,
         /// Initial text to inject into the session after the PTY is spawned.
