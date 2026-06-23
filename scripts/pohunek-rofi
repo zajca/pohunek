@@ -121,6 +121,12 @@ import sys
 # metachar there would break or broaden the kill/mark criteria). Local ids are
 # `s-<N>` so this rejects nothing legitimate.
 SAFE = re.compile(r"^[A-Za-z0-9._-]+$")
+# Context columns (project, branch) are not the selection key, so they are not
+# charset-restricted — but a tab/newline in them would forge a column or split a
+# row, and a split row's leading fragment would be emitted as an (unvalidated)
+# target. Collapse every control char to a space so each row stays one tab-safe
+# line. (A project label is attacker-influenceable on a remote host, like the id.)
+CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 tmp = pathlib.Path(sys.argv[1])
 hosts = []
@@ -152,9 +158,10 @@ for idx, host in hosts:
         state = session.get("state", "-")
         activity = session.get("activity") or "-"
         # `session list --json` enriches the project label; fall back to the id,
-        # then `-` for a session with no git project.
-        project = session.get("project_label") or session.get("project_id") or "-"
-        branch = session.get("branch") or "-"
+        # then `-` for a session with no git project. Neutralize control chars so a
+        # crafted label/branch cannot forge a column or split the row.
+        project = CONTROL.sub(" ", session.get("project_label") or session.get("project_id") or "-")
+        branch = CONTROL.sub(" ", session.get("branch") or "-")
         # The first field (host/session_id) stays the selection key; the project
         # and branch columns are context only.
         print(f"{host}/{session_id}\t{project}\t{branch}\t{agent}\t{state}\t{activity}")

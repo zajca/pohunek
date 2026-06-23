@@ -430,7 +430,10 @@ if [ "$1" = "host" ] && [ "$2" = "discover" ]; then
 fi
 if [ "$1" = "--host" ] && [ "$3" = "session" ] && [ "$4" = "list" ]; then
   case "$2" in
-    local) printf '[{"id":"s-1","agent":"claude","state":"running","activity":"blocked","project_id":"p-ui","project_label":"ui","branch":"feat/x"}]\n' ;;
+    # project_label carries a JSON newline escape (\n): the switcher must collapse
+    # it to a space so the row stays one tab-safe line and no fragment leaks as a
+    # target. `printf '%s\n'` keeps the arg's backslash-n literal for the JSON.
+    local) printf '%s\n' '[{"id":"s-1","agent":"claude","state":"running","activity":"blocked","project_id":"p-ui","project_label":"ui\nevil","branch":"feat/x"}]' ;;
     box) printf '[{"id":"s-2","agent":"codex","state":"running","activity":"working"}]\n' ;;
     down) printf 'host down\n' >&2; exit 9 ;;
     *) printf '[]\n' ;;
@@ -505,22 +508,29 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_TERMINAL_ARGS"; done
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    // Both selected sessions are returned (multi-select), local first.
+    // Both selected sessions are returned (multi-select), local first. Crucially,
+    // the newline in local's project label did NOT split its row into a second
+    // line whose fragment ("evil") would leak through as an extra target.
     assert_eq!(
         String::from_utf8(out.stdout).expect("utf8 stdout"),
         "local/s-1\nbox/s-2\n"
     );
     let rows = read(&rofi_stdin);
+    // The control char is collapsed to a space, keeping the row one tab-safe line.
+    assert!(
+        rows.contains("local/s-1\tui evil\tfeat/x\tclaude\trunning\tblocked"),
+        "label newline must be flattened to a space: {rows}"
+    );
+    assert!(
+        !rows.lines().any(|line| line.starts_with("evil")),
+        "a label fragment must never become its own (target) row: {rows}"
+    );
     // The local daemon is enumerated even though `host discover` omits it: the
     // mock discover returns only box+down, so a local/s-1 row can ONLY appear if
-    // the switcher queried `--host local` on its own (the F2 guarantee).
-    // Row columns: host/session  PROJECT  BRANCH  agent  state  activity. The
-    // local session carries a project label + branch; box has neither, so both
-    // fall back to `-`. The first field stays the selection key.
-    assert!(
-        rows.contains("local/s-1\tui\tfeat/x\tclaude\trunning\tblocked"),
-        "{rows}"
-    );
+    // the switcher queried `--host local` on its own (the F2 guarantee). The
+    // local row (with its flattened project label + branch) is asserted above.
+    // Row columns: host/session  PROJECT  BRANCH  agent  state  activity. box has
+    // no project/branch, so both fall back to `-`; the first field is the key.
     assert!(
         rows.contains("box/s-2\t-\t-\tcodex\trunning\tworking"),
         "{rows}"
