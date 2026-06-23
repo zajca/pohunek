@@ -176,6 +176,7 @@ fn session_params() -> SessionNewParams {
         cwd: Some(std::env::temp_dir()),
         cols: 80,
         rows: 24,
+        project: None,
         repo: None,
         branch: None,
         base_branch: None,

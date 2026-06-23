@@ -4,7 +4,7 @@
 //! handle and has a watcher task that records process exit.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -31,8 +31,10 @@ use crate::detect::{ActivityTransition, Detector, DetectorConfig};
 use crate::integration::{
     ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
+use crate::project::detect::DetectedProject;
+use crate::project::{detect_at, ProjectManager};
 use crate::pty::{PtyCommand, PtyError, PtyExit, PtyHandle};
-use crate::store::{ResumeBinding, Store};
+use crate::store::{ProjectRecord, ResumeBinding, Store};
 use crate::worktree::{WorktreeManager, WorktreeRequest};
 
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
@@ -340,6 +342,10 @@ struct PtySessionSpec {
     command: PtyCommand,
     /// Native id when relaunching a captured session (`None` on first launch).
     native_session_id: Option<String>,
+    /// Project this session belongs to (derived id), when one was resolved.
+    project_id: Option<String>,
+    /// Whether the session's checkout is a linked worktree (`None` if no git).
+    is_linked_worktree: Option<bool>,
     /// Source repository, when the session is bound to a worktree.
     repo: Option<PathBuf>,
     /// Branch checked out in the bound worktree.
@@ -348,6 +354,29 @@ struct PtySessionSpec {
     worktree_path: Option<PathBuf>,
     /// Non-fatal worktree-setup warnings to surface on the session.
     warnings: Vec<SessionWarning>,
+}
+
+/// The resolved launch target for a `session.new`: where the agent runs and the
+/// project/worktree metadata to stamp on the session (see
+/// [`SessionRegistry::resolve_target`]).
+#[derive(Debug)]
+struct TargetResolution {
+    /// Directory the agent is launched in (an in-place checkout or a worktree).
+    launch_cwd: PathBuf,
+    /// Source repository, set for a worktree session.
+    repo: Option<PathBuf>,
+    /// Branch checked out in the bound worktree, set for a worktree session.
+    branch: Option<String>,
+    /// Bound worktree path, set for a worktree session.
+    worktree_path: Option<PathBuf>,
+    /// Project the session belongs to (derived id), when one resolved.
+    project_id: Option<String>,
+    /// Whether the checkout is a linked worktree (`None` if no git identity).
+    is_linked_worktree: Option<bool>,
+    /// Non-fatal worktree-setup warnings to surface on the session.
+    warnings: Vec<SessionWarning>,
+    /// Whether a worktree was actually bound (drives launch-failure rollback).
+    worktree_bound: bool,
 }
 
 impl Default for SessionRegistryConfig {
@@ -402,6 +431,11 @@ struct SessionRegistryInner {
     /// Per-session worktree binder, present when worktree binding is configured.
     /// Shared into `spawn_blocking` for the (blocking) git subprocesses.
     worktree: Option<Arc<WorktreeManager>>,
+    /// Project store glue (auto-registration + reference resolution), present
+    /// when the metadata store is configured. Shares the same `Arc<Store>` as the
+    /// resume/worktree records, and is shared into `spawn_blocking` for the
+    /// (blocking) git detection + store I/O.
+    projects: Option<Arc<ProjectManager>>,
     /// Cancellation signal for the event-log drain, fired by
     /// [`SessionRegistry::shutdown_event_log`] so the drain flushes its backlog
     /// and exits cleanly at shutdown.
@@ -472,6 +506,11 @@ impl SessionRegistry {
             ))),
             _ => None,
         };
+        // The project manager shares the same store as resume/worktree records, so
+        // it is enabled exactly when persistence is. Projects need no worktree root.
+        let projects = store
+            .clone()
+            .map(|store| Arc::new(ProjectManager::new(store)));
         Self {
             inner: Arc::new(SessionRegistryInner {
                 sessions: Mutex::new(HashMap::new()),
@@ -485,6 +524,7 @@ impl SessionRegistry {
                 store,
                 persist_lock: Mutex::new(()),
                 worktree,
+                projects,
                 event_log_shutdown: CancellationToken::new(),
                 event_log_task: std::sync::Mutex::new(None),
             }),
@@ -504,6 +544,14 @@ impl SessionRegistry {
     #[must_use]
     pub fn daemon_instance_id(&self) -> &str {
         &self.inner.daemon_instance_id
+    }
+
+    /// The project manager, when the metadata store is configured. Exposed for
+    /// the `project.*` control handlers, which share the same store the session
+    /// registry writes resume/worktree records through.
+    #[must_use]
+    pub fn projects(&self) -> Option<Arc<ProjectManager>> {
+        self.inner.projects.clone()
     }
 
     /// Start the append-only event log, if [`SessionRegistryConfig::event_log_dir`]
@@ -562,14 +610,20 @@ impl SessionRegistry {
 
     /// Create a new PTY-backed session.
     ///
-    /// When `params` carries a repo + branch, a dedicated worktree is bound (or
-    /// reused) and the agent is launched **inside** it; otherwise the agent is
-    /// launched in the resolved `cwd` (today's behavior). Non-fatal worktree
-    /// warnings ride along on the returned [`SessionInfo`].
+    /// Resolves the session's **target** (design Decisions 1 & 3): which project
+    /// it belongs to (a `--project` reference, else auto-detected from `--repo`/
+    /// `--cwd`) and where the agent runs — **in-place** in the project's checkout
+    /// (no `--branch`) or in a **dedicated worktree** bound for `(session, repo,
+    /// branch)` (with `--branch`). A non-git directory yields a plain shell with
+    /// no project. The session records `project_id`/`is_linked_worktree`, and any
+    /// non-fatal worktree warnings ride along on the returned [`SessionInfo`].
     pub async fn create(&self, params: SessionNewParams) -> Result<SessionInfo, ProtocolError> {
         validate_new_params(&params)?;
         let initial_input = params.input.clone();
-        let cwd = match params.cwd.clone() {
+        // Fallback launch dir for a no-project (plain shell) session: the CLI's
+        // own cwd for a local session, else the daemon's. A resolved project
+        // overrides this with its checkout (or worktree) path.
+        let fallback_cwd = match params.cwd.clone() {
             Some(cwd) => cwd,
             None => std::env::current_dir().map_err(|source| {
                 ProtocolError::new(
@@ -586,22 +640,18 @@ impl SessionRegistry {
             self.inner.next_id.fetch_add(1, Ordering::Relaxed)
         ));
 
-        // Bind a worktree when a repo+branch was requested; launch there instead
-        // of the plain cwd. A plain cwd (no repo) keeps today's behavior.
-        let bound = self.resolve_worktree(&id, &params).await?;
-        let worktree_bound = bound.is_some();
-        let (launch_cwd, repo, branch, worktree_path, warnings) = match bound {
-            Some(bound) => (
-                bound.path.clone(),
-                Some(bound.repository),
-                Some(bound.branch),
-                Some(bound.path),
-                bound.warnings,
-            ),
-            None => (cwd, None, None, None, Vec::new()),
-        };
+        let TargetResolution {
+            launch_cwd,
+            repo,
+            branch,
+            worktree_path,
+            project_id,
+            is_linked_worktree,
+            warnings,
+            worktree_bound,
+        } = self.resolve_target(&id, &params, fallback_cwd).await?;
 
-        // The worktree is now bound and its branch is checked out. Any failure
+        // When a worktree was bound its branch is now checked out. Any failure
         // building the launch command or spawning the PTY must roll that back: a
         // leftover worktree keeps the branch checked out and blocks the next
         // `session.new` on it with `worktree_branch_in_use` (an orphan a fresh
@@ -627,6 +677,8 @@ impl SessionRegistry {
                 rows: params.rows,
                 command,
                 native_session_id: None,
+                project_id,
+                is_linked_worktree,
                 repo,
                 branch,
                 worktree_path,
@@ -755,49 +807,174 @@ impl SessionRegistry {
         }
     }
 
-    /// Bind a worktree for this session when `params` requests one.
-    ///
-    /// Returns `Ok(None)` for a plain-`cwd` session (no repo). Validates that
-    /// `repo`/`branch` are supplied together and that `base_branch` is not given
-    /// without them. Runs the blocking git work on a blocking thread.
-    async fn resolve_worktree(
+    /// Resolve the session's target: the project it belongs to and where the
+    /// agent runs (in-place checkout vs a freshly bound worktree), per Decisions
+    /// 1 & 3. Runs the blocking git/store work on blocking threads.
+    async fn resolve_target(
         &self,
         id: &SessionId,
         params: &SessionNewParams,
-    ) -> Result<Option<crate::worktree::WorktreeBound>, ProtocolError> {
-        match (params.repo.as_ref(), params.branch.as_ref()) {
-            (None, None) => {
-                if params.base_branch.is_some() {
-                    return Err(ProtocolError::bad_request(
-                        "session.new base_branch requires repo and branch",
-                    ));
-                }
-                Ok(None)
-            }
-            (Some(_), None) | (None, Some(_)) => Err(ProtocolError::bad_request(
-                "session.new repo and branch must be supplied together",
-            )),
-            (Some(repo), Some(branch)) => {
-                let Some(manager) = self.inner.worktree.clone() else {
-                    return Err(runtime_error(
-                        "worktree_not_configured",
-                        "the daemon is not configured for worktree binding",
-                    ));
-                };
-                let request = WorktreeRequest {
-                    session_id: id.0.clone(),
-                    repo: repo.clone(),
-                    branch: branch.clone(),
-                    base_branch: params.base_branch.clone(),
-                };
-                let bound = tokio::task::spawn_blocking(move || manager.bind(&request))
-                    .await
-                    .map_err(|_| {
-                        runtime_error("worktree_bind_failed", "worktree bind task panicked")
-                    })??;
-                Ok(Some(bound))
-            }
+        fallback_cwd: PathBuf,
+    ) -> Result<TargetResolution, ProtocolError> {
+        // `base_branch` only branches a worktree; it is meaningless in-place.
+        if params.base_branch.is_some() && params.branch.is_none() {
+            return Err(ProtocolError::bad_request(
+                "session.new base_branch requires branch",
+            ));
         }
+
+        // Phase 1: resolve the project (by reference, else by detecting a path).
+        let (project, detected) = self.resolve_project(params).await?;
+
+        // Phase 2: isolation (Decision 3).
+        let Some(branch) = params.branch.clone() else {
+            return Ok(self.in_place_target(project, detected, fallback_cwd));
+        };
+
+        // Worktree-per-session. The source repo is an explicit `--repo`, else the
+        // resolved project's main checkout; the base is `--base-branch`, else the
+        // project's configured default (`None` ⇒ the repo's HEAD at creation). The
+        // project id is stamped onto both the session and the worktree binding.
+        let project_id = project.as_ref().map(ProjectRecord::id);
+        let repo = params
+            .repo
+            .clone()
+            .or_else(|| project.as_ref().map(|record| record.repo_root.clone()))
+            .ok_or_else(|| {
+                ProtocolError::bad_request(
+                    "session.new branch requires --repo or a resolvable --project",
+                )
+            })?;
+        let base_branch = params
+            .base_branch
+            .clone()
+            .or_else(|| project.as_ref().and_then(|r| r.default_base_branch.clone()));
+        let bound = self
+            .bind_worktree(&id.0, repo, branch, base_branch, project_id.clone())
+            .await?;
+        Ok(TargetResolution {
+            launch_cwd: bound.path.clone(),
+            repo: Some(bound.repository),
+            branch: Some(bound.branch),
+            worktree_path: Some(bound.path),
+            project_id,
+            is_linked_worktree: Some(true),
+            warnings: bound.warnings,
+            worktree_bound: true,
+        })
+    }
+
+    /// Build the in-place (no-worktree) target: run the agent in the project's
+    /// checkout as-is (Decision 3), or in `fallback_cwd` when no project resolved.
+    ///
+    /// A bare project keeps its association (it launches in the bare repo's dir,
+    /// stamped with the project id); it is not blocked — `is_bare` is a UI flag
+    /// (`project show`), and detection is non-fatal by design.
+    fn in_place_target(
+        &self,
+        project: Option<ProjectRecord>,
+        detected: Option<DetectedProject>,
+        fallback_cwd: PathBuf,
+    ) -> TargetResolution {
+        let (launch_cwd, project_id, is_linked_worktree) = match (project, detected) {
+            // Detected from a path: launch in this work tree's root.
+            (Some(record), Some(detected)) => (
+                detected.checkout_path,
+                Some(record.id()),
+                Some(detected.is_linked_worktree),
+            ),
+            // Resolved by `--project`: the in-place checkout is its main checkout.
+            (Some(record), None) => {
+                let id = record.id();
+                (record.repo_root, Some(id), Some(false))
+            }
+            // No project: a plain shell in the fallback cwd (today's behavior).
+            (None, _) => (fallback_cwd, None, None),
+        };
+        TargetResolution {
+            launch_cwd,
+            repo: None,
+            branch: None,
+            worktree_path: None,
+            project_id,
+            is_linked_worktree,
+            warnings: Vec::new(),
+            worktree_bound: false,
+        }
+    }
+
+    /// Resolve the project this session belongs to, doing the blocking git
+    /// detection + store I/O on a blocking thread.
+    ///
+    /// Order (Decision 1): a `--project <id|label>` reference resolves against the
+    /// store; otherwise detect at the explicit `--repo` path or — for a local
+    /// session — the CLI's own `--cwd`, auto-registering the result. `--repo` wins
+    /// over the implicitly-sent `--cwd` so naming a repo is honored and the
+    /// worktree source stays coherent with the project identity. Returns the
+    /// record and, when detection ran, the [`DetectedProject`] (the in-place path
+    /// needs its `checkout_path`/`is_linked_worktree`).
+    async fn resolve_project(
+        &self,
+        params: &SessionNewParams,
+    ) -> Result<(Option<ProjectRecord>, Option<DetectedProject>), ProtocolError> {
+        let Some(projects) = self.inner.projects.clone() else {
+            // No project subsystem (store unconfigured, e.g. some unit tests): a
+            // `--project` reference cannot be honored; otherwise there is simply no
+            // project, and worktree binding via `--repo`/`--branch` still works.
+            if params.project.is_some() {
+                return Err(runtime_error(
+                    "projects_not_configured",
+                    "the daemon is not configured for projects (no metadata store)",
+                ));
+            }
+            return Ok((None, None));
+        };
+        let reference = params.project.clone();
+        let detect_path = params.repo.clone().or_else(|| params.cwd.clone());
+        let now = timestamp_now();
+        tokio::task::spawn_blocking(move || -> Result<_, ProtocolError> {
+            if let Some(reference) = reference {
+                return Ok((Some(projects.resolve(&reference)?), None));
+            }
+            let Some(path) = detect_path else {
+                return Ok((None, None));
+            };
+            let Some(detected) = detect_at(&path)? else {
+                return Ok((None, None));
+            };
+            let record = projects.register(&detected, &now, false)?;
+            Ok((Some(record), Some(detected)))
+        })
+        .await
+        .map_err(|_| runtime_error("project_resolve_failed", "project resolution task panicked"))?
+    }
+
+    /// Bind (or reuse) a worktree for `(session, repo, branch)` on a blocking
+    /// thread. Errors when worktree binding is not configured.
+    async fn bind_worktree(
+        &self,
+        session_id: &str,
+        repo: PathBuf,
+        branch: String,
+        base_branch: Option<String>,
+        project_id: Option<String>,
+    ) -> Result<crate::worktree::WorktreeBound, ProtocolError> {
+        let Some(manager) = self.inner.worktree.clone() else {
+            return Err(runtime_error(
+                "worktree_not_configured",
+                "the daemon is not configured for worktree binding",
+            ));
+        };
+        let request = WorktreeRequest {
+            session_id: session_id.to_owned(),
+            repo,
+            branch,
+            base_branch,
+            project_id,
+        };
+        tokio::task::spawn_blocking(move || manager.bind(&request))
+            .await
+            .map_err(|_| runtime_error("worktree_bind_failed", "worktree bind task panicked"))?
     }
 
     /// Spawn a PTY for `spec.command`, register the session, and start its
@@ -815,6 +992,8 @@ impl SessionRegistry {
             rows,
             command,
             native_session_id,
+            project_id,
+            is_linked_worktree,
             repo,
             branch,
             worktree_path,
@@ -846,6 +1025,8 @@ impl SessionRegistry {
             state_source: StateSource::Process,
             activity: None,
             native_session_id,
+            project_id,
+            is_linked_worktree,
             repo,
             branch,
             worktree_path,
@@ -1171,6 +1352,11 @@ impl SessionRegistry {
         // metadata (repo/branch/worktree_path) is restored too, so inspect/list
         // show it again after a restart.
         let (repo, branch, worktree_path) = self.restore_worktree_metadata(&binding.session_id);
+        // Re-derive the project metadata from the recorded cwd (the worktree path
+        // for worktree sessions, the checkout for in-place): it is not persisted on
+        // the resume binding, but detection on the same cwd reproduces it, so a
+        // resumed session shows its project/branch context again in list/inspect.
+        let (project_id, is_linked_worktree) = self.restore_project_metadata(&binding.cwd);
         self.register_pty_session(PtySessionSpec {
             id,
             agent: binding.agent,
@@ -1179,12 +1365,29 @@ impl SessionRegistry {
             rows: binding.rows,
             command,
             native_session_id: binding.native_session_id,
+            project_id,
+            is_linked_worktree,
             repo,
             branch,
             worktree_path,
             warnings: Vec::new(),
         })
         .await
+    }
+
+    /// Re-derive a resumed session's `(project_id, is_linked_worktree)` from its
+    /// recorded cwd. Read-only: detection never resurrects a `project rm`-ed
+    /// record (the id is derived from the path, not looked up). Best-effort — a
+    /// non-git cwd or any detection failure yields `(None, None)` and resume still
+    /// proceeds; only the display metadata is absent.
+    fn restore_project_metadata(&self, cwd: &Path) -> (Option<String>, Option<bool>) {
+        match detect_at(cwd) {
+            Ok(Some(detected)) => (
+                Some(crate::project::detect::project_id(&detected.git_common_dir)),
+                Some(detected.is_linked_worktree),
+            ),
+            _ => (None, None),
+        }
     }
 
     /// Look up a resumed session's worktree binding in the unified store and
@@ -1949,8 +2152,8 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use protocol::{
-        AgentKind, SessionAttachParams, SessionId, SessionNewParams, SessionReportNativeIdParams,
-        SessionState,
+        AgentKind, ProjectSource, SessionAttachParams, SessionId, SessionNewParams,
+        SessionReportNativeIdParams, SessionState,
     };
 
     use crate::agent::InputRules;
@@ -1967,6 +2170,7 @@ mod tests {
             cwd: Some(PathBuf::from("/tmp")),
             cols: 80,
             rows: 24,
+            project: None,
             repo: None,
             branch: None,
             base_branch: None,
@@ -2155,6 +2359,180 @@ mod tests {
         assert!(
             !listing.contains("feat/x"),
             "branch checkout must be pruned so a fresh bind succeeds: {listing}"
+        );
+    }
+
+    /// A registry with persistence + worktree binding configured, using the
+    /// default shell so a launch actually succeeds (for the project-wiring tests).
+    fn project_registry(tag: &str) -> (SessionRegistry, PathBuf) {
+        let store = temp_store_path(tag);
+        let worktree_root = store.parent().expect("store parent").join("worktrees");
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            store_path: Some(store),
+            worktree_root: Some(worktree_root),
+            ..SessionRegistryConfig::default()
+        });
+        let repo = init_git_repo(tag);
+        (registry, repo)
+    }
+
+    #[tokio::test]
+    async fn session_new_auto_registers_project_from_cwd_and_stamps_ids() {
+        // The first observable change (M3): starting a session inside a git work
+        // tree with no flags runs in-place and silently records an Auto project,
+        // stamping the session's project_id / is_linked_worktree.
+        let (registry, repo) = project_registry("auto-register");
+        let info = registry
+            .create(SessionNewParams {
+                cwd: Some(repo.clone()),
+                ..params()
+            })
+            .await
+            .expect("session is created in the repo");
+
+        let canonical_repo = std::fs::canonicalize(&repo).expect("canonical repo");
+        assert_eq!(info.cwd, canonical_repo, "in-place runs in the checkout");
+        assert_eq!(info.worktree_path, None, "in-place binds no worktree");
+        assert_eq!(info.is_linked_worktree, Some(false), "the main checkout");
+        let project_id = info.project_id.clone().expect("a project was stamped");
+
+        let projects = registry
+            .projects()
+            .expect("projects configured")
+            .store()
+            .load_projects()
+            .expect("load projects");
+        assert_eq!(projects.len(), 1, "exactly one project auto-registered");
+        assert_eq!(projects[0].source, ProjectSource::Auto);
+        assert_eq!(
+            projects[0].id(),
+            project_id,
+            "session id matches the record"
+        );
+        assert_eq!(
+            projects[0].git_common_dir,
+            std::fs::canonicalize(repo.join(".git")).expect("canonical .git")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_in_a_non_git_cwd_records_no_project() {
+        // A plain shell in a non-git directory: no project, no stamping, today's
+        // behavior unchanged.
+        let (registry, _repo) = project_registry("non-git");
+        let non_git = std::env::temp_dir().join(format!(
+            "pohunek-nongit-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&non_git).expect("create non-git dir");
+
+        let info = registry
+            .create(SessionNewParams {
+                cwd: Some(non_git.clone()),
+                ..params()
+            })
+            .await
+            .expect("plain shell session is created");
+
+        assert_eq!(info.project_id, None, "no git ⇒ no project");
+        assert_eq!(info.is_linked_worktree, None);
+        assert_eq!(info.worktree_path, None);
+        assert!(
+            registry
+                .projects()
+                .expect("projects configured")
+                .store()
+                .load_projects()
+                .expect("load")
+                .is_empty(),
+            "a non-git directory must register nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_with_project_ref_binds_the_main_checkout_in_place() {
+        // Resolve a project by its id reference (the only remote-capable option):
+        // an in-place session launches in the project's main checkout.
+        let (registry, repo) = project_registry("by-ref");
+        // Auto-register by starting once in the repo, then reference it by id.
+        let first = registry
+            .create(SessionNewParams {
+                cwd: Some(repo.clone()),
+                ..params()
+            })
+            .await
+            .expect("first session auto-registers the project");
+        let project_id = first.project_id.clone().expect("project stamped");
+
+        let info = registry
+            .create(SessionNewParams {
+                cwd: None,
+                project: Some(project_id.clone()),
+                ..params()
+            })
+            .await
+            .expect("session created from a --project reference");
+
+        assert_eq!(info.project_id.as_deref(), Some(project_id.as_str()));
+        assert_eq!(info.worktree_path, None, "no --branch ⇒ in-place");
+        assert_eq!(info.is_linked_worktree, Some(false));
+        assert_eq!(
+            info.cwd,
+            std::fs::canonicalize(&repo).expect("canonical repo"),
+            "in-place runs in the project's main checkout"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_with_unknown_project_ref_is_rejected() {
+        let (registry, _repo) = project_registry("unknown-ref");
+        let err = registry
+            .create(SessionNewParams {
+                cwd: None,
+                project: Some("does-not-exist".to_owned()),
+                ..params()
+            })
+            .await
+            .expect_err("an unknown project reference must error");
+        assert_eq!(err.code, "project_not_found", "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn session_new_branch_with_detected_project_binds_worktree_carrying_project_id() {
+        // `--branch` in a detected project builds a worktree-per-session off the
+        // project's repo; the worktree's binding carries the project id so prune /
+        // `project show` can find pohunek's own worktrees later (M5).
+        let (registry, repo) = project_registry("wt-project");
+        let info = registry
+            .create(SessionNewParams {
+                cwd: Some(repo.clone()),
+                branch: Some("feat/x".to_owned()),
+                ..params()
+            })
+            .await
+            .expect("worktree session created from the detected project");
+
+        assert!(info.worktree_path.is_some(), "--branch binds a worktree");
+        assert_eq!(info.is_linked_worktree, Some(true));
+        let project_id = info.project_id.clone().expect("project stamped on session");
+
+        let binding = registry
+            .projects()
+            .expect("projects configured")
+            .store()
+            .load_worktrees()
+            .expect("load worktrees")
+            .into_iter()
+            .find(|b| b.session_id == info.id.0)
+            .expect("this session has a worktree binding");
+        assert_eq!(
+            binding.project_id.as_deref(),
+            Some(project_id.as_str()),
+            "the worktree binding must carry the project id"
         );
     }
 

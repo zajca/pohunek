@@ -46,6 +46,14 @@ pub struct SessionNewParams {
     pub cols: u16,
     /// Initial terminal height in rows.
     pub rows: u16,
+    /// Project to run in, by `<id|label>` reference (see `docs/design/projects.md`).
+    /// The daemon resolves it against **its own** project store and turns it into a
+    /// host-local checkout, so no filesystem path crosses the wire — this is the
+    /// only target option for a remote host. With `branch` it picks the worktree's
+    /// source repository (the project's `repo_root`); without `branch` the agent
+    /// runs in-place in that checkout. Takes precedence over `cwd` auto-detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
     /// Git repository to bind a dedicated worktree for. When set together with
     /// `branch`, the daemon creates/binds one worktree per
     /// `(session, repository, branch)` and launches the agent inside it instead
@@ -303,6 +311,17 @@ pub struct SessionInfo {
     /// terminal session can retain this id for reference yet not be resumable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_id: Option<String>,
+    /// Project this session belongs to, by derived id (`p-…`), when it started
+    /// inside (or was pointed at) a git repository. `None` for a session with no
+    /// git identity (a plain shell in a non-git directory).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Whether the session's checkout is a linked git worktree rather than the
+    /// repository's main checkout. `Some(true)` for a worktree-per-session, the
+    /// detected value for an in-place session in a linked worktree, `Some(false)`
+    /// for the main checkout, and `None` when the session has no git identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_linked_worktree: Option<bool>,
     /// Source git repository, when the session is bound to a worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<PathBuf>,
@@ -385,6 +404,8 @@ mod tests {
             state_source: StateSource::Process,
             activity: Some(AgentActivity::Working),
             native_session_id: None,
+            project_id: None,
+            is_linked_worktree: None,
             repo: None,
             branch: None,
             worktree_path: None,

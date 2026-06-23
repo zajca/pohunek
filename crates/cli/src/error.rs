@@ -107,6 +107,16 @@ pub(crate) enum CliError {
         source: ProtocolError,
     },
 
+    /// A remote `session new` named no target. No filesystem path crosses the
+    /// wire to another host, so a remote session must be referenced by `--project`
+    /// (or, for first-introduction, `--repo` with a path valid on that host). Fails
+    /// fast before any connection is dialed (design Decision 1).
+    #[error(
+        "starting a session on a remote host requires a --project reference \
+         (or --repo with a path valid on that host)"
+    )]
+    RemoteTargetRequired,
+
     /// A remote `session new` was requested under `--json` without `--yes`. The
     /// machine path must not block on an interactive prompt, so it fails fast and
     /// asks the caller to pass `--yes` explicitly.
@@ -192,6 +202,16 @@ impl CliError {
                 err.msg = format!("host '{host}': {}", err.msg);
                 err
             }
+            CliError::RemoteTargetRequired => ProtocolError::new(
+                ErrorClass::Configuration,
+                "remote_target_required",
+                "starting a session on a remote host requires a --project reference".to_owned(),
+                Some(
+                    "pass --project <id|label> from `pohunek --host <host> project list` \
+                     (or --repo with a path valid on that host the first time)"
+                        .to_owned(),
+                ),
+            ),
             CliError::RemoteConfirmationRequired => ProtocolError::new(
                 ErrorClass::Configuration,
                 "confirmation_required",

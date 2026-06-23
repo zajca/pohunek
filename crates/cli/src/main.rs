@@ -222,7 +222,14 @@ enum SessionAction {
         /// Initial terminal height in rows.
         #[arg(long, default_value_t = 24)]
         rows: u16,
-        /// Git repository to bind a dedicated worktree for. Requires `--branch`.
+        /// Project to run in, by `<id|label>` on the target host (resolved
+        /// daemon-side). The everyday way to target a host without sending a
+        /// filesystem path; required for a remote host (with `--repo` as the
+        /// first-introduction alternative).
+        #[arg(long)]
+        project: Option<String>,
+        /// Git repository to bind a dedicated worktree for (with `--branch`), or
+        /// to run in-place / register as a project (without `--branch`).
         #[arg(long)]
         repo: Option<PathBuf>,
         /// Branch to check out in the bound worktree. Requires `--repo`.
@@ -417,6 +424,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     cwd,
                     cols,
                     rows,
+                    project,
                     repo,
                     branch,
                     base_branch,
@@ -433,6 +441,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                             cwd,
                             cols,
                             rows,
+                            project,
                             repo,
                             branch,
                             base_branch,
@@ -577,6 +586,7 @@ mod tests {
                         cwd,
                         cols,
                         rows,
+                        project,
                         repo,
                         branch,
                         base_branch,
@@ -589,6 +599,7 @@ mod tests {
                 assert_eq!(cwd, None);
                 assert_eq!(cols, 80);
                 assert_eq!(rows, 24);
+                assert_eq!(project, None);
                 assert_eq!(repo, None);
                 assert_eq!(branch, None);
                 assert_eq!(base_branch, None);

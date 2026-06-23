@@ -96,6 +96,7 @@ fn request(session: &str, repo: &Path, branch: &str) -> WorktreeRequest {
         repo: repo.to_path_buf(),
         branch: branch.to_owned(),
         base_branch: None,
+        project_id: None,
     }
 }
 

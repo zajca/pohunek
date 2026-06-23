@@ -74,6 +74,10 @@ pub struct WorktreeRequest {
     pub branch: String,
     /// Requested base branch. `None` uses the repository's current branch.
     pub base_branch: Option<String>,
+    /// Project this worktree belongs to (derived id), stamped onto the binding so
+    /// `project show` / `project rm --prune-worktrees` can find pohunek's own
+    /// worktrees for a project. `None` for a bare `--repo` with no resolved project.
+    pub project_id: Option<String>,
 }
 
 /// Result of a successful [`WorktreeManager::bind`].
@@ -264,9 +268,7 @@ impl WorktreeManager {
             branch_slug: slug,
             path: path.clone(),
             status: WorktreeStatus::Active,
-            // The project this worktree belongs to is threaded in by the worktree
-            // linkage milestone (M5); the binder is project-agnostic until then.
-            project_id: None,
+            project_id: req.project_id.clone(),
             created_at: now.clone(),
             updated_at: now,
         };

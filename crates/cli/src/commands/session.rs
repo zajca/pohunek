@@ -57,7 +57,9 @@ pub(crate) struct NewArgs {
     pub cols: u16,
     /// Initial terminal rows.
     pub rows: u16,
-    /// Repository to bind a worktree for.
+    /// Project to run in, by `<id|label>` (resolved daemon-side).
+    pub project: Option<String>,
+    /// Repository to bind a worktree for / run in-place / register.
     pub repo: Option<PathBuf>,
     /// Branch to check out in the worktree.
     pub branch: Option<String>,
@@ -232,6 +234,10 @@ pub(crate) async fn run_new(
     json: bool,
     yes: bool,
 ) -> Result<(), CliError> {
+    // Resolve the target shape before dialing: defaults the local cwd, and rejects
+    // a remote start that names no project/repo (fail fast, no connection).
+    let args = prepare_new_args(host, args)?;
+
     match confirmation_decision(host, json, yes) {
         ConfirmDecision::Proceed => {}
         ConfirmDecision::RequireYes => return Err(CliError::RemoteConfirmationRequired),
@@ -412,12 +418,37 @@ fn build_new_request(args: &NewArgs) -> Result<Request, CliError> {
             cwd: args.cwd.clone(),
             cols: args.cols,
             rows: args.rows,
+            project: args.project.clone(),
             repo: args.repo.clone(),
             branch: args.branch.clone(),
             base_branch: args.base_branch.clone(),
             input: args.input.clone(),
         },
     )
+}
+
+/// Prepare the `session new` args for the target host (design Decision 1).
+///
+/// Local: send the CLI's **own** `current_dir()` as `cwd` (unless the user pinned
+/// `--cwd`) so the daemon auto-detects the project we are standing in. Remote: send
+/// **no** local path — a filesystem path is meaningless on another host — and
+/// require a `--project` reference (or `--repo` for first-introduction), failing
+/// fast before any connection is dialed.
+fn prepare_new_args(host: &str, args: NewArgs) -> Result<NewArgs, CliError> {
+    let remote = !host.is_empty() && host != LOCAL_HOST;
+    if remote {
+        if args.project.is_none() && args.repo.is_none() {
+            return Err(CliError::RemoteTargetRequired);
+        }
+        // Drop any local --cwd: it cannot be resolved on the remote host.
+        Ok(NewArgs { cwd: None, ..args })
+    } else {
+        let cwd = match args.cwd {
+            Some(cwd) => Some(cwd),
+            None => Some(std::env::current_dir()?),
+        };
+        Ok(NewArgs { cwd, ..args })
+    }
 }
 
 fn build_list_request(filters: &[ListFilter]) -> Result<Request, CliError> {
@@ -766,6 +797,8 @@ mod tests {
             state_source: StateSource::Process,
             activity: None,
             native_session_id: None,
+            project_id: None,
+            is_linked_worktree: None,
             repo: None,
             branch: None,
             worktree_path: None,
@@ -782,6 +815,7 @@ mod tests {
             cwd,
             cols: 80,
             rows: 24,
+            project: None,
             repo: None,
             branch: None,
             base_branch: None,
@@ -854,6 +888,7 @@ mod tests {
             cwd: None,
             cols: 80,
             rows: 24,
+            project: None,
             repo: Some(PathBuf::from("/workspace/project")),
             branch: Some("feature/login".to_owned()),
             base_branch: Some("main".to_owned()),
@@ -882,6 +917,7 @@ mod tests {
             cwd: Some(PathBuf::from("/workspace/project")),
             cols: 120,
             rows: 40,
+            project: None,
             repo: None,
             branch: None,
             base_branch: None,
@@ -1104,6 +1140,82 @@ mod tests {
         let request = build_stop_request(&remote).expect("request");
 
         assert_request(&request, method::SESSION_STOP, json!("s-42"));
+    }
+
+    #[test]
+    fn prepare_new_args_local_defaults_cwd_to_current_dir() {
+        // A local session sends the CLI's own cwd so the daemon auto-detects the
+        // project we are standing in.
+        let prepared = prepare_new_args(LOCAL_HOST, new_args(AgentArg::Shell, None))
+            .expect("local prepare succeeds");
+        assert_eq!(
+            prepared.cwd,
+            Some(std::env::current_dir().expect("cwd")),
+            "local defaults cwd to the CLI's own current dir"
+        );
+    }
+
+    #[test]
+    fn prepare_new_args_local_respects_explicit_cwd() {
+        let prepared = prepare_new_args(
+            LOCAL_HOST,
+            new_args(AgentArg::Shell, Some(PathBuf::from("/explicit"))),
+        )
+        .expect("local prepare succeeds");
+        assert_eq!(prepared.cwd, Some(PathBuf::from("/explicit")));
+    }
+
+    #[test]
+    fn prepare_new_args_remote_without_project_or_repo_is_rejected() {
+        // No filesystem path crosses the wire to a remote host: a remote start must
+        // name a --project (or --repo), and is rejected before any dial.
+        let err = prepare_new_args(
+            "host-b",
+            new_args(AgentArg::Shell, Some(PathBuf::from("/x"))),
+        )
+        .expect_err("remote without a target is rejected");
+        assert!(
+            matches!(err, CliError::RemoteTargetRequired),
+            "expected RemoteTargetRequired, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn prepare_new_args_remote_with_project_drops_local_cwd() {
+        let mut args = new_args(AgentArg::Shell, Some(PathBuf::from("/local/path")));
+        args.project = Some("ui".to_owned());
+        let prepared = prepare_new_args("host-b", args).expect("remote with --project");
+        assert_eq!(
+            prepared.cwd, None,
+            "a local cwd must not be sent to a remote"
+        );
+        assert_eq!(prepared.project.as_deref(), Some("ui"));
+    }
+
+    #[test]
+    fn prepare_new_args_remote_with_repo_is_allowed() {
+        let mut args = new_args(AgentArg::Shell, None);
+        args.repo = Some(PathBuf::from("/on/remote"));
+        let prepared = prepare_new_args("host-b", args).expect("remote with --repo");
+        assert_eq!(prepared.cwd, None);
+        assert_eq!(prepared.repo, Some(PathBuf::from("/on/remote")));
+    }
+
+    #[test]
+    fn new_request_carries_project_reference() {
+        let mut args = new_args(AgentArg::Claude, None);
+        args.project = Some("ui".to_owned());
+        let request = build_new_request(&args).expect("request");
+        assert_request(
+            &request,
+            method::SESSION_NEW,
+            json!({
+                "agent": "claude",
+                "cols": 80,
+                "rows": 24,
+                "project": "ui"
+            }),
+        );
     }
 
     #[test]
