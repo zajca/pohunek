@@ -907,12 +907,14 @@ impl SessionRegistry {
     /// detection + store I/O on a blocking thread.
     ///
     /// Order (Decision 1): a `--project <id|label>` reference resolves against the
-    /// store; otherwise detect at the explicit `--repo` path or — for a local
-    /// session — the CLI's own `--cwd`, auto-registering the result. `--repo` wins
-    /// over the implicitly-sent `--cwd` so naming a repo is honored and the
-    /// worktree source stays coherent with the project identity. Returns the
-    /// record and, when detection ran, the [`DetectedProject`] (the in-place path
-    /// needs its `checkout_path`/`is_linked_worktree`).
+    /// store (bumping its `last_used_at`); otherwise detect at the explicit
+    /// `--repo` path, else — for a local session — the CLI's own `--cwd`,
+    /// auto-registering the result. `--project` and `--repo` are mutually exclusive
+    /// (rejected earlier by [`validate_new_params`]). An **explicit** `--repo` that
+    /// is not a git work tree is an error (no silent fallback to a different dir),
+    /// whereas an **implicit** non-git `--cwd` is the normal plain-shell case.
+    /// Returns the record and, when detection ran, the [`DetectedProject`] (the
+    /// in-place path needs its `checkout_path`/`is_linked_worktree`).
     async fn resolve_project(
         &self,
         params: &SessionNewParams,
@@ -930,16 +932,28 @@ impl SessionRegistry {
             return Ok((None, None));
         };
         let reference = params.project.clone();
-        let detect_path = params.repo.clone().or_else(|| params.cwd.clone());
+        let repo = params.repo.clone();
+        let cwd = params.cwd.clone();
         let now = timestamp_now();
         tokio::task::spawn_blocking(move || -> Result<_, ProtocolError> {
+            // 1. Reference resolves against the store; a session start bumps recency.
             if let Some(reference) = reference {
-                return Ok((Some(projects.resolve(&reference)?), None));
+                let record = projects.resolve(&reference)?;
+                let record = projects.touch(&record.git_common_dir, &now)?.unwrap_or(record);
+                return Ok((Some(record), None));
             }
-            let Some(path) = detect_path else {
+            // 2. Explicit --repo: must be a git work tree, else error — never
+            // silently launch somewhere else (no-silent-defaults).
+            if let Some(repo) = repo {
+                let detected = detect_at(&repo)?.ok_or_else(|| not_a_git_repo(&repo))?;
+                let record = projects.register(&detected, &now, false)?;
+                return Ok((Some(record), Some(detected)));
+            }
+            // 3. Implicit --cwd (local): a non-git cwd is the normal plain shell.
+            let Some(cwd) = cwd else {
                 return Ok((None, None));
             };
-            let Some(detected) = detect_at(&path)? else {
+            let Some(detected) = detect_at(&cwd)? else {
                 return Ok((None, None));
             };
             let record = projects.register(&detected, &now, false)?;
@@ -1951,7 +1965,26 @@ fn validate_new_params(params: &SessionNewParams) -> Result<(), ProtocolError> {
             "session.new requires non-zero cols and rows",
         ));
     }
+    // `--project` and `--repo` are two ways to name the same target repository;
+    // accepting both would let the worktree be cut from one while the session is
+    // stamped with the other's project id (an incoherent binding). The CLI rejects
+    // this at parse time too; this guards non-CLI / remote callers.
+    if params.project.is_some() && params.repo.is_some() {
+        return Err(ProtocolError::bad_request(
+            "session.new: --project and --repo are mutually exclusive (both name the target repository)",
+        ));
+    }
     Ok(())
+}
+
+/// An explicitly named path is not a git work tree (no silent fallback elsewhere).
+fn not_a_git_repo(path: &Path) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Runtime,
+        "not_a_git_repo",
+        format!("{} is not a git repository", path.display()),
+        Some("point --repo at a git work tree, or omit it to use the current directory".to_owned()),
+    )
 }
 
 fn build_launch_command(
@@ -2533,6 +2566,99 @@ mod tests {
             binding.project_id.as_deref(),
             Some(project_id.as_str()),
             "the worktree binding must carry the project id"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_with_project_ref_bumps_last_used_at() {
+        // The data model defines last_used_at as bumped on each session start; the
+        // --project reference path must do that too, not only auto-detection.
+        let (registry, repo) = project_registry("touch");
+        let first = registry
+            .create(SessionNewParams {
+                cwd: Some(repo.clone()),
+                ..params()
+            })
+            .await
+            .expect("first session auto-registers");
+        let project_id = first.project_id.clone().expect("project stamped");
+        let projects = registry.projects().expect("projects");
+        let store = projects.store();
+
+        // Backdate last_used_at so the bump is unambiguously observable.
+        let mut record = store
+            .load_projects()
+            .expect("load")
+            .into_iter()
+            .next()
+            .expect("one project");
+        record.last_used_at = "2000-01-01T00:00:00Z".to_owned();
+        store.record_project(&record).expect("backdate");
+
+        registry
+            .create(SessionNewParams {
+                cwd: None,
+                project: Some(project_id),
+                ..params()
+            })
+            .await
+            .expect("session created by --project reference");
+
+        let after = store
+            .load_projects()
+            .expect("reload")
+            .into_iter()
+            .next()
+            .expect("one project");
+        assert_ne!(
+            after.last_used_at, "2000-01-01T00:00:00Z",
+            "a --project reference must bump last_used_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_with_explicit_non_git_repo_errors() {
+        // An explicitly named --repo that is not a git work tree must error, not
+        // silently launch a plain shell somewhere else (no silent defaults).
+        let (registry, _repo) = project_registry("explicit-nonrepo");
+        let nonrepo = std::env::temp_dir().join(format!(
+            "pohunek-nonrepo-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&nonrepo).expect("create non-git dir");
+
+        let err = registry
+            .create(SessionNewParams {
+                cwd: None,
+                repo: Some(nonrepo),
+                ..params()
+            })
+            .await
+            .expect_err("an explicit non-git --repo must error");
+        assert_eq!(err.code, "not_a_git_repo", "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn session_new_rejects_project_and_repo_together() {
+        // --project and --repo both name the target repo; accepting both would
+        // persist an incoherent binding, so the daemon rejects the combination.
+        let (registry, repo) = project_registry("mutual-exclusion");
+        let err = registry
+            .create(SessionNewParams {
+                cwd: None,
+                project: Some("anything".to_owned()),
+                repo: Some(repo),
+                ..params()
+            })
+            .await
+            .expect_err("--project and --repo together must be rejected");
+        assert!(
+            err.msg.contains("mutually exclusive"),
+            "got: {err:?}"
         );
     }
 

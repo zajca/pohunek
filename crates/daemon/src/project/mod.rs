@@ -117,6 +117,31 @@ impl ProjectManager {
         self.store.record_project(&record).map_err(store_error)?;
         Ok(record)
     }
+
+    /// Bump a project's `last_used_at` to `now` (a session started in it). Keyed
+    /// by the canonical `git_common_dir` and re-read from the store before writing
+    /// so a concurrent rename/add is not clobbered. Returns the updated record, or
+    /// `None` if the project no longer exists (a benign race with `project rm`).
+    /// The data model defines `last_used_at` as bumped on each session start, so
+    /// the `--project` reference path must do this too — not only auto-detection.
+    pub fn touch(
+        &self,
+        git_common_dir: &Path,
+        now: &str,
+    ) -> Result<Option<ProjectRecord>, ProtocolError> {
+        let existing = self
+            .store
+            .load_projects()
+            .map_err(store_error)?
+            .into_iter()
+            .find(|project| project.git_common_dir == git_common_dir);
+        let Some(mut record) = existing else {
+            return Ok(None);
+        };
+        record.last_used_at = now.to_owned();
+        self.store.record_project(&record).map_err(store_error)?;
+        Ok(Some(record))
+    }
 }
 
 /// Map a project-store I/O failure to a typed runtime error.

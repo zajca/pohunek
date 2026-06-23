@@ -225,11 +225,12 @@ enum SessionAction {
         /// Project to run in, by `<id|label>` on the target host (resolved
         /// daemon-side). The everyday way to target a host without sending a
         /// filesystem path; required for a remote host (with `--repo` as the
-        /// first-introduction alternative).
-        #[arg(long)]
+        /// first-introduction alternative). Mutually exclusive with `--repo`.
+        #[arg(long, conflicts_with = "repo")]
         project: Option<String>,
         /// Git repository to bind a dedicated worktree for (with `--branch`), or
-        /// to run in-place / register as a project (without `--branch`).
+        /// to run in-place / register as a project (without `--branch`). Mutually
+        /// exclusive with `--project` (both name the target repository).
         #[arg(long)]
         repo: Option<PathBuf>,
         /// Branch to check out in the bound worktree. Requires `--repo`.
@@ -678,6 +679,32 @@ mod tests {
                 assert_eq!(branch.as_deref(), Some("feature/login"));
                 assert_eq!(base_branch.as_deref(), Some("main"));
                 assert_eq!(input, None);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_session_new_project_and_repo_together() {
+        // --project and --repo both name the target repository; clap rejects them
+        // together so the daemon never has to reconcile an incoherent pair.
+        let err = Cli::try_parse_from([
+            "pohunek", "session", "new", "--project", "ui", "--repo", "/x",
+        ])
+        .expect_err("project and repo conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn parses_session_new_project_reference() {
+        let cli = Cli::try_parse_from(["pohunek", "session", "new", "--project", "ui"])
+            .expect("parse");
+        match cli.command {
+            Commands::Session {
+                action: SessionAction::New { project, repo, .. },
+            } => {
+                assert_eq!(project.as_deref(), Some("ui"));
+                assert_eq!(repo, None);
             }
             other => panic!("unexpected command: {other:?}"),
         }
