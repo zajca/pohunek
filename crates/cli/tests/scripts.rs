@@ -106,7 +106,7 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
             ("gh_bin", gh.to_str().expect("utf8 path")),
             ("agent", "claude"),
             ("host", "local"),
-            ("repo", "/workspace/project"),
+            ("project", "ui"),
             ("yes", "true"),
         ],
     );
@@ -135,7 +135,10 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
     let args = read(&pohunek_args);
     assert!(args.contains("--host\nlocal\nsession\nnew\n"), "{args}");
     assert!(args.contains("--agent\nclaude\n"), "{args}");
-    assert!(args.contains("--repo\n/workspace/project\n"), "{args}");
+    // The launcher references the project (resolved on the host); no --repo path
+    // crosses the wire.
+    assert!(args.contains("--project\nui\n"), "{args}");
+    assert!(!args.contains("--repo"), "no --repo leaks: {args}");
     assert!(args.contains("--branch\nfeature/filters\n"), "{args}");
     assert!(args.contains("--yes\n"), "{args}");
     assert!(
@@ -179,7 +182,7 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
             ("linear_cli", linear.to_str().expect("utf8 path")),
             ("agent", "codex"),
             ("host", "build-box"),
-            ("repo", "/workspace/project"),
+            ("project", "ui"),
         ],
     );
     fs::write(
@@ -206,6 +209,8 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
     let args = read(&pohunek_args);
     assert!(args.contains("--host\nbuild-box\nsession\nnew\n"), "{args}");
     assert!(args.contains("--agent\ncodex\n"), "{args}");
+    assert!(args.contains("--project\nui\n"), "{args}");
+    assert!(!args.contains("--repo"), "no --repo leaks: {args}");
     assert!(args.contains("--branch\nlin-123-fix-launcher\n"), "{args}");
     assert!(
         args.contains("Issue LIN-123: Fix launcher\nIssue body\n"),
@@ -267,7 +272,7 @@ for arg in \"$@\"; do printf '%s\\n' \"$arg\" >>\"$POHUNEK_TEST_TERMINAL_ARGS\";
             // though the mock terminal never actually runs the script).
             ("agent", "claude"),
             ("host", "local"),
-            ("repo", "/workspace/project"),
+            ("project", "ui"),
         ],
     );
 
@@ -366,7 +371,7 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_TERMINAL_ARGS"; done
             ("terminal", terminal.to_str().expect("utf8 path")),
             ("agent", "claude"),
             ("host", "local"),
-            ("repo", "/workspace/project"),
+            ("project", "ui"),
         ],
     );
 

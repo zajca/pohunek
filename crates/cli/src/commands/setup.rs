@@ -68,8 +68,8 @@ const SCRIPTS: &[(&str, &str)] = &[
 
 /// Default `launcher.conf` contents read by the launcher scripts via `lib.sh`.
 /// Keys must match what `pohunek_required_config`/`pohunek_optional_config` look
-/// up; the `repo`/`terminal` values are intentionally left blank for the user to
-/// fill in (the scripts fail fast when a required value is empty).
+/// up; the `project`/`terminal` values are intentionally left blank for the user
+/// to fill in (the scripts fail fast when a required value is empty).
 const LAUNCHER_CONF: &str = "# pohunek launcher configuration.
 # Lines are key=value; '#' starts a comment. Edit the values below.
 
@@ -78,8 +78,10 @@ const LAUNCHER_CONF: &str = "# pohunek launcher configuration.
 agent=claude
 # Default host: 'local' or a NetBird peer name
 host=local
-# Absolute path to the git repository sessions are created in
-repo=
+# Project to create sessions in, by id or label on the target host. Find it with
+# `pohunek [--host H] project list`; the host must already know it — run
+# `pohunek [--host H] project add <path-on-that-host>` once if it does not.
+project=
 # Terminal emulator command (falls back to $TERMINAL if empty)
 terminal=
 # Per-host timeout (seconds) for `session list` queries in the rofi switcher
@@ -398,7 +400,7 @@ fn next_steps(paths: &Paths) -> Vec<String> {
     let sway_dir = paths.sway_config_dir();
     vec![
         format!(
-            "Edit {}/launcher.conf — set 'repo' and 'terminal' (and 'linear_cli' for Linear).",
+            "Edit {}/launcher.conf — set 'project' and 'terminal' (and 'linear_cli' for Linear).",
             paths.config_dir.display()
         ),
         format!(

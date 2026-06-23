@@ -12,7 +12,7 @@ pohunek_bin="$(pohunek_optional_config pohunek_bin pohunek)"
 gh_bin="$(pohunek_optional_config gh_bin gh)"
 agent="$(pohunek_required_config agent)"
 host="$(pohunek_required_config host)"
-repo="$(pohunek_required_config repo)"
+project="$(pohunek_required_config project)"
 yes="$(pohunek_optional_config yes false)"
 template="$(pohunek_template_path pr)"
 
@@ -32,4 +32,4 @@ sys.stdout.write(branch)
 PY
 )"
 
-pohunek_run_session_new "$pohunek_bin" "$host" "$agent" "$repo" "$branch" "$prompt" "$yes"
+pohunek_run_session_new "$pohunek_bin" "$host" "$agent" "$project" "$branch" "$prompt" "$yes"

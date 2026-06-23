@@ -176,7 +176,7 @@ pohunek_run_session_new() {
   pohunek_bin="$1"
   host="$2"
   agent="$3"
-  repo="$4"
+  project="$4"
   branch="$5"
   prompt="$6"
   yes="$7"
@@ -186,7 +186,10 @@ pohunek_run_session_new() {
   else
     set -- "$pohunek_bin" session new
   fi
-  set -- "$@" --agent "$agent" --repo "$repo" --branch "$branch" --input "$prompt"
+  # Reference the project by id|label (resolved on the target host); no filesystem
+  # path crosses the wire. --branch makes the daemon cut a worktree off the
+  # project's repo for this issue/PR branch.
+  set -- "$@" --agent "$agent" --project "$project" --branch "$branch" --input "$prompt"
   if [ "$yes" = "true" ]; then
     set -- "$@" --yes
   fi
