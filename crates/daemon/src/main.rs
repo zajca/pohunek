@@ -79,6 +79,10 @@ async fn run() -> Result<(), DaemonError> {
         store_path: Some(paths.data_dir.join(STORE_NAME)),
         worktree_root: Some(paths.data_dir.join(WORKTREES_SUBDIR)),
         event_log_dir: Some(paths.data_dir.join(EVENTS_SUBDIR)),
+        // Slice 0 owns this line: B3 (host-global hooks) and C1 (agent profiles)
+        // read it through SessionRegistry::config_dir() / derive off it — they must
+        // NOT re-add config_dir here.
+        config_dir: Some(paths.config_dir.clone()),
         ..SessionRegistryConfig::default()
     };
     let sessions = SessionRegistry::new(config);

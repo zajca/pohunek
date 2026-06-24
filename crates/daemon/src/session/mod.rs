@@ -4,7 +4,7 @@
 //! handle and has a watcher task that records process exit.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -164,6 +164,12 @@ pub struct SessionRegistryConfig {
     /// Directory for the append-only event log (`<data_dir>/events`). `None`
     /// disables event logging. Started via [`SessionRegistry::spawn_event_log`].
     pub event_log_dir: Option<PathBuf>,
+    /// Host config directory (`<config_dir>` = `$XDG_CONFIG_HOME/pohunek` or
+    /// `~/.config/pohunek`). The host-default layer for templates/actions/prompts
+    /// (Part A), lifecycle hooks (Part B), and agent profiles (Part C). `None`
+    /// disables the host-default layer (e.g. unit tests that exercise only the
+    /// in-repo layer). Read through [`SessionRegistry::config_dir`].
+    pub config_dir: Option<PathBuf>,
     /// Minimum interval between per-session "PTY output lag" WARN logs. The first
     /// lag in each window logs immediately; further lags are folded into one
     /// summary WARN when the window elapses, so a runaway session cannot flood the
@@ -393,6 +399,7 @@ impl Default for SessionRegistryConfig {
             worktree_root: None,
             setup_script_timeout: DEFAULT_SETUP_SCRIPT_TIMEOUT,
             event_log_dir: None,
+            config_dir: None,
             detector_lag_warn_interval: DEFAULT_DETECTOR_LAG_WARN_INTERVAL,
         }
     }
@@ -535,6 +542,15 @@ impl SessionRegistry {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.inner.events.subscribe()
+    }
+
+    /// The host config directory (`$XDG_CONFIG_HOME/pohunek` or `~/.config/pohunek`),
+    /// or `None` when the host-default layer is disabled. The single read API for the
+    /// host-default layer used by Part A's `project.*` handlers, Part B's host-global
+    /// hooks, and Part C's agent profiles — no consumer re-derives the path.
+    #[must_use]
+    pub fn config_dir(&self) -> Option<&Path> {
+        self.inner.config.config_dir.as_deref()
     }
 
     /// This daemon process instance's opaque id, injected into every session PTY

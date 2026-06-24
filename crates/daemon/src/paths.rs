@@ -11,6 +11,8 @@
 //! - logs:            `$XDG_STATE_HOME` or `~/.local/state` + `/pohunek/logs`
 //! - data dir:        `$XDG_DATA_HOME`  or `~/.local/share` + `/pohunek`
 //!   (state.db, events/, worktrees/ live here in later milestones)
+//! - config dir:      `$XDG_CONFIG_HOME` or `~/.config` + `/pohunek`
+//!   (host-default templates/actions/prompts, hooks/, agents/ profiles)
 
 use std::path::PathBuf;
 
@@ -36,6 +38,10 @@ pub struct Paths {
     pub log_dir: PathBuf,
     /// The user data directory (state.db / events / worktrees in later milestones).
     pub data_dir: PathBuf,
+    /// The host config directory (`$XDG_CONFIG_HOME/pohunek` or `~/.config/pohunek`).
+    /// Home of host-default templates/actions/prompts, lifecycle hooks, and agent
+    /// profiles. The daemon reads (never writes) this tree as the host-default layer.
+    pub config_dir: PathBuf,
 }
 
 impl Paths {
@@ -45,8 +51,8 @@ impl Paths {
     ///
     /// Returns [`DaemonError::MissingEnv`] when `XDG_RUNTIME_DIR` is unset (it is
     /// required and has no safe invented default), or when neither
-    /// `XDG_STATE_HOME`/`XDG_DATA_HOME` nor `HOME` is available to derive the
-    /// log/data directories.
+    /// `XDG_STATE_HOME`/`XDG_DATA_HOME`/`XDG_CONFIG_HOME` nor `HOME` is available to
+    /// derive the log/data/config directories.
     pub fn resolve() -> Result<Self, DaemonError> {
         // XDG_RUNTIME_DIR is mandatory: it is the only correct home for an
         // owner-private socket, and inventing e.g. /tmp would weaken the
@@ -65,12 +71,18 @@ impl Paths {
         let data_home = xdg_or_home_relative("XDG_DATA_HOME", &[".local", "share"])?;
         let data_dir = data_home.join(APP_DIR);
 
+        // Config dir: prefer XDG_CONFIG_HOME, else ~/.config. One of the two must
+        // resolve; otherwise fail fast (no silent default).
+        let config_home = xdg_or_home_relative("XDG_CONFIG_HOME", &[".config"])?;
+        let config_dir = config_home.join(APP_DIR);
+
         Ok(Self {
             runtime_dir,
             socket,
             lock,
             log_dir,
             data_dir,
+            config_dir,
         })
     }
 }
@@ -103,4 +115,114 @@ fn xdg_or_home_relative(key: &str, home_relative: &[&str]) -> Result<PathBuf, Da
         p.push(seg);
     }
     Ok(p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // Env-var resolution is process-global; serialize the env-mutating tests and
+    // restore every touched var on drop so they stay hermetic under the parallel
+    // runner (mirrors the PATH_LOCK guard in `tests/health_socket.rs`).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const VARS: [&str; 5] = [
+        "XDG_RUNTIME_DIR",
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CONFIG_HOME",
+        "HOME",
+    ];
+
+    /// Holds `ENV_LOCK` for the test's duration and restores every snapshotted var
+    /// on drop, so a panic mid-test cannot leak mutated env into a sibling.
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn acquire() -> Self {
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let saved = VARS.iter().map(|&k| (k, std::env::var(k).ok())).collect();
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    fn tmp_base(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("pohunek-paths-{tag}-{}", std::process::id()))
+    }
+
+    /// Set every base var the resolver reads to temp paths, so a test can exercise
+    /// one variable in isolation without tripping an unrelated fail-fast.
+    fn set_all_present(base: &Path) {
+        std::env::set_var("XDG_RUNTIME_DIR", base.join("run"));
+        std::env::set_var("XDG_STATE_HOME", base.join("state"));
+        std::env::set_var("XDG_DATA_HOME", base.join("data"));
+        std::env::set_var("XDG_CONFIG_HOME", base.join("cfg"));
+        std::env::set_var("HOME", base.join("home"));
+    }
+
+    #[test]
+    fn config_dir_from_xdg_config_home() {
+        let _env = EnvGuard::acquire();
+        let base = tmp_base("xdg");
+        set_all_present(&base);
+        let paths = Paths::resolve().expect("resolve with all base vars set");
+        assert_eq!(paths.config_dir, base.join("cfg").join(APP_DIR));
+    }
+
+    #[test]
+    fn config_dir_falls_back_to_home_dot_config() {
+        let _env = EnvGuard::acquire();
+        let base = tmp_base("home");
+        set_all_present(&base);
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let paths = Paths::resolve().expect("resolve with XDG_CONFIG_HOME unset");
+        assert_eq!(
+            paths.config_dir,
+            base.join("home").join(".config").join(APP_DIR)
+        );
+    }
+
+    #[test]
+    fn missing_config_home_and_home_fails_fast() {
+        let _env = EnvGuard::acquire();
+        let base = tmp_base("missing");
+        set_all_present(&base);
+        // XDG_STATE_HOME/XDG_DATA_HOME stay set so the earlier steps do not need
+        // HOME; only the config step must fail, and with the actionable message.
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("HOME");
+        match Paths::resolve() {
+            Err(DaemonError::MissingEnv { var }) => {
+                assert_eq!(var, "XDG_CONFIG_HOME or HOME");
+            }
+            other => panic!("expected MissingEnv, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_session_config_has_no_config_dir() {
+        // Pins the new field is opt-in: every `..SessionRegistryConfig::default()`
+        // construction across the crate keeps compiling with `config_dir = None`.
+        assert_eq!(
+            crate::session::SessionRegistryConfig::default().config_dir,
+            None
+        );
+    }
 }
