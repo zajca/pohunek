@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use protocol::{ErrorClass, ProtocolError};
+use serde::{Deserialize, Serialize};
 
 use crate::detect::Manifest;
 use crate::pty::PtyCommand;
@@ -19,7 +20,7 @@ mod shell;
 
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
-pub(crate) use profile::{ProfileRegistry, ResolvedAgent};
+pub(crate) use profile::{default_program, ProfileRegistry, ResolvedAgent};
 pub use shell::ShellAdapter;
 
 static SHELL_ADAPTER: ShellAdapter = ShellAdapter;
@@ -61,7 +62,8 @@ const MAX_SESSION_PATH_LEN: usize = 4096;
 /// Ported from herdr `src/agent_resume.rs`: Claude and Codex resume by id; the
 /// path variant exists for agents that resume from a transcript path. Both
 /// kinds feed the same resume-argv builder via [`SessionRef::value`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionRefKind {
     /// An opaque native session id (e.g. `claude --resume <id>`).
     Id,
@@ -177,6 +179,62 @@ impl AgentCommand {
     }
 }
 
+/// How an agent's resume invocation is shaped on the command line.
+///
+/// The two built-in kinds differ only in this: Claude resumes via a `--resume`
+/// flag, Codex via a `resume` subcommand. A host profile (Part C) may override the
+/// mode so a profile whose base is `claude` can still drive a `resume`-subcommand
+/// CLI. Both produce a two-element argv ending in the native session reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeMode {
+    /// `<program> --resume <ref>` (Claude).
+    Flag,
+    /// `<program> resume <ref>` (Codex).
+    Subcommand,
+}
+
+impl ResumeMode {
+    /// Build the resume argv (excluding `argv[0]`) for `value`.
+    fn argv(self, value: &str) -> Vec<String> {
+        match self {
+            ResumeMode::Flag => vec!["--resume".to_owned(), value.to_owned()],
+            ResumeMode::Subcommand => vec!["resume".to_owned(), value.to_owned()],
+        }
+    }
+}
+
+/// The resolved "how to resume" for a session: the argv mode plus which native
+/// reference kind ([`SessionRefKind`]) its captured value is.
+///
+/// `ref_kind` decides which validating [`SessionRef`] constructor builds the
+/// reference at resume — and therefore which trust-boundary guard applies: `Id`
+/// carries the leading-dash argv-injection guard, `Path` carries the
+/// must-be-absolute guard (the asymmetry is intentional, see [`SessionRef`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResumeTemplate {
+    /// Whether the resume argv uses a `--resume` flag or a `resume` subcommand.
+    pub mode: ResumeMode,
+    /// Whether the captured native reference is an id or a path.
+    pub ref_kind: SessionRefKind,
+}
+
+/// The resume template for a bare base kind, or `None` when it has no native
+/// resume (a shell).
+pub(crate) fn base_resume_template(base: protocol::AgentKind) -> Option<ResumeTemplate> {
+    match base {
+        protocol::AgentKind::Shell => None,
+        protocol::AgentKind::Codex => Some(ResumeTemplate {
+            mode: ResumeMode::Subcommand,
+            ref_kind: SessionRefKind::Id,
+        }),
+        protocol::AgentKind::Claude => Some(ResumeTemplate {
+            mode: ResumeMode::Flag,
+            ref_kind: SessionRefKind::Id,
+        }),
+    }
+}
+
 /// Thin per-agent adapter for launch, input, and resume behavior.
 pub trait AgentAdapter: std::fmt::Debug + Send + Sync {
     /// Stable adapter id.
@@ -258,6 +316,24 @@ pub fn resume_pty_command(
     build_pty_command(&command.program, command.args, opts)
 }
 
+/// Build the PTY command that resumes a session from its frozen structural
+/// snapshot (Part C: C.4).
+///
+/// Unlike [`resume_pty_command`], this never consults the base adapter: the
+/// `program` and the resume `template` come from the session's launch-time
+/// snapshot, so a host profile that overrode the launch program or the resume
+/// mode resumes with exactly those values — not the base kind's defaults. The
+/// `session_ref` must already be the kind named by `template.ref_kind` (its
+/// constructor enforced the matching guard).
+pub(crate) fn resume_pty_command_from_template(
+    program: &str,
+    template: ResumeTemplate,
+    session_ref: &SessionRef,
+    opts: &LaunchOpts,
+) -> Result<PtyCommand, ProtocolError> {
+    build_pty_command(program, template.mode.argv(session_ref.value()), opts)
+}
+
 fn resume_command(program: &'static str, args: Vec<String>) -> AgentCommand {
     AgentCommand::new(program, args)
 }
@@ -281,6 +357,22 @@ fn resolve_binary(name: &str) -> Result<String, ProtocolError> {
     }
 
     Err(missing_binary(name))
+}
+
+/// Resolve `name` to the first **executable** match on `PATH`, for capability
+/// probing (`host.inspect`). Uses the same executable-bit check as
+/// [`resolve_binary`], so "available" in a capability snapshot agrees with what
+/// the launch path would actually accept — unlike a bare `is_file` probe. Returns
+/// the resolved path, or `None` when nothing executable matches.
+pub(crate) fn which_executable(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -325,7 +417,8 @@ mod tests {
     use protocol::{AgentActivity, ErrorClass};
 
     use super::{
-        AgentAdapter, ClaudeAdapter, CodexAdapter, LaunchOpts, SessionRef, SessionRefKind,
+        base_resume_template, resume_pty_command_from_template, AgentAdapter, ClaudeAdapter,
+        CodexAdapter, LaunchOpts, ResumeMode, ResumeTemplate, SessionRef, SessionRefKind,
         ShellAdapter,
     };
     use crate::detect::{ManifestRegion, MatchContext};
@@ -633,6 +726,82 @@ mod tests {
             super::resume_pty_command(protocol::AgentKind::Shell, &session, &launch_opts(cwd))
                 .expect_err("shell is not resumable");
         assert_eq!(err.code, "agent_not_resumable");
+    }
+
+    #[test]
+    fn base_resume_template_matches_native_adapter_modes() {
+        // The base-kind templates must agree with the hard-coded adapter argv:
+        // Claude → `--resume` flag, Codex → `resume` subcommand, both id-kind.
+        let claude = base_resume_template(protocol::AgentKind::Claude).expect("claude resumable");
+        assert_eq!(claude.mode, ResumeMode::Flag);
+        assert_eq!(claude.ref_kind, SessionRefKind::Id);
+        let codex = base_resume_template(protocol::AgentKind::Codex).expect("codex resumable");
+        assert_eq!(codex.mode, ResumeMode::Subcommand);
+        assert_eq!(codex.ref_kind, SessionRefKind::Id);
+        // A shell has no native resume.
+        assert!(base_resume_template(protocol::AgentKind::Shell).is_none());
+    }
+
+    #[test]
+    fn resume_pty_command_from_template_builds_argv_by_mode() {
+        let bin_dir = temp_dir("template-resume-bin");
+        write_executable(&bin_dir, "claude-sonnet");
+        let cwd = temp_dir("template-resume-cwd");
+        let session = SessionRef::id("native-123").expect("id ref");
+
+        // Flag mode resumes with `--resume <id>`; the program is the snapshot's,
+        // NOT the base adapter's "claude".
+        let flag = with_path(&bin_dir, || {
+            resume_pty_command_from_template(
+                "claude-sonnet",
+                ResumeTemplate {
+                    mode: ResumeMode::Flag,
+                    ref_kind: SessionRefKind::Id,
+                },
+                &session,
+                &launch_opts(cwd.clone()),
+            )
+            .expect("flag resume command")
+        });
+        assert!(flag.program.ends_with("claude-sonnet"));
+        assert_eq!(flag.args, vec!["--resume", "native-123"]);
+
+        // Subcommand mode resumes with `resume <id>`.
+        let sub = with_path(&bin_dir, || {
+            resume_pty_command_from_template(
+                "claude-sonnet",
+                ResumeTemplate {
+                    mode: ResumeMode::Subcommand,
+                    ref_kind: SessionRefKind::Id,
+                },
+                &session,
+                &launch_opts(cwd.clone()),
+            )
+            .expect("subcommand resume command")
+        });
+        assert_eq!(sub.args, vec!["resume", "native-123"]);
+    }
+
+    #[test]
+    fn resume_pty_command_from_template_carries_path_ref_value() {
+        let bin_dir = temp_dir("template-path-bin");
+        write_executable(&bin_dir, "myagent");
+        let cwd = temp_dir("template-path-cwd");
+        let session = SessionRef::path("/abs/session.jsonl").expect("path ref");
+
+        let command = with_path(&bin_dir, || {
+            resume_pty_command_from_template(
+                "myagent",
+                ResumeTemplate {
+                    mode: ResumeMode::Flag,
+                    ref_kind: SessionRefKind::Path,
+                },
+                &session,
+                &launch_opts(cwd),
+            )
+            .expect("path resume command")
+        });
+        assert_eq!(command.args, vec!["--resume", "/abs/session.jsonl"]);
     }
 
     #[test]

@@ -345,6 +345,13 @@ pub struct SessionInfo {
     /// terminal session can retain this id for reference yet not be resumable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_id: Option<String>,
+    /// Native agent session **path** captured via the `SessionStart` hook, for an
+    /// agent whose host profile resumes from a transcript path rather than an
+    /// opaque id (`ref_kind = "path"`, Part C). Mutually exclusive with
+    /// [`Self::native_session_id`]: a session resumes by exactly one of the two,
+    /// chosen by its frozen `ref_kind`. `None` for the common id-resuming agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_session_path: Option<String>,
     /// Project this session belongs to, by derived id (`p-…`), when it started
     /// inside (or was pointed at) a git repository. `None` for a session with no
     /// git identity (a plain shell in a non-git directory).
@@ -445,6 +452,7 @@ mod tests {
             state_source: StateSource::Process,
             activity: Some(AgentActivity::Working),
             native_session_id: None,
+            native_session_path: None,
             project_id: None,
             project_label: None,
             is_linked_worktree: None,

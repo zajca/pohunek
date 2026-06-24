@@ -26,16 +26,26 @@
 //! project) so a full rewrite per mutation is cheap. No secrets are ever written:
 //! a native session id, a cwd, a repository path, a branch, a worktree path, and
 //! a project's git common dir / credential-redacted origin URL are not secrets.
+//!
+//! The resume binding additionally carries the **structural relaunch snapshot**
+//! (Part C, C.4): `program`, `args`, `input_rules`, `resume_mode`, `ref_kind`,
+//! `resumable`, and `agent_base`. These are the seven non-secret fields needed to
+//! relaunch-and-resume a host-profile session with exactly its launch-time shape
+//! after a daemon restart. The profile's **`env` is deliberately NOT among them** —
+//! it may hold secrets, so it is re-resolved by agent name at resume, never
+//! persisted (a deleted profile resumes from the structural snapshot with no env).
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use protocol::{AgentKind, ProjectSource};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::agent::{InputRules, ResumeMode, SessionRefKind};
 use crate::project::detect::project_id;
 
 /// One session's resume binding: everything needed to relaunch-and-resume.
@@ -74,6 +84,69 @@ pub struct ResumeBinding {
     /// reason. `None` when there is no project / it was never known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_linked_worktree: Option<bool>,
+    /// Structural relaunch snapshot (C.4): the resolved launch program, frozen at
+    /// creation so a host profile's `program` override survives a restart even if
+    /// the profile is later edited or deleted. Serde default (`""`) for a legacy
+    /// line — the store carries no compatibility guarantee beyond loading.
+    #[serde(default)]
+    pub program: String,
+    /// Structural relaunch snapshot (C.4): the resolved launch args, frozen at
+    /// creation. Serde default (`[]`) for a legacy line.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Structural relaunch snapshot (C.4): the resolved input-framing rules, frozen
+    /// at creation so a profile's `[input_rules]` override survives a restart.
+    #[serde(default)]
+    pub input_rules: StoredInputRules,
+    /// Structural relaunch snapshot (C.4): the resume argv mode, frozen at creation
+    /// so a profile's `[resume] mode` override drives the relaunch argv. `None` for
+    /// a non-resumable session or a legacy line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_mode: Option<ResumeMode>,
+    /// Structural relaunch snapshot (C.4): the native-reference kind, frozen at
+    /// creation. Decides whether the captured reference resumes via the id (dash)
+    /// guard or the path (absolute) guard. `None` for non-resumable / legacy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_kind: Option<SessionRefKind>,
+    /// Structural relaunch snapshot (C.4): whether this session resumes at all,
+    /// frozen at creation. Serde default (`false`) for a legacy line.
+    #[serde(default)]
+    pub resumable: bool,
+}
+
+/// Serializable mirror of [`crate::agent::InputRules`] for the resume snapshot
+/// (C.4). A `Duration` serializes as a `{secs, nanos}` object; this stores the
+/// submit delay flat as whole milliseconds instead, matching the profile TOML.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct StoredInputRules {
+    /// Whether prompt text is wrapped in bracketed-paste markers.
+    #[serde(default)]
+    pub bracketed_paste: bool,
+    /// Delay before the submit byte, in whole milliseconds.
+    #[serde(default)]
+    pub submit_delay_ms: u64,
+}
+
+impl From<InputRules> for StoredInputRules {
+    fn from(rules: InputRules) -> Self {
+        Self {
+            bracketed_paste: rules.bracketed_paste,
+            // Submit delays are small (≤ a few hundred ms); saturate defensively
+            // rather than truncate, so a pathological value can never wrap.
+            submit_delay_ms: u64::try_from(rules.submit_delay.as_millis()).unwrap_or(u64::MAX),
+        }
+    }
+}
+
+impl StoredInputRules {
+    /// Rebuild the in-memory [`InputRules`] from the persisted snapshot.
+    #[must_use]
+    pub fn to_input_rules(self) -> InputRules {
+        InputRules {
+            bracketed_paste: self.bracketed_paste,
+            submit_delay: Duration::from_millis(self.submit_delay_ms),
+        }
+    }
 }
 
 /// Lifecycle status of a worktree binding.
@@ -549,7 +622,8 @@ mod tests {
     use protocol::{AgentKind, ProjectSource};
 
     use super::{
-        ProjectRecord, ProjectResolution, ResumeBinding, Store, WorktreeBinding, WorktreeStatus,
+        ProjectRecord, ProjectResolution, ResumeBinding, ResumeMode, SessionRefKind, Store,
+        StoredInputRules, WorktreeBinding, WorktreeStatus,
     };
 
     fn temp_store_path(tag: &str) -> PathBuf {
@@ -577,6 +651,15 @@ mod tests {
             native_session_path: None,
             project_id: None,
             is_linked_worktree: None,
+            program: "claude".to_owned(),
+            args: Vec::new(),
+            input_rules: StoredInputRules {
+                bracketed_paste: false,
+                submit_delay_ms: 150,
+            },
+            resume_mode: Some(ResumeMode::Flag),
+            ref_kind: Some(SessionRefKind::Id),
+            resumable: true,
         }
     }
 
@@ -633,6 +716,63 @@ mod tests {
         assert_eq!(loaded.len(), 2, "no duplicate session id: {loaded:?}");
         let s1 = loaded.iter().find(|b| b.session_id == "s-1").expect("s-1");
         assert_eq!(s1.native_session_id.as_deref(), Some("native-1-updated"));
+    }
+
+    #[test]
+    fn resume_structural_snapshot_round_trips_verbatim() {
+        // A path-kind host-profile binding with a full C.4 snapshot must survive
+        // the JSON-lines round-trip byte-for-byte (PartialEq), including the seven
+        // structural fields and the path-vs-id native reference.
+        let store = Store::new(temp_store_path("resume-snapshot-roundtrip"));
+        let binding = ResumeBinding {
+            session_id: "s-path".to_owned(),
+            agent: "claude-sonnet".to_owned(),
+            agent_base: AgentKind::Claude,
+            cwd: PathBuf::from("/workspace"),
+            cols: 100,
+            rows: 30,
+            native_session_id: None,
+            native_session_path: Some("/home/u/.claude/t.jsonl".to_owned()),
+            project_id: Some("p-abc".to_owned()),
+            is_linked_worktree: Some(true),
+            program: "/opt/claude".to_owned(),
+            args: vec!["--model".to_owned(), "sonnet".to_owned()],
+            input_rules: StoredInputRules {
+                bracketed_paste: true,
+                submit_delay_ms: 42,
+            },
+            resume_mode: Some(ResumeMode::Subcommand),
+            ref_kind: Some(SessionRefKind::Path),
+            resumable: true,
+        };
+        store.record_resume(&binding).expect("record");
+        let loaded = store.load_resume().expect("load");
+        assert_eq!(loaded, vec![binding], "the structural snapshot round-trips");
+    }
+
+    #[test]
+    fn resume_legacy_line_loads_with_default_snapshot() {
+        // A resume line written before the C.4 snapshot existed (no program/args/
+        // input_rules/resume_mode/ref_kind/resumable) still loads, defaulting the
+        // snapshot — the store's only compatibility concession (serde default).
+        let store = Store::new(temp_store_path("resume-legacy"));
+        let legacy = concat!(
+            r#"{"kind":"resume","session_id":"s-old","agent":"claude","agent_base":"claude","#,
+            r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"native-old"}"#,
+            "\n"
+        );
+        fs::write(store.path(), legacy).expect("write legacy line");
+        let loaded = store.load_resume().expect("load legacy");
+        assert_eq!(loaded.len(), 1);
+        let b = &loaded[0];
+        assert_eq!(b.session_id, "s-old");
+        assert_eq!(b.native_session_id.as_deref(), Some("native-old"));
+        assert_eq!(b.program, "");
+        assert!(b.args.is_empty());
+        assert_eq!(b.input_rules, StoredInputRules::default());
+        assert_eq!(b.resume_mode, None);
+        assert_eq!(b.ref_kind, None);
+        assert!(!b.resumable);
     }
 
     #[test]

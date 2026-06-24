@@ -162,7 +162,7 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
             handle_session_report_native_id(request, &state.sessions).await
         }
         method::INTEGRATION_INSTALL => handle_integration_install(request),
-        method::HOST_INSPECT => handle_host_inspect(request, &state.health),
+        method::HOST_INSPECT => handle_host_inspect(request, &state.health, &state.sessions),
         method::HOST_DISCOVER => handle_host_discover(request, &state.discovery).await,
         method::PROJECT_LIST => handle_project_list(request, &state.sessions).await,
         method::PROJECT_ADD => handle_project_add(request, &state.sessions).await,
@@ -194,10 +194,14 @@ fn handle_health(request: &Request, health: &HealthInfo) -> Response {
 /// against `PATH`), so it always reflects the host as it is now. Transport
 /// agnostic: the same handler answers over the local Unix socket and over a
 /// NetBird TCP connection.
-fn handle_host_inspect(request: &Request, health: &HealthInfo) -> Response {
+fn handle_host_inspect(
+    request: &Request,
+    health: &HealthInfo,
+    sessions: &SessionRegistry,
+) -> Response {
     ok_value(
         request,
-        &crate::capabilities::host_capabilities(&health.daemon_version),
+        &crate::capabilities::host_capabilities(&health.daemon_version, sessions.profiles()),
     )
 }
 
@@ -663,6 +667,7 @@ mod tests {
             state_source: StateSource::Process,
             activity: None,
             native_session_id: None,
+            native_session_path: None,
             project_id: None,
             project_label: None,
             is_linked_worktree: Some(true),

@@ -24,10 +24,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::agent::{
-    adapter_for, build_pty_command, launch_adapter_for, resume_pty_command, AgentAdapter,
-    AgentCommand, InputRules, LaunchOpts, ProfileRegistry, ResolvedAgent, SessionRef,
+    adapter_for, agent_not_resumable, base_resume_template, build_pty_command, default_program,
+    launch_adapter_for, resume_pty_command_from_template, AgentAdapter, AgentCommand, InputRules,
+    LaunchOpts, ProfileRegistry, ResolvedAgent, ResumeTemplate, SessionRef, SessionRefKind,
 };
-use crate::detect::{ActivityTransition, Detector, DetectorConfig};
+use crate::detect::{ActivityTransition, Detector, DetectorConfig, Manifest};
 use crate::integration::{
     ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
@@ -359,12 +360,22 @@ struct PtySessionSpec {
     agent_base: AgentKind,
     /// Input-framing rules for this session (base-kind defaults, profile-overridden).
     input_rules: InputRules,
+    /// Frozen structural relaunch snapshot (C.4): launch program/args + the resolved
+    /// resume template (`None` ⇒ not resumable). Persisted verbatim so a restart
+    /// resumes with the launch-time shape even after the profile changes.
+    snapshot: ResumeSnapshot,
+    /// Detection-manifest override (a profile's `manifest =`), threaded to the
+    /// detector at spawn. `None` ⇒ inherit the base kind's manifest. Re-resolved by
+    /// agent name on the resume path (never persisted).
+    manifest_override: Option<Manifest>,
     cwd: PathBuf,
     cols: u16,
     rows: u16,
     command: PtyCommand,
     /// Native id when relaunching a captured session (`None` on first launch).
     native_session_id: Option<String>,
+    /// Native transcript path when relaunching a path-resuming captured session.
+    native_session_path: Option<String>,
     /// Project this session belongs to (derived id), when one was resolved.
     project_id: Option<String>,
     /// Whether the session's checkout is a linked worktree (`None` if no git).
@@ -377,6 +388,23 @@ struct PtySessionSpec {
     worktree_path: Option<PathBuf>,
     /// Non-fatal worktree-setup warnings to surface on the session.
     warnings: Vec<SessionWarning>,
+}
+
+/// Frozen structural relaunch snapshot for a session (Part C, C.4).
+///
+/// Set once at launch from the [`ResolvedAgent`] and persisted verbatim on every
+/// resume-binding write, so a daemon restart relaunches with the original launch
+/// program/args + resume mechanics even after the host profile is edited or
+/// deleted. Deliberately holds **no env** — that is re-resolved by agent name at
+/// resume (it may carry secrets, which never touch the store).
+#[derive(Debug, Clone)]
+struct ResumeSnapshot {
+    /// Launch program (the profile's `program` or the base kind's default).
+    program: String,
+    /// Launch args (the profile's `args`; empty for a bare base kind).
+    args: Vec<String>,
+    /// Resolved resume template; `None` ⇒ this session does not resume.
+    resume: Option<ResumeTemplate>,
 }
 
 /// The resolved launch target for a `session.new`: where the agent runs and the
@@ -482,6 +510,10 @@ struct SessionEntry {
     /// Resolved input-framing rules (base-kind defaults, profile-overridden), used
     /// by `session.input` so a profile's `[input_rules]` is honored on every write.
     input_rules: InputRules,
+    /// Frozen structural relaunch snapshot (C.4), set once at register time and
+    /// copied verbatim into every persisted [`ResumeBinding`] — so a resize-driven
+    /// re-persist can never overwrite the launch-time program/args/resume shape.
+    snapshot: ResumeSnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -579,6 +611,13 @@ impl SessionRegistry {
     #[must_use]
     pub fn config_dir(&self) -> Option<&Path> {
         self.inner.config.config_dir.as_deref()
+    }
+
+    /// The resolved host agent-profile registry (Part C), for `host.inspect` to
+    /// enumerate the launchable agent names + probe each profile's program.
+    #[must_use]
+    pub(crate) fn profiles(&self) -> &ProfileRegistry {
+        &self.inner.profiles
     }
 
     /// This daemon process instance's opaque id, injected into every session PTY
@@ -805,6 +844,29 @@ impl SessionRegistry {
                 .as_ref()
                 .and_then(|profile| profile.input_rules)
                 .unwrap_or_else(|| input_rules_for_agent(base, &self.inner.config));
+            // Freeze the structural relaunch snapshot (C.4) from the resolved agent:
+            // the launch program/args plus the resume template (a profile's override,
+            // else the base kind's). Cloned/copied so `resolved` stays usable below.
+            let snapshot = ResumeSnapshot {
+                program: resolved
+                    .profile
+                    .as_ref()
+                    .map_or_else(|| default_program(base), |profile| profile.program.clone()),
+                args: resolved
+                    .profile
+                    .as_ref()
+                    .map_or_else(Vec::new, |profile| profile.args.clone()),
+                resume: match &resolved.profile {
+                    Some(profile) => profile.resume,
+                    None => base_resume_template(base),
+                },
+            };
+            // The detection-manifest override is consumed only by the detector, on
+            // both the launch and resume paths; never persisted (re-resolved by name).
+            let manifest_override = resolved
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.manifest.clone());
             // Profile env first, then the daemon handshake env appended last, so
             // every reserved POHUNEK_* key takes the daemon's value (last-write-wins;
             // the loader also strips POHUNEK_* from the profile env up front).
@@ -828,11 +890,14 @@ impl SessionRegistry {
                 agent: resolved.name.clone(),
                 agent_base: base,
                 input_rules,
+                snapshot,
+                manifest_override,
                 cwd: launch_cwd,
                 cols: params.cols,
                 rows: params.rows,
                 command,
                 native_session_id: None,
+                native_session_path: None,
                 project_id,
                 is_linked_worktree,
                 repo,
@@ -1171,11 +1236,14 @@ impl SessionRegistry {
             agent,
             agent_base,
             input_rules,
+            snapshot,
+            manifest_override,
             cwd,
             cols,
             rows,
             command,
             native_session_id,
+            native_session_path,
             project_id,
             is_linked_worktree,
             repo,
@@ -1210,6 +1278,7 @@ impl SessionRegistry {
             state_source: StateSource::Process,
             activity: None,
             native_session_id,
+            native_session_path,
             project_id,
             // Denormalized for display, resolved fresh at `session.list` time.
             project_label: None,
@@ -1234,6 +1303,7 @@ impl SessionRegistry {
                     detector_resize,
                     stopping: false,
                     input_rules,
+                    snapshot,
                 },
             );
         }
@@ -1242,6 +1312,7 @@ impl SessionRegistry {
         self.spawn_detector(
             id.clone(),
             agent_base,
+            manifest_override,
             detector_output,
             (rows, cols),
             detector_cancel,
@@ -1356,19 +1427,6 @@ impl SessionRegistry {
     ) -> SessionReportNativeIdResult {
         let not_recorded = SessionReportNativeIdResult { recorded: false };
 
-        // Claude and Codex report an opaque native id, never a path.
-        let session_ref = match SessionRef::id(&params.native_session_id) {
-            Ok(session_ref) => session_ref,
-            Err(err) => {
-                debug!(
-                    session_id = %params.session_id.0,
-                    error = %err,
-                    "ignoring native-id report with an invalid native session id"
-                );
-                return not_recorded;
-            }
-        };
-
         let info = {
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(&params.session_id) else {
@@ -1386,7 +1444,41 @@ impl SessionRegistry {
                 return not_recorded;
             }
 
-            entry.info.native_session_id = Some(session_ref.value().to_owned());
+            // The native reference KIND is frozen at launch (a profile's `ref_kind`,
+            // or `id` for a base kind). The SessionStart hook bakes a base-kind
+            // literal into the wire `agent` and carries no profile identity, so the
+            // wire value is ignored for kind selection — the snapshot is authoritative.
+            let ref_kind = entry
+                .snapshot
+                .resume
+                .map_or(SessionRefKind::Id, |template| template.ref_kind);
+            let validated = match ref_kind {
+                SessionRefKind::Id => SessionRef::id(&params.native_session_id),
+                SessionRefKind::Path => SessionRef::path(&params.native_session_id),
+            };
+            let session_ref = match validated {
+                Ok(session_ref) => session_ref,
+                Err(err) => {
+                    debug!(
+                        session_id = %params.session_id.0,
+                        error = %err,
+                        "ignoring native-id report with an invalid native reference"
+                    );
+                    return not_recorded;
+                }
+            };
+            // Store into the field chosen by kind, clearing the other so a session
+            // resumes by exactly one mechanism (the persist literal copies both).
+            match ref_kind {
+                SessionRefKind::Id => {
+                    entry.info.native_session_id = Some(session_ref.value().to_owned());
+                    entry.info.native_session_path = None;
+                }
+                SessionRefKind::Path => {
+                    entry.info.native_session_path = Some(session_ref.value().to_owned());
+                    entry.info.native_session_id = None;
+                }
+            }
             entry.info.updated_at = timestamp_now();
             entry.info.clone()
         };
@@ -1422,24 +1514,39 @@ impl SessionRegistry {
                 if is_terminal(entry.info.state) {
                     return None;
                 }
-                entry
-                    .info
-                    .native_session_id
-                    .as_ref()
-                    .map(|native| ResumeBinding {
-                        session_id: id.0.clone(),
-                        agent: entry.info.agent.clone(),
-                        agent_base: entry.info.agent_base,
-                        cwd: entry.info.cwd.clone(),
-                        cols: entry.info.cols,
-                        rows: entry.info.rows,
-                        native_session_id: Some(native.clone()),
-                        native_session_path: None,
-                        // Capture the project context so resume restores it without
-                        // re-detecting (F5): a restart reads these back verbatim.
-                        project_id: entry.info.project_id.clone(),
-                        is_linked_worktree: entry.info.is_linked_worktree,
-                    })
+                // Resumable once the agent has reported a native reference — an
+                // opaque id (claude/codex) or a transcript path (a path-resuming
+                // host profile). No reference yet ⇒ no binding.
+                if entry.info.native_session_id.is_none()
+                    && entry.info.native_session_path.is_none()
+                {
+                    return None;
+                }
+                Some(ResumeBinding {
+                    session_id: id.0.clone(),
+                    agent: entry.info.agent.clone(),
+                    agent_base: entry.info.agent_base,
+                    cwd: entry.info.cwd.clone(),
+                    cols: entry.info.cols,
+                    rows: entry.info.rows,
+                    native_session_id: entry.info.native_session_id.clone(),
+                    native_session_path: entry.info.native_session_path.clone(),
+                    // Capture the project context so resume restores it without
+                    // re-detecting (F5): a restart reads these back verbatim.
+                    project_id: entry.info.project_id.clone(),
+                    is_linked_worktree: entry.info.is_linked_worktree,
+                    // Structural relaunch snapshot (C.4): copied verbatim from the
+                    // frozen entry snapshot on EVERY persist (creation, native-id
+                    // capture, the hot resize path), so a resize re-persist can never
+                    // overwrite the launch-time shape. `env` is intentionally absent —
+                    // it is re-resolved by agent name at resume (no secrets in store).
+                    program: entry.snapshot.program.clone(),
+                    args: entry.snapshot.args.clone(),
+                    input_rules: entry.input_rules.into(),
+                    resume_mode: entry.snapshot.resume.map(|template| template.mode),
+                    ref_kind: entry.snapshot.resume.map(|template| template.ref_kind),
+                    resumable: entry.snapshot.resume.is_some(),
+                })
             })
         };
         let result = match &desired {
@@ -1512,35 +1619,101 @@ impl SessionRegistry {
 
     /// Relaunch one session from its stored resume binding, reusing its id.
     async fn resume_binding(&self, binding: ResumeBinding) -> Result<SessionInfo, ProtocolError> {
-        let session_ref = match (&binding.native_session_id, &binding.native_session_path) {
-            (Some(id), _) => SessionRef::id(id)?,
-            (None, Some(path)) => SessionRef::path(path)?,
-            (None, None) => {
-                return Err(runtime_error(
-                    "not_resumable",
-                    format!(
-                        "resume binding for {} has no native id or path",
-                        binding.session_id
-                    ),
-                ));
-            }
+        // The resume mechanics come from the frozen structural snapshot (C.4). An
+        // explicit `(resume_mode, ref_kind)` pair drives the argv; a legacy binding
+        // (pre-C2, no snapshot) falls back to the base kind's native template.
+        let template = match (binding.resume_mode, binding.ref_kind) {
+            (Some(mode), Some(ref_kind)) => ResumeTemplate { mode, ref_kind },
+            _ => base_resume_template(binding.agent_base)
+                .ok_or_else(|| agent_not_resumable(&binding.agent))?,
+        };
+        // Build the native reference from the field the frozen `ref_kind` names, so
+        // a `path`-kind profile inherits the absolute-path guard and an `id`-kind the
+        // leading-dash guard (the documented asymmetry).
+        let session_ref = match template.ref_kind {
+            SessionRefKind::Id => match &binding.native_session_id {
+                Some(value) => SessionRef::id(value)?,
+                None => {
+                    return Err(runtime_error(
+                        "not_resumable",
+                        format!(
+                            "resume binding for {} is id-kind but has no native id",
+                            binding.session_id
+                        ),
+                    ));
+                }
+            },
+            SessionRefKind::Path => match &binding.native_session_path {
+                Some(value) => SessionRef::path(value)?,
+                None => {
+                    return Err(runtime_error(
+                        "not_resumable",
+                        format!(
+                            "resume binding for {} is path-kind but has no native path",
+                            binding.session_id
+                        ),
+                    ));
+                }
+            },
         };
 
         let id = SessionId(binding.session_id.clone());
         self.bump_next_id_past(&id);
-        // Resume is keyed on the snapshotted base kind (the detection/handshake/
-        // resume-argv mechanics); the agent NAME is preserved for display. C1
-        // re-derives input rules from the base kind — a profile's resume override +
-        // frozen structural snapshot land in C2.
-        let env_extra = self.session_pty_env(binding.agent_base, &id);
+
+        // A legacy binding carries no snapshot program; fall back to the base kind's
+        // default so it still relaunches. `program`/`input_rules` are frozen
+        // structural fields — never re-resolved from the profile.
+        let has_snapshot = !binding.program.is_empty();
+        let program = if has_snapshot {
+            binding.program.clone()
+        } else {
+            default_program(binding.agent_base)
+        };
+        let input_rules = if has_snapshot {
+            binding.input_rules.to_input_rules()
+        } else {
+            input_rules_for_agent(binding.agent_base, &self.inner.config)
+        };
+
+        // Re-resolve the profile by NAME to recover its (possibly-secret) env + its
+        // detection-manifest override — neither is ever persisted (C.4 no-secrets).
+        // A deleted/renamed profile resumes from the frozen structural snapshot with
+        // no profile env and a warning, never a failure.
+        let (profile_env, manifest_override) = match self
+            .inner
+            .profiles
+            .resolve_agent(&binding.agent)
+        {
+            Ok(resolved) => resolved.profile.map_or((Vec::new(), None), |profile| {
+                (profile.env, profile.manifest)
+            }),
+            Err(err) => {
+                warn!(
+                    session_id = %binding.session_id,
+                    agent = %binding.agent,
+                    error = %err,
+                    "agent profile no longer resolves at resume; relaunching from the structural snapshot without profile env"
+                );
+                (Vec::new(), None)
+            }
+        };
+        // Profile env first, daemon handshake env appended last (POHUNEK_* wins).
+        let mut env_extra = profile_env;
+        env_extra.extend(self.session_pty_env(binding.agent_base, &id));
         let opts = LaunchOpts {
             cwd: binding.cwd.clone(),
             cols: binding.cols,
             rows: binding.rows,
             env_extra,
         };
-        let command = resume_pty_command(binding.agent_base, &session_ref, &opts)?;
-        let input_rules = input_rules_for_agent(binding.agent_base, &self.inner.config);
+        let command = resume_pty_command_from_template(&program, template, &session_ref, &opts)?;
+        // Re-freeze the structural snapshot for the resumed entry so a later resize
+        // re-persist keeps the same launch-time shape.
+        let snapshot = ResumeSnapshot {
+            program,
+            args: binding.args.clone(),
+            resume: Some(template),
+        };
         // A resumed session relaunches in its recorded cwd, which already is the
         // worktree path for worktree sessions (the worktree persists on disk
         // across a daemon restart). With the unified store the session's worktree
@@ -1559,11 +1732,14 @@ impl SessionRegistry {
             agent: binding.agent,
             agent_base: binding.agent_base,
             input_rules,
+            snapshot,
+            manifest_override,
             cwd: binding.cwd,
             cols: binding.cols,
             rows: binding.rows,
             command,
             native_session_id: binding.native_session_id,
+            native_session_path: binding.native_session_path,
             project_id,
             is_linked_worktree,
             repo,
@@ -1951,10 +2127,15 @@ impl SessionRegistry {
         });
     }
 
+    // The detector spawn carries the session id, base kind, manifest override, the
+    // output stream, the initial size, and its cancel/resize channels — all distinct
+    // runtime inputs with no natural grouping struct.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_detector(
         &self,
         id: SessionId,
         agent: AgentKind,
+        manifest_override: Option<Manifest>,
         mut output_rx: broadcast::Receiver<Vec<u8>>,
         size: (u16, u16),
         cancel: CancellationToken,
@@ -1962,7 +2143,9 @@ impl SessionRegistry {
     ) {
         let registry = self.clone();
         tokio::spawn(async move {
-            let detector_config = DetectorConfig::for_agent(agent);
+            // A host profile may override the base kind's detection manifest; absent
+            // an override this is exactly `for_agent(agent)` (C.3).
+            let detector_config = DetectorConfig::for_profile(agent, manifest_override);
             let mut tick = tokio::time::interval(detector_config.detection.recheck_after);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tick.tick().await;
@@ -2367,7 +2550,7 @@ mod tests {
         SessionReportNativeIdParams, SessionState,
     };
 
-    use crate::agent::InputRules;
+    use crate::agent::{InputRules, ResumeMode, SessionRefKind};
     use crate::integration::{
         ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
     };
@@ -3477,6 +3660,130 @@ mod tests {
         let _ = registry.stop(&created.id).await;
     }
 
+    /// Create a temp `agents/` dir holding one profile file; return the dir path.
+    fn temp_agents_dir_with(tag: &str, name: &str, body: &str) -> PathBuf {
+        let dir = temp_store_path(tag)
+            .parent()
+            .expect("store parent")
+            .join("agents");
+        std::fs::create_dir_all(&dir).expect("create agents dir");
+        std::fs::write(dir.join(format!("{name}.toml")), body).expect("write profile");
+        dir
+    }
+
+    #[tokio::test]
+    async fn report_native_id_path_profile_stores_path_and_ignores_wire_agent() {
+        // The load-bearing C.3 fix: a `ref_kind = "path"` profile must store the
+        // native reference into `native_session_path` (clearing `native_session_id`),
+        // chosen by the FROZEN snapshot — never by the wire `agent` literal, which
+        // the SessionStart hook bakes to a base-kind name carrying no profile id.
+        let store_path = temp_store_path("path-profile");
+        let agents_dir = temp_agents_dir_with(
+            "path-profile",
+            "pathy",
+            "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n[resume]\nref_kind = \"path\"\n",
+        );
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path.clone()),
+            agents_dir: Some(agents_dir),
+            socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
+            ..SessionRegistryConfig::default()
+        });
+
+        let created = registry
+            .create(SessionNewParams {
+                agent: "pathy".to_owned(),
+                ..params()
+            })
+            .await
+            .expect("create path-profile session");
+
+        let result = registry
+            .report_native_id(SessionReportNativeIdParams {
+                session_id: created.id.clone(),
+                // Wire agent is a base-kind literal (what the hook reports); ignored
+                // for ref-kind selection.
+                agent: "claude".to_owned(),
+                native_session_id: "/home/u/.claude/t.jsonl".to_owned(),
+                transcript_path: None,
+            })
+            .await;
+        assert!(result.recorded);
+
+        let inspected = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(
+            inspected.native_session_path.as_deref(),
+            Some("/home/u/.claude/t.jsonl"),
+            "a path-kind profile stores into native_session_path"
+        );
+        assert_eq!(
+            inspected.native_session_id, None,
+            "the id field is left empty for a path-kind session"
+        );
+
+        let persisted = crate::store::Store::new(store_path)
+            .load_resume()
+            .expect("load store");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(
+            persisted[0].native_session_path.as_deref(),
+            Some("/home/u/.claude/t.jsonl")
+        );
+        assert_eq!(persisted[0].native_session_id, None);
+        assert_eq!(persisted[0].ref_kind, Some(SessionRefKind::Path));
+        assert_eq!(persisted[0].resume_mode, Some(ResumeMode::Flag));
+        assert_eq!(persisted[0].program, "/bin/sh");
+        assert!(persisted[0].resumable);
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn resume_binding_never_persists_profile_env_secrets() {
+        // C.4 no-secrets invariant: a profile's `[env]` (which may hold secrets) is
+        // never written to the store. The serialized resume line must contain none
+        // of the env keys OR values — env is re-resolved by agent name at resume.
+        let store_path = temp_store_path("env-secret");
+        let agents_dir = temp_agents_dir_with(
+            "env-secret",
+            "withenv",
+            "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n[env]\nSECRET_TOKEN = \"supersecretvalue\"\n",
+        );
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path.clone()),
+            agents_dir: Some(agents_dir),
+            socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
+            ..SessionRegistryConfig::default()
+        });
+
+        let created = registry
+            .create(SessionNewParams {
+                agent: "withenv".to_owned(),
+                ..params()
+            })
+            .await
+            .expect("create env-profile session");
+        let result = registry
+            .report_native_id(SessionReportNativeIdParams {
+                session_id: created.id.clone(),
+                agent: "claude".to_owned(),
+                native_session_id: "native-xyz".to_owned(),
+                transcript_path: None,
+            })
+            .await;
+        assert!(result.recorded);
+
+        let raw = std::fs::read_to_string(&store_path).expect("read store file");
+        assert!(
+            !raw.contains("SECRET_TOKEN") && !raw.contains("supersecretvalue"),
+            "profile env (key or value) must never reach the store: {raw}"
+        );
+
+        let _ = registry.stop(&created.id).await;
+    }
+
     #[tokio::test]
     async fn stopping_a_session_drops_its_resume_binding() {
         let store_path = temp_store_path("drop-on-stop");
@@ -3617,6 +3924,12 @@ mod tests {
                 native_session_path: None,
                 project_id: None,
                 is_linked_worktree: None,
+                program: String::new(),
+                args: Vec::new(),
+                input_rules: crate::store::StoredInputRules::default(),
+                resume_mode: None,
+                ref_kind: None,
+                resumable: false,
             })
             .expect("seed corrupt binding");
 

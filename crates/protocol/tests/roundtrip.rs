@@ -41,6 +41,7 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         state_source: StateSource::Process,
         activity: None,
         native_session_id: None,
+        native_session_path: None,
         project_id: None,
         project_label: None,
         is_linked_worktree: None,
