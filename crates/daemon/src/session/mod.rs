@@ -24,8 +24,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::agent::{
-    resume_pty_command, AgentAdapter, ClaudeAdapter, CodexAdapter, InputRules, LaunchOpts,
-    SessionRef,
+    adapter_for, launch_adapter_for, resume_pty_command, AgentAdapter, AgentCommand, InputRules,
+    LaunchOpts, SessionRef,
 };
 use crate::detect::{ActivityTransition, Detector, DetectorConfig};
 use crate::integration::{
@@ -95,29 +95,37 @@ impl ShellCommand {
             args: args.into_iter().map(Into::into).collect(),
         }
     }
-
-    fn to_pty_command(
-        &self,
-        cwd: PathBuf,
-        cols: u16,
-        rows: u16,
-        env: Vec<(String, String)>,
-    ) -> PtyCommand {
-        PtyCommand {
-            program: self.program.clone(),
-            args: self.args.clone(),
-            env,
-            cwd,
-            cols,
-            rows,
-        }
-    }
 }
 
 impl Default for ShellCommand {
     fn default() -> Self {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
         Self::new(shell, std::iter::empty::<String>())
+    }
+}
+
+impl AgentAdapter for ShellCommand {
+    fn id(&self) -> &str {
+        "shell"
+    }
+
+    fn launch(&self, opts: &LaunchOpts) -> Result<PtyCommand, ProtocolError> {
+        crate::agent::build_pty_command(&self.program, self.args.clone(), opts)
+    }
+
+    fn input_rules(&self) -> InputRules {
+        InputRules {
+            bracketed_paste: false,
+            submit_delay: Duration::ZERO,
+        }
+    }
+
+    fn manifest(&self) -> &crate::detect::Manifest {
+        crate::detect::generic_shell_manifest()
+    }
+
+    fn resume(&self, _session_ref: &SessionRef) -> Result<AgentCommand, ProtocolError> {
+        Err(crate::agent::agent_not_resumable(self.id()))
     }
 }
 
@@ -2127,38 +2135,24 @@ fn build_launch_command(
     rows: u16,
     env_extra: Vec<(String, String)>,
 ) -> Result<PtyCommand, ProtocolError> {
-    match agent {
-        // A shell gets no agent-hook handshake, but it does carry the universal
-        // `POHUNEK_SESSION_ID` marker (see `session_pty_env`) so a `pohunek attach`
-        // launched inside it is still caught as a self-feeding loop.
-        AgentKind::Shell => Ok(shell_command.to_pty_command(cwd, cols, rows, env_extra)),
-        AgentKind::Codex => CodexAdapter.launch(&LaunchOpts {
-            cwd,
-            cols,
-            rows,
-            env_extra,
-        }),
-        AgentKind::Claude => ClaudeAdapter.launch(&LaunchOpts {
-            cwd,
-            cols,
-            rows,
-            env_extra,
-        }),
-    }
+    // Shell carries no agent-hook handshake, but it does carry the universal
+    // `POHUNEK_SESSION_ID` marker (see `session_pty_env`) so a `pohunek attach`
+    // launched inside it is still caught as a self-feeding loop.
+    let opts = LaunchOpts {
+        cwd,
+        cols,
+        rows,
+        env_extra,
+    };
+    launch_adapter_for(agent, shell_command).launch(&opts)
 }
 
 fn input_rules_for_agent(agent: AgentKind, config: &SessionRegistryConfig) -> InputRules {
-    match agent {
-        AgentKind::Shell => InputRules {
-            bracketed_paste: false,
-            submit_delay: Duration::ZERO,
-        },
-        AgentKind::Codex => CodexAdapter.input_rules(),
-        AgentKind::Claude => InputRules {
-            submit_delay: config.claude_submit_delay,
-            ..ClaudeAdapter.input_rules()
-        },
+    let mut rules = adapter_for(agent).input_rules();
+    if agent == AgentKind::Claude {
+        rules.submit_delay = config.claude_submit_delay;
     }
+    rules
 }
 
 fn build_input_writes(text: &str, rules: InputRules) -> InputWritePlan {

@@ -13,7 +13,7 @@ use crate::pty::PtyCommand;
 pub struct CodexAdapter;
 
 impl AgentAdapter for CodexAdapter {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "codex"
     }
 
@@ -28,14 +28,14 @@ impl AgentAdapter for CodexAdapter {
         }
     }
 
-    fn manifest(&self) -> &'static Manifest {
+    fn manifest(&self) -> &Manifest {
         crate::detect::codex_manifest()
     }
 
-    fn resume(&self, session_ref: &SessionRef) -> AgentCommand {
-        resume_command(
+    fn resume(&self, session_ref: &SessionRef) -> Result<AgentCommand, ProtocolError> {
+        Ok(resume_command(
             "codex",
             vec!["resume".to_owned(), session_ref.value().to_owned()],
-        )
+        ))
     }
 }

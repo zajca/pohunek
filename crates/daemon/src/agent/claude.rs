@@ -12,7 +12,7 @@ use crate::pty::PtyCommand;
 pub struct ClaudeAdapter;
 
 impl AgentAdapter for ClaudeAdapter {
-    fn id(&self) -> &'static str {
+    fn id(&self) -> &str {
         "claude"
     }
 
@@ -27,14 +27,14 @@ impl AgentAdapter for ClaudeAdapter {
         }
     }
 
-    fn manifest(&self) -> &'static Manifest {
+    fn manifest(&self) -> &Manifest {
         crate::detect::claude_manifest()
     }
 
-    fn resume(&self, session_ref: &SessionRef) -> AgentCommand {
-        resume_command(
+    fn resume(&self, session_ref: &SessionRef) -> Result<AgentCommand, ProtocolError> {
+        Ok(resume_command(
             "claude",
             vec!["--resume".to_owned(), session_ref.value().to_owned()],
-        )
+        ))
     }
 }

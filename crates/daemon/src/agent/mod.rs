@@ -14,9 +14,15 @@ use crate::pty::PtyCommand;
 
 mod claude;
 mod codex;
+mod shell;
 
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
+pub use shell::ShellAdapter;
+
+static SHELL_ADAPTER: ShellAdapter = ShellAdapter;
+static CODEX_ADAPTER: CodexAdapter = CodexAdapter;
+static CLAUDE_ADAPTER: ClaudeAdapter = ClaudeAdapter;
 
 /// Default submit delay for Claude Code's Ink TUI.
 pub const DEFAULT_CLAUDE_SUBMIT_DELAY: Duration = Duration::from_millis(150);
@@ -172,23 +178,43 @@ impl AgentCommand {
 /// Thin per-agent adapter for launch, input, and resume behavior.
 pub trait AgentAdapter: std::fmt::Debug + Send + Sync {
     /// Stable adapter id.
-    fn id(&self) -> &'static str;
+    fn id(&self) -> &str;
     /// Build the PTY launch command, resolving the executable from `PATH`.
     fn launch(&self, opts: &LaunchOpts) -> Result<PtyCommand, ProtocolError>;
     /// Programmatic input injection rules.
     fn input_rules(&self) -> InputRules;
     /// Agent-specific activity manifest.
-    fn manifest(&self) -> &'static Manifest;
+    fn manifest(&self) -> &Manifest;
     /// Build a native resume command argv. M6 only builds this; M7 wires resume.
-    fn resume(&self, session_ref: &SessionRef) -> AgentCommand;
+    fn resume(&self, session_ref: &SessionRef) -> Result<AgentCommand, ProtocolError>;
 }
 
 fn launch_command(
-    program: &'static str,
+    program: &str,
     args: Vec<String>,
     opts: &LaunchOpts,
 ) -> Result<PtyCommand, ProtocolError> {
     build_pty_command(program, args, opts)
+}
+
+/// Return the built-in adapter for an agent kind.
+pub fn adapter_for(agent: protocol::AgentKind) -> &'static dyn AgentAdapter {
+    match agent {
+        protocol::AgentKind::Shell => &SHELL_ADAPTER,
+        protocol::AgentKind::Codex => &CODEX_ADAPTER,
+        protocol::AgentKind::Claude => &CLAUDE_ADAPTER,
+    }
+}
+
+/// Return the launch adapter, preserving the configured shell command seam.
+pub(crate) fn launch_adapter_for(
+    agent: protocol::AgentKind,
+    shell_command: &crate::session::ShellCommand,
+) -> &dyn AgentAdapter {
+    match agent {
+        protocol::AgentKind::Shell => shell_command,
+        protocol::AgentKind::Codex | protocol::AgentKind::Claude => adapter_for(agent),
+    }
 }
 
 /// Resolve `program` on `PATH` and build a PTY launch command in `opts`.
@@ -226,23 +252,21 @@ pub fn resume_pty_command(
     session_ref: &SessionRef,
     opts: &LaunchOpts,
 ) -> Result<PtyCommand, ProtocolError> {
-    let command = match agent {
-        protocol::AgentKind::Claude => ClaudeAdapter.resume(session_ref),
-        protocol::AgentKind::Codex => CodexAdapter.resume(session_ref),
-        protocol::AgentKind::Shell => {
-            return Err(ProtocolError::new(
-                ErrorClass::Runtime,
-                "agent_not_resumable",
-                "shell sessions cannot be resumed",
-                None,
-            ));
-        }
-    };
+    let command = adapter_for(agent).resume(session_ref)?;
     build_pty_command(&command.program, command.args, opts)
 }
 
 fn resume_command(program: &'static str, args: Vec<String>) -> AgentCommand {
     AgentCommand::new(program, args)
+}
+
+pub(crate) fn agent_not_resumable(agent: &str) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Runtime,
+        "agent_not_resumable",
+        format!("{agent} sessions cannot be resumed"),
+        None,
+    )
 }
 
 fn resolve_binary(name: &str) -> Result<String, ProtocolError> {
@@ -300,6 +324,7 @@ mod tests {
 
     use super::{
         AgentAdapter, ClaudeAdapter, CodexAdapter, LaunchOpts, SessionRef, SessionRefKind,
+        ShellAdapter,
     };
     use crate::detect::{ManifestRegion, MatchContext};
 
@@ -355,6 +380,24 @@ mod tests {
         result
     }
 
+    fn with_path_and_shell<T>(path: &Path, shell: &str, run: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let old_path = std::env::var_os("PATH");
+        let old_shell = std::env::var_os("SHELL");
+        std::env::set_var("PATH", path);
+        std::env::set_var("SHELL", shell);
+        let result = run();
+        match old_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        match old_shell {
+            Some(value) => std::env::set_var("SHELL", value),
+            None => std::env::remove_var("SHELL"),
+        }
+        result
+    }
+
     #[test]
     fn codex_launch_resolves_binary_and_preserves_opts() {
         let bin_dir = temp_dir("codex-bin");
@@ -402,7 +445,34 @@ mod tests {
     }
 
     #[test]
+    fn shell_launch_resolves_binary_and_preserves_opts() {
+        let bin_dir = temp_dir("shell-bin");
+        let shell = write_executable(&bin_dir, "shell");
+        let cwd = temp_dir("shell-cwd");
+
+        let command = with_path_and_shell(&bin_dir, "shell", || {
+            ShellAdapter
+                .launch(&launch_opts(cwd.clone()))
+                .expect("shell launch command")
+        });
+
+        assert_eq!(command.program, shell.display().to_string());
+        assert!(command.args.is_empty());
+        assert_eq!(command.cwd, cwd);
+        assert_eq!(command.cols, 120);
+        assert_eq!(command.rows, 40);
+        assert_eq!(
+            command.env,
+            vec![("POHUNEK_SESSION_ID".to_owned(), "s-42".to_owned())]
+        );
+    }
+
+    #[test]
     fn adapters_return_expected_input_rules() {
+        let shell = ShellAdapter.input_rules();
+        assert!(!shell.bracketed_paste);
+        assert_eq!(shell.submit_delay, Duration::ZERO);
+
         let codex = CodexAdapter.input_rules();
         assert!(codex.bracketed_paste);
         assert_eq!(codex.submit_delay, Duration::ZERO);
@@ -416,11 +486,13 @@ mod tests {
     fn resume_builders_match_native_agent_argv() {
         let session = SessionRef::new("native-123").expect("session ref");
 
-        let codex = CodexAdapter.resume(&session);
+        let codex = CodexAdapter.resume(&session).expect("codex resume command");
         assert_eq!(codex.program, "codex");
         assert_eq!(codex.args, vec!["resume", "native-123"]);
 
-        let claude = ClaudeAdapter.resume(&session);
+        let claude = ClaudeAdapter
+            .resume(&session)
+            .expect("claude resume command");
         assert_eq!(claude.program, "claude");
         assert_eq!(claude.args, vec!["--resume", "native-123"]);
     }
@@ -513,9 +585,11 @@ mod tests {
     #[test]
     fn resume_argv_carries_path_kind_value() {
         let session = SessionRef::path("/abs/session.jsonl").expect("path session ref");
-        let claude = ClaudeAdapter.resume(&session);
+        let claude = ClaudeAdapter
+            .resume(&session)
+            .expect("claude resume command");
         assert_eq!(claude.args, vec!["--resume", "/abs/session.jsonl"]);
-        let codex = CodexAdapter.resume(&session);
+        let codex = CodexAdapter.resume(&session).expect("codex resume command");
         assert_eq!(codex.args, vec!["resume", "/abs/session.jsonl"]);
     }
 
@@ -548,6 +622,11 @@ mod tests {
     fn resume_pty_command_rejects_shell_agent() {
         let cwd = temp_dir("resume-shell-cwd");
         let session = SessionRef::id("native-123").expect("session ref");
+        let adapter_err = ShellAdapter
+            .resume(&session)
+            .expect_err("shell adapter is not resumable");
+        assert_eq!(adapter_err.code, "agent_not_resumable");
+
         let err =
             super::resume_pty_command(protocol::AgentKind::Shell, &session, &launch_opts(cwd))
                 .expect_err("shell is not resumable");
@@ -573,6 +652,17 @@ mod tests {
 
     #[test]
     fn adapter_manifests_match_agent_specific_rules() {
+        // Shell inherits the generic-shell manifest verbatim — assert it returns
+        // that exact static instance (Manifest holds compiled Regex, so it is not
+        // PartialEq; pointer identity is the meaningful check).
+        assert!(
+            std::ptr::eq(
+                ShellAdapter.manifest(),
+                crate::detect::generic_shell_manifest()
+            ),
+            "shell adapter must inherit the generic-shell manifest"
+        );
+
         let codex = CodexAdapter
             .manifest()
             .match_context(
