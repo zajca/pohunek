@@ -198,6 +198,73 @@ pub struct ProjectPromptResult {
     pub layer: PromptLayer,
 }
 
+/// Provider-specific reference type an action expects the launcher to supply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    /// A Linear issue reference; the launcher fetches Linear data caller-side.
+    LinearIssue,
+    /// A GitHub pull request reference; the launcher fetches GitHub data caller-side.
+    GithubPr,
+    /// No provider-derived branch/data; static action metadata is enough.
+    None,
+}
+
+/// Parameters for `project.action`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectActionParams {
+    /// The `<id|label>` reference to resolve against the host's store.
+    pub reference: String,
+    /// The action name to resolve. A single path segment enforced daemon-side.
+    pub name: String,
+}
+
+/// Result of `project.action`: a resolved launch recipe plus prompt content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectActionResult {
+    /// Which provider data shape the caller should fetch/render for this action.
+    pub provider: ProviderKind,
+    /// Agent name to pass through verbatim to `session new --agent`.
+    pub agent: String,
+    /// Template-selected base branch; absent means fall through to project default / HEAD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    /// Static branch for provider-less actions; absent when provider supplies it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Name of the prompt template used to populate [`Self::prompt_content`].
+    pub prompt_name: String,
+    /// Raw prompt-template content, with `${var}` placeholders intact.
+    pub prompt_content: String,
+}
+
+/// Parameters for `project.actions`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectActionsParams {
+    /// The `<id|label>` reference to resolve against the host's store.
+    pub reference: String,
+}
+
+/// Result of `project.actions`: available action summaries after layer shadowing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectActionsResult {
+    /// Available action definitions.
+    pub actions: Vec<ActionSummary>,
+}
+
+/// One available action after applying in-repo-over-host shadowing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionSummary {
+    /// Action name.
+    pub name: String,
+    /// Provider required by this action.
+    pub provider: ProviderKind,
+    /// Template name this action references.
+    pub template: String,
+    /// Winning layer for this action definition.
+    pub layer: PromptLayer,
+}
+
 /// Result of `project.remove`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectRemoveResult {

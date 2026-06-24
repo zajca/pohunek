@@ -1261,3 +1261,108 @@ fn project_prompt_json_shape_roundtrips() {
     };
     assert_eq!(line_roundtrip(&params), params);
 }
+
+#[test]
+fn provider_kind_json_shape_roundtrips() {
+    let cases = [
+        (protocol::ProviderKind::LinearIssue, json!("linear_issue")),
+        (protocol::ProviderKind::GithubPr, json!("github_pr")),
+        (protocol::ProviderKind::None, json!("none")),
+    ];
+
+    for (provider, expected) in cases {
+        let value = serde_json::to_value(&provider).expect("serialize provider");
+        assert_eq!(value, expected);
+
+        let back = line_roundtrip(&provider);
+        assert_eq!(back, provider);
+    }
+}
+
+#[test]
+fn project_action_json_shape_roundtrips() {
+    let result = protocol::ProjectActionResult {
+        provider: protocol::ProviderKind::GithubPr,
+        agent: "codex".to_owned(),
+        base_branch: Some("main".to_owned()),
+        branch: None,
+        prompt_name: "pr-review".to_owned(),
+        prompt_content: "Review ${title}\n\n${body}".to_owned(),
+    };
+    assert_eq!(line_roundtrip(&result), result);
+
+    let value: Value = serde_json::to_value(&result).expect("to_value");
+    assert_eq!(
+        value,
+        json!({
+            "provider": "github_pr",
+            "agent": "codex",
+            "base_branch": "main",
+            "prompt_name": "pr-review",
+            "prompt_content": "Review ${title}\n\n${body}"
+        })
+    );
+
+    let params = protocol::ProjectActionParams {
+        reference: "ui".to_owned(),
+        name: "review-pr".to_owned(),
+    };
+    assert_eq!(line_roundtrip(&params), params);
+}
+
+#[test]
+fn project_action_omits_absent_optional_fields() {
+    let result = protocol::ProjectActionResult {
+        provider: protocol::ProviderKind::None,
+        agent: "shell".to_owned(),
+        base_branch: None,
+        branch: Some("feature/static".to_owned()),
+        prompt_name: "task".to_owned(),
+        prompt_content: "Do the task".to_owned(),
+    };
+
+    let value: Value = serde_json::to_value(&result).expect("to_value");
+    assert!(
+        !value
+            .as_object()
+            .expect("object")
+            .contains_key("base_branch"),
+        "absent base_branch must be omitted: {value}"
+    );
+    assert_eq!(value["branch"], json!("feature/static"));
+
+    let back = line_roundtrip(&result);
+    assert_eq!(back, result);
+}
+
+#[test]
+fn action_summary_json_shape_roundtrips() {
+    let summary = protocol::ActionSummary {
+        name: "issue".to_owned(),
+        provider: protocol::ProviderKind::LinearIssue,
+        template: "linear".to_owned(),
+        layer: protocol::PromptLayer::Host,
+    };
+    assert_eq!(line_roundtrip(&summary), summary);
+
+    let value: Value = serde_json::to_value(&summary).expect("to_value");
+    assert_eq!(
+        value,
+        json!({
+            "name": "issue",
+            "provider": "linear_issue",
+            "template": "linear",
+            "layer": "host"
+        })
+    );
+
+    let result = protocol::ProjectActionsResult {
+        actions: vec![summary],
+    };
+    assert_eq!(line_roundtrip(&result), result);
+
+    let params = protocol::ProjectActionsParams {
+        reference: "ui".to_owned(),
+    };
+    assert_eq!(line_roundtrip(&params), params);
+}

@@ -198,6 +198,27 @@ enum ProjectAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Resolve one action to its full recipe (agent, base branch, branch rule,
+    /// prompt name + resolved prompt content). The command the launcher calls.
+    Action {
+        /// Project reference: `<id|label>` on the target host.
+        reference: String,
+        /// The action name to resolve.
+        name: String,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List the actions resolvable for a project (with the template each uses).
+    Actions {
+        /// Project reference: `<id|label>` on the target host.
+        reference: String,
+        /// Emit machine-readable JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -413,7 +434,9 @@ impl ProjectAction {
             | ProjectAction::Show { json, .. }
             | ProjectAction::Rename { json, .. }
             | ProjectAction::Rm { json, .. }
-            | ProjectAction::Prompt { json, .. } => *json,
+            | ProjectAction::Prompt { json, .. }
+            | ProjectAction::Action { json, .. }
+            | ProjectAction::Actions { json, .. } => *json,
         }
     }
 }
@@ -691,6 +714,16 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     json,
                 } => {
                     commands::project::run_prompt(&host, &paths, &reference, &name, json).await?;
+                }
+                ProjectAction::Action {
+                    reference,
+                    name,
+                    json,
+                } => {
+                    commands::project::run_action(&host, &paths, &reference, &name, json).await?;
+                }
+                ProjectAction::Actions { reference, json } => {
+                    commands::project::run_actions(&host, &paths, &reference, json).await?;
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -1322,6 +1355,66 @@ mod tests {
         assert!(
             Cli::try_parse_from(["pohunek", "project", "prompt", "ui"]).is_err(),
             "missing prompt name must be a usage error"
+        );
+    }
+
+    #[test]
+    fn parses_project_action_with_required_name() {
+        let cli = Cli::try_parse_from([
+            "pohunek",
+            "--host",
+            "host-b",
+            "project",
+            "action",
+            "ui",
+            "review-pr",
+            "--json",
+        ])
+        .expect("parse action");
+        match cli.command {
+            Commands::Project {
+                action:
+                    ProjectAction::Action {
+                        reference,
+                        name,
+                        json,
+                    },
+            } => {
+                assert_eq!(reference, "ui");
+                assert_eq!(name, "review-pr");
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert_eq!(
+            cli.host, "host-b",
+            "project action honors the global --host"
+        );
+
+        assert!(
+            Cli::try_parse_from(["pohunek", "project", "action", "ui"]).is_err(),
+            "missing action name must be a usage error"
+        );
+    }
+
+    #[test]
+    fn parses_project_actions() {
+        let cli = Cli::try_parse_from([
+            "pohunek", "--host", "host-b", "project", "actions", "ui", "--json",
+        ])
+        .expect("parse actions");
+        match cli.command {
+            Commands::Project {
+                action: ProjectAction::Actions { reference, json },
+            } => {
+                assert_eq!(reference, "ui");
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert_eq!(
+            cli.host, "host-b",
+            "project actions honors the global --host"
         );
     }
 }

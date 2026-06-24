@@ -11,10 +11,11 @@
 use std::path::PathBuf;
 
 use protocol::{
-    method, ProjectAddParams, ProjectInfo, ProjectListFilter, ProjectListParams,
+    method, ActionSummary, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
+    ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListFilter, ProjectListParams,
     ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult,
     ProjectRenameParams, ProjectShowParams, ProjectShowResult, ProjectSource, ProjectWorktree,
-    PromptLayer, Request,
+    PromptLayer, ProviderKind, Request,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -178,6 +179,107 @@ pub(crate) async fn run_prompt(
         print!("{}", result.content);
     }
     Ok(())
+}
+
+/// Human label for a provider kind (matches the wire snake_case form).
+fn provider_label(provider: &ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::LinearIssue => "linear_issue",
+        ProviderKind::GithubPr => "github_pr",
+        ProviderKind::None => "none",
+    }
+}
+
+/// Run `project action <reference> <name>` against the daemon for `host`.
+///
+/// Resolves one action to its full recipe (provider, agent, base branch, branch
+/// rule, prompt name + resolved prompt content) — the command the launcher calls.
+/// Human output prints the recipe header, then the raw prompt template after a
+/// `---` separator (rendered caller-side with provider data, A.4).
+pub(crate) async fn run_action(
+    host: &str,
+    paths: &Paths,
+    reference: &str,
+    name: &str,
+    json: bool,
+) -> Result<(), CliError> {
+    let request = request_with_params(
+        method::PROJECT_ACTION,
+        &ProjectActionParams {
+            reference: reference.to_owned(),
+            name: name.to_owned(),
+        },
+    )?;
+    let mut client = Client::connect(host, paths).await?;
+    let result: ProjectActionResult = serde_json::from_value(client.request(&request).await?)?;
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        println!("provider:    {}", provider_label(&result.provider));
+        println!("agent:       {}", result.agent);
+        println!(
+            "base_branch: {}",
+            result
+                .base_branch
+                .as_deref()
+                .unwrap_or("(project default / HEAD)")
+        );
+        if let Some(branch) = &result.branch {
+            println!("branch:      {branch}");
+        }
+        println!("prompt:      {}", result.prompt_name);
+        println!("---");
+        print!("{}", result.prompt_content);
+    }
+    Ok(())
+}
+
+/// Run `project actions <reference>` against the daemon for `host`.
+///
+/// Lists the actions resolvable for the project (the union across the in-repo and
+/// host layers), with the template each uses and the layer it resolved from.
+pub(crate) async fn run_actions(
+    host: &str,
+    paths: &Paths,
+    reference: &str,
+    json: bool,
+) -> Result<(), CliError> {
+    let request = request_with_params(
+        method::PROJECT_ACTIONS,
+        &ProjectActionsParams {
+            reference: reference.to_owned(),
+        },
+    )?;
+    let mut client = Client::connect(host, paths).await?;
+    let result: ProjectActionsResult = serde_json::from_value(client.request(&request).await?)?;
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        print!("{}", render_actions_human(&result.actions));
+    }
+    Ok(())
+}
+
+/// Render `project actions` as a tab-separated table (human output).
+fn render_actions_human(actions: &[ActionSummary]) -> String {
+    if actions.is_empty() {
+        return "no actions resolvable for this project\n".to_owned();
+    }
+    let mut out = String::from("ACTION\tPROVIDER\tTEMPLATE\tLAYER\n");
+    for action in actions {
+        let layer = match action.layer {
+            PromptLayer::InRepo => "in-repo",
+            PromptLayer::Host => "host",
+        };
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            action.name,
+            provider_label(&action.provider),
+            action.template,
+            layer
+        ));
+    }
+    out
 }
 
 /// Run `project rename <reference> <name>` against the daemon for `host`.

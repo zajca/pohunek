@@ -22,9 +22,14 @@
 //!
 //! See `docs/design/per-project-actions-and-worktree-hooks.md` (A.2, A.2.1).
 
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use protocol::{ErrorClass, ProjectPromptResult, PromptLayer, ProtocolError};
+use protocol::{
+    ActionSummary, ErrorClass, ProjectActionResult, ProjectPromptResult, PromptLayer,
+    ProtocolError, ProviderKind,
+};
+use serde::Deserialize;
 
 /// The per-project config subdirectory under a repo root.
 const POHUNEK_DIR: &str = ".pohunek";
@@ -33,6 +38,57 @@ const POHUNEK_DIR: &str = ".pohunek";
 const PROMPTS_DIR: &str = "prompts";
 /// File extension for prompt templates.
 const PROMPT_EXT: &str = "tmpl";
+/// Template definitions file under each config layer.
+const TEMPLATES_FILE: &str = "templates.toml";
+/// Action definitions file under each config layer.
+const ACTIONS_FILE: &str = "actions.toml";
+
+#[derive(Debug, Clone, Deserialize)]
+struct TemplatesFile {
+    #[serde(default)]
+    template: HashMap<String, RawTemplate>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTemplate {
+    agent: String,
+    prompt: String,
+    base_branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ActionsFile {
+    #[serde(default)]
+    action: HashMap<String, RawAction>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAction {
+    template: String,
+    provider: ProviderKind,
+    branch: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedTemplate {
+    pub(crate) agent: String,
+    pub(crate) prompt_name: String,
+    pub(crate) base_branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LayeredTemplates {
+    host: HashMap<String, RawTemplate>,
+    repo: HashMap<String, RawTemplate>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LayeredActions {
+    host: HashMap<String, RawAction>,
+    repo: HashMap<String, RawAction>,
+}
 
 /// Resolves per-project config from the in-repo and host-default layers, applying
 /// the name + containment guards on every read.
@@ -96,6 +152,140 @@ impl ProjectConfigResolver {
         }
         Err(prompt_not_found(name))
     }
+
+    /// Resolve a template by name over the host + in-repo `templates.toml` layers.
+    ///
+    /// In-repo `[template.<name>]` shadows a host entry of the same name as a
+    /// whole value — there is no field merge. The returned value carries only the
+    /// launch recipe fields; prompt content is resolved separately by
+    /// [`Self::resolve_action`].
+    pub(crate) fn resolve_template(&self, name: &str) -> Result<ResolvedTemplate, ProtocolError> {
+        validate_name("template", name)?;
+        let layers = self.load_templates(name)?;
+        let raw = layers
+            .repo
+            .get(name)
+            .or_else(|| layers.host.get(name))
+            .ok_or_else(|| template_not_found(name))?;
+        validate_name("prompt", &raw.prompt)?;
+        Ok(ResolvedTemplate {
+            agent: raw.agent.clone(),
+            prompt_name: raw.prompt.clone(),
+            base_branch: raw.base_branch.clone(),
+        })
+    }
+
+    /// Resolve an action by name to a full recipe plus resolved prompt content.
+    pub(crate) fn resolve_action(&self, name: &str) -> Result<ProjectActionResult, ProtocolError> {
+        validate_name("action", name)?;
+        let layers = self.load_actions(name)?;
+        let raw = layers
+            .repo
+            .get(name)
+            .or_else(|| layers.host.get(name))
+            .ok_or_else(|| action_not_found(name))?;
+        validate_name("template", &raw.template)?;
+        if raw.provider != ProviderKind::None && raw.branch.is_some() {
+            return Err(invalid_action(
+                name,
+                "branch may only be set when provider is 'none'",
+            ));
+        }
+
+        let template = self.resolve_template(&raw.template)?;
+        let prompt = self.resolve_prompt(&template.prompt_name)?;
+        Ok(ProjectActionResult {
+            provider: raw.provider.clone(),
+            agent: template.agent,
+            base_branch: template.base_branch,
+            branch: raw.branch.clone(),
+            prompt_name: template.prompt_name,
+            prompt_content: prompt.content,
+        })
+    }
+
+    /// List action summaries after applying in-repo-over-host shadowing.
+    pub(crate) fn list_actions(&self) -> Result<Vec<ActionSummary>, ProtocolError> {
+        let layers = self.load_actions("actions")?;
+        let mut names = BTreeSet::new();
+        names.extend(layers.host.keys().cloned());
+        names.extend(layers.repo.keys().cloned());
+
+        let mut actions = Vec::with_capacity(names.len());
+        for name in names {
+            validate_name("action", &name)?;
+            let (raw, layer) = match layers.repo.get(&name) {
+                Some(raw) => (raw, PromptLayer::InRepo),
+                None => (
+                    layers
+                        .host
+                        .get(&name)
+                        .expect("name came from host action keys"),
+                    PromptLayer::Host,
+                ),
+            };
+            validate_name("template", &raw.template)?;
+            actions.push(ActionSummary {
+                name,
+                provider: raw.provider.clone(),
+                template: raw.template.clone(),
+                layer,
+            });
+        }
+        Ok(actions)
+    }
+
+    fn load_templates(&self, error_name: &str) -> Result<LayeredTemplates, ProtocolError> {
+        let host = if let Some(config_dir) = &self.config_dir {
+            match read_contained(config_dir, &config_dir.join(TEMPLATES_FILE))? {
+                Some(content) => parse_templates(error_name, &content)?,
+                None => HashMap::new(),
+            }
+        } else {
+            HashMap::new()
+        };
+        let repo_base = self.repo_base();
+        let repo = match read_contained(&repo_base, &repo_base.join(TEMPLATES_FILE))? {
+            Some(content) => parse_templates(error_name, &content)?,
+            None => HashMap::new(),
+        };
+        Ok(LayeredTemplates { host, repo })
+    }
+
+    fn load_actions(&self, error_name: &str) -> Result<LayeredActions, ProtocolError> {
+        let host = if let Some(config_dir) = &self.config_dir {
+            match read_contained(config_dir, &config_dir.join(ACTIONS_FILE))? {
+                Some(content) => parse_actions(error_name, &content)?,
+                None => HashMap::new(),
+            }
+        } else {
+            HashMap::new()
+        };
+        let repo_base = self.repo_base();
+        let repo = match read_contained(&repo_base, &repo_base.join(ACTIONS_FILE))? {
+            Some(content) => parse_actions(error_name, &content)?,
+            None => HashMap::new(),
+        };
+        Ok(LayeredActions { host, repo })
+    }
+}
+
+fn parse_templates(
+    error_name: &str,
+    content: &str,
+) -> Result<HashMap<String, RawTemplate>, ProtocolError> {
+    toml::from_str::<TemplatesFile>(content)
+        .map(|file| file.template)
+        .map_err(|err| invalid_template(error_name, &err.to_string()))
+}
+
+fn parse_actions(
+    error_name: &str,
+    content: &str,
+) -> Result<HashMap<String, RawAction>, ProtocolError> {
+    toml::from_str::<ActionsFile>(content)
+        .map(|file| file.action)
+        .map_err(|err| invalid_action(error_name, &err.to_string()))
 }
 
 /// A.2.1.1 single-segment charset guard. A prompt/action/template/agent/manifest
@@ -198,6 +388,60 @@ fn config_read_failed(path: &Path, err: &std::io::Error) -> ProtocolError {
         ErrorClass::Runtime,
         "config_read_failed",
         format!("failed to read {}: {err}", path.display()),
+        None,
+    )
+}
+
+/// `runtime/template_not_found`: an action (or a direct lookup) named a template
+/// that resolves in neither the in-repo nor the host layer.
+fn template_not_found(name: &str) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Runtime,
+        "template_not_found",
+        format!(
+            "no template named '{name}' in the project's .pohunek/templates.toml or the host config"
+        ),
+        Some(
+            "define [template.<name>] in .pohunek/templates.toml or ~/.config/pohunek/templates.toml"
+                .to_owned(),
+        ),
+    )
+}
+
+/// `runtime/action_not_found`: no action of that name in either layer.
+fn action_not_found(name: &str) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Runtime,
+        "action_not_found",
+        format!(
+            "no action named '{name}' in the project's .pohunek/actions.toml or the host config"
+        ),
+        Some(
+            "define [action.<name>] in .pohunek/actions.toml or ~/.config/pohunek/actions.toml"
+                .to_owned(),
+        ),
+    )
+}
+
+/// `runtime/invalid_template`: a `templates.toml` failed to parse or carried an
+/// unknown key — the A.5 safe-subset guard (`deny_unknown_fields`) rejects an
+/// in-repo `program`/`argv`/`args`/`flags`/`env`, so they surface here.
+fn invalid_template(name: &str, reason: &str) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Runtime,
+        "invalid_template",
+        format!("invalid template '{name}': {reason}"),
+        None,
+    )
+}
+
+/// `runtime/invalid_action`: an `actions.toml` failed to parse, carried an unknown
+/// key (A.5), or set an explicit `branch` under a provider that supplies it (A.4).
+fn invalid_action(name: &str, reason: &str) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Runtime,
+        "invalid_action",
+        format!("invalid action '{name}': {reason}"),
         None,
     )
 }
@@ -369,5 +613,267 @@ mod tests {
             assert_eq!(err.code, "path_escape");
             std::fs::remove_file(&link).unwrap();
         }
+    }
+
+    #[test]
+    fn action_resolves_to_recipe_with_prompt_content() {
+        let (r, repo, _cfg) = resolver("action-recipe");
+        write(
+            &repo.join(".pohunek/templates.toml"),
+            r#"
+[template.issue]
+agent = "codex"
+prompt = "issue"
+base_branch = "main"
+"#,
+        );
+        write(
+            &repo.join(".pohunek/actions.toml"),
+            r#"
+[action.pick]
+template = "issue"
+provider = "none"
+branch = "feature/static"
+"#,
+        );
+        write(&repo.join(".pohunek/prompts/issue.tmpl"), "Handle ${title}");
+
+        let got = r.resolve_action("pick").expect("resolves");
+
+        assert_eq!(got.provider, protocol::ProviderKind::None);
+        assert_eq!(got.agent, "codex");
+        assert_eq!(got.base_branch.as_deref(), Some("main"));
+        assert_eq!(got.branch.as_deref(), Some("feature/static"));
+        assert_eq!(got.prompt_name, "issue");
+        assert_eq!(got.prompt_content, "Handle ${title}");
+    }
+
+    #[test]
+    fn in_repo_template_shadows_host_template_whole() {
+        let (r, repo, cfg) = resolver("template-shadow");
+        write(
+            &cfg.join("templates.toml"),
+            r#"
+[template.shared]
+agent = "shell"
+prompt = "host_prompt"
+base_branch = "host-main"
+"#,
+        );
+        write(
+            &cfg.join("actions.toml"),
+            r#"
+[action.run]
+template = "shared"
+provider = "none"
+"#,
+        );
+        write(&cfg.join("prompts/host_prompt.tmpl"), "HOST");
+        write(
+            &repo.join(".pohunek/templates.toml"),
+            r#"
+[template.shared]
+agent = "codex"
+prompt = "repo_prompt"
+"#,
+        );
+        write(&repo.join(".pohunek/prompts/repo_prompt.tmpl"), "REPO");
+
+        let got = r.resolve_action("run").expect("resolves");
+
+        assert_eq!(got.agent, "codex");
+        assert_eq!(got.base_branch, None);
+        assert_eq!(got.prompt_name, "repo_prompt");
+        assert_eq!(got.prompt_content, "REPO");
+    }
+
+    #[test]
+    fn forbidden_template_keys_are_invalid_template() {
+        for (key, value) in [
+            ("program", r#""sh""#),
+            ("argv", r#"["sh"]"#),
+            ("args", r#"["--flag"]"#),
+            ("flags", r#"["--flag"]"#),
+            ("env", r#"{ FOO = "bar" }"#),
+        ] {
+            let (r, repo, _cfg) = resolver(&format!("bad-template-{key}"));
+            write(
+                &repo.join(".pohunek/templates.toml"),
+                &format!(
+                    r#"
+[template.x]
+agent = "codex"
+prompt = "issue"
+{key} = {value}
+"#
+                ),
+            );
+
+            let err = r.resolve_template("x").expect_err("must reject");
+            assert_eq!(err.code, "invalid_template", "key {key}");
+        }
+    }
+
+    #[test]
+    fn forbidden_action_keys_are_invalid_action() {
+        for (key, value) in [
+            ("program", r#""sh""#),
+            ("argv", r#"["sh"]"#),
+            ("args", r#"["--flag"]"#),
+            ("flags", r#"["--flag"]"#),
+            ("env", r#"{ FOO = "bar" }"#),
+        ] {
+            let (r, repo, _cfg) = resolver(&format!("bad-action-{key}"));
+            write(
+                &repo.join(".pohunek/actions.toml"),
+                &format!(
+                    r#"
+[action.x]
+template = "issue"
+provider = "none"
+{key} = {value}
+"#
+                ),
+            );
+
+            let err = r.resolve_action("x").expect_err("must reject");
+            assert_eq!(err.code, "invalid_action", "key {key}");
+        }
+    }
+
+    #[test]
+    fn branch_with_non_none_provider_is_invalid_action() {
+        let (r, repo, _cfg) = resolver("provider-branch");
+        write(
+            &repo.join(".pohunek/templates.toml"),
+            r#"
+[template.issue]
+agent = "codex"
+prompt = "issue"
+"#,
+        );
+        write(
+            &repo.join(".pohunek/actions.toml"),
+            r#"
+[action.review]
+template = "issue"
+provider = "github_pr"
+branch = "feature/static"
+"#,
+        );
+        write(&repo.join(".pohunek/prompts/issue.tmpl"), "Review");
+
+        let err = r.resolve_action("review").expect_err("must reject");
+        assert_eq!(err.code, "invalid_action");
+    }
+
+    #[test]
+    fn missing_template_is_template_not_found() {
+        let (r, repo, _cfg) = resolver("missing-template");
+        write(
+            &repo.join(".pohunek/actions.toml"),
+            r#"
+[action.review]
+template = "missing"
+provider = "none"
+"#,
+        );
+
+        let err = r.resolve_action("review").expect_err("missing template");
+        assert_eq!(err.code, "template_not_found");
+    }
+
+    #[test]
+    fn unknown_action_is_action_not_found() {
+        let (r, _repo, _cfg) = resolver("missing-action");
+
+        let err = r.resolve_action("nope").expect_err("missing action");
+        assert_eq!(err.code, "action_not_found");
+    }
+
+    #[test]
+    fn bad_template_and_prompt_names_inside_toml_are_invalid_name() {
+        let (bad_template, repo, _cfg) = resolver("bad-template-name");
+        write(
+            &repo.join(".pohunek/actions.toml"),
+            r#"
+[action.bad]
+template = "bad/name"
+provider = "none"
+"#,
+        );
+        let err = bad_template
+            .resolve_action("bad")
+            .expect_err("bad template name");
+        assert_eq!(err.code, "invalid_name");
+
+        let (bad_prompt, repo, _cfg) = resolver("bad-prompt-name");
+        write(
+            &repo.join(".pohunek/templates.toml"),
+            r#"
+[template.good]
+agent = "codex"
+prompt = "bad/name"
+"#,
+        );
+        write(
+            &repo.join(".pohunek/actions.toml"),
+            r#"
+[action.bad]
+template = "good"
+provider = "none"
+"#,
+        );
+        let err = bad_prompt
+            .resolve_action("bad")
+            .expect_err("bad prompt name");
+        assert_eq!(err.code, "invalid_name");
+    }
+
+    #[test]
+    fn list_actions_returns_union_with_in_repo_shadowing_host() {
+        let (r, repo, cfg) = resolver("list-actions");
+        write(
+            &cfg.join("actions.toml"),
+            r#"
+[action.shared]
+template = "host_shared"
+provider = "linear_issue"
+
+[action.host_only]
+template = "host"
+provider = "github_pr"
+"#,
+        );
+        write(
+            &repo.join(".pohunek/actions.toml"),
+            r#"
+[action.shared]
+template = "repo_shared"
+provider = "none"
+branch = "feature/static"
+
+[action.repo_only]
+template = "repo"
+provider = "none"
+"#,
+        );
+
+        let mut actions = r.list_actions().expect("lists actions");
+        actions.sort_by(|a, b| a.name.cmp(&b.name));
+
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[0].name, "host_only");
+        assert_eq!(actions[0].provider, protocol::ProviderKind::GithubPr);
+        assert_eq!(actions[0].template, "host");
+        assert_eq!(actions[0].layer, PromptLayer::Host);
+        assert_eq!(actions[1].name, "repo_only");
+        assert_eq!(actions[1].provider, protocol::ProviderKind::None);
+        assert_eq!(actions[1].template, "repo");
+        assert_eq!(actions[1].layer, PromptLayer::InRepo);
+        assert_eq!(actions[2].name, "shared");
+        assert_eq!(actions[2].provider, protocol::ProviderKind::None);
+        assert_eq!(actions[2].template, "repo_shared");
+        assert_eq!(actions[2].layer, PromptLayer::InRepo);
     }
 }

@@ -40,9 +40,11 @@ pub use integration::{
     ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
 pub use project::{
-    ProjectAddParams, ProjectInfo, ProjectListFilter, ProjectListParams, ProjectPromptParams,
-    ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
-    ProjectShowParams, ProjectShowResult, ProjectSource, ProjectWorktree, PromptLayer,
+    ActionSummary, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
+    ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListFilter, ProjectListParams,
+    ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult,
+    ProjectRenameParams, ProjectShowParams, ProjectShowResult, ProjectSource, ProjectWorktree,
+    PromptLayer, ProviderKind,
 };
 pub use session::{
     AgentActivity, AgentKind, AttachHeader, SessionAttachParams, SessionAttachResult,
@@ -109,6 +111,13 @@ pub mod method {
     /// Resolve one prompt by name to its template content, fail-closed
     /// (`prompt_not_found`). Returns a [`ProjectPromptResult`](crate::ProjectPromptResult).
     pub const PROJECT_PROMPT: &str = "project.prompt";
+    /// Resolve one action by name to its recipe plus prompt content, fail-closed
+    /// (`action_not_found`/`template_not_found`). Returns a
+    /// [`ProjectActionResult`](crate::ProjectActionResult).
+    pub const PROJECT_ACTION: &str = "project.action";
+    /// List available project actions after in-repo-over-host shadowing. Returns a
+    /// [`ProjectActionsResult`](crate::ProjectActionsResult).
+    pub const PROJECT_ACTIONS: &str = "project.actions";
 }
 
 /// Control-protocol event names.

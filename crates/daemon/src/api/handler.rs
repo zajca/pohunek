@@ -11,10 +11,11 @@
 //! methods.
 
 use protocol::{
-    method, negotiate, HostDiscoverParams, IntegrationInstallParams, ProjectAddParams,
-    ProjectListParams, ProjectPromptParams, ProjectRemoveParams, ProjectRenameParams,
-    ProjectShowParams, ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams,
-    SessionId, SessionInputParams, SessionListParams, SessionNewParams, SessionNewResult,
+    method, negotiate, HostDiscoverParams, IntegrationInstallParams, ProjectActionParams,
+    ProjectActionsParams, ProjectActionsResult, ProjectAddParams, ProjectListParams,
+    ProjectPromptParams, ProjectRemoveParams, ProjectRenameParams, ProjectShowParams,
+    ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams, SessionId,
+    SessionInputParams, SessionListParams, SessionNewParams, SessionNewResult,
     SessionReportNativeIdParams, SessionResizeParams, PROTOCOL_VERSION,
 };
 use std::path::Path;
@@ -169,6 +170,8 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::PROJECT_RENAME => handle_project_rename(request, &state.sessions).await,
         method::PROJECT_REMOVE => handle_project_remove(request, &state.sessions).await,
         method::PROJECT_PROMPT => handle_project_prompt(request, &state.sessions).await,
+        method::PROJECT_ACTION => handle_project_action(request, &state.sessions).await,
+        method::PROJECT_ACTIONS => handle_project_actions(request, &state.sessions).await,
         other => Response::err(request.id.clone(), ProtocolError::method_not_found(other)),
     }
 }
@@ -353,6 +356,51 @@ async fn handle_project_prompt(request: &Request, sessions: &SessionRegistry) ->
         let record = pm.resolve(&reference)?;
         let resolver = ProjectConfigResolver::new(record.repo_root, config_dir);
         resolver.resolve_prompt(&name)
+    })
+    .await
+}
+
+/// `project.action`: resolve one action to its full recipe (provider, agent, base
+/// branch, branch rule, prompt name + resolved prompt content). The command the
+/// launcher calls. Read-only — does not bump `last_used`.
+async fn handle_project_action(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_params::<ProjectActionParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    let pm = match require_projects(request, sessions) {
+        Ok(pm) => pm,
+        Err(resp) => return resp,
+    };
+    let config_dir = sessions.config_dir().map(Path::to_path_buf);
+    let ProjectActionParams { reference, name } = params;
+    run_project_blocking(request, move || {
+        let record = pm.resolve(&reference)?;
+        let resolver = ProjectConfigResolver::new(record.repo_root, config_dir);
+        resolver.resolve_action(&name)
+    })
+    .await
+}
+
+/// `project.actions`: list the actions resolvable for a project (the union across
+/// the in-repo and host layers), with the template each uses.
+async fn handle_project_actions(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_params::<ProjectActionsParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    let pm = match require_projects(request, sessions) {
+        Ok(pm) => pm,
+        Err(resp) => return resp,
+    };
+    let config_dir = sessions.config_dir().map(Path::to_path_buf);
+    let ProjectActionsParams { reference } = params;
+    run_project_blocking(request, move || {
+        let record = pm.resolve(&reference)?;
+        let resolver = ProjectConfigResolver::new(record.repo_root, config_dir);
+        resolver
+            .list_actions()
+            .map(|actions| ProjectActionsResult { actions })
     })
     .await
 }
