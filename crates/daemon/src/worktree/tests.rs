@@ -12,7 +12,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::SessionWarningKind;
 
-use super::{branch_slug, is_valid_worktree, WorktreeManager, WorktreeRequest};
+use super::{
+    branch_slug, hook_env, is_valid_worktree, HookContext, HookEvent, WorktreeManager,
+    WorktreeRequest,
+};
 use crate::store::{Store, WorktreeStatus};
 
 /// Generous setup-script timeout for tests whose script finishes promptly; long
@@ -86,6 +89,34 @@ fn init_bare_repo(tag: &str) -> PathBuf {
 
 fn manager(tag: &str) -> WorktreeManager {
     manager_with_timeout(tag, TEST_SETUP_TIMEOUT)
+}
+
+#[test]
+fn session_hook_events_have_stable_env_tokens() {
+    assert_eq!(HookEvent::SessionStart.as_env(), "session-start");
+    assert_eq!(HookEvent::SessionStop.as_env(), "session-stop");
+    assert_eq!(HookEvent::AgentState.as_env(), "agent-state");
+}
+
+#[test]
+fn hook_env_includes_session_stop_reason_and_agent_activity() {
+    let ctx = HookContext {
+        session_id: "s-7".to_owned(),
+        project_id: None,
+        agent: "codex".to_owned(),
+        repo: None,
+        worktree: None,
+        branch: None,
+        base_branch: None,
+        stop_reason: Some("failed"),
+        activity: Some("blocked"),
+    };
+
+    let env = hook_env(HookEvent::AgentState, &ctx);
+    let lookup = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+
+    assert_eq!(lookup("POHUNEK_STOP_REASON"), Some("failed"));
+    assert_eq!(lookup("POHUNEK_ACTIVITY"), Some("blocked"));
 }
 
 fn manager_with_timeout(tag: &str, setup_timeout: Duration) -> WorktreeManager {

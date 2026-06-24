@@ -327,11 +327,14 @@ pub fn resume_pty_command(
 /// constructor enforced the matching guard).
 pub(crate) fn resume_pty_command_from_template(
     program: &str,
+    frozen_args: Vec<String>,
     template: ResumeTemplate,
     session_ref: &SessionRef,
     opts: &LaunchOpts,
 ) -> Result<PtyCommand, ProtocolError> {
-    build_pty_command(program, template.mode.argv(session_ref.value()), opts)
+    let mut args = frozen_args;
+    args.extend(template.mode.argv(session_ref.value()));
+    build_pty_command(program, args, opts)
 }
 
 fn resume_command(program: &'static str, args: Vec<String>) -> AgentCommand {
@@ -754,6 +757,7 @@ mod tests {
         let flag = with_path(&bin_dir, || {
             resume_pty_command_from_template(
                 "claude-sonnet",
+                Vec::new(),
                 ResumeTemplate {
                     mode: ResumeMode::Flag,
                     ref_kind: SessionRefKind::Id,
@@ -770,6 +774,7 @@ mod tests {
         let sub = with_path(&bin_dir, || {
             resume_pty_command_from_template(
                 "claude-sonnet",
+                Vec::new(),
                 ResumeTemplate {
                     mode: ResumeMode::Subcommand,
                     ref_kind: SessionRefKind::Id,
@@ -792,6 +797,7 @@ mod tests {
         let command = with_path(&bin_dir, || {
             resume_pty_command_from_template(
                 "myagent",
+                Vec::new(),
                 ResumeTemplate {
                     mode: ResumeMode::Flag,
                     ref_kind: SessionRefKind::Path,
@@ -802,6 +808,34 @@ mod tests {
             .expect("path resume command")
         });
         assert_eq!(command.args, vec!["--resume", "/abs/session.jsonl"]);
+    }
+
+    #[test]
+    fn resume_pty_command_from_template_preserves_frozen_profile_args() {
+        let bin_dir = temp_dir("template-args-bin");
+        write_executable(&bin_dir, "myagent");
+        let cwd = temp_dir("template-args-cwd");
+        let session = SessionRef::id("native-123").expect("id ref");
+
+        let command = with_path(&bin_dir, || {
+            resume_pty_command_from_template(
+                "myagent",
+                vec!["--model".to_owned(), "sonnet".to_owned()],
+                ResumeTemplate {
+                    mode: ResumeMode::Flag,
+                    ref_kind: SessionRefKind::Id,
+                },
+                &session,
+                &launch_opts(cwd),
+            )
+            .expect("resume command")
+        });
+
+        assert_eq!(
+            command.args,
+            vec!["--model", "sonnet", "--resume", "native-123"],
+            "resume relaunch must preserve frozen profile args before resume argv"
+        );
     }
 
     #[test]

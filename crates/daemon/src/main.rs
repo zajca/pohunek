@@ -98,6 +98,7 @@ async fn run() -> Result<(), DaemonError> {
             path: paths.data_dir.join(EVENTS_SUBDIR),
             source,
         })?;
+    sessions.spawn_agent_state_hooks();
 
     // 7. Bind the control socket (stale-socket recovery + 0600).
     let health = HealthInfo::new(DAEMON_VERSION);
@@ -146,6 +147,7 @@ async fn run() -> Result<(), DaemonError> {
 
     // 11. Flush the append-only event log before exit so events buffered at
     //     shutdown are not lost (bounded so a wedged write cannot hang exit).
+    sessions.shutdown_agent_state_hooks().await;
     sessions.shutdown_event_log().await;
 
     info!("pohunekd stopped");

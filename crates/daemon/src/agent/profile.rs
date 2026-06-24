@@ -231,6 +231,29 @@ fn dir_is_owner_secure(_dir: &Path) -> bool {
     true
 }
 
+/// Whether a host-authored config file is owned by the daemon's effective user
+/// and not group/world-writable. Missing/unreadable files fail closed because a
+/// caller is about to read this exact path.
+#[cfg(unix)]
+fn file_is_owner_secure(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[allow(unsafe_code)]
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid {
+        return false;
+    }
+    meta.permissions().mode() & 0o022 == 0
+}
+
+#[cfg(not(unix))]
+fn file_is_owner_secure(_path: &Path) -> bool {
+    true
+}
+
 /// Canonicalize `candidate` and assert it stays within the canonicalized `base_dir`
 /// tree — owner-checking a file alone is insufficient because a symlink would exec
 /// its (out-of-tree) target. Returns the canonical path on success.
@@ -272,6 +295,12 @@ fn load_profile(name: &str, path: &Path, dir: &Path) -> Result<ResolvedAgent, Pr
     // Containment first: a symlinked `<name>.toml` that escapes the tree must be
     // rejected before its contents are read or exec'd (C.5).
     assert_contained(dir, path, name)?;
+    if !file_is_owner_secure(path) {
+        return Err(invalid_profile(
+            name,
+            "profile file is not owner-secure (wrong owner or group/world-writable)",
+        ));
+    }
     let content =
         std::fs::read_to_string(path).map_err(|err| invalid_profile(name, &err.to_string()))?;
     let raw: RawProfile =
@@ -556,6 +585,27 @@ mod tests {
         .expect("write profile");
         let reg = ProfileRegistry::new(Some(dir));
         let err = reg.resolve_agent("p").expect_err("unknown key rejected");
+        assert_eq!(err.code, "invalid_profile");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_writable_profile_file_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmp_agents_dir("bad-file-mode");
+        let path = dir.join("unsafe.toml");
+        std::fs::write(&path, "base = \"claude\"\nprogram = \"/bin/sh\"\n").expect("write profile");
+        let mut perms = std::fs::metadata(&path)
+            .expect("profile metadata")
+            .permissions();
+        perms.set_mode(0o660);
+        std::fs::set_permissions(&path, perms).expect("set profile mode");
+
+        let reg = ProfileRegistry::new(Some(dir));
+        let err = reg
+            .resolve_agent("unsafe")
+            .expect_err("group-writable profile file rejected");
         assert_eq!(err.code, "invalid_profile");
     }
 

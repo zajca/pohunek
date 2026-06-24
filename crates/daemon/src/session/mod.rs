@@ -10,15 +10,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    event, AgentKind, ErrorClass, Event, ProjectRemoveResult, ProtocolError, SessionAttachParams,
-    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionNewParams,
-    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionState, SessionStopResult,
-    SessionWarning, StateSource, PROTOCOL_VERSION,
+    event, AgentActivity, AgentKind, ErrorClass, Event, ProjectRemoveResult, ProtocolError,
+    SessionAttachParams, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
+    SessionNewParams, SessionReportNativeIdParams, SessionReportNativeIdResult, SessionState,
+    SessionStopResult, SessionWarning, StateSource, PROTOCOL_VERSION,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
-use tokio::sync::{broadcast, watch, Mutex};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -36,7 +36,9 @@ use crate::project::detect::DetectedProject;
 use crate::project::{detect_at, ProjectManager};
 use crate::pty::{PtyCommand, PtyError, PtyExit, PtyHandle};
 use crate::store::{ProjectRecord, ResumeBinding, Store};
-use crate::worktree::{canonical_or_original, WorktreeManager, WorktreeRequest};
+use crate::worktree::{
+    canonical_or_original, run_hook, HookContext, HookEvent, WorktreeManager, WorktreeRequest,
+};
 
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
 /// Bound on how long a graceful shutdown waits for the event-log drain to flush
@@ -75,6 +77,10 @@ const DEFAULT_INITIAL_INPUT_STARTUP_GRACE: Duration = Duration::from_millis(500)
 /// resyncs on every lag — only the logging is rate-limited. Overridable via
 /// [`SessionRegistryConfig::detector_lag_warn_interval`].
 const DEFAULT_DETECTOR_LAG_WARN_INTERVAL: Duration = Duration::from_secs(5);
+/// Debounce window for session-layer `agent-state` hooks. The detector/event log
+/// still sees every transition immediately; only hook side effects wait briefly
+/// so a short-lived visual flap does not run a hook for each intermediate value.
+const AGENT_STATE_HOOK_DEBOUNCE: Duration = Duration::from_millis(50);
 
 /// Shell command configuration used for `AgentKind::Shell`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -498,6 +504,30 @@ struct SessionRegistryInner {
     event_log_shutdown: CancellationToken,
     /// Join handle of the spawned event-log drain task, awaited at shutdown.
     event_log_task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// Cancellation signal for the agent-state hook dispatcher.
+    agent_state_hook_shutdown: CancellationToken,
+    /// Join handle of the spawned agent-state hook dispatcher.
+    agent_state_hook_task: std::sync::Mutex<Option<JoinHandle<()>>>,
+}
+
+#[derive(Debug, Clone)]
+struct AgentStateHookSnapshot {
+    session_id: SessionId,
+    project_id: Option<String>,
+    cwd: PathBuf,
+    agent: String,
+    activity: AgentActivity,
+}
+
+#[derive(Debug, Clone)]
+struct SessionHookRequest {
+    event: HookEvent,
+    cwd: PathBuf,
+    session_id: String,
+    project_id: Option<String>,
+    agent: String,
+    stop_reason: Option<&'static str>,
+    activity: Option<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -595,6 +625,8 @@ impl SessionRegistry {
                 projects,
                 event_log_shutdown: CancellationToken::new(),
                 event_log_task: std::sync::Mutex::new(None),
+                agent_state_hook_shutdown: CancellationToken::new(),
+                agent_state_hook_task: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -796,6 +828,49 @@ impl SessionRegistry {
         }
     }
 
+    /// Start the agent-state hook dispatcher.
+    ///
+    /// This task subscribes to the registry's event stream, filters only
+    /// `agent_state`, deduplicates by last-fired activity value, and runs
+    /// `agent-state` hooks off the broadcast hot path. A no-op if it is already
+    /// running.
+    pub fn spawn_agent_state_hooks(&self) {
+        let mut slot = self
+            .inner
+            .agent_state_hook_task
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if slot.is_some() {
+            return;
+        }
+        let handle = spawn_agent_state_hook_dispatcher(
+            self.clone(),
+            self.subscribe(),
+            self.inner.agent_state_hook_shutdown.clone(),
+        );
+        *slot = Some(handle);
+    }
+
+    /// Stop the agent-state hook dispatcher and flush any pending debounced
+    /// activity values before returning.
+    pub async fn shutdown_agent_state_hooks(&self) {
+        self.inner.agent_state_hook_shutdown.cancel();
+        let handle = self
+            .inner
+            .agent_state_hook_task
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take();
+        if let Some(handle) = handle {
+            if tokio::time::timeout(EVENT_LOG_FLUSH_TIMEOUT, handle)
+                .await
+                .is_err()
+            {
+                warn!("agent-state hook dispatcher did not finish within the shutdown timeout");
+            }
+        }
+    }
+
     /// Create a new PTY-backed session.
     ///
     /// Resolves the session's **target** (design Decisions 1 & 3): which project
@@ -926,6 +1001,15 @@ impl SessionRegistry {
             self.cleanup_bound_worktree(&id).await;
         }
         let info = launch?;
+        self.spawn_session_hook(SessionHookRequest {
+            event: HookEvent::SessionStart,
+            cwd: info.cwd.clone(),
+            session_id: info.id.0.clone(),
+            project_id: info.project_id.clone(),
+            agent: info.agent.clone(),
+            stop_reason: None,
+            activity: None,
+        });
         if let Some(input) = initial_input {
             // Wait for the agent to come up before injecting the first prompt so
             // the bytes are not delivered to a stdin reader that has not yet
@@ -944,6 +1028,53 @@ impl SessionRegistry {
             }
         }
         Ok(info)
+    }
+
+    /// Fire a session-layer lifecycle hook without blocking the async hot path.
+    ///
+    /// The hook runner itself is synchronous (process spawn + bounded wait), so
+    /// session events hand it to the blocking pool and only log non-fatal
+    /// warnings. Worktree hook call sites can return warnings to `session.new`;
+    /// session-start/stop/agent-state have no response field to carry them.
+    fn spawn_session_hook(&self, request: SessionHookRequest) {
+        drop(self.spawn_session_hook_task(request));
+    }
+
+    fn spawn_session_hook_task(&self, request: SessionHookRequest) -> JoinHandle<()> {
+        let timeout = self.inner.config.setup_script_timeout;
+        let config_dir = self.inner.config.config_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let ctx = HookContext {
+                session_id: request.session_id,
+                project_id: request.project_id,
+                agent: request.agent,
+                repo: None,
+                worktree: None,
+                branch: None,
+                base_branch: None,
+                stop_reason: request.stop_reason,
+                activity: request.activity,
+            };
+            let mut warnings = Vec::new();
+            run_hook(
+                request.event,
+                &request.cwd,
+                &ctx,
+                timeout,
+                config_dir.as_deref(),
+                &mut warnings,
+            );
+            for warning in warnings {
+                warn!(
+                    event = request.event.as_env(),
+                    session_id = %ctx.session_id,
+                    cwd = %request.cwd.display(),
+                    warning = %warning.message,
+                    detail = ?warning.detail,
+                    "session hook warning"
+                );
+            }
+        })
     }
 
     /// Wait for a freshly spawned agent to produce its first PTY output before a
@@ -1486,13 +1617,26 @@ impl SessionRegistry {
             // or `id` for a base kind). The SessionStart hook bakes a base-kind
             // literal into the wire `agent` and carries no profile identity, so the
             // wire value is ignored for kind selection — the snapshot is authoritative.
-            let ref_kind = entry
-                .snapshot
-                .resume
-                .map_or(SessionRefKind::Id, |template| template.ref_kind);
+            let Some(template) = entry.snapshot.resume else {
+                debug!(
+                    session_id = %params.session_id.0,
+                    "native-id report for a non-resumable session; ignoring"
+                );
+                return not_recorded;
+            };
+            let ref_kind = template.ref_kind;
             let validated = match ref_kind {
                 SessionRefKind::Id => SessionRef::id(&params.native_session_id),
-                SessionRefKind::Path => SessionRef::path(&params.native_session_id),
+                SessionRefKind::Path => match params.transcript_path.as_deref() {
+                    Some(path) => SessionRef::path(path),
+                    None => {
+                        debug!(
+                            session_id = %params.session_id.0,
+                            "ignoring path-kind native-id report without transcript_path"
+                        );
+                        return not_recorded;
+                    }
+                },
             };
             let session_ref = match validated {
                 Ok(session_ref) => session_ref,
@@ -1552,6 +1696,7 @@ impl SessionRegistry {
                 if is_terminal(entry.info.state) {
                     return None;
                 }
+                entry.snapshot.resume?;
                 // Resumable once the agent has reported a native reference — an
                 // opaque id (claude/codex) or a transcript path (a path-resuming
                 // host profile). No reference yet ⇒ no binding.
@@ -1660,6 +1805,15 @@ impl SessionRegistry {
         // The resume mechanics come from the frozen structural snapshot (C.4). An
         // explicit `(resume_mode, ref_kind)` pair drives the argv; a legacy binding
         // (pre-C2, no snapshot) falls back to the base kind's native template.
+        if !binding.resumable && !binding.program.is_empty() {
+            return Err(runtime_error(
+                "not_resumable",
+                format!(
+                    "resume binding for {} was captured from a non-resumable profile",
+                    binding.session_id
+                ),
+            ));
+        }
         let template = match (binding.resume_mode, binding.ref_kind) {
             (Some(mode), Some(ref_kind)) => ResumeTemplate { mode, ref_kind },
             _ => base_resume_template(binding.agent_base)
@@ -1744,7 +1898,13 @@ impl SessionRegistry {
             rows: binding.rows,
             env_extra,
         };
-        let command = resume_pty_command_from_template(&program, template, &session_ref, &opts)?;
+        let command = resume_pty_command_from_template(
+            &program,
+            binding.args.clone(),
+            template,
+            &session_ref,
+            &opts,
+        )?;
         // Re-freeze the structural snapshot for the resumed entry so a later resize
         // re-persist keeps the same launch-time shape.
         let snapshot = ResumeSnapshot {
@@ -2063,7 +2223,8 @@ impl SessionRegistry {
             entry.info.cols = cols;
             entry.info.rows = rows;
             entry.info.updated_at = timestamp_now();
-            let has_native = entry.info.native_session_id.is_some();
+            let has_native =
+                entry.info.native_session_id.is_some() || entry.info.native_session_path.is_some();
             (
                 entry.info.clone(),
                 entry.detector_resize.clone(),
@@ -2271,6 +2432,38 @@ impl SessionRegistry {
         let _ = self.inner.events.send(event);
     }
 
+    async fn agent_state_hook_snapshot(&self, id: &SessionId) -> Option<AgentStateHookSnapshot> {
+        let sessions = self.inner.sessions.lock().await;
+        let entry = sessions.get(id)?;
+        if entry.stopping || is_terminal(entry.info.state) {
+            return None;
+        }
+        Some(AgentStateHookSnapshot {
+            session_id: entry.info.id.clone(),
+            project_id: entry.info.project_id.clone(),
+            cwd: entry.info.cwd.clone(),
+            agent: entry.info.agent.clone(),
+            activity: entry.info.activity?,
+        })
+    }
+
+    async fn agent_state_hook_snapshots(&self) -> Vec<AgentStateHookSnapshot> {
+        let sessions = self.inner.sessions.lock().await;
+        sessions
+            .values()
+            .filter(|entry| !entry.stopping && !is_terminal(entry.info.state))
+            .filter_map(|entry| {
+                Some(AgentStateHookSnapshot {
+                    session_id: entry.info.id.clone(),
+                    project_id: entry.info.project_id.clone(),
+                    cwd: entry.info.cwd.clone(),
+                    agent: entry.info.agent.clone(),
+                    activity: entry.info.activity?,
+                })
+            })
+            .collect()
+    }
+
     async fn record_exit(&self, id: &SessionId, exit: PtyExit, stopped_by_user: bool) {
         let updated = {
             let mut sessions = self.inner.sessions.lock().await;
@@ -2291,13 +2484,16 @@ impl SessionRegistry {
                 stopped_by_user || entry.stopping || entry.info.state == SessionState::Stopped;
             entry.stopping = false;
 
-            if stopped {
+            let stop_reason = if stopped {
                 entry.info.state = SessionState::Stopped;
+                "stopped"
             } else if exit.success {
                 entry.info.state = SessionState::Done;
+                "done"
             } else {
                 entry.info.state = SessionState::Failed;
-            }
+                "failed"
+            };
             entry.info.state_source = StateSource::Process;
             entry.info.activity = None;
             entry.info.exit_code = exit.exit_code;
@@ -2308,11 +2504,20 @@ impl SessionRegistry {
             } else {
                 event::SESSION_UPDATED
             };
-            (event, entry.info.clone())
+            (event, entry.info.clone(), stop_reason)
         };
 
         self.cancel_session_attaches(id).await;
         self.remove_pending_attaches_for_session(id).await;
+        self.spawn_session_hook(SessionHookRequest {
+            event: HookEvent::SessionStop,
+            cwd: updated.1.cwd.clone(),
+            session_id: updated.1.id.0.clone(),
+            project_id: updated.1.project_id.clone(),
+            agent: updated.1.agent.clone(),
+            stop_reason: Some(updated.2),
+            activity: None,
+        });
         // A terminal session must not resurrect on the next daemon restart:
         // resume is for sessions whose live PTY a restart killed, not for ones
         // the user stopped or that exited. The session is now terminal, so
@@ -2429,6 +2634,243 @@ fn input_rules_for_agent(agent: AgentKind, config: &SessionRegistryConfig) -> In
         rules.submit_delay = config.claude_submit_delay;
     }
     rules
+}
+
+fn spawn_agent_state_hook_dispatcher(
+    registry: SessionRegistry,
+    mut events: broadcast::Receiver<Event>,
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last_fired: HashMap<SessionId, AgentActivity> = HashMap::new();
+        let mut pending: HashMap<SessionId, (AgentActivity, tokio::time::Instant)> = HashMap::new();
+        let mut in_flight: HashSet<SessionId> = HashSet::new();
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel();
+        let mut tick = tokio::time::interval(AGENT_STATE_HOOK_DEBOUNCE);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => {
+                    drain_buffered_agent_state_events(
+                        &registry,
+                        &mut events,
+                        &mut last_fired,
+                        &mut pending,
+                    ).await;
+                    flush_pending_agent_state_hooks(
+                        &registry,
+                        &mut last_fired,
+                        &mut pending,
+                        &mut in_flight,
+                        &done_tx,
+                        true,
+                    ).await;
+                    while !in_flight.is_empty() {
+                        let Some(session_id) = done_rx.recv().await else {
+                            break;
+                        };
+                        in_flight.remove(&session_id);
+                        flush_pending_agent_state_hooks(
+                            &registry,
+                            &mut last_fired,
+                            &mut pending,
+                            &mut in_flight,
+                            &done_tx,
+                            true,
+                        ).await;
+                    }
+                    break;
+                }
+                Some(session_id) = done_rx.recv() => {
+                    in_flight.remove(&session_id);
+                    flush_pending_agent_state_hooks(
+                        &registry,
+                        &mut last_fired,
+                        &mut pending,
+                        &mut in_flight,
+                        &done_tx,
+                        false,
+                    ).await;
+                }
+                _ = tick.tick() => {
+                    flush_pending_agent_state_hooks(
+                        &registry,
+                        &mut last_fired,
+                        &mut pending,
+                        &mut in_flight,
+                        &done_tx,
+                        false,
+                    ).await;
+                }
+                received = events.recv() => match received {
+                    Ok(event) => {
+                        if let Some((session_id, activity)) = parse_agent_state_event(&event) {
+                            queue_agent_state_hook(&mut last_fired, &mut pending, session_id, activity);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                        warn!(
+                            dropped,
+                            "agent-state hook dispatcher lagged; re-reading current activities"
+                        );
+                        for snapshot in registry.agent_state_hook_snapshots().await {
+                            queue_agent_state_hook(
+                                &mut last_fired,
+                                &mut pending,
+                                snapshot.session_id,
+                                snapshot.activity,
+                            );
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+            }
+        }
+    })
+}
+
+async fn drain_buffered_agent_state_events(
+    registry: &SessionRegistry,
+    events: &mut broadcast::Receiver<Event>,
+    last_fired: &mut HashMap<SessionId, AgentActivity>,
+    pending: &mut HashMap<SessionId, (AgentActivity, tokio::time::Instant)>,
+) {
+    loop {
+        match events.try_recv() {
+            Ok(event) => {
+                if let Some((session_id, activity)) = parse_agent_state_event(&event) {
+                    queue_agent_state_hook(last_fired, pending, session_id, activity);
+                }
+            }
+            Err(broadcast::error::TryRecvError::Lagged(dropped)) => {
+                warn!(
+                    dropped,
+                    "agent-state hook dispatcher lagged during shutdown; re-reading current activities"
+                );
+                for snapshot in registry.agent_state_hook_snapshots().await {
+                    queue_agent_state_hook(
+                        last_fired,
+                        pending,
+                        snapshot.session_id,
+                        snapshot.activity,
+                    );
+                }
+            }
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                break;
+            }
+        }
+    }
+}
+
+fn parse_agent_state_event(event: &Event) -> Option<(SessionId, AgentActivity)> {
+    if event.event != event::AGENT_STATE {
+        return None;
+    }
+    let payload = event.payload.as_object()?;
+    let session_id = payload.get("session_id")?.as_str()?;
+    let activity = parse_agent_activity(payload.get("activity")?)?;
+    Some((SessionId(session_id.to_owned()), activity))
+}
+
+fn parse_agent_activity(value: &Value) -> Option<AgentActivity> {
+    serde_json::from_value(value.clone()).ok()
+}
+
+fn queue_agent_state_hook(
+    last_fired: &mut HashMap<SessionId, AgentActivity>,
+    pending: &mut HashMap<SessionId, (AgentActivity, tokio::time::Instant)>,
+    session_id: SessionId,
+    activity: AgentActivity,
+) {
+    if last_fired.get(&session_id) == Some(&activity) {
+        pending.remove(&session_id);
+        return;
+    }
+    pending.insert(
+        session_id,
+        (
+            activity,
+            tokio::time::Instant::now() + AGENT_STATE_HOOK_DEBOUNCE,
+        ),
+    );
+}
+
+async fn flush_pending_agent_state_hooks(
+    registry: &SessionRegistry,
+    last_fired: &mut HashMap<SessionId, AgentActivity>,
+    pending: &mut HashMap<SessionId, (AgentActivity, tokio::time::Instant)>,
+    in_flight: &mut HashSet<SessionId>,
+    done_tx: &mpsc::UnboundedSender<SessionId>,
+    flush_all: bool,
+) {
+    let now = tokio::time::Instant::now();
+    let due: Vec<SessionId> = pending
+        .iter()
+        .filter_map(|(session_id, (_, deadline))| {
+            if flush_all || *deadline <= now {
+                Some(session_id.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for session_id in due {
+        if in_flight.contains(&session_id) {
+            continue;
+        }
+        let Some((pending_activity, _)) = pending.remove(&session_id) else {
+            continue;
+        };
+        let Some(snapshot) = registry.agent_state_hook_snapshot(&session_id).await else {
+            last_fired.remove(&session_id);
+            continue;
+        };
+        if snapshot.activity != pending_activity {
+            queue_agent_state_hook(last_fired, pending, session_id, snapshot.activity);
+            continue;
+        }
+        if last_fired.get(&snapshot.session_id) == Some(&snapshot.activity) {
+            continue;
+        }
+        fire_agent_state_hook(registry, snapshot.clone(), in_flight, done_tx);
+        last_fired.insert(snapshot.session_id, snapshot.activity);
+    }
+}
+
+fn fire_agent_state_hook(
+    registry: &SessionRegistry,
+    snapshot: AgentStateHookSnapshot,
+    in_flight: &mut HashSet<SessionId>,
+    done_tx: &mpsc::UnboundedSender<SessionId>,
+) {
+    let session_id = snapshot.session_id.clone();
+    in_flight.insert(session_id.clone());
+    let handle = registry.spawn_session_hook_task(SessionHookRequest {
+        event: HookEvent::AgentState,
+        cwd: snapshot.cwd,
+        session_id: snapshot.session_id.0,
+        project_id: snapshot.project_id,
+        agent: snapshot.agent,
+        stop_reason: None,
+        activity: Some(agent_activity_env(snapshot.activity)),
+    });
+    let done_tx = done_tx.clone();
+    tokio::spawn(async move {
+        let _ = handle.await;
+        let _ = done_tx.send(session_id);
+    });
+}
+
+fn agent_activity_env(activity: AgentActivity) -> &'static str {
+    match activity {
+        AgentActivity::Working => "working",
+        AgentActivity::Blocked => "blocked",
+        AgentActivity::Idle => "idle",
+    }
 }
 
 fn build_input_writes(text: &str, rules: InputRules) -> InputWritePlan {
@@ -2580,15 +3022,17 @@ fn timestamp_now() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use protocol::{
-        AgentKind, ProjectSource, SessionAttachParams, SessionId, SessionNewParams,
-        SessionReportNativeIdParams, SessionState,
+        AgentActivity, AgentKind, Event, ProjectSource, SessionAttachParams, SessionId,
+        SessionNewParams, SessionReportNativeIdParams, SessionState,
     };
 
     use crate::agent::{InputRules, ResumeMode, SessionRefKind};
+    use crate::detect::ActivityTransition;
     use crate::integration::{
         ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
     };
@@ -2630,6 +3074,85 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir.join("metadata.jsonl")
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = temp_store_path(tag)
+            .parent()
+            .expect("store parent")
+            .join("dir");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn write_host_hook(config_dir: &std::path::Path, event: &str, body: &str) {
+        let hooks = config_dir.join("hooks");
+        fs::create_dir_all(&hooks).expect("create hooks dir");
+        fs::write(hooks.join(event), body).expect("write hook");
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(path, body).expect("write executable");
+        let mut perms = fs::metadata(path).expect("metadata").permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(path, perms).expect("chmod executable");
+    }
+
+    async fn wait_for_file_contains(path: &std::path::Path, needle: &str) -> String {
+        for _ in 0..100 {
+            if let Ok(contents) = fs::read_to_string(path) {
+                if contents.contains(needle) {
+                    return contents;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "timed out waiting for {} to contain {needle:?}",
+            path.display()
+        );
+    }
+
+    async fn wait_for_line_count(path: &std::path::Path, expected: usize) -> String {
+        for _ in 0..100 {
+            if let Ok(contents) = fs::read_to_string(path) {
+                if contents.lines().count() >= expected {
+                    return contents;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "timed out waiting for {} to contain at least {expected} lines",
+            path.display()
+        );
+    }
+
+    fn transition(activity: AgentActivity) -> ActivityTransition {
+        ActivityTransition {
+            activity,
+            source: protocol::StateSource::Process,
+        }
+    }
+
+    fn parse_env_dump(text: &str) -> std::collections::HashMap<String, String> {
+        text.lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect()
+    }
+
+    fn pohunek_env_keys(env: &std::collections::HashMap<String, String>) -> Vec<String> {
+        let mut keys: Vec<String> = env
+            .keys()
+            .filter(|key| key.starts_with("POHUNEK_"))
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
     }
 
     /// Run git in `dir`, asserting success (test helper for the worktree path).
@@ -3294,6 +3817,647 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_start_hook_runs_after_spawn_without_blocking_create() {
+        let config_dir = temp_dir("session-start-config");
+        let cwd = temp_dir("session-start-cwd");
+        let marker = config_dir.join("session-start.marker");
+        write_host_hook(
+            &config_dir,
+            "session-start",
+            &format!(
+                "#!/bin/sh\nprintf '%s:%s:%s\\n' \"$POHUNEK_HOOK_EVENT\" \"$POHUNEK_SESSION_ID\" \"$POHUNEK_AGENT\" >> {}\n",
+                marker.display()
+            ),
+        );
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            config_dir: Some(config_dir.clone()),
+            ..SessionRegistryConfig::default()
+        });
+
+        let created = registry
+            .create(SessionNewParams {
+                cwd: Some(cwd),
+                ..params()
+            })
+            .await
+            .expect("create session returns while hook runs best-effort");
+
+        let contents =
+            wait_for_file_contains(&marker, &format!("session-start:{}:shell", created.id.0)).await;
+        assert_eq!(contents.lines().count(), 1, "session-start fires once");
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn session_start_hook_is_best_effort_when_hook_hangs() {
+        let config_dir = temp_dir("session-start-hang-config");
+        let cwd = temp_dir("session-start-hang-cwd");
+        write_host_hook(&config_dir, "session-start", "#!/bin/sh\nsleep 30\n");
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            setup_script_timeout: Duration::from_millis(50),
+            config_dir: Some(config_dir),
+            ..SessionRegistryConfig::default()
+        });
+
+        let started = std::time::Instant::now();
+        let created = registry
+            .create(SessionNewParams {
+                cwd: Some(cwd),
+                ..params()
+            })
+            .await
+            .expect("create session returns despite a hanging session-start hook");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "session-start hook must be best-effort and not wedge create"
+        );
+
+        let _ = registry.stop(&created.id).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn session_stop_hook_reports_stopped_done_and_failed_reasons_once() {
+        async fn run_case(tag: &str, command: &str, stop: bool, expected_reason: &str) {
+            let config_dir = temp_dir(&format!("session-stop-config-{tag}"));
+            let cwd = temp_dir(&format!("session-stop-cwd-{tag}"));
+            let store_path = temp_store_path(&format!("session-stop-store-{tag}"));
+            let agents_dir = temp_agents_dir_with(
+                &format!("session-stop-agent-{tag}"),
+                "resumable",
+                &format!(
+                    "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"{command}\"]\n"
+                ),
+            );
+            let marker = config_dir.join("session-stop.marker");
+            write_host_hook(
+                &config_dir,
+                "session-stop",
+                &format!(
+                    "#!/bin/sh\nprintf '%s:%s:%s\\n' \"$POHUNEK_HOOK_EVENT\" \"$POHUNEK_SESSION_ID\" \"$POHUNEK_STOP_REASON\" >> {}\n",
+                    marker.display()
+                ),
+            );
+            let registry = SessionRegistry::new(SessionRegistryConfig {
+                stop_grace: Duration::from_millis(50),
+                config_dir: Some(config_dir),
+                store_path: Some(store_path.clone()),
+                agents_dir: Some(agents_dir),
+                ..SessionRegistryConfig::default()
+            });
+
+            let created = registry
+                .create(SessionNewParams {
+                    cwd: Some(cwd),
+                    ..resumable_params()
+                })
+                .await
+                .expect("create session");
+            let recorded = registry
+                .report_native_id(SessionReportNativeIdParams {
+                    session_id: created.id.clone(),
+                    agent: "claude".to_owned(),
+                    native_session_id: format!("native-{tag}"),
+                    transcript_path: None,
+                })
+                .await;
+            assert!(recorded.recorded, "native id captured for {tag}");
+            assert_eq!(
+                crate::store::Store::new(store_path.clone())
+                    .load_resume()
+                    .expect("load before terminal")
+                    .len(),
+                1,
+                "terminal transition precondition: one resume binding for {tag}"
+            );
+
+            if stop {
+                registry.stop(&created.id).await.expect("stop session");
+            } else {
+                registry
+                    .wait_for_exit(&created.id, Duration::from_secs(2))
+                    .await
+                    .expect("session exits");
+            }
+
+            let expected = format!("session-stop:{}:{expected_reason}", created.id.0);
+            let contents = wait_for_file_contains(&marker, &expected).await;
+            assert_eq!(
+                contents.lines().count(),
+                1,
+                "session-stop fires once for {tag}: {contents:?}"
+            );
+            assert!(
+                crate::store::Store::new(store_path)
+                    .load_resume()
+                    .expect("load after terminal")
+                    .is_empty(),
+                "terminal transition must remove resume binding for {tag}"
+            );
+        }
+
+        run_case("stopped", "sleep 30", true, "stopped").await;
+        run_case("done", "sleep 0.2; exit 0", false, "done").await;
+        run_case("failed", "sleep 0.2; exit 7", false, "failed").await;
+    }
+
+    #[tokio::test]
+    async fn agent_state_hook_fires_once_per_distinct_activity_value() {
+        let config_dir = temp_dir("agent-state-config");
+        let cwd = temp_dir("agent-state-cwd");
+        let marker = config_dir.join("agent-state.marker");
+        write_host_hook(
+            &config_dir,
+            "agent-state",
+            &format!(
+                "#!/bin/sh\nprintf '%s:%s:%s\\n' \"$POHUNEK_HOOK_EVENT\" \"$POHUNEK_SESSION_ID\" \"$POHUNEK_ACTIVITY\" >> {}\n",
+                marker.display()
+            ),
+        );
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            config_dir: Some(config_dir),
+            ..SessionRegistryConfig::default()
+        });
+        registry.spawn_agent_state_hooks();
+        let created = registry
+            .create(SessionNewParams {
+                cwd: Some(cwd),
+                ..params()
+            })
+            .await
+            .expect("create session");
+
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Working))
+            .await;
+        let mut contents = wait_for_line_count(&marker, 1).await;
+        assert!(contents.contains(&format!("agent-state:{}:working", created.id.0)));
+
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Working))
+            .await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        contents = fs::read_to_string(&marker).expect("read marker");
+        assert_eq!(
+            contents.lines().count(),
+            1,
+            "same-state refresh must not fire another hook: {contents:?}"
+        );
+
+        for (activity, expected_count) in [
+            (AgentActivity::Blocked, 2),
+            (AgentActivity::Working, 3),
+            (AgentActivity::Idle, 4),
+            (AgentActivity::Working, 5),
+        ] {
+            registry
+                .record_activity(&created.id, transition(activity))
+                .await;
+            contents = wait_for_line_count(&marker, expected_count).await;
+        }
+
+        let lines: Vec<String> = contents.lines().map(str::to_owned).collect();
+        assert_eq!(lines.len(), 5, "only distinct values fire: {contents:?}");
+        assert_eq!(
+            lines,
+            vec![
+                format!("agent-state:{}:working", created.id.0),
+                format!("agent-state:{}:blocked", created.id.0),
+                format!("agent-state:{}:working", created.id.0),
+                format!("agent-state:{}:idle", created.id.0),
+                format!("agent-state:{}:working", created.id.0),
+            ]
+        );
+
+        registry.stop(&created.id).await.expect("stop session");
+        registry.shutdown_agent_state_hooks().await;
+    }
+
+    #[tokio::test]
+    async fn session_layer_hooks_run_with_cleared_env_and_exact_allowlist() {
+        let config_dir = temp_dir("session-hook-env-config");
+        let cwd = temp_dir("session-hook-env-cwd");
+        let start_env = config_dir.join("session-start.env");
+        let state_env = config_dir.join("agent-state.env");
+        write_host_hook(
+            &config_dir,
+            "session-start",
+            &format!("#!/bin/sh\nenv > {}\n", start_env.display()),
+        );
+        write_host_hook(
+            &config_dir,
+            "agent-state",
+            &format!("#!/bin/sh\nenv > {}\n", state_env.display()),
+        );
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            config_dir: Some(config_dir),
+            ..SessionRegistryConfig::default()
+        });
+        registry.spawn_agent_state_hooks();
+        let created = registry
+            .create(SessionNewParams {
+                cwd: Some(cwd),
+                ..params()
+            })
+            .await
+            .expect("create session");
+
+        wait_for_file_contains(&start_env, "POHUNEK_HOOK_EVENT=session-start").await;
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Working))
+            .await;
+        wait_for_file_contains(&state_env, "POHUNEK_ACTIVITY=working").await;
+
+        let start = parse_env_dump(&fs::read_to_string(&start_env).expect("read start env"));
+        assert_eq!(
+            start.get("POHUNEK_HOOK_EVENT").map(String::as_str),
+            Some("session-start")
+        );
+        assert_eq!(
+            start.get("POHUNEK_SESSION_ID").map(String::as_str),
+            Some(created.id.0.as_str())
+        );
+        assert_eq!(
+            start.get("POHUNEK_AGENT").map(String::as_str),
+            Some("shell")
+        );
+        assert_eq!(
+            pohunek_env_keys(&start),
+            [
+                "POHUNEK_AGENT",
+                "POHUNEK_HOOK_EVENT",
+                "POHUNEK_PROJECT_ID",
+                "POHUNEK_SESSION_ID",
+            ]
+            .map(str::to_owned)
+            .to_vec()
+        );
+
+        let state = parse_env_dump(&fs::read_to_string(&state_env).expect("read state env"));
+        assert_eq!(
+            state.get("POHUNEK_HOOK_EVENT").map(String::as_str),
+            Some("agent-state")
+        );
+        assert_eq!(
+            state.get("POHUNEK_ACTIVITY").map(String::as_str),
+            Some("working")
+        );
+        assert_eq!(
+            pohunek_env_keys(&state),
+            [
+                "POHUNEK_ACTIVITY",
+                "POHUNEK_AGENT",
+                "POHUNEK_HOOK_EVENT",
+                "POHUNEK_PROJECT_ID",
+                "POHUNEK_SESSION_ID",
+            ]
+            .map(str::to_owned)
+            .to_vec()
+        );
+
+        for env in [&start, &state] {
+            assert!(env.contains_key("PATH"), "PATH is passed through");
+            assert!(
+                !env.keys().any(|key| key.starts_with("CARGO")),
+                "daemon inherited CARGO_* env must be cleared: {:?}",
+                env.keys().collect::<Vec<_>>()
+            );
+            for forbidden in [
+                "GITHUB_TOKEN",
+                "ANTHROPIC_API_KEY",
+                "POHUNEK_SOCKET_PATH",
+                "POHUNEK_DAEMON_ID",
+                "POHUNEK_ENV",
+                "POHUNEK_PROTOCOL_VERSION",
+                "POHUNEK_REPO",
+                "POHUNEK_WORKTREE",
+                "POHUNEK_BRANCH",
+                "POHUNEK_BASE_BRANCH",
+            ] {
+                assert!(
+                    !env.contains_key(forbidden),
+                    "{forbidden} must not be exposed to a session-layer hook"
+                );
+            }
+        }
+
+        registry.stop(&created.id).await.expect("stop session");
+        registry.shutdown_agent_state_hooks().await;
+    }
+
+    #[tokio::test]
+    async fn in_place_session_fires_session_hooks_but_no_worktree_hooks() {
+        let config_dir = temp_dir("in-place-hooks-config");
+        let repo = init_git_repo("in-place-hooks-repo");
+        let marker = config_dir.join("hooks.marker");
+        for event_name in [
+            "pre-create",
+            "post-create",
+            "pre-remove",
+            "post-remove",
+            "session-start",
+            "session-stop",
+            "agent-state",
+        ] {
+            write_host_hook(
+                &config_dir,
+                event_name,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$POHUNEK_HOOK_EVENT\" >> {}\n",
+                    marker.display()
+                ),
+            );
+        }
+        let store = temp_store_path("in-place-hooks-store");
+        let worktree_root = store.parent().expect("store parent").join("worktrees");
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store),
+            worktree_root: Some(worktree_root),
+            config_dir: Some(config_dir),
+            ..SessionRegistryConfig::default()
+        });
+        registry.spawn_agent_state_hooks();
+
+        let created = registry
+            .create(SessionNewParams {
+                cwd: Some(repo),
+                ..params()
+            })
+            .await
+            .expect("create in-place session");
+        assert_eq!(created.worktree_path, None, "no --branch means in-place");
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Working))
+            .await;
+        wait_for_file_contains(&marker, "agent-state").await;
+        registry.stop(&created.id).await.expect("stop session");
+        let contents = wait_for_line_count(&marker, 3).await;
+
+        let lines: Vec<&str> = contents.lines().collect();
+        assert!(lines.contains(&"session-start"));
+        assert!(lines.contains(&"agent-state"));
+        assert!(lines.contains(&"session-stop"));
+        for forbidden in ["pre-create", "post-create", "pre-remove", "post-remove"] {
+            assert!(
+                !lines.contains(&forbidden),
+                "in-place sessions must not run {forbidden}: {contents:?}"
+            );
+        }
+
+        registry.shutdown_agent_state_hooks().await;
+    }
+
+    #[tokio::test]
+    async fn project_backed_session_hooks_receive_project_id() {
+        let config_dir = temp_dir("project-session-hooks-config");
+        let repo = init_git_repo("project-session-hooks-repo");
+        let marker = config_dir.join("project-hooks.marker");
+        for event_name in ["session-start", "session-stop", "agent-state"] {
+            write_host_hook(
+                &config_dir,
+                event_name,
+                &format!(
+                    "#!/bin/sh\nprintf '%s:%s\\n' \"$POHUNEK_HOOK_EVENT\" \"$POHUNEK_PROJECT_ID\" >> {}\n",
+                    marker.display()
+                ),
+            );
+        }
+        let store = temp_store_path("project-session-hooks-store");
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store),
+            config_dir: Some(config_dir),
+            ..SessionRegistryConfig::default()
+        });
+        registry.spawn_agent_state_hooks();
+
+        let created = registry
+            .create(SessionNewParams {
+                cwd: Some(repo),
+                ..params()
+            })
+            .await
+            .expect("create project-backed in-place session");
+        let project_id = created.project_id.clone().expect("project id stamped");
+        wait_for_file_contains(&marker, &format!("session-start:{project_id}")).await;
+
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Working))
+            .await;
+        wait_for_file_contains(&marker, &format!("agent-state:{project_id}")).await;
+
+        registry.stop(&created.id).await.expect("stop session");
+        let contents = wait_for_file_contains(&marker, &format!("session-stop:{project_id}")).await;
+        for event_name in ["session-start", "agent-state", "session-stop"] {
+            assert!(
+                contents.contains(&format!("{event_name}:{project_id}")),
+                "{event_name} must receive project id {project_id}: {contents:?}"
+            );
+        }
+
+        registry.shutdown_agent_state_hooks().await;
+    }
+
+    #[tokio::test]
+    async fn agent_state_hook_dispatcher_survives_lag_and_shutdown_cancellation() {
+        let config_dir = temp_dir("agent-state-lag-config");
+        let cwd = temp_dir("agent-state-lag-cwd");
+        let marker = config_dir.join("agent-state-lag.marker");
+        write_host_hook(
+            &config_dir,
+            "agent-state",
+            &format!(
+                "#!/bin/sh\nsleep 0.1\nprintf '%s\\n' \"$POHUNEK_ACTIVITY\" >> {}\n",
+                marker.display()
+            ),
+        );
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            config_dir: Some(config_dir),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry
+            .create(SessionNewParams {
+                cwd: Some(cwd),
+                ..params()
+            })
+            .await
+            .expect("create session");
+
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Working))
+            .await;
+        let (tx, rx) = tokio::sync::broadcast::channel(1);
+        for n in 0..8 {
+            let _ = tx.send(Event::new(
+                protocol::event::SESSION_UPDATED,
+                serde_json::json!({ "n": n }),
+            ));
+        }
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let handle =
+            super::spawn_agent_state_hook_dispatcher(registry.clone(), rx, shutdown.clone());
+        wait_for_file_contains(&marker, "working").await;
+        for n in 8..16 {
+            let _ = tx.send(Event::new(
+                protocol::event::SESSION_UPDATED,
+                serde_json::json!({ "n": n }),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let contents = fs::read_to_string(&marker).expect("read marker after same-state lag");
+        assert_eq!(
+            contents.lines().count(),
+            1,
+            "lag re-read of the already-fired activity must not double-fire: {contents:?}"
+        );
+
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Blocked))
+            .await;
+        tx.send(Event::new(
+            protocol::event::AGENT_STATE,
+            serde_json::json!({
+                "session_id": created.id.clone(),
+                "activity": "blocked",
+                "source": "process",
+            }),
+        ))
+        .expect("send blocked event");
+        wait_for_file_contains(&marker, "blocked").await;
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("dispatcher joins after cancellation")
+            .expect("dispatcher task succeeds");
+
+        registry.stop(&created.id).await.expect("stop session");
+    }
+
+    #[tokio::test]
+    async fn agent_state_hook_dispatcher_flushes_buffered_event_on_shutdown() {
+        let config_dir = temp_dir("agent-state-shutdown-config");
+        let cwd = temp_dir("agent-state-shutdown-cwd");
+        let marker = config_dir.join("agent-state-shutdown.marker");
+        write_host_hook(
+            &config_dir,
+            "agent-state",
+            &format!(
+                "#!/bin/sh\nsleep 0.15\nprintf '%s\\n' \"$POHUNEK_ACTIVITY\" >> {}\n",
+                marker.display()
+            ),
+        );
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            config_dir: Some(config_dir),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry
+            .create(SessionNewParams {
+                cwd: Some(cwd),
+                ..params()
+            })
+            .await
+            .expect("create session");
+
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Working))
+            .await;
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let handle =
+            super::spawn_agent_state_hook_dispatcher(registry.clone(), rx, shutdown.clone());
+        tx.send(Event::new(
+            protocol::event::AGENT_STATE,
+            serde_json::json!({
+                "session_id": created.id.clone(),
+                "activity": "working",
+                "source": "process",
+            }),
+        ))
+        .expect("send buffered event");
+        shutdown.cancel();
+        handle.await.expect("dispatcher joins after cancellation");
+
+        let contents = fs::read_to_string(&marker)
+            .expect("dispatcher must await the hook flushed during shutdown");
+        assert!(
+            contents.contains("working"),
+            "dispatcher must flush and await buffered activity before joining: {contents:?}"
+        );
+        registry.stop(&created.id).await.expect("stop session");
+    }
+
+    #[tokio::test]
+    async fn agent_state_hook_coalesces_flaps_while_hook_is_in_flight() {
+        let config_dir = temp_dir("agent-state-coalesce-config");
+        let cwd = temp_dir("agent-state-coalesce-cwd");
+        let marker = config_dir.join("agent-state-coalesce.marker");
+        write_host_hook(
+            &config_dir,
+            "agent-state",
+            &format!(
+                "#!/bin/sh\nsleep 0.2\nprintf '%s\\n' \"$POHUNEK_ACTIVITY\" >> {}\n",
+                marker.display()
+            ),
+        );
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            setup_script_timeout: Duration::from_secs(1),
+            config_dir: Some(config_dir),
+            ..SessionRegistryConfig::default()
+        });
+        registry.spawn_agent_state_hooks();
+        let created = registry
+            .create(SessionNewParams {
+                cwd: Some(cwd),
+                ..params()
+            })
+            .await
+            .expect("create session");
+
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Working))
+            .await;
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Blocked))
+            .await;
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Idle))
+            .await;
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Blocked))
+            .await;
+
+        let contents = wait_for_line_count(&marker, 2).await;
+        assert_eq!(
+            contents.lines().collect::<Vec<_>>(),
+            vec!["working", "blocked"],
+            "only one hook runs in flight per session and intermediate flap is coalesced"
+        );
+
+        registry.stop(&created.id).await.expect("stop session");
+        registry.shutdown_agent_state_hooks().await;
+    }
+
+    #[tokio::test]
     async fn stop_marks_running_session_stopped() {
         let registry = SessionRegistry::new(SessionRegistryConfig {
             shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
@@ -3660,20 +4824,24 @@ mod tests {
     #[tokio::test]
     async fn report_native_id_records_binding_and_updates_info() {
         let store_path = temp_store_path("report");
+        let agents_dir = temp_resumable_agents_dir("report");
         let registry = SessionRegistry::new(SessionRegistryConfig {
-            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
             stop_grace: Duration::from_millis(50),
             store_path: Some(store_path.clone()),
+            agents_dir: Some(agents_dir),
             ..SessionRegistryConfig::default()
         });
 
-        let created = registry.create(params()).await.expect("create session");
+        let created = registry
+            .create(resumable_params())
+            .await
+            .expect("create session");
         assert_eq!(created.native_session_id, None);
 
         let result = registry
             .report_native_id(SessionReportNativeIdParams {
                 session_id: created.id.clone(),
-                agent: "shell".to_owned(),
+                agent: "claude".to_owned(),
                 native_session_id: "native-abc".to_owned(),
                 transcript_path: None,
             })
@@ -3685,7 +4853,7 @@ mod tests {
         assert_eq!(inspected.native_session_id.as_deref(), Some("native-abc"));
 
         // The binding was persisted to the store.
-        let persisted = crate::store::Store::new(store_path)
+        let persisted = crate::store::Store::new(store_path.clone())
             .load_resume()
             .expect("load store");
         assert_eq!(persisted.len(), 1);
@@ -3707,6 +4875,21 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create agents dir");
         std::fs::write(dir.join(format!("{name}.toml")), body).expect("write profile");
         dir
+    }
+
+    fn temp_resumable_agents_dir(tag: &str) -> PathBuf {
+        temp_agents_dir_with(
+            tag,
+            "resumable",
+            "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
+        )
+    }
+
+    fn resumable_params() -> SessionNewParams {
+        SessionNewParams {
+            agent: "resumable".to_owned(),
+            ..params()
+        }
     }
 
     #[tokio::test]
@@ -3743,8 +4926,8 @@ mod tests {
                 // Wire agent is a base-kind literal (what the hook reports); ignored
                 // for ref-kind selection.
                 agent: "claude".to_owned(),
-                native_session_id: "/home/u/.claude/t.jsonl".to_owned(),
-                transcript_path: None,
+                native_session_id: "opaque-native-id".to_owned(),
+                transcript_path: Some("/home/u/.claude/t.jsonl".to_owned()),
             })
             .await;
         assert!(result.recorded);
@@ -3760,7 +4943,7 @@ mod tests {
             "the id field is left empty for a path-kind session"
         );
 
-        let persisted = crate::store::Store::new(store_path)
+        let persisted = crate::store::Store::new(store_path.clone())
             .load_resume()
             .expect("load store");
         assert_eq!(persisted.len(), 1);
@@ -3773,6 +4956,66 @@ mod tests {
         assert_eq!(persisted[0].resume_mode, Some(ResumeMode::Flag));
         assert_eq!(persisted[0].program, "/bin/sh");
         assert!(persisted[0].resumable);
+
+        registry
+            .resize(&created.id, 120, 40)
+            .await
+            .expect("resize path-profile session");
+        let resized = crate::store::Store::new(store_path)
+            .load_resume()
+            .expect("load resized binding");
+        assert_eq!(
+            (resized[0].cols, resized[0].rows),
+            (120, 40),
+            "path-kind resume binding must refresh dimensions after resize"
+        );
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn non_resumable_profile_ignores_native_id_reports() {
+        let store_path = temp_store_path("noresume-profile");
+        let agents_dir = temp_agents_dir_with(
+            "noresume-profile",
+            "noresume",
+            "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n[resume]\nresumable = false\n",
+        );
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path.clone()),
+            agents_dir: Some(agents_dir),
+            socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
+            ..SessionRegistryConfig::default()
+        });
+
+        let created = registry
+            .create(SessionNewParams {
+                agent: "noresume".to_owned(),
+                ..params()
+            })
+            .await
+            .expect("create non-resumable profile session");
+
+        let result = registry
+            .report_native_id(SessionReportNativeIdParams {
+                session_id: created.id.clone(),
+                agent: "codex".to_owned(),
+                native_session_id: "native-ignored".to_owned(),
+                transcript_path: None,
+            })
+            .await;
+        assert!(
+            !result.recorded,
+            "non-resumable profile must reject native-id reports fail-closed"
+        );
+        assert!(
+            crate::store::Store::new(store_path)
+                .load_resume()
+                .expect("load")
+                .is_empty(),
+            "non-resumable profile must not persist a resume binding"
+        );
 
         let _ = registry.stop(&created.id).await;
     }
@@ -3825,18 +5068,22 @@ mod tests {
     #[tokio::test]
     async fn stopping_a_session_drops_its_resume_binding() {
         let store_path = temp_store_path("drop-on-stop");
+        let agents_dir = temp_resumable_agents_dir("drop-on-stop");
         let registry = SessionRegistry::new(SessionRegistryConfig {
-            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
             stop_grace: Duration::from_millis(50),
             store_path: Some(store_path.clone()),
+            agents_dir: Some(agents_dir),
             ..SessionRegistryConfig::default()
         });
 
-        let created = registry.create(params()).await.expect("create session");
+        let created = registry
+            .create(resumable_params())
+            .await
+            .expect("create session");
         let recorded = registry
             .report_native_id(SessionReportNativeIdParams {
                 session_id: created.id.clone(),
-                agent: "shell".to_owned(),
+                agent: "claude".to_owned(),
                 native_session_id: "native-stop".to_owned(),
                 transcript_path: None,
             })
@@ -3866,19 +5113,23 @@ mod tests {
     #[tokio::test]
     async fn resize_after_capture_updates_persisted_binding() {
         let store_path = temp_store_path("resize-binding");
+        let agents_dir = temp_resumable_agents_dir("resize-binding");
         let registry = SessionRegistry::new(SessionRegistryConfig {
-            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
             stop_grace: Duration::from_millis(50),
             store_path: Some(store_path.clone()),
+            agents_dir: Some(agents_dir),
             ..SessionRegistryConfig::default()
         });
 
-        let created = registry.create(params()).await.expect("create session");
+        let created = registry
+            .create(resumable_params())
+            .await
+            .expect("create session");
         // Capture a native id so a resume binding exists at the launch size.
         let recorded = registry
             .report_native_id(SessionReportNativeIdParams {
                 session_id: created.id.clone(),
-                agent: "shell".to_owned(),
+                agent: "claude".to_owned(),
                 native_session_id: "native-resize".to_owned(),
                 transcript_path: None,
             })
@@ -3986,6 +5237,58 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_and_resume_uses_frozen_profile_args() {
+        let store_path = temp_store_path("resume-args");
+        let dir = temp_dir("resume-args-runtime");
+        let script = dir.join("resume-agent");
+        let marker = dir.join("argv.txt");
+        write_executable(
+            &script,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nsleep 30\n",
+                marker.display()
+            ),
+        );
+        let store = crate::store::Store::new(store_path.clone());
+        store
+            .record_resume(&crate::store::ResumeBinding {
+                session_id: "s-44".to_owned(),
+                agent: "profiled".to_owned(),
+                agent_base: AgentKind::Claude,
+                cwd: dir.clone(),
+                cols: 80,
+                rows: 24,
+                native_session_id: Some("native-44".to_owned()),
+                native_session_path: None,
+                project_id: None,
+                is_linked_worktree: None,
+                program: script.display().to_string(),
+                args: vec!["--model".to_owned(), "sonnet".to_owned()],
+                input_rules: crate::store::StoredInputRules::default(),
+                resume_mode: Some(ResumeMode::Flag),
+                ref_kind: Some(SessionRefKind::Id),
+                resumable: true,
+            })
+            .expect("seed resume binding");
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            store_path: Some(store_path),
+            ..SessionRegistryConfig::default()
+        });
+
+        registry.load_and_resume().await;
+
+        let argv = wait_for_file_contains(&marker, "native-44").await;
+        assert_eq!(
+            argv.lines().collect::<Vec<_>>(),
+            vec!["--model", "sonnet", "--resume", "native-44"],
+            "resume relaunch must preserve frozen profile args before resume argv"
+        );
+
+        let _ = registry.stop(&SessionId("s-44".to_owned())).await;
+    }
+
     #[tokio::test]
     async fn resume_binding_persists_project_context_for_restart() {
         // F5: a resumed session's project context is restored from the persisted
@@ -3993,11 +5296,20 @@ mod tests {
         // `is_linked_worktree` captured from the live session — verified here by
         // round-tripping through the store (record on native-id capture, read back
         // via load_resume), which is exactly what `load_and_resume` reads at start.
-        let (registry, repo) = project_registry("resume-project-ctx");
+        let store = temp_store_path("resume-project-ctx");
+        let worktree_root = store.parent().expect("store parent").join("worktrees");
+        let agents_dir = temp_resumable_agents_dir("resume-project-ctx");
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            store_path: Some(store),
+            worktree_root: Some(worktree_root),
+            agents_dir: Some(agents_dir),
+            ..SessionRegistryConfig::default()
+        });
+        let repo = init_git_repo("resume-project-ctx");
         let info = registry
             .create(SessionNewParams {
                 cwd: Some(repo.clone()),
-                ..params()
+                ..resumable_params()
             })
             .await
             .expect("in-place session in the repo");
@@ -4008,7 +5320,7 @@ mod tests {
         let recorded = registry
             .report_native_id(SessionReportNativeIdParams {
                 session_id: info.id.clone(),
-                agent: "shell".to_owned(),
+                agent: "claude".to_owned(),
                 native_session_id: "native-resume".to_owned(),
                 transcript_path: None,
             })
@@ -4037,18 +5349,22 @@ mod tests {
     #[tokio::test]
     async fn concurrent_resize_and_recapture_keep_store_consistent_with_memory() {
         let store_path = temp_store_path("concurrent-persist");
+        let agents_dir = temp_resumable_agents_dir("concurrent-persist");
         let registry = SessionRegistry::new(SessionRegistryConfig {
-            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
             stop_grace: Duration::from_millis(50),
             store_path: Some(store_path.clone()),
+            agents_dir: Some(agents_dir),
             ..SessionRegistryConfig::default()
         });
 
-        let created = registry.create(params()).await.expect("create session");
+        let created = registry
+            .create(resumable_params())
+            .await
+            .expect("create session");
         let recorded = registry
             .report_native_id(SessionReportNativeIdParams {
                 session_id: created.id.clone(),
-                agent: "shell".to_owned(),
+                agent: "claude".to_owned(),
                 native_session_id: "native-concurrent".to_owned(),
                 transcript_path: None,
             })
@@ -4071,7 +5387,7 @@ mod tests {
                 registry
                     .report_native_id(SessionReportNativeIdParams {
                         session_id: id,
-                        agent: "shell".to_owned(),
+                        agent: "claude".to_owned(),
                         native_session_id: "native-concurrent".to_owned(),
                         transcript_path: None,
                     })
@@ -4102,18 +5418,22 @@ mod tests {
     #[tokio::test]
     async fn resize_then_stop_leaves_no_binding() {
         let store_path = temp_store_path("resize-then-stop");
+        let agents_dir = temp_resumable_agents_dir("resize-then-stop");
         let registry = SessionRegistry::new(SessionRegistryConfig {
-            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
             stop_grace: Duration::from_millis(50),
             store_path: Some(store_path.clone()),
+            agents_dir: Some(agents_dir),
             ..SessionRegistryConfig::default()
         });
 
-        let created = registry.create(params()).await.expect("create session");
+        let created = registry
+            .create(resumable_params())
+            .await
+            .expect("create session");
         let recorded = registry
             .report_native_id(SessionReportNativeIdParams {
                 session_id: created.id.clone(),
-                agent: "shell".to_owned(),
+                agent: "claude".to_owned(),
                 native_session_id: "native-resize-stop".to_owned(),
                 transcript_path: None,
             })

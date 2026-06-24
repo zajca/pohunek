@@ -370,6 +370,8 @@ impl WorktreeManager {
             worktree: worktree.map(Path::to_path_buf),
             branch: Some(req.branch.clone()),
             base_branch: Some(base_branch.to_owned()),
+            stop_reason: None,
+            activity: None,
         };
         run_hook(
             event,
@@ -400,6 +402,8 @@ impl WorktreeManager {
             worktree: worktree.map(Path::to_path_buf),
             branch: Some(binding.branch.clone()),
             base_branch: Some(binding.base_branch.clone()),
+            stop_reason: None,
+            activity: None,
         };
         run_hook(
             event,
@@ -989,6 +993,12 @@ pub(crate) enum HookEvent {
     PreRemove,
     /// After `git worktree remove`, in the repository (worktree gone).
     PostRemove,
+    /// After a PTY session is launched, in the session cwd.
+    SessionStart,
+    /// When a session reaches a terminal state, in the session cwd.
+    SessionStop,
+    /// When detector-visible agent activity changes, in the session cwd.
+    AgentState,
 }
 
 impl HookEvent {
@@ -999,6 +1009,9 @@ impl HookEvent {
             HookEvent::PostCreate => "post-create",
             HookEvent::PreRemove => "pre-remove",
             HookEvent::PostRemove => "post-remove",
+            HookEvent::SessionStart => "session-start",
+            HookEvent::SessionStop => "session-stop",
+            HookEvent::AgentState => "agent-state",
         }
     }
 }
@@ -1025,6 +1038,10 @@ pub(crate) struct HookContext {
     pub branch: Option<String>,
     /// Base branch (`POHUNEK_BASE_BRANCH`).
     pub base_branch: Option<String>,
+    /// Terminal stop reason (`POHUNEK_STOP_REASON`) for `session-stop`.
+    pub stop_reason: Option<&'static str>,
+    /// Agent activity value (`POHUNEK_ACTIVITY`) for `agent-state`.
+    pub activity: Option<&'static str>,
 }
 
 /// Build the env-clear allowlist a hook runs with: `PATH`/`HOME` passed through
@@ -1060,6 +1077,12 @@ fn hook_env(event: HookEvent, ctx: &HookContext) -> Vec<(String, String)> {
     }
     if let Some(base_branch) = &ctx.base_branch {
         env.push(("POHUNEK_BASE_BRANCH".to_owned(), base_branch.clone()));
+    }
+    if let Some(stop_reason) = ctx.stop_reason {
+        env.push(("POHUNEK_STOP_REASON".to_owned(), stop_reason.to_owned()));
+    }
+    if let Some(activity) = ctx.activity {
+        env.push(("POHUNEK_ACTIVITY".to_owned(), activity.to_owned()));
     }
     env
 }
