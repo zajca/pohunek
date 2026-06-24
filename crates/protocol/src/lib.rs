@@ -40,9 +40,9 @@ pub use integration::{
     ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
 pub use project::{
-    ProjectAddParams, ProjectInfo, ProjectListFilter, ProjectListParams, ProjectRemoveParams,
-    ProjectRemoveResult, ProjectRenameParams, ProjectShowParams, ProjectShowResult, ProjectSource,
-    ProjectWorktree,
+    ProjectAddParams, ProjectInfo, ProjectListFilter, ProjectListParams, ProjectPromptParams,
+    ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
+    ProjectShowParams, ProjectShowResult, ProjectSource, ProjectWorktree, PromptLayer,
 };
 pub use session::{
     AgentActivity, AgentKind, AttachHeader, SessionAttachParams, SessionAttachResult,
@@ -106,6 +106,9 @@ pub mod method {
     /// Forget a project record (optionally pruning owned worktrees). Returns a
     /// [`ProjectRemoveResult`](crate::ProjectRemoveResult).
     pub const PROJECT_REMOVE: &str = "project.remove";
+    /// Resolve one prompt by name to its template content, fail-closed
+    /// (`prompt_not_found`). Returns a [`ProjectPromptResult`](crate::ProjectPromptResult).
+    pub const PROJECT_PROMPT: &str = "project.prompt";
 }
 
 /// Control-protocol event names.

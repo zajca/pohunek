@@ -186,6 +186,18 @@ enum ProjectAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Resolve one prompt by name to its template content (which layer wins), or
+    /// error if neither the repo's `.pohunek/` nor the host config defines it.
+    Prompt {
+        /// Project reference: `<id|label>` on the target host.
+        reference: String,
+        /// The prompt name to resolve (a single path segment).
+        name: String,
+        /// Emit machine-readable JSON instead of the raw template text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -400,7 +412,8 @@ impl ProjectAction {
             | ProjectAction::Add { json, .. }
             | ProjectAction::Show { json, .. }
             | ProjectAction::Rename { json, .. }
-            | ProjectAction::Rm { json, .. } => *json,
+            | ProjectAction::Rm { json, .. }
+            | ProjectAction::Prompt { json, .. } => *json,
         }
     }
 }
@@ -671,6 +684,13 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 } => {
                     commands::project::run_rm(&host, &paths, &reference, prune_worktrees, json)
                         .await?;
+                }
+                ProjectAction::Prompt {
+                    reference,
+                    name,
+                    json,
+                } => {
+                    commands::project::run_prompt(&host, &paths, &reference, &name, json).await?;
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -1269,5 +1289,39 @@ mod tests {
                 }
             }
         ));
+    }
+
+    #[test]
+    fn parses_project_prompt_with_required_name() {
+        let cli = Cli::try_parse_from([
+            "pohunek", "--host", "host-b", "project", "prompt", "ui", "issue", "--json",
+        ])
+        .expect("parse prompt");
+        match cli.command {
+            Commands::Project {
+                action:
+                    ProjectAction::Prompt {
+                        reference,
+                        name,
+                        json,
+                    },
+            } => {
+                assert_eq!(reference, "ui");
+                assert_eq!(name, "issue");
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert_eq!(
+            cli.host, "host-b",
+            "project prompt honors the global --host"
+        );
+
+        // The prompt name is required: `project prompt <ref>` with no name is a
+        // usage error (there is no "default prompt").
+        assert!(
+            Cli::try_parse_from(["pohunek", "project", "prompt", "ui"]).is_err(),
+            "missing prompt name must be a usage error"
+        );
     }
 }

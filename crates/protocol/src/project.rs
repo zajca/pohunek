@@ -161,6 +161,43 @@ pub struct ProjectShowResult {
     pub worktrees: Vec<ProjectWorktree>,
 }
 
+/// Which config layer a `project.prompt`/`project.action` definition resolved from.
+///
+/// In-repo `<repo_root>/.pohunek/` shadows the host-default `<config_dir>/` layer
+/// per name; this records which one won so a caller (and `--json`) can see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptLayer {
+    /// Resolved from the repository's in-repo `.pohunek/` (travels with the repo).
+    InRepo,
+    /// Resolved from the host-default `~/.config/pohunek/` on the daemon's host.
+    Host,
+}
+
+/// Parameters for `project.prompt`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectPromptParams {
+    /// The `<id|label>` reference to resolve against the host's store.
+    pub reference: String,
+    /// The prompt name to resolve. A single path segment (the daemon enforces the
+    /// `^[A-Za-z0-9._-]+$` name guard before any read); required — there is no
+    /// "default prompt".
+    pub name: String,
+}
+
+/// Result of `project.prompt`: the resolved template content (fail-closed) and the
+/// layer it came from. The daemon does **not** render it — provider data and
+/// rendering stay caller-side (A.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectPromptResult {
+    /// The resolved prompt name (echoed back).
+    pub name: String,
+    /// The raw prompt-template content, with `${var}` placeholders intact.
+    pub content: String,
+    /// Which layer the prompt was resolved from.
+    pub layer: PromptLayer,
+}
+
 /// Result of `project.remove`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectRemoveResult {

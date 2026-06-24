@@ -14,6 +14,10 @@
 
 pub mod detect;
 
+mod config;
+
+pub(crate) use config::ProjectConfigResolver;
+
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

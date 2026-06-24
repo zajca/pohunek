@@ -1237,3 +1237,27 @@ fn new_remote_error_codes_are_distinct() {
         "error codes must all be distinct: {codes:?}"
     );
 }
+
+#[test]
+fn project_prompt_json_shape_roundtrips() {
+    let result = protocol::ProjectPromptResult {
+        name: "issue".to_owned(),
+        content: "Process ${title}\n\n${body}".to_owned(),
+        layer: protocol::PromptLayer::InRepo,
+    };
+    assert_eq!(line_roundtrip(&result), result);
+
+    // PromptLayer serializes in snake_case, the contract the two clients share.
+    let value: Value = serde_json::to_value(&result).expect("to_value");
+    assert_eq!(value["layer"], json!("in_repo"));
+    assert_eq!(
+        serde_json::to_value(protocol::PromptLayer::Host).expect("to_value"),
+        json!("host")
+    );
+
+    let params = protocol::ProjectPromptParams {
+        reference: "ui".to_owned(),
+        name: "issue".to_owned(),
+    };
+    assert_eq!(line_roundtrip(&params), params);
+}

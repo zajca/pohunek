@@ -12,8 +12,9 @@ use std::path::PathBuf;
 
 use protocol::{
     method, ProjectAddParams, ProjectInfo, ProjectListFilter, ProjectListParams,
-    ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams, ProjectShowParams,
-    ProjectShowResult, ProjectSource, ProjectWorktree, Request,
+    ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult,
+    ProjectRenameParams, ProjectShowParams, ProjectShowResult, ProjectSource, ProjectWorktree,
+    PromptLayer, Request,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -139,6 +140,42 @@ pub(crate) async fn run_show(
         print!("{}", crate::commands::render_json(&result)?);
     } else {
         print!("{}", render_show_human(&result));
+    }
+    Ok(())
+}
+
+/// Run `project prompt <reference> <name>` against the daemon for `host`.
+///
+/// Resolves one prompt by name to its template content (the in-repo `.pohunek/`
+/// layer shadows the host default), or a typed `prompt_not_found`/`invalid_name`.
+/// Human output writes the raw template to stdout verbatim (it is fed to a
+/// renderer) and the resolved layer to stderr, so a `--json`-free consumer still
+/// gets a clean template on stdout.
+pub(crate) async fn run_prompt(
+    host: &str,
+    paths: &Paths,
+    reference: &str,
+    name: &str,
+    json: bool,
+) -> Result<(), CliError> {
+    let request = request_with_params(
+        method::PROJECT_PROMPT,
+        &ProjectPromptParams {
+            reference: reference.to_owned(),
+            name: name.to_owned(),
+        },
+    )?;
+    let mut client = Client::connect(host, paths).await?;
+    let result: ProjectPromptResult = serde_json::from_value(client.request(&request).await?)?;
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        let layer = match result.layer {
+            PromptLayer::InRepo => "in-repo .pohunek/",
+            PromptLayer::Host => "host config",
+        };
+        eprintln!("pohunek: prompt '{}' resolved from {layer}", result.name);
+        print!("{}", result.content);
     }
     Ok(())
 }

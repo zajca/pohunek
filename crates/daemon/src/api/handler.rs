@@ -12,11 +12,12 @@
 
 use protocol::{
     method, negotiate, HostDiscoverParams, IntegrationInstallParams, ProjectAddParams,
-    ProjectListParams, ProjectRemoveParams, ProjectRenameParams, ProjectShowParams, ProtocolError,
-    Request, Response, SessionAttachParams, SessionDetachParams, SessionId, SessionInputParams,
-    SessionListParams, SessionNewParams, SessionNewResult, SessionReportNativeIdParams,
-    SessionResizeParams, PROTOCOL_VERSION,
+    ProjectListParams, ProjectPromptParams, ProjectRemoveParams, ProjectRenameParams,
+    ProjectShowParams, ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams,
+    SessionId, SessionInputParams, SessionListParams, SessionNewParams, SessionNewResult,
+    SessionReportNativeIdParams, SessionResizeParams, PROTOCOL_VERSION,
 };
+use std::path::Path;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -24,7 +25,7 @@ use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 use crate::discovery::DiscoveryCache;
-use crate::project::{LiveSession, ProjectManager};
+use crate::project::{LiveSession, ProjectConfigResolver, ProjectManager};
 use crate::session::SessionRegistry;
 
 /// Static facts the daemon reports from `daemon.health`.
@@ -167,6 +168,7 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::PROJECT_SHOW => handle_project_show(request, &state.sessions).await,
         method::PROJECT_RENAME => handle_project_rename(request, &state.sessions).await,
         method::PROJECT_REMOVE => handle_project_remove(request, &state.sessions).await,
+        method::PROJECT_PROMPT => handle_project_prompt(request, &state.sessions).await,
         other => Response::err(request.id.clone(), ProtocolError::method_not_found(other)),
     }
 }
@@ -328,6 +330,31 @@ async fn handle_project_show(request: &Request, sessions: &SessionRegistry) -> R
     let live = live_sessions(sessions.list().await);
     let reference = params.reference;
     run_project_blocking(request, move || pm.show(&reference, &live)).await
+}
+
+/// `project.prompt`: resolve one prompt by name to its template content,
+/// fail-closed (`prompt_not_found`). The primitive behind `project.action` and the
+/// `pohunek project prompt` command. Read-only — it does not bump `last_used`.
+async fn handle_project_prompt(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_params::<ProjectPromptParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    let pm = match require_projects(request, sessions) {
+        Ok(pm) => pm,
+        Err(resp) => return resp,
+    };
+    // The host-default layer lives under the daemon's config dir; `None` disables it
+    // (the resolver then sees in-repo only). The daemon reads its own host's
+    // `.pohunek/`, so this works identically for a local or a remote project.
+    let config_dir = sessions.config_dir().map(Path::to_path_buf);
+    let ProjectPromptParams { reference, name } = params;
+    run_project_blocking(request, move || {
+        let record = pm.resolve(&reference)?;
+        let resolver = ProjectConfigResolver::new(record.repo_root, config_dir);
+        resolver.resolve_prompt(&name)
+    })
+    .await
 }
 
 /// `project.rename`: set a project's custom display name.
