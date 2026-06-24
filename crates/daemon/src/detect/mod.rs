@@ -58,6 +58,21 @@ impl DetectorConfig {
         }
     }
 
+    /// Detector config for a host agent profile (Part C): use the profile's
+    /// override manifest when it declares one, else inherit the base kind's
+    /// embedded manifest. The override is already parsed via the capped,
+    /// non-panicking [`Manifest::parse_str`] (a malformed one disabled the profile
+    /// before this point), so detection never `.expect`-panics on host input.
+    pub fn for_profile(base: AgentKind, override_manifest: Option<Manifest>) -> Self {
+        match override_manifest {
+            Some(manifest) => Self {
+                detection: DetectionConfig::default(),
+                manifest: Some(manifest),
+            },
+            None => Self::for_agent(base),
+        }
+    }
+
     /// Production detector config using the embedded Codex manifest.
     pub fn codex() -> Self {
         Self {
@@ -977,6 +992,58 @@ mod tests {
         assert_eq!(
             claude.feed(started_at, "\x1b]2;\u{280b} thinking\x07".as_bytes()),
             vec![transition(AgentActivity::Working, StateSource::OscTitle)]
+        );
+    }
+
+    #[test]
+    fn detector_config_for_profile_uses_override_manifest_when_present() {
+        let override_manifest = manifest(
+            r#"
+            [[rules]]
+            id = "custom-blocked"
+            state = "blocked"
+            priority = 1
+            region = "whole_recent"
+            contains = "custom blocker"
+            "#,
+        );
+
+        let mut config =
+            super::DetectorConfig::for_profile(protocol::AgentKind::Codex, Some(override_manifest));
+        config.detection = self::config().detection;
+        let started_at = instant();
+        let mut detector = Detector::new(3, 80, started_at, config);
+
+        assert_eq!(
+            detector.feed(started_at, b"custom blocker\r\n"),
+            vec![transition(AgentActivity::Blocked, StateSource::Screen)]
+        );
+    }
+
+    #[test]
+    fn detector_config_for_profile_inherits_base_manifest_without_override() {
+        // With no override, a profile inherits its base kind's manifest. The
+        // detector config holds an owned manifest (not the &'static), so assert by
+        // behavior: feeding a Claude blocking pattern yields the same blocked
+        // transition the base Claude config produces.
+        let mut profile_config =
+            super::DetectorConfig::for_profile(protocol::AgentKind::Claude, None);
+        profile_config.detection = self::config().detection;
+        let mut base_config = super::DetectorConfig::claude();
+        base_config.detection = self::config().detection;
+        assert!(
+            profile_config.manifest.is_some(),
+            "a profile without an override must inherit a base manifest"
+        );
+
+        let blocked = "enter to select\nesc to cancel\n↑/↓ to navigate";
+        let started_at = instant();
+        let mut from_profile = Detector::new(6, 80, started_at, profile_config);
+        let mut from_base = Detector::new(6, 80, started_at, base_config);
+        assert_eq!(
+            from_profile.feed(started_at, blocked.as_bytes()),
+            from_base.feed(started_at, blocked.as_bytes()),
+            "inherited manifest must detect exactly like the base Claude config"
         );
     }
 
