@@ -236,9 +236,19 @@ async fn exchange(framed: &mut Framed<UnixStream, LinesCodec>, request: &Request
     serde_json::from_str(&reply).expect("parse response")
 }
 
+/// Map a base kind to its wire name (the `agent` field is a free string since
+/// Part C; the helpers below still take an `AgentKind` for convenience).
+fn agent_name(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::Shell => "shell",
+        AgentKind::Codex => "codex",
+        AgentKind::Claude => "claude",
+    }
+}
+
 fn session_params() -> SessionNewParams {
     SessionNewParams {
-        agent: AgentKind::Shell,
+        agent: "shell".to_owned(),
         cwd: Some(std::env::temp_dir()),
         cols: 80,
         rows: 24,
@@ -252,7 +262,7 @@ fn session_params() -> SessionNewParams {
 
 fn session_params_for_agent(agent: AgentKind, cwd: PathBuf) -> SessionNewParams {
     SessionNewParams {
-        agent,
+        agent: agent_name(agent).to_owned(),
         cwd: Some(cwd),
         cols: 80,
         rows: 24,
@@ -267,7 +277,7 @@ fn session_params_for_agent(agent: AgentKind, cwd: PathBuf) -> SessionNewParams 
 /// `session.new` params binding a worktree for `repo` + `branch`.
 fn session_params_for_worktree(agent: AgentKind, repo: PathBuf, branch: &str) -> SessionNewParams {
     SessionNewParams {
-        agent,
+        agent: agent_name(agent).to_owned(),
         cwd: None,
         cols: 80,
         rows: 24,
@@ -697,7 +707,7 @@ async fn assert_resume_round_trip(
         create_session_with_agent(&mut control, agent, cwd.clone()).await,
     ))
     .expect("stub session info");
-    assert_eq!(created.agent, agent);
+    assert_eq!(created.agent, agent_name(agent));
 
     // The stub fires the report RPC (proving the handshake env reached it); wait
     // until the daemon records the native id on the session.
@@ -999,7 +1009,7 @@ async fn session_lifecycle_over_socket() {
 
     let mut client = connect(&socket).await;
     let created = create_session(&mut client).await;
-    assert_eq!(created.agent, AgentKind::Shell);
+    assert_eq!(created.agent, "shell");
     assert_eq!(created.state, SessionState::Running);
     assert_eq!(created.cols, 80);
     assert_eq!(created.rows, 24);
@@ -1154,7 +1164,7 @@ async fn session_new_with_input_writes_text_to_shell_pty() {
         "session.new must keep returning SessionInfo, not SessionInputResult: {ok}"
     );
     let created: SessionInfo = serde_json::from_value(ok).expect("session info");
-    assert_eq!(created.agent, AgentKind::Shell);
+    assert_eq!(created.agent, "shell");
     assert_eq!(created.state, SessionState::Running);
 
     let attach = attach_session(&mut client, &created.id).await;
@@ -1212,7 +1222,7 @@ async fn codex_stub_session_publishes_blocked_and_receives_bracketed_input() {
         ))
         .expect("codex session info")
     };
-    assert_eq!(created.agent, AgentKind::Codex);
+    assert_eq!(created.agent, "codex");
 
     let streamed = wait_for_agent_state_event(
         &mut subscriber,
@@ -1276,7 +1286,7 @@ async fn claude_stub_session_publishes_screen_blocked_and_receives_plain_input()
         ))
         .expect("claude session info")
     };
-    assert_eq!(created.agent, AgentKind::Claude);
+    assert_eq!(created.agent, "claude");
 
     let streamed = wait_for_agent_state_event(
         &mut subscriber,

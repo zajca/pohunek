@@ -37,8 +37,8 @@ pub enum AgentActivity {
 /// Parameters for `session.new`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionNewParams {
-    /// Agent kind to start.
-    pub agent: AgentKind,
+    /// Agent profile name to start.
+    pub agent: String,
     /// Working directory for the session. If omitted, the daemon chooses one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
@@ -92,8 +92,8 @@ pub enum SessionListFilter {
     State(SessionState),
     /// Match [`SessionInfo::activity`].
     Activity(AgentActivity),
-    /// Match [`SessionInfo::agent`].
-    Agent(AgentKind),
+    /// Match [`SessionInfo::agent`] or its snapshotted base kind label.
+    Agent(String),
     /// Match [`SessionInfo::id`].
     Id(String),
     /// Match the session's project by `<id|label>` reference — its derived id
@@ -110,13 +110,23 @@ impl SessionListFilter {
         match self {
             Self::State(state) => session.state == *state,
             Self::Activity(activity) => session.activity == Some(*activity),
-            Self::Agent(agent) => session.agent == *agent,
+            Self::Agent(name) => {
+                session.agent == *name || base_kind_label(session.agent_base) == name
+            }
             Self::Id(id) => session.id.0 == *id,
             Self::Project(reference) => {
                 session.project_id.as_deref() == Some(reference)
                     || session.project_label.as_deref() == Some(reference)
             }
         }
+    }
+}
+
+fn base_kind_label(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::Shell => "shell",
+        AgentKind::Codex => "codex",
+        AgentKind::Claude => "claude",
     }
 }
 
@@ -189,8 +199,8 @@ pub struct SessionInputResult {
 pub struct SessionReportNativeIdParams {
     /// The pohunek session id the agent was launched under.
     pub session_id: SessionId,
-    /// Agent kind reporting its native session id.
-    pub agent: AgentKind,
+    /// Agent profile name reporting its native session id.
+    pub agent: String,
     /// The agent's own native session identifier used to build the resume argv.
     pub native_session_id: String,
     /// Optional transcript path reported by the agent (Claude provides one).
@@ -309,8 +319,10 @@ pub struct SessionWarning {
 pub struct SessionInfo {
     /// Stable session identifier.
     pub id: SessionId,
-    /// Agent kind backing the session.
-    pub agent: AgentKind,
+    /// Agent profile name backing the session.
+    pub agent: String,
+    /// Resolved base kind backing the session.
+    pub agent_base: AgentKind,
     /// Current working directory for the session.
     pub cwd: PathBuf,
     /// Operating-system process id of the session root process.
@@ -423,7 +435,8 @@ mod tests {
     fn session(id: &str) -> SessionInfo {
         SessionInfo {
             id: SessionId(id.to_owned()),
-            agent: AgentKind::Claude,
+            agent: "claude".to_owned(),
+            agent_base: AgentKind::Claude,
             cwd: PathBuf::from("/workspace"),
             pid: 4242,
             cols: 80,
@@ -463,7 +476,7 @@ mod tests {
         s.project_id = Some("p-abc".to_owned());
         s.project_label = Some("ui".to_owned());
         assert!(SessionListFilter::State(SessionState::Running).matches(&s));
-        assert!(SessionListFilter::Agent(AgentKind::Claude).matches(&s));
+        assert!(SessionListFilter::Agent("claude".to_owned()).matches(&s));
         assert!(SessionListFilter::Activity(AgentActivity::Working).matches(&s));
         assert!(SessionListFilter::Id("s-42".to_owned()).matches(&s));
         // A project filter matches the derived id or the enriched label.
@@ -475,10 +488,21 @@ mod tests {
     fn filter_rejects_non_matching_field() {
         let s = session("s-42");
         assert!(!SessionListFilter::State(SessionState::Stopped).matches(&s));
-        assert!(!SessionListFilter::Agent(AgentKind::Codex).matches(&s));
+        assert!(!SessionListFilter::Agent("codex".to_owned()).matches(&s));
         assert!(!SessionListFilter::Activity(AgentActivity::Blocked).matches(&s));
         // No project on this session ⇒ a project filter never matches.
         assert!(!SessionListFilter::Project("ui".to_owned()).matches(&s));
+    }
+
+    #[test]
+    fn agent_filter_matches_profile_name_or_base_kind() {
+        let mut s = session("s-42");
+        s.agent = "claude-sonnet".to_owned();
+        s.agent_base = AgentKind::Claude;
+
+        assert!(SessionListFilter::Agent("claude-sonnet".to_owned()).matches(&s));
+        assert!(SessionListFilter::Agent("claude".to_owned()).matches(&s));
+        assert!(!SessionListFilter::Agent("codex".to_owned()).matches(&s));
     }
 
     #[test]

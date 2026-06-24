@@ -31,7 +31,8 @@ where
 fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
     SessionInfo {
         id: SessionId("s-42".to_owned()),
-        agent: AgentKind::Shell,
+        agent: "shell".to_owned(),
+        agent_base: AgentKind::Shell,
         cwd: PathBuf::from("/workspace/project"),
         pid: 4242,
         cols: 120,
@@ -90,7 +91,7 @@ fn agent_activity_json_shape_roundtrips() {
 #[test]
 fn session_new_params_json_shape_roundtrips() {
     let params = SessionNewParams {
-        agent: AgentKind::Shell,
+        agent: "shell".to_owned(),
         cwd: Some(PathBuf::from("/workspace/project")),
         cols: 120,
         rows: 40,
@@ -119,7 +120,7 @@ fn session_new_params_json_shape_roundtrips() {
 #[test]
 fn session_new_params_roundtrips_with_worktree_fields() {
     let params = SessionNewParams {
-        agent: AgentKind::Claude,
+        agent: "claude".to_owned(),
         cwd: None,
         cols: 80,
         rows: 24,
@@ -150,7 +151,7 @@ fn session_new_params_roundtrips_with_worktree_fields() {
 #[test]
 fn session_new_params_omits_absent_worktree_fields() {
     let params = SessionNewParams {
-        agent: AgentKind::Shell,
+        agent: "shell".to_owned(),
         cwd: None,
         cols: 80,
         rows: 24,
@@ -177,7 +178,7 @@ fn session_new_params_omits_absent_worktree_fields() {
 #[test]
 fn session_new_params_roundtrips_with_initial_input() {
     let params = SessionNewParams {
-        agent: AgentKind::Shell,
+        agent: "shell".to_owned(),
         cwd: Some(PathBuf::from("/workspace/project")),
         cols: 120,
         rows: 40,
@@ -209,7 +210,7 @@ fn session_list_params_roundtrips_with_filters() {
     let params = SessionListParams {
         filters: vec![
             SessionListFilter::State(SessionState::Running),
-            SessionListFilter::Agent(AgentKind::Codex),
+            SessionListFilter::Agent("codex".to_owned()),
             SessionListFilter::Activity(AgentActivity::Blocked),
             SessionListFilter::Id("s-42".to_owned()),
         ],
@@ -279,6 +280,7 @@ fn session_info_json_shape_roundtrips_with_activity() {
         json!({
             "id": "s-42",
             "agent": "shell",
+            "agent_base": "shell",
             "cwd": "/workspace/project",
             "pid": 4242,
             "cols": 120,
@@ -310,6 +312,7 @@ fn session_info_json_shape_roundtrips_with_exit_code() {
         json!({
             "id": "s-42",
             "agent": "shell",
+            "agent_base": "shell",
             "cwd": "/workspace/project",
             "pid": 4242,
             "cols": 120,
@@ -410,7 +413,7 @@ fn session_report_native_id_method_name_is_stable() {
 fn session_report_native_id_params_roundtrips_with_transcript_path() {
     let params = SessionReportNativeIdParams {
         session_id: SessionId("s-42".to_owned()),
-        agent: AgentKind::Claude,
+        agent: "claude".to_owned(),
         native_session_id: "claude-native-abc".to_owned(),
         transcript_path: Some("/home/user/.claude/transcripts/abc.jsonl".to_owned()),
     };
@@ -434,7 +437,7 @@ fn session_report_native_id_params_roundtrips_with_transcript_path() {
 fn session_report_native_id_params_omits_absent_transcript_path() {
     let params = SessionReportNativeIdParams {
         session_id: SessionId("s-7".to_owned()),
-        agent: AgentKind::Codex,
+        agent: "codex".to_owned(),
         native_session_id: "codex-native-xyz".to_owned(),
         transcript_path: None,
     };
@@ -758,6 +761,7 @@ fn session_resize_result_carries_updated_session_info() {
             "session": {
                 "id": "s-42",
                 "agent": "shell",
+                "agent_base": "shell",
                 "cwd": "/workspace/project",
                 "pid": 4242,
                 "cols": 120,
@@ -1027,7 +1031,7 @@ fn host_inspect_method_name_is_stable() {
 #[test]
 fn agent_runtime_json_shape_roundtrips_with_path() {
     let runtime = AgentRuntime {
-        agent: AgentKind::Codex,
+        agent: "codex".to_owned(),
         available: true,
         path: Some("/usr/local/bin/codex".to_owned()),
     };
@@ -1049,7 +1053,7 @@ fn agent_runtime_json_shape_roundtrips_with_path() {
 #[test]
 fn agent_runtime_omits_absent_path() {
     let runtime = AgentRuntime {
-        agent: AgentKind::Shell,
+        agent: "shell".to_owned(),
         available: true,
         path: None,
     };
@@ -1079,20 +1083,20 @@ fn host_capabilities_json_shape_roundtrips() {
     let caps = HostCapabilities {
         daemon_version: "0.1.0".to_owned(),
         protocol_version: PROTOCOL_VERSION,
-        supported_agents: vec![AgentKind::Shell, AgentKind::Codex, AgentKind::Claude],
+        supported_agents: vec!["shell".to_owned(), "codex".to_owned(), "claude".to_owned()],
         runtimes: vec![
             AgentRuntime {
-                agent: AgentKind::Shell,
+                agent: "shell".to_owned(),
                 available: true,
                 path: None,
             },
             AgentRuntime {
-                agent: AgentKind::Codex,
+                agent: "codex".to_owned(),
                 available: true,
                 path: Some("/usr/local/bin/codex".to_owned()),
             },
             AgentRuntime {
-                agent: AgentKind::Claude,
+                agent: "claude".to_owned(),
                 available: false,
                 path: None,
             },

@@ -7,7 +7,7 @@
 //! fresh on every request, so it always reflects the host as it is now and is
 //! never cached.
 
-use protocol::{AgentKind, AgentRuntime, HostCapabilities, PROTOCOL_VERSION};
+use protocol::{AgentRuntime, HostCapabilities, PROTOCOL_VERSION};
 
 /// Build the live capability snapshot for this host.
 ///
@@ -18,18 +18,20 @@ use protocol::{AgentKind, AgentRuntime, HostCapabilities, PROTOCOL_VERSION};
 /// probe and currently also gates worktree support.
 #[must_use]
 pub fn host_capabilities(daemon_version: &str) -> HostCapabilities {
-    let supported_agents = vec![AgentKind::Shell, AgentKind::Codex, AgentKind::Claude];
+    // The compiled base kinds, as free-string names (Part C). Enumerating loaded
+    // host profiles + probing each profile's program is C2's host.inspect work.
+    let supported_agents = vec!["shell".to_owned(), "codex".to_owned(), "claude".to_owned()];
 
     let runtimes = vec![
         // The shell runtime is always available; the daemon falls back to a
         // login shell and does not require a named binary on PATH.
         AgentRuntime {
-            agent: AgentKind::Shell,
+            agent: "shell".to_owned(),
             available: true,
             path: None,
         },
-        probe_runtime(AgentKind::Codex, "codex"),
-        probe_runtime(AgentKind::Claude, "claude"),
+        probe_runtime("codex", "codex"),
+        probe_runtime("claude", "claude"),
     ];
 
     let git_available = which_on_path("git").is_some();
@@ -50,15 +52,15 @@ pub fn host_capabilities(daemon_version: &str) -> HostCapabilities {
 ///
 /// `available` is true exactly when the binary resolves on `PATH`; the resolved
 /// path is reported when found.
-fn probe_runtime(agent: AgentKind, binary: &str) -> AgentRuntime {
+fn probe_runtime(agent: &str, binary: &str) -> AgentRuntime {
     match which_on_path(binary) {
         Some(path) => AgentRuntime {
-            agent,
+            agent: agent.to_owned(),
             available: true,
             path: Some(path.display().to_string()),
         },
         None => AgentRuntime {
-            agent,
+            agent: agent.to_owned(),
             available: false,
             path: None,
         },
@@ -90,10 +92,7 @@ mod tests {
         let caps = host_capabilities("1.2.3-test");
         assert_eq!(caps.daemon_version, "1.2.3-test");
         assert_eq!(caps.protocol_version, PROTOCOL_VERSION);
-        assert_eq!(
-            caps.supported_agents,
-            vec![AgentKind::Shell, AgentKind::Codex, AgentKind::Claude]
-        );
+        assert_eq!(caps.supported_agents, vec!["shell", "codex", "claude"]);
         // worktree support tracks git availability.
         assert_eq!(caps.worktree_supported, caps.git_available);
     }
@@ -104,7 +103,7 @@ mod tests {
         let shell = caps
             .runtimes
             .iter()
-            .find(|runtime| runtime.agent == AgentKind::Shell)
+            .find(|runtime| runtime.agent == "shell")
             .expect("shell runtime is reported");
         assert!(shell.available, "shell runtime must always be available");
         assert!(
@@ -117,7 +116,7 @@ mod tests {
     fn agent_runtime_availability_matches_resolved_path() {
         let caps = host_capabilities("0.0.0");
         for runtime in &caps.runtimes {
-            if runtime.agent == AgentKind::Shell {
+            if runtime.agent == "shell" {
                 continue;
             }
             // For probed agents, availability is exactly path presence.

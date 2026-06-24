@@ -14,10 +14,12 @@ use crate::pty::PtyCommand;
 
 mod claude;
 mod codex;
+mod profile;
 mod shell;
 
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
+pub(crate) use profile::{ProfileRegistry, ResolvedAgent};
 pub use shell::ShellAdapter;
 
 static SHELL_ADAPTER: ShellAdapter = ShellAdapter;

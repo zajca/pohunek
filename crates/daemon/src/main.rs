@@ -83,6 +83,8 @@ async fn run() -> Result<(), DaemonError> {
         // read it through SessionRegistry::config_dir() / derive off it — they must
         // NOT re-add config_dir here.
         config_dir: Some(paths.config_dir.clone()),
+        // Part C: host agent profiles live under <config_dir>/agents.
+        agents_dir: Some(paths.config_dir.join("agents")),
         ..SessionRegistryConfig::default()
     };
     let sessions = SessionRegistry::new(config);

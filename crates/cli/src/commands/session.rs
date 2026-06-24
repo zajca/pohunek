@@ -9,11 +9,10 @@
 use std::io::Write as _;
 use std::path::PathBuf;
 
-use clap::ValueEnum;
 use protocol::{
-    method, AgentActivity, AgentKind, Request, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams, SessionNewResult,
-    SessionState, SessionStopResult, SessionWarningKind, StateSource,
+    method, AgentActivity, Request, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
+    SessionListFilter, SessionListParams, SessionNewParams, SessionNewResult, SessionState,
+    SessionStopResult, SessionWarningKind, StateSource,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -24,33 +23,13 @@ use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::{Target, LOCAL_HOST};
 
-/// Agent selector accepted by `session new`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum AgentArg {
-    /// Start a plain shell session.
-    Shell,
-    /// Start a Codex CLI agent session.
-    Codex,
-    /// Start a Claude Code agent session.
-    Claude,
-}
-
-impl From<AgentArg> for AgentKind {
-    fn from(value: AgentArg) -> Self {
-        match value {
-            AgentArg::Shell => AgentKind::Shell,
-            AgentArg::Codex => AgentKind::Codex,
-            AgentArg::Claude => AgentKind::Claude,
-        }
-    }
-}
-
 /// Arguments for `session new`, grouped to keep the call site readable as the
 /// optional worktree flags accumulate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NewArgs {
-    /// Agent kind to start.
-    pub agent: AgentArg,
+    /// Agent NAME to start: a base kind (`shell`/`codex`/`claude`) or a host
+    /// profile, resolved daemon-side on the target host (Part C, free string).
+    pub agent: String,
     /// Working directory (ignored when a worktree is bound).
     pub cwd: Option<PathBuf>,
     /// Initial terminal columns.
@@ -104,8 +83,9 @@ pub(crate) enum ListFilter {
     State(SessionState),
     /// Match the detected activity.
     Activity(AgentActivity),
-    /// Match the agent kind.
-    Agent(AgentKind),
+    /// Match the agent name (a base kind or a host profile). The daemon groups by
+    /// the snapshotted base kind too; this client-side check is exact-name.
+    Agent(String),
     /// Match the session's project by `<id|label>` reference.
     Project(String),
 }
@@ -131,7 +111,7 @@ impl ListFilter {
             ListFilter::Id(id) => SessionListFilter::Id(id.clone()),
             ListFilter::State(state) => SessionListFilter::State(*state),
             ListFilter::Activity(activity) => SessionListFilter::Activity(*activity),
-            ListFilter::Agent(agent) => SessionListFilter::Agent(*agent),
+            ListFilter::Agent(agent) => SessionListFilter::Agent(agent.clone()),
             ListFilter::Project(reference) => SessionListFilter::Project(reference.clone()),
         }
     }
@@ -192,15 +172,13 @@ fn parse_activity_filter(value: &str) -> Result<AgentActivity, String> {
     }
 }
 
-fn parse_agent_filter(value: &str) -> Result<AgentKind, String> {
-    match value {
-        "shell" => Ok(AgentKind::Shell),
-        "codex" => Ok(AgentKind::Codex),
-        "claude" => Ok(AgentKind::Claude),
-        other => Err(format!(
-            "invalid agent filter value {other:?}; expected one of: shell, codex, claude"
-        )),
+fn parse_agent_filter(value: &str) -> Result<String, String> {
+    // Free-form agent name (a base kind or a host profile); the daemon applies the
+    // A.2.1 charset guard and resolves it. The client only rejects an empty value.
+    if value.is_empty() {
+        return Err("invalid agent filter value: name cannot be empty".to_owned());
     }
+    Ok(value.to_owned())
 }
 
 fn session_matches_filters(session: &SessionInfo, filters: &[ListFilter]) -> bool {
@@ -422,7 +400,7 @@ fn build_new_request(args: &NewArgs) -> Result<Request, CliError> {
     request_with_params(
         method::SESSION_NEW,
         &SessionNewParams {
-            agent: args.agent.into(),
+            agent: args.agent.clone(),
             cwd: args.cwd.clone(),
             cols: args.cols,
             rows: args.rows,
@@ -532,7 +510,7 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
         .max("ID".len());
     let agent_width = sessions
         .iter()
-        .map(|s| agent_label(s.agent).len())
+        .map(|s| agent_label(&s.agent).len())
         .max()
         .unwrap_or(0)
         .max("AGENT".len());
@@ -571,7 +549,7 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
         output.push_str(&format!(
             "{:<id_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {}\n",
             session.id.0,
-            agent_label(session.agent),
+            agent_label(&session.agent),
             state_label(session.state),
             activity_label_option(session.activity),
             state_source_label(session.state_source),
@@ -652,7 +630,7 @@ fn render_inspect_human(info: &SessionInfo) -> String {
     let none = || "<none>".to_owned();
     let rows: Vec<(&str, String)> = vec![
         ("id", info.id.0.clone()),
-        ("agent", agent_label(info.agent).to_owned()),
+        ("agent", agent_label(&info.agent).to_owned()),
         ("cwd", info.cwd.display().to_string()),
         ("pid", info.pid.to_string()),
         ("cols", info.cols.to_string()),
@@ -743,12 +721,11 @@ fn render_input_human(session_id: &str, result: &SessionInputResult) -> String {
     }
 }
 
-fn agent_label(agent: AgentKind) -> &'static str {
-    match agent {
-        AgentKind::Shell => "shell",
-        AgentKind::Codex => "codex",
-        AgentKind::Claude => "claude",
-    }
+/// The agent name as displayed. Free-string since Part C, so the label is the name
+/// itself (kept as a function so the call sites read uniformly with the other
+/// `*_label` helpers).
+fn agent_label(agent: &str) -> &str {
+    agent
 }
 
 fn state_label(state: SessionState) -> &'static str {
@@ -816,7 +793,8 @@ mod tests {
     fn running_session(id: &str) -> SessionInfo {
         SessionInfo {
             id: protocol::SessionId(id.to_owned()),
-            agent: protocol::AgentKind::Shell,
+            agent: "shell".to_owned(),
+            agent_base: protocol::AgentKind::Shell,
             cwd: PathBuf::from("/workspace/project"),
             pid: 4242,
             cols: 120,
@@ -838,9 +816,9 @@ mod tests {
         }
     }
 
-    fn new_args(agent: AgentArg, cwd: Option<PathBuf>) -> NewArgs {
+    fn new_args(agent: &str, cwd: Option<PathBuf>) -> NewArgs {
         NewArgs {
-            agent,
+            agent: agent.to_owned(),
             cwd,
             cols: 80,
             rows: 24,
@@ -867,7 +845,7 @@ mod tests {
 
     #[test]
     fn new_request_defaults_to_shell_size_and_omits_cwd() {
-        let request = build_new_request(&new_args(AgentArg::Shell, None)).expect("request");
+        let request = build_new_request(&new_args("shell", None)).expect("request");
 
         assert_request(
             &request,
@@ -882,7 +860,7 @@ mod tests {
 
     #[test]
     fn new_request_accepts_codex_agent() {
-        let request = build_new_request(&new_args(AgentArg::Codex, None)).expect("request");
+        let request = build_new_request(&new_args("codex", None)).expect("request");
 
         assert_request(
             &request,
@@ -897,7 +875,7 @@ mod tests {
 
     #[test]
     fn new_request_accepts_claude_agent() {
-        let request = build_new_request(&new_args(AgentArg::Claude, None)).expect("request");
+        let request = build_new_request(&new_args("claude", None)).expect("request");
 
         assert_request(
             &request,
@@ -913,7 +891,7 @@ mod tests {
     #[test]
     fn new_request_carries_worktree_repo_branch_and_base() {
         let args = NewArgs {
-            agent: AgentArg::Claude,
+            agent: "claude".to_owned(),
             cwd: None,
             cols: 80,
             rows: 24,
@@ -942,7 +920,7 @@ mod tests {
     #[test]
     fn new_request_includes_cwd_and_requested_size() {
         let request = build_new_request(&NewArgs {
-            agent: AgentArg::Shell,
+            agent: "shell".to_owned(),
             cwd: Some(PathBuf::from("/workspace/project")),
             cols: 120,
             rows: 40,
@@ -968,7 +946,7 @@ mod tests {
 
     #[test]
     fn new_request_carries_initial_input() {
-        let mut args = new_args(AgentArg::Shell, None);
+        let mut args = new_args("shell", None);
         args.input = Some("Fix #1234".to_owned());
         let request = build_new_request(&args).expect("request");
 
@@ -1030,7 +1008,7 @@ mod tests {
     #[test]
     fn list_filters_are_anded() {
         let mut codex = running_session("s-codex");
-        codex.agent = protocol::AgentKind::Codex;
+        codex.agent = "codex".to_owned();
         codex.activity = Some(AgentActivity::Working);
         let filters = vec![
             parse_list_filter("state=running").expect("state filter"),
@@ -1053,7 +1031,7 @@ mod tests {
         // and outcome, or the defense-in-depth re-filter could narrow the set
         // differently from the daemon. Pin them together so they cannot drift.
         let mut codex = running_session("s-codex");
-        codex.agent = protocol::AgentKind::Codex;
+        codex.agent = "codex".to_owned();
         codex.activity = Some(AgentActivity::Working);
         codex.project_id = Some("p-aaa".to_owned());
         codex.project_label = Some("ui".to_owned());
@@ -1131,9 +1109,9 @@ mod tests {
     #[test]
     fn json_and_quiet_list_outputs_use_the_same_filtered_sessions() {
         let mut codex = running_session("s-codex");
-        codex.agent = protocol::AgentKind::Codex;
+        codex.agent = "codex".to_owned();
         let mut claude = running_session("s-claude");
-        claude.agent = protocol::AgentKind::Claude;
+        claude.agent = "claude".to_owned();
         claude.state = SessionState::Stopped;
         let sessions = vec![running_session("s-shell"), codex, claude];
         let filters = vec![parse_list_filter("state=running").expect("filter")];
@@ -1208,8 +1186,8 @@ mod tests {
     fn prepare_new_args_local_defaults_cwd_to_current_dir() {
         // A local session sends the CLI's own cwd so the daemon auto-detects the
         // project we are standing in.
-        let prepared = prepare_new_args(LOCAL_HOST, new_args(AgentArg::Shell, None))
-            .expect("local prepare succeeds");
+        let prepared =
+            prepare_new_args(LOCAL_HOST, new_args("shell", None)).expect("local prepare succeeds");
         assert_eq!(
             prepared.cwd,
             Some(std::env::current_dir().expect("cwd")),
@@ -1221,7 +1199,7 @@ mod tests {
     fn prepare_new_args_local_respects_explicit_cwd() {
         let prepared = prepare_new_args(
             LOCAL_HOST,
-            new_args(AgentArg::Shell, Some(PathBuf::from("/explicit"))),
+            new_args("shell", Some(PathBuf::from("/explicit"))),
         )
         .expect("local prepare succeeds");
         assert_eq!(prepared.cwd, Some(PathBuf::from("/explicit")));
@@ -1231,11 +1209,8 @@ mod tests {
     fn prepare_new_args_remote_without_project_or_repo_is_rejected() {
         // No filesystem path crosses the wire to a remote host: a remote start must
         // name a --project (or --repo), and is rejected before any dial.
-        let err = prepare_new_args(
-            "host-b",
-            new_args(AgentArg::Shell, Some(PathBuf::from("/x"))),
-        )
-        .expect_err("remote without a target is rejected");
+        let err = prepare_new_args("host-b", new_args("shell", Some(PathBuf::from("/x"))))
+            .expect_err("remote without a target is rejected");
         assert!(
             matches!(err, CliError::RemoteTargetRequired),
             "expected RemoteTargetRequired, got {err:?}"
@@ -1244,7 +1219,7 @@ mod tests {
 
     #[test]
     fn prepare_new_args_remote_with_project_drops_local_cwd() {
-        let mut args = new_args(AgentArg::Shell, Some(PathBuf::from("/local/path")));
+        let mut args = new_args("shell", Some(PathBuf::from("/local/path")));
         args.project = Some("ui".to_owned());
         let prepared = prepare_new_args("host-b", args).expect("remote with --project");
         assert_eq!(
@@ -1256,7 +1231,7 @@ mod tests {
 
     #[test]
     fn prepare_new_args_remote_with_repo_is_allowed() {
-        let mut args = new_args(AgentArg::Shell, None);
+        let mut args = new_args("shell", None);
         args.repo = Some(PathBuf::from("/on/remote"));
         let prepared = prepare_new_args("host-b", args).expect("remote with --repo");
         assert_eq!(prepared.cwd, None);
@@ -1265,7 +1240,7 @@ mod tests {
 
     #[test]
     fn new_request_carries_project_reference() {
-        let mut args = new_args(AgentArg::Claude, None);
+        let mut args = new_args("claude", None);
         args.project = Some("ui".to_owned());
         let request = build_new_request(&args).expect("request");
         assert_request(
@@ -1400,9 +1375,9 @@ mod tests {
     #[test]
     fn renders_codex_and_claude_agents_in_session_list_table() {
         let mut codex = running_session("s-codex");
-        codex.agent = protocol::AgentKind::Codex;
+        codex.agent = "codex".to_owned();
         let mut claude = running_session("s-claude");
-        claude.agent = protocol::AgentKind::Claude;
+        claude.agent = "claude".to_owned();
 
         let output = render_list_human(&[codex, claude]);
 
@@ -1505,7 +1480,7 @@ mod tests {
     #[test]
     fn renders_claude_agent_in_session_inspect_table() {
         let mut session = running_session("s-42");
-        session.agent = protocol::AgentKind::Claude;
+        session.agent = "claude".to_owned();
 
         let output = render_inspect_human(&session);
 

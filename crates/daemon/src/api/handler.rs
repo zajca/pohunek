@@ -653,7 +653,8 @@ mod tests {
         let path = PathBuf::from(format!("/work/{id}"));
         SessionInfo {
             id: SessionId(id.to_owned()),
-            agent: AgentKind::Shell,
+            agent: "shell".to_owned(),
+            agent_base: AgentKind::Shell,
             cwd: path.clone(),
             pid: 0,
             cols: 80,

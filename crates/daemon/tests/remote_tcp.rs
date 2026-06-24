@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use protocol::{
-    method, AgentKind, AttachHeader, HostCapabilities, ProtocolVersion, Request, Response,
+    method, AttachHeader, HostCapabilities, ProtocolVersion, Request, Response,
     SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
     SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
     SessionNewParams, SessionState, SessionStopResult, PROTOCOL_VERSION,
@@ -172,7 +172,7 @@ fn ok_payload(response: Response) -> Value {
 
 fn session_params() -> SessionNewParams {
     SessionNewParams {
-        agent: AgentKind::Shell,
+        agent: "shell".to_owned(),
         cwd: Some(std::env::temp_dir()),
         cols: 80,
         rows: 24,
@@ -324,7 +324,7 @@ async fn session_lifecycle_over_tcp() {
 
     let mut client = connect_tcp(addr).await;
     let created = create_session(&mut client).await;
-    assert_eq!(created.agent, AgentKind::Shell);
+    assert_eq!(created.agent, "shell");
     assert_eq!(created.state, SessionState::Running);
     assert!(created.pid > 0);
 
@@ -420,7 +420,7 @@ async fn session_new_with_input_over_tcp_writes_text_to_shell_pty() {
         "session.new must keep returning SessionInfo, not SessionInputResult: {ok}"
     );
     let created: SessionInfo = serde_json::from_value(ok).expect("session info");
-    assert_eq!(created.agent, AgentKind::Shell);
+    assert_eq!(created.agent, "shell");
     assert_eq!(created.state, SessionState::Running);
 
     let attach = attach_session(&mut control, &created.id).await;
@@ -513,10 +513,7 @@ async fn host_inspect_over_tcp_returns_capabilities() {
 
     assert_eq!(caps.daemon_version, "7.7.7-test");
     assert_eq!(caps.protocol_version, PROTOCOL_VERSION);
-    assert_eq!(
-        caps.supported_agents,
-        vec![AgentKind::Shell, AgentKind::Codex, AgentKind::Claude]
-    );
+    assert_eq!(caps.supported_agents, vec!["shell", "codex", "claude"]);
     assert_eq!(caps.worktree_supported, caps.git_available);
 
     let _ = shutdown.send(());

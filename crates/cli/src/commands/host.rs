@@ -160,38 +160,23 @@ fn render_capabilities_human(host: &str, caps: &HostCapabilities) -> String {
         caps.worktree_supported
     ));
     output.push_str("  supported_agents:   ");
-    let agents: Vec<String> = caps
-        .supported_agents
-        .iter()
-        .map(agent_label)
-        .map(str::to_owned)
-        .collect();
-    output.push_str(&agents.join(", "));
+    // Agent names are free strings since Part C (base kinds + host profiles).
+    output.push_str(&caps.supported_agents.join(", "));
     output.push('\n');
     output.push_str("  runtimes:\n");
     for rt in &caps.runtimes {
         let path = rt.path.as_deref().unwrap_or("-");
         output.push_str(&format!(
             "    {:<8} available={:<5} path={}\n",
-            agent_label(&rt.agent),
-            rt.available,
-            path,
+            rt.agent, rt.available, path,
         ));
     }
     output
 }
 
-fn agent_label(agent: &protocol::AgentKind) -> &'static str {
-    match agent {
-        protocol::AgentKind::Shell => "shell",
-        protocol::AgentKind::Codex => "codex",
-        protocol::AgentKind::Claude => "claude",
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use protocol::{AgentKind, AgentRuntime, ProtocolVersion};
+    use protocol::{AgentRuntime, ProtocolVersion};
 
     use super::*;
 
@@ -200,15 +185,15 @@ mod tests {
         let caps = HostCapabilities {
             daemon_version: "0.1.0".to_owned(),
             protocol_version: ProtocolVersion(1),
-            supported_agents: vec![AgentKind::Shell, AgentKind::Codex, AgentKind::Claude],
+            supported_agents: vec!["shell".to_owned(), "codex".to_owned(), "claude".to_owned()],
             runtimes: vec![
                 AgentRuntime {
-                    agent: AgentKind::Shell,
+                    agent: "shell".to_owned(),
                     available: true,
                     path: None,
                 },
                 AgentRuntime {
-                    agent: AgentKind::Claude,
+                    agent: "claude".to_owned(),
                     available: true,
                     path: Some("/usr/bin/claude".to_owned()),
                 },

@@ -637,9 +637,17 @@ mod tests {
 
     #[test]
     fn clap_invalid_value_maps_to_cli_usage_and_round_trips() {
-        // `session new --agent nonsense` — the second case from the finding.
-        let err = crate::Cli::try_parse_from(["pohunek", "session", "new", "--agent", "nonsense"])
-            .expect_err("invalid --agent value must fail to parse");
+        // A clap invalid-value error. `session new --agent` is a free string since
+        // Part C (resolved daemon-side), so use the still-enum `integration install
+        // --agent`, whose value_parser only accepts claude/codex.
+        let err = crate::Cli::try_parse_from([
+            "pohunek",
+            "integration",
+            "install",
+            "--agent",
+            "nonsense",
+        ])
+        .expect_err("invalid --agent value must fail to parse");
         let pe = clap_error_to_protocol_error(&err);
         assert_eq!(pe.code, "cli_usage");
         // Round-trips through serde like every other structured error, so a

@@ -14,18 +14,17 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::session::AgentKind;
 use crate::version::ProtocolVersion;
 
 /// One agent runtime's availability on a host.
 ///
-/// Reports whether a given [`AgentKind`]'s backing binary is present on the
+/// Reports whether a given agent profile's backing binary is present on the
 /// host, and, when known, the resolved path to it. The shell runtime is always
 /// available and typically carries no path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRuntime {
-    /// Agent kind this runtime entry describes.
-    pub agent: AgentKind,
+    /// Agent profile or built-in base name this runtime entry describes.
+    pub agent: String,
     /// Whether the agent's backing binary is available on the host.
     pub available: bool,
     /// Resolved path to the agent binary, when one was found.
@@ -43,8 +42,8 @@ pub struct HostCapabilities {
     pub daemon_version: String,
     /// Protocol version the host's daemon speaks.
     pub protocol_version: ProtocolVersion,
-    /// Agent kinds the host's daemon knows how to launch.
-    pub supported_agents: Vec<AgentKind>,
+    /// Agent profile and built-in base names the host's daemon knows how to launch.
+    pub supported_agents: Vec<String>,
     /// Per-agent runtime availability on the host.
     pub runtimes: Vec<AgentRuntime>,
     /// Whether `git` is present on the host. When true, repo/worktree-bound

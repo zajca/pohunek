@@ -24,8 +24,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::agent::{
-    adapter_for, launch_adapter_for, resume_pty_command, AgentAdapter, AgentCommand, InputRules,
-    LaunchOpts, SessionRef,
+    adapter_for, build_pty_command, launch_adapter_for, resume_pty_command, AgentAdapter,
+    AgentCommand, InputRules, LaunchOpts, ProfileRegistry, ResolvedAgent, SessionRef,
 };
 use crate::detect::{ActivityTransition, Detector, DetectorConfig};
 use crate::integration::{
@@ -178,6 +178,10 @@ pub struct SessionRegistryConfig {
     /// disables the host-default layer (e.g. unit tests that exercise only the
     /// in-repo layer). Read through [`SessionRegistry::config_dir`].
     pub config_dir: Option<PathBuf>,
+    /// Directory holding host agent profiles (`<config_dir>/agents`). `None`
+    /// disables host profiles (a bare `shell`/`codex`/`claude` still resolves).
+    /// Part C: a profile extends a base kind with program/args/env/input-rules.
+    pub agents_dir: Option<PathBuf>,
     /// Minimum interval between per-session "PTY output lag" WARN logs. The first
     /// lag in each window logs immediately; further lags are folded into one
     /// summary WARN when the window elapses, so a runaway session cannot flood the
@@ -349,7 +353,12 @@ fn log_lag_warn(session_id: &SessionId, warn_kind: LagWarn) {
 #[derive(Debug)]
 struct PtySessionSpec {
     id: SessionId,
-    agent: AgentKind,
+    /// Resolved agent NAME (a host-profile name, or a bare base-kind name).
+    agent: String,
+    /// Resolved base kind backing the agent (detection/resume/handshake env).
+    agent_base: AgentKind,
+    /// Input-framing rules for this session (base-kind defaults, profile-overridden).
+    input_rules: InputRules,
     cwd: PathBuf,
     cols: u16,
     rows: u16,
@@ -408,6 +417,7 @@ impl Default for SessionRegistryConfig {
             setup_script_timeout: DEFAULT_SETUP_SCRIPT_TIMEOUT,
             event_log_dir: None,
             config_dir: None,
+            agents_dir: None,
             detector_lag_warn_interval: DEFAULT_DETECTOR_LAG_WARN_INTERVAL,
         }
     }
@@ -432,6 +442,9 @@ struct SessionRegistryInner {
     /// (see [`SessionRegistry::attach`]). Regenerated each start; never persisted.
     daemon_instance_id: String,
     config: SessionRegistryConfig,
+    /// Resolves the free-string `agent` name to a base kind + optional host-profile
+    /// overrides (Part C). Built from `config.agents_dir` at construction.
+    profiles: ProfileRegistry,
     events: broadcast::Sender<Event>,
     /// Unified metadata store (resume + worktree bindings), present when
     /// persistence is configured. Shared (`Arc`) with [`Self::worktree`] so both
@@ -466,6 +479,9 @@ struct SessionEntry {
     detector_cancel: CancellationToken,
     detector_resize: watch::Sender<(u16, u16)>,
     stopping: bool,
+    /// Resolved input-framing rules (base-kind defaults, profile-overridden), used
+    /// by `session.input` so a profile's `[input_rules]` is honored on every write.
+    input_rules: InputRules,
 }
 
 #[derive(Debug, Clone)]
@@ -526,6 +542,9 @@ impl SessionRegistry {
         let projects = store
             .clone()
             .map(|store| Arc::new(ProjectManager::new(store)));
+        // Host agent profiles resolve the free-string `agent` name; built from the
+        // configured agents dir (a bare base kind still resolves when it is unset).
+        let profiles = ProfileRegistry::new(config.agents_dir.clone());
         Self {
             inner: Arc::new(SessionRegistryInner {
                 sessions: Mutex::new(HashMap::new()),
@@ -535,6 +554,7 @@ impl SessionRegistry {
                 next_stream_id: AtomicU64::new(1),
                 daemon_instance_id: generate_daemon_instance_id(),
                 config,
+                profiles,
                 events,
                 store,
                 persist_lock: Mutex::new(()),
@@ -775,9 +795,27 @@ impl SessionRegistry {
         // `register_pty_session`, which `resume_binding` shares and where the
         // worktree must be kept.
         let launch = async {
-            let env_extra = self.session_pty_env(params.agent, &id);
+            // Resolve the free-string agent name to a base kind + optional host
+            // profile (Part C). A bad name / missing profile fails here and rolls
+            // back any bound worktree, like any other launch failure.
+            let resolved = self.inner.profiles.resolve_agent(&params.agent)?;
+            let base = resolved.base;
+            let input_rules = resolved
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.input_rules)
+                .unwrap_or_else(|| input_rules_for_agent(base, &self.inner.config));
+            // Profile env first, then the daemon handshake env appended last, so
+            // every reserved POHUNEK_* key takes the daemon's value (last-write-wins;
+            // the loader also strips POHUNEK_* from the profile env up front).
+            let mut env_extra = resolved
+                .profile
+                .as_ref()
+                .map(|profile| profile.env.clone())
+                .unwrap_or_default();
+            env_extra.extend(self.session_pty_env(base, &id));
             let command = build_launch_command(
-                params.agent,
+                &resolved,
                 &self.inner.config.shell_command,
                 launch_cwd.clone(),
                 params.cols,
@@ -787,7 +825,9 @@ impl SessionRegistry {
 
             self.register_pty_session(PtySessionSpec {
                 id: id.clone(),
-                agent: params.agent,
+                agent: resolved.name.clone(),
+                agent_base: base,
+                input_rules,
                 cwd: launch_cwd,
                 cols: params.cols,
                 rows: params.rows,
@@ -1129,6 +1169,8 @@ impl SessionRegistry {
         let PtySessionSpec {
             id,
             agent,
+            agent_base,
+            input_rules,
             cwd,
             cols,
             rows,
@@ -1159,6 +1201,7 @@ impl SessionRegistry {
         let info = SessionInfo {
             id: id.clone(),
             agent,
+            agent_base,
             cwd,
             pid: pty.pid(),
             cols,
@@ -1190,6 +1233,7 @@ impl SessionRegistry {
                     detector_cancel: detector_cancel.clone(),
                     detector_resize,
                     stopping: false,
+                    input_rules,
                 },
             );
         }
@@ -1197,7 +1241,7 @@ impl SessionRegistry {
         self.emit(event::SESSION_CREATED, &info);
         self.spawn_detector(
             id.clone(),
-            agent,
+            agent_base,
             detector_output,
             (rows, cols),
             detector_cancel,
@@ -1278,10 +1322,7 @@ impl SessionRegistry {
             if entry.info.state != SessionState::Running {
                 return Err(session_not_running(session_id));
             }
-            (
-                entry.pty.clone(),
-                input_rules_for_agent(entry.info.agent, &self.inner.config),
-            )
+            (entry.pty.clone(), entry.input_rules)
         };
 
         let writes = build_input_writes(text, rules);
@@ -1387,7 +1428,8 @@ impl SessionRegistry {
                     .as_ref()
                     .map(|native| ResumeBinding {
                         session_id: id.0.clone(),
-                        agent: entry.info.agent,
+                        agent: entry.info.agent.clone(),
+                        agent_base: entry.info.agent_base,
                         cwd: entry.info.cwd.clone(),
                         cols: entry.info.cols,
                         rows: entry.info.rows,
@@ -1440,7 +1482,7 @@ impl SessionRegistry {
         );
         for binding in bindings {
             let session_id = binding.session_id.clone();
-            let agent = binding.agent;
+            let agent = binding.agent.clone();
             match self.resume_binding(binding).await {
                 Ok(info) => {
                     info!(session_id = %info.id.0, ?agent, "resumed session via native id");
@@ -1486,14 +1528,19 @@ impl SessionRegistry {
 
         let id = SessionId(binding.session_id.clone());
         self.bump_next_id_past(&id);
-        let env_extra = self.session_pty_env(binding.agent, &id);
+        // Resume is keyed on the snapshotted base kind (the detection/handshake/
+        // resume-argv mechanics); the agent NAME is preserved for display. C1
+        // re-derives input rules from the base kind — a profile's resume override +
+        // frozen structural snapshot land in C2.
+        let env_extra = self.session_pty_env(binding.agent_base, &id);
         let opts = LaunchOpts {
             cwd: binding.cwd.clone(),
             cols: binding.cols,
             rows: binding.rows,
             env_extra,
         };
-        let command = resume_pty_command(binding.agent, &session_ref, &opts)?;
+        let command = resume_pty_command(binding.agent_base, &session_ref, &opts)?;
+        let input_rules = input_rules_for_agent(binding.agent_base, &self.inner.config);
         // A resumed session relaunches in its recorded cwd, which already is the
         // worktree path for worktree sessions (the worktree persists on disk
         // across a daemon restart). With the unified store the session's worktree
@@ -1510,6 +1557,8 @@ impl SessionRegistry {
         self.register_pty_session(PtySessionSpec {
             id,
             agent: binding.agent,
+            agent_base: binding.agent_base,
+            input_rules,
             cwd: binding.cwd,
             cols: binding.cols,
             rows: binding.rows,
@@ -2128,7 +2177,7 @@ fn validate_new_params(params: &SessionNewParams) -> Result<(), ProtocolError> {
 }
 
 fn build_launch_command(
-    agent: AgentKind,
+    resolved: &ResolvedAgent,
     shell_command: &ShellCommand,
     cwd: PathBuf,
     cols: u16,
@@ -2144,7 +2193,13 @@ fn build_launch_command(
         rows,
         env_extra,
     };
-    launch_adapter_for(agent, shell_command).launch(&opts)
+    match &resolved.profile {
+        // A host profile overrides the launch program/args; build via the shared
+        // PATH-resolving primitive (the same one the base adapters use).
+        Some(profile) => build_pty_command(&profile.program, profile.args.clone(), &opts),
+        // A bare base kind launches exactly as the compiled adapter (zero change).
+        None => launch_adapter_for(resolved.base, shell_command).launch(&opts),
+    }
 }
 
 fn input_rules_for_agent(agent: AgentKind, config: &SessionRegistryConfig) -> InputRules {
@@ -2322,7 +2377,7 @@ mod tests {
 
     fn params() -> SessionNewParams {
         SessionNewParams {
-            agent: AgentKind::Shell,
+            agent: "shell".to_owned(),
             cwd: Some(PathBuf::from("/tmp")),
             cols: 80,
             rows: 24,
@@ -3397,7 +3452,7 @@ mod tests {
         let result = registry
             .report_native_id(SessionReportNativeIdParams {
                 session_id: created.id.clone(),
-                agent: AgentKind::Shell,
+                agent: "shell".to_owned(),
                 native_session_id: "native-abc".to_owned(),
                 transcript_path: None,
             })
@@ -3436,7 +3491,7 @@ mod tests {
         let recorded = registry
             .report_native_id(SessionReportNativeIdParams {
                 session_id: created.id.clone(),
-                agent: AgentKind::Shell,
+                agent: "shell".to_owned(),
                 native_session_id: "native-stop".to_owned(),
                 transcript_path: None,
             })
@@ -3478,7 +3533,7 @@ mod tests {
         let recorded = registry
             .report_native_id(SessionReportNativeIdParams {
                 session_id: created.id.clone(),
-                agent: AgentKind::Shell,
+                agent: "shell".to_owned(),
                 native_session_id: "native-resize".to_owned(),
                 transcript_path: None,
             })
@@ -3553,7 +3608,8 @@ mod tests {
         store
             .record_resume(&crate::store::ResumeBinding {
                 session_id: "s-corrupt".to_owned(),
-                agent: AgentKind::Claude,
+                agent: "claude".to_owned(),
+                agent_base: AgentKind::Claude,
                 cwd: PathBuf::from("/tmp"),
                 cols: 80,
                 rows: 24,
@@ -3601,7 +3657,7 @@ mod tests {
         let recorded = registry
             .report_native_id(SessionReportNativeIdParams {
                 session_id: info.id.clone(),
-                agent: AgentKind::Shell,
+                agent: "shell".to_owned(),
                 native_session_id: "native-resume".to_owned(),
                 transcript_path: None,
             })
@@ -3641,7 +3697,7 @@ mod tests {
         let recorded = registry
             .report_native_id(SessionReportNativeIdParams {
                 session_id: created.id.clone(),
-                agent: AgentKind::Shell,
+                agent: "shell".to_owned(),
                 native_session_id: "native-concurrent".to_owned(),
                 transcript_path: None,
             })
@@ -3664,7 +3720,7 @@ mod tests {
                 registry
                     .report_native_id(SessionReportNativeIdParams {
                         session_id: id,
-                        agent: AgentKind::Shell,
+                        agent: "shell".to_owned(),
                         native_session_id: "native-concurrent".to_owned(),
                         transcript_path: None,
                     })
@@ -3706,7 +3762,7 @@ mod tests {
         let recorded = registry
             .report_native_id(SessionReportNativeIdParams {
                 session_id: created.id.clone(),
-                agent: AgentKind::Shell,
+                agent: "shell".to_owned(),
                 native_session_id: "native-resize-stop".to_owned(),
                 transcript_path: None,
             })
@@ -3749,7 +3805,7 @@ mod tests {
         let unknown = registry
             .report_native_id(SessionReportNativeIdParams {
                 session_id: SessionId("s-missing".to_owned()),
-                agent: AgentKind::Claude,
+                agent: "claude".to_owned(),
                 native_session_id: "native-1".to_owned(),
                 transcript_path: None,
             })
@@ -3762,7 +3818,7 @@ mod tests {
         let invalid = registry
             .report_native_id(SessionReportNativeIdParams {
                 session_id: created.id.clone(),
-                agent: AgentKind::Shell,
+                agent: "shell".to_owned(),
                 native_session_id: String::new(),
                 transcript_path: None,
             })
@@ -3774,7 +3830,7 @@ mod tests {
         let terminal = registry
             .report_native_id(SessionReportNativeIdParams {
                 session_id: created.id.clone(),
-                agent: AgentKind::Shell,
+                agent: "shell".to_owned(),
                 native_session_id: "native-late".to_owned(),
                 transcript_path: None,
             })

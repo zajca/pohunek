@@ -43,8 +43,12 @@ use crate::project::detect::project_id;
 pub struct ResumeBinding {
     /// The pohunek session id (stable across restart).
     pub session_id: String,
-    /// Agent kind backing the session.
-    pub agent: AgentKind,
+    /// Resolved agent NAME backing the session (a host-profile name or a base
+    /// kind). Free string since Part C; a name only, never a profile body/env.
+    pub agent: String,
+    /// Resolved base kind for the agent (drives resume/handshake on relaunch, and
+    /// `session list --filter agent=<base>` grouping after a restart).
+    pub agent_base: AgentKind,
     /// Working directory to relaunch in.
     pub cwd: PathBuf,
     /// Terminal width at capture time.
@@ -564,7 +568,8 @@ mod tests {
     fn resume(session_id: &str, native: &str) -> ResumeBinding {
         ResumeBinding {
             session_id: session_id.to_owned(),
-            agent: AgentKind::Claude,
+            agent: "claude".to_owned(),
+            agent_base: AgentKind::Claude,
             cwd: PathBuf::from("/workspace/project"),
             cols: 120,
             rows: 40,

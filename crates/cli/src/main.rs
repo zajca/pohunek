@@ -312,9 +312,10 @@ enum DaemonAction {
 enum SessionAction {
     /// Start a new session.
     New {
-        /// Agent kind to start.
-        #[arg(long, value_enum, default_value = "shell")]
-        agent: commands::session::AgentArg,
+        /// Agent name to start: a base kind (`shell`/`codex`/`claude`) or a host
+        /// profile, resolved daemon-side on the target host.
+        #[arg(long, default_value = "shell")]
+        agent: String,
         /// Working directory for the session.
         #[arg(long)]
         cwd: Option<PathBuf>,
@@ -772,7 +773,7 @@ mod tests {
                         json,
                     },
             } => {
-                assert_eq!(agent, commands::session::AgentArg::Shell);
+                assert_eq!(agent, "shell");
                 assert_eq!(cwd, None);
                 assert_eq!(cols, 80);
                 assert_eq!(rows, 24);
@@ -797,7 +798,7 @@ mod tests {
             Commands::Session {
                 action: SessionAction::New { agent, .. },
             } => {
-                assert_eq!(agent, commands::session::AgentArg::Codex);
+                assert_eq!(agent, "codex");
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -812,7 +813,7 @@ mod tests {
             Commands::Session {
                 action: SessionAction::New { agent, .. },
             } => {
-                assert_eq!(agent, commands::session::AgentArg::Claude);
+                assert_eq!(agent, "claude");
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -847,7 +848,7 @@ mod tests {
                         ..
                     },
             } => {
-                assert_eq!(agent, commands::session::AgentArg::Claude);
+                assert_eq!(agent, "claude");
                 assert_eq!(
                     repo.as_deref(),
                     Some(std::path::Path::new("/workspace/project"))
