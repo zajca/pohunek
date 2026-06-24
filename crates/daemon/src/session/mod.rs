@@ -566,6 +566,7 @@ impl SessionRegistry {
                 root.clone(),
                 store.clone(),
                 config.setup_script_timeout,
+                config.config_dir.clone(),
             ))),
             _ => None,
         };
@@ -689,7 +690,19 @@ impl SessionRegistry {
                     Some(manager) => {
                         let skip: HashSet<PathBuf> =
                             live.iter().map(|(path, _)| path.clone()).collect();
-                        let prune = manager.cleanup_project(&record.id(), &skip)?;
+                        // Remove-hook warnings have no field on the prune response, so
+                        // log them: the prune is a fire-and-forget admin action.
+                        let mut hook_warnings = Vec::new();
+                        let prune =
+                            manager.cleanup_project(&record.id(), &skip, &mut hook_warnings)?;
+                        for warning in &hook_warnings {
+                            warn!(
+                                project_id = %record.id(),
+                                warning = %warning.message,
+                                detail = ?warning.detail,
+                                "remove hook warning during project prune"
+                            );
+                        }
                         // Map each skipped worktree path back to its live session id.
                         let skipped = prune
                             .skipped
@@ -1006,7 +1019,23 @@ impl SessionRegistry {
             return;
         };
         let session_id = id.0.clone();
-        match tokio::task::spawn_blocking(move || manager.cleanup_session(&session_id)).await {
+        match tokio::task::spawn_blocking(move || {
+            // Remove-hook warnings on the rollback path are logged (the launch error
+            // is what the caller surfaces).
+            let mut hook_warnings = Vec::new();
+            let result = manager.cleanup_session(&session_id, &mut hook_warnings);
+            for warning in &hook_warnings {
+                warn!(
+                    session_id = %session_id,
+                    warning = %warning.message,
+                    detail = ?warning.detail,
+                    "remove hook warning during worktree rollback"
+                );
+            }
+            result
+        })
+        .await
+        {
             Ok(Ok(removed)) => {
                 if removed > 0 {
                     debug!(
@@ -1083,7 +1112,14 @@ impl SessionRegistry {
             .clone()
             .or_else(|| project.as_ref().and_then(|r| r.default_base_branch.clone()));
         let bound = self
-            .bind_worktree(&id.0, repo, branch, base_branch, project_id.clone())
+            .bind_worktree(
+                &id.0,
+                repo,
+                branch,
+                base_branch,
+                project_id.clone(),
+                &params.agent,
+            )
             .await?;
         Ok(TargetResolution {
             launch_cwd: bound.path.clone(),
@@ -1205,6 +1241,7 @@ impl SessionRegistry {
         branch: String,
         base_branch: Option<String>,
         project_id: Option<String>,
+        agent: &str,
     ) -> Result<crate::worktree::WorktreeBound, ProtocolError> {
         let Some(manager) = self.inner.worktree.clone() else {
             return Err(runtime_error(
@@ -1218,6 +1255,7 @@ impl SessionRegistry {
             branch,
             base_branch,
             project_id,
+            agent: agent.to_owned(),
         };
         tokio::task::spawn_blocking(move || manager.bind(&request))
             .await

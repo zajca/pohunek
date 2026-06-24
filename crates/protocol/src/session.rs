@@ -296,6 +296,12 @@ pub enum SessionWarningKind {
     BaseBranchFallback,
     /// The repository setup script failed; the worktree was kept without it.
     SetupScript,
+    /// A lifecycle hook (worktree pre/post-create or -remove, or a session-level
+    /// hook) failed, timed out, or could not be run. Non-fatal: the session
+    /// proceeds and the worktree is kept. The failing event name + reason ride in
+    /// the warning's `message`/`detail`, not the kind (a **unit** variant, so the
+    /// enum stays `Copy` and serializes to the bare string `"hook"`).
+    Hook,
 }
 
 /// A non-fatal warning surfaced while setting up a session's worktree.

@@ -181,6 +181,12 @@ pub struct WorktreeBinding {
     pub branch_slug: String,
     /// Absolute path of the worktree directory.
     pub path: PathBuf,
+    /// Resolved agent NAME the worktree was bound for (Part B). A non-secret name
+    /// only — never a profile body/env — exposed to remove hooks as `POHUNEK_AGENT`
+    /// so pre/post-remove hooks see the same agent identity as create hooks. Serde
+    /// default (`""`) for a legacy line written before Part B.
+    #[serde(default)]
+    pub agent: String,
     /// Lifecycle status.
     pub status: WorktreeStatus,
     /// Project this worktree belongs to ([`ProjectRecord::id`]), when the binding
@@ -671,6 +677,7 @@ mod tests {
             base_branch: "main".to_owned(),
             branch_slug: slug.to_owned(),
             path: PathBuf::from(format!("/data/worktrees/{session_id}-project-{slug}")),
+            agent: "claude".to_owned(),
             status: WorktreeStatus::Active,
             project_id: None,
             created_at: "2026-06-19T00:00:00Z".to_owned(),

@@ -91,7 +91,19 @@ fn manager(tag: &str) -> WorktreeManager {
 fn manager_with_timeout(tag: &str, setup_timeout: Duration) -> WorktreeManager {
     let root = unique_dir(&format!("{tag}-root"));
     let store = unique_dir(&format!("{tag}-store")).join("metadata.jsonl");
-    WorktreeManager::new(root, Arc::new(Store::new(store)), setup_timeout)
+    WorktreeManager::new(root, Arc::new(Store::new(store)), setup_timeout, None)
+}
+
+/// A manager with a host-global hook layer rooted at `config_dir`.
+fn manager_with_config_dir(tag: &str, config_dir: PathBuf) -> WorktreeManager {
+    let root = unique_dir(&format!("{tag}-root"));
+    let store = unique_dir(&format!("{tag}-store")).join("metadata.jsonl");
+    WorktreeManager::new(
+        root,
+        Arc::new(Store::new(store)),
+        TEST_SETUP_TIMEOUT,
+        Some(config_dir),
+    )
 }
 
 /// Run git in `dir` and return trimmed stdout (asserting success).
@@ -117,6 +129,7 @@ fn request(session: &str, repo: &Path, branch: &str) -> WorktreeRequest {
         branch: branch.to_owned(),
         base_branch: None,
         project_id: None,
+        agent: "claude".to_owned(),
     }
 }
 
@@ -546,7 +559,7 @@ fn failing_setup_script_keeps_the_worktree_with_a_warning() {
     let warning = bound
         .warnings
         .iter()
-        .find(|w| w.kind == SessionWarningKind::SetupScript)
+        .find(|w| w.kind == SessionWarningKind::Hook)
         .expect("setup-script warning present");
     assert!(warning.detail.is_some(), "setup warning carries detail");
 }
@@ -592,7 +605,7 @@ fn failing_setup_script_warning_detail_excludes_script_stderr() {
     let warning = bound
         .warnings
         .iter()
-        .find(|w| w.kind == SessionWarningKind::SetupScript)
+        .find(|w| w.kind == SessionWarningKind::Hook)
         .expect("setup-script warning present");
     let detail = warning.detail.as_deref().unwrap_or_default();
     assert!(
@@ -645,7 +658,7 @@ fn hanging_setup_script_is_terminated_with_its_forked_children() {
     let warning = bound
         .warnings
         .iter()
-        .find(|w| w.kind == SessionWarningKind::SetupScript)
+        .find(|w| w.kind == SessionWarningKind::Hook)
         .expect("setup-script timeout warning present");
     let detail = warning.detail.as_deref().unwrap_or_default();
     assert!(
@@ -714,7 +727,12 @@ fn binding_persist_failure_rolls_back_the_worktree() {
     let root = unique_dir("persist-fail-root");
     let store_dir = unique_dir("persist-fail-store");
     let store_path = store_dir.join("metadata.jsonl");
-    let mgr = WorktreeManager::new(root, Arc::new(Store::new(store_path)), TEST_SETUP_TIMEOUT);
+    let mgr = WorktreeManager::new(
+        root,
+        Arc::new(Store::new(store_path)),
+        TEST_SETUP_TIMEOUT,
+        None,
+    );
     let repo = init_repo("persist-fail-repo");
 
     // Force the persist to fail by making the store directory read-only: the store
@@ -760,7 +778,9 @@ fn cleanup_session_removes_only_owned_worktrees() {
     assert!(bound.path.exists());
 
     // Unknown session: nothing owned, nothing removed.
-    let none = mgr.cleanup_session("s-unknown").expect("cleanup unknown");
+    let none = mgr
+        .cleanup_session("s-unknown", &mut Vec::new())
+        .expect("cleanup unknown");
     assert_eq!(none, 0);
     assert!(
         bound.path.exists(),
@@ -768,7 +788,9 @@ fn cleanup_session_removes_only_owned_worktrees() {
     );
 
     // Owned session: the tree and its binding are removed.
-    let removed = mgr.cleanup_session("s-1").expect("cleanup owned");
+    let removed = mgr
+        .cleanup_session("s-1", &mut Vec::new())
+        .expect("cleanup owned");
     assert_eq!(removed, 1);
     assert!(!bound.path.exists(), "owned worktree directory removed");
     assert!(
@@ -798,7 +820,9 @@ fn cleanup_project_removes_only_the_projects_owned_worktrees() {
     let no_skip = HashSet::new();
 
     // Pruning p-1 (nothing skipped) removes both of its worktrees, never p-2's.
-    let prune = mgr.cleanup_project("p-1", &no_skip).expect("cleanup p-1");
+    let prune = mgr
+        .cleanup_project("p-1", &no_skip, &mut Vec::new())
+        .expect("cleanup p-1");
     assert_eq!(prune.removed, 2);
     assert!(prune.skipped.is_empty());
     assert!(!a.path.exists(), "p-1 worktree a removed");
@@ -820,7 +844,7 @@ fn cleanup_project_removes_only_the_projects_owned_worktrees() {
         .into_iter()
         .collect();
     let prune = mgr
-        .cleanup_project("p-2", &skip)
+        .cleanup_project("p-2", &skip, &mut Vec::new())
         .expect("cleanup p-2 skipping c");
     assert_eq!(prune.removed, 0, "the live worktree was skipped");
     assert_eq!(prune.skipped.len(), 1);
@@ -833,7 +857,7 @@ fn cleanup_project_removes_only_the_projects_owned_worktrees() {
 
     // With nothing skipped, p-2 is finally removed.
     assert_eq!(
-        mgr.cleanup_project("p-2", &no_skip)
+        mgr.cleanup_project("p-2", &no_skip, &mut Vec::new())
             .expect("cleanup p-2")
             .removed,
         1
@@ -842,7 +866,7 @@ fn cleanup_project_removes_only_the_projects_owned_worktrees() {
 
     // Pruning a project with no owned worktrees is a no-op.
     assert_eq!(
-        mgr.cleanup_project("p-unknown", &no_skip)
+        mgr.cleanup_project("p-unknown", &no_skip, &mut Vec::new())
             .expect("cleanup unknown")
             .removed,
         0
@@ -933,5 +957,207 @@ fn redact_url_credentials_security_boundary_scp_and_query_are_out_of_scope() {
     assert!(
         fragment.contains("#SECRET"),
         "fragment out of scope: {fragment}"
+    );
+}
+
+// --- lifecycle hooks (Part B) --------------------------------------------
+
+/// Commit a hook script at `<repo>/.pohunek/hooks/<event>` on the current branch,
+/// so a worktree created from it has the hook checked out too.
+fn commit_hook(repo: &Path, event: &str, body: &str) {
+    let dir = repo.join(".pohunek/hooks");
+    fs::create_dir_all(&dir).expect("create hooks dir");
+    fs::write(dir.join(event), body).expect("write hook");
+    git_in(repo, &["add", "."]);
+    git_in(repo, &["commit", "-q", "-m", &format!("add {event} hook")]);
+}
+
+/// Parse a `KEY=VALUE`-per-line dump (the output of `env`) into a map.
+fn parse_env_dump(text: &str) -> std::collections::HashMap<String, String> {
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect()
+}
+
+#[test]
+fn post_create_hook_runs_with_cleared_env_and_exact_allowlist() {
+    // The load-bearing security test: a hook must run with a CLEARED environment
+    // plus only the B.3.1 allowlist — never the daemon's inherited env (which holds
+    // GITHUB_TOKEN/ANTHROPIC_API_KEY/POHUNEK_SOCKET_PATH). The test binary always
+    // runs under cargo, so `CARGO_*` is present in the daemon process env; its
+    // absence in the hook env proves `.env_clear()` fired.
+    let mgr = manager("hook-env");
+    let repo = init_repo("hook-env-repo");
+    commit_hook(
+        &repo,
+        "post-create",
+        "#!/bin/sh\nenv > \"$POHUNEK_REPO/hook-env.txt\"\n",
+    );
+    let bound = mgr
+        .bind(&request("s-hook", &repo, "feat/x"))
+        .expect("bind runs post-create hook");
+    assert!(bound.warnings.is_empty(), "a passing hook warns nothing");
+
+    let dump = fs::read_to_string(repo.join("hook-env.txt")).expect("hook wrote its env");
+    let env = parse_env_dump(&dump);
+
+    // The B.3.1 allowlist is present with the right values.
+    assert_eq!(
+        env.get("POHUNEK_HOOK_EVENT").map(String::as_str),
+        Some("post-create")
+    );
+    assert_eq!(
+        env.get("POHUNEK_SESSION_ID").map(String::as_str),
+        Some("s-hook")
+    );
+    assert_eq!(env.get("POHUNEK_AGENT").map(String::as_str), Some("claude"));
+    assert_eq!(
+        env.get("POHUNEK_BRANCH").map(String::as_str),
+        Some("feat/x")
+    );
+    assert!(env.contains_key("POHUNEK_REPO"));
+    assert!(env.contains_key("POHUNEK_WORKTREE"));
+    assert!(env.contains_key("POHUNEK_BASE_BRANCH"));
+    assert!(env.contains_key("PATH"), "PATH is passed through");
+
+    // env_clear proof: NO inherited daemon env survives.
+    assert!(
+        !env.keys().any(|k| k.starts_with("CARGO")),
+        "the daemon's inherited env (CARGO_*) must be cleared: {:?}",
+        env.keys().collect::<Vec<_>>()
+    );
+    // The daemon handshake vars must NEVER reach a hook.
+    for forbidden in [
+        "POHUNEK_SOCKET_PATH",
+        "POHUNEK_DAEMON_ID",
+        "POHUNEK_ENV",
+        "POHUNEK_PROTOCOL_VERSION",
+    ] {
+        assert!(
+            !env.contains_key(forbidden),
+            "handshake var {forbidden} must not be exposed to a hook"
+        );
+    }
+}
+
+#[test]
+fn post_create_hook_in_hooks_dir_shadows_legacy_setup() {
+    // The B.1 matrix: with BOTH `.pohunek/hooks/post-create` and `.pohunek/setup`
+    // committed, only post-create runs (never both).
+    let mgr = manager("hook-shadow");
+    let repo = init_repo("hook-shadow-repo");
+    fs::create_dir_all(repo.join(".pohunek/hooks")).expect("hooks dir");
+    fs::write(
+        repo.join(".pohunek/hooks/post-create"),
+        "#!/bin/sh\ntouch \"$POHUNEK_WORKTREE/post-create-ran\"\n",
+    )
+    .expect("write hook");
+    fs::write(
+        repo.join(".pohunek/setup"),
+        "#!/bin/sh\ntouch \"$PWD/setup-ran\"\n",
+    )
+    .expect("write setup");
+    git_in(&repo, &["add", "."]);
+    git_in(&repo, &["commit", "-q", "-m", "hook + setup"]);
+
+    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    assert!(
+        bound.path.join("post-create-ran").exists(),
+        "the hooks/post-create script runs"
+    );
+    assert!(
+        !bound.path.join("setup-ran").exists(),
+        "the legacy setup is shadowed by post-create (never both)"
+    );
+}
+
+#[test]
+fn reused_worktree_fires_no_create_hook() {
+    // A post-create hook appends a line each run; reusing an owned worktree (the
+    // early-return) must fire NO create hook, so the count stays 1.
+    let mgr = manager("hook-reuse");
+    let repo = init_repo("hook-reuse-repo");
+    commit_hook(
+        &repo,
+        "post-create",
+        "#!/bin/sh\necho ran >> \"$POHUNEK_REPO/create-count\"\n",
+    );
+    mgr.bind(&request("s-1", &repo, "feat/x"))
+        .expect("first bind");
+    let again = mgr
+        .bind(&request("s-1", &repo, "feat/x"))
+        .expect("reuse bind");
+    assert!(again.reused, "second bind reuses the worktree");
+
+    let count = fs::read_to_string(repo.join("create-count")).expect("counter exists");
+    assert_eq!(
+        count.lines().count(),
+        1,
+        "the create hook fires only on the fresh-create path"
+    );
+}
+
+#[test]
+fn remove_hooks_fire_on_cleanup_with_post_remove_in_repository() {
+    // pre-remove fires IN the worktree (before removal); post-remove fires IN the
+    // repository (after). Both see POHUNEK_AGENT from the persisted binding. Markers
+    // are written into POHUNEK_REPO (which persists past the worktree removal).
+    let mgr = manager("hook-remove");
+    let repo = init_repo("hook-remove-repo");
+    commit_hook(
+        &repo,
+        "pre-remove",
+        "#!/bin/sh\necho \"$POHUNEK_AGENT\" > \"$POHUNEK_REPO/pre-remove-agent\"\n",
+    );
+    commit_hook(
+        &repo,
+        "post-remove",
+        "#!/bin/sh\ntouch \"$POHUNEK_REPO/post-remove-ran\"\n",
+    );
+    mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+
+    let mut warnings = Vec::new();
+    let removed = mgr.cleanup_session("s-1", &mut warnings).expect("cleanup");
+    assert_eq!(removed, 1);
+    assert!(warnings.is_empty(), "passing remove hooks warn nothing");
+    assert_eq!(
+        fs::read_to_string(repo.join("pre-remove-agent"))
+            .expect("pre-remove ran")
+            .trim(),
+        "claude",
+        "pre-remove sees POHUNEK_AGENT from the binding"
+    );
+    assert!(
+        repo.join("post-remove-ran").exists(),
+        "post-remove runs in the repository after removal"
+    );
+}
+
+#[test]
+fn host_global_and_in_repo_post_create_run_host_global_first() {
+    // B3 compose: when both layers have a post-create hook, both run, host-global
+    // FIRST, then in-repo (append-ordered marker proves ordering).
+    let config_dir = unique_dir("hook-host-config");
+    fs::create_dir_all(config_dir.join("hooks")).expect("host hooks dir");
+    fs::write(
+        config_dir.join("hooks/post-create"),
+        "#!/bin/sh\necho host >> \"$POHUNEK_REPO/order\"\n",
+    )
+    .expect("write host hook");
+    let mgr = manager_with_config_dir("hook-host", config_dir);
+    let repo = init_repo("hook-host-repo");
+    commit_hook(
+        &repo,
+        "post-create",
+        "#!/bin/sh\necho repo >> \"$POHUNEK_REPO/order\"\n",
+    );
+
+    mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    let order = fs::read_to_string(repo.join("order")).expect("order file");
+    assert_eq!(
+        order.lines().collect::<Vec<_>>(),
+        vec!["host", "repo"],
+        "host-global hook runs before the in-repo hook"
     );
 }

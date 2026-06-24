@@ -78,6 +78,9 @@ pub struct WorktreeRequest {
     /// `project show` / `project rm --prune-worktrees` can find pohunek's own
     /// worktrees for a project. `None` for a bare `--repo` with no resolved project.
     pub project_id: Option<String>,
+    /// Resolved agent NAME (Part B), persisted onto the binding and exposed to the
+    /// create/remove hooks as `POHUNEK_AGENT`. A non-secret name only.
+    pub agent: String,
 }
 
 /// Result of a successful [`WorktreeManager::bind`].
@@ -115,21 +118,33 @@ pub struct WorktreeManager {
     /// (`Arc`) with the session registry so resume and worktree records live in
     /// one file behind one serialization point.
     store: Arc<Store>,
-    /// Wall-clock bound on a per-repository setup script. A script that does not
-    /// finish within this window is terminated and recorded as a non-fatal
-    /// `setup_script` warning, so a hanging script can never wedge `session.new`.
-    setup_script_timeout: Duration,
+    /// Wall-clock bound on a single lifecycle hook (worktree pre/post-create or
+    /// -remove, and the session-level hooks). A hook that does not finish within
+    /// this window is terminated and recorded as a non-fatal `hook` warning, so a
+    /// hanging hook can never wedge `session.new` or cleanup.
+    hook_timeout: Duration,
+    /// Host config dir (`~/.config/pohunek`), source of the host-global hook layer
+    /// (`<config_dir>/hooks/<event>`). `None` disables that layer; in-repo hooks
+    /// still run.
+    config_dir: Option<PathBuf>,
 }
 
 impl WorktreeManager {
     /// Build a manager that creates worktrees under `root`, persists bindings to
-    /// the shared `store`, and bounds each setup script by `setup_script_timeout`.
+    /// the shared `store`, bounds each hook by `hook_timeout`, and composes the
+    /// host-global hook layer from `config_dir` (when configured).
     #[must_use]
-    pub fn new(root: PathBuf, store: Arc<Store>, setup_script_timeout: Duration) -> Self {
+    pub fn new(
+        root: PathBuf,
+        store: Arc<Store>,
+        hook_timeout: Duration,
+        config_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             root,
             store,
-            setup_script_timeout,
+            hook_timeout,
+            config_dir,
         }
     }
 
@@ -265,8 +280,31 @@ impl WorktreeManager {
         // `base_branch` name is what we persist/display; `start_point` is what
         // `git worktree add` actually branches from.
         let start_point = self.fetch_start_point(&repository, &base_branch, &mut warnings);
+        // Pre-create hook: fires only on the fresh-create path (the reuse / recreate
+        // / foreign-conflict branches above all returned before here). The worktree
+        // does not exist yet, so it runs IN THE REPOSITORY — `POHUNEK_BASE_BRANCH`
+        // is already resolved and available.
+        self.run_worktree_hook(
+            HookEvent::PreCreate,
+            &repository,
+            req,
+            &repository,
+            None,
+            &base_branch,
+            &mut warnings,
+        );
         self.create_worktree(&repository, &path, &req.branch, &start_point)?;
-        run_setup_script(&path, self.setup_script_timeout, &mut warnings);
+        // Post-create hook (replaces the legacy `.pohunek/setup` script, which it
+        // still falls back to): runs IN the freshly created worktree.
+        self.run_worktree_hook(
+            HookEvent::PostCreate,
+            &path,
+            req,
+            &repository,
+            Some(&path),
+            &base_branch,
+            &mut warnings,
+        );
 
         let now = timestamp_now();
         let binding = WorktreeBinding {
@@ -276,6 +314,7 @@ impl WorktreeManager {
             base_branch: base_branch.clone(),
             branch_slug: slug,
             path: path.clone(),
+            agent: req.agent.clone(),
             status: WorktreeStatus::Active,
             project_id: req.project_id.clone(),
             created_at: now.clone(),
@@ -307,6 +346,71 @@ impl WorktreeManager {
         })
     }
 
+    /// Fire a create-side worktree hook (`pre`/`post-create`) from the request
+    /// context, bounded by `hook_timeout` and composed with the host-global layer.
+    // The create hook needs the event, the hook-lookup dir, the request, the repo,
+    // the optional worktree, the base branch, and the warning sink — all distinct
+    // inputs with no natural grouping struct beyond the request itself.
+    #[allow(clippy::too_many_arguments)]
+    fn run_worktree_hook(
+        &self,
+        event: HookEvent,
+        in_repo_dir: &Path,
+        req: &WorktreeRequest,
+        repository: &Path,
+        worktree: Option<&Path>,
+        base_branch: &str,
+        warnings: &mut Vec<SessionWarning>,
+    ) {
+        let ctx = HookContext {
+            session_id: req.session_id.clone(),
+            project_id: req.project_id.clone(),
+            agent: req.agent.clone(),
+            repo: Some(repository.to_path_buf()),
+            worktree: worktree.map(Path::to_path_buf),
+            branch: Some(req.branch.clone()),
+            base_branch: Some(base_branch.to_owned()),
+        };
+        run_hook(
+            event,
+            in_repo_dir,
+            &ctx,
+            self.hook_timeout,
+            self.config_dir.as_deref(),
+            warnings,
+        );
+    }
+
+    /// Fire a remove-side worktree hook (`pre`/`post-remove`) from a persisted
+    /// binding. `POHUNEK_AGENT`/`POHUNEK_BASE_BRANCH` come from the binding, so a
+    /// remove hook sees the same identity a create hook did.
+    fn run_remove_hook(
+        &self,
+        event: HookEvent,
+        in_repo_dir: &Path,
+        binding: &WorktreeBinding,
+        worktree: Option<&Path>,
+        warnings: &mut Vec<SessionWarning>,
+    ) {
+        let ctx = HookContext {
+            session_id: binding.session_id.clone(),
+            project_id: binding.project_id.clone(),
+            agent: binding.agent.clone(),
+            repo: Some(binding.repository.clone()),
+            worktree: worktree.map(Path::to_path_buf),
+            branch: Some(binding.branch.clone()),
+            base_branch: Some(binding.base_branch.clone()),
+        };
+        run_hook(
+            event,
+            in_repo_dir,
+            &ctx,
+            self.hook_timeout,
+            self.config_dir.as_deref(),
+            warnings,
+        );
+    }
+
     /// Remove every worktree owned by `session_id` (cleanup). Refuses to touch a
     /// tree the daemon does not own: only paths recorded in the binding store
     /// are removed, then their bindings are dropped. Returns the number of
@@ -319,7 +423,11 @@ impl WorktreeManager {
     ///
     /// Only the binding-store read/write can fail with a [`ProtocolError`]; git
     /// failures are non-fatal.
-    pub fn cleanup_session(&self, session_id: &str) -> Result<usize, ProtocolError> {
+    pub fn cleanup_session(
+        &self,
+        session_id: &str,
+        warnings: &mut Vec<SessionWarning>,
+    ) -> Result<usize, ProtocolError> {
         let bindings = self
             .store
             .load_worktrees()
@@ -329,6 +437,16 @@ impl WorktreeManager {
             .into_iter()
             .filter(|binding| binding.session_id == session_id)
         {
+            // pre-remove fires IN the worktree while it still exists.
+            if binding.path.is_dir() {
+                self.run_remove_hook(
+                    HookEvent::PreRemove,
+                    &binding.path,
+                    &binding,
+                    Some(&binding.path),
+                    warnings,
+                );
+            }
             // Ownership proof is the binding itself; only then do we delete.
             if let Err(message) = worktree_remove(&binding.repository, &binding.path) {
                 warn!(
@@ -337,6 +455,26 @@ impl WorktreeManager {
                     error = %message,
                     "git worktree remove failed during cleanup; dropping binding anyway"
                 );
+            }
+            // post-remove fires IN the repository (the worktree is gone). If the
+            // repository itself is gone, skip with a warning rather than spawn in a
+            // non-existent cwd.
+            if binding.repository.is_dir() {
+                self.run_remove_hook(
+                    HookEvent::PostRemove,
+                    &binding.repository,
+                    &binding,
+                    None,
+                    warnings,
+                );
+            } else {
+                warnings.push(hook_warning(
+                    HookEvent::PostRemove,
+                    format!(
+                        "repository {} no longer exists; post-remove hook skipped",
+                        binding.repository.display()
+                    ),
+                ));
             }
             removed += 1;
         }
@@ -367,6 +505,7 @@ impl WorktreeManager {
         &self,
         project_id: &str,
         skip: &std::collections::HashSet<PathBuf>,
+        warnings: &mut Vec<SessionWarning>,
     ) -> Result<ProjectPrune, ProtocolError> {
         let bindings = self
             .store
@@ -380,9 +519,20 @@ impl WorktreeManager {
         {
             let canonical = canonical_or_original(&binding.path);
             if skip.contains(&canonical) {
-                // A live session is using this worktree; leave it and its binding.
+                // A live session is using this worktree; leave it and its binding —
+                // and fire NO remove hook for it (the `continue` is before the seams).
                 prune.skipped.push(canonical);
                 continue;
+            }
+            // pre-remove fires IN the worktree while it still exists.
+            if binding.path.is_dir() {
+                self.run_remove_hook(
+                    HookEvent::PreRemove,
+                    &binding.path,
+                    &binding,
+                    Some(&binding.path),
+                    warnings,
+                );
             }
             // The binding is the ownership proof; only an owned worktree is removed.
             if let Err(message) = worktree_remove(&binding.repository, &binding.path) {
@@ -392,6 +542,25 @@ impl WorktreeManager {
                     error = %message,
                     "git worktree remove failed during project prune; dropping binding anyway"
                 );
+            }
+            // post-remove fires IN the repository (worktree gone); skip + warn if the
+            // repository itself is gone.
+            if binding.repository.is_dir() {
+                self.run_remove_hook(
+                    HookEvent::PostRemove,
+                    &binding.repository,
+                    &binding,
+                    None,
+                    warnings,
+                );
+            } else {
+                warnings.push(hook_warning(
+                    HookEvent::PostRemove,
+                    format!(
+                        "repository {} no longer exists; post-remove hook skipped",
+                        binding.repository.display()
+                    ),
+                ));
             }
             // A session binds at most one worktree, so dropping by session id drops
             // exactly this binding and never a skipped (live) one.
@@ -807,35 +976,176 @@ enum SetupOutcome {
     WaitError(io::Error),
 }
 
-/// Run `<repo>/.pohunek/setup` inside `worktree` if present, bounded by
-/// `timeout`. A non-zero exit, a spawn failure, or a timeout is recorded as a
-/// non-fatal `setup_script` warning; the worktree is kept in every case.
-///
-/// **Security:** the warning `detail` carries only the exit status / a generic
-/// reason — never the script's output. Setup-script output is arbitrary process
-/// output that can contain secrets (e.g. `echo $TOKEN`), and this warning rides
-/// on `SessionInfo` into the append-only event log, whose invariant is that it
-/// never holds a secret (and `redact_url_credentials` only catches URL-embedded
-/// ones). So the script's stdout/stderr are discarded outright (`/dev/null`) —
-/// the script never feeds any daemon-side sink. It is the user's own committed
-/// file, debuggable by running it directly in the worktree.
-///
-/// **Robustness:** the script runs in its own process group so a timeout can kill
-/// the whole subtree — a multi-command script forks children (`npm`, `sleep`, …)
-/// that killing only the direct `sh` would leave as runaways (see
-/// [`terminate_setup_script`]).
-fn run_setup_script(worktree: &Path, timeout: Duration, warnings: &mut Vec<SessionWarning>) {
-    let script = worktree.join(SETUP_SCRIPT_REL);
-    if !script.is_file() {
-        return;
+/// A lifecycle hook event (Part B). Its [`as_env`](HookEvent::as_env) string is
+/// both the `POHUNEK_HOOK_EVENT` value and the hook-script filename under
+/// `.pohunek/hooks/` (and the host-global `<config_dir>/hooks/`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HookEvent {
+    /// Before `git worktree add`, in the repository (worktree not yet created).
+    PreCreate,
+    /// After `git worktree add`, in the new worktree (replaces `.pohunek/setup`).
+    PostCreate,
+    /// Before `git worktree remove`, in the worktree (still present).
+    PreRemove,
+    /// After `git worktree remove`, in the repository (worktree gone).
+    PostRemove,
+}
+
+impl HookEvent {
+    /// The event's wire/filename token.
+    pub(crate) fn as_env(self) -> &'static str {
+        match self {
+            HookEvent::PreCreate => "pre-create",
+            HookEvent::PostCreate => "post-create",
+            HookEvent::PreRemove => "pre-remove",
+            HookEvent::PostRemove => "post-remove",
+        }
     }
+}
+
+/// The non-secret context a hook receives as `POHUNEK_*` environment variables.
+///
+/// Every field is a non-secret identity value (session id, project id, agent
+/// NAME, repo/worktree paths, branch names). The daemon handshake vars
+/// (`POHUNEK_SOCKET_PATH`/`_DAEMON_ID`/`_ENV`/`_PROTOCOL_VERSION`) are **never**
+/// here — a hook runs with a cleared environment plus only this allowlist.
+#[derive(Debug, Default)]
+pub(crate) struct HookContext {
+    /// Owning session id (`POHUNEK_SESSION_ID`).
+    pub session_id: String,
+    /// Project id (`POHUNEK_PROJECT_ID`, empty string when `None`).
+    pub project_id: Option<String>,
+    /// Resolved agent NAME (`POHUNEK_AGENT`).
+    pub agent: String,
+    /// Source repository (`POHUNEK_REPO`).
+    pub repo: Option<PathBuf>,
+    /// Bound worktree path (`POHUNEK_WORKTREE`); set for post-create / pre-remove.
+    pub worktree: Option<PathBuf>,
+    /// Branch (`POHUNEK_BRANCH`).
+    pub branch: Option<String>,
+    /// Base branch (`POHUNEK_BASE_BRANCH`).
+    pub base_branch: Option<String>,
+}
+
+/// Build the env-clear allowlist a hook runs with: `PATH`/`HOME` passed through
+/// from the daemon's own env, plus the non-secret `POHUNEK_*` context. No daemon
+/// handshake var is ever included.
+fn hook_env(event: HookEvent, ctx: &HookContext) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    // Pass through PATH/HOME so a hook can find `git`/`npm`/etc. and resolve `~`.
+    if let Some(path) = std::env::var_os("PATH") {
+        env.push(("PATH".to_owned(), path.to_string_lossy().into_owned()));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        env.push(("HOME".to_owned(), home.to_string_lossy().into_owned()));
+    }
+    env.push(("POHUNEK_HOOK_EVENT".to_owned(), event.as_env().to_owned()));
+    env.push(("POHUNEK_SESSION_ID".to_owned(), ctx.session_id.clone()));
+    env.push((
+        "POHUNEK_PROJECT_ID".to_owned(),
+        ctx.project_id.clone().unwrap_or_default(),
+    ));
+    env.push(("POHUNEK_AGENT".to_owned(), ctx.agent.clone()));
+    if let Some(repo) = &ctx.repo {
+        env.push(("POHUNEK_REPO".to_owned(), repo.display().to_string()));
+    }
+    if let Some(worktree) = &ctx.worktree {
+        env.push((
+            "POHUNEK_WORKTREE".to_owned(),
+            worktree.display().to_string(),
+        ));
+    }
+    if let Some(branch) = &ctx.branch {
+        env.push(("POHUNEK_BRANCH".to_owned(), branch.clone()));
+    }
+    if let Some(base_branch) = &ctx.base_branch {
+        env.push(("POHUNEK_BASE_BRANCH".to_owned(), base_branch.clone()));
+    }
+    env
+}
+
+/// Resolve a hook's in-repo script path: `<in_repo_dir>/.pohunek/hooks/<event>`,
+/// or — for `post-create` only — the legacy `.pohunek/setup` fallback (never both).
+fn resolve_in_repo_hook(event: HookEvent, in_repo_dir: &Path) -> Option<PathBuf> {
+    let hook = in_repo_dir.join(".pohunek/hooks").join(event.as_env());
+    if hook.is_file() {
+        return Some(hook);
+    }
+    if event == HookEvent::PostCreate {
+        let legacy = in_repo_dir.join(SETUP_SCRIPT_REL);
+        if legacy.is_file() {
+            return Some(legacy);
+        }
+    }
+    None
+}
+
+/// Run the lifecycle hooks for `event`, composing the **host-global layer first,
+/// then the in-repo layer** (each an independent, env-cleared spawn; a failure in
+/// one is its own warning and does not stop the other). In-repo hooks are looked
+/// up under `in_repo_dir`; the host-global layer under `<config_dir>/hooks/`.
+///
+/// Each hook runs with a **cleared environment** plus only the [`hook_env`]
+/// allowlist (closing the env-inheritance exfil gap: a hostile committed hook can
+/// no longer read the daemon's `GITHUB_TOKEN`/`ANTHROPIC_API_KEY`/socket path), in
+/// its own process group (so a timeout kills the whole subtree), with stdio sent
+/// to `/dev/null` (output never feeds a daemon-side sink).
+pub(crate) fn run_hook(
+    event: HookEvent,
+    in_repo_dir: &Path,
+    ctx: &HookContext,
+    timeout: Duration,
+    config_dir: Option<&Path>,
+    warnings: &mut Vec<SessionWarning>,
+) {
+    let env = hook_env(event, ctx);
+    let cwd = &ctx.cwd_or(in_repo_dir);
+    // Host-global layer first (composed, not overridden).
+    if let Some(config_dir) = config_dir {
+        let host_script = config_dir.join("hooks").join(event.as_env());
+        if host_script.is_file() {
+            run_one_hook(event, &host_script, cwd, &env, timeout, warnings);
+        }
+    }
+    if let Some(in_repo_script) = resolve_in_repo_hook(event, in_repo_dir) {
+        run_one_hook(event, &in_repo_script, cwd, &env, timeout, warnings);
+    }
+}
+
+impl HookContext {
+    /// The directory a hook runs in: the bound worktree when present (post-create /
+    /// pre-remove), else the supplied `in_repo_dir` (the repository).
+    fn cwd_or<'a>(&'a self, in_repo_dir: &'a Path) -> &'a Path {
+        self.worktree.as_deref().unwrap_or(in_repo_dir)
+    }
+}
+
+/// Spawn one hook script with the full hook discipline (env-clear + allowlist +
+/// process-group + timeout + `/dev/null`), recording any failure as a non-fatal
+/// `Hook` warning. The warning detail carries only the event + a generic reason —
+/// never the hook's output (which can contain secrets; see the security note on
+/// the original setup-script path).
+fn run_one_hook(
+    event: HookEvent,
+    script: &Path,
+    cwd: &Path,
+    env: &[(String, String)],
+    timeout: Duration,
+    warnings: &mut Vec<SessionWarning>,
+) {
     let mut builder = Command::new(SETUP_SCRIPT_INTERPRETER);
     builder
-        .arg(&script)
-        .current_dir(worktree)
+        .arg(script)
+        .current_dir(cwd)
+        // Load-bearing: clear the daemon's inherited env, then set only the
+        // allowlist, so a hook can never exfiltrate the daemon's secrets.
+        .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    for (key, value) in env {
+        builder.env(key, value);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -846,55 +1156,59 @@ fn run_setup_script(worktree: &Path, timeout: Duration, warnings: &mut Vec<Sessi
     let mut child = match builder.spawn() {
         Ok(child) => child,
         Err(err) => {
-            warnings.push(SessionWarning {
-                kind: SessionWarningKind::SetupScript,
-                message:
-                    "Repository setup script could not be run; the worktree was kept without it."
-                        .to_owned(),
-                detail: Some(format!("failed to spawn {}: {err}", script.display())),
-            });
+            warnings.push(hook_warning(
+                event,
+                format!("failed to spawn {}: {err}", script.display()),
+            ));
             return;
         }
     };
 
-    let warning = match wait_with_timeout(&mut child, timeout) {
-        SetupOutcome::Exited(status) if status.success() => return,
+    match wait_with_timeout(&mut child, timeout) {
+        SetupOutcome::Exited(status) if status.success() => {}
         SetupOutcome::Exited(status) => {
-            debug!(script = %script.display(), %status, "setup script failed");
-            SessionWarning {
-                kind: SessionWarningKind::SetupScript,
-                message: "Repository setup script failed; the worktree was kept without it."
-                    .to_owned(),
-                detail: Some(format!("{} exited with status {status}", script.display())),
-            }
+            debug!(script = %script.display(), %status, event = event.as_env(), "hook failed");
+            warnings.push(hook_warning(
+                event,
+                format!("{} exited with status {status}", script.display()),
+            ));
         }
         SetupOutcome::TimedOut => {
             warn!(
                 script = %script.display(),
+                event = event.as_env(),
                 timeout_secs = timeout.as_secs(),
-                "setup script timed out; terminated"
+                "hook timed out; terminated"
             );
-            SessionWarning {
-                kind: SessionWarningKind::SetupScript,
-                message:
-                    "Repository setup script timed out; it was terminated and the worktree was kept without it."
-                        .to_owned(),
-                detail: Some(format!(
+            warnings.push(hook_warning(
+                event,
+                format!(
                     "{} did not finish within {}s and was terminated",
                     script.display(),
                     timeout.as_secs()
-                )),
-            }
+                ),
+            ));
         }
-        SetupOutcome::WaitError(err) => SessionWarning {
-            kind: SessionWarningKind::SetupScript,
-            message:
-                "Repository setup script could not be supervised; the worktree was kept without it."
-                    .to_owned(),
-            detail: Some(format!("failed to wait for {}: {err}", script.display())),
-        },
-    };
-    warnings.push(warning);
+        SetupOutcome::WaitError(err) => {
+            warnings.push(hook_warning(
+                event,
+                format!("failed to wait for {}: {err}", script.display()),
+            ));
+        }
+    }
+}
+
+/// Build a non-fatal `Hook` warning naming the failing event; the detail never
+/// carries the hook's output.
+fn hook_warning(event: HookEvent, detail: String) -> SessionWarning {
+    SessionWarning {
+        kind: SessionWarningKind::Hook,
+        message: format!(
+            "The {} hook failed; the session proceeded without it.",
+            event.as_env()
+        ),
+        detail: Some(detail),
+    }
 }
 
 /// Poll `child` to completion, terminating it if `timeout` elapses first.

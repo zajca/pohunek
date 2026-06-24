@@ -519,6 +519,7 @@ fn session_warning_json_shape_roundtrips() {
             json!("base_branch_fallback"),
         ),
         (SessionWarningKind::SetupScript, json!("setup_script")),
+        (SessionWarningKind::Hook, json!("hook")),
     ];
     for (kind, expected) in cases {
         let value = serde_json::to_value(kind).expect("serialize warning kind");

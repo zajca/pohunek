@@ -642,6 +642,7 @@ mod tests {
                 base_branch: "main".to_owned(),
                 branch_slug: "feature".to_owned(),
                 path: canonical_wt.clone(),
+                agent: "claude".to_owned(),
                 status: WorktreeStatus::Active,
                 project_id: Some(added.id.clone()),
                 created_at: "2026-06-23T00:00:00Z".to_owned(),
