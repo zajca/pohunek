@@ -70,11 +70,46 @@ pohunek_optional_config() {
   fi
 }
 
-pohunek_template_path() {
-  name="$1"
-  path="$(pohunek_config_dir)/prompts/$name.tmpl"
-  [ -f "$path" ] || pohunek_fail "missing prompt template: $path"
-  printf '%s\n' "$path"
+# Resolve a daemon action recipe for `project`/`action` on `host`.
+#
+# The daemon is the single source of truth for which agent runs and which prompt
+# template is used (resolved per project from the named action, Part A); provider
+# fetch + rendering stay caller-side with the caller's own credentials (A.4).
+#
+# Writes the recipe's prompt-template content to the file at $5, and prints two
+# lines to stdout: the resolved agent name, then the recipe's base_branch (empty
+# when the template omits it). Under `set -e`, a daemon resolution failure (e.g.
+# `prompt_not_found`) aborts the launch HERE, before any session is started — no
+# silent fallback.
+pohunek_resolve_action() {
+  pohunek_need_cmd python3
+  _pra_bin="$1"
+  _pra_host="$2"
+  _pra_project="$3"
+  _pra_action="$4"
+  _pra_prompt_out="$5"
+  if [ -n "$_pra_host" ]; then
+    set -- "$_pra_bin" --host "$_pra_host" project action "$_pra_project" "$_pra_action" --json
+  else
+    set -- "$_pra_bin" project action "$_pra_project" "$_pra_action" --json
+  fi
+  _pra_json="$("$@")"
+  # Data is passed via argv (not stdin): the heredoc already occupies python's
+  # stdin to supply the program, so a piped stdin would be discarded.
+  python3 - "$_pra_prompt_out" "$_pra_json" <<'PY'
+import json
+import sys
+
+out_path, raw_json = sys.argv[1], sys.argv[2]
+try:
+    data = json.loads(raw_json)
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"daemon returned invalid action recipe JSON: {exc}")
+with open(out_path, "w", encoding="utf-8") as handle:
+    handle.write(data["prompt_content"])
+sys.stdout.write((data.get("agent") or "") + "\n")
+sys.stdout.write((data.get("base_branch") or "") + "\n")
+PY
 }
 
 # Resolve the authenticated user's Linear display name (the value the issue
@@ -180,6 +215,7 @@ pohunek_run_session_new() {
   branch="$5"
   prompt="$6"
   yes="$7"
+  base_branch="${8:-}"
 
   if [ -n "$host" ]; then
     set -- "$pohunek_bin" --host "$host" session new
@@ -190,6 +226,11 @@ pohunek_run_session_new() {
   # path crosses the wire. --branch makes the daemon cut a worktree off the
   # project's repo for this issue/PR branch.
   set -- "$@" --agent "$agent" --project "$project" --branch "$branch" --input "$prompt"
+  # Honor a template-specified base branch; empty means the daemon falls through
+  # to the project default / repo HEAD.
+  if [ -n "$base_branch" ]; then
+    set -- "$@" --base-branch "$base_branch"
+  fi
   if [ "$yes" = "true" ]; then
     set -- "$@" --yes
   fi

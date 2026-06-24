@@ -10,16 +10,24 @@ pr_number="$1"
 
 pohunek_bin="$(pohunek_optional_config pohunek_bin pohunek)"
 gh_bin="$(pohunek_optional_config gh_bin gh)"
-agent="$(pohunek_required_config agent)"
 host="$(pohunek_required_config host)"
 project="$(pohunek_required_config project)"
+action="$(pohunek_optional_config pr_action process-pr)"
 yes="$(pohunek_optional_config yes false)"
-template="$(pohunek_template_path pr)"
 
 pohunek_need_cmd "$gh_bin"
 
+# Agent + prompt template come from the daemon-resolved action (the single source
+# of truth, Part A); provider fetch + rendering stay here with the GitHub creds.
+# A `prompt_not_found` from the daemon aborts before any session is started.
+prompt_template="$(mktemp "${TMPDIR:-/tmp}/pohunek-prompt.XXXXXX")"
+trap 'rm -f "$prompt_template"' EXIT INT TERM
+recipe="$(pohunek_resolve_action "$pohunek_bin" "$host" "$project" "$action" "$prompt_template")"
+agent="$(printf '%s\n' "$recipe" | sed -n 1p)"
+base_branch="$(printf '%s\n' "$recipe" | sed -n 2p)"
+
 context_json="$("$gh_bin" pr view "$pr_number" --json title,body,headRefName,url)"
-prompt="$(pohunek_render_provider_prompt "$template" github_pr "$pr_number" "$context_json")"
+prompt="$(pohunek_render_provider_prompt "$prompt_template" github_pr "$pr_number" "$context_json")"
 branch="$(python3 - "$context_json" <<'PY'
 import json
 import sys
@@ -32,4 +40,4 @@ sys.stdout.write(branch)
 PY
 )"
 
-pohunek_run_session_new "$pohunek_bin" "$host" "$agent" "$project" "$branch" "$prompt" "$yes"
+pohunek_run_session_new "$pohunek_bin" "$host" "$agent" "$project" "$branch" "$prompt" "$yes" "$base_branch"

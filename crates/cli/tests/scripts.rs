@@ -76,7 +76,7 @@ fn write_config(root: &Path, lines: &[(&str, &str)]) -> PathBuf {
 }
 
 #[test]
-fn launch_pr_renders_template_and_starts_one_session_without_token_leak() {
+fn launch_pr_resolves_action_from_daemon_and_starts_one_session_without_token_leak() {
     let root = temp_dir("launch-pr");
     let bin = root.join("bin");
     fs::create_dir_all(&bin).expect("create bin dir");
@@ -92,10 +92,23 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_GH_ARGS"; done
 printf '{"title":"Fix filters","body":"Body text","headRefName":"feature/filters","url":"https://example.test/pr/7"}\n'
 "#,
     );
+    // The mock daemon answers `project action` with a recipe (the agent + prompt
+    // template are daemon-resolved now, Part A); every invocation logs its argv so
+    // we can assert the resolve call and the session-new call. The optional
+    // POHUNEK_TEST_RECIPE_FAIL makes the resolve fail (prompt_not_found).
     write_executable(
         &pohunek,
         r#"#!/bin/sh
 for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
+case " $* " in
+  *" project action "*)
+    if [ -n "${POHUNEK_TEST_RECIPE_FAIL:-}" ]; then
+      printf 'pohunek: prompt_not_found\n' >&2
+      exit 1
+    fi
+    printf '%s' "$POHUNEK_TEST_RECIPE_JSON"
+    ;;
+esac
 "#,
     );
 
@@ -104,17 +117,12 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
         &[
             ("pohunek_bin", pohunek.to_str().expect("utf8 path")),
             ("gh_bin", gh.to_str().expect("utf8 path")),
-            ("agent", "claude"),
             ("host", "local"),
             ("project", "ui"),
             ("yes", "true"),
         ],
     );
-    fs::write(
-        config_dir.join("prompts").join("pr.tmpl"),
-        "PR ${number}: ${title}\n${body}\nbranch=${branch}\nurl=${url}\n",
-    )
-    .expect("write pr template");
+    let recipe = r#"{"provider":"github_pr","agent":"claude","prompt_name":"pr","prompt_content":"PR ${number}: ${title}\n${body}\nbranch=${branch}\nurl=${url}\n"}"#;
 
     let out = Command::new("sh")
         .arg(script_path("pohunek-launch-pr"))
@@ -122,6 +130,7 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
         .env("POHUNEK_CONFIG_DIR", &config_dir)
         .env("POHUNEK_TEST_GH_ARGS", &gh_args)
         .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
+        .env("POHUNEK_TEST_RECIPE_JSON", recipe)
         .env("GITHUB_TOKEN", "ghp_secret_should_not_leak")
         .output()
         .expect("run launch-pr");
@@ -133,6 +142,12 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
         String::from_utf8_lossy(&out.stderr)
     );
     let args = read(&pohunek_args);
+    // The launcher first resolves the action recipe from the daemon, then starts
+    // the session with the daemon-resolved agent.
+    assert!(
+        args.contains("project\naction\nui\nprocess-pr\n--json\n"),
+        "{args}"
+    );
     assert!(args.contains("--host\nlocal\nsession\nnew\n"), "{args}");
     assert!(args.contains("--agent\nclaude\n"), "{args}");
     // The launcher references the project (resolved on the host); no --repo path
@@ -154,7 +169,7 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
 }
 
 #[test]
-fn launch_issue_uses_linear_seam_and_template() {
+fn launch_issue_uses_linear_seam_and_daemon_resolved_recipe() {
     let root = temp_dir("launch-issue");
     let bin = root.join("bin");
     fs::create_dir_all(&bin).expect("create bin dir");
@@ -172,6 +187,9 @@ printf '{"id":"LIN-123","title":"Fix launcher","description":"Issue body","branc
         &pohunek,
         r#"#!/bin/sh
 for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
+case " $* " in
+  *" project action "*) printf '%s' "$POHUNEK_TEST_RECIPE_JSON" ;;
+esac
 "#,
     );
 
@@ -180,22 +198,19 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
         &[
             ("pohunek_bin", pohunek.to_str().expect("utf8 path")),
             ("linear_cli", linear.to_str().expect("utf8 path")),
-            ("agent", "codex"),
             ("host", "build-box"),
             ("project", "ui"),
         ],
     );
-    fs::write(
-        config_dir.join("prompts").join("issue.tmpl"),
-        "Issue ${id}: ${title}\n${body}\nbranch=${branch}\n",
-    )
-    .expect("write issue template");
+    // The recipe sets a base_branch; the launcher must thread it as --base-branch.
+    let recipe = r#"{"provider":"linear_issue","agent":"codex","base_branch":"develop","prompt_name":"issue","prompt_content":"Issue ${id}: ${title}\n${body}\nbranch=${branch}\n"}"#;
 
     let out = Command::new("sh")
         .arg(script_path("pohunek-launch-issue"))
         .arg("LIN-123")
         .env("POHUNEK_CONFIG_DIR", &config_dir)
         .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
+        .env("POHUNEK_TEST_RECIPE_JSON", recipe)
         .env("LINEAR_API_KEY", "lin_secret_should_not_leak")
         .output()
         .expect("run launch-issue");
@@ -207,18 +222,142 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
         String::from_utf8_lossy(&out.stderr)
     );
     let args = read(&pohunek_args);
+    assert!(
+        args.contains("--host\nbuild-box\nproject\naction\nui\nprocess-issue\n--json\n"),
+        "{args}"
+    );
     assert!(args.contains("--host\nbuild-box\nsession\nnew\n"), "{args}");
     assert!(args.contains("--agent\ncodex\n"), "{args}");
     assert!(args.contains("--project\nui\n"), "{args}");
     assert!(!args.contains("--repo"), "no --repo leaks: {args}");
     assert!(args.contains("--branch\nlin-123-fix-launcher\n"), "{args}");
+    // The template's base branch is honored.
+    assert!(args.contains("--base-branch\ndevelop\n"), "{args}");
     assert!(
         args.contains("Issue LIN-123: Fix launcher\nIssue body\n"),
         "{args}"
     );
-    // Credential isolation (Slice B): the Linear token never reaches the
-    // pohunek command line — auth stays inside the linear CLI's own seam.
+    // Credential isolation: the Linear token never reaches the pohunek command
+    // line — auth stays inside the linear CLI's own seam.
     assert!(!args.contains("lin_secret_should_not_leak"), "{args}");
+}
+
+#[test]
+fn launch_issue_agent_diverges_per_project_recipe() {
+    // Two projects (driven entirely by the daemon-resolved recipe) launch issues
+    // with different agents — the launcher passes through whatever the daemon's
+    // action resolves, with no agent in the client config.
+    let root = temp_dir("launch-divergence");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("create bin dir");
+    let linear = bin.join("linear-wrapper");
+    let pohunek = bin.join("pohunek");
+
+    write_executable(
+        &linear,
+        r#"#!/bin/sh
+printf '{"id":"LIN-1","title":"T","description":"B","branchName":"lin-1","url":"u"}\n'
+"#,
+    );
+    write_executable(
+        &pohunek,
+        r#"#!/bin/sh
+for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
+case " $* " in
+  *" project action "*) printf '%s' "$POHUNEK_TEST_RECIPE_JSON" ;;
+esac
+"#,
+    );
+
+    let config_dir = write_config(
+        &root,
+        &[
+            ("pohunek_bin", pohunek.to_str().expect("utf8 path")),
+            ("linear_cli", linear.to_str().expect("utf8 path")),
+            ("host", "local"),
+            ("project", "ui"),
+        ],
+    );
+
+    let claude_recipe = r#"{"provider":"linear_issue","agent":"claude","prompt_name":"issue","prompt_content":"P ${title}\n"}"#;
+    let codex_recipe = r#"{"provider":"linear_issue","agent":"codex-fast","prompt_name":"issue","prompt_content":"P ${title}\n"}"#;
+
+    let run = |recipe: &str, args_file: &Path| {
+        let out = Command::new("sh")
+            .arg(script_path("pohunek-launch-issue"))
+            .arg("LIN-1")
+            .env("POHUNEK_CONFIG_DIR", &config_dir)
+            .env("POHUNEK_TEST_POHUNEK_ARGS", args_file)
+            .env("POHUNEK_TEST_RECIPE_JSON", recipe)
+            .output()
+            .expect("run launch-issue");
+        assert!(out.status.success(), "launch-issue failed");
+        read(args_file)
+    };
+
+    let a = run(claude_recipe, &root.join("a.args"));
+    let b = run(codex_recipe, &root.join("b.args"));
+    assert!(a.contains("--agent\nclaude\n"), "project A agent: {a}");
+    assert!(b.contains("--agent\ncodex-fast\n"), "project B agent: {b}");
+    assert!(!a.contains("--agent\ncodex-fast\n"), "{a}");
+}
+
+#[test]
+fn launch_issue_aborts_without_session_on_prompt_not_found() {
+    // A daemon resolution failure (prompt_not_found) aborts the launch before any
+    // session is started — no silent fallback.
+    let root = temp_dir("launch-abort");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("create bin dir");
+    let linear = bin.join("linear-wrapper");
+    let pohunek = bin.join("pohunek");
+    let pohunek_args = root.join("pohunek.args");
+
+    write_executable(
+        &linear,
+        r#"#!/bin/sh
+printf '{"id":"LIN-1","title":"T","description":"B","branchName":"lin-1","url":"u"}\n'
+"#,
+    );
+    write_executable(
+        &pohunek,
+        r#"#!/bin/sh
+for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
+case " $* " in
+  *" project action "*) printf 'pohunek: prompt_not_found\n' >&2; exit 1 ;;
+esac
+"#,
+    );
+
+    let config_dir = write_config(
+        &root,
+        &[
+            ("pohunek_bin", pohunek.to_str().expect("utf8 path")),
+            ("linear_cli", linear.to_str().expect("utf8 path")),
+            ("host", "local"),
+            ("project", "ui"),
+        ],
+    );
+
+    let out = Command::new("sh")
+        .arg(script_path("pohunek-launch-issue"))
+        .arg("LIN-1")
+        .env("POHUNEK_CONFIG_DIR", &config_dir)
+        .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
+        .output()
+        .expect("run launch-issue");
+
+    assert!(
+        !out.status.success(),
+        "launch-issue must fail when the action does not resolve"
+    );
+    let args = read(&pohunek_args);
+    // The resolve was attempted, but no session was ever started.
+    assert!(args.contains("project\naction\n"), "{args}");
+    assert!(
+        !args.contains("session\nnew\n"),
+        "no session must be started: {args}"
+    );
 }
 
 #[test]

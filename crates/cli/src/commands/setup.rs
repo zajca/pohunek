@@ -74,8 +74,6 @@ const LAUNCHER_CONF: &str = "# pohunek launcher configuration.
 # Lines are key=value; '#' starts a comment. Edit the values below.
 
 # --- Required ---
-# Default agent for launched sessions: shell | codex | claude
-agent=claude
 # Default host: 'local' or a NetBird peer name
 host=local
 # Project to create sessions in, by id or label on the target host. Find it with
@@ -90,6 +88,10 @@ list_timeout_seconds=5
 linear_cli=linear
 
 # --- Optional (defaults shown) ---
+# Daemon action each launcher resolves; the agent + prompt template come from it
+# (defined per project in the repo's .pohunek/, else the host config).
+#issue_action=process-issue
+#pr_action=process-pr
 #pohunek_bin=pohunek
 #gh_bin=gh
 #rofi_bin=rofi
