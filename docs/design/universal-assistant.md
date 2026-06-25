@@ -219,6 +219,89 @@ code + CLI + protocol types + config schemas + manual docs
 The important rule is: the assistant does not invent the source of truth. It
 consumes the same versioned documentation bundle humans use.
 
+### Bundle Format: OKF-Inspired Markdown
+
+Use an Open Knowledge Format (OKF)-inspired bundle as the storage shape for
+human- and agent-consumable knowledge, following the draft spec at
+`https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md`.
+The useful OKF ideas for `pohunek` are:
+
+- a knowledge bundle is a directory tree;
+- each concept is one UTF-8 Markdown file;
+- each concept has YAML frontmatter;
+- every concept has a required `type`;
+- `index.md` files provide progressive-disclosure navigation;
+- `log.md` files record local bundle history;
+- bundle-relative Markdown links connect related concepts;
+- citations point back to code, generated reference, or design sources;
+- consumers tolerate unknown frontmatter fields so the format can evolve.
+
+`pohunek` should not adopt OKF as an external dependency or defer correctness to
+the draft spec. Instead, define a **Pohunek OKF profile**: a stricter local
+contract that uses the OKF shape but adds project-specific types, metadata,
+generation rules, redaction rules, and drift checks.
+
+### Pohunek OKF Profile
+
+Every non-reserved knowledge file under `docs/knowledge/` should be a concept
+document with frontmatter:
+
+```yaml
+---
+type: Guide
+title: Local setup
+description: Configure the local daemon, launcher assets, and agent hooks.
+tags: [setup, local, assistant]
+intents: [setup, help]
+source_kind: manual
+resource: pohunek://guide/setup
+since: 0.4.0
+---
+```
+
+Required fields:
+
+- `type`: one of the local concept types listed below.
+- `title`: human-readable page title.
+- `description`: one sentence for index generation, search snippets, and
+  assistant previews.
+- `source_kind`: `manual`, `generated`, or `snapshot-template`.
+
+Recommended fields:
+
+- `tags`: cross-cutting filters.
+- `intents`: assistant intents this concept is useful for (`setup`, `project`,
+  `update`, `debug`, `help`).
+- `resource`: stable `pohunek://...` identifier for generated or addressable
+  concepts.
+- `generated_from`: source file or command for generated concepts.
+- `since`: first `pohunek` version whose behavior this concept describes.
+- `citations`: short list of source files, generated references, or external
+  URLs supporting important claims.
+
+Local concept types:
+
+```text
+Concept
+Guide
+Runbook
+Troubleshooting
+SafetyPolicy
+CliCommand
+ConfigReference
+ProtocolMethod
+ProtocolEvent
+SetupAsset
+PromptTemplate
+SourceMap
+SnapshotTemplate
+ReleaseNote
+```
+
+Consumers should tolerate unknown extra fields. CI should reject missing required
+fields, invalid local `type` values, malformed frontmatter, and broken internal
+links.
+
 ### Sources of Truth
 
 Use four source categories.
@@ -267,36 +350,59 @@ Suggested layout:
 
 ```text
 docs/
-  source/
+  knowledge/
+    index.md
+    log.md
     concepts/
+      architecture.md
+      sessions.md
+      projects.md
+      worktrees.md
+      agent-profiles.md
     guides/
-    reference/
+      setup.md
+      project-setup.md
+      remote-hosts.md
+      launcher.md
     runbooks/
-    troubleshooting/
-  generated/
-    cli.md
-    protocol.md
-    config.md
-    setup-assets.md
-  assistant/
-    system.md
-    knowledge.md
-    runbooks.md
-    safety.md
-    source-map.md
-  site/
+      debug-daemon.md
+      debug-launcher.md
+      update-after-release.md
+    reference/
+      cli/
+        index.md
+        session-new.md
+        project-action.md
+      config/
+        launcher-conf.md
+        templates-toml.md
+        actions-toml.md
+        agent-profile.md
+      protocol/
+        session-new.md
+        project-action.md
+        host-inspect.md
+    safety/
+      trust-model.md
+      secrets.md
+      repo-pohunek.md
+    assistant/
+      system.md
+      source-map.md
 ```
 
-`docs/source/` is the hand-authored documentation. `docs/generated/` is produced
-from code and committed when it is useful for review. `docs/assistant/` is the
-curated assistant pack assembled from source and generated docs. `docs/site/`
-holds web-specific structure only when the project needs it; it must not become
-an independent source of truth.
+`docs/knowledge/` is the committed OKF-style source bundle. Manual and generated
+concepts can live together there as long as generated concepts carry
+`source_kind: generated` and `generated_from`. `docs/knowledge/assistant/` holds
+assistant-specific concepts, not a separate source of truth. Web-specific
+structure should be generated into `target/pohunek-docs/site/`; it must not
+become an independent documentation corpus.
 
 Generated release artifacts should live under an ignored build directory:
 
 ```text
 target/pohunek-docs/
+  knowledge-bundle/
   assistant-pack/
   site/
   offline/
@@ -319,6 +425,7 @@ scripts/docs/build
 
 The build should produce:
 
+- a normalized knowledge bundle;
 - an assistant pack optimized for prompt composition;
 - an online site artifact;
 - an offline docs artifact;
@@ -329,6 +436,8 @@ Example manifest:
 ```json
 {
   "pohunek_version": "0.3.3",
+  "knowledge_format": "pohunek-okf",
+  "knowledge_format_version": "0.1",
   "docs_schema": 1,
   "generated_at": "2026-06-25T00:00:00Z",
   "sources": ["manual_docs", "cli", "protocol", "config", "runbooks"],
@@ -376,6 +485,9 @@ Documentation must fail loudly when generated truth changes.
 
 Required checks:
 
+- validate every concept's YAML frontmatter;
+- validate local `type`, `source_kind`, and `intents` values;
+- fail on broken internal links;
 - regenerate CLI reference and fail if committed output differs;
 - regenerate protocol reference and fail if committed output differs;
 - regenerate config reference and fail if committed output differs;
@@ -842,6 +954,10 @@ JSON output:
 ### Documentation Tests
 
 - source-map paths exist;
+- every `docs/knowledge/` concept has valid YAML frontmatter with required
+  Pohunek OKF profile fields;
+- reserved `index.md` and `log.md` files follow the local bundle rules;
+- internal bundle links resolve;
 - runbook commands match the CLI grammar;
 - examples stay synchronized with parser tests;
 - generated CLI, protocol, config, and setup-asset references are up to date;
@@ -866,12 +982,15 @@ The feature is complete only when the full assistant experience works:
 - Remote launches preserve existing safety gates.
 - Snapshot redaction prevents profile env values and process env values from
   entering prompts.
+- `docs/knowledge/` is a valid Pohunek OKF profile bundle with checked
+  frontmatter, reserved files, internal links, and concept types.
 - The assistant pack, online docs artifact, and offline docs artifact are built
   from one documentation pipeline and share a manifest.
 - Generated CLI, protocol, config, setup-asset, and runbook references have drift
   checks.
 - Tests cover prompt composition, bootstrap, agent selection, snapshot redaction,
-  local launch, remote launch, project intent, docs generation, and docs drift.
+  local launch, remote launch, project intent, docs generation, OKF validation,
+  and docs drift.
 
 ## Delivery Scope
 
@@ -890,6 +1009,8 @@ the opening prompt; it does not split the system into separate assistants.
 
 - curated product knowledge built into the CLI;
 - a documentation pipeline shared by assistant, online docs, and offline docs;
+- a Pohunek OKF profile bundle that stays readable by humans and traversable by
+  agents;
 - redacted live context from the current host/project;
 - source-map access to the repo;
 - exact CLI runbooks;
