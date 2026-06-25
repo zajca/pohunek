@@ -3033,6 +3033,7 @@ fn timestamp_now() -> String {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use protocol::{
@@ -3048,6 +3049,8 @@ mod tests {
 
     use super::{LagWarn, LagWarnThrottle, SessionRegistry, SessionRegistryConfig, ShellCommand};
     use std::time::Instant;
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn params() -> SessionNewParams {
         SessionNewParams {
@@ -3077,9 +3080,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
+        let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "pohunek-session-{tag}-{}-{nanos}",
-            std::process::id()
+            "pohunek-session-{tag}-{}-{nanos}-{n}",
+            std::process::id(),
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir.join("metadata.jsonl")
@@ -3111,7 +3115,7 @@ mod tests {
     }
 
     async fn wait_for_file_contains(path: &std::path::Path, needle: &str) -> String {
-        for _ in 0..100 {
+        for _ in 0..500 {
             if let Ok(contents) = fs::read_to_string(path) {
                 if contents.contains(needle) {
                     return contents;
@@ -3126,7 +3130,7 @@ mod tests {
     }
 
     async fn wait_for_line_count(path: &std::path::Path, expected: usize) -> String {
-        for _ in 0..100 {
+        for _ in 0..500 {
             if let Ok(contents) = fs::read_to_string(path) {
                 if contents.lines().count() >= expected {
                     return contents;

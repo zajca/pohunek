@@ -2,16 +2,20 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn temp_dir(tag: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time after epoch")
         .as_nanos();
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "pohunek-script-{tag}-{}-{nanos}",
-        std::process::id()
+        "pohunek-script-{tag}-{}-{nanos}-{n}",
+        std::process::id(),
     ));
     fs::create_dir_all(&dir).expect("create temp dir");
     dir

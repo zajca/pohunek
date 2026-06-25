@@ -13,6 +13,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
@@ -32,6 +33,8 @@ use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo, RemoteServer};
 use pohunek_daemon::error::DaemonError;
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// A unique temp directory inside the test temp root.
 ///
 /// The Unix server enforces its directory's mode on bind, so the socket must
@@ -41,8 +44,11 @@ fn temp_dir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let dir =
-        std::env::temp_dir().join(format!("pohunek-test-{tag}-{}-{nanos}", std::process::id()));
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "pohunek-test-{tag}-{}-{nanos}-{n}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).expect("create test dir");
     dir
 }

@@ -9,6 +9,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -31,6 +32,7 @@ use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellComma
 use pohunek_daemon::store::Store;
 
 static PATH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct PathGuard {
     _guard: MutexGuard<'static, ()>,
@@ -114,8 +116,11 @@ fn temp_dir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let dir =
-        std::env::temp_dir().join(format!("pohunek-test-{tag}-{}-{nanos}", std::process::id()));
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "pohunek-test-{tag}-{}-{nanos}-{n}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).expect("create test socket dir");
     dir
 }
