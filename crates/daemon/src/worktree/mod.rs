@@ -974,7 +974,7 @@ fn worktree_prune(repo: &Path) -> Result<(), String> {
 enum SetupOutcome {
     /// The script exited on its own with this status.
     Exited(ExitStatus),
-    /// The script outlived `setup_script_timeout` and was terminated.
+    /// The hook outlived `hook_timeout` and was terminated.
     TimedOut,
     /// Waiting on the child failed (an OS error, not a script failure).
     WaitError(io::Error),

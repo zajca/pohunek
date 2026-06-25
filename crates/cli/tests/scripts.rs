@@ -118,7 +118,6 @@ esac
             ("pohunek_bin", pohunek.to_str().expect("utf8 path")),
             ("gh_bin", gh.to_str().expect("utf8 path")),
             ("host", "local"),
-            ("project", "ui"),
             ("yes", "true"),
         ],
     );
@@ -126,7 +125,9 @@ esac
 
     let out = Command::new("sh")
         .arg(script_path("pohunek-launch-pr"))
+        .arg("ui")
         .arg("7")
+        .arg("review-pr")
         .env("POHUNEK_CONFIG_DIR", &config_dir)
         .env("POHUNEK_TEST_GH_ARGS", &gh_args)
         .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
@@ -145,7 +146,7 @@ esac
     // The launcher first resolves the action recipe from the daemon, then starts
     // the session with the daemon-resolved agent.
     assert!(
-        args.contains("project\naction\nui\nprocess-pr\n--json\n"),
+        args.contains("project\naction\nui\nreview-pr\n--json\n"),
         "{args}"
     );
     assert!(args.contains("--host\nlocal\nsession\nnew\n"), "{args}");
@@ -199,7 +200,6 @@ esac
             ("pohunek_bin", pohunek.to_str().expect("utf8 path")),
             ("linear_cli", linear.to_str().expect("utf8 path")),
             ("host", "build-box"),
-            ("project", "ui"),
         ],
     );
     // The recipe sets a base_branch; the launcher must thread it as --base-branch.
@@ -207,6 +207,7 @@ esac
 
     let out = Command::new("sh")
         .arg(script_path("pohunek-launch-issue"))
+        .arg("ui")
         .arg("LIN-123")
         .env("POHUNEK_CONFIG_DIR", &config_dir)
         .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
@@ -275,16 +276,16 @@ esac
             ("pohunek_bin", pohunek.to_str().expect("utf8 path")),
             ("linear_cli", linear.to_str().expect("utf8 path")),
             ("host", "local"),
-            ("project", "ui"),
         ],
     );
 
     let claude_recipe = r#"{"provider":"linear_issue","agent":"claude","prompt_name":"issue","prompt_content":"P ${title}\n"}"#;
     let codex_recipe = r#"{"provider":"linear_issue","agent":"codex-fast","prompt_name":"issue","prompt_content":"P ${title}\n"}"#;
 
-    let run = |recipe: &str, args_file: &Path| {
+    let run = |project: &str, recipe: &str, args_file: &Path| {
         let out = Command::new("sh")
             .arg(script_path("pohunek-launch-issue"))
+            .arg(project)
             .arg("LIN-1")
             .env("POHUNEK_CONFIG_DIR", &config_dir)
             .env("POHUNEK_TEST_POHUNEK_ARGS", args_file)
@@ -295,8 +296,16 @@ esac
         read(args_file)
     };
 
-    let a = run(claude_recipe, &root.join("a.args"));
-    let b = run(codex_recipe, &root.join("b.args"));
+    let a = run("project-a", claude_recipe, &root.join("a.args"));
+    let b = run("project-b", codex_recipe, &root.join("b.args"));
+    assert!(
+        a.contains("project\naction\nproject-a\nprocess-issue\n"),
+        "{a}"
+    );
+    assert!(
+        b.contains("project\naction\nproject-b\nprocess-issue\n"),
+        "{b}"
+    );
     assert!(a.contains("--agent\nclaude\n"), "project A agent: {a}");
     assert!(b.contains("--agent\ncodex-fast\n"), "project B agent: {b}");
     assert!(!a.contains("--agent\ncodex-fast\n"), "{a}");
@@ -335,12 +344,12 @@ esac
             ("pohunek_bin", pohunek.to_str().expect("utf8 path")),
             ("linear_cli", linear.to_str().expect("utf8 path")),
             ("host", "local"),
-            ("project", "ui"),
         ],
     );
 
     let out = Command::new("sh")
         .arg(script_path("pohunek-launch-issue"))
+        .arg("ui")
         .arg("LIN-1")
         .env("POHUNEK_CONFIG_DIR", &config_dir)
         .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
@@ -357,6 +366,196 @@ esac
     assert!(
         !args.contains("session\nnew\n"),
         "no session must be started: {args}"
+    );
+}
+
+#[test]
+fn launch_issue_rejects_action_with_non_linear_provider_before_fetch() {
+    let root = temp_dir("launch-issue-provider-mismatch");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("create bin dir");
+    let linear = bin.join("linear-wrapper");
+    let pohunek = bin.join("pohunek");
+    let linear_args = root.join("linear.args");
+    let pohunek_args = root.join("pohunek.args");
+
+    write_executable(
+        &linear,
+        r#"#!/bin/sh
+for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_LINEAR_ARGS"; done
+printf '{"id":"LIN-1","title":"T","description":"B","branchName":"lin-1","url":"u"}\n'
+"#,
+    );
+    write_executable(
+        &pohunek,
+        r#"#!/bin/sh
+for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
+case " $* " in
+  *" project action "*) printf '%s' "$POHUNEK_TEST_RECIPE_JSON" ;;
+esac
+"#,
+    );
+    let config_dir = write_config(
+        &root,
+        &[
+            ("pohunek_bin", pohunek.to_str().expect("utf8 path")),
+            ("linear_cli", linear.to_str().expect("utf8 path")),
+            ("host", "local"),
+        ],
+    );
+    let recipe = r#"{"provider":"github_pr","agent":"codex","prompt_name":"issue","prompt_content":"Issue ${id}\n"}"#;
+
+    let out = Command::new("sh")
+        .arg(script_path("pohunek-launch-issue"))
+        .arg("ui")
+        .arg("LIN-1")
+        .env("POHUNEK_CONFIG_DIR", &config_dir)
+        .env("POHUNEK_TEST_LINEAR_ARGS", &linear_args)
+        .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
+        .env("POHUNEK_TEST_RECIPE_JSON", recipe)
+        .output()
+        .expect("run launch-issue");
+
+    assert!(
+        !out.status.success(),
+        "launch-issue must reject a non-linear provider"
+    );
+    let args = read(&pohunek_args);
+    assert!(
+        args.contains("project\naction\nui\nprocess-issue\n--json\n"),
+        "{args}"
+    );
+    assert!(
+        !args.contains("session\nnew\n"),
+        "no session must be started: {args}"
+    );
+    assert_eq!(read(&linear_args), "", "Linear must not be fetched");
+}
+
+#[test]
+fn launch_pr_rejects_provider_none_static_branch_before_fetch() {
+    let root = temp_dir("launch-pr-provider-none");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("create bin dir");
+    let gh = bin.join("gh");
+    let pohunek = bin.join("pohunek");
+    let gh_args = root.join("gh.args");
+    let pohunek_args = root.join("pohunek.args");
+
+    write_executable(
+        &gh,
+        r#"#!/bin/sh
+for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_GH_ARGS"; done
+printf '{"title":"T","body":"B","headRefName":"feat/x","url":"u"}\n'
+"#,
+    );
+    write_executable(
+        &pohunek,
+        r#"#!/bin/sh
+for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
+case " $* " in
+  *" project action "*) printf '%s' "$POHUNEK_TEST_RECIPE_JSON" ;;
+esac
+"#,
+    );
+    let config_dir = write_config(
+        &root,
+        &[
+            ("pohunek_bin", pohunek.to_str().expect("utf8 path")),
+            ("gh_bin", gh.to_str().expect("utf8 path")),
+            ("host", "local"),
+        ],
+    );
+    let recipe = r#"{"provider":"none","agent":"claude","branch":"feature/static","prompt_name":"pr","prompt_content":"PR ${number}\n"}"#;
+
+    let out = Command::new("sh")
+        .arg(script_path("pohunek-launch-pr"))
+        .arg("ui")
+        .arg("7")
+        .env("POHUNEK_CONFIG_DIR", &config_dir)
+        .env("POHUNEK_TEST_GH_ARGS", &gh_args)
+        .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
+        .env("POHUNEK_TEST_RECIPE_JSON", recipe)
+        .output()
+        .expect("run launch-pr");
+
+    assert!(
+        !out.status.success(),
+        "launch-pr must reject provider=none recipes"
+    );
+    let args = read(&pohunek_args);
+    assert!(
+        args.contains("project\naction\nui\nprocess-pr\n--json\n"),
+        "{args}"
+    );
+    assert!(
+        !args.contains("session\nnew\n"),
+        "no session must be started: {args}"
+    );
+    assert_eq!(read(&gh_args), "", "GitHub must not be fetched");
+}
+
+#[test]
+fn launch_issue_rejects_unknown_template_variable_without_session() {
+    let root = temp_dir("launch-issue-unknown-var");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("create bin dir");
+    let linear = bin.join("linear-wrapper");
+    let pohunek = bin.join("pohunek");
+    let pohunek_args = root.join("pohunek.args");
+
+    write_executable(
+        &linear,
+        r#"#!/bin/sh
+printf '{"id":"LIN-1","title":"T","description":"B","branchName":"lin-1","url":"u"}\n'
+"#,
+    );
+    write_executable(
+        &pohunek,
+        r#"#!/bin/sh
+for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
+case " $* " in
+  *" project action "*) printf '%s' "$POHUNEK_TEST_RECIPE_JSON" ;;
+esac
+"#,
+    );
+    let config_dir = write_config(
+        &root,
+        &[
+            ("pohunek_bin", pohunek.to_str().expect("utf8 path")),
+            ("linear_cli", linear.to_str().expect("utf8 path")),
+            ("host", "local"),
+        ],
+    );
+    let recipe = r#"{"provider":"linear_issue","agent":"codex","prompt_name":"issue","prompt_content":"Issue ${id}: ${missing}\n"}"#;
+
+    let out = Command::new("sh")
+        .arg(script_path("pohunek-launch-issue"))
+        .arg("ui")
+        .arg("LIN-1")
+        .env("POHUNEK_CONFIG_DIR", &config_dir)
+        .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
+        .env("POHUNEK_TEST_RECIPE_JSON", recipe)
+        .output()
+        .expect("run launch-issue");
+
+    assert!(
+        !out.status.success(),
+        "unknown template variables must reject the launch"
+    );
+    let args = read(&pohunek_args);
+    assert!(
+        args.contains("project\naction\nui\nprocess-issue\n--json\n"),
+        "{args}"
+    );
+    assert!(
+        !args.contains("session\nnew\n"),
+        "no session must be started: {args}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unknown variable"),
+        "stderr should explain the template failure: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -407,16 +606,13 @@ for arg in \"$@\"; do printf '%s\\n' \"$arg\" >>\"$POHUNEK_TEST_TERMINAL_ARGS\";
             ("terminal", terminal.to_str().expect("utf8 path")),
             // Explicit assignee avoids depending on a `linear auth whoami` stub.
             ("linear_assignee", "zajca"),
-            // pohunek-launch-issue config keys (the launcher resolves them even
-            // though the mock terminal never actually runs the script).
-            ("agent", "claude"),
             ("host", "local"),
-            ("project", "ui"),
         ],
     );
 
     let out = Command::new("sh")
         .arg(script_path("pohunek-rofi-issue"))
+        .arg("ui")
         .env("POHUNEK_CONFIG_DIR", &config_dir)
         .env("POHUNEK_TEST_LINEAR_ARGS", &linear_args)
         .env("POHUNEK_TEST_ROFI_STDIN", &rofi_stdin)
@@ -450,7 +646,7 @@ for arg in \"$@\"; do printf '%s\\n' \"$arg\" >>\"$POHUNEK_TEST_TERMINAL_ARGS\";
     // The launch runs in the background, so poll for the spawned args.
     wait_for_file_contains(
         &terminal_args,
-        &["pohunek-launch-issue", "AI-1"],
+        &["pohunek-launch-issue", "ui", "AI-1"],
         "rofi-issue terminal",
     );
     // The Linear token never reaches the spawned command line.
@@ -508,14 +704,13 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_TERMINAL_ARGS"; done
             ("linear_cli", linear.to_str().expect("utf8 path")),
             ("rofi_bin", rofi.to_str().expect("utf8 path")),
             ("terminal", terminal.to_str().expect("utf8 path")),
-            ("agent", "claude"),
             ("host", "local"),
-            ("project", "ui"),
         ],
     );
 
     let out = Command::new("sh")
         .arg(script_path("pohunek-rofi-issue"))
+        .arg("ui")
         .env("POHUNEK_CONFIG_DIR", &config_dir)
         .env("POHUNEK_TEST_LINEAR_ARGS", &linear_args)
         .env("POHUNEK_TEST_TERMINAL_ARGS", &terminal_args)
@@ -536,7 +731,7 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_TERMINAL_ARGS"; done
     );
     wait_for_file_contains(
         &terminal_args,
-        &["pohunek-launch-issue", "AI-9"],
+        &["pohunek-launch-issue", "ui", "AI-9"],
         "rofi-issue derive terminal",
     );
 }

@@ -7,9 +7,11 @@
 //! fresh on every request, so it always reflects the host as it is now and is
 //! never cached.
 
+use std::ffi::OsStr;
+
 use protocol::{AgentRuntime, HostCapabilities, PROTOCOL_VERSION};
 
-use crate::agent::{default_program, which_executable, ProfileRegistry};
+use crate::agent::{default_program, is_executable_file, which_executable, ProfileRegistry};
 
 /// Build the live capability snapshot for this host.
 ///
@@ -87,13 +89,17 @@ fn probe_runtime(agent: &str, binary: &str) -> AgentRuntime {
 /// Resolve a binary name against the `PATH` environment variable.
 ///
 /// A small dependency-free `which`: splits `PATH`, joins the name, and returns
-/// the first entry that exists and is a regular file. Mirrors the same helper in
-/// the CLI's `doctor` command rather than pulling in a crate for one call.
+/// the first executable file. Mirrors the agent launch-path probe rather than
+/// reporting a non-executable placeholder as available.
 fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
     let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
+    which_on_path_value(name, &path_var)
+}
+
+fn which_on_path_value(name: &str, path_var: &OsStr) -> Option<std::path::PathBuf> {
+    for dir in std::env::split_paths(path_var) {
         let candidate = dir.join(name);
-        if candidate.is_file() {
+        if is_executable_file(&candidate) {
             return Some(candidate);
         }
     }
@@ -102,6 +108,7 @@ fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -188,5 +195,20 @@ mod tests {
         // The availability invariant holds for profile programs too.
         assert_eq!(runtime.available, runtime.path.is_some());
         assert!(runtime.available, "/bin/sh resolves as executable");
+    }
+
+    #[test]
+    fn path_probe_ignores_non_executable_files() {
+        let dir = temp_agents_dir();
+        let git = dir.join("git");
+        std::fs::write(&git, "#!/bin/sh\n").expect("write fake git");
+        let mut perms = std::fs::metadata(&git).expect("metadata").permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&git, perms).expect("chmod fake git");
+
+        assert!(
+            which_on_path_value("git", dir.as_os_str()).is_none(),
+            "capability probing must match launch probing and require executable files"
+        );
     }
 }

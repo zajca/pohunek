@@ -58,8 +58,8 @@ const DEFAULT_OUTPUT_HISTORY_LIMIT_BYTES: usize = 10_000_000;
 /// (`.pohunek/setup`). It is a safety cap on a *hang*, not a tight budget — a
 /// legitimate script may install dependencies — so it is generous; a script that
 /// exceeds it is terminated and surfaced as a non-fatal `setup_script` warning.
-/// Overridable via [`SessionRegistryConfig::setup_script_timeout`].
-const DEFAULT_SETUP_SCRIPT_TIMEOUT: Duration = Duration::from_secs(300);
+/// Overridable via [`SessionRegistryConfig::hook_timeout`].
+const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Default grace period to wait for a freshly spawned agent to produce its first
 /// PTY output before injecting a `session.new --input` prompt. It is an upper
@@ -171,11 +171,11 @@ pub struct SessionRegistryConfig {
     /// to enable worktree binding; when unset, a `session.new` carrying a
     /// repo+branch fails (no silent default).
     pub worktree_root: Option<PathBuf>,
-    /// Wall-clock bound on a per-repository worktree setup script. A script that
-    /// exceeds it is terminated and recorded as a non-fatal `setup_script`
-    /// warning, so a hanging script can never wedge `session.new`. Defaults to
-    /// [`DEFAULT_SETUP_SCRIPT_TIMEOUT`].
-    pub setup_script_timeout: Duration,
+    /// Wall-clock bound on each worktree/session lifecycle hook. A hook that
+    /// exceeds it is terminated and recorded/logged as a non-fatal hook warning,
+    /// so a hanging hook can never wedge a session operation. Defaults to
+    /// [`DEFAULT_HOOK_TIMEOUT`].
+    pub hook_timeout: Duration,
     /// Directory for the append-only event log (`<data_dir>/events`). `None`
     /// disables event logging. Started via [`SessionRegistry::spawn_event_log`].
     pub event_log_dir: Option<PathBuf>,
@@ -448,7 +448,7 @@ impl Default for SessionRegistryConfig {
             socket_path: None,
             store_path: None,
             worktree_root: None,
-            setup_script_timeout: DEFAULT_SETUP_SCRIPT_TIMEOUT,
+            hook_timeout: DEFAULT_HOOK_TIMEOUT,
             event_log_dir: None,
             config_dir: None,
             agents_dir: None,
@@ -595,7 +595,7 @@ impl SessionRegistry {
             (Some(root), Some(store)) => Some(Arc::new(WorktreeManager::new(
                 root.clone(),
                 store.clone(),
-                config.setup_script_timeout,
+                config.hook_timeout,
                 config.config_dir.clone(),
             ))),
             _ => None,
@@ -1041,7 +1041,7 @@ impl SessionRegistry {
     }
 
     fn spawn_session_hook_task(&self, request: SessionHookRequest) -> JoinHandle<()> {
-        let timeout = self.inner.config.setup_script_timeout;
+        let timeout = self.inner.config.hook_timeout;
         let config_dir = self.inner.config.config_dir.clone();
         tokio::task::spawn_blocking(move || {
             let ctx = HookContext {
@@ -1783,7 +1783,10 @@ impl SessionRegistry {
                     // it to self-heal instead of retrying it on every restart.
                     // `agent_binary_missing` is left in place: it may be a
                     // transient PATH gap at startup that resolves on a later run.
-                    if matches!(err.code.as_str(), "invalid_session_ref" | "not_resumable") {
+                    if matches!(
+                        err.code.as_str(),
+                        "invalid_session_ref" | "not_resumable" | "agent_not_resumable"
+                    ) {
                         // Prune via the serialized persist path: the failed
                         // resume registered no live session, so this re-reads the
                         // id as absent and removes its binding. Routing it here
@@ -1806,13 +1809,7 @@ impl SessionRegistry {
         // explicit `(resume_mode, ref_kind)` pair drives the argv; a legacy binding
         // (pre-C2, no snapshot) falls back to the base kind's native template.
         if !binding.resumable && !binding.program.is_empty() {
-            return Err(runtime_error(
-                "not_resumable",
-                format!(
-                    "resume binding for {} was captured from a non-resumable profile",
-                    binding.session_id
-                ),
-            ));
+            return Err(agent_not_resumable(&binding.agent));
         }
         let template = match (binding.resume_mode, binding.ref_kind) {
             (Some(mode), Some(ref_kind)) => ResumeTemplate { mode, ref_kind },
@@ -2771,12 +2768,24 @@ fn parse_agent_state_event(event: &Event) -> Option<(SessionId, AgentActivity)> 
     }
     let payload = event.payload.as_object()?;
     let session_id = payload.get("session_id")?.as_str()?;
-    let activity = parse_agent_activity(payload.get("activity")?)?;
+    let activity_value = payload.get("activity")?;
+    let activity = match parse_agent_activity(activity_value) {
+        Ok(activity) => activity,
+        Err(err) => {
+            warn!(
+                session_id,
+                activity = ?activity_value,
+                error = %err,
+                "failed to parse agent-state activity; hook not fired"
+            );
+            return None;
+        }
+    };
     Some((SessionId(session_id.to_owned()), activity))
 }
 
-fn parse_agent_activity(value: &Value) -> Option<AgentActivity> {
-    serde_json::from_value(value.clone()).ok()
+fn parse_agent_activity(value: &Value) -> Result<AgentActivity, serde_json::Error> {
+    serde_json::from_value(value.clone())
 }
 
 fn queue_agent_state_hook(
@@ -3859,7 +3868,7 @@ mod tests {
         let registry = SessionRegistry::new(SessionRegistryConfig {
             shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
             stop_grace: Duration::from_millis(50),
-            setup_script_timeout: Duration::from_millis(50),
+            hook_timeout: Duration::from_millis(50),
             config_dir: Some(config_dir),
             ..SessionRegistryConfig::default()
         });
@@ -4419,7 +4428,7 @@ mod tests {
         let registry = SessionRegistry::new(SessionRegistryConfig {
             shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
             stop_grace: Duration::from_millis(50),
-            setup_script_timeout: Duration::from_secs(1),
+            hook_timeout: Duration::from_secs(1),
             config_dir: Some(config_dir),
             ..SessionRegistryConfig::default()
         });
@@ -4455,6 +4464,16 @@ mod tests {
 
         registry.stop(&created.id).await.expect("stop session");
         registry.shutdown_agent_state_hooks().await;
+    }
+
+    #[test]
+    fn invalid_agent_activity_parse_returns_error() {
+        let err = super::parse_agent_activity(&serde_json::json!("future-state"))
+            .expect_err("unknown activity should remain an explicit parse error");
+        assert!(
+            err.to_string().contains("future-state"),
+            "parse error should name the invalid activity: {err}"
+        );
     }
 
     #[tokio::test]
@@ -5021,6 +5040,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_resumable_profile_binding_reports_agent_not_resumable() {
+        let registry = SessionRegistry::default();
+        let binding = crate::store::ResumeBinding {
+            session_id: "s-noresume".to_owned(),
+            agent: "noresume".to_owned(),
+            agent_base: AgentKind::Codex,
+            cwd: temp_dir("noresume-binding-cwd"),
+            cols: 80,
+            rows: 24,
+            native_session_id: Some("native-ignored".to_owned()),
+            native_session_path: None,
+            project_id: None,
+            is_linked_worktree: None,
+            program: "/bin/sh".to_owned(),
+            args: Vec::new(),
+            input_rules: crate::store::StoredInputRules::default(),
+            resume_mode: Some(ResumeMode::Flag),
+            ref_kind: Some(SessionRefKind::Id),
+            resumable: false,
+        };
+
+        let err = registry
+            .resume_binding(binding)
+            .await
+            .expect_err("non-resumable binding must fail");
+        assert_eq!(err.code, "agent_not_resumable");
+    }
+
+    #[tokio::test]
     async fn resume_binding_never_persists_profile_env_secrets() {
         // C.4 no-secrets invariant: a profile's `[env]` (which may hold secrets) is
         // never written to the store. The serialized resume line must contain none
@@ -5287,6 +5335,116 @@ mod tests {
         );
 
         let _ = registry.stop(&SessionId("s-44".to_owned())).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_after_profile_edit_and_resize_uses_original_snapshot() {
+        let store_path = temp_store_path("resume-edit-resize");
+        let dir = temp_dir("resume-edit-resize-runtime");
+        let script_v1 = dir.join("agent-v1");
+        let script_v2 = dir.join("agent-v2");
+        let marker_v1 = dir.join("v1-argv.txt");
+        let marker_v2 = dir.join("v2-argv.txt");
+        write_executable(
+            &script_v1,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nsleep 30\n",
+                marker_v1.display()
+            ),
+        );
+        write_executable(
+            &script_v2,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nsleep 30\n",
+                marker_v2.display()
+            ),
+        );
+        let agents_dir = temp_agents_dir_with(
+            "resume-edit-resize",
+            "editable",
+            &format!(
+                "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"sonnet\"]\n",
+                script_v1.display()
+            ),
+        );
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path.clone()),
+            agents_dir: Some(agents_dir.clone()),
+            ..SessionRegistryConfig::default()
+        });
+
+        let created = registry
+            .create(SessionNewParams {
+                agent: "editable".to_owned(),
+                cwd: Some(dir.clone()),
+                ..params()
+            })
+            .await
+            .expect("create editable profile session");
+        let recorded = registry
+            .report_native_id(SessionReportNativeIdParams {
+                session_id: created.id.clone(),
+                agent: "claude".to_owned(),
+                native_session_id: "native-edit-resize".to_owned(),
+                transcript_path: None,
+            })
+            .await;
+        assert!(recorded.recorded);
+        registry
+            .resize(&created.id, 123, 55)
+            .await
+            .expect("resize captured session");
+        let binding = crate::store::Store::new(store_path.clone())
+            .load_resume()
+            .expect("load resized binding")
+            .into_iter()
+            .next()
+            .expect("resume binding exists");
+        assert_eq!((binding.cols, binding.rows), (123, 55));
+
+        registry
+            .stop(&created.id)
+            .await
+            .expect("stop original session after snapshot capture");
+        fs::write(&marker_v1, "").expect("clear v1 marker");
+        fs::write(
+            agents_dir.join("editable.toml"),
+            format!(
+                "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"opus\"]\n",
+                script_v2.display()
+            ),
+        )
+        .expect("edit profile");
+
+        let restarted = SessionRegistry::new(SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path),
+            agents_dir: Some(agents_dir),
+            ..SessionRegistryConfig::default()
+        });
+        let resumed = restarted
+            .resume_binding(binding)
+            .await
+            .expect("resume from frozen binding");
+
+        assert_eq!((resumed.cols, resumed.rows), (123, 55));
+        let argv = wait_for_file_contains(&marker_v1, "native-edit-resize").await;
+        assert_eq!(
+            argv.lines().collect::<Vec<_>>(),
+            vec!["--model", "sonnet", "--resume", "native-edit-resize"],
+            "resume must use launch-time program/args, not the edited profile"
+        );
+        assert!(
+            !marker_v2.exists()
+                || fs::read_to_string(&marker_v2)
+                    .unwrap_or_default()
+                    .is_empty(),
+            "edited profile program must not run during resume"
+        );
+
+        let _ = restarted.stop(&resumed.id).await;
     }
 
     #[tokio::test]

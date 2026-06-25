@@ -1166,6 +1166,32 @@ fn remove_hooks_fire_on_cleanup_with_post_remove_in_repository() {
 }
 
 #[test]
+fn post_remove_skips_with_warning_when_repository_is_gone() {
+    let mgr = manager("hook-remove-repo-gone");
+    let repo = init_repo("hook-remove-repo-gone-repo");
+    mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
+    fs::remove_dir_all(&repo).expect("delete repository before cleanup");
+
+    let mut warnings = Vec::new();
+    let removed = mgr.cleanup_session("s-1", &mut warnings).expect("cleanup");
+
+    assert_eq!(removed, 1);
+    let warning = warnings
+        .iter()
+        .find(|warning| warning.kind == SessionWarningKind::Hook)
+        .expect("post-remove skip warning");
+    assert!(
+        warning.message.contains("post-remove"),
+        "warning summary should identify the hook event: {warning:?}"
+    );
+    let detail = warning.detail.as_deref().unwrap_or_default();
+    assert!(
+        detail.contains("no longer exists") && detail.contains("post-remove hook skipped"),
+        "warning detail should explain that post-remove was skipped: {warning:?}"
+    );
+}
+
+#[test]
 fn host_global_and_in_repo_post_create_run_host_global_first() {
     // B3 compose: when both layers have a post-create hook, both run, host-global
     // FIRST, then in-repo (append-ordered marker proves ordering).

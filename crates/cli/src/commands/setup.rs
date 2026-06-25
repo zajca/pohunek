@@ -76,10 +76,6 @@ const LAUNCHER_CONF: &str = "# pohunek launcher configuration.
 # --- Required ---
 # Default host: 'local' or a NetBird peer name
 host=local
-# Project to create sessions in, by id or label on the target host. Find it with
-# `pohunek [--host H] project list`; the host must already know it — run
-# `pohunek [--host H] project add <path-on-that-host>` once if it does not.
-project=
 # Terminal emulator command (falls back to $TERMINAL if empty)
 terminal=
 # Per-host timeout (seconds) for `session list` queries in the rofi switcher
@@ -88,10 +84,6 @@ list_timeout_seconds=5
 linear_cli=linear
 
 # --- Optional (defaults shown) ---
-# Daemon action each launcher resolves; the agent + prompt template come from it
-# (defined per project in the repo's .pohunek/, else the host config).
-#issue_action=process-issue
-#pr_action=process-pr
 #pohunek_bin=pohunek
 #gh_bin=gh
 #rofi_bin=rofi
@@ -402,9 +394,10 @@ fn next_steps(paths: &Paths) -> Vec<String> {
     let sway_dir = paths.sway_config_dir();
     vec![
         format!(
-            "Edit {}/launcher.conf — set 'project' and 'terminal' (and 'linear_cli' for Linear).",
+            "Edit {}/launcher.conf — set 'terminal' (and 'linear_cli' for Linear).",
             paths.config_dir.display()
         ),
+        "Pass a project id/label to launchers, for example `pohunek-launch-issue <project> <issue-id> [action]`.".to_owned(),
         format!(
             "Ensure your sway config has: include {}/config.d/*",
             sway_dir.display()
@@ -568,6 +561,19 @@ mod tests {
             LAUNCHER_CONF,
             "forced run restored the default config"
         );
+    }
+
+    #[test]
+    fn launcher_conf_contains_only_host_level_launcher_keys() {
+        for removed in ["project=", "agent=", "issue_action", "pr_action"] {
+            assert!(
+                !LAUNCHER_CONF.contains(removed),
+                "launcher.conf must not contain per-project/per-action key {removed:?}"
+            );
+        }
+        assert!(LAUNCHER_CONF.contains("host=local"));
+        assert!(LAUNCHER_CONF.contains("terminal="));
+        assert!(LAUNCHER_CONF.contains("linear_cli=linear"));
     }
 
     #[test]

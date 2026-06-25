@@ -11,6 +11,10 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 # that one attaches to existing sessions, this one starts a new one from a work
 # item, so they earn their own keybinds.
 
+[ "$#" -ge 1 ] && [ "$#" -le 2 ] || pohunek_fail "usage: pohunek-rofi-issue <project> [action]"
+project="$1"
+action="${2:-process-issue}"
+
 linear_cli="$(pohunek_required_config linear_cli)"
 rofi_bin="$(pohunek_optional_config rofi_bin rofi)"
 terminal_bin="$(pohunek_optional_config terminal "${TERMINAL:-}")"
@@ -112,11 +116,11 @@ launch_issue="$script_dir/pohunek-launch-issue"
 # error). Keep the window open after it finishes so a fast local create does not
 # just flash and vanish.
 "$terminal_bin" -e sh -c '
-  "$1" "$2"
+  "$1" "$2" "$3" "$4"
   status=$?
   printf "\n[pohunek] launch finished (exit %s); press Enter to close..." "$status"
   read _ignored
   exit "$status"
-' sh "$launch_issue" "$issue_id" &
+' sh "$launch_issue" "$project" "$issue_id" "$action" &
 
 exit 0

@@ -5,14 +5,14 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 . "$script_dir/lib.sh"
 
-[ "$#" -eq 1 ] || pohunek_fail "usage: pohunek-launch-issue <linear-issue-id>"
-issue_id="$1"
+[ "$#" -ge 2 ] && [ "$#" -le 3 ] || pohunek_fail "usage: pohunek-launch-issue <project> <linear-issue-id> [action]"
+project="$1"
+issue_id="$2"
+action="${3:-process-issue}"
 
 pohunek_bin="$(pohunek_optional_config pohunek_bin pohunek)"
 linear_cli="$(pohunek_required_config linear_cli)"
 host="$(pohunek_required_config host)"
-project="$(pohunek_required_config project)"
-action="$(pohunek_optional_config issue_action process-issue)"
 yes="$(pohunek_optional_config yes false)"
 
 pohunek_need_cmd "$linear_cli"
@@ -23,8 +23,13 @@ pohunek_need_cmd "$linear_cli"
 prompt_template="$(mktemp "${TMPDIR:-/tmp}/pohunek-prompt.XXXXXX")"
 trap 'rm -f "$prompt_template"' EXIT INT TERM
 recipe="$(pohunek_resolve_action "$pohunek_bin" "$host" "$project" "$action" "$prompt_template")"
-agent="$(printf '%s\n' "$recipe" | sed -n 1p)"
-base_branch="$(printf '%s\n' "$recipe" | sed -n 2p)"
+provider="$(printf '%s\n' "$recipe" | sed -n 1p)"
+agent="$(printf '%s\n' "$recipe" | sed -n 2p)"
+base_branch="$(printf '%s\n' "$recipe" | sed -n 3p)"
+recipe_branch="$(printf '%s\n' "$recipe" | sed -n 4p)"
+
+[ "$provider" = "linear_issue" ] || pohunek_fail "action '$action' resolved provider '$provider'; expected linear_issue"
+[ -z "$recipe_branch" ] || pohunek_fail "action '$action' returned branch for provider '$provider'"
 
 context_json="$("$linear_cli" issue view "$issue_id" --json)"
 prompt="$(pohunek_render_provider_prompt "$prompt_template" linear_issue "$issue_id" "$context_json")"

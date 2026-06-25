@@ -76,11 +76,10 @@ pohunek_optional_config() {
 # template is used (resolved per project from the named action, Part A); provider
 # fetch + rendering stay caller-side with the caller's own credentials (A.4).
 #
-# Writes the recipe's prompt-template content to the file at $5, and prints two
-# lines to stdout: the resolved agent name, then the recipe's base_branch (empty
-# when the template omits it). Under `set -e`, a daemon resolution failure (e.g.
-# `prompt_not_found`) aborts the launch HERE, before any session is started — no
-# silent fallback.
+# Writes the recipe's prompt-template content to the file at $5, and prints four
+# lines to stdout: provider, agent, base_branch, branch (optional lines empty when
+# omitted). Under `set -e`, a daemon resolution failure (e.g. `prompt_not_found`)
+# aborts the launch HERE, before any session is started — no silent fallback.
 pohunek_resolve_action() {
   pohunek_need_cmd python3
   _pra_bin="$1"
@@ -105,10 +104,16 @@ try:
     data = json.loads(raw_json)
 except json.JSONDecodeError as exc:
     raise SystemExit(f"daemon returned invalid action recipe JSON: {exc}")
+for key in ("provider", "agent"):
+    value = data.get(key)
+    if not isinstance(value, str) or not value:
+        raise SystemExit(f"daemon action recipe missing required field: {key}")
 with open(out_path, "w", encoding="utf-8") as handle:
     handle.write(data["prompt_content"])
-sys.stdout.write((data.get("agent") or "") + "\n")
+sys.stdout.write(data["provider"] + "\n")
+sys.stdout.write(data["agent"] + "\n")
 sys.stdout.write((data.get("base_branch") or "") + "\n")
+sys.stdout.write((data.get("branch") or "") + "\n")
 PY
 }
 

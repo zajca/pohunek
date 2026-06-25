@@ -167,6 +167,7 @@ impl ProjectConfigResolver {
             .get(name)
             .or_else(|| layers.host.get(name))
             .ok_or_else(|| template_not_found(name))?;
+        validate_name("agent", &raw.agent)?;
         validate_name("prompt", &raw.prompt)?;
         Ok(ResolvedTemplate {
             agent: raw.agent.clone(),
@@ -184,13 +185,7 @@ impl ProjectConfigResolver {
             .get(name)
             .or_else(|| layers.host.get(name))
             .ok_or_else(|| action_not_found(name))?;
-        validate_name("template", &raw.template)?;
-        if raw.provider != ProviderKind::None && raw.branch.is_some() {
-            return Err(invalid_action(
-                name,
-                "branch may only be set when provider is 'none'",
-            ));
-        }
+        validate_action(name, raw)?;
 
         let template = self.resolve_template(&raw.template)?;
         let prompt = self.resolve_prompt(&template.prompt_name)?;
@@ -224,7 +219,8 @@ impl ProjectConfigResolver {
                     PromptLayer::Host,
                 ),
             };
-            validate_name("template", &raw.template)?;
+            validate_action(&name, raw)?;
+            self.resolve_template(&raw.template)?;
             actions.push(ActionSummary {
                 name,
                 provider: raw.provider.clone(),
@@ -301,14 +297,27 @@ pub(crate) fn validate_name(kind: &str, name: &str) -> Result<(), ProtocolError>
     let charset_ok = name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    // Non-empty, no leading `.`/`-`, charset-clean. A leading-`.` reject also covers
-    // `.` and `..`; `/` and `\` are not in the charset, so a path separator or
-    // traversal segment can never pass.
+    // Non-empty, no leading `.`/`-`, charset-clean, and no embedded `..`. `/` and
+    // `\` are not in the charset, so a path separator can never pass.
     if first.is_some() && first != Some('.') && first != Some('-') && charset_ok {
+        if name.contains("..") {
+            return Err(invalid_name(kind, name));
+        }
         Ok(())
     } else {
         Err(invalid_name(kind, name))
     }
+}
+
+fn validate_action(name: &str, raw: &RawAction) -> Result<(), ProtocolError> {
+    validate_name("template", &raw.template)?;
+    if raw.provider != ProviderKind::None && raw.branch.is_some() {
+        return Err(invalid_action(
+            name,
+            "branch may only be set when provider is 'none'",
+        ));
+    }
+    Ok(())
 }
 
 /// A.2.1.2 canonicalize-and-contain guard + read.
@@ -528,6 +537,7 @@ mod tests {
             "-leading",
             ".hidden",
             "..",
+            "a..b",
             "",
             "a\u{7}b",
         ] {
@@ -792,7 +802,7 @@ provider = "none"
     }
 
     #[test]
-    fn bad_template_and_prompt_names_inside_toml_are_invalid_name() {
+    fn bad_template_prompt_and_agent_names_inside_toml_are_invalid_name() {
         let (bad_template, repo, _cfg) = resolver("bad-template-name");
         write(
             &repo.join(".pohunek/actions.toml"),
@@ -828,11 +838,37 @@ provider = "none"
             .resolve_action("bad")
             .expect_err("bad prompt name");
         assert_eq!(err.code, "invalid_name");
+
+        let (bad_agent, repo, _cfg) = resolver("bad-agent-name");
+        write(
+            &repo.join(".pohunek/templates.toml"),
+            r#"
+[template.good]
+agent = "../bad"
+prompt = "issue"
+"#,
+        );
+        let err = bad_agent
+            .resolve_template("good")
+            .expect_err("bad agent name");
+        assert_eq!(err.code, "invalid_name");
     }
 
     #[test]
     fn list_actions_returns_union_with_in_repo_shadowing_host() {
         let (r, repo, cfg) = resolver("list-actions");
+        write(
+            &cfg.join("templates.toml"),
+            r#"
+[template.host]
+agent = "codex"
+prompt = "host"
+
+[template.host_shared]
+agent = "claude"
+prompt = "host-shared"
+"#,
+        );
         write(
             &cfg.join("actions.toml"),
             r#"
@@ -843,6 +879,18 @@ provider = "linear_issue"
 [action.host_only]
 template = "host"
 provider = "github_pr"
+"#,
+        );
+        write(
+            &repo.join(".pohunek/templates.toml"),
+            r#"
+[template.repo]
+agent = "codex"
+prompt = "repo"
+
+[template.repo_shared]
+agent = "shell"
+prompt = "repo-shared"
 "#,
         );
         write(
@@ -875,5 +923,50 @@ provider = "none"
         assert_eq!(actions[2].provider, protocol::ProviderKind::None);
         assert_eq!(actions[2].template, "repo_shared");
         assert_eq!(actions[2].layer, PromptLayer::InRepo);
+    }
+
+    #[test]
+    fn list_actions_rejects_action_with_missing_template() {
+        let (r, repo, _cfg) = resolver("list-missing-template");
+        write(
+            &repo.join(".pohunek/actions.toml"),
+            r#"
+[action.bad]
+template = "missing"
+provider = "none"
+"#,
+        );
+
+        let err = r
+            .list_actions()
+            .expect_err("missing template must fail listing");
+        assert_eq!(err.code, "template_not_found");
+    }
+
+    #[test]
+    fn list_actions_rejects_branch_with_non_none_provider() {
+        let (r, repo, _cfg) = resolver("list-provider-branch");
+        write(
+            &repo.join(".pohunek/templates.toml"),
+            r#"
+[template.issue]
+agent = "codex"
+prompt = "issue"
+"#,
+        );
+        write(
+            &repo.join(".pohunek/actions.toml"),
+            r#"
+[action.bad]
+template = "issue"
+provider = "linear_issue"
+branch = "feature/static"
+"#,
+        );
+
+        let err = r
+            .list_actions()
+            .expect_err("provider-supplied branch must fail listing");
+        assert_eq!(err.code, "invalid_action");
     }
 }
