@@ -4421,12 +4421,15 @@ mod tests {
         let config_dir = temp_dir("agent-state-coalesce-config");
         let cwd = temp_dir("agent-state-coalesce-cwd");
         let marker = config_dir.join("agent-state-coalesce.marker");
+        let release = config_dir.join("agent-state-coalesce.release");
         write_host_hook(
             &config_dir,
             "agent-state",
             &format!(
-                "#!/bin/sh\nsleep 0.2\nprintf '%s\\n' \"$POHUNEK_ACTIVITY\" >> {}\n",
-                marker.display()
+                "#!/bin/sh\nprintf 'start:%s\\n' \"$POHUNEK_ACTIVITY\" >> {}\nif [ \"$POHUNEK_ACTIVITY\" = working ]; then\n  while [ ! -f {} ]; do sleep 0.02; done\nfi\nprintf 'done:%s\\n' \"$POHUNEK_ACTIVITY\" >> {}\n",
+                marker.display(),
+                release.display(),
+                marker.display(),
             ),
         );
         let registry = SessionRegistry::new(SessionRegistryConfig {
@@ -4448,7 +4451,12 @@ mod tests {
         registry
             .record_activity(&created.id, transition(AgentActivity::Working))
             .await;
-        tokio::time::sleep(Duration::from_millis(90)).await;
+        let contents = wait_for_file_contains(&marker, "start:working").await;
+        assert_eq!(
+            contents.lines().collect::<Vec<_>>(),
+            vec!["start:working"],
+            "the first hook must be in flight before the flap sequence starts"
+        );
         registry
             .record_activity(&created.id, transition(AgentActivity::Blocked))
             .await;
@@ -4458,11 +4466,17 @@ mod tests {
         registry
             .record_activity(&created.id, transition(AgentActivity::Blocked))
             .await;
+        fs::write(&release, "").expect("release first hook");
 
-        let contents = wait_for_line_count(&marker, 2).await;
+        let contents = wait_for_file_contains(&marker, "done:blocked").await;
         assert_eq!(
             contents.lines().collect::<Vec<_>>(),
-            vec!["working", "blocked"],
+            vec![
+                "start:working",
+                "done:working",
+                "start:blocked",
+                "done:blocked"
+            ],
             "only one hook runs in flight per session and intermediate flap is coalesced"
         );
 
