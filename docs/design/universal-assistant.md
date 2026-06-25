@@ -194,11 +194,206 @@ Suggested ranking:
 The ranking is only a launch policy. Users can always override it with
 `--agent`.
 
+## Knowledge and Documentation Pipeline
+
+The assistant must not be the only consumer of pohunek knowledge. The same
+source material should feed:
+
+- the assistant knowledge pack;
+- online documentation;
+- offline documentation bundled with releases;
+- generated reference pages for CLI, protocol, and config formats.
+
+The design therefore treats assistant knowledge as a build artifact from a
+documentation pipeline, not as a hand-written one-off prompt.
+
+```text
+code + CLI + protocol types + config schemas + manual docs
+  -> generated reference
+  -> curated documentation bundle
+  -> assistant knowledge pack
+  -> online docs site
+  -> offline docs bundle
+```
+
+The important rule is: the assistant does not invent the source of truth. It
+consumes the same versioned documentation bundle humans use.
+
+### Sources of Truth
+
+Use four source categories.
+
+1. **Manual conceptual documentation.**
+   These are the human-authored explanations: architecture, mental model,
+   workflows, setup guides, troubleshooting, security/trust model, examples, and
+   release/update notes.
+
+2. **Generated reference from code.**
+   These are extracted or rendered from the implementation so they cannot drift
+   silently:
+
+   - CLI command reference from the `clap` command tree and help output;
+   - protocol method and event reference from `crates/protocol`;
+   - JSON payload shape reference from protocol structs;
+   - config reference for `launcher.conf`, `templates.toml`, `actions.toml`,
+     `agents/*.toml`, hook names, and prompt variables;
+   - setup asset reference from embedded scripts and default templates.
+
+3. **Tested runbooks.**
+   These are executable operational guides for common tasks:
+
+   - first setup;
+   - launcher setup;
+   - project setup;
+   - remote host setup;
+   - agent profile setup;
+   - hook setup and review;
+   - update after release/source changes;
+   - troubleshooting.
+
+4. **Runtime snapshot.**
+   These are live facts collected at assistant launch: doctor output, host
+   capabilities, project state, session state, selected config file existence,
+   and redacted local paths.
+
+The first three categories are documentation bundle inputs. The runtime snapshot
+is added only when composing a concrete assistant prompt.
+
+### Repository Layout
+
+The documentation pipeline should have stable inputs and generated outputs.
+
+Suggested layout:
+
+```text
+docs/
+  source/
+    concepts/
+    guides/
+    reference/
+    runbooks/
+    troubleshooting/
+  generated/
+    cli.md
+    protocol.md
+    config.md
+    setup-assets.md
+  assistant/
+    system.md
+    knowledge.md
+    runbooks.md
+    safety.md
+    source-map.md
+  site/
+```
+
+`docs/source/` is the hand-authored documentation. `docs/generated/` is produced
+from code and committed when it is useful for review. `docs/assistant/` is the
+curated assistant pack assembled from source and generated docs. `docs/site/`
+holds web-specific structure only when the project needs it; it must not become
+an independent source of truth.
+
+Generated release artifacts should live under an ignored build directory:
+
+```text
+target/pohunek-docs/
+  assistant-pack/
+  site/
+  offline/
+  manifest.json
+```
+
+### Build Command
+
+The project should have one documentation build entry point:
+
+```bash
+pohunek docs build
+```
+
+or, before the CLI command exists:
+
+```bash
+scripts/docs/build
+```
+
+The build should produce:
+
+- an assistant pack optimized for prompt composition;
+- an online site artifact;
+- an offline docs artifact;
+- a manifest describing version, sources, and content hashes.
+
+Example manifest:
+
+```json
+{
+  "pohunek_version": "0.3.3",
+  "docs_schema": 1,
+  "generated_at": "2026-06-25T00:00:00Z",
+  "sources": ["manual_docs", "cli", "protocol", "config", "runbooks"],
+  "content_hash": "sha256:..."
+}
+```
+
+The assistant prompt should include the manifest summary so the agent knows
+which docs version it is using.
+
+### Assistant Pack
+
+The assistant pack is a compact operational slice of the documentation bundle.
+It should include:
+
+- mission and working agreement;
+- product mental model;
+- command runbook index;
+- safety rules;
+- source map;
+- selected task runbooks;
+- generated CLI/config/protocol reference summaries;
+- docs manifest.
+
+The assistant pack should not include the full website or the full source tree.
+It should include enough to start useful work and enough index/source-map
+information to retrieve exact details when needed.
+
+### Online and Offline Documentation
+
+The same bundle should support two human-facing outputs:
+
+- **Online docs:** browsable website for current released behavior, examples, CLI
+  reference, config reference, and troubleshooting.
+- **Offline docs:** release-bundled static docs that match the installed binary
+  and work without a network.
+
+Both outputs should identify the `pohunek` version they document. The assistant
+should prefer the local/offline bundle matching its binary over any online docs,
+because the installed tool can be newer or older than the website.
+
+### Drift Checks
+
+Documentation must fail loudly when generated truth changes.
+
+Required checks:
+
+- regenerate CLI reference and fail if committed output differs;
+- regenerate protocol reference and fail if committed output differs;
+- regenerate config reference and fail if committed output differs;
+- validate runbook command examples against the actual CLI parser;
+- verify assistant source-map paths exist;
+- verify assistant pack generation is deterministic;
+- verify redaction rules prevent secret-like config fields from entering the
+  assistant pack or snapshot.
+
+These checks are the guardrail that lets one documentation source feed both
+humans and the assistant.
+
 ## Knowledge Pack
 
-The assistant should carry a curated knowledge pack built into the CLI release.
-It is versioned with the binary so the assistant knows the semantics of the
-`pohunek` version that launched it.
+The assistant should carry the curated assistant pack from the documentation
+pipeline. It is built into the CLI release or loaded from the matching offline
+docs bundle, and versioned with the binary so the assistant knows the semantics
+of the `pohunek` version that launched it.
 
 Recommended source layout:
 
@@ -208,11 +403,13 @@ crates/cli/src/commands/assistant/
   prompt.rs
   snapshot.rs
   assets/
-    system.md
-    knowledge.md
-    safety.md
-    runbooks.md
-    source-map.md
+    assistant-pack/
+      manifest.json
+      system.md
+      knowledge.md
+      safety.md
+      runbooks.md
+      source-map.md
 ```
 
 Responsibilities:
@@ -220,12 +417,13 @@ Responsibilities:
 - `prompt.rs`: pure prompt composition from intent, snapshot, request, and
   embedded assets.
 - `snapshot.rs`: redacted local and daemon-backed context collection.
-- `assets/*.md`: static English assistant instructions embedded with
-  `include_str!`, matching the existing setup-asset style.
+- `assets/assistant-pack/*`: generated/curated English assistant instructions
+  embedded with `include_str!`, matching the existing setup-asset style.
 - `mod.rs`: CLI parsing, bootstrap, agent selection, and session launch.
 
-The knowledge pack must be operational, not marketing copy. It should include
-exact command names, file paths, trust boundaries, error codes, and source files.
+The assistant pack must be operational, not marketing copy. It should include
+exact command names, file paths, trust boundaries, error codes, source files, and
+the docs manifest.
 
 ### Product Model
 
@@ -620,7 +818,8 @@ JSON output:
 - `--print-prompt` never starts a session;
 - snapshot redacts profile env values;
 - daemon bootstrap policy is covered;
-- prompt-size failures happen before daemon dialing.
+- prompt-size failures happen before daemon dialing;
+- assistant pack generation is deterministic for a fixed docs manifest.
 
 ### CLI Tests
 
@@ -644,7 +843,12 @@ JSON output:
 
 - source-map paths exist;
 - runbook commands match the CLI grammar;
-- examples stay synchronized with parser tests.
+- examples stay synchronized with parser tests;
+- generated CLI, protocol, config, and setup-asset references are up to date;
+- assistant pack, online docs, and offline docs are built from the same manifest;
+- the offline docs manifest version matches the binary version used in tests;
+- generated docs do not include profile env values, process env values, or other
+  secret-like fields.
 
 ## Definition of Done
 
@@ -662,16 +866,20 @@ The feature is complete only when the full assistant experience works:
 - Remote launches preserve existing safety gates.
 - Snapshot redaction prevents profile env values and process env values from
   entering prompts.
+- The assistant pack, online docs artifact, and offline docs artifact are built
+  from one documentation pipeline and share a manifest.
+- Generated CLI, protocol, config, setup-asset, and runbook references have drift
+  checks.
 - Tests cover prompt composition, bootstrap, agent selection, snapshot redaction,
-  local launch, remote launch, and project intent.
+  local launch, remote launch, project intent, docs generation, and docs drift.
 
 ## Delivery Scope
 
 This should land as one coherent feature, not as a narrow setup-only assistant
 followed by a series of product expansions. Engineering can still split the work
 internally across parser, prompt assets, snapshot collection, bootstrap, launch
-wiring, and tests, but the shipped user-facing capability is the complete
-universal assistant described here.
+wiring, docs generation, and tests, but the shipped user-facing capability is the
+complete universal assistant described here.
 
 ## Summary
 
@@ -681,6 +889,7 @@ the opening prompt; it does not split the system into separate assistants.
 "Knows everything" means:
 
 - curated product knowledge built into the CLI;
+- a documentation pipeline shared by assistant, online docs, and offline docs;
 - redacted live context from the current host/project;
 - source-map access to the repo;
 - exact CLI runbooks;
