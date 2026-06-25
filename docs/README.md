@@ -45,6 +45,9 @@ sessions across your own machines on a NetBird (WireGuard) network.
 
 ## Design Notes (proposals, pre-phase)
 
+- [Universal Pohunek Assistant](design/universal-assistant.md) - one ordinary
+  session-backed assistant, steered by intent and a live snapshot, for setup,
+  project configuration, updates, troubleshooting, and general help.
 - [Projects: automatic git-repo awareness](design/projects.md) — detect the repo
   / worktree a session runs in and record lightweight projects; auto on session
   start or manual via CLI, no filesystem scan.
