@@ -4503,7 +4503,7 @@ mod tests {
     async fn attach_tokens_are_one_shot_and_expired_tokens_are_pruned() {
         let registry = SessionRegistry::new(SessionRegistryConfig {
             shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-            stop_grace: Duration::from_millis(50),
+            stop_grace: Duration::from_millis(500),
             attach_token_ttl: Duration::from_millis(1),
             ..SessionRegistryConfig::default()
         });

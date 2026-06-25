@@ -982,7 +982,7 @@ async fn stale_socket_is_recovered_on_bind() {
     let socket = temp_socket("stale");
     // Create a stale socket file with no listener behind it.
     {
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind stale");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind stale");
         drop(listener);
     }
     assert!(socket.exists(), "stale socket file should exist");
