@@ -209,11 +209,7 @@ mod tests {
         let capabilities = HostCapabilities {
             daemon_version: "test".to_owned(),
             protocol_version: PROTOCOL_VERSION,
-            supported_agents: vec![
-                "shell".to_owned(),
-                "codex".to_owned(),
-                "claude".to_owned(),
-            ],
+            supported_agents: vec!["shell".to_owned(), "codex".to_owned(), "claude".to_owned()],
             runtimes: vec![
                 AgentRuntime {
                     agent: "shell".to_owned(),
