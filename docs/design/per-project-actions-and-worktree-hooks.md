@@ -1,8 +1,9 @@
 # Design: Per-Project Actions/Prompts, Per-Host Agent Profiles & Worktree Hooks
 
-Status: **proposed** (RFC). Companion implementation plan (`*-plan.md`) is deferred
-until this design is accepted, mirroring how
-[`projects.md`](projects.md) preceded [`projects-plan.md`](projects-plan.md).
+Status: **accepted and implemented** (verified on 2026-06-26). The full feature —
+all three parts below — is implemented and merged into `main`; see the companion
+[`*-plan.md`](per-project-actions-and-worktree-hooks-plan.md) for the
+slice-by-slice landing record.
 
 This RFC proposes three related features that share one config model:
 

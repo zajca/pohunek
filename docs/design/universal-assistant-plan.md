@@ -1,9 +1,14 @@
 # Implementation Plan: Universal Pohunek Assistant
 
-Status: **partially implemented**. P0, P1, and P3 are implemented in the current
-workspace. P2 has the build/embedding skeleton implemented, but the full
-generated-reference pipeline and CI drift gates remain pending. P4 and later are
-not implemented yet.
+Status: **mostly implemented** (verified against the code on 2026-06-26).
+**P0–P7 and P9 are implemented** in the workspace (full P2 generated-reference
+pipeline + CI drift gates, P4 snapshot/redaction, P5 selection/preflight/bootstrap,
+P6 prompt composition + `--print-prompt`, P7 `pohunek assistant` CLI + `session.new`
+wiring). **Remaining, finish-only:** P8 (hook write hard gate — the only untouched
+phase, plus most of the Security checklist), P10 (behavior eval: promote
+`crates/xtask/src/eval.rs` from skeleton to a working manual release gate), and P11
+(human docs: wire the existing site render into release artifacts). See the
+top-level [`ROADMAP.md`](../ROADMAP.md) for how this fits the wider plan.
 
 This is the end-to-end engineering plan for the feature
 specified in [`universal-assistant.md`](./universal-assistant.md). It is grounded

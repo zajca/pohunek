@@ -1,6 +1,9 @@
 # Implementation Plan: Per-Project Actions, Worktree Hooks & Agent Profiles
 
-Status: **proposed.** This is the companion implementation plan to the RFC
+Status: **implemented and merged** (verified on 2026-06-26). All slices landed,
+including the final session-lifecycle + agent-state hooks (Slice B2, `ed6b778`);
+the feature branch is merged into `main` with no commits ahead. This is the
+companion implementation plan to the RFC
 [`per-project-actions-and-worktree-hooks.md`](per-project-actions-and-worktree-hooks.md);
 it turns the RFC's ten slices into ordered, testable milestones with concrete code
 touch-points, mirroring how [`projects-plan.md`](projects-plan.md) followed
