@@ -2,9 +2,9 @@
 
 use super::{
     broadcast, event, is_terminal, mpsc, run_hook, warn, AgentActivity, AgentKind,
-    CancellationToken, Duration, ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID,
-    ENV_SOCKET_PATH, Event, HashMap, HashSet, HookContext, HookEvent, JoinHandle, PathBuf,
-    PROTOCOL_VERSION, SessionId, SessionRegistry, Value, EVENT_LOG_FLUSH_TIMEOUT,
+    CancellationToken, Duration, Event, HashMap, HashSet, HookContext, HookEvent, JoinHandle,
+    PathBuf, SessionId, SessionRegistry, Value, ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION,
+    ENV_SESSION_ID, ENV_SOCKET_PATH, EVENT_LOG_FLUSH_TIMEOUT, PROTOCOL_VERSION,
 };
 
 /// Debounce window for session-layer `agent-state` hooks. The detector/event log
@@ -127,7 +127,11 @@ impl SessionRegistry {
     /// `SessionStart` hook can report its native session id back to the socket.
     /// Shell sessions (and registries without a configured socket path) get no
     /// hook env.
-    pub(super) fn hook_env(&self, agent: AgentKind, session_id: &SessionId) -> Vec<(String, String)> {
+    pub(super) fn hook_env(
+        &self,
+        agent: AgentKind,
+        session_id: &SessionId,
+    ) -> Vec<(String, String)> {
         match agent {
             AgentKind::Shell => Vec::new(),
             AgentKind::Codex | AgentKind::Claude => match &self.inner.config.socket_path {

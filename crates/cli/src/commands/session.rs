@@ -15,14 +15,13 @@ use protocol::{
     SessionListFilter, SessionListParams, SessionNewParams, SessionNewResult, SessionState,
     SessionStopResult, SessionWarningKind, StateSource,
 };
-use serde::Serialize;
 use serde_json::Value;
 
 use crate::client::Client;
-use crate::commands::request_id;
+use crate::commands::{request_id, request_with_params};
 use crate::error::CliError;
 use crate::paths::Paths;
-use crate::target::{Target, LOCAL_HOST};
+use crate::target::{is_local_host, Target};
 
 /// Arguments for `session new`, grouped to keep the call site readable as the
 /// optional worktree flags accumulate.
@@ -194,7 +193,7 @@ fn session_matches_filters(session: &SessionInfo, filters: &[ListFilter]) -> boo
 /// human path [`Prompt`](ConfirmDecision::Prompt)s.
 #[must_use]
 pub(crate) fn confirmation_decision(host: &str, json: bool, yes: bool) -> ConfirmDecision {
-    let remote = !host.is_empty() && host != LOCAL_HOST;
+    let remote = !is_local_host(host);
     if !remote || yes {
         ConfirmDecision::Proceed
     } else if json {
@@ -386,17 +385,6 @@ pub(crate) async fn run_input(
     Ok(())
 }
 
-fn request_with_params<T>(method: &str, params: &T) -> Result<Request, CliError>
-where
-    T: Serialize + ?Sized,
-{
-    Ok(Request::new(
-        request_id(method),
-        method,
-        serde_json::to_value(params)?,
-    ))
-}
-
 fn build_new_request(args: &NewArgs) -> Result<Request, CliError> {
     request_with_params(
         method::SESSION_NEW,
@@ -422,7 +410,7 @@ fn build_new_request(args: &NewArgs) -> Result<Request, CliError> {
 /// require a `--project` reference (or `--repo` for first-introduction), failing
 /// fast before any connection is dialed.
 fn prepare_new_args(host: &str, args: NewArgs) -> Result<NewArgs, CliError> {
-    let remote = !host.is_empty() && host != LOCAL_HOST;
+    let remote = !is_local_host(host);
     if remote {
         if args.project.is_none() && args.repo.is_none() {
             return Err(CliError::RemoteTargetRequired);
@@ -768,6 +756,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::target::LOCAL_HOST;
 
     fn running_session(id: &str) -> SessionInfo {
         SessionInfo {

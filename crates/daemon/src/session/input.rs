@@ -87,7 +87,10 @@ pub(super) fn prompt_arg_supported(agent: AgentKind) -> bool {
     matches!(agent, AgentKind::Codex | AgentKind::Claude)
 }
 
-pub(super) fn input_rules_for_agent(agent: AgentKind, config: &SessionRegistryConfig) -> InputRules {
+pub(super) fn input_rules_for_agent(
+    agent: AgentKind,
+    config: &SessionRegistryConfig,
+) -> InputRules {
     let mut rules = adapter_for(agent).input_rules();
     if agent == AgentKind::Claude {
         rules.submit_delay = config.claude_submit_delay;

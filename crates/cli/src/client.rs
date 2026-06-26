@@ -25,7 +25,7 @@ use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
 use crate::error::CliError;
 use crate::paths::Paths;
-use crate::target::LOCAL_HOST;
+use crate::target::is_local_host;
 
 /// Default per-request timeout. Bounds the CLI when the daemon is wedged.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -220,9 +220,10 @@ pub(crate) enum Client {
 impl Client {
     /// Connect to the daemon for `host`.
     ///
-    /// `host` is the *effective* host string: the reserved [`LOCAL_HOST`] (or an
-    /// empty string) dials the local Unix socket; any other name is resolved to a
-    /// `NetBird` IP and dialed over TCP.
+    /// `host` is the *effective* host string: the reserved
+    /// [`LOCAL_HOST`](crate::target::LOCAL_HOST) (or an empty string) dials the
+    /// local Unix socket; any other name is resolved to a `NetBird` IP and dialed
+    /// over TCP.
     ///
     /// # Errors
     ///
@@ -290,14 +291,6 @@ pub(crate) async fn connect_raw(host: &str, paths: &Paths) -> Result<RawStream, 
         let addr = resolve_remote_addr(host)?;
         Ok(RawStream::Remote(connect_tcp(host, addr).await?))
     }
-}
-
-/// Whether `host` denotes the local machine.
-///
-/// The reserved [`LOCAL_HOST`] name and an empty string (no host supplied) both
-/// route to the Unix socket; everything else is remote.
-fn is_local_host(host: &str) -> bool {
-    host.is_empty() || host == LOCAL_HOST
 }
 
 /// Dial the local Unix control socket.

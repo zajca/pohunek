@@ -46,11 +46,30 @@ use handler::Dispatch;
 pub use handler::{handle_request, DaemonState, HealthInfo};
 
 /// Directory mode for the runtime dir: owner rwx only (`0700`).
+///
+/// The runtime dir holds the control socket and the daemon's local state.
+/// Granting any group or other access would let a second local user reach
+/// into the directory to connect to the control plane or read daemon state,
+/// so it is restricted to the owning user. This is the outer access-control
+/// boundary that backs the per-socket mode below.
 const DIR_MODE: u32 = 0o700;
 /// Socket mode: owner rw only (`0600`).
+///
+/// Anyone able to open the control socket can drive the daemon (create and
+/// attach sessions, inspect the host). There is no further authentication on
+/// the local transport, so the file mode *is* the access-control boundary:
+/// limiting read/write to the owner keeps other local users off the control
+/// plane.
 const SOCKET_MODE: u32 = 0o600;
-/// Max accepted control line length, in bytes. Bounds memory per connection;
-/// control envelopes are small. Raw terminal bytes never travel here.
+/// Max accepted control line length, in bytes (1 MiB).
+///
+/// Control traffic is line-framed JSON, so without a cap a malicious or buggy
+/// client could stream a single unterminated line and force the codec to
+/// buffer it without bound, exhausting memory for that connection. This cap
+/// bounds per-connection memory while staying generous: legitimate control
+/// envelopes are small, and raw terminal bytes travel on the separate attach
+/// path rather than through this framed channel, so 1 MiB comfortably covers
+/// the largest real control message.
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 
 /// The bound control server, ready to accept connections.

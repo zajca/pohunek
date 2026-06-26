@@ -194,10 +194,6 @@ impl WorktreeManager {
     /// (`worktree_add_failed`). The three non-fatal paths (fetch, base-branch
     /// fallback, setup script) never abort; they are returned in
     /// [`WorktreeBound::warnings`].
-    #[expect(
-        clippy::too_many_lines,
-        reason = "single bind orchestration; the reuse/recreate/refuse branches return early and do not extract cleanly"
-    )]
     pub fn bind(&self, req: &WorktreeRequest) -> Result<WorktreeBound, ProtocolError> {
         let slug = require_branch_slug(&req.branch)?;
         // The branch and base branch arrive from the socket and are passed
@@ -218,28 +214,50 @@ impl WorktreeManager {
         }
 
         let path = self.path_for(&req.session_id, &repository, &slug);
-        let owned = self
-            .store
-            .find_worktree(&req.session_id, &repository, &slug)
-            .map_err(|err| store_error("read worktree binding store", &err))?;
 
         // Reuse / recreate / refuse-foreign decision (Kandev tryReuseExisting).
+        // `Some(bound)` means an owned, valid worktree was reused — return it as-is;
+        // `None` means proceed to the fresh-create path below.
+        if let Some(bound) = self.check_existing_worktree(req, &repository, &path, &slug)? {
+            return Ok(bound);
+        }
+
+        self.create_and_bind(req, repository, path, slug)
+    }
+
+    /// Resolve the reuse / recreate / refuse-foreign decision for an existing path
+    /// (Kandev `tryReuseExisting`). Returns `Some(bound)` when an owned, valid
+    /// worktree is reused (the caller returns it verbatim), or `None` when the
+    /// caller should proceed to the fresh-create path (after this has pruned any
+    /// stale admin entry / leftover directory for a recreate).
+    fn check_existing_worktree(
+        &self,
+        req: &WorktreeRequest,
+        repository: &Path,
+        path: &Path,
+        slug: &str,
+    ) -> Result<Option<WorktreeBound>, ProtocolError> {
+        let owned = self
+            .store
+            .find_worktree(&req.session_id, repository, slug)
+            .map_err(|err| store_error("read worktree binding store", &err))?;
+
         if path.exists() {
             match owned {
-                Some(binding) if is_valid_worktree(&path) => {
+                Some(binding) if is_valid_worktree(path) => {
                     debug!(
                         session_id = %req.session_id,
                         path = %path.display(),
                         "reusing owned worktree"
                     );
-                    return Ok(WorktreeBound {
+                    Ok(Some(WorktreeBound {
                         path: binding.path,
-                        repository,
+                        repository: repository.to_path_buf(),
                         branch: binding.branch,
                         base_branch: binding.base_branch,
                         reused: true,
                         warnings: Vec::new(),
-                    });
+                    }))
                 }
                 Some(_) => {
                     // We own the binding but the directory is no longer a valid
@@ -250,12 +268,13 @@ impl WorktreeManager {
                         path = %path.display(),
                         "recreating owned worktree with an invalid directory"
                     );
-                    Self::reset_stale_worktree(&repository, &path)?;
+                    Self::reset_stale_worktree(repository, path)?;
+                    Ok(None)
                 }
                 None => {
                     // A directory we have no binding for is not ours; refuse to
                     // adopt or clobber it (the ownership gate).
-                    return Err(error(
+                    Err(error(
                         ErrorClass::Runtime,
                         "worktree_path_conflict",
                         format!(
@@ -263,15 +282,31 @@ impl WorktreeManager {
                             path.display()
                         ),
                         Some("remove the directory or choose a different branch".to_owned()),
-                    ));
+                    ))
                 }
             }
         } else if owned.is_some() {
             // Owned binding but the directory vanished entirely: prune the stale
             // git admin entry before re-adding at the same path.
-            Self::reset_stale_worktree(&repository, &path)?;
+            Self::reset_stale_worktree(repository, path)?;
+            Ok(None)
+        } else {
+            Ok(None)
         }
+    }
 
+    /// Fresh-create path: create the worktree directory, resolve the base branch +
+    /// fetch start-point, run the pre/post-create hooks, `git worktree add`, then
+    /// persist the binding (rolling the checkout back if the persist fails) and
+    /// return the freshly bound worktree. Reached only when the reuse / recreate /
+    /// foreign-conflict decision in [`Self::check_existing_worktree`] said "create".
+    fn create_and_bind(
+        &self,
+        req: &WorktreeRequest,
+        repository: PathBuf,
+        path: PathBuf,
+        slug: String,
+    ) -> Result<WorktreeBound, ProtocolError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|err| store_error("create the worktrees root directory", &err))?;
@@ -448,45 +483,20 @@ impl WorktreeManager {
             .into_iter()
             .filter(|binding| binding.session_id == session_id)
         {
-            // pre-remove fires IN the worktree while it still exists.
-            if binding.path.is_dir() {
-                self.run_remove_hook(
-                    HookEvent::PreRemove,
-                    &binding.path,
-                    &binding,
-                    Some(&binding.path),
-                    warnings,
-                );
-            }
-            // Ownership proof is the binding itself; only then do we delete.
-            if let Err(message) = worktree_remove(&binding.repository, &binding.path) {
+            // The `worktree_remove` failure log differs only in its id field/value
+            // and message between session cleanup and project prune; `tracing`
+            // field names and message literals are fixed at the macro call site, so
+            // unifying them would change the emitted output. The per-call-site
+            // closure keeps the exact `warn!` invocation verbatim while the shared
+            // hook bracketing lives in `cleanup_one_worktree`.
+            self.cleanup_one_worktree(&binding, warnings, |message| {
                 warn!(
                     session_id = %session_id,
                     path = %binding.path.display(),
                     error = %message,
                     "git worktree remove failed during cleanup; dropping binding anyway"
                 );
-            }
-            // post-remove fires IN the repository (the worktree is gone). If the
-            // repository itself is gone, skip with a warning rather than spawn in a
-            // non-existent cwd.
-            if binding.repository.is_dir() {
-                self.run_remove_hook(
-                    HookEvent::PostRemove,
-                    &binding.repository,
-                    &binding,
-                    None,
-                    warnings,
-                );
-            } else {
-                warnings.push(hook_warning(
-                    HookEvent::PostRemove,
-                    format!(
-                        "repository {} no longer exists; post-remove hook skipped",
-                        binding.repository.display()
-                    ),
-                ));
-            }
+            });
             removed += 1;
         }
         if removed > 0 {
@@ -535,44 +545,17 @@ impl WorktreeManager {
                 prune.skipped.push(canonical);
                 continue;
             }
-            // pre-remove fires IN the worktree while it still exists.
-            if binding.path.is_dir() {
-                self.run_remove_hook(
-                    HookEvent::PreRemove,
-                    &binding.path,
-                    &binding,
-                    Some(&binding.path),
-                    warnings,
-                );
-            }
-            // The binding is the ownership proof; only an owned worktree is removed.
-            if let Err(message) = worktree_remove(&binding.repository, &binding.path) {
+            // See `cleanup_session`: the differing `warn!` (project_id field + its
+            // own message) stays verbatim at this call site; the shared hook
+            // bracketing + `worktree_remove` live in `cleanup_one_worktree`.
+            self.cleanup_one_worktree(&binding, warnings, |message| {
                 warn!(
                     project_id = %project_id,
                     path = %binding.path.display(),
                     error = %message,
                     "git worktree remove failed during project prune; dropping binding anyway"
                 );
-            }
-            // post-remove fires IN the repository (worktree gone); skip + warn if the
-            // repository itself is gone.
-            if binding.repository.is_dir() {
-                self.run_remove_hook(
-                    HookEvent::PostRemove,
-                    &binding.repository,
-                    &binding,
-                    None,
-                    warnings,
-                );
-            } else {
-                warnings.push(hook_warning(
-                    HookEvent::PostRemove,
-                    format!(
-                        "repository {} no longer exists; post-remove hook skipped",
-                        binding.repository.display()
-                    ),
-                ));
-            }
+            });
             // A session binds at most one worktree, so dropping by session id drops
             // exactly this binding and never a skipped (live) one.
             removed_sessions.push(binding.session_id);
@@ -584,6 +567,59 @@ impl WorktreeManager {
                 .map_err(|err| store_error("drop worktree bindings", &err))?;
         }
         Ok(prune)
+    }
+
+    /// Run the per-binding cleanup body shared by [`Self::cleanup_session`] and
+    /// [`Self::cleanup_project`]: the pre-remove hook (while the worktree exists),
+    /// the `git worktree remove` (the binding is the ownership proof), and the
+    /// post-remove hook in the repository — or a skip warning when the repository
+    /// is gone.
+    ///
+    /// The two callers' `git worktree remove` failure logs differ in their id
+    /// field (`session_id` vs `project_id`) and message string; `tracing` fixes
+    /// both at the macro call site, so unifying them would change emitted output.
+    /// `on_remove_error` therefore carries each caller's exact `warn!` verbatim and
+    /// is invoked only on a remove failure.
+    fn cleanup_one_worktree(
+        &self,
+        binding: &WorktreeBinding,
+        warnings: &mut Vec<SessionWarning>,
+        on_remove_error: impl FnOnce(&str),
+    ) {
+        // pre-remove fires IN the worktree while it still exists.
+        if binding.path.is_dir() {
+            self.run_remove_hook(
+                HookEvent::PreRemove,
+                &binding.path,
+                binding,
+                Some(&binding.path),
+                warnings,
+            );
+        }
+        // The binding is the ownership proof; only an owned worktree is removed.
+        if let Err(message) = worktree_remove(&binding.repository, &binding.path) {
+            on_remove_error(&message);
+        }
+        // post-remove fires IN the repository (the worktree is gone). If the
+        // repository itself is gone, skip with a warning rather than spawn in a
+        // non-existent cwd.
+        if binding.repository.is_dir() {
+            self.run_remove_hook(
+                HookEvent::PostRemove,
+                &binding.repository,
+                binding,
+                None,
+                warnings,
+            );
+        } else {
+            warnings.push(hook_warning(
+                HookEvent::PostRemove,
+                format!(
+                    "repository {} no longer exists; post-remove hook skipped",
+                    binding.repository.display()
+                ),
+            ));
+        }
     }
 
     /// Prune a stale git admin entry and remove any leftover directory so a

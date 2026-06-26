@@ -14,16 +14,62 @@ pub struct ActivityTransition {
     pub source: StateSource,
 }
 
+/// Tuning for the debounced detection state machine.
+///
+/// Idle and blocked evidence is noisy: a single screen scrape or OSC sequence
+/// can momentarily look idle in the middle of active work. Publishing every
+/// such reading would make the visible state flicker. Every field below is a
+/// knob in the same tradeoff: longer windows and more confirmations suppress
+/// flicker but slow detection down, while shorter ones feel more responsive
+/// but let spurious states leak through. The [`Default`] values are tuned for
+/// that balance; see each field for the role it plays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DetectionConfig {
+    /// Minimum spacing between counted confirmations of a pending candidate.
+    ///
+    /// A repeated observation only increments the confirmation count once this
+    /// much time has passed since the previous counted one (see
+    /// [`PendingCandidate::note_observed`]). This decouples "how many
+    /// confirmations" from "how fast evidence happens to arrive": a burst of
+    /// rechecks in the same instant cannot race a candidate to publication.
+    /// Small enough (100ms) that confirmations accrue responsively, large
+    /// enough that re-evaluation does not thrash.
     pub recheck_after: Duration,
+    /// Consecutive confirmations required before a debounced state publishes.
+    ///
+    /// Used by [`StateMachine::pending_ready`]. A higher count means more
+    /// agreeing observations before idle/blocked becomes visible, trading
+    /// settle time for fewer spurious flickers. The default of 3 needs the
+    /// candidate to survive a couple of recheck windows before it is trusted.
     pub confirmations: usize,
+    /// Upper bound on how long debouncing may delay a transition.
+    ///
+    /// Used by [`StateMachine::pending_ready`]: once a candidate has been
+    /// pending for this long it publishes even if it never reached
+    /// `confirmations`. This guarantees a state always surfaces within this
+    /// window under noisy evidence, so a real idle/blocked state cannot be
+    /// starved indefinitely by confirmations arriving just too slowly.
     pub cap: Duration,
+    /// How often an already-published visible state is re-emitted.
+    ///
+    /// Used by [`StateMachine::refresh_due`]. Visible (screen/OSC) states are
+    /// periodically re-announced so downstream consumers can treat the stream
+    /// as a heartbeat and detect a stalled producer; the interval is long
+    /// enough (800ms) not to spam, short enough to stay timely.
     pub stable_visible_refresh: Duration,
+    /// Initial window after start during which debounced states are suppressed.
+    ///
+    /// Used by [`StateMachine::startup_grace_elapsed`]: pending idle/blocked
+    /// candidates cannot publish until this grace period elapses. Right after a
+    /// session starts the terminal is unsettled and easily misreads as
+    /// idle/blocked, so the first few seconds are held back to avoid an
+    /// immediate spurious transition before real activity begins.
     pub startup_grace: Duration,
 }
 
 impl Default for DetectionConfig {
+    /// Tuned defaults balancing detection responsiveness against state flicker;
+    /// see the field docs on [`DetectionConfig`] for the role of each value.
     fn default() -> Self {
         Self {
             recheck_after: Duration::from_millis(100),

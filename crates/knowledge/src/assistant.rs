@@ -44,7 +44,9 @@ impl EmbeddedBundle {
     /// valid UTF-8.
     #[must_use]
     pub fn get_text(self, path: &str) -> Option<&'static str> {
-        self.dir.get_file(path).and_then(|file| file.contents_utf8())
+        self.dir
+            .get_file(path)
+            .and_then(|file| file.contents_utf8())
     }
 
     /// Borrow the underlying embedded directory for crate-internal walking.

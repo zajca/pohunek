@@ -14,11 +14,11 @@
 
 use std::fmt::Write as _;
 
-use protocol::{method, HostCapabilities, HostClass, HostDiscoverParams, HostRecord, Request};
+use protocol::{method, HostCapabilities, HostClass, HostDiscoverParams, HostRecord};
 use serde_json::Value;
 
 use crate::client::Client;
-use crate::commands::request_id;
+use crate::commands::request_with_params;
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::LOCAL_HOST;
@@ -61,12 +61,7 @@ async fn fetch_records(paths: &Paths) -> Result<Vec<HostRecord>, CliError> {
     let mut client = Client::connect(LOCAL_HOST, paths).await?;
     // `force: false` uses the daemon's cached snapshot when fresh; the launcher
     // calls discover on every keypress, so the cache is what keeps it instant.
-    let params = serde_json::to_value(HostDiscoverParams { force: false })?;
-    let request = Request::new(
-        request_id(method::HOST_DISCOVER),
-        method::HOST_DISCOVER,
-        params,
-    );
+    let request = request_with_params(method::HOST_DISCOVER, &HostDiscoverParams { force: false })?;
     let result = client.request(&request).await?;
     Ok(serde_json::from_value(result)?)
 }
@@ -79,11 +74,7 @@ async fn fetch_records(paths: &Paths) -> Result<Vec<HostRecord>, CliError> {
 /// daemon returns an error or an unexpected payload.
 pub(crate) async fn run_inspect(host: &str, paths: &Paths, json: bool) -> Result<(), CliError> {
     let mut client = Client::connect(host, paths).await?;
-    let request = Request::new(
-        request_id(method::HOST_INSPECT),
-        method::HOST_INSPECT,
-        Value::Null,
-    );
+    let request = request_with_params(method::HOST_INSPECT, &Value::Null)?;
     let result = client.request(&request).await?;
     let caps: HostCapabilities = serde_json::from_value(result)?;
 

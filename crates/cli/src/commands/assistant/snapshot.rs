@@ -20,7 +20,7 @@ use std::path::Path;
 use knowledge::BUNDLE_VERSION;
 use protocol::{
     method, DaemonDoctorResult, HostCapabilities, ProjectActionsParams, ProjectInfo,
-    ProjectListParams, ProjectShowParams, Request, SessionInfo, SessionListParams,
+    ProjectListParams, ProjectShowParams, SessionInfo, SessionListParams,
 };
 use serde::Serialize;
 
@@ -447,11 +447,9 @@ fn collect_local_sections(paths: &Paths, opts: &AssistantOptions) -> LocalSectio
 // ---------------------------------------------------------------------------
 
 async fn fetch_doctor(client: &mut Client) -> Result<DoctorSection, String> {
-    let request = Request::new(
-        crate::commands::request_id(method::DAEMON_DOCTOR),
-        method::DAEMON_DOCTOR,
-        serde_json::Value::Null,
-    );
+    let request =
+        crate::commands::request_with_params(method::DAEMON_DOCTOR, &serde_json::Value::Null)
+            .map_err(|e| e.to_string())?;
     let value = client.request(&request).await.map_err(|e| e.to_string())?;
     let result: DaemonDoctorResult = serde_json::from_value(value).map_err(|e| e.to_string())?;
     Ok(DoctorSection {
@@ -469,11 +467,9 @@ async fn fetch_doctor(client: &mut Client) -> Result<DoctorSection, String> {
 }
 
 async fn fetch_host(client: &mut Client) -> Result<HostSection, String> {
-    let request = Request::new(
-        crate::commands::request_id(method::HOST_INSPECT),
-        method::HOST_INSPECT,
-        serde_json::Value::Null,
-    );
+    let request =
+        crate::commands::request_with_params(method::HOST_INSPECT, &serde_json::Value::Null)
+            .map_err(|e| e.to_string())?;
     let value = client.request(&request).await.map_err(|e| e.to_string())?;
     let caps: HostCapabilities = serde_json::from_value(value).map_err(|e| e.to_string())?;
     Ok(map_host_capabilities(&caps))
@@ -505,11 +501,8 @@ async fn fetch_projects(
 ) -> Result<ProjectsSection, String> {
     // List all projects.
     let list_params = ProjectListParams::default();
-    let request = Request::new(
-        crate::commands::request_id(method::PROJECT_LIST),
-        method::PROJECT_LIST,
-        serde_json::to_value(&list_params).map_err(|e| e.to_string())?,
-    );
+    let request = crate::commands::request_with_params(method::PROJECT_LIST, &list_params)
+        .map_err(|e| e.to_string())?;
     let value = client.request(&request).await.map_err(|e| e.to_string())?;
     let projects: Vec<ProjectInfo> = serde_json::from_value(value).map_err(|e| e.to_string())?;
 
@@ -520,11 +513,8 @@ async fn fetch_projects(
         let show_params = ProjectShowParams {
             reference: reference.clone(),
         };
-        let show_request = Request::new(
-            crate::commands::request_id(method::PROJECT_SHOW),
-            method::PROJECT_SHOW,
-            serde_json::to_value(&show_params).map_err(|e| e.to_string())?,
-        );
+        let show_request = crate::commands::request_with_params(method::PROJECT_SHOW, &show_params)
+            .map_err(|e| e.to_string())?;
         let show_value = client
             .request(&show_request)
             .await
@@ -535,11 +525,9 @@ async fn fetch_projects(
         let actions_params = ProjectActionsParams {
             reference: reference.clone(),
         };
-        let actions_request = Request::new(
-            crate::commands::request_id(method::PROJECT_ACTIONS),
-            method::PROJECT_ACTIONS,
-            serde_json::to_value(&actions_params).map_err(|e| e.to_string())?,
-        );
+        let actions_request =
+            crate::commands::request_with_params(method::PROJECT_ACTIONS, &actions_params)
+                .map_err(|e| e.to_string())?;
         let actions_value = client
             .request(&actions_request)
             .await
@@ -557,6 +545,15 @@ async fn fetch_projects(
         selected_project,
     })
 }
+
+// TODO: the `source`/`state`/`activity` strings below are derived with
+// `format!("{:?}", x).to_lowercase()`, which couples the snapshot.json contract
+// to the Debug derives of the protocol enums. The values happen to equal each
+// enum's serde `snake_case` repr today (all variants are single PascalCase
+// words). Switching to the canonical serde repr would decouple the contract, but
+// the protocol enums expose neither an `as_str()` nor a clean in-crate
+// string-repr helper, and adding one is out of scope here (protocol lives in
+// another crate). Left as-is to avoid risking the pinned snapshot output.
 
 /// Pure mapping from a [`ProjectInfo`] to a [`ProjectSummary`] (no paths).
 fn map_project_summary(info: &ProjectInfo) -> ProjectSummary {
@@ -588,11 +585,8 @@ fn map_selected_project(
 
 async fn fetch_sessions(client: &mut Client) -> Result<SessionsSection, String> {
     let params = SessionListParams::default();
-    let request = Request::new(
-        crate::commands::request_id(method::SESSION_LIST),
-        method::SESSION_LIST,
-        serde_json::to_value(&params).map_err(|e| e.to_string())?,
-    );
+    let request = crate::commands::request_with_params(method::SESSION_LIST, &params)
+        .map_err(|e| e.to_string())?;
     let value = client.request(&request).await.map_err(|e| e.to_string())?;
     let sessions: Vec<SessionInfo> = serde_json::from_value(value).map_err(|e| e.to_string())?;
 

@@ -18,14 +18,13 @@ use protocol::{
     ProjectRenameParams, ProjectShowParams, ProjectShowResult, ProjectSource, ProjectWorktree,
     PromptLayer, ProviderKind, Request,
 };
-use serde::Serialize;
 use serde_json::Value;
 
 use crate::client::Client;
-use crate::commands::request_id;
+use crate::commands::{request_id, request_with_params};
 use crate::error::CliError;
 use crate::paths::Paths;
-use crate::target::LOCAL_HOST;
+use crate::target::is_local_host;
 
 /// Parse one `project list --filter key=value` argument into a protocol filter.
 ///
@@ -353,7 +352,7 @@ pub(crate) async fn run_rm(
 /// PATH is host-local, so it must be an explicit **absolute** path — a relative
 /// path (or none) is meaningless on another host and fails fast before dialing.
 fn resolve_add_path(host: &str, path: Option<PathBuf>) -> Result<PathBuf, CliError> {
-    let remote = !host.is_empty() && host != LOCAL_HOST;
+    let remote = !is_local_host(host);
     match path {
         Some(path) if remote => {
             if path.is_relative() {
@@ -366,17 +365,6 @@ fn resolve_add_path(host: &str, path: Option<PathBuf>) -> Result<PathBuf, CliErr
         None if remote => Err(CliError::RemoteAddPathRequired),
         None => Ok(std::env::current_dir()?),
     }
-}
-
-fn request_with_params<T>(method: &str, params: &T) -> Result<Request, CliError>
-where
-    T: Serialize + ?Sized,
-{
-    Ok(Request::new(
-        request_id(method),
-        method,
-        serde_json::to_value(params)?,
-    ))
 }
 
 fn source_label(source: ProjectSource) -> &'static str {
@@ -503,6 +491,7 @@ fn render_worktree_line(wt: &ProjectWorktree) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::target::LOCAL_HOST;
 
     fn project(id: &str, label: &str, source: ProjectSource) -> ProjectInfo {
         ProjectInfo {

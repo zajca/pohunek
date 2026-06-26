@@ -54,9 +54,9 @@ use attach::{generate_daemon_instance_id, ActiveAttach, PendingAttach};
 use hooks::SessionHookRequest;
 #[cfg(test)]
 use hooks::{parse_agent_activity, spawn_agent_state_hook_dispatcher};
-use input::{input_rules_for_agent, plan_initial_input_delivery};
 #[cfg(test)]
 use input::build_input_writes;
+use input::{input_rules_for_agent, plan_initial_input_delivery};
 use lag::{log_lag_warn, LagWarnThrottle};
 use resume::ResumeSnapshot;
 use target::{build_launch_command, LaunchCommandPlan, PtySessionSpec, TargetResolution};

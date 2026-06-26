@@ -2,11 +2,11 @@
 
 use super::{
     build_pty_command, debug, detect_at, event, launch_adapter_for, plan_initial_input_delivery,
-    runtime_error, spawn_error_to_protocol, timestamp_now, warn, AgentKind, CancellationToken,
-    DetectedProject, InputRules, LaunchOpts, Manifest, PathBuf, ProjectRecord, ProtocolError,
-    PtyCommand, PtyHandle, ResolvedAgent, ResumeSnapshot, SessionEntry, SessionId, SessionInfo,
-    SessionNewParams, SessionRegistry, SessionState, SessionWarning, ShellCommand, StateSource,
-    WorktreeRequest, watch,
+    runtime_error, spawn_error_to_protocol, timestamp_now, warn, watch, AgentKind,
+    CancellationToken, DetectedProject, InputRules, LaunchOpts, Manifest, PathBuf, ProjectRecord,
+    ProtocolError, PtyCommand, PtyHandle, ResolvedAgent, ResumeSnapshot, SessionEntry, SessionId,
+    SessionInfo, SessionNewParams, SessionRegistry, SessionState, SessionWarning, ShellCommand,
+    StateSource, WorktreeRequest,
 };
 
 /// Everything needed to spawn and register one PTY-backed session, shared by

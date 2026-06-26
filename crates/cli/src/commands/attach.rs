@@ -12,12 +12,11 @@ use protocol::{
     method, AttachHeader, Request, SessionAttachParams, SessionAttachResult, SessionDetachParams,
     SessionId, SessionResizeParams, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
-use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
 
 use crate::client::{connect_raw, Client, RawStream};
-use crate::commands::request_id;
+use crate::commands::request_with_params;
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::Target;
@@ -94,17 +93,6 @@ where
     }
 
     forward_attached_stream(stream, client, stream_id.to_owned(), target).await
-}
-
-fn request_with_params<T>(method: &str, params: &T) -> Result<Request, CliError>
-where
-    T: Serialize + ?Sized,
-{
-    Ok(Request::new(
-        request_id(method),
-        method,
-        serde_json::to_value(params)?,
-    ))
 }
 
 // Host routing is the transport's job; the request carries only the session id

@@ -1,9 +1,9 @@
 //! Per-session activity detector task and activity recording.
 
 use super::{
-    debug, event, is_terminal, json, log_lag_warn, timestamp_now, ActivityTransition, AgentKind,
-    CancellationToken, Detector, DetectorConfig, Event, Instant, LagWarnThrottle, Manifest,
-    SessionId, SessionRegistry, broadcast, watch,
+    broadcast, debug, event, is_terminal, json, log_lag_warn, timestamp_now, watch,
+    ActivityTransition, AgentKind, CancellationToken, Detector, DetectorConfig, Event, Instant,
+    LagWarnThrottle, Manifest, SessionId, SessionRegistry,
 };
 
 impl SessionRegistry {

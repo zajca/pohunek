@@ -23,7 +23,7 @@ pub(crate) mod snapshot;
 use std::path::PathBuf;
 
 use protocol::{
-    method, AssistantMaterializeResult, ConceptIntent, HostCapabilities, Request, SessionNewParams,
+    method, AssistantMaterializeResult, ConceptIntent, HostCapabilities, SessionNewParams,
     SessionNewResult,
 };
 use serde::Serialize;
@@ -105,7 +105,7 @@ pub(crate) struct AssistantOptions {
 
 impl AssistantOptions {
     fn is_remote(&self) -> bool {
-        !self.host.is_empty() && self.host != LOCAL_HOST
+        !crate::target::is_local_host(&self.host)
     }
 }
 
@@ -222,8 +222,9 @@ async fn run_full(opts: AssistantOptions, paths: &Paths) -> Result<(), CliError>
 
     // 7. `--print-prompt` is a dry run: show the prompt and resolved paths, then
     //    exit without starting a session.
+    let knowledge = Knowledge::Materialized(&materialized);
     if opts.print_prompt {
-        print_prompt_full(&opts, &selection, &materialized, &prompt)?;
+        print_prompt(&opts, &selection, &knowledge, &prompt)?;
         return Ok(());
     }
 
@@ -232,7 +233,7 @@ async fn run_full(opts: AssistantOptions, paths: &Paths) -> Result<(), CliError>
         &mut client,
         &opts,
         &selection,
-        &materialized,
+        &knowledge,
         prompt,
         auto_started,
     )
@@ -280,17 +281,18 @@ async fn run_degraded(opts: AssistantOptions, paths: &Paths) -> Result<(), CliEr
     });
 
     // 7. `--print-prompt` dry run.
+    let knowledge = Knowledge::Degraded(&degraded);
     if opts.print_prompt {
-        print_prompt_degraded(&opts, &selection, &degraded, &prompt)?;
+        print_prompt(&opts, &selection, &knowledge, &prompt)?;
         return Ok(());
     }
 
     // 8. Launch the session with the reduced prompt.
-    launch_session_degraded(
+    launch_session(
         &mut client,
         &opts,
         &selection,
-        &degraded,
+        &knowledge,
         prompt,
         auto_started,
     )
@@ -298,71 +300,78 @@ async fn run_degraded(opts: AssistantOptions, paths: &Paths) -> Result<(), CliEr
 }
 
 async fn fetch_capabilities(client: &mut Client) -> Result<HostCapabilities, CliError> {
-    let request = Request::new(
-        crate::commands::request_id(method::HOST_INSPECT),
-        method::HOST_INSPECT,
-        serde_json::Value::Null,
-    );
+    let request =
+        crate::commands::request_with_params(method::HOST_INSPECT, &serde_json::Value::Null)?;
     let value = client.request(&request).await?;
     Ok(serde_json::from_value(value)?)
 }
 
-fn print_prompt_full(
-    opts: &AssistantOptions,
-    selection: &select::AgentSelection,
-    materialized: &AssistantMaterializeResult,
-    prompt: &str,
-) -> Result<(), CliError> {
-    if opts.json {
-        #[derive(Serialize)]
-        struct PrintPrompt<'a> {
-            prompt: &'a str,
-            agent: &'a str,
-            agent_reason: &'a str,
-            intent: &'a str,
-            bundle_path: &'a str,
-            snapshot_path: &'a str,
-            knowledge_bundle_version: &'a str,
-            knowledge: &'a str,
-        }
-        print!(
-            "{}",
-            crate::commands::render_json(&PrintPrompt {
-                prompt,
-                agent: &selection.name,
-                agent_reason: &selection.reason,
-                intent: opts.intent.as_str(),
-                bundle_path: &materialized.bundle_path,
-                snapshot_path: &materialized.snapshot_path,
-                knowledge_bundle_version: &materialized.version,
-                knowledge: "materialized",
-            })?
-        );
-    } else {
-        println!("agent: {} ({})", selection.name, selection.reason);
-        println!("intent: {}", opts.intent.as_str());
-        println!("knowledge: {} (materialized)", materialized.version);
-        println!("bundle: {}", materialized.bundle_path);
-        println!("snapshot: {}", materialized.snapshot_path);
-        println!("--- prompt ---");
-        println!("{prompt}");
-    }
-    Ok(())
+/// The materialized knowledge a launch carries, abstracting over the full
+/// (bundle + snapshot) and degraded (snapshot-only) results so the launch,
+/// emit, and print-prompt steps share one implementation each.
+///
+/// The two arms differ only in whether a bundle was materialized (full has a
+/// `bundle_path`, degraded does not) and the `materialized`/`degraded` label
+/// that threads through every rendered line; everything else is identical.
+enum Knowledge<'a> {
+    Materialized(&'a AssistantMaterializeResult),
+    Degraded(&'a crate::assistant::DegradedMaterializeResult),
 }
 
-fn print_prompt_degraded(
+impl Knowledge<'_> {
+    /// The bundle version (embedded, for both arms — degraded annotates it even
+    /// though the bundle files are absent).
+    fn version(&self) -> &str {
+        match self {
+            Knowledge::Materialized(m) => &m.version,
+            Knowledge::Degraded(d) => &d.version,
+        }
+    }
+
+    /// The materialized bundle directory path, or `None` for a degraded launch
+    /// (no bundle was extracted).
+    fn bundle_path(&self) -> Option<&str> {
+        match self {
+            Knowledge::Materialized(m) => Some(&m.bundle_path),
+            Knowledge::Degraded(_) => None,
+        }
+    }
+
+    /// The persisted snapshot path (present on both arms).
+    fn snapshot_path(&self) -> &str {
+        match self {
+            Knowledge::Materialized(m) => &m.snapshot_path,
+            Knowledge::Degraded(d) => &d.snapshot_path,
+        }
+    }
+
+    /// The stable `knowledge` label used in JSON output and the human
+    /// `knowledge: <version> (<label>)` line.
+    fn knowledge_label(&self) -> &'static str {
+        match self {
+            Knowledge::Materialized(_) => "materialized",
+            Knowledge::Degraded(_) => "degraded",
+        }
+    }
+}
+
+fn print_prompt(
     opts: &AssistantOptions,
     selection: &select::AgentSelection,
-    degraded: &crate::assistant::DegradedMaterializeResult,
+    knowledge: &Knowledge<'_>,
     prompt: &str,
 ) -> Result<(), CliError> {
     if opts.json {
+        // `bundle_path` is skipped for a degraded launch (no bundle exists), so
+        // the JSON shape matches the original per-mode structs exactly.
         #[derive(Serialize)]
         struct PrintPrompt<'a> {
             prompt: &'a str,
             agent: &'a str,
             agent_reason: &'a str,
             intent: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            bundle_path: Option<&'a str>,
             snapshot_path: &'a str,
             knowledge_bundle_version: &'a str,
             knowledge: &'a str,
@@ -374,16 +383,25 @@ fn print_prompt_degraded(
                 agent: &selection.name,
                 agent_reason: &selection.reason,
                 intent: opts.intent.as_str(),
-                snapshot_path: &degraded.snapshot_path,
-                knowledge_bundle_version: &degraded.version,
-                knowledge: "degraded",
+                bundle_path: knowledge.bundle_path(),
+                snapshot_path: knowledge.snapshot_path(),
+                knowledge_bundle_version: knowledge.version(),
+                knowledge: knowledge.knowledge_label(),
             })?
         );
     } else {
         println!("agent: {} ({})", selection.name, selection.reason);
         println!("intent: {}", opts.intent.as_str());
-        println!("knowledge: {} (degraded)", degraded.version);
-        println!("snapshot: {}", degraded.snapshot_path);
+        println!(
+            "knowledge: {} ({})",
+            knowledge.version(),
+            knowledge.knowledge_label()
+        );
+        // The bundle line only appears for a full launch (degraded has no bundle).
+        if let Some(bundle_path) = knowledge.bundle_path() {
+            println!("bundle: {bundle_path}");
+        }
+        println!("snapshot: {}", knowledge.snapshot_path());
         println!("--- prompt ---");
         println!("{prompt}");
     }
@@ -394,7 +412,7 @@ async fn launch_session(
     client: &mut Client,
     opts: &AssistantOptions,
     selection: &select::AgentSelection,
-    materialized: &AssistantMaterializeResult,
+    knowledge: &Knowledge<'_>,
     prompt: String,
     auto_started: bool,
 ) -> Result<(), CliError> {
@@ -423,11 +441,7 @@ async fn launch_session(
         base_branch: opts.base_branch.clone(),
         input: Some(prompt),
     };
-    let request = Request::new(
-        crate::commands::request_id(method::SESSION_NEW),
-        method::SESSION_NEW,
-        serde_json::to_value(&params)?,
-    );
+    let request = crate::commands::request_with_params(method::SESSION_NEW, &params)?;
     let value = client.request(&request).await?;
     let result: SessionNewResult = serde_json::from_value(value)?;
 
@@ -439,13 +453,13 @@ async fn launch_session(
         );
     }
 
-    emit_launch_output(opts, selection, materialized, &result, auto_started)
+    emit_launch_output(opts, selection, knowledge, &result, auto_started)
 }
 
 fn emit_launch_output(
     opts: &AssistantOptions,
     selection: &select::AgentSelection,
-    materialized: &AssistantMaterializeResult,
+    knowledge: &Knowledge<'_>,
     result: &SessionNewResult,
     auto_started: bool,
 ) -> Result<(), CliError> {
@@ -463,124 +477,32 @@ fn emit_launch_output(
                 assistant: AssistantMeta {
                     intent: opts.intent.as_str(),
                     agent: &selection.name,
-                    knowledge_bundle_version: &materialized.version,
+                    knowledge_bundle_version: knowledge.version(),
                     snapshot_included: !opts.no_snapshot,
                     auto_started_daemon: auto_started,
-                    knowledge: "materialized",
+                    knowledge: knowledge.knowledge_label(),
                 },
             })?
         );
     } else {
-        let target = if opts.host.is_empty() || opts.host == LOCAL_HOST {
+        let target = if crate::target::is_local_host(&opts.host) {
             format!("{LOCAL_HOST}/{}", info.id.0)
         } else {
             format!("{}/{}", opts.host, info.id.0)
         };
-        println!("started assistant session: {target}");
+        // The degraded launch annotates the headline; the full launch does not.
+        let degraded_note = match knowledge {
+            Knowledge::Materialized(_) => "",
+            Knowledge::Degraded(_) => " (degraded)",
+        };
+        println!("started assistant session{degraded_note}: {target}");
         println!("agent: {}", selection.name);
         println!("intent: {}", opts.intent.as_str());
-        println!("knowledge: {} (materialized)", materialized.version);
         println!(
-            "snapshot: {}",
-            if opts.no_snapshot {
-                "skipped"
-            } else {
-                "included"
-            }
+            "knowledge: {} ({})",
+            knowledge.version(),
+            knowledge.knowledge_label()
         );
-        println!("attach: pohunek attach {target}");
-    }
-    Ok(())
-}
-
-async fn launch_session_degraded(
-    client: &mut Client,
-    opts: &AssistantOptions,
-    selection: &select::AgentSelection,
-    degraded: &crate::assistant::DegradedMaterializeResult,
-    prompt: String,
-    auto_started: bool,
-) -> Result<(), CliError> {
-    match confirmation_decision(&opts.host, opts.json, opts.yes) {
-        ConfirmDecision::Proceed => {}
-        ConfirmDecision::RequireYes => return Err(CliError::RemoteConfirmationRequired),
-        ConfirmDecision::Prompt => {
-            if !crate::commands::session::prompt_confirm(&opts.host)? {
-                return Err(CliError::RemoteConfirmationDeclined {
-                    host: opts.host.clone(),
-                });
-            }
-        }
-    }
-
-    let params = SessionNewParams {
-        agent: selection.name.clone(),
-        cwd: None,
-        cols: DEFAULT_COLS,
-        rows: DEFAULT_ROWS,
-        project: opts.project.clone(),
-        repo: opts.repo.clone(),
-        branch: opts.branch.clone(),
-        base_branch: opts.base_branch.clone(),
-        input: Some(prompt),
-    };
-    let request = Request::new(
-        crate::commands::request_id(method::SESSION_NEW),
-        method::SESSION_NEW,
-        serde_json::to_value(&params)?,
-    );
-    let value = client.request(&request).await?;
-    let result: SessionNewResult = serde_json::from_value(value)?;
-
-    if result.applied_input != Some(true) {
-        eprintln!(
-            "pohunek: warning: host '{}' did not confirm the assistant opening prompt was \
-             delivered; the session is running without it.",
-            opts.host
-        );
-    }
-
-    emit_launch_output_degraded(opts, selection, degraded, &result, auto_started)
-}
-
-fn emit_launch_output_degraded(
-    opts: &AssistantOptions,
-    selection: &select::AgentSelection,
-    degraded: &crate::assistant::DegradedMaterializeResult,
-    result: &SessionNewResult,
-    auto_started: bool,
-) -> Result<(), CliError> {
-    let info = &result.session;
-    if opts.json {
-        #[derive(Serialize)]
-        struct Output<'a> {
-            session: &'a protocol::SessionInfo,
-            assistant: AssistantMeta<'a>,
-        }
-        print!(
-            "{}",
-            crate::commands::render_json(&Output {
-                session: info,
-                assistant: AssistantMeta {
-                    intent: opts.intent.as_str(),
-                    agent: &selection.name,
-                    knowledge_bundle_version: &degraded.version,
-                    snapshot_included: !opts.no_snapshot,
-                    auto_started_daemon: auto_started,
-                    knowledge: "degraded",
-                },
-            })?
-        );
-    } else {
-        let target = if opts.host.is_empty() || opts.host == LOCAL_HOST {
-            format!("{LOCAL_HOST}/{}", info.id.0)
-        } else {
-            format!("{}/{}", opts.host, info.id.0)
-        };
-        println!("started assistant session (degraded): {target}");
-        println!("agent: {}", selection.name);
-        println!("intent: {}", opts.intent.as_str());
-        println!("knowledge: {} (degraded)", degraded.version);
         println!(
             "snapshot: {}",
             if opts.no_snapshot {

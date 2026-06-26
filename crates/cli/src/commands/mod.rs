@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use protocol::Request;
 use serde::Serialize;
 
 use crate::error::CliError;
@@ -63,6 +64,28 @@ pub(crate) fn request_id(method: &str) -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     format!("cli-{method}-{}-{seq}", run_token())
+}
+
+/// Build a control [`Request`] for `method` carrying `params` as its JSON body.
+///
+/// One place defines the request envelope every command sends: a fresh per-call
+/// [`request_id`] plus the `serde_json`-serialized params. Centralizing it keeps
+/// the id format and the params encoding identical across `session`, `project`,
+/// `attach`, `host`, and `assistant`, so a daemon sees byte-identical envelopes
+/// regardless of which command emitted them.
+///
+/// # Errors
+///
+/// Returns [`CliError`] when `params` cannot be serialized to JSON.
+pub(crate) fn request_with_params<T>(method: &str, params: &T) -> Result<Request, CliError>
+where
+    T: Serialize + ?Sized,
+{
+    Ok(Request::new(
+        request_id(method),
+        method,
+        serde_json::to_value(params)?,
+    ))
 }
 
 #[cfg(test)]

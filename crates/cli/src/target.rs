@@ -18,6 +18,17 @@ use std::fmt;
 /// The reserved host name meaning "this machine".
 pub(crate) const LOCAL_HOST: &str = "local";
 
+/// Whether `host` denotes the local machine.
+///
+/// The reserved [`LOCAL_HOST`] name and an empty string (no host supplied) both
+/// route to the local Unix socket; every other name is remote. This is the one
+/// predicate every command and the transport agree on for "is this local", so
+/// the empty-string-is-local rule is decided in exactly one place.
+#[must_use]
+pub(crate) fn is_local_host(host: &str) -> bool {
+    host.is_empty() || host == LOCAL_HOST
+}
+
 /// A parsed session target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Target {
@@ -94,6 +105,16 @@ impl fmt::Display for Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_local_host_recognizes_local_and_empty() {
+        // The reserved name and an empty string (no host supplied) are local; any
+        // other name is remote. Every command and the transport share this rule.
+        assert!(is_local_host(LOCAL_HOST));
+        assert!(is_local_host(""));
+        assert!(!is_local_host("host-b"));
+        assert!(!is_local_host("100.92.10.20"));
+    }
 
     #[test]
     fn parses_bare_session_id_as_implicit_local() {

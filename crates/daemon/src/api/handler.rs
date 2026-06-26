@@ -247,8 +247,17 @@ fn require_projects(
     })
 }
 
-/// Run a blocking project operation off the async runtime and build its response.
-async fn run_project_blocking<T, F>(request: &Request, op: F) -> Response
+/// Run a fallible blocking operation off the async runtime and map its result to
+/// a [`Response`]: a serialized value on success, the operation's typed error on
+/// failure, and a daemon-class error built from `panic_code`/`panic_msg`/
+/// `panic_hint` if the `spawn_blocking` task panics (the `JoinError` case).
+async fn run_blocking<T, F>(
+    request: &Request,
+    op: F,
+    panic_code: &'static str,
+    panic_msg: &'static str,
+    panic_hint: Option<&'static str>,
+) -> Response
 where
     T: Serialize + Send + 'static,
     F: FnOnce() -> Result<T, ProtocolError> + Send + 'static,
@@ -260,12 +269,28 @@ where
             request.id.clone(),
             ProtocolError::new(
                 protocol::ErrorClass::Daemon,
-                "project_task_panicked",
-                "project operation task panicked".to_owned(),
-                None,
+                panic_code,
+                panic_msg,
+                panic_hint.map(str::to_owned),
             ),
         ),
     }
+}
+
+/// Run a blocking project operation off the async runtime and build its response.
+async fn run_project_blocking<T, F>(request: &Request, op: F) -> Response
+where
+    T: Serialize + Send + 'static,
+    F: FnOnce() -> Result<T, ProtocolError> + Send + 'static,
+{
+    run_blocking(
+        request,
+        op,
+        "project_task_panicked",
+        "project operation task panicked",
+        None,
+    )
+    .await
 }
 
 /// `project.list`: known projects on this host, AND-filtered.
@@ -640,19 +665,14 @@ async fn run_assistant_materialize_blocking<F>(request: &Request, op: F) -> Resp
 where
     F: FnOnce() -> Result<AssistantMaterializeResult, ProtocolError> + Send + 'static,
 {
-    match tokio::task::spawn_blocking(op).await {
-        Ok(Ok(result)) => ok_value(request, &result),
-        Ok(Err(err)) => Response::err(request.id.clone(), err),
-        Err(_) => Response::err(
-            request.id.clone(),
-            ProtocolError::new(
-                protocol::ErrorClass::Daemon,
-                "assistant_materialize_task_panicked",
-                "assistant materialization task panicked".to_owned(),
-                Some("retry the request; if it repeats, inspect daemon logs".to_owned()),
-            ),
-        ),
-    }
+    run_blocking(
+        request,
+        op,
+        "assistant_materialize_task_panicked",
+        "assistant materialization task panicked",
+        Some("retry the request; if it repeats, inspect daemon logs"),
+    )
+    .await
 }
 
 fn parse_params<T>(request: &Request) -> Result<T, ProtocolError>
