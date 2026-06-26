@@ -11,10 +11,11 @@
 //! - logs:            `$XDG_STATE_HOME` or `~/.local/state` + `/pohunek/logs`
 //! - data dir:        `$XDG_DATA_HOME`  or `~/.local/share` + `/pohunek`
 //!   (state.db, events/, worktrees/ live here in later milestones)
+//! - cache dir:       `$XDG_CACHE_HOME` or `~/.cache` + `/pohunek`
 //! - config dir:      `$XDG_CONFIG_HOME` or `~/.config` + `/pohunek`
 //!   (host-default templates/actions/prompts, hooks/, agents/ profiles)
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::DaemonError;
 
@@ -38,6 +39,10 @@ pub struct Paths {
     pub log_dir: PathBuf,
     /// The user data directory (state.db / events / worktrees in later milestones).
     pub data_dir: PathBuf,
+    /// The user cache directory.
+    pub cache_dir: PathBuf,
+    /// The XDG config base (`$XDG_CONFIG_HOME` or `$HOME/.config`).
+    pub config_home: PathBuf,
     /// The host config directory (`$XDG_CONFIG_HOME/pohunek` or `~/.config/pohunek`).
     /// Home of host-default templates/actions/prompts, lifecycle hooks, and agent
     /// profiles. The daemon reads (never writes) this tree as the host-default layer.
@@ -71,6 +76,10 @@ impl Paths {
         let data_home = xdg_or_home_relative("XDG_DATA_HOME", &[".local", "share"])?;
         let data_dir = data_home.join(APP_DIR);
 
+        // Cache dir: prefer XDG_CACHE_HOME, else ~/.cache.
+        let cache_home = xdg_or_home_relative("XDG_CACHE_HOME", &[".cache"])?;
+        let cache_dir = cache_home.join(APP_DIR);
+
         // Config dir: prefer XDG_CONFIG_HOME, else ~/.config. One of the two must
         // resolve; otherwise fail fast (no silent default).
         let config_home = xdg_or_home_relative("XDG_CONFIG_HOME", &[".config"])?;
@@ -82,8 +91,43 @@ impl Paths {
             lock,
             log_dir,
             data_dir,
+            cache_dir,
+            config_home,
             config_dir,
         })
+    }
+
+    /// Directory the launcher scripts are materialized into by `pohunek setup scripts`.
+    #[must_use]
+    pub fn launcher_bin_dir(&self) -> PathBuf {
+        self.data_dir.join("bin")
+    }
+
+    /// The user's sway config dir (`<config_home>/sway`).
+    #[must_use]
+    pub fn sway_config_dir(&self) -> PathBuf {
+        self.config_home.join("sway")
+    }
+
+    /// Directory where assistant knowledge bundles are cached.
+    #[must_use]
+    pub fn assistant_bundle_cache_dir(&self) -> PathBuf {
+        self.cache_dir.join("knowledge")
+    }
+
+    /// Runtime directory for assistant material generated for one session or launch.
+    #[must_use]
+    pub fn assistant_runtime_dir(&self, session_or_launch_id: &str) -> Option<PathBuf> {
+        valid_runtime_id(session_or_launch_id).map(|id| self.runtime_dir.join("assistant").join(id))
+    }
+}
+
+fn valid_runtime_id(id: &str) -> Option<&Path> {
+    let path = Path::new(id);
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Some(path),
+        _ => None,
     }
 }
 
@@ -122,16 +166,14 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    // Env-var resolution is process-global; serialize the env-mutating tests and
-    // restore every touched var on drop so they stay hermetic under the parallel
-    // runner (mirrors the PATH_LOCK guard in `tests/health_socket.rs`).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::test_support::XDG_ENV_LOCK;
 
-    const VARS: [&str; 5] = [
+    const VARS: [&str; 6] = [
         "XDG_RUNTIME_DIR",
         "XDG_STATE_HOME",
         "XDG_DATA_HOME",
         "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
         "HOME",
     ];
 
@@ -144,7 +186,7 @@ mod tests {
 
     impl EnvGuard {
         fn acquire() -> Self {
-            let lock = ENV_LOCK
+            let lock = XDG_ENV_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let saved = VARS.iter().map(|&k| (k, std::env::var(k).ok())).collect();
@@ -174,6 +216,7 @@ mod tests {
         std::env::set_var("XDG_STATE_HOME", base.join("state"));
         std::env::set_var("XDG_DATA_HOME", base.join("data"));
         std::env::set_var("XDG_CONFIG_HOME", base.join("cfg"));
+        std::env::set_var("XDG_CACHE_HOME", base.join("cache"));
         std::env::set_var("HOME", base.join("home"));
     }
 
@@ -197,6 +240,65 @@ mod tests {
             paths.config_dir,
             base.join("home").join(".config").join(APP_DIR)
         );
+    }
+
+    #[test]
+    fn cache_dir_from_xdg_cache_home() {
+        let _env = EnvGuard::acquire();
+        let base = tmp_base("xdg-cache");
+        set_all_present(&base);
+        let paths = Paths::resolve().expect("resolve with all base vars set");
+        assert_eq!(paths.cache_dir, base.join("cache").join(APP_DIR));
+    }
+
+    #[test]
+    fn cache_dir_falls_back_to_home_dot_cache() {
+        let _env = EnvGuard::acquire();
+        let base = tmp_base("home-cache");
+        set_all_present(&base);
+        std::env::remove_var("XDG_CACHE_HOME");
+        let paths = Paths::resolve().expect("resolve with XDG_CACHE_HOME unset");
+        assert_eq!(
+            paths.cache_dir,
+            base.join("home").join(".cache").join(APP_DIR)
+        );
+    }
+
+    #[test]
+    fn assistant_dirs_have_expected_shape() {
+        let _env = EnvGuard::acquire();
+        let base = tmp_base("assistant");
+        set_all_present(&base);
+        let paths = Paths::resolve().expect("resolve with all base vars set");
+        assert_eq!(
+            paths.assistant_bundle_cache_dir(),
+            base.join("cache").join(APP_DIR).join("knowledge")
+        );
+        assert_eq!(
+            paths.assistant_runtime_dir("launch-123"),
+            Some(
+                base.join("run")
+                    .join(APP_DIR)
+                    .join("assistant")
+                    .join("launch-123")
+            )
+        );
+    }
+
+    #[test]
+    fn assistant_runtime_dir_rejects_unsafe_ids() {
+        let _env = EnvGuard::acquire();
+        let base = tmp_base("assistant-unsafe");
+        set_all_present(&base);
+        let paths = Paths::resolve().expect("resolve with all base vars set");
+
+        for id in ["", "/tmp/launch", "../launch", "launch/child", "launch/.."] {
+            assert_eq!(
+                paths.assistant_runtime_dir(id),
+                None,
+                "unsafe id should be rejected: {id:?}"
+            );
+        }
     }
 
     #[test]

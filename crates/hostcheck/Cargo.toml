@@ -1,0 +1,15 @@
+[package]
+name = "pohunek-hostcheck"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "pohunek host environment probes shared by the CLI doctor and the daemon.doctor RPC."
+
+[lib]
+name = "hostcheck"
+path = "src/lib.rs"
+
+[dependencies]
+pohunek-protocol = { path = "../protocol" }
+pohunek-netbird = { path = "../netbird" }
