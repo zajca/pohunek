@@ -242,9 +242,6 @@ pub fn build_site(options: SiteOptions) -> Result<SiteSummary, XtaskError> {
         // Simpler direct replacement of .md" -> .html" in href attributes.
         let body_html = replace_md_links_in_html(&body_html);
 
-        // Build the HTML page using the skeleton.
-        let page_html = render_html_page(&page_title, &pohunek_version, &body_html);
-
         // Determine output path: change .md extension to .html.
         let html_relative_path = file.relative_path.with_extension("html");
         let html_relative_str = html_relative_path
@@ -252,6 +249,10 @@ pub fn build_site(options: SiteOptions) -> Result<SiteSummary, XtaskError> {
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join("/");
+        let nav_href = relative_index_href(&html_relative_path);
+
+        // Build the HTML page using the skeleton.
+        let page_html = render_html_page(&page_title, &pohunek_version, &nav_href, &body_html);
 
         // Write to both site/ and offline/.
         for out_root in [&site_dir, &offline_dir] {
@@ -284,6 +285,18 @@ pub fn build_site(options: SiteOptions) -> Result<SiteSummary, XtaskError> {
         pages_rendered: md_files.len(),
         pohunek_version,
     })
+}
+
+fn relative_index_href(page_path: &Path) -> String {
+    let parent_depth = page_path
+        .parent()
+        .map(|parent| parent.components().count())
+        .unwrap_or(0);
+    if parent_depth == 0 {
+        "index.html".to_string()
+    } else {
+        format!("{}index.html", "../".repeat(parent_depth))
+    }
 }
 
 /// Replace `.md"` with `.html"` inside `href="…"` attributes so that
@@ -319,7 +332,7 @@ fn replace_md_links_in_html(html: &str) -> String {
 }
 
 /// Wrap a body HTML fragment in the full page skeleton.
-fn render_html_page(title: &str, version: &str, body: &str) -> String {
+fn render_html_page(title: &str, version: &str, nav_href: &str, body: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -336,7 +349,7 @@ nav{{border-bottom:1px solid #d0d7de;padding-bottom:0.5rem;margin-bottom:1.5rem}
 </style>
 </head>
 <body>
-<nav><a href="/index.html">pohunek docs</a> — v{version}</nav>
+<nav><a href="{nav_href}">pohunek docs</a> — v{version}</nav>
 {body}
 <footer><hr><small>pohunek {version} — generated from knowledge bundle</small></footer>
 </body>
@@ -344,6 +357,7 @@ nav{{border-bottom:1px solid #d0d7de;padding-bottom:0.5rem;margin-bottom:1.5rem}
 "#,
         title = title,
         version = version,
+        nav_href = nav_href,
         body = body,
     )
 }
@@ -355,7 +369,7 @@ fn render_index_html(version: &str, pages: &[(String, String)]) -> String {
         list_items.push_str(&format!("<li><a href=\"{path}\">{title}</a></li>\n"));
     }
     let body = format!("<h1>pohunek docs</h1>\n<ul>\n{list_items}</ul>\n");
-    render_html_page("pohunek docs", version, &body)
+    render_html_page("pohunek docs", version, "index.html", &body)
 }
 
 /// Run all drift checks for the knowledge bundle. Returns `Ok(true)` if every

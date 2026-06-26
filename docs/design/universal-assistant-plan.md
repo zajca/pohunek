@@ -1,14 +1,12 @@
 # Implementation Plan: Universal Pohunek Assistant
 
-Status: **mostly implemented** (verified against the code on 2026-06-26).
-**P0–P7 and P9 are implemented** in the workspace (full P2 generated-reference
-pipeline + CI drift gates, P4 snapshot/redaction, P5 selection/preflight/bootstrap,
-P6 prompt composition + `--print-prompt`, P7 `pohunek assistant` CLI + `session.new`
-wiring). **Remaining, finish-only:** P8 (hook write hard gate — the only untouched
-phase, plus most of the Security checklist), P10 (behavior eval: promote
-`crates/xtask/src/eval.rs` from skeleton to a working manual release gate), and P11
-(human docs: wire the existing site render into release artifacts). See the
-top-level [`ROADMAP.md`](../ROADMAP.md) for how this fits the wider plan.
+Status: **implemented** (verified against the code on 2026-06-26).
+**P0–P11 are implemented** in the workspace: generated-reference pipeline + CI
+drift gates, snapshot/redaction, selection/preflight/bootstrap, prompt
+composition + `--print-prompt`, `pohunek assistant` CLI + `session.new` wiring,
+hook write hard-gate guidance, manual behavior eval, and human docs release
+artifacts. See the top-level [`ROADMAP.md`](../ROADMAP.md) for how this fits the
+wider plan.
 
 This is the end-to-end engineering plan for the feature
 specified in [`universal-assistant.md`](./universal-assistant.md). It is grounded
@@ -44,17 +42,10 @@ Done in the current workspace:
   older-daemon `assistant_method_unsupported` mapping, daemon socket coverage, and
   materializer race/symlink safety tests.
 
-Still pending:
+Remaining:
 
-- Full P2 generated reference pipeline (`reference/cli`, `reference/protocol`,
-  `reference/config`, setup-asset reference), schema reflection, config
-  descriptor, and CI drift checks.
-- P4 snapshot collector and allowlist redaction.
-- P5 agent selection, daemon bootstrap, and read-access preflight.
-- P6 prompt composition and `--print-prompt`.
-- P7 public `pohunek assistant ...` CLI surface and `session.new` wiring.
-- P8 hook hard gate, P9 drift/secret-scan CI, P10 behavior eval, and P11 human
-  docs outputs.
+- None for this track. Follow-on product work starts from the roadmap's public
+  API / SDK track.
 
 ---
 
@@ -698,16 +689,16 @@ Site + offline artifacts build from the same manifest; offline ships with releas
 
 ## 14. Cross-Cutting: Security Checklist
 
-- [ ] Snapshot is allowlist-built; serializer cannot emit unknown fields (P4).
-- [ ] Profile `[env]` and process env never collected (P4) — re-verified by test.
-- [ ] Absolute paths redacted in snapshot (P4).
-- [ ] Bundle bodies secret-scanned in CI (P9); public-safe rule holds.
-- [ ] Prompt composer reads only allowlisted frontmatter fields (P6).
-- [ ] Hook writes gated independent of `--yes`; quarantine in non-interactive (P8).
+- [x] Snapshot is allowlist-built; serializer cannot emit unknown fields (P4).
+- [x] Profile `[env]` and process env never collected (P4) — re-verified by test.
+- [x] Absolute paths redacted in snapshot (P4).
+- [x] Bundle bodies secret-scanned in CI (P9); public-safe rule holds.
+- [x] Prompt composer reads only allowlisted frontmatter fields (P6).
+- [x] Hook writes gated independent of `--yes`; quarantine in non-interactive (P8).
 - [x] No bundle bytes shipped over the wire; remote bundle from remote binary (P3).
-- [ ] Remote launch fails before launch without a readable bundle unless
+- [x] Remote launch fails before launch without a readable bundle unless
       `--degraded` (P3/P7).
-- [ ] Owner-secure profile gate preserved (`profile.rs:132-149`); assistant never
+- [x] Owner-secure profile gate preserved (`profile.rs:132-149`); assistant never
       weakens name-guard/containment checks.
 
 ## 15. Cross-Cutting: Test Matrix

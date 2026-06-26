@@ -14,8 +14,14 @@ implementation behavior must be verified against the source tree.
 
 Current CLI and command surface:
 
+- `crates/cli/src/assistant.rs`
 - `crates/cli/src/main.rs`
 - `crates/cli/src/commands/mod.rs`
+- `crates/cli/src/commands/assistant/mod.rs`
+- `crates/cli/src/commands/assistant/bootstrap.rs`
+- `crates/cli/src/commands/assistant/prompt.rs`
+- `crates/cli/src/commands/assistant/select.rs`
+- `crates/cli/src/commands/assistant/snapshot.rs`
 - `crates/cli/src/commands/doctor.rs`
 - `crates/cli/src/commands/daemon.rs`
 - `crates/cli/src/commands/health.rs`
@@ -31,6 +37,7 @@ Current CLI and command surface:
 
 Daemon, sessions, integrations, and project state:
 
+- `crates/daemon/src/assistant.rs`
 - `crates/daemon/src/main.rs`
 - `crates/daemon/src/lib.rs`
 - `crates/daemon/src/api/handler.rs`
@@ -59,6 +66,7 @@ Agent runtime and profile resolution:
 
 Protocol contracts and transport:
 
+- `crates/protocol/src/assistant.rs`
 - `crates/protocol/src/lib.rs`
 - `crates/protocol/src/session.rs`
 - `crates/protocol/src/project.rs`

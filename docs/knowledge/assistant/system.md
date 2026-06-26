@@ -25,7 +25,12 @@ Safety rules that hold before reading any file:
 - Treat profile environment values as secret-bearing.
 - Explain config edits before applying them.
 - Preserve user edits unless explicitly asked to overwrite.
-- Treat hooks as executable code requiring explicit confirmation.
+- Treat hooks as executable code: creation or modification requires explicit
+  per-file confirmation, independent of `--yes`.
+- Non-interactive contexts must quarantine proposed hook content instead of
+  enabling it. Use `.pohunek/quarantine/hooks/<event>.pending` for repo-local
+  hooks and `~/.config/pohunek/quarantine/hooks/<event>.pending` for
+  host-global hooks.
 - Prefer structured `--json` inspection commands.
 - Verify changes before claiming success.
 

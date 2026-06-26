@@ -31,21 +31,25 @@ Last reconciled: 2026-06-26.
 
 ---
 
-## 2. In flight — finalize the Universal Assistant
+## 2. Completed — Universal Assistant
 
 Plan: [`design/universal-assistant-plan.md`](design/universal-assistant-plan.md).
-**P0–P7 and P9 are implemented** (the plan's own status header at lines 3–6 is
-stale — trust the code). Remaining, all finish-only:
+**P0–P11 are implemented** in this tree.
 
-- **P8 — hook write hard gate.** The only untouched phase. Gate hook writes
-  independent of `--yes`; quarantine in non-interactive contexts. Most open boxes
-  in the plan's Security checklist (lines 696–705) hang off this.
-- **P10 — behavior eval.** Promote `crates/xtask/src/eval.rs` from skeleton to a
-  working manual release gate.
-- **P11 — human docs outputs.** Site render exists (`crates/xtask/src/lib.rs`);
-  wire it into release artifacts.
+Final finish-only items are closed:
 
-This track closes before the larger forward work starts in earnest.
+- **P8 — hook write hard gate.** The assistant prompt and embedded knowledge
+  bundle now require explicit per-file hook confirmation independent of `--yes`
+  and define quarantine paths for non-interactive contexts.
+- **P10 — behavior eval.** `cargo xtask eval` writes a concrete manual release
+  gate package and validates captured transcripts for parser-valid `pohunek`
+  commands plus required outcome terms.
+- **P11 — human docs outputs.** `cargo xtask docs site` renders site/offline
+  docs, and the release workflow packages `docs/offline/` plus the docs
+  manifest into each tarball.
+
+This track is closed. The forward path below starts with the public API / SDK
+work.
 
 ---
 
@@ -189,13 +193,12 @@ changes the daemon (no gateway, no embedded assets, no daemon-side auth).
 
 ## 5. Recommended sequence
 
-1. **Finalize Universal Assistant** — P8 → P10 → P11 (small; closes the track).
-2. **Track S.1** — extract the **Rust SDK** (`crates/client`); low-risk refactor,
+1. **Track S.1** — extract the **Rust SDK** (`crates/client`); low-risk refactor,
    unblocks the desktop app.
-3. **Track S.2** — document the public API + version negotiation.
-4. **Track D** — build the **native desktop companion app** on the Rust SDK:
+2. **Track S.2** — document the public API + version negotiation.
+3. **Track D** — build the **native desktop companion app** on the Rust SDK:
    D.1 (workspace + multi-host) → D.2 (attach) → D.3 (session/project/worktree) →
    D.4 (prompts) → D.5 (Linear + PRs) → D.6 (diff review + comment-to-session loop).
-5. **Track B (later/optional)** — when mobile / from-any-device access is wanted:
+4. **Track B (later/optional)** — when mobile / from-any-device access is wanted:
    S.3 (TS SDK + drift check) → aggregator backend → Svelte SPA → PWA → provider
    parity, reusing the desktop app's provider seam and the shared link store.

@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use xtask::{build_docs, validate_docs, BuildOptions};
+use xtask::{build_docs, build_site, validate_docs, BuildOptions, SiteOptions};
 
 #[test]
 fn validate_docs_reports_committed_bundle() {
@@ -62,6 +62,53 @@ fn build_docs_copies_files_and_writes_deterministic_manifest() {
     assert!(sources.contains(&serde_json::json!("cli")));
     assert!(sources.contains(&serde_json::json!("protocol")));
     assert_eq!(manifest["content_hash"], second.content_hash);
+}
+
+#[test]
+fn build_site_writes_matching_site_and_offline_outputs_with_relative_nav() {
+    let temp = temp_dir("build-site");
+    let source = temp.join("source");
+    let target = temp.join("target");
+    write_source_bundle(&source);
+
+    let docs = build_docs(BuildOptions {
+        source_dir: source,
+        output_root: target.clone(),
+        pohunek_version: "1.2.3-test".to_string(),
+    })
+    .expect("docs build succeeds");
+
+    let site = build_site(SiteOptions {
+        bundle_dir: docs.bundle_dir,
+        manifest_path: docs.manifest_path.clone(),
+        output_root: target,
+    })
+    .expect("site build succeeds");
+
+    assert_eq!(site.pohunek_version, "1.2.3-test");
+    assert!(site.site_dir.join("index.html").is_file());
+    assert!(site.offline_dir.join("index.html").is_file());
+    assert!(site.site_dir.join("concepts/example.html").is_file());
+    assert!(site.offline_dir.join("concepts/example.html").is_file());
+
+    let site_index = fs::read_to_string(site.site_dir.join("index.html")).expect("site index");
+    let offline_index =
+        fs::read_to_string(site.offline_dir.join("index.html")).expect("offline index");
+    let site_page =
+        fs::read_to_string(site.site_dir.join("concepts/example.html")).expect("site page");
+    let offline_page =
+        fs::read_to_string(site.offline_dir.join("concepts/example.html")).expect("offline page");
+
+    assert_eq!(site_index, offline_index);
+    assert_eq!(site_page, offline_page);
+    assert!(offline_index.contains("pohunek 1.2.3-test"));
+    assert!(offline_index.contains("href=\"concepts/example.html\""));
+    assert!(offline_page.contains("href=\"../index.html\""));
+    assert!(!offline_index.contains("href=\"/index.html\""));
+    assert!(!offline_page.contains("href=\"/index.html\""));
+
+    let manifest = fs::read_to_string(docs.manifest_path).expect("manifest exists");
+    assert!(manifest.contains("\"pohunek_version\": \"1.2.3-test\""));
 }
 
 fn repo_root() -> PathBuf {

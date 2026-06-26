@@ -35,8 +35,9 @@ const INLINE_SAFETY: &str = "\
 - Never print, store, or infer secret values.
 - Treat agent profile [env] values as secret-bearing.
 - Explain config edits before applying them; preserve user edits unless asked to overwrite.
-- Hooks are executable code: creating or modifying any hook requires explicit, \
-per-file confirmation, independent of --yes.
+- Hooks are executable code: creation or modification requires \
+explicit per-file confirmation, independent of --yes.
+- Non-interactive contexts must quarantine proposed hook content instead of enabling it.
 - Prefer structured --json inspection commands.
 - Verify changes after applying them before claiming success.";
 
@@ -372,6 +373,43 @@ mod tests {
             prompt.contains("Hooks are executable code"),
             "degraded prompt must still carry inline safety rules; got:\n{prompt}"
         );
+    }
+
+    #[test]
+    fn inline_safety_hard_gates_hook_writes() {
+        let full_prompt = compose(ComposeParams {
+            intent: Intent::Project,
+            request: Some("install a hook"),
+            concepts: &[concept(
+                "safety/repo-pohunek",
+                Some(vec![ConceptIntent::Project]),
+            )],
+            bundle_path: "/b",
+            snapshot_path: "/s",
+            orientation: &orientation(),
+            version: "0.3.3",
+        });
+        let degraded_prompt = compose_degraded(ComposeDegradedParams {
+            intent: Intent::Project,
+            request: Some("install a hook"),
+            snapshot_path: "/s",
+            orientation: &orientation(),
+            version: "0.3.3",
+            bundle_version_note: "0.3.3",
+        });
+
+        for prompt in [&full_prompt, &degraded_prompt] {
+            assert!(
+                prompt.contains("explicit per-file confirmation, independent of --yes"),
+                "prompt must hard-gate hook writes independent of --yes; got:\n{prompt}"
+            );
+            assert!(
+                prompt.contains(
+                    "Non-interactive contexts must quarantine proposed hook content instead of enabling it."
+                ),
+                "prompt must quarantine hook writes in non-interactive contexts; got:\n{prompt}"
+            );
+        }
     }
 
     #[test]

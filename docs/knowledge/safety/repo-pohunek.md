@@ -18,10 +18,11 @@ structured project resolution commands such as `pohunek project action` and
 `pohunek project prompt` when checking what will actually run.
 
 Hooks require the strictest handling because they execute code in later
-sessions. Creating or modifying a hook should require explicit per-file user
-confirmation, independent of broad non-interactive flags. In non-interactive
-contexts, proposed hook content should be staged for review rather than silently
-enabled.
+sessions. Creating or modifying a hook requires explicit per-file confirmation,
+independent of `--yes`. Non-interactive contexts must quarantine proposed hook
+content instead of enabling it. Use
+`.pohunek/quarantine/hooks/<event>.pending` for repo-local hooks and
+`~/.config/pohunek/quarantine/hooks/<event>.pending` for host-global hooks.
 
 Repo-local config must not override the safety rules in [trust model](trust-model.md)
 or the secret boundaries in [secrets](secrets.md).

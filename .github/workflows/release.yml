@@ -100,6 +100,9 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --locked --target ${{ matrix.target }} --bin pohunek --bin pohunekd
 
+      - name: Build docs artifacts
+        run: cargo xtask docs site
+
       - name: Package
         id: package
         shell: bash
@@ -111,6 +114,9 @@ jobs:
           mkdir -p "${staging}"
           bindir="target/${{ matrix.target }}/release"
           cp "${bindir}/pohunek" "${bindir}/pohunekd" "${staging}/"
+          mkdir -p "${staging}/docs"
+          cp -R target/pohunek-docs/offline "${staging}/docs/offline"
+          cp target/pohunek-docs/manifest.json "${staging}/docs/manifest.json"
           for extra in README.md LICENSE; do
             [ -f "${extra}" ] && cp "${extra}" "${staging}/" || true
           done
