@@ -170,7 +170,7 @@ trait AgentAdapter {
 | Launch | `claude` (PTY/TUI) | `codex` (PTY/TUI) |
 | Resume argv | `claude --resume <id>` | `codex resume <id>` |
 | Session dir | `~/.claude` | `~/.codex` |
-| Input injection | **Ink TUI**: bracketed paste OFF; send `\r` as a separate write after **~150 ms** delay (else the Enter is swallowed) | bracketed paste ON for multi-line; submit `\r` |
+| Input injection | **Ink TUI**: bracketed paste OFF; send `\r` as a separate write after **~150 ms** delay (else the Enter is swallowed) | bracketed paste ON for multi-line; send `\r` as a separate write after **~150 ms** delay |
 | Blocked signal | screen form: "enter to select" + "esc to cancel" + nav hints | OSC title contains "Action Required" |
 | Working signal | Braille spinner (U+2800–U+28FF) in OSC title | Braille spinner in OSC title |
 

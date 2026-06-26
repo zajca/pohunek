@@ -8,6 +8,14 @@ use super::{
 use crate::detect::Manifest;
 use crate::pty::PtyCommand;
 
+/// Delay after bracketed paste before submitting Codex input.
+///
+/// Codex accepts bracketed paste for multi-line prompts, but newer TUIs can
+/// treat an immediate Enter in the same burst as part of paste handling instead
+/// of a submit. Keeping submit as a separate write mirrors the Claude Ink guard
+/// while preserving bracketed paste for prompt bodies.
+const CODEX_SUBMIT_DELAY: Duration = Duration::from_millis(150);
+
 /// Codex PTY/TUI adapter.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CodexAdapter;
@@ -24,7 +32,7 @@ impl AgentAdapter for CodexAdapter {
     fn input_rules(&self) -> InputRules {
         InputRules {
             bracketed_paste: true,
-            submit_delay: Duration::ZERO,
+            submit_delay: CODEX_SUBMIT_DELAY,
         }
     }
 

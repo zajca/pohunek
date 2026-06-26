@@ -573,7 +573,7 @@ mod tests {
 
         let codex = CodexAdapter.input_rules();
         assert!(codex.bracketed_paste);
-        assert_eq!(codex.submit_delay, Duration::ZERO);
+        assert_eq!(codex.submit_delay, Duration::from_millis(150));
 
         let claude = ClaudeAdapter.input_rules();
         assert!(!claude.bracketed_paste);

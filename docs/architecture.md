@@ -241,9 +241,11 @@ Kandev's hard-won handling:
 - **Claude Code (Ink TUI):** disable bracketed paste and send the submit byte
   (`\r`) as a **separate write after a ~150 ms delay**, or Ink's paste-burst
   detection absorbs the Enter into the pasted text and the prompt never submits.
-- **Other agents (Codex, etc.):** wrap multi-line prompts in bracketed paste
-  (`ESC[200~` … `ESC[201~`) so embedded newlines are not treated as premature
-  Enter; submit with `\r`.
+- **Codex:** wrap multi-line prompts in bracketed paste (`ESC[200~` …
+  `ESC[201~`) so embedded newlines are not treated as premature Enter; send
+  the submit byte (`\r`) as a separate write after a short delay so newer TUIs
+  do not absorb Enter into paste handling.
+- **Other agents:** use the agent adapter's framing rules.
 
 These per-agent input rules live in the agent adapter next to its launch command,
 state manifest, and resume command.

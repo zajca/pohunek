@@ -155,8 +155,7 @@ pub struct SessionRegistryConfig {
     /// agent produces any output, so this caps the delay rather than imposing
     /// it; a value of `Duration::ZERO` disables the gate and injects
     /// immediately. Prevents the prompt from being delivered to a TUI that has
-    /// not yet entered raw/bracketed-paste input mode (Codex has a zero submit
-    /// delay, so without this its bracketed-paste prompt can race startup).
+    /// not yet entered raw/bracketed-paste input mode.
     pub initial_input_startup_grace: Duration,
     /// Control socket path injected into Codex/Claude agents so their hook can
     /// call home. `None` disables hook-handshake env injection (e.g. in unit
