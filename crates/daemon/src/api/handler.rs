@@ -11,12 +11,12 @@
 //! methods.
 
 use protocol::{
-    method, negotiate, HostDiscoverParams, IntegrationInstallParams, ProjectActionParams,
-    ProjectActionsParams, ProjectActionsResult, ProjectAddParams, ProjectListParams,
-    ProjectPromptParams, ProjectRemoveParams, ProjectRenameParams, ProjectShowParams,
-    ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams, SessionId,
-    SessionInputParams, SessionListParams, SessionNewParams, SessionNewResult,
-    SessionReportNativeIdParams, SessionResizeParams, PROTOCOL_VERSION,
+    method, negotiate, AssistantMaterializeParams, AssistantMaterializeResult, HostDiscoverParams,
+    IntegrationInstallParams, ProjectActionParams, ProjectActionsParams, ProjectActionsResult,
+    ProjectAddParams, ProjectListParams, ProjectPromptParams, ProjectRemoveParams,
+    ProjectRenameParams, ProjectShowParams, ProtocolError, Request, Response, SessionAttachParams,
+    SessionDetachParams, SessionId, SessionInputParams, SessionListParams, SessionNewParams,
+    SessionNewResult, SessionReportNativeIdParams, SessionResizeParams, PROTOCOL_VERSION,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -161,6 +161,8 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::SESSION_REPORT_NATIVE_ID => {
             handle_session_report_native_id(request, &state.sessions).await
         }
+        method::DAEMON_DOCTOR => handle_daemon_doctor(request).await,
+        method::ASSISTANT_MATERIALIZE => handle_assistant_materialize(request).await,
         method::INTEGRATION_INSTALL => handle_integration_install(request),
         method::HOST_INSPECT => handle_host_inspect(request, &state.health, &state.sessions),
         method::HOST_DISCOVER => handle_host_discover(request, &state.discovery).await,
@@ -577,6 +579,82 @@ fn handle_integration_install(request: &Request) -> Response {
     }
 }
 
+async fn handle_daemon_doctor(request: &Request) -> Response {
+    if !request.params.is_null() {
+        return Response::err(
+            request.id.clone(),
+            ProtocolError::bad_request("daemon.doctor does not accept params"),
+        );
+    }
+    let paths = match crate::Paths::resolve() {
+        Ok(paths) => paths,
+        Err(err) => {
+            return Response::err(
+                request.id.clone(),
+                ProtocolError::new(
+                    protocol::ErrorClass::Configuration,
+                    "paths_unavailable",
+                    format!("failed to resolve daemon paths: {err}"),
+                    Some("set the required XDG environment variables and retry".to_owned()),
+                ),
+            );
+        }
+    };
+    match tokio::task::spawn_blocking(move || crate::doctor::report(&paths)).await {
+        Ok(report) => ok_value(request, &protocol::DaemonDoctorResult { report }),
+        Err(_) => Response::err(
+            request.id.clone(),
+            ProtocolError::new(
+                protocol::ErrorClass::Daemon,
+                "doctor_task_panicked",
+                "daemon doctor task panicked".to_owned(),
+                Some("retry the request; if it repeats, inspect daemon logs".to_owned()),
+            ),
+        ),
+    }
+}
+
+async fn handle_assistant_materialize(request: &Request) -> Response {
+    let params = match parse_params::<AssistantMaterializeParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    let paths = match crate::Paths::resolve() {
+        Ok(paths) => paths,
+        Err(err) => {
+            return Response::err(
+                request.id.clone(),
+                ProtocolError::materialization_failed("assistant paths", &err.to_string()),
+            );
+        }
+    };
+
+    let snapshot = params.snapshot;
+    run_assistant_materialize_blocking(request, move || {
+        crate::assistant::materialize_assistant(&paths, &snapshot)
+    })
+    .await
+}
+
+async fn run_assistant_materialize_blocking<F>(request: &Request, op: F) -> Response
+where
+    F: FnOnce() -> Result<AssistantMaterializeResult, ProtocolError> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(op).await {
+        Ok(Ok(result)) => ok_value(request, &result),
+        Ok(Err(err)) => Response::err(request.id.clone(), err),
+        Err(_) => Response::err(
+            request.id.clone(),
+            ProtocolError::new(
+                protocol::ErrorClass::Daemon,
+                "assistant_materialize_task_panicked",
+                "assistant materialization task panicked".to_owned(),
+                Some("retry the request; if it repeats, inspect daemon logs".to_owned()),
+            ),
+        ),
+    }
+}
+
 fn parse_params<T>(request: &Request) -> Result<T, ProtocolError>
 where
     T: serde::de::DeserializeOwned,
@@ -647,9 +725,13 @@ fn parse_attach_prelude(line: &str) -> Option<String> {
 mod tests {
     use std::path::PathBuf;
 
-    use protocol::{AgentKind, SessionId, SessionInfo, SessionState, StateSource};
+    use protocol::{
+        method, AgentKind, AssistantMaterializeParams, AssistantMaterializeResult,
+        DaemonDoctorResult, Request, SessionId, SessionInfo, SessionState, StateSource,
+    };
 
-    use super::{live_sessions, parse_attach_prelude};
+    use super::{handle_request, live_sessions, parse_attach_prelude, DaemonState, HealthInfo};
+    use crate::session::{SessionRegistry, SessionRegistryConfig};
 
     /// A minimal `SessionInfo` for the given id/state with a worktree path, so a
     /// test can assert which sessions survive the `project show` live filter.
@@ -678,6 +760,182 @@ mod tests {
             created_at: "2026-06-23T00:00:00Z".to_owned(),
             updated_at: "2026-06-23T00:00:00Z".to_owned(),
             exit_code: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn assistant_materialize_persists_snapshot_and_returns_bundle_metadata() {
+        let _env = EnvGuard::set_all("assistant-materialize-rpc");
+        let state = DaemonState::new(
+            HealthInfo::new("test"),
+            SessionRegistry::new(SessionRegistryConfig::default()),
+        );
+        let params = AssistantMaterializeParams {
+            snapshot: r#"{"daemon":"running"}"#.to_owned(),
+        };
+        let request = Request::new(
+            "assistant-materialize",
+            method::ASSISTANT_MATERIALIZE,
+            serde_json::to_value(params).expect("params serialize"),
+        );
+
+        let response = handle_request(&request, &state).await;
+
+        let protocol::Response::Ok { ok, .. } = response else {
+            panic!("expected assistant.materialize ok response: {response:?}");
+        };
+        let result: AssistantMaterializeResult =
+            serde_json::from_value(ok).expect("result deserializes");
+        assert!(std::path::Path::new(&result.bundle_path)
+            .join("index.md")
+            .is_file());
+        assert_eq!(
+            std::fs::read_to_string(&result.snapshot_path).expect("snapshot"),
+            r#"{"daemon":"running"}"#
+        );
+        assert!(result.content_hash.starts_with("sha256:"));
+        assert!(!result.concepts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn assistant_materialize_uses_unique_snapshot_paths_per_request() {
+        let _env = EnvGuard::set_all("assistant-materialize-unique-rpc");
+        let state = DaemonState::new(
+            HealthInfo::new("test"),
+            SessionRegistry::new(SessionRegistryConfig::default()),
+        );
+
+        let first =
+            assistant_materialize_result(&state, "assistant-materialize-first", "first").await;
+        let second =
+            assistant_materialize_result(&state, "assistant-materialize-second", "second").await;
+
+        assert_eq!(first.bundle_path, second.bundle_path);
+        assert_ne!(first.snapshot_path, second.snapshot_path);
+        assert_eq!(
+            std::fs::read_to_string(&first.snapshot_path).expect("first snapshot"),
+            "first"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&second.snapshot_path).expect("second snapshot"),
+            "second"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_doctor_returns_report() {
+        let _env = EnvGuard::set_all("daemon-doctor-rpc");
+        let state = DaemonState::new(
+            HealthInfo::new("test"),
+            SessionRegistry::new(SessionRegistryConfig::default()),
+        );
+        let request = Request::new(
+            "daemon-doctor",
+            method::DAEMON_DOCTOR,
+            serde_json::Value::Null,
+        );
+
+        let response = handle_request(&request, &state).await;
+
+        let protocol::Response::Ok { ok, .. } = response else {
+            panic!("expected daemon.doctor ok response: {response:?}");
+        };
+        let result: DaemonDoctorResult =
+            serde_json::from_value(ok).expect("doctor result deserializes");
+        assert!(result
+            .report
+            .checks
+            .iter()
+            .any(|check| check.name == "socket_dir_writable"));
+    }
+
+    #[tokio::test]
+    async fn assistant_materialize_blocking_task_panic_returns_daemon_error() {
+        let request = Request::new(
+            "assistant-materialize-panic",
+            method::ASSISTANT_MATERIALIZE,
+            serde_json::json!({ "snapshot": "{}" }),
+        );
+
+        let response =
+            super::run_assistant_materialize_blocking(&request, || panic!("materialize panic"))
+                .await;
+
+        let protocol::Response::Err { err, .. } = response else {
+            panic!("expected assistant.materialize error response: {response:?}");
+        };
+        assert_eq!(err.class, protocol::ErrorClass::Daemon);
+        assert_eq!(err.code, "assistant_materialize_task_panicked");
+    }
+
+    async fn assistant_materialize_result(
+        state: &DaemonState,
+        id: &str,
+        snapshot: &str,
+    ) -> AssistantMaterializeResult {
+        let params = AssistantMaterializeParams {
+            snapshot: snapshot.to_owned(),
+        };
+        let request = Request::new(
+            id,
+            method::ASSISTANT_MATERIALIZE,
+            serde_json::to_value(params).expect("params serialize"),
+        );
+        let response = handle_request(&request, state).await;
+        let protocol::Response::Ok { ok, .. } = response else {
+            panic!("expected assistant.materialize ok response: {response:?}");
+        };
+        serde_json::from_value(ok).expect("result deserializes")
+    }
+
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn set_all(tag: &str) -> Self {
+            let _lock = crate::test_support::XDG_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let vars = [
+                "XDG_RUNTIME_DIR",
+                "XDG_STATE_HOME",
+                "XDG_DATA_HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_CACHE_HOME",
+                "HOME",
+            ];
+            let saved = vars
+                .iter()
+                .map(|&key| (key, std::env::var(key).ok()))
+                .collect::<Vec<_>>();
+            let root = std::env::temp_dir().join(format!(
+                "pohunek-handler-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock is after unix epoch")
+                    .as_nanos()
+            ));
+            std::env::set_var("XDG_RUNTIME_DIR", root.join("runtime"));
+            std::env::set_var("XDG_STATE_HOME", root.join("state"));
+            std::env::set_var("XDG_DATA_HOME", root.join("data"));
+            std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
+            std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
+            std::env::set_var("HOME", root.join("home"));
+            Self { _lock, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
         }
     }
 

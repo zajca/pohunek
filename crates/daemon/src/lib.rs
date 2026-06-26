@@ -25,8 +25,10 @@ pub mod logging;
 pub mod paths;
 
 pub mod api;
+pub mod assistant;
 pub mod capabilities;
 pub mod discovery;
+pub mod doctor;
 
 // PTY ownership, the session registry/supervisor, and raw attach streaming are
 // implemented; the remaining modules are future-milestone stubs (see plan
@@ -47,3 +49,8 @@ pub use paths::Paths;
 
 /// Daemon build version (from Cargo). Reported by `daemon.health`.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) static XDG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}

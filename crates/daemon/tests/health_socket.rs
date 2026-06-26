@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use protocol::{
-    event, method, AgentActivity, AgentKind, AttachHeader, ErrorClass, Event, Request, Response,
+    event, method, AgentActivity, AgentKind, AssistantMaterializeParams,
+    AssistantMaterializeResult, AttachHeader, ErrorClass, Event, Request, Response,
     SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
     SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
     SessionNewParams, SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult,
@@ -32,6 +33,7 @@ use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellComma
 use pohunek_daemon::store::Store;
 
 static PATH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static XDG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct PathGuard {
@@ -97,6 +99,51 @@ impl Drop for PathGuard {
         match &self.old_path {
             Some(path) => std::env::set_var("PATH", path),
             None => std::env::remove_var("PATH"),
+        }
+    }
+}
+
+struct XdgGuard {
+    _guard: MutexGuard<'static, ()>,
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+impl XdgGuard {
+    async fn set_all(tag: &str) -> Self {
+        let guard = XDG_LOCK.lock().await;
+        let vars = [
+            "XDG_RUNTIME_DIR",
+            "XDG_STATE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "HOME",
+        ];
+        let saved = vars
+            .iter()
+            .map(|&key| (key, std::env::var(key).ok()))
+            .collect::<Vec<_>>();
+        let root = temp_dir(tag);
+        std::env::set_var("XDG_RUNTIME_DIR", root.join("runtime"));
+        std::env::set_var("XDG_STATE_HOME", root.join("state"));
+        std::env::set_var("XDG_DATA_HOME", root.join("data"));
+        std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
+        std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
+        std::env::set_var("HOME", root.join("home"));
+        Self {
+            _guard: guard,
+            saved,
+        }
+    }
+}
+
+impl Drop for XdgGuard {
+    fn drop(&mut self) {
+        for (key, value) in &self.saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
         }
     }
 }
@@ -793,6 +840,42 @@ async fn health_returns_versions() {
             assert_eq!(ok["status"], Value::from("ok"));
             assert_eq!(ok["daemon_version"], Value::from("9.9.9-test"));
             assert_eq!(ok["protocol_version"], Value::from(PROTOCOL_VERSION.get()));
+        }
+        Response::Err { err, .. } => panic!("expected ok, got error: {err}"),
+    }
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn assistant_materialize_returns_readable_paths_over_socket() {
+    let _env = XdgGuard::set_all("assistant-materialize-socket").await;
+    let socket = temp_socket("assistant-materialize");
+    let (shutdown, handle) = spawn_server(&socket, "0.0.0").await;
+
+    let mut client = connect(&socket).await;
+    let params = AssistantMaterializeParams {
+        snapshot: r#"{"source":"socket"}"#.to_owned(),
+    };
+    let req = Request::new(
+        "assistant-materialize-socket",
+        method::ASSISTANT_MATERIALIZE,
+        serde_json::to_value(params).expect("params serialize"),
+    );
+    let resp = exchange(&mut client, &req).await;
+
+    match resp {
+        Response::Ok { ok, .. } => {
+            let result: AssistantMaterializeResult =
+                serde_json::from_value(ok).expect("result deserializes");
+            assert!(Path::new(&result.bundle_path).join("index.md").is_file());
+            assert_eq!(
+                std::fs::read_to_string(&result.snapshot_path).expect("snapshot"),
+                r#"{"source":"socket"}"#
+            );
+            assert!(result.content_hash.starts_with("sha256:"));
+            assert!(!result.concepts.is_empty());
         }
         Response::Err { err, .. } => panic!("expected ok, got error: {err}"),
     }
