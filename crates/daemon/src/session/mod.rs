@@ -395,6 +395,12 @@ struct PtySessionSpec {
     warnings: Vec<SessionWarning>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LaunchCommandPlan {
+    command: PtyCommand,
+    pending_initial_input: Option<String>,
+}
+
 /// Frozen structural relaunch snapshot for a session (Part C, C.4).
 ///
 /// Set once at launch from the [`ResolvedAgent`] and persisted verbatim on every
@@ -963,43 +969,47 @@ impl SessionRegistry {
                 .map(|profile| profile.env.clone())
                 .unwrap_or_default();
             env_extra.extend(self.session_pty_env(base, &id));
-            let command = build_launch_command(
+            let plan = build_launch_command(
                 &resolved,
                 &self.inner.config.shell_command,
                 launch_cwd.clone(),
                 params.cols,
                 params.rows,
                 env_extra,
+                initial_input.clone(),
             )?;
 
-            self.register_pty_session(PtySessionSpec {
-                id: id.clone(),
-                agent: resolved.name.clone(),
-                agent_base: base,
-                input_rules,
-                snapshot,
-                manifest_override,
-                cwd: launch_cwd,
-                cols: params.cols,
-                rows: params.rows,
-                command,
-                native_session_id: None,
-                native_session_path: None,
-                project_id,
-                is_linked_worktree,
-                repo,
-                branch,
-                worktree_path,
-                warnings,
-            })
-            .await
+            let info = self
+                .register_pty_session(PtySessionSpec {
+                    id: id.clone(),
+                    agent: resolved.name.clone(),
+                    agent_base: base,
+                    input_rules,
+                    snapshot,
+                    manifest_override,
+                    cwd: launch_cwd,
+                    cols: params.cols,
+                    rows: params.rows,
+                    command: plan.command,
+                    native_session_id: None,
+                    native_session_path: None,
+                    project_id,
+                    is_linked_worktree,
+                    repo,
+                    branch,
+                    worktree_path,
+                    warnings,
+                })
+                .await?;
+
+            Ok((info, plan.pending_initial_input))
         }
         .await;
 
         if launch.is_err() && worktree_bound {
             self.cleanup_bound_worktree(&id).await;
         }
-        let info = launch?;
+        let (info, pending_initial_input) = launch?;
         self.spawn_session_hook(SessionHookRequest {
             event: HookEvent::SessionStart,
             cwd: info.cwd.clone(),
@@ -1009,7 +1019,7 @@ impl SessionRegistry {
             stop_reason: None,
             activity: None,
         });
-        if let Some(input) = initial_input {
+        if let Some(input) = pending_initial_input {
             // Wait for the agent to come up before injecting the first prompt so
             // the bytes are not delivered to a stdin reader that has not yet
             // entered raw/bracketed-paste mode (and would drop or mis-frame
@@ -2605,7 +2615,8 @@ fn build_launch_command(
     cols: u16,
     rows: u16,
     env_extra: Vec<(String, String)>,
-) -> Result<PtyCommand, ProtocolError> {
+    initial_input: Option<String>,
+) -> Result<LaunchCommandPlan, ProtocolError> {
     // Shell carries no agent-hook handshake, but it does carry the universal
     // `POHUNEK_SESSION_ID` marker (see `session_pty_env`) so a `pohunek attach`
     // launched inside it is still caught as a self-feeding loop.
@@ -2615,13 +2626,43 @@ fn build_launch_command(
         rows,
         env_extra,
     };
-    match &resolved.profile {
+    let command = match &resolved.profile {
         // A host profile overrides the launch program/args; build via the shared
         // PATH-resolving primitive (the same one the base adapters use).
-        Some(profile) => build_pty_command(&profile.program, profile.args.clone(), &opts),
-        // A bare base kind launches exactly as the compiled adapter (zero change).
-        None => launch_adapter_for(resolved.base, shell_command).launch(&opts),
+        Some(profile) => build_pty_command(&profile.program, profile.args.clone(), &opts)?,
+        // A bare base kind launches exactly as the compiled adapter.
+        None => launch_adapter_for(resolved.base, shell_command).launch(&opts)?,
+    };
+    Ok(plan_initial_input_delivery(
+        resolved,
+        command,
+        initial_input,
+    ))
+}
+
+fn plan_initial_input_delivery(
+    resolved: &ResolvedAgent,
+    mut command: PtyCommand,
+    initial_input: Option<String>,
+) -> LaunchCommandPlan {
+    if resolved.profile.is_none() && prompt_arg_supported(resolved.base) {
+        if let Some(input) = initial_input {
+            command.args.push(input);
+        }
+        return LaunchCommandPlan {
+            command,
+            pending_initial_input: None,
+        };
     }
+
+    LaunchCommandPlan {
+        command,
+        pending_initial_input: initial_input,
+    }
+}
+
+fn prompt_arg_supported(agent: AgentKind) -> bool {
+    matches!(agent, AgentKind::Codex | AgentKind::Claude)
 }
 
 fn input_rules_for_agent(agent: AgentKind, config: &SessionRegistryConfig) -> InputRules {
@@ -3045,6 +3086,7 @@ mod tests {
     use crate::integration::{
         ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
     };
+    use crate::pty::PtyCommand;
 
     use super::{LagWarn, LagWarnThrottle, SessionRegistry, SessionRegistryConfig, ShellCommand};
     use std::time::Instant;
@@ -3147,6 +3189,17 @@ mod tests {
         ActivityTransition {
             activity,
             source: protocol::StateSource::Process,
+        }
+    }
+
+    fn pty_command<'a>(program: &str, args: impl IntoIterator<Item = &'a str>) -> PtyCommand {
+        PtyCommand {
+            program: program.to_owned(),
+            args: args.into_iter().map(str::to_owned).collect(),
+            env: Vec::new(),
+            cwd: PathBuf::from("/tmp"),
+            cols: 80,
+            rows: 24,
         }
     }
 
@@ -4774,6 +4827,79 @@ mod tests {
         assert_eq!(
             writes.delayed_submit,
             Some((Duration::from_millis(150), b"\r".to_vec()))
+        );
+    }
+
+    #[test]
+    fn bare_codex_launch_receives_initial_input_as_prompt_arg() {
+        let resolved = crate::agent::ProfileRegistry::default()
+            .resolve_agent("codex")
+            .expect("resolve bare codex");
+        let plan = super::plan_initial_input_delivery(
+            &resolved,
+            pty_command("codex", []),
+            Some("# Pohunek Assistant".to_owned()),
+        );
+
+        assert_eq!(plan.command.args, vec!["# Pohunek Assistant".to_owned()]);
+        assert_eq!(plan.pending_initial_input, None);
+    }
+
+    #[test]
+    fn bare_claude_launch_receives_initial_input_as_prompt_arg() {
+        let resolved = crate::agent::ProfileRegistry::default()
+            .resolve_agent("claude")
+            .expect("resolve bare claude");
+        let plan = super::plan_initial_input_delivery(
+            &resolved,
+            pty_command("claude", []),
+            Some("# Pohunek Assistant".to_owned()),
+        );
+
+        assert_eq!(plan.command.args, vec!["# Pohunek Assistant".to_owned()]);
+        assert_eq!(plan.pending_initial_input, None);
+    }
+
+    #[test]
+    fn shell_launch_keeps_initial_input_for_pty_injection() {
+        let resolved = crate::agent::ProfileRegistry::default()
+            .resolve_agent("shell")
+            .expect("resolve shell");
+        let plan = super::plan_initial_input_delivery(
+            &resolved,
+            pty_command("/bin/sh", ["-c", "sleep 30"]),
+            Some("hello shell".to_owned()),
+        );
+
+        assert_eq!(plan.pending_initial_input.as_deref(), Some("hello shell"));
+    }
+
+    #[test]
+    fn host_profile_launch_keeps_initial_input_for_pty_injection() {
+        let agents_dir = temp_dir("profile-initial-prompt-agents");
+        fs::write(
+            agents_dir.join("wrapped-codex.toml"),
+            "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
+        )
+        .expect("write profile");
+        let registry = crate::agent::ProfileRegistry::new(Some(agents_dir));
+        let resolved = registry
+            .resolve_agent("wrapped-codex")
+            .expect("resolve profile");
+
+        let plan = super::plan_initial_input_delivery(
+            &resolved,
+            pty_command("/bin/sh", ["-c", "sleep 30"]),
+            Some("# Pohunek Assistant".to_owned()),
+        );
+
+        assert_eq!(
+            plan.command.args,
+            vec!["-c".to_owned(), "sleep 30".to_owned()]
+        );
+        assert_eq!(
+            plan.pending_initial_input.as_deref(),
+            Some("# Pohunek Assistant")
         );
     }
 
