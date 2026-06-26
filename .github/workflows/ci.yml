@@ -62,3 +62,62 @@ jobs:
         run: cargo xtask docs check
         env:
           RUSTFLAGS: -D warnings
+
+  # Dependency hygiene (M-STATIC-VERIFICATION): security advisories, the Cargo
+  # feature matrix, and unused dependencies. Kept off the critical `test` job so
+  # an advisory in a transitive crate stays visible without masking a real
+  # failure.
+  audit:
+    name: cargo-audit (RustSec advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit dependencies
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  feature-matrix:
+    name: cargo-hack (feature powerset)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: feature-matrix
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+
+      # Validates every feature combination compiles. knowledge gates its
+      # protocol bridge behind the `protocol` feature; --all-features only
+      # exercises the everything-on case.
+      - name: Check feature powerset
+        run: cargo hack --feature-powerset --workspace clippy --all-targets
+
+  udeps:
+    name: cargo-udeps (unused dependencies)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: udeps
+
+      - name: Install cargo-udeps
+        uses: taiki-e/install-action@cargo-udeps
+
+      - name: Check for unused dependencies
+        run: cargo udeps --workspace --all-targets --all-features
