@@ -1,0 +1,24 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Workspace automation for pohunek."
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+knowledge = { package = "pohunek-knowledge", path = "../knowledge" }
+cli = { package = "pohunek-cli", path = "../cli" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+regex = { workspace = true }
+clap = { workspace = true }
+pulldown-cmark = "0.12"
+
+[dev-dependencies]
+serde_json = { workspace = true }
