@@ -6,8 +6,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DoctorStatus {
+    /// Check passed.
     Ok,
+    /// Check passed with a warning.
     Warn,
+    /// Check failed.
     Fail,
 }
 
@@ -26,8 +29,11 @@ impl DoctorStatus {
 /// One reported doctor check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DoctorCheck {
+    /// Short check name.
     pub name: String,
+    /// Outcome status for this check.
     pub status: DoctorStatus,
+    /// Human-readable detail explaining the outcome.
     pub detail: String,
 }
 
@@ -45,7 +51,9 @@ impl DoctorCheck {
 /// Aggregated doctor report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DoctorReport {
+    /// Individual checks that were run.
     pub checks: Vec<DoctorCheck>,
+    /// Aggregated overall status across all checks.
     pub overall: DoctorStatus,
 }
 
@@ -67,5 +75,6 @@ impl DoctorReport {
 /// Result returned by `daemon.doctor`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonDoctorResult {
+    /// Full doctor report produced by the daemon.
     pub report: DoctorReport,
 }

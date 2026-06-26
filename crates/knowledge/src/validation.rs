@@ -1,22 +1,32 @@
 //! Validation for markdown knowledge bundles.
 
 use std::collections::HashMap;
-use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+
+use thiserror::Error;
 
 use crate::{Concept, ConceptType, CONCEPT_SCHEMA_VERSION};
 
 /// Summary returned after a bundle passes validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BundleValidationReport {
+    /// Concept frontmatter schema version this bundle was checked against.
     pub schema_version: u32,
+    /// Number of markdown files inspected during validation.
     pub files_checked: usize,
+    /// All concepts parsed from the bundle, in sorted file order.
     pub concepts: Vec<Concept>,
 }
 
 /// A failed bundle validation with one or more precise issues.
+///
+/// `Display` joins every contained [`BundleValidationIssue`] with `; `; that
+/// loop cannot be expressed with a `thiserror` format string, so this type
+/// keeps a hand-written `Display` and implements [`std::error::Error`]
+/// directly. The per-issue messages it formats come from the `thiserror`
+/// derive on [`BundleValidationIssue`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BundleValidationError {
     issues: Vec<BundleValidationIssue>,
@@ -46,108 +56,82 @@ impl fmt::Display for BundleValidationError {
     }
 }
 
-impl Error for BundleValidationError {}
+impl std::error::Error for BundleValidationError {}
 
 /// Individual validation failures.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum BundleValidationIssue {
+    #[error("failed to read directory `{}`: {message}", path.display())]
     ReadDir {
+        /// Directory that could not be read.
         path: PathBuf,
+        /// Underlying I/O error message.
         message: String,
     },
+    #[error("failed to read file `{}`: {message}", path.display())]
     ReadFile {
+        /// File that could not be read.
         path: PathBuf,
+        /// Underlying I/O error message.
         message: String,
     },
+    #[error("missing frontmatter in `{}`", path.display())]
     MissingFrontmatter {
+        /// File missing concept frontmatter.
         path: PathBuf,
     },
+    #[error("invalid frontmatter in `{}`: {message}", path.display())]
     InvalidFrontmatter {
+        /// File with malformed frontmatter.
         path: PathBuf,
+        /// Parser error message.
         message: String,
     },
+    #[error("duplicate concept id `{id}` in `{}` and `{}`", first_path.display(), duplicate_path.display())]
     DuplicateId {
+        /// Concept id seen more than once.
         id: String,
+        /// First file declaring the id.
         first_path: PathBuf,
+        /// Later file re-declaring the id.
         duplicate_path: PathBuf,
     },
+    #[error("concept `{id}` of type {concept_type:?} requires `since` in `{}`", path.display())]
     MissingSince {
+        /// File whose concept is missing `since`.
         path: PathBuf,
+        /// Concept id missing the `since` field.
         id: String,
+        /// Concept type that requires `since`.
         concept_type: ConceptType,
     },
+    #[error("broken internal markdown link `{target}` in `{}`", path.display())]
     BrokenLink {
+        /// File containing the broken link.
         path: PathBuf,
+        /// Link target that did not resolve.
         target: String,
     },
+    #[error("reserved markdown file `{}` must not contain concept frontmatter", path.display())]
     ReservedFrontmatter {
+        /// Reserved file carrying disallowed frontmatter.
         path: PathBuf,
     },
+    #[error("unsupported file type in knowledge bundle: `{}`", path.display())]
     UnsupportedFileType {
+        /// Path of the unsupported (non-file) entry.
         path: PathBuf,
     },
-}
-
-impl fmt::Display for BundleValidationIssue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ReadDir { path, message } => {
-                write!(
-                    f,
-                    "failed to read directory `{}`: {message}",
-                    path.display()
-                )
-            }
-            Self::ReadFile { path, message } => {
-                write!(f, "failed to read file `{}`: {message}", path.display())
-            }
-            Self::MissingFrontmatter { path } => {
-                write!(f, "missing frontmatter in `{}`", path.display())
-            }
-            Self::InvalidFrontmatter { path, message } => {
-                write!(f, "invalid frontmatter in `{}`: {message}", path.display())
-            }
-            Self::DuplicateId {
-                id,
-                first_path,
-                duplicate_path,
-            } => write!(
-                f,
-                "duplicate concept id `{id}` in `{}` and `{}`",
-                first_path.display(),
-                duplicate_path.display()
-            ),
-            Self::MissingSince {
-                path,
-                id,
-                concept_type,
-            } => write!(
-                f,
-                "concept `{id}` of type {concept_type:?} requires `since` in `{}`",
-                path.display()
-            ),
-            Self::BrokenLink { path, target } => write!(
-                f,
-                "broken internal markdown link `{target}` in `{}`",
-                path.display()
-            ),
-            Self::ReservedFrontmatter { path } => write!(
-                f,
-                "reserved markdown file `{}` must not contain concept frontmatter",
-                path.display()
-            ),
-            Self::UnsupportedFileType { path } => {
-                write!(
-                    f,
-                    "unsupported file type in knowledge bundle: `{}`",
-                    path.display()
-                )
-            }
-        }
-    }
 }
 
 /// Validate a markdown knowledge bundle directory.
+///
+/// # Errors
+///
+/// Returns a [`BundleValidationError`] collecting every issue found: unreadable
+/// directories or files, missing or invalid frontmatter, duplicate concept ids,
+/// concepts missing a required `since`, broken internal links, reserved files
+/// carrying frontmatter, or unsupported file types.
 pub fn validate_bundle(
     dir: impl AsRef<Path>,
 ) -> Result<BundleValidationReport, BundleValidationError> {

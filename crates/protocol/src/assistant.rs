@@ -54,22 +54,39 @@ pub struct ConceptMeta {
 }
 
 /// Protocol-local copy of the knowledge concept type enum.
+///
+/// Mirrors `knowledge::ConceptType`; the two are bridged in the knowledge
+/// crate's `protocol_conversions.rs` and guarded by a parity test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum ConceptType {
+    /// General explanatory concept.
     Concept,
+    /// Step-by-step how-to guide.
     Guide,
+    /// Operational runbook.
     Runbook,
+    /// Troubleshooting reference.
     Troubleshooting,
+    /// Safety policy the assistant must enforce.
     SafetyPolicy,
+    /// Documentation for a CLI command.
     CliCommand,
+    /// Documentation for a configuration option.
     ConfigReference,
+    /// Documentation for a protocol method.
     ProtocolMethod,
+    /// Documentation for a protocol event.
     ProtocolEvent,
+    /// Asset used during environment setup.
     SetupAsset,
+    /// Reusable prompt template.
     PromptTemplate,
+    /// Mapping from concepts to their source material.
     SourceMap,
+    /// Template for live snapshot content.
     SnapshotTemplate,
+    /// Release note entry.
     ReleaseNote,
 }
 

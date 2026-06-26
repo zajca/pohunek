@@ -9,12 +9,49 @@ use sha2::{Digest, Sha256};
 pub const BUNDLE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Whether generated reference concepts were included in the embedded bundle.
-pub const REFERENCE_MODE: &str = env!("POHUNEK_KNOWLEDGE_REFERENCE_MODE");
+///
+/// Only consumed by tests; the value is set by the build script.
+#[cfg(test)]
+const REFERENCE_MODE: &str = env!("POHUNEK_KNOWLEDGE_REFERENCE_MODE");
 
 const EMBEDDED_BUNDLE_CONTENT_HASH: &str = env!("POHUNEK_KNOWLEDGE_CONTENT_HASH");
 
 /// Embedded assistant knowledge bundle.
-pub static BUNDLE: Dir<'static> = include_dir!("$OUT_DIR/knowledge-bundle");
+static BUNDLE: Dir<'static> = include_dir!("$OUT_DIR/knowledge-bundle");
+
+/// Crate-owned handle to the embedded assistant knowledge bundle.
+///
+/// Wraps the third-party [`include_dir::Dir`] so it never appears in this
+/// crate's public contract. Exposes only the read/extract operations consumers
+/// need; bundle walking for indexing stays crate-internal.
+#[derive(Clone, Copy, Debug)]
+pub struct EmbeddedBundle {
+    dir: &'static Dir<'static>,
+}
+
+impl EmbeddedBundle {
+    /// Extract the embedded bundle into `target`, preserving its directory tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`std::io::Error`] if any file or directory in the bundle
+    /// cannot be created under `target`.
+    pub fn extract(self, target: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        self.dir.extract(target)
+    }
+
+    /// Return the UTF-8 text of a bundle-relative file, if it exists and is
+    /// valid UTF-8.
+    #[must_use]
+    pub fn get_text(self, path: &str) -> Option<&'static str> {
+        self.dir.get_file(path).and_then(|file| file.contents_utf8())
+    }
+
+    /// Borrow the underlying embedded directory for crate-internal walking.
+    pub(crate) fn as_dir(self) -> &'static Dir<'static> {
+        self.dir
+    }
+}
 
 /// Return the memoized content hash for the bundle bytes compiled into this
 /// crate.
@@ -34,6 +71,10 @@ pub fn materialized_version_hash() -> String {
 }
 
 /// Return a unique runtime launch id for one assistant materialization.
+///
+/// # Panics
+///
+/// Panics if the system clock is set before the Unix epoch.
 #[must_use]
 pub fn assistant_launch_id(version_hash: &str) -> String {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -50,8 +91,8 @@ pub fn assistant_launch_id(version_hash: &str) -> String {
 
 /// Return the embedded assistant knowledge bundle.
 #[must_use]
-pub fn embedded_bundle() -> &'static Dir<'static> {
-    &BUNDLE
+pub fn embedded_bundle() -> EmbeddedBundle {
+    EmbeddedBundle { dir: &BUNDLE }
 }
 
 /// Compute a SHA-256 digest for a byte slice.
@@ -122,10 +163,10 @@ mod tests {
     #[test]
     fn embedded_bundle_contains_manual_index() {
         let index = embedded_bundle()
-            .get_file("index.md")
+            .get_text("index.md")
             .expect("embedded bundle contains index.md");
 
-        assert!(index.contents_utf8().is_some_and(|body| body.contains('#')));
+        assert!(index.contains('#'));
         assert_eq!(REFERENCE_MODE, "manual-only");
     }
 }

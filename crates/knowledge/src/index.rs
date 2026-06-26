@@ -1,11 +1,10 @@
 //! Read-only metadata accessors for the embedded knowledge bundle.
 
-use std::error::Error;
-use std::fmt;
 use std::path::{Path, PathBuf};
 
 use include_dir::{Dir, DirEntry, File};
 use serde::Serialize;
+use thiserror::Error;
 
 use crate::assistant::embedded_bundle;
 use crate::{Concept, ConceptType, Deprecation, Intent};
@@ -29,7 +28,8 @@ pub struct ConceptMeta {
 }
 
 /// Error returned when embedded concept metadata cannot be indexed.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+#[error("invalid embedded knowledge concept `{}`: {message}", path.display())]
 pub struct BundleIndexError {
     path: PathBuf,
     message: String,
@@ -50,19 +50,6 @@ impl BundleIndexError {
     }
 }
 
-impl fmt::Display for BundleIndexError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "invalid embedded knowledge concept `{}`: {}",
-            self.path.display(),
-            self.message
-        )
-    }
-}
-
-impl Error for BundleIndexError {}
-
 impl From<Concept> for ConceptMeta {
     fn from(concept: Concept) -> Self {
         Self {
@@ -79,9 +66,14 @@ impl From<Concept> for ConceptMeta {
 }
 
 /// Return allowlisted metadata for concepts in the embedded knowledge bundle.
+///
+/// # Errors
+///
+/// Returns a [`BundleIndexError`] if any embedded concept file is not valid
+/// UTF-8, is missing frontmatter, or has frontmatter that fails to parse.
 pub fn bundle_index() -> Result<Vec<ConceptMeta>, BundleIndexError> {
     let mut files = Vec::new();
-    collect_markdown_files(embedded_bundle(), &mut files);
+    collect_markdown_files(embedded_bundle().as_dir(), &mut files);
 
     let mut concepts: Vec<ConceptMeta> = files
         .into_iter()

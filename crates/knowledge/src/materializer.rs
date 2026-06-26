@@ -15,6 +15,11 @@ const COMPLETE_MARKER: &str = ".complete";
 /// On every successful materialization, stale version directories are pruned
 /// (best-effort) so the cache does not grow unbounded as the binary version
 /// changes. A GC failure never fails materialization.
+///
+/// # Errors
+///
+/// Returns an [`io::Error`] if `version_hash` is not a single path segment, or
+/// if extracting the embedded bundle into the cache directory fails.
 pub fn materialize(cache_dir: impl AsRef<Path>, version_hash: &str) -> io::Result<PathBuf> {
     validate_version_hash(version_hash)?;
 
@@ -53,6 +58,11 @@ fn extract_into_knowledge_dir(knowledge_dir: &Path, version_hash: &str) -> io::R
 }
 
 /// Remove stale materialized knowledge versions under the cache knowledge dir.
+///
+/// # Errors
+///
+/// Returns an [`io::Error`] if `keep` is not a single path segment, or if a
+/// stale version directory cannot be removed.
 pub fn gc(cache_dir: impl AsRef<Path>, keep: &str) -> io::Result<()> {
     validate_version_hash(keep)?;
     gc_in_knowledge_dir(&cache_dir.as_ref().join(KNOWLEDGE_DIR), keep)

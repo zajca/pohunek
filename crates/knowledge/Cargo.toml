@@ -16,6 +16,7 @@ pohunek-protocol = { path = "../protocol", optional = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }
+thiserror = { workspace = true }
 
 [features]
 protocol = ["dep:pohunek-protocol"]

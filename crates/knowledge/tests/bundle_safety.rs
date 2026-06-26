@@ -8,10 +8,8 @@ const HOST_HOOK_QUARANTINE: &str = "~/.config/pohunek/quarantine/hooks/<event>.p
 
 fn embedded_markdown(path: &str) -> &'static str {
     embedded_bundle()
-        .get_file(path)
-        .unwrap_or_else(|| panic!("embedded bundle contains {path}"))
-        .contents_utf8()
-        .unwrap_or_else(|| panic!("{path} is utf-8 markdown"))
+        .get_text(path)
+        .unwrap_or_else(|| panic!("embedded bundle contains {path} as utf-8 markdown"))
 }
 
 fn normalize_whitespace(input: &str) -> String {

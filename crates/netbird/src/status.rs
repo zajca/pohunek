@@ -196,8 +196,12 @@ impl NetbirdStatus {
 
 /// Parse the JSON text of `netbird status --json` into a [`NetbirdStatus`].
 ///
-/// Pure and fixture-tested. Maps any serde error to [`NetbirdError::Parse`];
-/// never panics on malformed input.
+/// Pure and fixture-tested. Never panics on malformed input.
+///
+/// # Errors
+///
+/// Returns [`NetbirdError::Parse`] when `json` is not valid `netbird status`
+/// output.
 pub fn parse_status(json: &str) -> Result<NetbirdStatus, NetbirdError> {
     serde_json::from_str(json).map_err(|e| NetbirdError::Parse(e.to_string()))
 }

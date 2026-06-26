@@ -552,6 +552,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "sha2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

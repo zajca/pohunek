@@ -23,7 +23,10 @@ use crate::status::{NetbirdError, NetbirdStatus};
 /// is never dialed. This is the same fail-closed gate the bind validator and the
 /// raw-IP step apply.
 ///
-/// Returns [`NetbirdError::HostUnknown`] when nothing matches.
+/// # Errors
+///
+/// Returns [`NetbirdError::HostUnknown`] when `name` matches no `NetBird` peer
+/// inside the CGNAT range.
 pub fn resolve_host(status: &NetbirdStatus, name: &str) -> Result<IpAddr, NetbirdError> {
     let needle = name.trim();
 

@@ -12,7 +12,7 @@ mod validation;
 
 pub use assistant::{
     assistant_launch_id, bundle_content_hash, embedded_bundle, materialized_version_hash,
-    sha256_for_bytes, BUNDLE_VERSION,
+    sha256_for_bytes, EmbeddedBundle, BUNDLE_VERSION,
 };
 pub use index::{bundle_index, BundleIndexError, ConceptMeta};
 pub use materializer::{gc, materialize};
