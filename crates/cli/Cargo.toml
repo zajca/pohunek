@@ -11,6 +11,8 @@ name = "pohunek"
 path = "src/main.rs"
 
 [dependencies]
+pohunek-knowledge = { path = "../knowledge", features = ["protocol"] }
+pohunek-hostcheck = { path = "../hostcheck" }
 pohunek-protocol = { path = "../protocol" }
 pohunek-netbird = { path = "../netbird" }
 serde = { workspace = true }
@@ -21,6 +23,7 @@ tokio-util = { workspace = true }
 futures = { workspace = true }
 clap = { workspace = true }
 libc = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 # Exercise the host-aware target parser without a running daemon.

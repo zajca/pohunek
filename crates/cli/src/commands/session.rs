@@ -268,7 +268,7 @@ pub(crate) async fn run_new(
 /// Returns `true` only when the answer is `y`/`yes` (case-insensitive). The
 /// prompt and echo go to stderr so a `--json` consumer is never affected (this
 /// path is only reached when `json` is false). Dependency-free.
-fn prompt_confirm(host: &str) -> Result<bool, CliError> {
+pub(crate) fn prompt_confirm(host: &str) -> Result<bool, CliError> {
     let mut stderr = std::io::stderr();
     write!(
         stderr,

@@ -12,6 +12,7 @@ use serde::Serialize;
 
 use crate::error::CliError;
 
+pub(crate) mod assistant;
 pub(crate) mod attach;
 pub(crate) mod daemon;
 pub(crate) mod doctor;

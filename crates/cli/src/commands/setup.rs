@@ -485,6 +485,7 @@ mod tests {
             socket: root.join("runtime").join("daemon.sock"),
             data_dir: data_dir.clone(),
             log_dir: root.join("logs"),
+            cache_dir: root.join("cache"),
             config_home: config_home.clone(),
             config_dir: config_home.join("pohunek"),
         };
