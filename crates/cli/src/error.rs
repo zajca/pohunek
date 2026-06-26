@@ -123,6 +123,21 @@ pub(crate) enum CliError {
     #[error("adding a project on a remote host requires a PATH valid on that host")]
     RemoteAddPathRequired,
 
+    /// `assistant --degraded` was requested against a remote host. Degraded mode
+    /// materializes the snapshot in a *local* runtime directory and embeds that
+    /// local path into the opening prompt; a remote agent cannot read a path on
+    /// the client's filesystem. Degraded is the local fallback when bundle
+    /// materialization fails — on a remote host the remote daemon owns
+    /// materialization, so this combination is rejected before any dial.
+    #[error(
+        "--degraded is not supported for a remote host '{host}': the snapshot would be \
+         materialized locally and unreadable by the remote agent"
+    )]
+    DegradedRemoteUnsupported {
+        /// The remote host the degraded launch targeted.
+        host: String,
+    },
+
     /// A remote `session new` was requested under `--json` without `--yes`. The
     /// machine path must not block on an interactive prompt, so it fails fast and
     /// asks the caller to pass `--yes` explicitly.
@@ -223,6 +238,19 @@ impl CliError {
                 "remote_add_path_required",
                 "adding a project on a remote host requires a PATH valid on that host".to_owned(),
                 Some("pass `pohunek --host <host> project add <path-on-that-host>`".to_owned()),
+            ),
+            CliError::DegradedRemoteUnsupported { host } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "degraded_remote_unsupported",
+                format!(
+                    "--degraded is not supported for remote host '{host}': the snapshot would \
+                     be materialized locally and unreadable by the remote agent"
+                ),
+                Some(
+                    "drop --degraded for the remote launch (the remote daemon materializes its \
+                     own bundle), or run the degraded launch locally"
+                        .to_owned(),
+                ),
             ),
             CliError::RemoteConfirmationRequired => ProtocolError::new(
                 ErrorClass::Configuration,

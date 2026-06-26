@@ -76,12 +76,19 @@ pub(crate) fn select_agent(
     Err(ProtocolError::no_capable_agent().into())
 }
 
+/// Whether `agent` can actually be launched right now.
+///
+/// Availability is read **only** from `runtimes` (probed against `PATH` by the
+/// host), never from `supported_agents`. `supported_agents` lists every *known*
+/// agent kind — the daemon always advertises `shell`/`codex`/`claude` there
+/// regardless of whether their binaries are installed — so treating membership
+/// as availability would let selection pick a missing agent and fail later at
+/// `session.new` instead of returning `no_capable_agent` here.
 fn is_available(capabilities: &HostCapabilities, agent: &str) -> bool {
     capabilities
         .runtimes
         .iter()
         .any(|runtime| runtime.agent == agent && runtime.available)
-        || capabilities.supported_agents.iter().any(|a| a == agent)
 }
 
 /// Confirm the selected agent's execution context can read the materialized
@@ -121,8 +128,10 @@ pub(crate) fn preflight_read_access(
 /// For degraded launches: confirm only the snapshot file is readable.
 ///
 /// The knowledge bundle is absent by design in degraded mode, so only the
-/// snapshot path is checked. Remote degraded launches skip even this check (the
-/// remote daemon materialized the snapshot and proved it exists).
+/// snapshot path is checked. Degraded launches are local-only (a remote degraded
+/// launch is rejected up front in [`super::run`], because its snapshot is
+/// materialized on the client and unreadable by the remote agent), so this is
+/// always a local path-exists check.
 ///
 /// # Errors
 ///
@@ -188,6 +197,48 @@ mod tests {
         )
         .expect("ranked");
         assert_eq!(selection.name, "codex");
+    }
+
+    #[test]
+    fn supported_but_unavailable_runtime_is_not_selected() {
+        // The daemon always advertises codex/claude in `supported_agents` even
+        // when their binaries are absent; only `runtimes[].available` is true
+        // selection truth. Here codex/claude are "supported" but not available,
+        // and only shell is available, so selection must fail rather than pick a
+        // missing agent that would only fail later at session.new.
+        let capabilities = HostCapabilities {
+            daemon_version: "test".to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+            supported_agents: vec![
+                "shell".to_owned(),
+                "codex".to_owned(),
+                "claude".to_owned(),
+            ],
+            runtimes: vec![
+                AgentRuntime {
+                    agent: "shell".to_owned(),
+                    available: true,
+                    path: None,
+                },
+                AgentRuntime {
+                    agent: "codex".to_owned(),
+                    available: false,
+                    path: None,
+                },
+                AgentRuntime {
+                    agent: "claude".to_owned(),
+                    available: false,
+                    path: None,
+                },
+            ],
+            git_available: true,
+            worktree_supported: true,
+        };
+        let err = select_agent(&capabilities, None, None).expect_err("no capable agent");
+        let CliError::Protocol(source) = err else {
+            panic!("expected protocol error");
+        };
+        assert_eq!(source.code, "no_capable_agent");
     }
 
     #[test]

@@ -134,10 +134,41 @@ struct AssistantMeta<'a> {
 /// agent is available, materialization fails, the read-access preflight fails,
 /// or the session launch is rejected.
 pub(crate) async fn run(opts: AssistantOptions, paths: &Paths) -> Result<(), CliError> {
+    validate_target(&opts)?;
     if opts.degraded {
         return run_degraded(opts, paths).await;
     }
     run_full(opts, paths).await
+}
+
+/// Validate the launch target before any daemon connection is dialed.
+///
+/// Mirrors `session new`'s `prepare_new_args` guard (design Decision 1): a remote
+/// launch must name a `--project` (or `--repo` for first-introduction) because no
+/// local filesystem path is meaningful on another host — otherwise the remote
+/// agent would start in the daemon process's working directory. Additionally,
+/// `--degraded` is rejected for a remote host: degraded materializes the snapshot
+/// into a *local* runtime dir and embeds that path into the prompt, which a remote
+/// agent cannot read.
+///
+/// # Errors
+///
+/// [`CliError::DegradedRemoteUnsupported`] for `--degraded` against a remote host;
+/// [`CliError::RemoteTargetRequired`] for a remote launch with neither `--project`
+/// nor `--repo`.
+fn validate_target(opts: &AssistantOptions) -> Result<(), CliError> {
+    if !opts.is_remote() {
+        return Ok(());
+    }
+    if opts.degraded {
+        return Err(CliError::DegradedRemoteUnsupported {
+            host: opts.host.clone(),
+        });
+    }
+    if opts.project.is_none() && opts.repo.is_none() {
+        return Err(CliError::RemoteTargetRequired);
+    }
+    Ok(())
 }
 
 /// Full (non-degraded) launch: requires a readable knowledge bundle.
@@ -557,4 +588,76 @@ fn emit_launch_output_degraded(
         println!("attach: pohunek attach {target}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts(host: &str) -> AssistantOptions {
+        AssistantOptions {
+            intent: Intent::Help,
+            request: None,
+            agent: None,
+            host: host.to_owned(),
+            project: None,
+            repo: None,
+            branch: None,
+            base_branch: None,
+            yes: false,
+            json: false,
+            print_prompt: false,
+            no_snapshot: false,
+            degraded: false,
+            no_start_daemon: false,
+        }
+    }
+
+    #[test]
+    fn local_launch_needs_no_target() {
+        validate_target(&opts(LOCAL_HOST)).expect("local with no target is allowed");
+        validate_target(&opts("")).expect("empty host is local");
+    }
+
+    #[test]
+    fn local_degraded_is_allowed() {
+        let mut o = opts(LOCAL_HOST);
+        o.degraded = true;
+        validate_target(&o).expect("local degraded is allowed");
+    }
+
+    #[test]
+    fn remote_without_target_is_rejected() {
+        let err = validate_target(&opts("build-box")).expect_err("remote needs a target");
+        assert!(
+            matches!(err, CliError::RemoteTargetRequired),
+            "expected RemoteTargetRequired, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn remote_with_project_is_allowed() {
+        let mut o = opts("build-box");
+        o.project = Some("ui".to_owned());
+        validate_target(&o).expect("remote with --project is allowed");
+    }
+
+    #[test]
+    fn remote_with_repo_is_allowed() {
+        let mut o = opts("build-box");
+        o.repo = Some(PathBuf::from("/srv/repo"));
+        validate_target(&o).expect("remote with --repo is allowed");
+    }
+
+    #[test]
+    fn remote_degraded_is_rejected_even_with_target() {
+        let mut o = opts("build-box");
+        o.degraded = true;
+        o.project = Some("ui".to_owned());
+        let err = validate_target(&o).expect_err("remote degraded is rejected");
+        let CliError::DegradedRemoteUnsupported { host } = err else {
+            panic!("expected DegradedRemoteUnsupported, got {err:?}");
+        };
+        assert_eq!(host, "build-box");
+    }
 }

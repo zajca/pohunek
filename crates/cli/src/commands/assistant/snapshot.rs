@@ -36,7 +36,11 @@ use crate::paths::Paths;
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     assistant: AssistantSection,
-    paths: PathsSection,
+    /// Local client paths. Present only for a local launch — for a remote host
+    /// these would be the *client's* directories, not the host the agent runs
+    /// on, so they are omitted (see [`collect_local_sections`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paths: Option<PathsSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     doctor: Option<DoctorSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -288,27 +292,11 @@ pub(crate) async fn collect(
         }
     };
 
-    // Config scan — best-effort (pure filesystem, no RPC).
-    let config_scan = match scan_config(paths, opts) {
-        Ok(section) => Some(section),
-        Err(message) => {
-            warnings.push(format!("config_scan: {message}"));
-            None
-        }
-    };
-
-    // Source tree — best-effort (runs git CLI, only when --repo is set).
-    let source_tree = if let Some(repo) = &opts.repo {
-        match collect_source_tree(repo) {
-            Ok(section) => Some(section),
-            Err(message) => {
-                warnings.push(format!("source_tree: {message}"));
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // Local-filesystem sections (paths, config scan, source tree). These read the
+    // client's filesystem, so for a remote host they describe the client rather
+    // than the host the agent runs on — they are omitted there (with warnings).
+    let local = collect_local_sections(paths, opts);
+    warnings.extend(local.warnings);
 
     let snapshot = Snapshot {
         assistant: AssistantSection {
@@ -321,13 +309,13 @@ pub(crate) async fn collect(
             knowledge_bundle_version: BUNDLE_VERSION.to_owned(),
             snapshot_collected: true,
         },
-        paths: paths_section(paths),
+        paths: local.paths,
         doctor,
         host,
         projects,
         sessions,
-        config_scan,
-        source_tree,
+        config_scan: local.config_scan,
+        source_tree: local.source_tree,
         warnings,
     };
 
@@ -358,12 +346,8 @@ pub(crate) fn skipped_snapshot(
             knowledge_bundle_version: BUNDLE_VERSION.to_owned(),
             snapshot_collected: false,
         },
-        paths: PathsSection {
-            config_dir: String::new(),
-            data_dir: String::new(),
-            log_dir: String::new(),
-            cache_dir: String::new(),
-        },
+        // No live collection: the local path set is not gathered either.
+        paths: None,
         doctor: None,
         host: None,
         projects: None,
@@ -378,6 +362,85 @@ pub(crate) fn skipped_snapshot(
         agent: selected_agent.to_owned(),
     };
     (serialize(&snapshot), orientation)
+}
+
+// ---------------------------------------------------------------------------
+// Local-filesystem sections (remote-aware)
+// ---------------------------------------------------------------------------
+
+/// The local-filesystem sections of a snapshot, plus any warnings produced while
+/// collecting (or deliberately skipping) them.
+struct LocalSections {
+    paths: Option<PathsSection>,
+    config_scan: Option<ConfigScanSection>,
+    source_tree: Option<SourceTreeSection>,
+    warnings: Vec<String>,
+}
+
+/// Collect the sections that come from the *local* filesystem: redacted paths,
+/// the config scan, and the git source tree.
+///
+/// For a remote host these are omitted: the snapshot is read by an agent running
+/// on the remote host, so the client's directories, host-config layer, and a
+/// `--repo` path (all local) describe the wrong machine and would mislead. The
+/// remote daemon's RPC-sourced sections (doctor/host/projects/sessions) already
+/// carry the correct remote state. The omission is recorded as a warning so the
+/// absence is explicit rather than silent.
+fn collect_local_sections(paths: &Paths, opts: &AssistantOptions) -> LocalSections {
+    if opts.is_remote() {
+        let mut warnings = vec![
+            "paths: omitted for a remote host (these are the local client's directories, \
+             not the host the agent runs on)"
+                .to_owned(),
+            "config_scan: omitted for a remote host (local-only section; it reflects the \
+             client's config layer, not the host)"
+                .to_owned(),
+        ];
+        if opts.repo.is_some() {
+            warnings.push(
+                "source_tree: omitted for a remote host (--repo is a path on the client, \
+                 not the host)"
+                    .to_owned(),
+            );
+        }
+        return LocalSections {
+            paths: None,
+            config_scan: None,
+            source_tree: None,
+            warnings,
+        };
+    }
+
+    let mut warnings = Vec::new();
+
+    // Config scan — best-effort (pure filesystem, no RPC).
+    let config_scan = match scan_config(paths, opts) {
+        Ok(section) => Some(section),
+        Err(message) => {
+            warnings.push(format!("config_scan: {message}"));
+            None
+        }
+    };
+
+    // Source tree — best-effort (runs git CLI, only when --repo is set).
+    let source_tree = if let Some(repo) = &opts.repo {
+        match collect_source_tree(repo) {
+            Ok(section) => Some(section),
+            Err(message) => {
+                warnings.push(format!("source_tree: {message}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    LocalSections {
+        paths: Some(paths_section(paths)),
+        config_scan,
+        source_tree,
+        warnings,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -801,6 +864,18 @@ mod tests {
 
     use super::*;
 
+    /// Serializes tests that mutate process-global environment variables
+    /// (`HOME`, ad-hoc secrets). Rust runs tests in parallel, so without this a
+    /// `set_var`/`remove_var` in one test can race a read in another and flake.
+    /// Mirrors the env guard in `crate::paths` tests.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
@@ -960,12 +1035,12 @@ mod tests {
                 knowledge_bundle_version: "0.4.0".to_owned(),
                 snapshot_collected: true,
             },
-            paths: PathsSection {
+            paths: Some(PathsSection {
                 config_dir: "~/.config/pohunek".to_owned(),
                 data_dir: "~/.local/share/pohunek".to_owned(),
                 log_dir: "~/.local/state/pohunek/logs".to_owned(),
                 cache_dir: "~/.cache/pohunek".to_owned(),
-            },
+            }),
             doctor: Some(doctor),
             host: Some(host),
             projects: Some(ProjectsSection {
@@ -1042,14 +1117,15 @@ mod tests {
 
     #[test]
     fn snapshot_does_not_leak_home_in_paths() {
+        let _env = lock_env();
         std::env::set_var("HOME", "/home/testuser");
         // The paths section should contain `~` not `/home/testuser`.
-        let paths = PathsSection {
+        let paths = Some(PathsSection {
             config_dir: redact_path("/home/testuser/.config/pohunek"),
             data_dir: redact_path("/home/testuser/.local/share/pohunek"),
             log_dir: redact_path("/home/testuser/.local/state/pohunek/logs"),
             cache_dir: redact_path("/home/testuser/.cache/pohunek"),
-        };
+        });
         let snapshot = Snapshot {
             assistant: AssistantSection {
                 intent: "help".to_owned(),
@@ -1189,6 +1265,7 @@ mod tests {
 
     #[test]
     fn snapshot_does_not_leak_env_vars_or_profile_env_keys() {
+        let _env = lock_env();
         // Set a process environment variable with a recognizable value.
         std::env::set_var("POHUNEK_TEST_SECRET", "super_secret_value_xyz");
 
@@ -1203,12 +1280,12 @@ mod tests {
                 knowledge_bundle_version: "0.4.0".to_owned(),
                 snapshot_collected: true,
             },
-            paths: PathsSection {
+            paths: Some(PathsSection {
                 config_dir: "~/.config/pohunek".to_owned(),
                 data_dir: "~/.local/share/pohunek".to_owned(),
                 log_dir: "~/.local/state/pohunek".to_owned(),
                 cache_dir: "~/.cache/pohunek".to_owned(),
-            },
+            }),
             doctor: None,
             host: None,
             projects: None,
@@ -1237,11 +1314,77 @@ mod tests {
             !json.contains(profile_env_value),
             "snapshot must never contain profile [env] values"
         );
+
+        std::env::remove_var("POHUNEK_TEST_SECRET");
     }
 
     // -----------------------------------------------------------------------
     // Skipped snapshot (--no-snapshot)
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Local-section gating: remote launches must not embed local filesystem data
+    // -----------------------------------------------------------------------
+
+    fn dummy_paths() -> Paths {
+        let base = std::env::temp_dir().join(format!(
+            "pohunek-snap-localsec-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("after epoch")
+                .as_nanos()
+        ));
+        Paths {
+            runtime_dir: base.join("runtime"),
+            socket: base.join("runtime").join("daemon.sock"),
+            data_dir: base.join("data"),
+            log_dir: base.join("logs"),
+            cache_dir: base.join("cache"),
+            config_home: base.join("config"),
+            config_dir: base.join("config").join("pohunek"),
+        }
+    }
+
+    #[test]
+    fn local_sections_present_for_local_host() {
+        let local = collect_local_sections(&dummy_paths(), &options());
+        assert!(local.paths.is_some(), "local launch must include paths");
+        assert!(
+            local.config_scan.is_some(),
+            "local launch must include config_scan"
+        );
+        // options() sets no repo, so source_tree is absent without a warning.
+        assert!(local.source_tree.is_none());
+        assert!(
+            local.warnings.is_empty(),
+            "no warnings expected for a clean local scan, got {:?}",
+            local.warnings
+        );
+    }
+
+    #[test]
+    fn local_sections_omitted_for_remote_host() {
+        let remote = AssistantOptions {
+            host: "build-box".to_owned(),
+            repo: Some(std::path::PathBuf::from("/srv/repo")),
+            ..options()
+        };
+        let local = collect_local_sections(&dummy_paths(), &remote);
+        assert!(local.paths.is_none(), "remote must omit local paths");
+        assert!(
+            local.config_scan.is_none(),
+            "remote must omit local config_scan"
+        );
+        assert!(
+            local.source_tree.is_none(),
+            "remote must omit local source_tree"
+        );
+        // The omission is explicit: one warning per omitted local section.
+        assert!(local.warnings.iter().any(|w| w.starts_with("paths:")));
+        assert!(local.warnings.iter().any(|w| w.starts_with("config_scan:")));
+        assert!(local.warnings.iter().any(|w| w.starts_with("source_tree:")));
+    }
 
     #[test]
     fn skipped_snapshot_marks_not_collected_and_orients() {
@@ -1264,6 +1407,7 @@ mod tests {
 
     #[test]
     fn redact_path_rewrites_home_prefix() {
+        let _env = lock_env();
         std::env::set_var("HOME", "/home/tester");
         assert_eq!(
             redact_path("/home/tester/.cache/pohunek"),

@@ -156,10 +156,11 @@ struct AssistantArgs {
     /// Override agent selection with a specific agent name or host profile.
     #[arg(long)]
     agent: Option<String>,
-    /// Target project by `<id|label>`.
-    #[arg(long)]
+    /// Target project by `<id|label>`. Mutually exclusive with `--repo` (both
+    /// name the target repository).
+    #[arg(long, conflicts_with = "repo")]
     project: Option<String>,
-    /// Repository to bind a worktree for.
+    /// Repository to bind a worktree for. Mutually exclusive with `--project`.
     #[arg(long)]
     repo: Option<PathBuf>,
     /// Branch to check out in the bound worktree.
@@ -916,6 +917,28 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    #[test]
+    fn command_tree_is_internally_consistent() {
+        // clap validates `conflicts_with`/`requires` id references (and other
+        // structural invariants) in `debug_assert`; a typo'd reference panics
+        // here rather than at runtime.
+        pohunek_cli::command().debug_assert();
+    }
+
+    #[test]
+    fn assistant_rejects_project_and_repo_together() {
+        let err = Cli::try_parse_from([
+            "pohunek",
+            "assistant",
+            "--project",
+            "ui",
+            "--repo",
+            "/srv/repo",
+        ])
+        .expect_err("--project and --repo are mutually exclusive");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
 
     #[test]
     fn exported_command_matches_root_subcommands() {
