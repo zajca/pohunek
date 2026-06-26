@@ -65,7 +65,7 @@ pub(crate) struct ComposeDegradedParams<'a> {
 /// This function is pure and deterministic, so it is unit-testable without a
 /// daemon.
 #[must_use]
-pub(crate) fn compose_degraded(params: ComposeDegradedParams<'_>) -> String {
+pub(crate) fn compose_degraded(params: &ComposeDegradedParams<'_>) -> String {
     let intent = params.intent;
     let mut prompt = String::with_capacity(1024);
 
@@ -141,7 +141,7 @@ pub(crate) fn compose_degraded(params: ComposeDegradedParams<'_>) -> String {
 
 /// Compose the navigational opening prompt for one assistant launch.
 #[must_use]
-pub(crate) fn compose(params: ComposeParams<'_>) -> String {
+pub(crate) fn compose(params: &ComposeParams<'_>) -> String {
     let intent = params.intent;
     let mut prompt = String::with_capacity(2048);
 
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn degraded_prompt_contains_snapshot_path() {
-        let prompt = compose_degraded(ComposeDegradedParams {
+        let prompt = compose_degraded(&ComposeDegradedParams {
             intent: Intent::Help,
             request: None,
             snapshot_path: "/run/pohunek/assistant/abc/snapshot.json",
@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn degraded_prompt_contains_source_map_pointer() {
-        let prompt = compose_degraded(ComposeDegradedParams {
+        let prompt = compose_degraded(&ComposeDegradedParams {
             intent: Intent::Help,
             request: None,
             snapshot_path: "/run/pohunek/assistant/abc/snapshot.json",
@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn degraded_prompt_does_not_contain_bundle_toc() {
-        let prompt = compose_degraded(ComposeDegradedParams {
+        let prompt = compose_degraded(&ComposeDegradedParams {
             intent: Intent::Setup,
             request: Some("configure the launcher"),
             snapshot_path: "/run/pohunek/assistant/abc/snapshot.json",
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn degraded_prompt_header_signals_degraded() {
-        let prompt = compose_degraded(ComposeDegradedParams {
+        let prompt = compose_degraded(&ComposeDegradedParams {
             intent: Intent::Debug,
             request: None,
             snapshot_path: "/run/pohunek/assistant/abc/snapshot.json",
@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn degraded_prompt_carries_inline_safety() {
-        let prompt = compose_degraded(ComposeDegradedParams {
+        let prompt = compose_degraded(&ComposeDegradedParams {
             intent: Intent::Update,
             request: None,
             snapshot_path: "/s.json",
@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn inline_safety_hard_gates_hook_writes() {
-        let full_prompt = compose(ComposeParams {
+        let full_prompt = compose(&ComposeParams {
             intent: Intent::Project,
             request: Some("install a hook"),
             concepts: &[concept(
@@ -389,7 +389,7 @@ mod tests {
             orientation: &orientation(),
             version: "0.3.3",
         });
-        let degraded_prompt = compose_degraded(ComposeDegradedParams {
+        let degraded_prompt = compose_degraded(&ComposeDegradedParams {
             intent: Intent::Project,
             request: Some("install a hook"),
             snapshot_path: "/s",
@@ -414,7 +414,7 @@ mod tests {
 
     #[test]
     fn degraded_prompt_carries_intent_and_request() {
-        let prompt = compose_degraded(ComposeDegradedParams {
+        let prompt = compose_degraded(&ComposeDegradedParams {
             intent: Intent::Project,
             request: Some("configure ci pipeline"),
             snapshot_path: "/s.json",
@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn degraded_prompt_carries_orientation() {
-        let prompt = compose_degraded(ComposeDegradedParams {
+        let prompt = compose_degraded(&ComposeDegradedParams {
             intent: Intent::Help,
             request: None,
             snapshot_path: "/s.json",
@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn prompt_carries_sections_and_never_inlines_bodies() {
         let concepts = vec![concept("guides/setup", Some(vec![ConceptIntent::Setup]))];
-        let prompt = compose(ComposeParams {
+        let prompt = compose(&ComposeParams {
             intent: Intent::Setup,
             request: Some("configure the launcher"),
             concepts: &concepts,
@@ -488,7 +488,7 @@ mod tests {
             concept("guides/setup", Some(vec![ConceptIntent::Setup])),
             concept("guides/project", Some(vec![ConceptIntent::Project])),
         ];
-        let prompt = compose(ComposeParams {
+        let prompt = compose(&ComposeParams {
             intent: Intent::Project,
             request: None,
             concepts: &concepts,
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn toc_falls_back_to_all_when_no_match() {
         let concepts = vec![concept("concepts/arch", Some(vec![ConceptIntent::Setup]))];
-        let prompt = compose(ComposeParams {
+        let prompt = compose(&ComposeParams {
             intent: Intent::Help,
             request: None,
             concepts: &concepts,

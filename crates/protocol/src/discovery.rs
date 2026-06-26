@@ -1,7 +1,7 @@
 //! Host discovery payloads.
 //!
 //! These types define the JSON shape carried by `host.discover` (see
-//! `crate::method::HOST_DISCOVER`). Discovery enumerates the local host's NetBird
+//! `crate::method::HOST_DISCOVER`). Discovery enumerates the local host's `NetBird`
 //! peers and classifies each by probing its daemon control port, so the operator
 //! (and the rofi switcher) sees which peers run a compatible daemon.
 //!
@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// How a NetBird peer is classified for `host.discover`.
+/// How a `NetBird` peer is classified for `host.discover`.
 ///
 /// Serializes with an internal `classification` tag so a `--json` consumer (and
 /// the rofi switcher) can branch on it, e.g.
@@ -49,9 +49,9 @@ pub enum HostClass {
 pub struct HostRecord {
     /// Short host name (first DNS label of the fqdn), when derivable.
     pub name: Option<String>,
-    /// The peer's fully qualified NetBird name.
+    /// The peer's fully qualified `NetBird` name.
     pub fqdn: Option<String>,
-    /// The peer's NetBird IP as a string.
+    /// The peer's `NetBird` IP as a string.
     pub netbird_ip: Option<String>,
     /// Classification (flattened so its fields sit alongside the record).
     #[serde(flatten)]

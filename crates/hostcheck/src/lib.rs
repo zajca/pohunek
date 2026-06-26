@@ -2,7 +2,7 @@
 //! `daemon.doctor` RPC.
 //!
 //! Both the CLI doctor and the daemon need to probe the same things — binaries
-//! on `PATH`, directory writability, NetBird state, the configured terminal,
+//! on `PATH`, directory writability, `NetBird` state, the configured terminal,
 //! and the optional sway/rofi launcher assets — but on potentially different
 //! hosts (the CLI describes the local host; `daemon.doctor` describes the host
 //! that owns the agent runtime). The probe logic is identical, so it lives here
@@ -13,9 +13,6 @@
 //! crate does not depend on either binary's path resolution (the CLI and daemon
 //! deliberately resolve paths separately).
 
-#![warn(missing_debug_implementations)]
-#![warn(rust_2018_idioms)]
-#![warn(unreachable_pub)]
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
@@ -45,32 +42,31 @@ pub fn which_on_path(name: &str) -> Option<PathBuf> {
 /// `required` controls whether absence is reported as `fail` or `warn`.
 #[must_use]
 pub fn binary(name: &str, required: bool) -> DoctorCheck {
-    match which_on_path(name) {
-        Some(path) => DoctorCheck::new(
+    if let Some(path) = which_on_path(name) {
+        DoctorCheck::new(
             format!("bin:{name}"),
             DoctorStatus::Ok,
             format!("found at {}", path.display()),
-        ),
-        None => {
-            let status = if required {
-                DoctorStatus::Fail
-            } else {
-                DoctorStatus::Warn
-            };
-            DoctorCheck::new(
-                format!("bin:{name}"),
-                status,
-                format!("'{name}' not found on PATH"),
-            )
-        }
+        )
+    } else {
+        let status = if required {
+            DoctorStatus::Fail
+        } else {
+            DoctorStatus::Warn
+        };
+        DoctorCheck::new(
+            format!("bin:{name}"),
+            status,
+            format!("'{name}' not found on PATH"),
+        )
     }
 }
 
-/// Check NetBird availability.
+/// Check `NetBird` availability.
 ///
-/// NetBird is *optional*: remote hosts need it, but local-only use is fully
+/// `NetBird` is *optional*: remote hosts need it, but local-only use is fully
 /// valid, so its absence is a `warn`, never a `fail`. When the CLI is present we
-/// additionally probe local state — a resolvable self NetBird IP yields `ok`;
+/// additionally probe local state — a resolvable self `NetBird` IP yields `ok`;
 /// an unreadable state (daemon down / not logged in) is a `warn`.
 #[must_use]
 pub fn netbird() -> DoctorCheck {
@@ -215,7 +211,6 @@ pub fn sway_include(sway_config_dir: &Path) -> DoctorCheck {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;

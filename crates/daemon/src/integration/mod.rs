@@ -12,6 +12,7 @@
 //! installed script path are stripped before the `SessionStart` hook is
 //! (re-)added.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -75,13 +76,13 @@ pub fn install(agent: Option<AgentKind>) -> Result<IntegrationInstallResult, Pro
         Some(AgentKind::Claude) => {
             vec![report(
                 AgentKind::Claude,
-                install_claude(&claude_config_dir()?)?,
+                &install_claude(&claude_config_dir()?)?,
             )]
         }
         Some(AgentKind::Codex) => {
             vec![report(
                 AgentKind::Codex,
-                install_codex(&codex_config_dir()?)?,
+                &install_codex(&codex_config_dir()?)?,
             )]
         }
         Some(AgentKind::Shell) => {
@@ -102,11 +103,11 @@ fn install_all_present() -> Result<Vec<IntegrationInstallReport>, ProtocolError>
     let mut installed = Vec::new();
     let claude_dir = claude_config_dir()?;
     if claude_dir.is_dir() {
-        installed.push(report(AgentKind::Claude, install_claude(&claude_dir)?));
+        installed.push(report(AgentKind::Claude, &install_claude(&claude_dir)?));
     }
     let codex_dir = codex_config_dir()?;
     if codex_dir.is_dir() {
-        installed.push(report(AgentKind::Codex, install_codex(&codex_dir)?));
+        installed.push(report(AgentKind::Codex, &install_codex(&codex_dir)?));
     }
     if installed.is_empty() {
         return Err(ProtocolError::new(
@@ -123,7 +124,7 @@ fn install_all_present() -> Result<Vec<IntegrationInstallReport>, ProtocolError>
     Ok(installed)
 }
 
-fn report(agent: AgentKind, paths: InstallPaths) -> IntegrationInstallReport {
+fn report(agent: AgentKind, paths: &InstallPaths) -> IntegrationInstallReport {
     IntegrationInstallReport {
         agent,
         hook_path: paths.hook_path.display().to_string(),
@@ -170,7 +171,7 @@ pub fn install_claude(claude_dir: &Path) -> Result<InstallPaths, ProtocolError> 
     let mut settings = read_json_object_or_empty(&settings_path)?;
     let hooks = ensure_hooks_object(&mut settings, &settings_path)?;
     remove_owned_command_hooks(hooks, &hook_path);
-    ensure_command_hook(hooks, hook_command(&hook_path), Some("*"))?;
+    ensure_command_hook(hooks, &hook_command(&hook_path), Some("*"))?;
     write_json_pretty(&settings_path, &settings)?;
 
     Ok(InstallPaths {
@@ -203,7 +204,7 @@ pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
     let hooks = ensure_hooks_object(&mut hooks_file, &hooks_path)?;
     remove_owned_command_hooks(hooks, &hook_path);
     let command = hook_command(&hook_path);
-    ensure_command_hook(hooks, command.clone(), None)?;
+    ensure_command_hook(hooks, &command, None)?;
     let (group_index, handler_index) = command_hook_position(hooks, &command).ok_or_else(|| {
         settings_invalid(
             &hooks_path,
@@ -330,10 +331,10 @@ fn version_for_toml(value: &toml::Value) -> String {
     let mut hasher = Sha256::new();
     hasher.update(serialized);
     let hash = hasher.finalize();
-    let hex = hash
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let mut hex = String::with_capacity(hash.len() * 2);
+    for byte in hash {
+        write!(hex, "{byte:02x}").expect("writing to a String is infallible");
+    }
     format!("sha256:{hex}")
 }
 
@@ -390,7 +391,7 @@ fn ensure_hooks_object<'a>(
 /// `{ "matcher": "...", "hooks": [{ "type": "command", "command": "...", "timeout": N }] }`.
 fn ensure_command_hook(
     hooks: &mut Map<String, Value>,
-    command: String,
+    command: &str,
     matcher: Option<&str>,
 ) -> Result<(), ProtocolError> {
     let entries = hooks
@@ -413,7 +414,7 @@ fn ensure_command_hook(
             .is_some_and(|hook_entries| {
                 hook_entries.iter().any(|hook| {
                     hook.get("type").and_then(Value::as_str) == Some("command")
-                        && hook.get("command").and_then(Value::as_str) == Some(command.as_str())
+                        && hook.get("command").and_then(Value::as_str) == Some(command)
                 })
             })
     });
@@ -500,12 +501,12 @@ fn enable_codex_hooks_feature(content: &str) -> String {
 
     if let Some(index) = hooks_index {
         lines[index] = "hooks = true".to_string();
-        return join_toml_lines(lines, trailing_newline);
+        return join_toml_lines(&lines, trailing_newline);
     }
 
     if let Some(index) = features_header_index {
         lines.insert(index + 1, "hooks = true".to_string());
-        return join_toml_lines(lines, trailing_newline);
+        return join_toml_lines(&lines, trailing_newline);
     }
 
     let mut result = content.trim_end_matches('\n').to_string();
@@ -539,7 +540,7 @@ fn ensure_codex_hook_trust_state(content: &str, trust_key: &str, trusted_hash: &
         } else {
             lines.insert(header_index + 1, trusted_hash_line);
         }
-        return join_toml_lines(lines, trailing_newline);
+        return join_toml_lines(&lines, trailing_newline);
     }
 
     let mut result = content.trim_end_matches('\n').to_string();
@@ -579,7 +580,7 @@ fn toml_basic_string(value: &str) -> String {
     escaped
 }
 
-fn join_toml_lines(lines: Vec<String>, trailing_newline: bool) -> String {
+fn join_toml_lines(lines: &[String], trailing_newline: bool) -> String {
     let mut result = lines.join("\n");
     if trailing_newline || result.is_empty() {
         result.push('\n');
@@ -680,7 +681,7 @@ fn make_executable(path: &Path) -> Result<(), ProtocolError> {
             .permissions();
         perms.set_mode(0o755);
         fs::set_permissions(path, perms).map_err(|err| io_error("chmod", path, &err))?;
-    }
+    };
     let _ = path;
     Ok(())
 }
@@ -831,7 +832,7 @@ mod tests {
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o111, 0o111, "hook must be executable");
-        }
+        };
 
         let settings = read_json(&claude_dir.join("settings.json"));
         let commands = session_start_command_hooks(&settings);

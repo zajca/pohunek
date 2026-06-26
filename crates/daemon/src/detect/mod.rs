@@ -42,6 +42,7 @@ pub struct DetectorConfig {
 
 impl DetectorConfig {
     /// Production detector config using the embedded generic shell manifest.
+    #[must_use]
     pub fn generic_shell() -> Self {
         Self {
             detection: DetectionConfig::default(),
@@ -50,6 +51,7 @@ impl DetectorConfig {
     }
 
     /// Production detector config for a specific agent kind.
+    #[must_use]
     pub fn for_agent(agent: AgentKind) -> Self {
         match agent {
             AgentKind::Shell => Self::generic_shell(),
@@ -63,6 +65,7 @@ impl DetectorConfig {
     /// embedded manifest. The override is already parsed via the capped,
     /// non-panicking [`Manifest::parse_str`] (a malformed one disabled the profile
     /// before this point), so detection never `.expect`-panics on host input.
+    #[must_use]
     pub fn for_profile(base: AgentKind, override_manifest: Option<Manifest>) -> Self {
         match override_manifest {
             Some(manifest) => Self {
@@ -74,6 +77,7 @@ impl DetectorConfig {
     }
 
     /// Production detector config using the embedded Codex manifest.
+    #[must_use]
     pub fn codex() -> Self {
         Self {
             detection: DetectionConfig::default(),
@@ -82,6 +86,7 @@ impl DetectorConfig {
     }
 
     /// Production detector config using the embedded Claude Code manifest.
+    #[must_use]
     pub fn claude() -> Self {
         Self {
             detection: DetectionConfig::default(),
@@ -124,6 +129,7 @@ pub struct Detector {
 }
 
 impl Detector {
+    #[must_use]
     pub fn new(rows: u16, cols: u16, started_at: Instant, config: DetectorConfig) -> Self {
         Self {
             osc: OscParser::new(),
@@ -200,10 +206,12 @@ impl Detector {
         self.screen.reset();
     }
 
+    #[must_use]
     pub fn latest_title(&self) -> Option<&str> {
         self.latest_title.as_deref()
     }
 
+    #[must_use]
     pub fn latest_progress(&self) -> Option<&str> {
         self.latest_progress.as_deref()
     }
@@ -282,11 +290,11 @@ impl Detector {
                 }
                 ManifestRegion::BottomLines(count) => context.with_region_text(
                     ManifestRegion::BottomLines(count),
-                    region_text(self.screen.bottom_lines(count)),
+                    region_text(&self.screen.bottom_lines(count)),
                 ),
                 ManifestRegion::BottomNonEmptyLines(count) => context.with_region_text(
                     ManifestRegion::BottomNonEmptyLines(count),
-                    region_text(self.screen.bottom_non_empty_lines(count)),
+                    region_text(&self.screen.bottom_non_empty_lines(count)),
                 ),
                 ManifestRegion::AfterLastPromptMarker => context.with_region_text(
                     ManifestRegion::AfterLastPromptMarker,
@@ -415,7 +423,7 @@ fn is_visible_manifest_source(source: StateSource) -> bool {
     )
 }
 
-fn region_text(region: ScreenRegion) -> String {
+fn region_text(region: &ScreenRegion) -> String {
     region.lines.join("\n")
 }
 

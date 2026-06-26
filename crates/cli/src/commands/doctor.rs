@@ -2,7 +2,7 @@
 //!
 //! Per `docs/plan-phase-1.md` "CLI Grammar": check Codex/Claude binaries, git,
 //! socket-dir perms, and state-dir writability. (Schema-version check is part of
-//! the SQLite milestone and is therefore reported as not-yet-available rather
+//! the `SQLite` milestone and is therefore reported as not-yet-available rather
 //! than faked.)
 //!
 //! Exit status: non-zero if any *required* check fails. Agent binaries are

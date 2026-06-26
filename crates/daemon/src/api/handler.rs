@@ -45,7 +45,7 @@ pub struct DaemonState {
     pub health: HealthInfo,
     /// In-memory session registry.
     pub sessions: SessionRegistry,
-    /// TTL-cached NetBird host discovery, shared across connections.
+    /// TTL-cached `NetBird` host discovery, shared across connections.
     pub discovery: DiscoveryCache,
 }
 
@@ -195,7 +195,7 @@ fn handle_health(request: &Request, health: &HealthInfo) -> Response {
 /// The snapshot is built fresh on each request (agent runtimes are probed
 /// against `PATH`), so it always reflects the host as it is now. Transport
 /// agnostic: the same handler answers over the local Unix socket and over a
-/// NetBird TCP connection.
+/// `NetBird` TCP connection.
 fn handle_host_inspect(
     request: &Request,
     health: &HealthInfo,
@@ -207,7 +207,7 @@ fn handle_host_inspect(
     )
 }
 
-/// `host.discover`: enumerate NetBird peers and classify each daemon.
+/// `host.discover`: enumerate `NetBird` peers and classify each daemon.
 ///
 /// The probe is run inside the daemon and cached for a short TTL (see
 /// [`DiscoveryCache`]), so repeated calls — e.g. every launcher keypress —
@@ -895,7 +895,7 @@ mod tests {
 
     impl EnvGuard {
         fn set_all(tag: &str) -> Self {
-            let _lock = crate::test_support::XDG_ENV_LOCK
+            let lock = crate::test_support::XDG_ENV_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let vars = [
@@ -924,7 +924,7 @@ mod tests {
             std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
             std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
             std::env::set_var("HOME", root.join("home"));
-            Self { _lock, saved }
+            Self { _lock: lock, saved }
         }
     }
 

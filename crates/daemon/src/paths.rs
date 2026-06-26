@@ -149,6 +149,10 @@ fn xdg_or_home_relative(key: &str, home_relative: &[&str]) -> Result<PathBuf, Da
             return Ok(PathBuf::from(v));
         }
     }
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "MissingEnv carries no source; we report a more actionable variable name instead"
+    )]
     let home = require_env("HOME").map_err(|_| DaemonError::MissingEnv {
         // Report the more actionable variable: the user needs HOME (or the XDG
         // var) so the daemon can locate its state directory.
@@ -164,7 +168,6 @@ fn xdg_or_home_relative(key: &str, home_relative: &[&str]) -> Result<PathBuf, Da
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     use crate::test_support::XDG_ENV_LOCK;
 

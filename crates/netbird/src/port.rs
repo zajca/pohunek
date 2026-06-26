@@ -2,7 +2,7 @@
 
 use crate::status::NetbirdError;
 
-/// Default TCP port the daemon's remote control listener binds on over NetBird.
+/// Default TCP port the daemon's remote control listener binds on over `NetBird`.
 ///
 /// Override with the [`REMOTE_PORT_ENV`] environment variable. Chosen below the
 /// Linux ephemeral range (`32768`+) so it does not collide with outbound
@@ -39,7 +39,7 @@ fn parse_port(raw: &str) -> Result<u16, NetbirdError> {
             "invalid {REMOTE_PORT_ENV}={raw:?}: expected a port number in 1..=65535"
         ))
     };
-    let port: u16 = trimmed.parse().map_err(|_| invalid())?;
+    let port: u16 = trimmed.parse().ok().ok_or_else(invalid)?;
     if port == 0 {
         return Err(invalid());
     }

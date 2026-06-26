@@ -12,7 +12,7 @@ use crate::session::ShellCommand;
 pub struct ShellAdapter;
 
 impl AgentAdapter for ShellAdapter {
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         "shell"
     }
 

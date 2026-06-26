@@ -12,8 +12,7 @@ fn temp_lock(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     p.push(format!(
         "pohunek-test-{tag}-{}-{nanos}.lock",
         std::process::id()

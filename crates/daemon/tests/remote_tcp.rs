@@ -1,9 +1,9 @@
-//! Integration test: the daemon's control server answers over a NetBird TCP
+//! Integration test: the daemon's control server answers over a `NetBird` TCP
 //! connection with identical protocol and attach semantics to the local Unix
-//! socket (milestone 11 "Remote hosts over NetBird").
+//! socket (milestone 11 "Remote hosts over `NetBird`").
 //!
-//! A real `TcpListener::bind("127.0.0.1:0")` stands in for the NetBird interface
-//! (loopback wrapping skips the fail-closed NetBird validation via
+//! A real `TcpListener::bind("127.0.0.1:0")` stands in for the `NetBird` interface
+//! (loopback wrapping skips the fail-closed `NetBird` validation via
 //! `RemoteServer::from_listener`; the validation itself is asserted separately by
 //! `bind_rejects_non_netbird_address`). A `ControlServer` (Unix) is bound on the
 //! SAME `DaemonState` so a session created over TCP is daemon-owned and survives
@@ -42,8 +42,7 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn temp_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
         "pohunek-test-{tag}-{}-{nanos}-{n}",

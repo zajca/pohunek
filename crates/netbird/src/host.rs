@@ -1,24 +1,24 @@
-//! Resolving a host *name* to a NetBird IP from a parsed status.
+//! Resolving a host *name* to a `NetBird` IP from a parsed status.
 
 use std::net::IpAddr;
 
 use crate::is_netbird_ip;
 use crate::status::{NetbirdError, NetbirdStatus};
 
-/// Resolve a host name to a NetBird IP using a parsed [`NetbirdStatus`].
+/// Resolve a host name to a `NetBird` IP using a parsed [`NetbirdStatus`].
 ///
 /// Matching is case-insensitive and tried in this order:
 /// 1. If `name` itself parses as an IP inside `100.64.0.0/10`, it is returned
-///    directly (lets a user dial a raw NetBird IP without a peer entry).
+///    directly (lets a user dial a raw `NetBird` IP without a peer entry).
 /// 2. A peer whose `fqdn` equals `name`.
 /// 3. A peer whose short hostname (the first DNS label of its `fqdn`) equals
 ///    `name`.
 /// 4. A peer whose `netbirdIp` string equals `name` (a literal IP that happens
 ///    to be a known peer).
 ///
-/// In every case the resolved address must lie inside the NetBird CGNAT range
+/// In every case the resolved address must lie inside the `NetBird` CGNAT range
 /// (`100.64.0.0/10`); a peer whose advertised `netbirdIp` is outside it (a
-/// loopback, link-local/cloud-metadata, LAN, or public address — through NetBird
+/// loopback, link-local/cloud-metadata, LAN, or public address — through `NetBird`
 /// output drift or a compromised coordinator) is treated as **not matched** and
 /// is never dialed. This is the same fail-closed gate the bind validator and the
 /// raw-IP step apply.

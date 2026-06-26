@@ -50,7 +50,7 @@ impl InstanceLock {
 
         // SAFETY: `file` owns a valid open fd for the duration of this call.
         // flock with LOCK_NB never blocks; it returns EWOULDBLOCK if contended.
-        #[allow(unsafe_code)]
+        #[expect(unsafe_code, reason = "libc::flock FFI; SAFETY documented above")]
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
             let err = std::io::Error::last_os_error();

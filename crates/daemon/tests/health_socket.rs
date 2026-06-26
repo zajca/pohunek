@@ -65,7 +65,7 @@ impl PathGuard {
     /// The rest of the suite runs concurrently and resolves a few tools through
     /// PATH (`git`, `python3`, `sh`); the isolated dir is seeded with symlinks to
     /// those, resolved from the current PATH, so replacing PATH cannot starve a
-    /// sibling test of them. PATH is restored on drop; PATH_LOCK serializes this
+    /// sibling test of them. PATH is restored on drop; `PATH_LOCK` serializes this
     /// against the other PATH-mutating tests.
     async fn isolated_without_agents(tag: &str) -> Self {
         let guard = PATH_LOCK.lock().await;
@@ -161,8 +161,7 @@ fn temp_socket(tag: &str) -> std::path::PathBuf {
 fn temp_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
         "pohunek-test-{tag}-{}-{nanos}-{n}",
@@ -1064,10 +1063,8 @@ async fn session_new_for_missing_agent_binary_returns_typed_error() {
 async fn stale_socket_is_recovered_on_bind() {
     let socket = temp_socket("stale");
     // Create a stale socket file with no listener behind it.
-    {
-        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind stale");
-        drop(listener);
-    }
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind stale");
+    drop(listener);
     assert!(socket.exists(), "stale socket file should exist");
 
     // Binding again must succeed by removing the stale socket.
@@ -2107,7 +2104,7 @@ async fn event_log_records_lifecycle_and_never_terminal_bytes() {
 /// stub agent records BOTH a worktree binding and a resume binding in one
 /// metadata file; after a simulated daemon kill + registry rebuild against the
 /// same data dir, both bindings survive, the session relaunches via its resume
-/// argv, and its worktree metadata (repo/branch/worktree_path) is restored.
+/// argv, and its worktree metadata (`repo/branch/worktree_path`) is restored.
 #[tokio::test]
 async fn worktree_session_resumes_with_metadata_after_restart() {
     let agent = AgentKind::Claude;

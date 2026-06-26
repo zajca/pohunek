@@ -41,6 +41,7 @@ impl DetectionConfig {
     /// Zero-duration windows are valid and keep their immediate behavior.
     /// Confirmation counts are clamped to at least one so an observed candidate
     /// always represents a real piece of evidence.
+    #[must_use]
     pub fn normalized(mut self) -> Self {
         self.confirmations = self.confirmations.max(1);
         self
@@ -61,6 +62,7 @@ impl StateMachine {
     ///
     /// Callers should pass the same monotonic clock domain to every later
     /// observation and timer call. The config is normalized before use.
+    #[must_use]
     pub fn new(started_at: Instant, config: DetectionConfig) -> Self {
         Self {
             started_at,
@@ -116,7 +118,7 @@ impl StateMachine {
     pub fn tick(&mut self, now: Instant) -> Option<ActivityTransition> {
         let published = self.published?;
         if self.refresh_due(now, published) {
-            return self.publish(now, published.transition);
+            return Some(self.publish(now, published.transition));
         }
 
         None
@@ -135,14 +137,14 @@ impl StateMachine {
         if let Some(published) = self.published {
             if published.transition.activity == AgentActivity::Working {
                 if published.transition == transition && self.refresh_due(now, published) {
-                    return self.publish(now, transition);
+                    return Some(self.publish(now, transition));
                 }
 
                 if published.transition.source == StateSource::Process
                     && transition.source != StateSource::Process
                     && !self.last_emitted_is_visible_working()
                 {
-                    return self.publish(now, transition);
+                    return Some(self.publish(now, transition));
                 }
 
                 if transition.source == StateSource::Process {
@@ -153,7 +155,7 @@ impl StateMachine {
             }
         }
 
-        self.publish(now, transition)
+        Some(self.publish(now, transition))
     }
 
     fn observe_debounced(
@@ -171,7 +173,7 @@ impl StateMachine {
 
         match self.pending.as_mut() {
             Some(pending) if pending.evidence == evidence => {
-                pending.note_observed(now, &self.config)
+                pending.note_observed(now, &self.config);
             }
             _ => {
                 self.pending = Some(PendingCandidate::new(now, evidence));
@@ -188,7 +190,7 @@ impl StateMachine {
         }
 
         self.pending = None;
-        self.publish(now, pending.evidence.into())
+        Some(self.publish(now, pending.evidence.into()))
     }
 
     fn pending_ready(&self, now: Instant, pending: PendingCandidate) -> bool {
@@ -210,12 +212,11 @@ impl StateMachine {
             if published.transition == transition {
                 return self
                     .refresh_due(now, published)
-                    .then(|| self.publish(now, transition))
-                    .flatten();
+                    .then(|| self.publish(now, transition));
             }
         }
 
-        self.publish(now, transition)
+        Some(self.publish(now, transition))
     }
 
     fn refresh_due(&self, now: Instant, published: PublishedState) -> bool {
@@ -224,14 +225,10 @@ impl StateMachine {
                 >= self.config.stable_visible_refresh
     }
 
-    fn publish(
-        &mut self,
-        now: Instant,
-        transition: ActivityTransition,
-    ) -> Option<ActivityTransition> {
+    fn publish(&mut self, now: Instant, transition: ActivityTransition) -> ActivityTransition {
         self.last_emitted = Some(transition);
         self.record_published(now, transition);
-        Some(transition)
+        transition
     }
 
     fn record_published(&mut self, now: Instant, transition: ActivityTransition) {
@@ -366,7 +363,11 @@ mod tests {
             None
         );
         assert_eq!(
-            machine.tick(started_at + Duration::from_secs(3) - Duration::from_millis(1)),
+            machine.tick(
+                (started_at + Duration::from_secs(3))
+                    .checked_sub(Duration::from_millis(1))
+                    .unwrap()
+            ),
             None
         );
         assert_eq!(
@@ -540,7 +541,7 @@ mod tests {
             None
         );
         assert_eq!(
-            machine.tick(started_at + Duration::from_millis(1000)),
+            machine.tick(started_at + Duration::from_secs(1)),
             Some(transition(AgentActivity::Blocked, StateSource::Screen))
         );
     }

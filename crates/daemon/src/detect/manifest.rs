@@ -44,6 +44,7 @@ impl Manifest {
         Ok(Self { rules })
     }
 
+    #[must_use]
     pub fn match_context(&self, context: &MatchContext) -> Option<ManifestMatch> {
         let mut evaluation = MatchEvaluation::new(context);
         let mut best_match = None;
@@ -51,7 +52,7 @@ impl Manifest {
         for rule in &self.rules {
             if !evaluation.has_region_text(&rule.region) {
                 continue;
-            };
+            }
 
             if !rule.gate.matches(&rule.region, &mut evaluation) {
                 continue;
@@ -74,6 +75,7 @@ impl Manifest {
         })
     }
 
+    #[must_use]
     pub fn required_regions(&self) -> Vec<ManifestRegion> {
         let mut regions = Vec::new();
 
@@ -181,6 +183,7 @@ pub struct MatchContext {
 }
 
 impl MatchContext {
+    #[must_use]
     pub fn with_region_text(mut self, region: ManifestRegion, text: impl Into<String>) -> Self {
         self.regions.insert(region, text.into());
         self
@@ -635,8 +638,6 @@ impl MatcherInput {
 
 #[cfg(test)]
 mod tests {
-    use protocol::AgentActivity;
-
     use super::*;
 
     #[test]

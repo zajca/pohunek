@@ -123,7 +123,7 @@ fn xdg_or_home_relative(key: &str, home_relative: &[&str]) -> Result<PathBuf, Cl
             return Ok(PathBuf::from(v));
         }
     }
-    let home = std::env::var("HOME").map_err(|_| CliError::MissingEnv {
+    let home = std::env::var("HOME").map_err(|_err| CliError::MissingEnv {
         var: format!("{key} or HOME"),
     })?;
     if home.is_empty() {
@@ -141,7 +141,6 @@ fn xdg_or_home_relative(key: &str, home_relative: &[&str]) -> Result<PathBuf, Cl
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

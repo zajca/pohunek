@@ -1,8 +1,5 @@
 //! Knowledge bundle primitives for the universal pohunek assistant.
 
-#![warn(missing_debug_implementations)]
-#![warn(rust_2018_idioms)]
-#![warn(unreachable_pub)]
 #![forbid(unsafe_code)]
 
 pub mod assistant;

@@ -1,6 +1,6 @@
 //! Parsing of `netbird status --json` and the subprocess that produces it.
 //!
-//! NetBird's JSON output drifts across versions. Two shapes appear in the wild
+//! `NetBird`'s JSON output drifts across versions. Two shapes appear in the wild
 //! and the types here tolerate both:
 //!
 //! - Shape A (current source: `OutputOverview` / `PeerStateDetailOutput`): the
@@ -20,29 +20,29 @@ use serde::Deserialize;
 
 use crate::{is_netbird_ip, parse_addr_strip_cidr};
 
-/// Subcommand and flag used to ask NetBird for machine-readable status.
+/// Subcommand and flag used to ask `NetBird` for machine-readable status.
 const NETBIRD_STATUS_ARGS: [&str; 2] = ["status", "--json"];
-/// Default program name for the NetBird CLI (resolved via the OS through PATH).
+/// Default program name for the `NetBird` CLI (resolved via the OS through PATH).
 const NETBIRD_PROGRAM: &str = "netbird";
 /// Maximum number of bytes of captured CLI output to surface in an error
 /// message. Bounds the size of a [`NetbirdError::StateUnavailable`] detail so a
 /// misbehaving CLI cannot flood logs or the agent context.
 const MAX_ERROR_DETAIL_BYTES: usize = 512;
 
-/// Errors raised while reading or interpreting NetBird's local state.
+/// Errors raised while reading or interpreting `NetBird`'s local state.
 #[derive(Debug, thiserror::Error)]
 pub enum NetbirdError {
     /// The `netbird` CLI binary could not be found on `PATH`.
     #[error("the `netbird` CLI was not found on PATH")]
     CliMissing,
-    /// NetBird is installed but its local state could not be read (daemon down,
+    /// `NetBird` is installed but its local state could not be read (daemon down,
     /// not logged in, or a non-zero exit). Carries a short, bounded detail.
     #[error("NetBird local state is unavailable: {0}")]
     StateUnavailable(String),
     /// The `netbird status --json` output could not be parsed.
     #[error("failed to parse `netbird status --json`: {0}")]
     Parse(String),
-    /// The requested host name did not match any NetBird peer.
+    /// The requested host name did not match any `NetBird` peer.
     #[error("host '{0}' was not found among NetBird peers")]
     HostUnknown(String),
 }
@@ -51,24 +51,24 @@ pub enum NetbirdError {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
 pub(crate) struct LocalPeerState {
-    /// This host's NetBird IP. The wire key is uppercase `IP`; a lowercase
+    /// This host's `NetBird` IP. The wire key is uppercase `IP`; a lowercase
     /// `ip` alias is accepted defensively. May carry a CIDR mask.
     #[serde(rename = "IP", alias = "ip")]
     ip: Option<String>,
-    /// This host's fully qualified NetBird name, when present.
+    /// This host's fully qualified `NetBird` name, when present.
     fqdn: Option<String>,
 }
 
-/// A single NetBird peer (another host on the mesh).
+/// A single `NetBird` peer (another host on the mesh).
 ///
 /// Field names are stable across both documented shapes; serde attributes
 /// capture the differing wire keys. Unknown per-peer keys are ignored.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Peer {
-    /// The peer's fully qualified NetBird name (e.g. `host-b.netbird.cloud`).
+    /// The peer's fully qualified `NetBird` name (e.g. `host-b.netbird.cloud`).
     pub fqdn: Option<String>,
-    /// The peer's NetBird IP as a string (wire key `netbirdIp` in both shapes).
+    /// The peer's `NetBird` IP as a string (wire key `netbirdIp` in both shapes).
     pub netbird_ip: Option<String>,
     /// Connection state. Shape A spells this `status`; shape B spells it
     /// `connectionStatus`. The rust field is named `connection_status` and
@@ -91,7 +91,7 @@ impl Peer {
             .is_some_and(|s| s.eq_ignore_ascii_case("Connected"))
     }
 
-    /// The peer's NetBird IP, parsed and with any CIDR mask stripped.
+    /// The peer's `NetBird` IP, parsed and with any CIDR mask stripped.
     ///
     /// Lenient: returns whatever parses as an [`std::net::IpAddr`] (the range
     /// check is left to callers such as [`resolve_host`](crate::resolve_host)),
@@ -102,7 +102,7 @@ impl Peer {
     }
 }
 
-/// A flat list of peers tolerant of both NetBird shapes.
+/// A flat list of peers tolerant of both `NetBird` shapes.
 ///
 /// Shape A nests peers under `{ "details": [...] }`; shape B is a bare array.
 /// This newtype deserializes from either via an untagged representation and
@@ -143,7 +143,7 @@ impl<'de> Deserialize<'de> for PeersField {
 /// A parsed `netbird status --json` snapshot.
 ///
 /// Construct via [`parse_status`] or [`run_status`]. All fields are optional
-/// and default; the accessors paper over the two NetBird shapes.
+/// and default; the accessors paper over the two `NetBird` shapes.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct NetbirdStatus {
@@ -151,25 +151,25 @@ pub struct NetbirdStatus {
     netbird_ip: Option<String>,
     /// Shape B self IP source: `localPeerState` (the `IP` may carry a mask).
     local_peer_state: Option<LocalPeerState>,
-    /// NetBird daemon version string, when reported.
+    /// `NetBird` daemon version string, when reported.
     daemon_version: Option<String>,
     /// Daemon/root status string. Shape A reports `daemonStatus`; shape B
     /// reports a root `status`, captured via the alias.
     #[serde(alias = "status")]
     daemon_status: Option<String>,
-    /// This host's fully qualified NetBird name, when present at the root.
+    /// This host's fully qualified `NetBird` name, when present at the root.
     fqdn: Option<String>,
     /// Peers across both shapes, flattened to a single list.
     peers: PeersField,
 }
 
 impl NetbirdStatus {
-    /// This host's NetBird IP with any CIDR mask stripped.
+    /// This host's `NetBird` IP with any CIDR mask stripped.
     ///
     /// Tries the shape A root `netbirdIp` first, then the shape B
     /// `localPeerState.IP`. The result is validated to parse as an
     /// [`std::net::IpAddr`] inside `100.64.0.0/10`; returns `None` if absent or
-    /// outside the NetBird range (fail closed for the bind-address path).
+    /// outside the `NetBird` range (fail closed for the bind-address path).
     #[must_use]
     pub fn self_netbird_ip(&self) -> Option<std::net::IpAddr> {
         let candidate = self
@@ -181,7 +181,7 @@ impl NetbirdStatus {
             .filter(|ip| is_netbird_ip(*ip))
     }
 
-    /// All peers, flattened across both NetBird shapes.
+    /// All peers, flattened across both `NetBird` shapes.
     #[must_use]
     pub fn peers(&self) -> &[Peer] {
         &self.peers.0

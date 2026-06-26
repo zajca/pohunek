@@ -125,7 +125,7 @@ mod tests {
             .get_file("index.md")
             .expect("embedded bundle contains index.md");
 
-        assert!(index.contents_utf8().is_some_and(|body| body.contains("#")));
+        assert!(index.contents_utf8().is_some_and(|body| body.contains('#')));
         assert_eq!(REFERENCE_MODE, "manual-only");
     }
 }

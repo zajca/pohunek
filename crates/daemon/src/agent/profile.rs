@@ -42,7 +42,7 @@ struct RawProfile {
     /// Input-framing override; absent ⇒ the base kind's defaults.
     #[serde(default)]
     input_rules: Option<RawInputRules>,
-    /// Resume override (mode/ref_kind/resumable); absent ⇒ inherit the base kind's
+    /// Resume override (`mode/ref_kind/resumable`); absent ⇒ inherit the base kind's
     /// resume template (or non-resumable for a shell).
     #[serde(default)]
     resume: Option<RawResume>,
@@ -180,9 +180,8 @@ impl ProfileRegistry {
         let Some(dir) = &self.dir else {
             return Vec::new();
         };
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(_) => return Vec::new(),
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
         };
         let mut resolved = Vec::new();
         for entry in entries.flatten() {
@@ -218,7 +217,7 @@ fn dir_is_owner_secure(dir: &Path) -> bool {
     };
     // SAFETY: `geteuid` is always safe — it reads the calling process's effective
     // uid and cannot fail.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code, reason = "libc::geteuid FFI; SAFETY documented above")]
     let euid = unsafe { libc::geteuid() };
     if meta.uid() != euid {
         return false;
@@ -241,7 +240,9 @@ fn file_is_owner_secure(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
-    #[allow(unsafe_code)]
+    // SAFETY: `geteuid` is always safe — it reads the calling process's effective
+    // uid and cannot fail.
+    #[expect(unsafe_code, reason = "libc::geteuid FFI; SAFETY documented above")]
     let euid = unsafe { libc::geteuid() };
     if meta.uid() != euid {
         return false;
@@ -345,7 +346,7 @@ fn load_profile(name: &str, path: &Path, dir: &Path) -> Result<ResolvedAgent, Pr
 }
 
 /// Resolve a profile's effective resume template (C.3). Absent `[resume]` inherits
-/// the base kind's template; an explicit block overrides mode/ref_kind/resumable,
+/// the base kind's template; an explicit block overrides `mode/ref_kind/resumable`,
 /// defaulting any omitted field from the base kind. `None` ⇒ not resumable
 /// (authoritative — never falls back to the base kind).
 fn resolve_resume(
@@ -372,9 +373,7 @@ fn resolve_resume(
     };
     let ref_kind = match raw.ref_kind.as_deref() {
         Some(value) => parse_ref_kind(name, value)?,
-        None => base_template
-            .map(|template| template.ref_kind)
-            .unwrap_or(SessionRefKind::Id),
+        None => base_template.map_or(SessionRefKind::Id, |template| template.ref_kind),
     };
     Ok(Some(ResumeTemplate { mode, ref_kind }))
 }

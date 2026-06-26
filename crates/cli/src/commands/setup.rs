@@ -12,6 +12,7 @@
 //! - `setup sway` writes (or prints) a sway drop-in binding a key to the launcher.
 //! - `setup` (no subcommand) runs all three and prints next steps.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -415,7 +416,7 @@ fn next_steps(paths: &Paths) -> Vec<String> {
 fn render_scripts_human(result: &ScriptsResult) -> String {
     let mut out = String::new();
     for path in &result.installed {
-        out.push_str(&format!("installed script: {path}\n"));
+        let _ = writeln!(out, "installed script: {path}");
     }
     out
 }
@@ -424,10 +425,10 @@ fn render_scripts_human(result: &ScriptsResult) -> String {
 fn render_config_human(result: &ConfigResult) -> String {
     let mut out = String::new();
     for path in &result.created {
-        out.push_str(&format!("created: {path}\n"));
+        let _ = writeln!(out, "created: {path}");
     }
     for path in &result.skipped {
-        out.push_str(&format!("skipped (exists): {path}\n"));
+        let _ = writeln!(out, "skipped (exists): {path}");
     }
     out
 }
@@ -442,10 +443,11 @@ fn render_sway_human(paths: &Paths, result: &SwayResult) -> String {
     }
     let mut out = format!("wrote sway drop-in: {}\n", result.path);
     if !result.include_present {
-        out.push_str(&format!(
-            "NOTE: add `include {}/config.d/*` to your sway config so the drop-in is loaded.\n",
+        let _ = writeln!(
+            out,
+            "NOTE: add `include {}/config.d/*` to your sway config so the drop-in is loaded.",
             paths.sway_config_dir().display()
-        ));
+        );
     }
     out
 }

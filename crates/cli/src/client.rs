@@ -4,12 +4,12 @@
 //! newline-delimited JSON (the shared `protocol` crate). The same exchange logic
 //! serves two transports:
 //! - the local Unix socket (`host == "local"`), and
-//! - a remote TCP connection over NetBird (any other host), resolved from
+//! - a remote TCP connection over `NetBird` (any other host), resolved from
 //!   `netbird status --json` (see [`crate::target`] for the host grammar).
 //!
 //! The request/response framing is identical across transports; only the dial
 //! step differs. Remote dialing fails closed: a missing `netbird` CLI, an
-//! unreadable NetBird state, an unknown host, or a refused connection each map to
+//! unreadable `NetBird` state, an unknown host, or a refused connection each map to
 //! a distinct typed [`CliError`] so a script can branch on the cause.
 
 use std::net::SocketAddr;
@@ -40,12 +40,12 @@ const MAX_LINE_BYTES: usize = 1024 * 1024;
 #[derive(Debug)]
 pub(crate) struct Conn<S> {
     framed: Framed<S, LinesCodec>,
-    /// The host name when this is a remote NetBird TCP transport; `None` for the
+    /// The host name when this is a remote `NetBird` TCP transport; `None` for the
     /// local Unix socket. Used solely to attach host context to remote-side
     /// failures — a connection that closes or times out after a successful dial,
     /// or a daemon-returned error — so they name the peer and (for the no-reply
     /// case) carry the daemon-class `remote_daemon_unavailable` code rather than
-    /// a generic, host-less framing error (DoD #7: name the host, separate the
+    /// a generic, host-less framing error (`DoD` #7: name the host, separate the
     /// failure layer).
     remote_host: Option<String>,
 }
@@ -180,7 +180,7 @@ fn map_daemon_error(remote_host: Option<&str>, err: ProtocolError) -> CliError {
 ///
 /// Over a remote transport an oversized or malformed framed line, or a mid-
 /// stream IO failure, means the peer is not delivering a usable response, so it
-/// becomes a host-named [`CliError::RemoteDaemonUnavailable`] (DoD #7: name the
+/// becomes a host-named [`CliError::RemoteDaemonUnavailable`] (`DoD` #7: name the
 /// host). Locally it keeps the original framing/IO mapping (see [`map_codec_err`]).
 fn map_codec_err_for(remote_host: Option<&str>, err: LinesCodecError) -> CliError {
     match remote_host {
@@ -213,7 +213,7 @@ fn unparseable_reply_error(remote_host: Option<&str>, err: serde_json::Error) ->
 pub(crate) enum Client {
     /// Local Unix-socket transport.
     Local(Conn<UnixStream>),
-    /// Remote NetBird TCP transport.
+    /// Remote `NetBird` TCP transport.
     Remote(Conn<TcpStream>),
 }
 
@@ -222,7 +222,7 @@ impl Client {
     ///
     /// `host` is the *effective* host string: the reserved [`LOCAL_HOST`] (or an
     /// empty string) dials the local Unix socket; any other name is resolved to a
-    /// NetBird IP and dialed over TCP.
+    /// `NetBird` IP and dialed over TCP.
     ///
     /// # Errors
     ///
@@ -272,7 +272,7 @@ impl Client {
 pub(crate) enum RawStream {
     /// Local Unix-socket transport.
     Local(UnixStream),
-    /// Remote NetBird TCP transport.
+    /// Remote `NetBird` TCP transport.
     Remote(TcpStream),
 }
 
@@ -310,10 +310,10 @@ async fn connect_unix(socket_path: &Path) -> Result<UnixStream, CliError> {
         })
 }
 
-/// Resolve a remote host name to its NetBird daemon control address.
+/// Resolve a remote host name to its `NetBird` daemon control address.
 ///
-/// Runs `netbird status --json`, resolves the host to a NetBird IP, and pairs it
-/// with the configured remote control port. Each NetBird failure is mapped to a
+/// Runs `netbird status --json`, resolves the host to a `NetBird` IP, and pairs it
+/// with the configured remote control port. Each `NetBird` failure is mapped to a
 /// distinct typed [`CliError`].
 fn resolve_remote_addr(host: &str) -> Result<SocketAddr, CliError> {
     let status = netbird::run_status().map_err(map_netbird_err)?;

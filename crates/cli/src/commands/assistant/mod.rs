@@ -77,6 +77,10 @@ impl Intent {
 /// Resolved options for one assistant launch, independent of how the CLI
 /// surface expressed them (default form or an intent wrapper).
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "flat bag of independent CLI flags; a state machine would not model them better"
+)]
 pub(crate) struct AssistantOptions {
     pub(crate) intent: Intent,
     pub(crate) request: Option<String>,
@@ -206,7 +210,7 @@ async fn run_full(opts: AssistantOptions, paths: &Paths) -> Result<(), CliError>
     )?;
 
     // 6. Compose the small navigational opening prompt (never inlines bodies).
-    let prompt = prompt::compose(prompt::ComposeParams {
+    let prompt = prompt::compose(&prompt::ComposeParams {
         intent: opts.intent,
         request: opts.request.as_deref(),
         concepts: &materialized.concepts,
@@ -266,7 +270,7 @@ async fn run_degraded(opts: AssistantOptions, paths: &Paths) -> Result<(), CliEr
     }
 
     // 6. Compose the reduced navigational prompt (no TOC, no bundle path).
-    let prompt = prompt::compose_degraded(prompt::ComposeDegradedParams {
+    let prompt = prompt::compose_degraded(&prompt::ComposeDegradedParams {
         intent: opts.intent,
         request: opts.request.as_deref(),
         snapshot_path: &degraded.snapshot_path,

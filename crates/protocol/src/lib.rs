@@ -1,13 +1,13 @@
 //! pohunek control protocol.
 //!
 //! This crate defines the typed control envelopes exchanged between the CLI and
-//! the daemon over the local Unix socket (and, in Phase 2, over NetBird TCP).
+//! the daemon over the local Unix socket (and, in Phase 2, over `NetBird` TCP).
 //! The wire format is newline-delimited JSON: exactly one JSON value per line
 //! (see `docs/plan-phase-1.md` "Control Protocol" and `docs/architecture.md`
 //! "Transport and Control Protocol").
 //!
 //! It is deliberately shared so the CLI and daemon cannot drift, and so Phase 2's
-//! NetBird transport reuses it unchanged.
+//! `NetBird` transport reuses it unchanged.
 //!
 //! Design rules carried from the plan:
 //! - Every envelope carries `v` (protocol version). New fields are additive and
@@ -17,9 +17,6 @@
 //! - Errors are typed (class + machine code + human message + optional recovery
 //!   hint) so `--json` consumers and operator agents can branch on them.
 
-#![warn(missing_debug_implementations)]
-#![warn(rust_2018_idioms)]
-#![warn(unreachable_pub)]
 #![forbid(unsafe_code)]
 
 mod assistant;
@@ -91,14 +88,14 @@ pub mod method {
     pub const SESSION_REPORT_NATIVE_ID: &str = "session.report_native_id";
     /// Install the per-agent `SessionStart` hook that captures the native id.
     pub const INTEGRATION_INSTALL: &str = "integration.install";
-    /// Live host capability probe (Phase 2 / remote hosts over NetBird). Returns
+    /// Live host capability probe (Phase 2 / remote hosts over `NetBird`). Returns
     /// a [`HostCapabilities`](crate::HostCapabilities) snapshot.
     pub const HOST_INSPECT: &str = "host.inspect";
     /// Materialize the embedded assistant knowledge bundle on the agent host.
     pub const ASSISTANT_MATERIALIZE: &str = "assistant.materialize";
     /// Run daemon-local doctor checks on the host that owns the daemon.
     pub const DAEMON_DOCTOR: &str = "daemon.doctor";
-    /// Enumerate and classify the local host's NetBird peers. Handled by the
+    /// Enumerate and classify the local host's `NetBird` peers. Handled by the
     /// local daemon, which caches the result for a short TTL. Returns a
     /// `Vec<`[`HostRecord`](crate::HostRecord)`>`.
     pub const HOST_DISCOVER: &str = "host.discover";

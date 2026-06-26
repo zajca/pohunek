@@ -1,6 +1,3 @@
-#![warn(missing_debug_implementations)]
-#![warn(rust_2018_idioms)]
-#![warn(unreachable_pub)]
 #![forbid(unsafe_code)]
 
 mod eval;
@@ -9,6 +6,7 @@ mod generators;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -70,19 +68,19 @@ pub enum XtaskError {
 }
 
 impl fmt::Display for XtaskError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Usage(message) => write!(formatter, "{message}"),
-            Self::BundleValidation(error) => write!(formatter, "{error}"),
+            Self::Usage(message) => write!(f, "{message}"),
+            Self::BundleValidation(error) => write!(f, "{error}"),
             Self::Io { path, source } => {
-                write!(formatter, "failed to access `{}`: {source}", path.display())
+                write!(f, "failed to access `{}`: {source}", path.display())
             }
             Self::UnsupportedFileType(path) => {
-                write!(formatter, "unsupported file type in `{}`", path.display())
+                write!(f, "unsupported file type in `{}`", path.display())
             }
-            Self::Json(error) => write!(formatter, "failed to write manifest json: {error}"),
+            Self::Json(error) => write!(f, "failed to write manifest json: {error}"),
             Self::InvalidPath(path) => write!(
-                formatter,
+                f,
                 "path `{}` cannot be represented as a deterministic relative path",
                 path.display()
             ),
@@ -126,13 +124,19 @@ pub fn validate_docs(source_dir: impl AsRef<Path>) -> Result<ValidationSummary, 
 }
 
 pub fn build_docs(options: BuildOptions) -> Result<BuildSummary, XtaskError> {
-    let bundle_dir = options.output_root.join("knowledge-bundle");
+    let BuildOptions {
+        source_dir,
+        output_root,
+        pohunek_version,
+    } = options;
+
+    let bundle_dir = output_root.join("knowledge-bundle");
     if bundle_dir.exists() {
         remove_dir_all(&bundle_dir)?;
     }
     create_dir_all(&bundle_dir)?;
 
-    let since = options.pohunek_version.as_str();
+    let since = pohunek_version.as_str();
 
     // Phase 1: run all reference generators into the bundle dir.
     generators::cli::generate(&bundle_dir, since)?;
@@ -141,7 +145,7 @@ pub fn build_docs(options: BuildOptions) -> Result<BuildSummary, XtaskError> {
     generators::setup_assets::generate(&bundle_dir, since)?;
 
     // Phase 2: copy manual docs into the bundle dir.
-    let manual_files = collect_files(&options.source_dir)?;
+    let manual_files = collect_files(&source_dir)?;
     for file in &manual_files {
         let destination = bundle_dir.join(&file.relative_path);
         if let Some(parent) = destination.parent() {
@@ -156,9 +160,9 @@ pub fn build_docs(options: BuildOptions) -> Result<BuildSummary, XtaskError> {
     // Phase 4: hash the merged bundle and write the manifest.
     let merged_files = collect_files(&bundle_dir)?;
     let content_hash = content_hash(&bundle_dir, &merged_files)?;
-    let manifest_path = options.output_root.join("manifest.json");
+    let manifest_path = output_root.join("manifest.json");
     let manifest = Manifest {
-        pohunek_version: &options.pohunek_version,
+        pohunek_version: &pohunek_version,
         knowledge_schema_version: CONCEPT_SCHEMA_VERSION,
         reference: GENERATED_REFERENCE,
         sources: vec!["cli", "config", "manual_docs", "protocol", "setup_assets"],
@@ -182,8 +186,14 @@ pub fn build_docs(options: BuildOptions) -> Result<BuildSummary, XtaskError> {
 /// under `output_root`. An `index.html` listing all pages is written to each
 /// output directory. No external resources are used — all CSS is inlined.
 pub fn build_site(options: SiteOptions) -> Result<SiteSummary, XtaskError> {
+    let SiteOptions {
+        bundle_dir,
+        manifest_path,
+        output_root,
+    } = options;
+
     // Read the manifest to obtain the pohunek version.
-    let manifest_bytes = read_file(options.manifest_path.clone())?;
+    let manifest_bytes = read_file(manifest_path)?;
     let manifest_value: serde_json::Value =
         serde_json::from_slice(&manifest_bytes).map_err(XtaskError::Json)?;
     let pohunek_version = manifest_value
@@ -193,8 +203,8 @@ pub fn build_site(options: SiteOptions) -> Result<SiteSummary, XtaskError> {
         .to_string();
 
     // Set up output directories.
-    let site_dir = options.output_root.join("site");
-    let offline_dir = options.output_root.join("offline");
+    let site_dir = output_root.join("site");
+    let offline_dir = output_root.join("offline");
     for dir in [&site_dir, &offline_dir] {
         if dir.exists() {
             remove_dir_all(dir)?;
@@ -203,7 +213,7 @@ pub fn build_site(options: SiteOptions) -> Result<SiteSummary, XtaskError> {
     }
 
     // Collect all files from the bundle dir (already sorted by collect_files).
-    let all_files = collect_files(&options.bundle_dir)?;
+    let all_files = collect_files(&bundle_dir)?;
     let md_files: Vec<&FileEntry> = all_files
         .iter()
         .filter(|f| f.source_path.extension().and_then(|e| e.to_str()) == Some("md"))
@@ -223,11 +233,8 @@ pub fn build_site(options: SiteOptions) -> Result<SiteSummary, XtaskError> {
             .lines()
             .find_map(|line| {
                 let stripped = line.trim_start_matches('#');
-                if stripped.len() < line.len() && line.trim_start_matches('#').starts_with(' ') {
-                    Some(stripped.trim().to_string())
-                } else {
-                    None
-                }
+                (stripped.len() < line.len() && line.trim_start_matches('#').starts_with(' '))
+                    .then(|| stripped.trim().to_string())
             })
             .unwrap_or_else(|| file.relative_path.to_string_lossy().into_owned());
 
@@ -290,8 +297,7 @@ pub fn build_site(options: SiteOptions) -> Result<SiteSummary, XtaskError> {
 fn relative_index_href(page_path: &Path) -> String {
     let parent_depth = page_path
         .parent()
-        .map(|parent| parent.components().count())
-        .unwrap_or(0);
+        .map_or(0, |parent| parent.components().count());
     if parent_depth == 0 {
         "index.html".to_string()
     } else {
@@ -355,10 +361,6 @@ nav{{border-bottom:1px solid #d0d7de;padding-bottom:0.5rem;margin-bottom:1.5rem}
 </body>
 </html>
 "#,
-        title = title,
-        version = version,
-        nav_href = nav_href,
-        body = body,
     )
 }
 
@@ -366,7 +368,7 @@ nav{{border-bottom:1px solid #d0d7de;padding-bottom:0.5rem;margin-bottom:1.5rem}
 fn render_index_html(version: &str, pages: &[(String, String)]) -> String {
     let mut list_items = String::new();
     for (path, title) in pages {
-        list_items.push_str(&format!("<li><a href=\"{path}\">{title}</a></li>\n"));
+        let _ = writeln!(list_items, "<li><a href=\"{path}\">{title}</a></li>");
     }
     let body = format!("<h1>pohunek docs</h1>\n<ul>\n{list_items}</ul>\n");
     render_html_page("pohunek docs", version, "index.html", &body)
@@ -394,27 +396,39 @@ pub fn check_docs(
     let source_dir = source_dir.as_ref();
     let output_root = output_root.as_ref();
     let repo = repo_root();
-    let mut all_pass = true;
 
-    // ------------------------------------------------------------------
-    // Check 1: schema validation
-    // ------------------------------------------------------------------
+    // Each check prints its own PASS/FAIL line and returns whether it passed.
+    // `&` (not `&&`) is used so every check runs even after an earlier failure.
+    let mut all_pass = true;
+    all_pass &= check_schema_validation(source_dir);
+    all_pass &= check_deterministic_build(source_dir, output_root)?;
+    all_pass &= check_source_map_paths(source_dir, &repo);
+    all_pass &= check_runbook_commands(source_dir)?;
+    all_pass &= check_secret_scan(source_dir, output_root)?;
+
+    Ok(all_pass)
+}
+
+/// Check 1: schema validation of the manual knowledge source.
+fn check_schema_validation(source_dir: &Path) -> bool {
     match validate_docs(source_dir) {
         Ok(summary) => {
             println!(
                 "[PASS] schema-validation: {} files, {} concepts, schema v{}",
                 summary.files_checked, summary.concept_count, summary.schema_version
             );
+            true
         }
         Err(err) => {
             println!("[FAIL] schema-validation: {err}");
-            all_pass = false;
+            false
         }
     }
+}
 
-    // ------------------------------------------------------------------
-    // Check 2: deterministic build (two independent builds, same hash)
-    // ------------------------------------------------------------------
+/// Check 2: deterministic build (two independent builds must share one hash).
+fn check_deterministic_build(source_dir: &Path, output_root: &Path) -> Result<bool, XtaskError> {
+    let mut all_pass = true;
     let build1_root = output_root.join("check-build-1");
     let build2_root = output_root.join("check-build-2");
 
@@ -469,9 +483,11 @@ pub fn check_docs(
         remove_dir_all(&build2_root)?;
     }
 
-    // ------------------------------------------------------------------
-    // Check 3: source-map path existence
-    // ------------------------------------------------------------------
+    Ok(all_pass)
+}
+
+/// Check 3: every repo-relative path referenced in the source map exists.
+fn check_source_map_paths(source_dir: &Path, repo: &Path) -> bool {
     let source_map_path = source_dir.join("assistant/source-map.md");
     match fs::read_to_string(&source_map_path) {
         Ok(content) => {
@@ -493,6 +509,7 @@ pub fn check_docs(
 
             if missing.is_empty() {
                 println!("[PASS] source-map-paths: all referenced paths exist");
+                true
             } else {
                 println!(
                     "[FAIL] source-map-paths: {} missing path(s):",
@@ -501,7 +518,7 @@ pub fn check_docs(
                 for path in &missing {
                     println!("        {path}");
                 }
-                all_pass = false;
+                false
             }
         }
         Err(source) => {
@@ -509,9 +526,13 @@ pub fn check_docs(
                 "[FAIL] source-map-paths: could not read {}: {source}",
                 source_map_path.display()
             );
-            all_pass = false;
+            false
         }
     }
+}
+
+fn check_runbook_commands(source_dir: &Path) -> Result<bool, XtaskError> {
+    let mut all_pass = true;
 
     // ------------------------------------------------------------------
     // Check 4: runbook-vs-parser
@@ -618,13 +639,16 @@ pub fn check_docs(
         all_pass = false;
     }
 
-    // ------------------------------------------------------------------
-    // Check 5: secret scan of the built knowledge bundle
-    //
-    // Build the bundle (reusing the main output_root so it stays around for
-    // normal use after `docs check`). Walk all .md files and flag any line
-    // that matches one of the secret-like patterns below.
-    // ------------------------------------------------------------------
+    Ok(all_pass)
+}
+
+/// Check 5: secret scan of the built knowledge bundle.
+///
+/// Build the bundle (reusing the main `output_root` so it stays around for
+/// normal use after `docs check`). Walk all `.md` files and flag any line
+/// that matches one of the secret-like patterns below.
+fn check_secret_scan(source_dir: &Path, output_root: &Path) -> Result<bool, XtaskError> {
+    let mut all_pass = true;
 
     // Build the bundle into the main output root for the secret scan.
     let bundle_root = output_root.join("check-secret-scan");
@@ -681,9 +705,8 @@ pub fn check_docs(
                 if file.source_path.extension().and_then(|e| e.to_str()) != Some("md") {
                     continue;
                 }
-                let content = match fs::read_to_string(&file.source_path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
+                let Ok(content) = fs::read_to_string(&file.source_path) else {
+                    continue;
                 };
                 for (i, line) in content.lines().enumerate() {
                     for (re, label) in &compiled {
@@ -744,11 +767,10 @@ where
         let all_pass = eval::run_eval();
         if all_pass {
             return Ok(());
-        } else {
-            return Err(XtaskError::Usage(
-                "eval: one or more fixture commands failed to parse".to_string(),
-            ));
         }
+        return Err(XtaskError::Usage(
+            "eval: one or more fixture commands failed to parse".to_string(),
+        ));
     }
 
     // All other commands require an action sub-argument.
@@ -841,7 +863,7 @@ fn collect_files_inner(
     files: &mut Vec<FileEntry>,
 ) -> Result<(), XtaskError> {
     let mut entries = read_dir(current)?;
-    entries.sort_by_key(|entry| entry.path());
+    entries.sort_by_key(std::fs::DirEntry::path);
 
     for entry in entries {
         let path = entry.path();
@@ -851,7 +873,8 @@ fn collect_files_inner(
         } else if file_type.is_file() {
             let relative_path = path
                 .strip_prefix(root)
-                .map_err(|_| XtaskError::InvalidPath(path.clone()))?
+                .ok()
+                .ok_or_else(|| XtaskError::InvalidPath(path.clone()))?
                 .to_path_buf();
             files.push(FileEntry {
                 source_path: path,

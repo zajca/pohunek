@@ -58,9 +58,10 @@ fn wait_for_file_contains(path: &Path, needles: &[&str], label: &str) {
         if needles.iter().all(|needle| content.contains(needle)) {
             return;
         }
-        if SystemTime::now() >= deadline {
-            panic!("{label}: timed out waiting for {needles:?} in:\n{content}");
-        }
+        assert!(
+            SystemTime::now() < deadline,
+            "{label}: timed out waiting for {needles:?} in:\n{content}"
+        );
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
@@ -689,10 +690,10 @@ fi
     );
     write_executable(
         &rofi,
-        r#"#!/bin/sh
+        r"#!/bin/sh
 cat >/dev/null
 printf 'AI-9\tDerived\n'
-"#,
+",
     );
     write_executable(
         &terminal,
@@ -741,6 +742,10 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_TERMINAL_ARGS"; done
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "single end-to-end scenario; splitting it would obscure the narrative under test"
+)]
 fn rofi_merges_local_and_remote_hosts_multi_selects_and_reconciles_marks() {
     let root = temp_dir("rofi");
     let bin = root.join("bin");

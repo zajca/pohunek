@@ -4,9 +4,9 @@
 //! single-instance lock, bind the control socket (with stale-socket recovery and
 //! owner-private permissions), and serve `daemon.health` until SIGINT/SIGTERM.
 //!
-//! Milestone 11: when NetBird is available and reports a self IP, additionally
-//! bind a TCP control listener on that NetBird address and serve it alongside the
-//! local Unix socket under one shutdown. NetBird being absent or its local state
+//! Milestone 11: when `NetBird` is available and reports a self IP, additionally
+//! bind a TCP control listener on that `NetBird` address and serve it alongside the
+//! local Unix socket under one shutdown. `NetBird` being absent or its local state
 //! being unavailable is not an error: the daemon stays local-only and logs why.
 
 use std::net::SocketAddr;
@@ -131,18 +131,15 @@ async fn run() -> Result<(), DaemonError> {
     let unix_serve = server.serve(async move {
         let _ = unix_rx.await;
     });
-    match remote_server {
-        Some(remote) => {
-            let remote_serve = remote.serve(async move {
-                let _ = remote_rx.await;
-            });
-            tokio::join!(unix_serve, remote_serve);
-        }
-        None => {
-            // Drop the unused remote receiver so the fan-out send is a no-op.
-            drop(remote_rx);
-            unix_serve.await;
-        }
+    if let Some(remote) = remote_server {
+        let remote_serve = remote.serve(async move {
+            let _ = remote_rx.await;
+        });
+        tokio::join!(unix_serve, remote_serve);
+    } else {
+        // Drop the unused remote receiver so the fan-out send is a no-op.
+        drop(remote_rx);
+        unix_serve.await;
     }
 
     // 11. Flush the append-only event log before exit so events buffered at
@@ -154,11 +151,11 @@ async fn run() -> Result<(), DaemonError> {
     Ok(())
 }
 
-/// Bind the optional NetBird TCP control listener.
+/// Bind the optional `NetBird` TCP control listener.
 ///
-/// Queries NetBird state, decides the bind address from it ([`remote_bind_addr`])
+/// Queries `NetBird` state, decides the bind address from it ([`remote_bind_addr`])
 /// and the resolved remote port, and binds a [`RemoteServer`] when an address
-/// resolves. Returns `None` (daemon stays local-only) when NetBird is
+/// resolves. Returns `None` (daemon stays local-only) when `NetBird` is
 /// unavailable, reports no self IP, the remote port is misconfigured, or the bind
 /// itself fails. Every local-only path logs the reason; a bind failure is logged
 /// but never fatal, so the local control plane always comes up.
@@ -179,12 +176,9 @@ async fn bind_remote_server(state: DaemonState) -> Option<RemoteServer> {
         }
     };
 
-    let addr = match remote_bind_addr(&status, port) {
-        Some(addr) => addr,
-        None => {
-            info!("NetBird present but no self IP resolved; serving local-only");
-            return None;
-        }
+    let Some(addr) = remote_bind_addr(&status, port) else {
+        info!("NetBird present but no self IP resolved; serving local-only");
+        return None;
     };
 
     match RemoteServer::bind(addr, state).await {
@@ -201,10 +195,10 @@ async fn bind_remote_server(state: DaemonState) -> Option<RemoteServer> {
     }
 }
 
-/// Decide the remote TCP bind address from parsed NetBird state.
+/// Decide the remote TCP bind address from parsed `NetBird` state.
 ///
-/// Returns `Some((self_ip, port))` when NetBird reports this host's own IP, else
-/// `None`. `NetbirdStatus::self_netbird_ip` already filters to the NetBird CGNAT
+/// Returns `Some((self_ip, port))` when `NetBird` reports this host's own IP, else
+/// `None`. `NetbirdStatus::self_netbird_ip` already filters to the `NetBird` CGNAT
 /// range, and the authoritative fail-closed gate is [`RemoteServer::bind`]'s
 /// validation, so this helper does not re-validate the range (which would only
 /// risk diverging from that single source of truth). Pure and unit-tested.

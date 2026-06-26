@@ -53,6 +53,64 @@ edition = "2021"
 license = "MIT"
 rust-version = "1.96"
 
+# Workspace-wide lint policy (M-STATIC-VERIFICATION). Every crate opts in via
+# `[lints] workspace = true`, so the set lives here once instead of being
+# duplicated as `#![warn(...)]` headers across crates. Per-crate `unsafe_code`
+# posture stays as an inner attribute, since libs forbid it while the daemon/cli
+# deny-with-localized-opt-in.
+[workspace.lints.rust]
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+# Not part of the upstream set, but the project relied on it via per-crate
+# headers before centralizing here.
+unreachable_pub = "warn"
+rust_2018_idioms = "warn"
+
+[workspace.lints.clippy]
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+
+# Restriction-group lints that drive up consistency and brevity.
+allow_attributes_without_reason = "warn"
+as_pointer_underscore = "warn"
+assertions_on_result_states = "warn"
+clone_on_ref_ptr = "warn"
+deref_by_slicing = "warn"
+disallowed_script_idents = "warn"
+empty_drop = "warn"
+empty_enum_variants_with_brackets = "warn"
+empty_structs_with_brackets = "warn"
+fn_to_numeric_cast_any = "warn"
+if_then_some_else_none = "warn"
+map_err_ignore = "warn"
+redundant_type_annotations = "warn"
+renamed_function_params = "warn"
+semicolon_outside_block = "warn"
+undocumented_unsafe_blocks = "warn"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
+unneeded_field_pattern = "warn"
+unused_result_ok = "warn"
+
+# Avoids false positives with the structured-logging message templates.
+literal_string_with_formatting_args = "allow"
+
+# Custom opt-outs (case-by-case, per M-STATIC-VERIFICATION). These are binary
+# crates and unpublished internal libs, so the public-API doc lints below would
+# be pure noise rather than catching real contract gaps.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+
 # Keep release builds debuggable enough for a daemon while small.
 [profile.release]
 opt-level = 2

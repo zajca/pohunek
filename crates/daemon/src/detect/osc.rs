@@ -17,6 +17,7 @@ pub struct OscParser {
 }
 
 impl OscParser {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -40,6 +41,7 @@ impl OscParser {
         evidence
     }
 
+    #[must_use]
     pub fn is_active(&self) -> bool {
         !matches!(self.state, State::Ground)
     }
@@ -124,8 +126,7 @@ impl OscParser {
 
     fn advance_osc_discard_escape(&mut self, byte: u8) {
         match byte {
-            BEL => self.reset(),
-            b'\\' => self.reset(),
+            BEL | b'\\' => self.reset(),
             b']' => self.start_osc(),
             ESC => self.state = State::OscDiscardEscape,
             _ => self.state = State::OscDiscard,

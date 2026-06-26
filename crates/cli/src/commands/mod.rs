@@ -46,8 +46,7 @@ fn run_token() -> &'static str {
         // is before the epoch (it never is in practice).
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos());
         format!("{:x}{:x}", std::process::id(), nanos)
     })
 }
@@ -58,7 +57,7 @@ fn run_token() -> &'static str {
 /// in logs; `<run-token>-<seq>` makes every id unique — across the concurrent
 /// probes a single `host discover` fires, and across separate CLI invocations —
 /// so one command correlates to exactly its own lines in both the local and the
-/// remote daemon's logs (DoD #7). A bare `cli-<method>` would alias every
+/// remote daemon's logs (`DoD` #7). A bare `cli-<method>` would alias every
 /// repeated or concurrent call of that method.
 pub(crate) fn request_id(method: &str) -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);

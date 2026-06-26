@@ -21,12 +21,12 @@ pub enum ErrorClass {
     Configuration,
     /// Daemon-level failures: unavailable, version mismatch, framing.
     Daemon,
-    /// Transport failures: NetBird unreachable, connection lost.
+    /// Transport failures: `NetBird` unreachable, connection lost.
     Transport,
     /// Runtime failures: agent binary missing, PTY allocation, process exit,
     /// worktree conflict.
     Runtime,
-    /// Discovery failures: NetBird CLI missing, local state unavailable.
+    /// Discovery failures: `NetBird` CLI missing, local state unavailable.
     Discovery,
 }
 
@@ -137,8 +137,8 @@ impl ProtocolError {
     /// The canonical `discovery/netbird_cli_missing` error.
     ///
     /// Raised when the local `netbird` CLI cannot be found on `PATH`, so remote
-    /// host discovery and remote sessions over NetBird are unavailable. Carries a
-    /// `recover` hint pointing at installing NetBird and verifying with the
+    /// host discovery and remote sessions over `NetBird` are unavailable. Carries a
+    /// `recover` hint pointing at installing `NetBird` and verifying with the
     /// doctor. Code is stable: `netbird_cli_missing`.
     #[must_use]
     pub fn netbird_cli_missing() -> Self {
@@ -156,7 +156,7 @@ impl ProtocolError {
     /// The canonical `discovery/netbird_state_unavailable` error.
     ///
     /// Raised when the `netbird` CLI is present but its local state could not be
-    /// read (the NetBird daemon is down, or this host is not logged in). Carries a
+    /// read (the `NetBird` daemon is down, or this host is not logged in). Carries a
     /// short `detail` in the message and a `recover` hint. Code is stable:
     /// `netbird_state_unavailable`.
     #[must_use]
@@ -174,8 +174,8 @@ impl ProtocolError {
 
     /// The canonical `discovery/host_unknown` error.
     ///
-    /// Raised when the requested host name did not match any NetBird peer (by
-    /// fqdn, short hostname, or NetBird IP). Names the host so the operator sees
+    /// Raised when the requested host name did not match any `NetBird` peer (by
+    /// fqdn, short hostname, or `NetBird` IP). Names the host so the operator sees
     /// exactly what failed to resolve. Code is stable: `host_unknown`.
     #[must_use]
     pub fn host_unknown(host: &str) -> Self {
@@ -191,7 +191,7 @@ impl ProtocolError {
 
     /// The canonical `transport/host_unreachable` error.
     ///
-    /// Raised when a NetBird TCP connection to the host's daemon control port
+    /// Raised when a `NetBird` TCP connection to the host's daemon control port
     /// could not be opened (the peer is offline or the port is closed). Names the
     /// host and carries a `recover` hint. Code is stable: `host_unreachable`.
     #[must_use]
@@ -206,7 +206,7 @@ impl ProtocolError {
 
     /// The canonical `daemon/remote_daemon_unavailable` error.
     ///
-    /// Raised when a NetBird TCP connection to the host opened, but no compatible
+    /// Raised when a `NetBird` TCP connection to the host opened, but no compatible
     /// pohunek daemon answered on the control port. Names the host so the
     /// operator can investigate that specific peer. Code is stable:
     /// `remote_daemon_unavailable`.

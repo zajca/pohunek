@@ -1,6 +1,6 @@
-//! NetBird host discovery with a short-lived TTL cache.
+//! `NetBird` host discovery with a short-lived TTL cache.
 //!
-//! Enumerates the local host's NetBird peers and classifies each by probing its
+//! Enumerates the local host's `NetBird` peers and classifies each by probing its
 //! daemon control port (TCP connect + one `daemon.health` exchange). With many
 //! mostly-dead peers and a per-probe timeout, a full probe is slow, so the result
 //! is cached for [`DISCOVERY_CACHE_TTL`]: repeated calls (e.g. every launcher
@@ -89,11 +89,11 @@ impl DiscoveryCache {
     }
 }
 
-/// Enumerate NetBird peers and build a classified record for each.
+/// Enumerate `NetBird` peers and build a classified record for each.
 ///
-/// Every peer that advertises a parseable NetBird IP is probed concurrently —
-/// regardless of its NetBird connection state. An `Idle` peer (lazy connection
-/// not yet established) still has a routable NetBird address whose daemon may be
+/// Every peer that advertises a parseable `NetBird` IP is probed concurrently —
+/// regardless of its `NetBird` connection state. An `Idle` peer (lazy connection
+/// not yet established) still has a routable `NetBird` address whose daemon may be
 /// reachable; dialing it establishes the tunnel on demand. Only a peer with no
 /// usable IP — nothing to dial — is left a [`HostClass::Candidate`].
 async fn discover_records() -> Result<Vec<HostRecord>, netbird::NetbirdError> {
@@ -128,8 +128,8 @@ async fn discover_records() -> Result<Vec<HostRecord>, netbird::NetbirdError> {
 /// The control address to probe for a peer, or `None` when there is nothing
 /// safe to dial.
 ///
-/// A peer is probed whenever it advertises a parseable IP **inside the NetBird
-/// CGNAT range** — its NetBird connection state is deliberately *not* a gate. An
+/// A peer is probed whenever it advertises a parseable IP **inside the `NetBird`
+/// CGNAT range** — its `NetBird` connection state is deliberately *not* a gate. An
 /// `Idle` peer has a routable address whose daemon may answer (the dial
 /// establishes the tunnel on demand), so excluding it would silently hide a
 /// reachable host. The [`netbird::is_netbird_ip`] gate is the same fail-closed
@@ -241,8 +241,7 @@ fn classify_response(response: &Response) -> HostClass {
             daemon_version: ok
                 .get("daemon_version")
                 .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| "<unknown>".to_owned()),
+                .map_or_else(|| "<unknown>".to_owned(), str::to_owned),
         },
         // A matching-version daemon that errored on health is not usable.
         Response::Err { .. } => HostClass::Unreachable,
@@ -499,7 +498,7 @@ mod tests {
     /// A fresh cached entry is returned without probing, and repeated reads
     /// return the same snapshot. (We cannot stub `run_status`, so the freshness
     /// branch is exercised by pre-populating the cache; `force` would re-probe
-    /// — and thus call NetBird — so it is not exercised here.)
+    /// — and thus call `NetBird` — so it is not exercised here.)
     #[tokio::test]
     async fn fresh_cache_is_served_without_probing() {
         let records = vec![HostRecord {

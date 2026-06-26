@@ -8,6 +8,7 @@
 //! grammar is host-aware through the global `--host` flag, exactly like `host` and
 //! `session`.
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use protocol::{
@@ -181,7 +182,7 @@ pub(crate) async fn run_prompt(
     Ok(())
 }
 
-/// Human label for a provider kind (matches the wire snake_case form).
+/// Human label for a provider kind (matches the wire `snake_case` form).
 fn provider_label(provider: &ProviderKind) -> &'static str {
     match provider {
         ProviderKind::LinearIssue => "linear_issue",
@@ -271,13 +272,13 @@ fn render_actions_human(actions: &[ActionSummary]) -> String {
             PromptLayer::InRepo => "in-repo",
             PromptLayer::Host => "host",
         };
-        out.push_str(&format!(
-            "{}\t{}\t{}\t{}\n",
+        let _ = writeln!(
+            out,
+            "{}\t{}\t{}\t{layer}",
             action.name,
             provider_label(&action.provider),
             action.template,
-            layer
-        ));
+        );
     }
     out
 }
@@ -400,26 +401,21 @@ fn render_list_human(projects: &[ProjectInfo]) -> String {
         .max("LABEL".len());
 
     let mut output = String::new();
-    output.push_str(&format!(
-        "{:<id_width$}  {:<label_width$}  {:<6}  {:<4}  ROOT\n",
-        "ID",
-        "LABEL",
-        "SOURCE",
-        "BARE",
-        id_width = id_width,
-        label_width = label_width,
-    ));
+    let _ = writeln!(
+        output,
+        "{:<id_width$}  {:<label_width$}  {:<6}  {:<4}  ROOT",
+        "ID", "LABEL", "SOURCE", "BARE",
+    );
     for project in projects {
-        output.push_str(&format!(
-            "{:<id_width$}  {:<label_width$}  {:<6}  {:<4}  {}\n",
+        let _ = writeln!(
+            output,
+            "{:<id_width$}  {:<label_width$}  {:<6}  {:<4}  {}",
             project.id,
             project.label,
             source_label(project.source),
             if project.is_bare { "yes" } else { "-" },
             project.repo_root.display(),
-            id_width = id_width,
-            label_width = label_width,
-        ));
+        );
     }
     output
 }
@@ -465,17 +461,17 @@ fn render_show_human(result: &ProjectShowResult) -> String {
         .max()
         .unwrap_or(0)
         .max("FIELD".len());
-    output.push_str(&format!("{:<width$}  VALUE\n", "FIELD", width = width));
+    let _ = writeln!(output, "{:<width$}  VALUE", "FIELD");
     for (field, value) in &rows {
-        output.push_str(&format!("{field:<width$}  {value}\n", width = width));
+        let _ = writeln!(output, "{field:<width$}  {value}");
     }
 
-    output.push_str(&format!("\nworktrees ({}):\n", result.worktrees.len()));
+    let _ = writeln!(output, "\nworktrees ({}):", result.worktrees.len());
     if result.worktrees.is_empty() {
         output.push_str("  <none reported by git>\n");
     } else {
         for wt in &result.worktrees {
-            output.push_str(&format!("  {}\n", render_worktree_line(wt)));
+            let _ = writeln!(output, "  {}", render_worktree_line(wt));
         }
     }
     output
@@ -506,10 +502,6 @@ fn render_worktree_line(wt: &ProjectWorktree) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
-    use protocol::{ProjectInfo, ProjectShowResult, ProjectSource, ProjectWorktree};
-
     use super::*;
 
     fn project(id: &str, label: &str, source: ProjectSource) -> ProjectInfo {

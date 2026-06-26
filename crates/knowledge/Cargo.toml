@@ -22,3 +22,6 @@ protocol = ["dep:pohunek-protocol"]
 
 [build-dependencies]
 sha2 = { workspace = true }
+
+[lints]
+workspace = true

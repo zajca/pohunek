@@ -154,6 +154,10 @@ impl PtyHandle {
     /// `history_limit_bytes` caps the raw-output ring buffer replayed to clients
     /// on attach. The cap is daemon policy, not part of the command, so it is a
     /// separate argument rather than a field of [`PtyCommand`].
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "spawn consumes a one-shot command config; ownership is part of the API contract"
+    )]
     pub fn spawn(command: PtyCommand, history_limit_bytes: usize) -> Result<Self, PtyError> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -225,11 +229,12 @@ impl PtyHandle {
                             // poisoned lock rather than killing the reader.
                             let mut history = history_for_thread
                                 .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             history.push(&buf[..n]);
                             let _ = output_tx_for_thread.send(buf[..n].to_vec());
                         }
-                        Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                        // Retry on EINTR: falling through re-enters the read loop.
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
                         Err(err) => {
                             debug!(pid, error = %err, "PTY reader stopped");
                             break;
@@ -239,7 +244,11 @@ impl PtyHandle {
 
                 let exit = match child.wait() {
                     Ok(status) => PtyExit {
-                        exit_code: status.signal().is_none().then(|| status.exit_code() as i32),
+                        exit_code: status
+                            .signal()
+                            .is_none()
+                            .then(|| i32::try_from(status.exit_code()).ok())
+                            .flatten(),
                         success: status.success(),
                     },
                     Err(err) => {
@@ -293,13 +302,17 @@ impl PtyHandle {
         let history = self
             .history
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let receiver = self.output_tx.subscribe();
         let snapshot = history.snapshot();
         (snapshot, receiver)
     }
 
     /// Write user input to the PTY.
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "Poisoned/ThreadPanicked are sourceless marker variants by design"
+    )]
     pub async fn write_user_input(&self, bytes: Vec<u8>) -> Result<(), PtyError> {
         let writer = Arc::clone(&self.writer);
         tokio::task::spawn_blocking(move || {
@@ -313,6 +326,10 @@ impl PtyHandle {
     }
 
     /// Resize the PTY.
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "Poisoned/ThreadPanicked are sourceless marker variants by design"
+    )]
     pub async fn resize(&self, cols: u16, rows: u16) -> Result<(), PtyError> {
         let master = Arc::clone(&self.master);
         tokio::task::spawn_blocking(move || {
@@ -335,6 +352,10 @@ impl PtyHandle {
     /// If exit was already observed, no signal is sent: the child may have been
     /// reaped and its pid could now belong to an unrelated process, so signaling
     /// it would be a hazard.
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "ExitTimeout is a sourceless marker variant by design"
+    )]
     pub async fn shutdown(&self, grace: Duration) -> Result<PtyExit, PtyError> {
         // Short-circuit if the child already exited: avoid signaling a pid that
         // may have been reaped and reused. Clone out of the watch guard first so
@@ -346,28 +367,29 @@ impl PtyHandle {
         }
 
         self.terminate()?;
-        match tokio::time::timeout(grace, self.wait_exit()).await {
-            Ok(exit) => {
-                let exit = exit?;
-                self.join_reader_thread().await?;
-                Ok(exit)
+        if let Ok(exit) = tokio::time::timeout(grace, self.wait_exit()).await {
+            let exit = exit?;
+            self.join_reader_thread().await?;
+            Ok(exit)
+        } else {
+            // Re-check: if the child exited during the grace window, skip the
+            // hard kill rather than risk signaling a recycled pid.
+            if self.exit_rx.borrow().clone().is_none() {
+                self.kill()?;
             }
-            Err(_) => {
-                // Re-check: if the child exited during the grace window, skip the
-                // hard kill rather than risk signaling a recycled pid.
-                if self.exit_rx.borrow().clone().is_none() {
-                    self.kill()?;
-                }
-                let exit = tokio::time::timeout(grace, self.wait_exit())
-                    .await
-                    .map_err(|_| PtyError::ExitTimeout)??;
-                self.join_reader_thread().await?;
-                Ok(exit)
-            }
+            let exit = tokio::time::timeout(grace, self.wait_exit())
+                .await
+                .map_err(|_| PtyError::ExitTimeout)??;
+            self.join_reader_thread().await?;
+            Ok(exit)
         }
     }
 
     /// Wait until the child exits.
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "ExitTimeout is a sourceless marker variant by design"
+    )]
     pub async fn wait_exit(&self) -> Result<PtyExit, PtyError> {
         let mut exit_rx = self.exit_rx.clone();
         loop {
@@ -379,6 +401,10 @@ impl PtyHandle {
     }
 
     /// Join the dedicated blocking reader thread after process exit.
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "Poisoned/ThreadPanicked are sourceless marker variants by design"
+    )]
     pub async fn join_reader_thread(&self) -> Result<(), PtyError> {
         let join = {
             let mut guard = self.reader_thread.lock().map_err(|_| PtyError::Poisoned)?;
@@ -398,6 +424,10 @@ impl PtyHandle {
         send_signal(self.pid, libc::SIGTERM)
     }
 
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "Poisoned is a sourceless marker variant by design"
+    )]
     fn kill(&self) -> Result<(), PtyError> {
         let mut killer = self.killer.lock().map_err(|_| PtyError::Poisoned)?;
         killer.kill()?;
@@ -405,16 +435,23 @@ impl PtyHandle {
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code, reason = "libc::kill FFI; SAFETY documented below")]
 fn send_signal(pid: u32, signal: libc::c_int) -> Result<(), PtyError> {
     // The callers re-check the observed-exit watch before signaling, but a
     // residual TOCTOU between that check and the `kill(2)` syscall below cannot
     // be fully closed without a pidfd; treating ESRCH as success is the standard
     // mitigation for that lost race.
     //
+    // A process id is bounded by the kernel's PID_MAX, far below `i32::MAX`, so
+    // the cast to `pid_t` cannot wrap.
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "process id is bounded by PID_MAX, far below i32::MAX"
+    )]
+    let pid = pid as libc::pid_t;
     // SAFETY: `kill` is called with a pid obtained from the child process handle
     // returned by portable-pty and a constant signal value.
-    let result = unsafe { libc::kill(pid as libc::pid_t, signal) };
+    let result = unsafe { libc::kill(pid, signal) };
     if result == 0 {
         Ok(())
     } else {

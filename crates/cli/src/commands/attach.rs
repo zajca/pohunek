@@ -49,11 +49,24 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
     // NetBird TCP connection consistently. Dispatch on the transport once, then
     // run the identical (generic) header -> resize -> forward sequence in each arm.
     match connect_raw(host, paths).await? {
+        // Box the large attach future to keep this enclosing future small.
         RawStream::Local(stream) => {
-            attach_over_stream(stream, client, &attach.stream_id, target).await
+            Box::pin(attach_over_stream(
+                stream,
+                client,
+                &attach.stream_id,
+                target,
+            ))
+            .await
         }
         RawStream::Remote(stream) => {
-            attach_over_stream(stream, client, &attach.stream_id, target).await
+            Box::pin(attach_over_stream(
+                stream,
+                client,
+                &attach.stream_id,
+                target,
+            ))
+            .await
         }
     }
 }
@@ -163,7 +176,7 @@ fn build_resize_request(target: &Target, cols: u16, rows: u16) -> Result<Request
 
 /// Write the attach header line over any byte stream.
 ///
-/// Generic over the transport so the local Unix socket and the remote NetBird
+/// Generic over the transport so the local Unix socket and the remote `NetBird`
 /// TCP connection share one implementation.
 async fn send_attach_header<S>(stream: &mut S, stream_id: &str) -> Result<(), CliError>
 where
@@ -282,21 +295,27 @@ impl Drop for RawTerminal {
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "calls libc::isatty, the sole way to probe a tty"
+)]
 fn is_tty(fd: RawFd) -> bool {
     // SAFETY: `isatty` only reads the file descriptor value and does not require
     // any Rust-side aliasing or lifetime guarantees.
     unsafe { libc::isatty(fd) == 1 }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code, reason = "zero-initializes a plain C termios struct")]
 fn zeroed_termios() -> libc::termios {
     // SAFETY: `termios` is a plain C data struct. It is immediately initialized
     // by `tcgetattr` before any field is read.
     unsafe { std::mem::zeroed() }
 }
 
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "calls libc::tcgetattr to read terminal attributes"
+)]
 fn tcgetattr(fd: RawFd, termios: &mut libc::termios) -> Result<(), CliError> {
     // SAFETY: `termios` points to valid writable memory for the duration of the
     // call, and `fd` is checked by libc.
@@ -307,7 +326,10 @@ fn tcgetattr(fd: RawFd, termios: &mut libc::termios) -> Result<(), CliError> {
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "calls libc::tcsetattr to apply terminal attributes"
+)]
 fn tcsetattr(fd: RawFd, termios: &libc::termios) -> Result<(), CliError> {
     // SAFETY: `termios` points to valid initialized memory for the duration of
     // the call, and `fd` is checked by libc.
@@ -327,7 +349,10 @@ fn make_raw(termios: &mut libc::termios) {
     termios.c_cc[libc::VTIME] = 0;
 }
 
-#[allow(unsafe_code)]
+#[expect(
+    unsafe_code,
+    reason = "zero-inits winsize and calls libc::ioctl(TIOCGWINSZ)"
+)]
 fn terminal_size(fd: RawFd) -> Option<(u16, u16)> {
     if !is_tty(fd) {
         return None;
@@ -351,12 +376,14 @@ fn terminal_size(fd: RawFd) -> Option<(u16, u16)> {
 
 #[cfg(test)]
 mod tests {
-    use protocol::{method, Request};
     use serde_json::json;
 
     use super::*;
-    use crate::target::Target;
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "test helper takes the json! literal by value to keep call sites terse"
+    )]
     fn assert_request(request: &Request, method_name: &str, params: serde_json::Value) {
         assert_eq!(request.v.get(), 1, "envelope version");
         assert_eq!(request.method, method_name, "method");

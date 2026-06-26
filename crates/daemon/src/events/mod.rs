@@ -62,7 +62,7 @@ impl EventLog {
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        }
+        };
         Ok(Self {
             path,
             file: Mutex::new(file),
@@ -81,7 +81,10 @@ impl EventLog {
         let mut line = serde_json::to_string(event)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         line.push('\n');
-        let mut file = self.file.lock().unwrap_or_else(|err| err.into_inner());
+        let mut file = self
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         file.write_all(line.as_bytes())?;
         file.flush()
     }
@@ -94,7 +97,7 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
+    };
     Ok(())
 }
 
@@ -242,7 +245,7 @@ mod tests {
         let dir = temp_events_dir("drain");
         let log = Arc::new(EventLog::open(&dir).expect("open log"));
         let (tx, rx) = broadcast::channel(16);
-        let handle = spawn_drain(log.clone(), rx, CancellationToken::new());
+        let handle = spawn_drain(Arc::clone(&log), rx, CancellationToken::new());
 
         let sent = [
             Event::new(
@@ -299,7 +302,7 @@ mod tests {
             let log = EventLog::open(&dir).expect("first open");
             log.append(&Event::new(event::SESSION_CREATED, json!({ "n": 1 })))
                 .expect("append 1");
-        }
+        };
         {
             let log = EventLog::open(&dir).expect("second open");
             log.append(&Event::new(event::SESSION_STOPPED, json!({ "n": 2 })))
@@ -323,7 +326,7 @@ mod tests {
         for n in 0..8 {
             let _ = tx.send(Event::new(event::SESSION_UPDATED, json!({ "n": n })));
         }
-        let handle = spawn_drain(log.clone(), rx, CancellationToken::new());
+        let handle = spawn_drain(Arc::clone(&log), rx, CancellationToken::new());
         // Give the drain a moment to process the lag + remaining buffered events.
         tokio::time::sleep(Duration::from_millis(50)).await;
         drop(tx);
@@ -345,7 +348,7 @@ mod tests {
         let log = Arc::new(EventLog::open(&dir).expect("open log"));
         let (tx, rx) = broadcast::channel(16);
         let shutdown = CancellationToken::new();
-        let handle = spawn_drain(log.clone(), rx, shutdown.clone());
+        let handle = spawn_drain(Arc::clone(&log), rx, shutdown.clone());
 
         // Buffer events, then trigger shutdown WITHOUT dropping the sender — the
         // real daemon keeps the broadcast Sender alive at shutdown, so the drain

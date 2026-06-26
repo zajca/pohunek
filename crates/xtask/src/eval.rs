@@ -14,6 +14,7 @@
 //! CI checks (schema validation, deterministic build, source-map paths,
 //! runbook-vs-parser, secret scan) stay in `cargo xtask docs check`.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -134,8 +135,8 @@ pub(crate) struct CommandCheckResult {
 /// placeholder tokens are skipped (they are not real command lines).
 ///
 /// Returns one result per command. A command is valid if the CLI parser
-/// accepts it (even with `--help`/`--version` which exit with DisplayHelp/
-/// DisplayVersion). Only genuine parse failures count as hallucinations.
+/// accepts it (even with `--help`/`--version` which exit with `DisplayHelp`/
+/// `DisplayVersion`). Only genuine parse failures count as hallucinations.
 pub(crate) fn check_commands(commands: &[&str]) -> Vec<CommandCheckResult> {
     check_commands_inner(commands, true)
 }
@@ -320,7 +321,7 @@ It does not run a live agent and is not intended for CI automation.\n\n\
     );
 
     for fixture in fixtures {
-        content.push_str(&format!("- `{}`\n", fixture.transcript_path));
+        let _ = writeln!(content, "- `{}`", fixture.transcript_path);
     }
 
     content
@@ -342,12 +343,12 @@ fn render_fixture_artifact(fixture: &FixtureState) -> String {
     );
 
     for term in fixture.required_terms {
-        content.push_str(&format!("- `{term}`\n"));
+        let _ = writeln!(content, "- `{term}`");
     }
 
     content.push_str("\n## Accepted Example Commands\n\n");
     for command in fixture.example_commands {
-        content.push_str(&format!("- `{command}`\n"));
+        let _ = writeln!(content, "- `{command}`");
     }
 
     content
@@ -486,16 +487,14 @@ pub(crate) fn run_eval() -> bool {
     let passed = fixture_count - failed_fixture_count;
     if !all_fixtures_pass {
         println!(
-            "eval summary: {}/{} fixture(s) passed -- {} fixture(s) had hallucinated example commands",
-            passed, fixture_count, failed_fixture_count
+            "eval summary: {passed}/{fixture_count} fixture(s) passed -- {failed_fixture_count} fixture(s) had hallucinated example commands"
         );
         println!("==========================================================");
         return false;
     }
 
     println!(
-        "example command summary: {}/{} fixture(s) passed -- all examples parse correctly",
-        passed, fixture_count
+        "example command summary: {passed}/{fixture_count} fixture(s) passed -- all examples parse correctly"
     );
 
     let transcripts_dir = output_root.join(TRANSCRIPTS_DIR);
@@ -539,8 +538,6 @@ pub(crate) fn run_eval() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -597,14 +594,14 @@ mod tests {
 
     #[test]
     fn extracts_pohunek_commands_from_transcript_and_checks_parser_validity() {
-        let transcript = r#"
+        let transcript = r"
 Assistant:
 ```sh
 pohunek health --json
 pohunek made-up-command
 ```
 The fallback is `pohunek doctor --json`.
-"#;
+";
 
         let commands = extract_pohunek_commands(transcript);
         assert_eq!(
@@ -626,11 +623,11 @@ The fallback is `pohunek doctor --json`.
 
     #[test]
     fn extracts_pohunek_commands_from_shell_prompts_and_lists() {
-        let transcript = r#"
+        let transcript = r"
 $ pohunek health --json
 - pohunek doctor --json
 * pohunek daemon start --detach
-"#;
+";
 
         let commands = extract_pohunek_commands(transcript);
 

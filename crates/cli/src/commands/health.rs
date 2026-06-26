@@ -1,7 +1,7 @@
 //! `pohunek health` (alias `status`) — query a daemon over the control plane.
 //!
 //! Connects to the daemon for the effective host (local Unix socket or a remote
-//! NetBird TCP connection), issues `daemon.health`, and prints the daemon and
+//! `NetBird` TCP connection), issues `daemon.health`, and prints the daemon and
 //! protocol versions as a table or, with `--json`, the raw payload (see
 //! `docs/plan-phase-1.md` "CLI Grammar": `--json` on `status`).
 
@@ -41,8 +41,7 @@ pub(crate) async fn run(host: &str, paths: &Paths, json: bool) -> Result<(), Cli
         .unwrap_or("<unknown>");
     let protocol_version = result
         .get("protocol_version")
-        .map(value_to_string)
-        .unwrap_or_else(|| "<unknown>".to_owned());
+        .map_or_else(|| "<unknown>".to_owned(), value_to_string);
     let status = result
         .get("status")
         .and_then(Value::as_str)

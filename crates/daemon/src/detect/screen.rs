@@ -10,15 +10,15 @@ pub struct ScreenTracker {
 }
 
 impl std::fmt::Debug for ScreenTracker {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ScreenTracker")
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScreenTracker")
             .field("size", &self.parser.screen().size())
             .finish_non_exhaustive()
     }
 }
 
 impl ScreenTracker {
+    #[must_use]
     pub fn new(rows: u16, cols: u16) -> Self {
         Self {
             parser: vt100::Parser::new(rows, cols, SCROLLBACK_LINES),
@@ -44,12 +44,14 @@ impl ScreenTracker {
         self.parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
     }
 
+    #[must_use]
     pub fn visible_lines(&self) -> Vec<String> {
         let (rows, cols) = self.parser.screen().size();
 
         (0..rows).map(|row| self.trimmed_line(row, cols)).collect()
     }
 
+    #[must_use]
     pub fn bottom_lines(&self, count: usize) -> ScreenRegion {
         let lines = self.visible_lines();
         let start = lines.len().saturating_sub(count);
@@ -59,6 +61,7 @@ impl ScreenTracker {
         }
     }
 
+    #[must_use]
     pub fn bottom_non_empty_lines(&self, count: usize) -> ScreenRegion {
         let mut lines = self
             .visible_lines()
@@ -77,6 +80,7 @@ impl ScreenTracker {
     /// Wide glyphs are emitted only when the requested range includes both
     /// terminal cells. Clipped wide glyph cells and continuation cells are
     /// represented with spaces so region geometry remains stable.
+    #[must_use]
     pub fn slice_columns(&self, row: u16, start_col: u16, width: u16) -> String {
         let screen = self.parser.screen();
         let (rows, cols) = screen.size();
@@ -120,9 +124,10 @@ impl ScreenTracker {
         text
     }
 
+    #[must_use]
     pub fn recent_text(&self) -> String {
         let mut lines = self.visible_lines();
-        while lines.last().is_some_and(|line| line.is_empty()) {
+        while lines.last().is_some_and(std::string::String::is_empty) {
             lines.pop();
         }
 
@@ -134,6 +139,7 @@ impl ScreenTracker {
     /// Mirrors herdr's `after_last_prompt_marker`: returns the lines following
     /// the last Codex-style prompt marker, or the whole visible text when no
     /// marker is present.
+    #[must_use]
     pub fn after_last_prompt_marker(&self) -> String {
         let lines = self.visible_lines();
         match lines
@@ -150,6 +156,7 @@ impl ScreenTracker {
     /// Mirrors herdr's `prompt_box_body`: the lines between the prompt-box top
     /// border (the second horizontal rule counting from the bottom) and the next
     /// horizontal rule below it. Returns an empty string when no box is present.
+    #[must_use]
     pub fn prompt_box_body(&self) -> String {
         let lines = self.visible_lines();
         let Some(top) = Self::prompt_box_top_border_index(&lines) else {
@@ -159,8 +166,7 @@ impl ScreenTracker {
         let end = lines[top + 1..]
             .iter()
             .position(|line| Self::is_horizontal_rule(line))
-            .map(|relative| top + 1 + relative)
-            .unwrap_or(lines.len());
+            .map_or(lines.len(), |relative| top + 1 + relative);
 
         lines[top + 1..end].join("\n")
     }
@@ -169,6 +175,7 @@ impl ScreenTracker {
     ///
     /// Mirrors herdr's `after_last_horizontal_rule`: returns the lines after the
     /// last horizontal rule, or the whole visible text when no rule is present.
+    #[must_use]
     pub fn after_last_horizontal_rule(&self) -> String {
         let lines = self.visible_lines();
         match lines
@@ -211,8 +218,7 @@ impl ScreenTracker {
         let rule_bytes = trimmed
             .char_indices()
             .nth(rule_chars)
-            .map(|(index, _)| index)
-            .unwrap_or(trimmed.len());
+            .map_or(trimmed.len(), |(index, _)| index);
         let suffix = trimmed[rule_bytes..].trim_start();
 
         suffix.is_empty() || rule_chars >= 3

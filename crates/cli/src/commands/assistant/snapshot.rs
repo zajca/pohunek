@@ -73,6 +73,10 @@ struct AssistantSection {
 
 /// Redacted path set. Absolute home-revealing paths are rewritten to a `~`-form.
 #[derive(Debug, Serialize, PartialEq, Eq)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "field names are the serialized snapshot.json keys; the `_dir` suffix is the contract"
+)]
 struct PathsSection {
     config_dir: String,
     data_dir: String,
@@ -413,14 +417,9 @@ fn collect_local_sections(paths: &Paths, opts: &AssistantOptions) -> LocalSectio
 
     let mut warnings = Vec::new();
 
-    // Config scan — best-effort (pure filesystem, no RPC).
-    let config_scan = match scan_config(paths, opts) {
-        Ok(section) => Some(section),
-        Err(message) => {
-            warnings.push(format!("config_scan: {message}"));
-            None
-        }
-    };
+    // Config scan — pure filesystem, no RPC, and infallible (missing dirs and
+    // unreadable files degrade to empty/`absent` status rather than erroring).
+    let config_scan = Some(scan_config(paths, opts));
 
     // Source tree — best-effort (runs git CLI, only when --repo is set).
     let source_tree = if let Some(repo) = &opts.repo {
@@ -613,7 +612,7 @@ fn map_session_summary(info: &SessionInfo) -> SessionSummary {
         id: info.id.0.clone(),
         agent: info.agent.clone(),
         state: format!("{:?}", info.state).to_lowercase(),
-        activity: info.activity.map(|a| format!("{:?}", a).to_lowercase()),
+        activity: info.activity.map(|a| format!("{a:?}").to_lowercase()),
         project_id: info.project_id.clone(),
         project_label: info.project_label.clone(),
         warning_count: info.warnings.len(),
@@ -624,7 +623,7 @@ fn map_session_summary(info: &SessionInfo) -> SessionSummary {
 ///
 /// Reads filenames and TOML parse status only — never file bodies or hook
 /// content.
-fn scan_config(paths: &Paths, opts: &AssistantOptions) -> Result<ConfigScanSection, String> {
+fn scan_config(paths: &Paths, opts: &AssistantOptions) -> ConfigScanSection {
     let host_config = scan_pohunek_dir(&paths.config_dir);
 
     let repo_scan = opts.repo.as_ref().map(|repo| {
@@ -632,7 +631,7 @@ fn scan_config(paths: &Paths, opts: &AssistantOptions) -> Result<ConfigScanSecti
         scan_repo_dir(&repo_pohunek)
     });
 
-    Ok(ConfigScanSection {
+    ConfigScanSection {
         launcher_conf_present: host_config.launcher_conf_present,
         templates_toml_status: host_config.templates_toml_status,
         actions_toml_status: host_config.actions_toml_status,
@@ -640,7 +639,7 @@ fn scan_config(paths: &Paths, opts: &AssistantOptions) -> Result<ConfigScanSecti
         agent_profile_names: host_config.agent_profile_names,
         hook_names: host_config.hook_names,
         repo_scan,
-    })
+    }
 }
 
 /// Intermediate result of scanning a pohunek config directory.
@@ -723,11 +722,8 @@ fn list_filenames_without_ext(dir: &Path, ext: &str) -> Vec<String> {
             }
             let file_name = entry.file_name();
             let name = file_name.to_string_lossy();
-            if name.ends_with(&format!(".{ext}")) {
-                Some(name[..name.len() - ext.len() - 1].to_owned())
-            } else {
-                None
-            }
+            name.ends_with(&format!(".{ext}"))
+                .then(|| name[..name.len() - ext.len() - 1].to_owned())
         })
         .collect();
     names.sort_unstable();
@@ -770,24 +766,24 @@ fn collect_source_tree(repo: &std::path::Path) -> Result<SourceTreeSection, Stri
         .filter(|s| !s.is_empty());
 
     // git status --porcelain=v1 — empty → clean, non-empty → dirty.
-    let dirty_status_summary = run_git(&["status", "--porcelain=v1"], repo)
-        .map(|out| {
+    let dirty_status_summary = run_git(&["status", "--porcelain=v1"], repo).map_or_else(
+        |_| "unknown".to_owned(),
+        |out| {
             if out.trim().is_empty() {
                 "clean".to_owned()
             } else {
                 "dirty".to_owned()
             }
-        })
-        .unwrap_or_else(|_| "unknown".to_owned());
+        },
+    );
 
     // Compare the nearest version tag at HEAD with the running binary version.
     let version_matches_binary = run_git(&["describe", "--tags", "--exact-match", "HEAD"], repo)
         .ok()
-        .map(|tag| {
+        .is_some_and(|tag| {
             let tag = tag.trim().trim_start_matches('v');
             tag == BUNDLE_VERSION
-        })
-        .unwrap_or(false);
+        });
 
     Ok(SourceTreeSection {
         git_root,
@@ -857,9 +853,8 @@ mod tests {
     use std::collections::HashSet;
 
     use protocol::{
-        AgentKind, AgentRuntime, DaemonDoctorResult, DoctorCheck, DoctorReport, DoctorStatus,
-        HostCapabilities, ProjectActionsResult, ProjectInfo, ProjectSource, SessionId, SessionInfo,
-        SessionState,
+        AgentKind, AgentRuntime, DoctorCheck, DoctorReport, DoctorStatus, ProjectActionsResult,
+        ProjectSource, SessionId, SessionState,
     };
 
     use super::*;
@@ -1091,7 +1086,7 @@ mod tests {
             "source_tree",
         ]
         .iter()
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .collect();
 
         // warnings is omitted when empty (skip_serializing_if).

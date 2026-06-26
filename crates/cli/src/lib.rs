@@ -3,12 +3,9 @@
 //! Commands: `doctor`, `daemon start`, `health`/`status`, `session`, `attach`,
 //! `integration`, and `host` (discover/list/inspect). The grammar is host-aware
 //! (a `--host` flag and `<host>/<session-id>` targets); the *effective host*
-//! selects the transport, so local and remote (over NetBird) execute through one
+//! selects the transport, so local and remote (over `NetBird`) execute through one
 //! surface. Local behavior is unchanged from the local-only phase.
 
-#![warn(missing_debug_implementations)]
-#![warn(rust_2018_idioms)]
-#![warn(unreachable_pub)]
 #![deny(unsafe_code)]
 
 mod assistant;
@@ -33,7 +30,7 @@ use crate::target::{Target, LOCAL_HOST};
 #[command(name = "pohunek", version, about, long_about = None)]
 struct Cli {
     /// Target host for the command. `local` (the default) uses this machine; any
-    /// other name is resolved to a NetBird peer and dialed over the mesh. A
+    /// other name is resolved to a `NetBird` peer and dialed over the mesh. A
     /// `<host>/<session-id>` target's host overrides this flag for that command.
     #[arg(long, global = true, default_value = LOCAL_HOST)]
     host: String,
@@ -119,7 +116,7 @@ enum Commands {
         json: bool,
     },
 
-    /// Discover, list, and inspect remote hosts over NetBird.
+    /// Discover, list, and inspect remote hosts over `NetBird`.
     Host {
         #[command(subcommand)]
         action: HostAction,
@@ -150,6 +147,10 @@ enum Commands {
 
 /// Options shared by the default `assistant` form and every intent wrapper.
 #[derive(Debug, Clone, clap::Args)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "clap flag bag of independent boolean switches; an enum would not model them better"
+)]
 struct AssistantArgs {
     /// Free-form request for the assistant (joined into one line).
     request: Vec<String>,
@@ -239,7 +240,7 @@ enum ProjectAction {
     /// List known projects on the target host.
     List {
         /// Exact-match filter in key=value form. May be repeated and filters are
-        /// ANDed. Supported keys: source, label, id.
+        /// `ANDed`. Supported keys: source, label, id.
         #[arg(long = "filter", value_name = "key=value", value_parser = commands::project::parse_project_filter)]
         filters: Vec<protocol::ProjectListFilter>,
         /// Emit machine-readable JSON instead of a table.
@@ -332,14 +333,14 @@ enum ProjectAction {
 
 #[derive(Debug, Subcommand)]
 enum HostAction {
-    /// Enumerate NetBird peers and probe their daemons.
+    /// Enumerate `NetBird` peers and probe their daemons.
     Discover {
         /// Emit machine-readable JSON instead of a table.
         #[arg(long)]
         json: bool,
     },
 
-    /// List known hosts (live NetBird peers) with their classification.
+    /// List known hosts (live `NetBird` peers) with their classification.
     List {
         /// Emit machine-readable JSON instead of a table.
         #[arg(long)]
@@ -348,7 +349,7 @@ enum HostAction {
 
     /// Inspect one host's live capabilities (a direct daemon query).
     Inspect {
-        /// Host name to inspect (a NetBird peer name, or `local`).
+        /// Host name to inspect (a `NetBird` peer name, or `local`).
         host: String,
         /// Emit machine-readable JSON instead of a table.
         #[arg(long)]
@@ -477,7 +478,7 @@ enum SessionAction {
         #[arg(short = 'q', long = "quiet", conflicts_with = "json")]
         quiet: bool,
         /// Exact-match filter in key=value form. May be repeated and filters
-        /// are ANDed. Supported keys: state, activity, agent, id.
+        /// are `ANDed`. Supported keys: state, activity, agent, id.
         #[arg(long = "filter", value_name = "key=value", value_parser = commands::session::parse_list_filter)]
         filters: Vec<commands::session::ListFilter>,
     },
@@ -602,12 +603,13 @@ pub async fn run_cli() -> ExitCode {
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
-        Err(err) => return error::render_clap_error(err, error::args_request_json(&args)),
+        Err(err) => return error::render_clap_error(&err, error::args_request_json(&args)),
     };
     // Capture whether the active command requested `--json` before `run` consumes
     // `cli`, so a failure is rendered in the same mode a success would have been.
     let json = cli.command.wants_json();
-    match run(cli).await {
+    // Box the large dispatch future so this entrypoint future stays small.
+    match Box::pin(run(cli)).await {
         Ok(code) => code,
         Err(err) => {
             error::render(&err, json);
@@ -616,6 +618,10 @@ pub async fn run_cli() -> ExitCode {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "flat one-arm-per-subcommand dispatch match; splitting would only scatter it"
+)]
 async fn run(cli: Cli) -> Result<ExitCode, CliError> {
     let global_host = cli.host;
 
@@ -623,7 +629,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         Commands::Attach { target } => {
             let paths = Paths::resolve()?;
             let host = effective_host(&global_host, Some(&target));
-            commands::attach::run_attach(&host, &paths, &target).await?;
+            // Box the large attach future to keep this dispatch arm small.
+            Box::pin(commands::attach::run_attach(&host, &paths, &target)).await?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Doctor { json } => {
@@ -683,7 +690,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                         json,
                         yes,
                     )
-                    .await?
+                    .await?;
                 }
                 SessionAction::List {
                     json,
@@ -698,24 +705,24 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     } else {
                         commands::session::ListOutputMode::Human
                     };
-                    commands::session::run_list(&host, &paths, &filters, output_mode).await?
+                    commands::session::run_list(&host, &paths, &filters, output_mode).await?;
                 }
                 SessionAction::Inspect { target, json } => {
                     let host = effective_host(&global_host, Some(&target));
-                    commands::session::run_inspect(&host, &paths, &target, json).await?
+                    commands::session::run_inspect(&host, &paths, &target, json).await?;
                 }
                 SessionAction::Stop { target, json } => {
                     let host = effective_host(&global_host, Some(&target));
-                    commands::session::run_stop(&host, &paths, &target, json).await?
+                    commands::session::run_stop(&host, &paths, &target, json).await?;
                 }
                 SessionAction::Input { target, text, json } => {
                     let host = effective_host(&global_host, Some(&target));
-                    commands::session::run_input(&host, &paths, &target, &text, json).await?
+                    commands::session::run_input(&host, &paths, &target, &text, json).await?;
                 }
             }
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Subscribe { json: _ } => {
+        Commands::Subscribe { .. } => {
             // `json` is intentionally not read here: the daemon's event stream is
             // already NDJSON, so success output is the same with or without the
             // flag. It still governs error rendering through `wants_json` above.
@@ -846,7 +853,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             args,
         } => {
             let paths = Paths::resolve()?;
-            let opts = resolve_assistant_options(&global_host, action, intent, args);
+            let opts = resolve_assistant_options(&global_host, action.as_ref(), intent, args);
             commands::assistant::run(opts, &paths).await?;
             Ok(ExitCode::SUCCESS)
         }
@@ -858,13 +865,13 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
 /// uses `--intent` (defaulting to `help`).
 fn resolve_assistant_options(
     global_host: &str,
-    action: Option<AssistantAction>,
+    action: Option<&AssistantAction>,
     intent: Option<commands::assistant::Intent>,
     default_args: AssistantArgs,
 ) -> commands::assistant::AssistantOptions {
     use commands::assistant::Intent;
 
-    let (intent, args) = match &action {
+    let (intent, args) = match action {
         Some(wrapper) => {
             let (intent, args) = wrapper.parts();
             (intent, args.clone())
@@ -901,7 +908,7 @@ fn resolve_assistant_options(
 /// A positional [`Target`]'s host (when present) wins over the global `--host`
 /// flag; otherwise the global flag is used. `None` (no target) means "use the
 /// global flag" (commands that take only the flag). The returned string is the
-/// host name the transport selects on (`local`, or a NetBird peer name).
+/// host name the transport selects on (`local`, or a `NetBird` peer name).
 #[must_use]
 fn effective_host(global: &str, target: Option<&Target>) -> String {
     match target.and_then(|t| t.host.as_deref()) {
@@ -913,8 +920,6 @@ fn effective_host(global: &str, target: Option<&Target>) -> String {
 #[cfg(test)]
 mod tests {
     use crate as pohunek_cli;
-
-    use clap::Parser;
 
     use super::*;
 

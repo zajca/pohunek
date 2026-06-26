@@ -51,9 +51,9 @@ impl BundleIndexError {
 }
 
 impl fmt::Display for BundleIndexError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
-            formatter,
+            f,
             "invalid embedded knowledge concept `{}`: {}",
             self.path.display(),
             self.message

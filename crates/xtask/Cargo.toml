@@ -22,3 +22,6 @@ pulldown-cmark = "0.12"
 
 [dev-dependencies]
 serde_json = { workspace = true }
+
+[lints]
+workspace = true

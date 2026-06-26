@@ -2,10 +2,11 @@
 //!
 //! The CLI grammar is host-aware through [`crate::target::Target`]; the effective
 //! host selects the transport ([`Client`] dials the local Unix socket or a remote
-//! NetBird TCP connection). The session-id is the same on either side, so the
+//! `NetBird` TCP connection). The session-id is the same on either side, so the
 //! request-building functions are transport-agnostic. Starting a session on a
 //! *remote* host goes through a confirmation gate (see [`confirmation_decision`]).
 
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::PathBuf;
 
@@ -489,14 +490,15 @@ fn render_new_human(info: &SessionInfo) -> String {
             .as_deref()
             .map(|b| format!(" (branch {b})"))
             .unwrap_or_default();
-        output.push_str(&format!("  worktree: {}{branch}\n", path.display()));
+        let _ = writeln!(output, "  worktree: {}{branch}", path.display());
     }
     for warning in &info.warnings {
-        output.push_str(&format!(
-            "  warning [{}]: {}\n",
+        let _ = writeln!(
+            output,
+            "  warning [{}]: {}",
             warning_kind_label(warning.kind),
             warning.message
-        ));
+        );
     }
     output
 }
@@ -528,26 +530,15 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
         .max("BRANCH".len());
 
     let mut output = String::new();
-    output.push_str(&format!(
-        "{:<id_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  CWD\n",
-        "ID",
-        "AGENT",
-        "STATE",
-        "ACTIVITY",
-        "SOURCE",
-        "PID",
-        "SIZE",
-        "PROJECT",
-        "BRANCH",
-        "WARN",
-        id_width = id_width,
-        agent_width = agent_width,
-        project_width = project_width,
-        branch_width = branch_width
-    ));
+    let _ = writeln!(
+        output,
+        "{:<id_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  CWD",
+        "ID", "AGENT", "STATE", "ACTIVITY", "SOURCE", "PID", "SIZE", "PROJECT", "BRANCH", "WARN",
+    );
     for session in sessions {
-        output.push_str(&format!(
-            "{:<id_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {}\n",
+        let _ = writeln!(
+            output,
+            "{:<id_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {}",
             session.id.0,
             agent_label(&session.agent),
             state_label(session.state),
@@ -559,11 +550,7 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
             branch_label(session),
             warn_count_label(session),
             session.cwd.display(),
-            id_width = id_width,
-            agent_width = agent_width,
-            project_width = project_width,
-            branch_width = branch_width
-        ));
+        );
     }
     output
 }
@@ -661,25 +648,21 @@ fn render_inspect_human(info: &SessionInfo) -> String {
             "repo",
             info.repo
                 .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(none),
+                .map_or_else(none, |p| p.display().to_string()),
         ),
         ("branch", info.branch.clone().unwrap_or_else(none)),
         (
             "worktree_path",
             info.worktree_path
                 .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(none),
+                .map_or_else(none, |p| p.display().to_string()),
         ),
         ("warnings", warn_count_label(info)),
         ("created_at", info.created_at.clone()),
         ("updated_at", info.updated_at.clone()),
         (
             "exit_code",
-            info.exit_code
-                .map(|code| code.to_string())
-                .unwrap_or_else(none),
+            info.exit_code.map_or_else(none, |code| code.to_string()),
         ),
     ];
     let width = rows
@@ -690,20 +673,21 @@ fn render_inspect_human(info: &SessionInfo) -> String {
         .max("FIELD".len());
 
     let mut output = String::new();
-    output.push_str(&format!("{:<width$}  VALUE\n", "FIELD", width = width));
+    let _ = writeln!(output, "{:<width$}  VALUE", "FIELD");
     for (field, value) in &rows {
-        output.push_str(&format!("{field:<width$}  {value}\n", width = width));
+        let _ = writeln!(output, "{field:<width$}  {value}");
     }
     // Each non-fatal warning is detailed below the table so a worktree session
     // surfaces exactly what happened and what was done instead.
     for warning in &info.warnings {
-        output.push_str(&format!(
-            "warning [{}]: {}\n",
+        let _ = writeln!(
+            output,
+            "warning [{}]: {}",
             warning_kind_label(warning.kind),
             warning.message
-        ));
+        );
         if let Some(detail) = &warning.detail {
-            output.push_str(&format!("  detail: {detail}\n"));
+            let _ = writeln!(output, "  detail: {detail}");
         }
     }
     output
@@ -749,7 +733,7 @@ fn is_terminal(state: SessionState) -> bool {
 }
 
 fn activity_label_option(activity: Option<AgentActivity>) -> &'static str {
-    activity.map(activity_label).unwrap_or("-")
+    activity.map_or("-", activity_label)
 }
 
 fn activity_label(activity: AgentActivity) -> &'static str {
@@ -780,16 +764,10 @@ fn warning_kind_label(kind: SessionWarningKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
-    use protocol::{
-        method, AgentActivity, Request, SessionInfo, SessionState, SessionWarning,
-        SessionWarningKind, StateSource,
-    };
+    use protocol::SessionWarning;
     use serde_json::json;
 
     use super::*;
-    use crate::target::Target;
 
     fn running_session(id: &str) -> SessionInfo {
         SessionInfo {
@@ -832,6 +810,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "test helper takes the json! literal by value to keep call sites terse"
+    )]
     fn assert_request(request: &Request, method_name: &str, params: serde_json::Value) {
         assert_eq!(request.v.get(), 1, "envelope version");
         assert_eq!(request.method, method_name, "method");

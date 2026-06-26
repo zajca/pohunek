@@ -734,8 +734,7 @@ fn wait_until_process_gone(pid: i32, budget: Duration) -> bool {
             .arg("-0")
             .arg(pid.to_string())
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+            .is_ok_and(|o| o.status.success());
         if !alive {
             return true;
         }
@@ -774,7 +773,7 @@ fn binding_persist_failure_rolls_back_the_worktree() {
     let probe = store_dir.join(".probe");
     if fs::write(&probe, b"x").is_ok() {
         let _ = fs::remove_file(&probe);
-        fs::set_permissions(&store_dir, fs::Permissions::from_mode(0o755)).ok();
+        let _ = fs::set_permissions(&store_dir, fs::Permissions::from_mode(0o755));
         eprintln!(
             "skipping binding_persist_failure_rolls_back_the_worktree: perms not enforced (root?)"
         );

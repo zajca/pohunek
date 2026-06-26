@@ -12,7 +12,7 @@ use crate::pty::PtyCommand;
 pub struct ClaudeAdapter;
 
 impl AgentAdapter for ClaudeAdapter {
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         "claude"
     }
 

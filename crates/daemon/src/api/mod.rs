@@ -1,4 +1,4 @@
-//! Control server (local Unix socket + NetBird TCP).
+//! Control server (local Unix socket + `NetBird` TCP).
 //!
 //! Binds the control socket with owner-private permissions, recovers from a
 //! stale socket left by a previous run, and serves newline-delimited JSON
@@ -8,7 +8,7 @@
 //! supervision").
 //!
 //! The same connection-serving code drives two transports: the local
-//! [`ControlServer`] over a Unix socket and the [`RemoteServer`] over a NetBird
+//! [`ControlServer`] over a Unix socket and the [`RemoteServer`] over a `NetBird`
 //! TCP listener (milestone 11). Everything below the accept loop is generic over
 //! any `AsyncRead + AsyncWrite` stream, so the protocol and attach semantics are
 //! identical across transports.
@@ -161,7 +161,7 @@ impl ControlServer {
     }
 }
 
-/// The bound remote (NetBird TCP) control server, ready to accept connections.
+/// The bound remote (`NetBird` TCP) control server, ready to accept connections.
 ///
 /// Identical protocol and attach semantics to [`ControlServer`]; only the
 /// transport differs. Binding is gated by [`validate_netbird_bind_addr`] so the
@@ -177,7 +177,7 @@ pub struct RemoteServer {
 impl RemoteServer {
     /// Bind a TCP control listener at `addr`.
     ///
-    /// FAILS CLOSED: `addr.ip()` is validated as a NetBird address
+    /// FAILS CLOSED: `addr.ip()` is validated as a `NetBird` address
     /// ([`validate_netbird_bind_addr`]) **before** the socket is opened, so an
     /// invalid or non-NetBird address never reaches the OS bind. This is the
     /// authoritative gate that keeps the control port off public, RFC1918, and
@@ -186,7 +186,7 @@ impl RemoteServer {
     /// # Errors
     ///
     /// Returns [`DaemonError::NetbirdBind`] when the address is not a valid
-    /// NetBird bind address, or [`DaemonError::Socket`] on an OS bind failure.
+    /// `NetBird` bind address, or [`DaemonError::Socket`] on an OS bind failure.
     pub async fn bind(addr: SocketAddr, state: DaemonState) -> Result<Self, DaemonError> {
         if let Err(err) = validate_netbird_bind_addr(addr.ip()) {
             return Err(DaemonError::NetbirdBind {
@@ -216,7 +216,7 @@ impl RemoteServer {
         })
     }
 
-    /// Wrap an already-bound listener WITHOUT NetBird validation.
+    /// Wrap an already-bound listener WITHOUT `NetBird` validation.
     ///
     /// For tests and internal use only: the loopback-TCP stand-in in CI binds
     /// `127.0.0.1:0` and wraps it here, which the production [`bind`](Self::bind)
@@ -286,7 +286,7 @@ impl RemoteServer {
 /// each, and write back one response line per request.
 ///
 /// Generic over the underlying stream so the same logic serves a local Unix
-/// connection ([`ControlServer`]) and a NetBird TCP connection ([`RemoteServer`])
+/// connection ([`ControlServer`]) and a `NetBird` TCP connection ([`RemoteServer`])
 /// without divergence.
 ///
 /// A `subscribe` request is the exception: after its OK ack the connection turns
@@ -421,7 +421,6 @@ where
                         skipped,
                         "attach output subscriber lagged; PTY bytes were dropped"
                     );
-                    continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
@@ -487,7 +486,6 @@ where
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(skipped, "event subscriber lagged; some events were dropped");
-                    continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -517,25 +515,22 @@ async fn recover_stale_socket(path: &Path) -> Result<(), DaemonError> {
     if !path.exists() {
         return Ok(());
     }
-    match UnixStream::connect(path).await {
-        Ok(_) => {
-            // Something is alive on the socket. This is unexpected after the
-            // single-instance lock; fail clearly rather than clobbering it.
-            Err(DaemonError::Socket {
-                path: path.to_path_buf(),
-                source: io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    "a live daemon is already listening on this socket",
-                ),
-            })
-        }
-        Err(_) => {
-            warn!(socket = %path.display(), "removing stale socket from a previous run");
-            std::fs::remove_file(path).map_err(|source| DaemonError::Socket {
-                path: path.to_path_buf(),
-                source,
-            })
-        }
+    if UnixStream::connect(path).await.is_ok() {
+        // Something is alive on the socket. This is unexpected after the
+        // single-instance lock; fail clearly rather than clobbering it.
+        Err(DaemonError::Socket {
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "a live daemon is already listening on this socket",
+            ),
+        })
+    } else {
+        warn!(socket = %path.display(), "removing stale socket from a previous run");
+        std::fs::remove_file(path).map_err(|source| DaemonError::Socket {
+            path: path.to_path_buf(),
+            source,
+        })
     }
 }
 

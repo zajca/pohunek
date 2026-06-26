@@ -7,7 +7,7 @@
 //! write-path: every mutation rewrites the whole file via one temp file +
 //! `rename`, so a write of one record kind can never corrupt or drop a record of
 //! another kind, and any single update is crash-atomic (one `rename(2)` commits
-//! it). This is the transactional consistency a SQLite store would have given,
+//! it). This is the transactional consistency a `SQLite` store would have given,
 //! without the dependency (see `NEXT.md` milestone 9).
 //!
 //! This is a consistency guarantee about the *write path*, not a lifecycle
@@ -406,7 +406,10 @@ impl Store {
     /// Upsert a resume binding (keyed by `session_id`), preserving every worktree
     /// record, and rewrite the file atomically.
     pub fn record_resume(&self, binding: &ResumeBinding) -> io::Result<()> {
-        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (mut resume, worktrees, projects) = self.read_all()?;
         if let Some(existing) = resume
             .iter_mut()
@@ -422,7 +425,10 @@ impl Store {
     /// Remove a resume binding by session id, preserving every worktree record. A
     /// missing entry is a no-op.
     pub fn remove_resume(&self, session_id: &str) -> io::Result<()> {
-        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (mut resume, worktrees, projects) = self.read_all()?;
         let before = resume.len();
         resume.retain(|binding| binding.session_id != session_id);
@@ -466,7 +472,10 @@ impl Store {
     /// atomically. The triple key keeps two branches of one `(session,
     /// repository)` pair from collapsing onto a single row.
     pub fn record_worktree(&self, binding: &WorktreeBinding) -> io::Result<()> {
-        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (resume, mut worktrees, projects) = self.read_all()?;
         if let Some(existing) = worktrees.iter_mut().find(|existing| {
             existing.session_id == binding.session_id
@@ -483,7 +492,10 @@ impl Store {
     /// Remove every worktree binding owned by `session_id`, preserving every
     /// resume record. Returns the number removed (`0` is a no-op success).
     pub fn remove_worktree_session(&self, session_id: &str) -> io::Result<usize> {
-        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (resume, mut worktrees, projects) = self.read_all()?;
         let before = worktrees.len();
         worktrees.retain(|binding| binding.session_id != session_id);
@@ -516,7 +528,10 @@ impl Store {
     where
         F: FnOnce(Option<ProjectRecord>) -> Option<ProjectRecord>,
     {
-        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (resume, worktrees, mut projects) = self.read_all()?;
         let pos = projects
             .iter()
@@ -545,7 +560,10 @@ impl Store {
     /// record (read-modify-write); this whole-record overwrite is for callers that
     /// already hold the complete intended record.
     pub fn record_project(&self, record: &ProjectRecord) -> io::Result<()> {
-        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (resume, worktrees, mut projects) = self.read_all()?;
         if let Some(existing) = projects
             .iter_mut()
@@ -563,7 +581,10 @@ impl Store {
     /// success). Only forgets the record; it never touches the on-disk repository
     /// or its worktrees.
     pub fn remove_project(&self, git_common_dir: &Path) -> io::Result<bool> {
-        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (resume, worktrees, mut projects) = self.read_all()?;
         let before = projects.len();
         projects.retain(|project| project.git_common_dir != git_common_dir);
@@ -660,8 +681,7 @@ impl Store {
         let mut name = self
             .path
             .file_name()
-            .map(|name| name.to_os_string())
-            .unwrap_or_else(|| "metadata.jsonl".into());
+            .map_or_else(|| "metadata.jsonl".into(), std::ffi::OsStr::to_os_string);
         name.push(format!(".tmp.{}", std::process::id()));
         match self.path.parent() {
             Some(parent) => parent.join(name),
@@ -687,7 +707,7 @@ fn write_owner_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
+    };
     Ok(())
 }
 

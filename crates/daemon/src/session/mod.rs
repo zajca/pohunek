@@ -59,7 +59,7 @@ const DEFAULT_OUTPUT_HISTORY_LIMIT_BYTES: usize = 10_000_000;
 /// legitimate script may install dependencies — so it is generous; a script that
 /// exceeds it is terminated and surfaced as a non-fatal `setup_script` warning.
 /// Overridable via [`SessionRegistryConfig::hook_timeout`].
-const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Default grace period to wait for a freshly spawned agent to produce its first
 /// PTY output before injecting a `session.new --input` prompt. It is an upper
@@ -112,7 +112,7 @@ impl Default for ShellCommand {
 }
 
 impl AgentAdapter for ShellCommand {
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         "shell"
     }
 
@@ -322,7 +322,7 @@ impl LagWarnThrottle {
     /// window may never elapse because the session died mid-storm). Emits the
     /// trailing summary if any lags were folded, then resets.
     fn flush(&mut self) -> Option<LagWarn> {
-        if self.pending_events > 0 {
+        (self.pending_events > 0).then(|| {
             let summary = LagWarn::Summary {
                 events: self.pending_events,
                 skipped: self.pending_skipped,
@@ -330,10 +330,8 @@ impl LagWarnThrottle {
             self.window_started = None;
             self.pending_events = 0;
             self.pending_skipped = 0;
-            Some(summary)
-        } else {
-            None
-        }
+            summary
+        })
     }
 }
 
@@ -599,7 +597,7 @@ impl SessionRegistry {
         let worktree = match (&config.worktree_root, &store) {
             (Some(root), Some(store)) => Some(Arc::new(WorktreeManager::new(
                 root.clone(),
-                store.clone(),
+                Arc::clone(store),
                 config.hook_timeout,
                 config.config_dir.clone(),
             ))),
@@ -684,6 +682,10 @@ impl SessionRegistry {
     /// is still using it, in which case the record is kept (`removed: false`) so its
     /// surviving bindings keep pointing at a real project; a later `rm` succeeds
     /// once those sessions stop. A plain `rm` (no prune) only forgets the record.
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "spawn_blocking JoinError has no meaningful source to surface in ProtocolError"
+    )]
     pub async fn remove_project(
         &self,
         reference: &str,
@@ -722,7 +724,7 @@ impl SessionRegistry {
             // Resolve first so a missing/ambiguous reference errors before any
             // worktree is touched, and so we have the id to scope the prune.
             let record = projects.resolve(&reference)?;
-            let (pruned_worktrees, skipped_worktrees) = if prune_worktrees {
+            let (pruned_count, skipped_worktrees) = if prune_worktrees {
                 match &worktree {
                     Some(manager) => {
                         let skip: HashSet<PathBuf> =
@@ -771,7 +773,7 @@ impl SessionRegistry {
             };
             Ok(ProjectRemoveResult {
                 removed,
-                pruned_worktrees,
+                pruned_worktrees: pruned_count,
                 skipped_worktrees,
             })
         })
@@ -805,7 +807,7 @@ impl SessionRegistry {
             .inner
             .event_log_task
             .lock()
-            .unwrap_or_else(|err| err.into_inner()) = Some(handle);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
         Ok(())
     }
 
@@ -821,7 +823,7 @@ impl SessionRegistry {
             .inner
             .event_log_task
             .lock()
-            .unwrap_or_else(|err| err.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         if let Some(handle) = handle {
             if tokio::time::timeout(EVENT_LOG_FLUSH_TIMEOUT, handle)
@@ -844,7 +846,7 @@ impl SessionRegistry {
             .inner
             .agent_state_hook_task
             .lock()
-            .unwrap_or_else(|err| err.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot.is_some() {
             return;
         }
@@ -864,7 +866,7 @@ impl SessionRegistry {
             .inner
             .agent_state_hook_task
             .lock()
-            .unwrap_or_else(|err| err.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         if let Some(handle) = handle {
             if tokio::time::timeout(EVENT_LOG_FLUSH_TIMEOUT, handle)
@@ -885,6 +887,10 @@ impl SessionRegistry {
     /// branch)` (with `--branch`). A non-git directory yields a plain shell with
     /// no project. The session records `project_id`/`is_linked_worktree`, and any
     /// non-fatal worktree warnings ride along on the returned [`SessionInfo`].
+    #[expect(
+        clippy::too_many_lines,
+        reason = "tracked for session module decomposition"
+    )]
     pub async fn create(&self, params: SessionNewParams) -> Result<SessionInfo, ProtocolError> {
         validate_new_params(&params)?;
         let initial_input = params.input.clone();
@@ -1118,9 +1124,11 @@ impl SessionRegistry {
         let _ = tokio::time::timeout(grace, async {
             loop {
                 match output.recv().await {
-                    Ok(_) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    // A live chunk arrived, or the channel closed: stop waiting.
+                    Ok(_) | Err(broadcast::error::RecvError::Closed) => break,
+                    // A lag means we missed chunks but the agent is producing output;
+                    // keep waiting for the next recv.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
                 }
             }
         })
@@ -1230,7 +1238,7 @@ impl SessionRegistry {
                      use --branch to create a worktree",
                 ));
             }
-            return Ok(self.in_place_target(project, detected, fallback_cwd));
+            return Ok(Self::in_place_target(project, detected, fallback_cwd));
         };
 
         // Worktree-per-session. The source repo is an explicit `--repo`, else the
@@ -1280,7 +1288,6 @@ impl SessionRegistry {
     /// in-place start on a bare repo (no working tree to run in) and steers the
     /// caller to `--branch`. So every project passed in has a real checkout.
     fn in_place_target(
-        &self,
         project: Option<ProjectRecord>,
         detected: Option<DetectedProject>,
         fallback_cwd: PathBuf,
@@ -1324,6 +1331,10 @@ impl SessionRegistry {
     /// whereas an **implicit** non-git `--cwd` is the normal plain-shell case.
     /// Returns the record and, when detection ran, the [`DetectedProject`] (the
     /// in-place path needs its `checkout_path`/`is_linked_worktree`).
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "spawn_blocking JoinError has no meaningful source to surface in ProtocolError"
+    )]
     async fn resolve_project(
         &self,
         params: &SessionNewParams,
@@ -1374,6 +1385,10 @@ impl SessionRegistry {
 
     /// Bind (or reuse) a worktree for `(session, repo, branch)` on a blocking
     /// thread. Errors when worktree binding is not configured.
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "spawn_blocking JoinError has no meaningful source to surface in ProtocolError"
+    )]
     async fn bind_worktree(
         &self,
         session_id: &str,
@@ -1405,6 +1420,10 @@ impl SessionRegistry {
     /// Spawn a PTY for `spec.command`, register the session, and start its
     /// detector and exit watcher. Shared by `create` (first launch) and
     /// `resume_binding` (relaunch after a daemon restart).
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "spawn_blocking JoinError has no meaningful source to surface in ProtocolError"
+    )]
     async fn register_pty_session(
         &self,
         spec: PtySessionSpec,
@@ -1483,8 +1502,8 @@ impl SessionRegistry {
                     input_rules,
                     snapshot,
                 },
-            );
-        }
+            )
+        };
 
         self.emit(event::SESSION_CREATED, &info);
         self.spawn_detector(
@@ -1636,16 +1655,17 @@ impl SessionRegistry {
             let ref_kind = template.ref_kind;
             let validated = match ref_kind {
                 SessionRefKind::Id => SessionRef::id(&params.native_session_id),
-                SessionRefKind::Path => match params.transcript_path.as_deref() {
-                    Some(path) => SessionRef::path(path),
-                    None => {
+                SessionRefKind::Path => {
+                    if let Some(path) = params.transcript_path.as_deref() {
+                        SessionRef::path(path)
+                    } else {
                         debug!(
                             session_id = %params.session_id.0,
                             "ignoring path-kind native-id report without transcript_path"
                         );
                         return not_recorded;
                     }
-                },
+                }
             };
             let session_ref = match validated {
                 Ok(session_ref) => session_ref,
@@ -1813,6 +1833,10 @@ impl SessionRegistry {
     }
 
     /// Relaunch one session from its stored resume binding, reusing its id.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "tracked for session module decomposition"
+    )]
     async fn resume_binding(&self, binding: ResumeBinding) -> Result<SessionInfo, ProtocolError> {
         // The resume mechanics come from the frozen structural snapshot (C.4). An
         // explicit `(resume_mode, ref_kind)` pair drives the argv; a legacy binding
@@ -2141,8 +2165,8 @@ impl SessionRegistry {
                     session_id: pending.session_id.clone(),
                     cancel: cancel.clone(),
                 },
-            );
-        }
+            )
+        };
 
         if let Err(err) = self.ensure_session_running(&pending.session_id).await {
             let mut active_attaches = self.inner.active_attaches.lock().await;
@@ -2335,7 +2359,10 @@ impl SessionRegistry {
     // The detector spawn carries the session id, base kind, manifest override, the
     // output stream, the initial size, and its cancel/resize channels — all distinct
     // runtime inputs with no natural grouping struct.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "distinct detector runtime inputs with no natural grouping struct"
+    )]
     fn spawn_detector(
         &self,
         id: SessionId,
@@ -2361,7 +2388,7 @@ impl SessionRegistry {
 
             loop {
                 tokio::select! {
-                    _ = cancel.cancelled() => break,
+                    () = cancel.cancelled() => break,
                     _ = tick.tick() => {
                         for transition in detector.tick(Instant::now()) {
                             registry.record_activity(&id, transition).await;
@@ -2858,13 +2885,8 @@ async fn flush_pending_agent_state_hooks(
     let now = tokio::time::Instant::now();
     let due: Vec<SessionId> = pending
         .iter()
-        .filter_map(|(session_id, (_, deadline))| {
-            if flush_all || *deadline <= now {
-                Some(session_id.clone())
-            } else {
-                None
-            }
-        })
+        .filter(|&(_session_id, (_, deadline))| flush_all || *deadline <= now)
+        .map(|(session_id, (_, _deadline))| session_id.clone())
         .collect();
 
     for session_id in due {
@@ -2997,11 +3019,14 @@ fn attach_token_error(code: &'static str, stream_id: &str) -> ProtocolError {
     )
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "used directly as a `.map_err` function pointer, which requires owning the error"
+)]
 fn pty_error_to_protocol(err: PtyError) -> ProtocolError {
     let code = match err {
         PtyError::Allocate(_) => "pty_alloc_failed",
-        PtyError::Spawn { .. } => "spawn_failed",
-        PtyError::MissingPid => "spawn_failed",
+        PtyError::Spawn { .. } | PtyError::MissingPid => "spawn_failed",
         PtyError::Io(_) | PtyError::Poisoned | PtyError::ThreadPanicked | PtyError::ExitTimeout => {
             "pty_error"
         }
@@ -4106,6 +4131,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "tracked for session module decomposition"
+    )]
     async fn session_layer_hooks_run_with_cleared_env_and_exact_allowlist() {
         let config_dir = temp_dir("session-hook-env-config");
         let cwd = temp_dir("session-hook-env-cwd");
@@ -4595,7 +4624,7 @@ mod tests {
                 pending.contains_key(&fresh.stream_id),
                 "fresh pending attach token should remain"
             );
-        }
+        };
 
         let redeemed = registry
             .redeem_attach(&fresh.stream_id)

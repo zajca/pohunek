@@ -21,7 +21,7 @@ const CODEX_SUBMIT_DELAY: Duration = Duration::from_millis(150);
 pub struct CodexAdapter;
 
 impl AgentAdapter for CodexAdapter {
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         "codex"
     }
 

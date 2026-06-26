@@ -6,6 +6,8 @@
 //! env names and the `session.report_native_id` method, and writes into the
 //! agent's config dir. The CLI is a thin client that forwards the request.
 
+use std::fmt::Write as _;
+
 use clap::ValueEnum;
 use protocol::{method, AgentKind, IntegrationInstallParams, IntegrationInstallResult, Request};
 
@@ -81,13 +83,14 @@ fn render_install_human(result: &IntegrationInstallResult) -> String {
     }
     let mut output = String::new();
     for report in &result.installed {
-        output.push_str(&format!(
-            "installed {} hook: {}\n",
+        let _ = writeln!(
+            output,
+            "installed {} hook: {}",
             agent_label(report.agent),
             report.hook_path
-        ));
+        );
         for path in &report.config_paths {
-            output.push_str(&format!("  config: {path}\n"));
+            let _ = writeln!(output, "  config: {path}");
         }
     }
     output

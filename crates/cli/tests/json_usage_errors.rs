@@ -5,7 +5,7 @@
 //! `--help` display — *before* any daemon connection or filesystem access, so
 //! the tests are hermetic: no socket, no state directory, no env setup.
 //!
-//! They lock in the milestone-10 DoD #2 contract for the one path that used to
+//! They lock in the milestone-10 `DoD` #2 contract for the one path that used to
 //! escape it: a usage error under `--json` must print a single structured
 //! `{class, code, msg, recover?}` document to stdout (nothing human leaking) and
 //! exit non-zero, so automation can branch on `code`.

@@ -11,6 +11,7 @@
 //! mis-typed command — is machine-readable, not just the ones that occur after a
 //! successful parse.
 
+use std::fmt::Write as _;
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -50,27 +51,27 @@ pub(crate) enum CliError {
     Protocol(#[from] ProtocolError),
 
     /// The local `netbird` CLI was not found on `PATH`, so a remote host could
-    /// not be resolved. NetBird is optional (local-only use is fine); this only
+    /// not be resolved. `NetBird` is optional (local-only use is fine); this only
     /// surfaces when a remote target is actually requested.
     #[error("the `netbird` CLI was not found on PATH")]
     NetbirdCliMissing,
 
     /// The `netbird` CLI is present but its local state could not be read (the
-    /// NetBird daemon is down, or this host is not logged in).
+    /// `NetBird` daemon is down, or this host is not logged in).
     #[error("NetBird local state is unavailable: {detail}")]
     NetbirdStateUnavailable {
         /// A short, non-secret detail describing why the state was unreadable.
         detail: String,
     },
 
-    /// The requested host name did not match any NetBird peer.
+    /// The requested host name did not match any `NetBird` peer.
     #[error("host '{host}' was not found among NetBird peers")]
     HostUnknown {
         /// The requested host name.
         host: String,
     },
 
-    /// A NetBird TCP connection to the host's daemon port could not be opened
+    /// A `NetBird` TCP connection to the host's daemon port could not be opened
     /// (the peer is offline or the control port is closed).
     #[error("could not open a NetBird connection to host '{host}': {source}")]
     HostUnreachable {
@@ -81,7 +82,7 @@ pub(crate) enum CliError {
         source: io::Error,
     },
 
-    /// A NetBird TCP connection to the host opened, but no usable pohunek
+    /// A `NetBird` TCP connection to the host opened, but no usable pohunek
     /// daemon answered the request — the connection closed without a reply or the
     /// daemon did not respond in time. Distinct from [`CliError::HostUnreachable`]
     /// (which is a failure to *connect*): here the transport succeeded but the
@@ -298,7 +299,7 @@ impl CliError {
 pub(crate) fn human_error_text(err: &CliError) -> String {
     let mut text = format!("pohunek: {err}\n");
     if let Some(hint) = err.recover_hint() {
-        text.push_str(&format!("hint: {hint}\n"));
+        let _ = writeln!(text, "hint: {hint}");
     }
     text
 }
@@ -402,9 +403,9 @@ fn clap_error_to_protocol_error(err: &clap::Error) -> ProtocolError {
 /// stdout under `--json` (exit [`CLI_USAGE_EXIT_CODE`]); otherwise it falls back
 /// to clap's native human rendering (stderr, exit 2), so the human experience is
 /// identical to a plain `Cli::parse()`. Returns the process exit code.
-pub(crate) fn render_clap_error(err: clap::Error, json: bool) -> ExitCode {
+pub(crate) fn render_clap_error(err: &clap::Error, json: bool) -> ExitCode {
     if json && !clap_kind_is_display(err.kind()) {
-        print_json_error(&clap_error_to_protocol_error(&err));
+        print_json_error(&clap_error_to_protocol_error(err));
         ExitCode::from(CLI_USAGE_EXIT_CODE)
     } else {
         // `clap::Error::exit` prints to the correct stream and never returns.

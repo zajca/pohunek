@@ -123,10 +123,10 @@ impl ProjectManager {
             .mutate_project(&detected.git_common_dir, |existing| {
                 let mut record = match existing {
                     Some(mut prev) => {
-                        prev.repo_root = detected.repo_root.clone();
-                        prev.origin_url = detected.origin_url.clone();
+                        prev.repo_root.clone_from(&detected.repo_root);
+                        prev.origin_url.clone_from(&detected.origin_url);
                         prev.is_bare = detected.is_bare;
-                        prev.last_used_at = now.clone();
+                        prev.last_used_at.clone_from(&now);
                         // A manual (re-)add promotes an auto record;
                         // auto-registration never demotes a manual one.
                         if manual {
@@ -430,6 +430,10 @@ fn short_branch(refname: &str) -> String {
 }
 
 /// Map a project-store I/O failure to a typed runtime error.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "used directly as a `.map_err` function pointer, which requires owning the error"
+)]
 fn store_error(err: io::Error) -> ProtocolError {
     ProtocolError::new(
         ErrorClass::Runtime,
@@ -571,7 +575,7 @@ mod tests {
         let store = Arc::new(Store::new(
             unique_dir(&format!("{tag}-store")).join("metadata.jsonl"),
         ));
-        (ProjectManager::new(store.clone()), store)
+        (ProjectManager::new(Arc::clone(&store)), store)
     }
 
     #[test]

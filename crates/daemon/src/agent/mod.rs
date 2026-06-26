@@ -258,6 +258,7 @@ fn launch_command(
 }
 
 /// Return the built-in adapter for an agent kind.
+#[must_use]
 pub fn adapter_for(agent: protocol::AgentKind) -> &'static dyn AgentAdapter {
     match agent {
         protocol::AgentKind::Shell => &SHELL_ADAPTER,
@@ -461,7 +462,7 @@ mod tests {
             let mut permissions = fs::metadata(&path).expect("metadata").permissions();
             permissions.set_mode(0o755);
             fs::set_permissions(&path, permissions).expect("chmod executable fixture");
-        }
+        };
 
         path
     }
@@ -642,7 +643,7 @@ mod tests {
             "invalid_session_ref"
         );
         // A dash elsewhere is fine (real native ids contain hyphens).
-        assert!(SessionRef::id("abc-123-def").is_ok());
+        SessionRef::id("abc-123-def").unwrap();
     }
 
     #[test]

@@ -35,12 +35,12 @@ impl BundleValidationError {
 }
 
 impl fmt::Display for BundleValidationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (index, issue) in self.issues.iter().enumerate() {
             if index > 0 {
-                write!(formatter, "; ")?;
+                write!(f, "; ")?;
             }
-            write!(formatter, "{issue}")?;
+            write!(f, "{issue}")?;
         }
         Ok(())
     }
@@ -89,38 +89,30 @@ pub enum BundleValidationIssue {
 }
 
 impl fmt::Display for BundleValidationIssue {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ReadDir { path, message } => {
                 write!(
-                    formatter,
+                    f,
                     "failed to read directory `{}`: {message}",
                     path.display()
                 )
             }
             Self::ReadFile { path, message } => {
-                write!(
-                    formatter,
-                    "failed to read file `{}`: {message}",
-                    path.display()
-                )
+                write!(f, "failed to read file `{}`: {message}", path.display())
             }
             Self::MissingFrontmatter { path } => {
-                write!(formatter, "missing frontmatter in `{}`", path.display())
+                write!(f, "missing frontmatter in `{}`", path.display())
             }
             Self::InvalidFrontmatter { path, message } => {
-                write!(
-                    formatter,
-                    "invalid frontmatter in `{}`: {message}",
-                    path.display()
-                )
+                write!(f, "invalid frontmatter in `{}`: {message}", path.display())
             }
             Self::DuplicateId {
                 id,
                 first_path,
                 duplicate_path,
             } => write!(
-                formatter,
+                f,
                 "duplicate concept id `{id}` in `{}` and `{}`",
                 first_path.display(),
                 duplicate_path.display()
@@ -130,23 +122,23 @@ impl fmt::Display for BundleValidationIssue {
                 id,
                 concept_type,
             } => write!(
-                formatter,
+                f,
                 "concept `{id}` of type {concept_type:?} requires `since` in `{}`",
                 path.display()
             ),
             Self::BrokenLink { path, target } => write!(
-                formatter,
+                f,
                 "broken internal markdown link `{target}` in `{}`",
                 path.display()
             ),
             Self::ReservedFrontmatter { path } => write!(
-                formatter,
+                f,
                 "reserved markdown file `{}` must not contain concept frontmatter",
                 path.display()
             ),
             Self::UnsupportedFileType { path } => {
                 write!(
-                    formatter,
+                    f,
                     "unsupported file type in knowledge bundle: `{}`",
                     path.display()
                 )
@@ -160,7 +152,7 @@ pub fn validate_bundle(
     dir: impl AsRef<Path>,
 ) -> Result<BundleValidationReport, BundleValidationError> {
     let root = dir.as_ref();
-    let normalized_root = normalize_path(root.to_path_buf());
+    let normalized_root = normalize_path(root);
     let mut issues = Vec::new();
     let mut markdown_files = Vec::new();
     collect_markdown_files(root, &mut markdown_files, &mut issues);
@@ -317,7 +309,8 @@ fn validate_links(
         }
 
         let resolved = normalize_path(
-            path.parent()
+            &path
+                .parent()
                 .unwrap_or_else(|| Path::new("."))
                 .join(target_path),
         );
@@ -338,14 +331,17 @@ fn markdown_link_target(target: &str) -> Option<&Path> {
         return None;
     }
     let target_path = target.split_once('#').map_or(target, |(path, _)| path);
-    target_path.ends_with(".md").then(|| Path::new(target_path))
+    Path::new(target_path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+        .then(|| Path::new(target_path))
 }
 
 fn is_under_root(root: &Path, path: &Path) -> bool {
     path.starts_with(root)
 }
 
-fn normalize_path(path: PathBuf) -> PathBuf {
+fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {

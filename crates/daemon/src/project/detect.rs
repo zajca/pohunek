@@ -149,8 +149,10 @@ pub fn detect(cwd: &Path) -> io::Result<Option<DetectedProject>> {
     let repo_root = if is_linked_worktree {
         main_worktree(cwd)
             .or_else(|| git_common_dir.parent().map(Path::to_path_buf))
-            .map(|root| canonical_or_original(&root))
-            .unwrap_or_else(|| checkout_path.clone())
+            .map_or_else(
+                || checkout_path.clone(),
+                |root| canonical_or_original(&root),
+            )
     } else {
         checkout_path.clone()
     };

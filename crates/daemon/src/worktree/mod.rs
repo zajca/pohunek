@@ -194,6 +194,10 @@ impl WorktreeManager {
     /// (`worktree_add_failed`). The three non-fatal paths (fetch, base-branch
     /// fallback, setup script) never abort; they are returned in
     /// [`WorktreeBound::warnings`].
+    #[expect(
+        clippy::too_many_lines,
+        reason = "single bind orchestration; the reuse/recreate/refuse branches return early and do not extract cleanly"
+    )]
     pub fn bind(&self, req: &WorktreeRequest) -> Result<WorktreeBound, ProtocolError> {
         let slug = require_branch_slug(&req.branch)?;
         // The branch and base branch arrive from the socket and are passed
@@ -246,7 +250,7 @@ impl WorktreeManager {
                         path = %path.display(),
                         "recreating owned worktree with an invalid directory"
                     );
-                    self.reset_stale_worktree(&repository, &path)?;
+                    Self::reset_stale_worktree(&repository, &path)?;
                 }
                 None => {
                     // A directory we have no binding for is not ours; refuse to
@@ -265,7 +269,7 @@ impl WorktreeManager {
         } else if owned.is_some() {
             // Owned binding but the directory vanished entirely: prune the stale
             // git admin entry before re-adding at the same path.
-            self.reset_stale_worktree(&repository, &path)?;
+            Self::reset_stale_worktree(&repository, &path)?;
         }
 
         if let Some(parent) = path.parent() {
@@ -274,12 +278,12 @@ impl WorktreeManager {
         }
 
         let mut warnings = Vec::new();
-        let base_branch = self.resolve_base_branch(&repository, req, &mut warnings)?;
+        let base_branch = Self::resolve_base_branch(&repository, req, &mut warnings)?;
         // Resolve the start-point for a new branch: the freshly fetched ref when
         // a fetch succeeds, else the (recorded) local base. The logical
         // `base_branch` name is what we persist/display; `start_point` is what
         // `git worktree add` actually branches from.
-        let start_point = self.fetch_start_point(&repository, &base_branch, &mut warnings);
+        let start_point = Self::fetch_start_point(&repository, &base_branch, &mut warnings);
         // Pre-create hook: fires only on the fresh-create path (the reuse / recreate
         // / foreign-conflict branches above all returned before here). The worktree
         // does not exist yet, so it runs IN THE REPOSITORY — `POHUNEK_BASE_BRANCH`
@@ -293,7 +297,7 @@ impl WorktreeManager {
             &base_branch,
             &mut warnings,
         );
-        self.create_worktree(&repository, &path, &req.branch, &start_point)?;
+        Self::create_worktree(&repository, &path, &req.branch, &start_point)?;
         // Post-create hook (replaces the legacy `.pohunek/setup` script, which it
         // still falls back to): runs IN the freshly created worktree.
         self.run_worktree_hook(
@@ -351,7 +355,10 @@ impl WorktreeManager {
     // The create hook needs the event, the hook-lookup dir, the request, the repo,
     // the optional worktree, the base branch, and the warning sink — all distinct
     // inputs with no natural grouping struct beyond the request itself.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "distinct hook inputs with no natural grouping struct beyond the request itself"
+    )]
     fn run_worktree_hook(
         &self,
         event: HookEvent,
@@ -581,7 +588,7 @@ impl WorktreeManager {
 
     /// Prune a stale git admin entry and remove any leftover directory so a
     /// fresh `git worktree add` can reuse the path.
-    fn reset_stale_worktree(&self, repository: &Path, path: &Path) -> Result<(), ProtocolError> {
+    fn reset_stale_worktree(repository: &Path, path: &Path) -> Result<(), ProtocolError> {
         // `git worktree prune` clears admin entries for vanished worktrees; a
         // failure here is non-fatal (the add below is the real gate).
         if let Err(message) = worktree_prune(repository) {
@@ -602,7 +609,6 @@ impl WorktreeManager {
     /// requested or a fallback is needed — so a repository in detached HEAD can
     /// still bind a worktree as long as an existing `--base-branch` is supplied.
     fn resolve_base_branch(
-        &self,
         repository: &Path,
         req: &WorktreeRequest,
         warnings: &mut Vec<SessionWarning>,
@@ -614,14 +620,14 @@ impl WorktreeManager {
             .filter(|b| !b.is_empty())
         else {
             // No base requested: branch from the repository's current branch.
-            return self.default_branch(repository);
+            return Self::default_branch(repository);
         };
 
         // `requested` was validated for flag injection by the caller.
         match branch_exists(repository, requested) {
             Ok(true) => Ok(requested.to_owned()),
             Ok(false) => {
-                let default_branch = self.default_branch(repository)?;
+                let default_branch = Self::default_branch(repository)?;
                 if default_branch == requested {
                     return Err(error(
                         ErrorClass::Runtime,
@@ -660,7 +666,7 @@ impl WorktreeManager {
     /// `refs/heads/--upload-pack=evil`) to smuggle a `git` flag into the
     /// positional sinks. Validating it here closes that argv-injection path even
     /// though the user never typed the name.
-    fn default_branch(&self, repository: &Path) -> Result<String, ProtocolError> {
+    fn default_branch(repository: &Path) -> Result<String, ProtocolError> {
         let default = current_branch(repository).map_err(|message| {
             error(
                 ErrorClass::Runtime,
@@ -684,7 +690,6 @@ impl WorktreeManager {
     /// On success the start-point is `FETCH_HEAD` so the new branch genuinely
     /// starts from the up-to-date remote tip, not the stale local ref.
     fn fetch_start_point(
-        &self,
         repository: &Path,
         base_branch: &str,
         warnings: &mut Vec<SessionWarning>,
@@ -713,7 +718,6 @@ impl WorktreeManager {
     /// Run `git worktree add`, checking out an existing branch or creating a new
     /// one from the base ref.
     fn create_worktree(
-        &self,
         repository: &Path,
         path: &Path,
         branch: &str,
@@ -1173,8 +1177,8 @@ fn run_one_hook(
     {
         use std::os::unix::process::CommandExt;
         // pgid := child pid, so a timeout can signal the whole group at once.
-        builder.process_group(0);
-    }
+        builder.process_group(0)
+    };
 
     let mut child = match builder.spawn() {
         Ok(child) => child,
@@ -1261,10 +1265,16 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> SetupOutcome {
 /// so children the script forked die too; the direct child is then reaped. The
 /// child is not yet reaped when this is called, so its pid — and thus the pgid —
 /// cannot have been recycled, making the group-directed kill safe.
-#[allow(unsafe_code)]
+#[expect(unsafe_code, reason = "libc::kill FFI; SAFETY documented below")]
 fn terminate_setup_script(child: &mut Child) {
     #[cfg(unix)]
     {
+        // A process id always fits in `pid_t` (bounded by the kernel's PID_MAX,
+        // far below `i32::MAX`); the wrap-around clippy warns about cannot occur.
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "process id is bounded by PID_MAX, far below i32::MAX"
+        )]
         let pgid = child.id() as libc::pid_t;
         // SAFETY: `kill(2)` is a plain syscall with no memory-safety contract. A
         // negative pid targets the process group created by `process_group(0)`;

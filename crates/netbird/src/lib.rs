@@ -1,31 +1,28 @@
-//! NetBird adapter for pohunek remote hosts.
+//! `NetBird` adapter for pohunek remote hosts.
 //!
 //! This crate is the foundation shared by the daemon and the CLI for the
-//! "remote hosts over NetBird" feature (Phase 2). It is deliberately small,
+//! "remote hosts over `NetBird`" feature (Phase 2). It is deliberately small,
 //! synchronous, and dependency-light so both downstream crates can depend on it
 //! without pulling in an async runtime: subprocess execution uses
 //! [`std::process::Command`], not tokio.
 //!
 //! Responsibilities:
-//! - Parse `netbird status --json`. NetBird's JSON output drifts across
+//! - Parse `netbird status --json`. `NetBird`'s JSON output drifts across
 //!   versions, so the [`NetbirdStatus`] / [`Peer`] types are intentionally
 //!   defensive: unknown fields are ignored, missing optional fields default,
 //!   and two documented shapes (current source vs. legacy/docs) are tolerated by
 //!   the same types. See [`parse_status`].
-//! - Resolve a host *name* to a NetBird IP from a parsed status
+//! - Resolve a host *name* to a `NetBird` IP from a parsed status
 //!   ([`resolve_host`]).
 //! - Validate a daemon control-listener bind address, failing closed
 //!   ([`validate_netbird_bind_addr`]) so the daemon never opens a socket on a
 //!   non-NetBird interface.
 //! - Resolve the remote control port from the environment ([`remote_port`]).
 //!
-//! NetBird assigns addresses from the RFC 6598 CGNAT range `100.64.0.0/10`
+//! `NetBird` assigns addresses from the RFC 6598 CGNAT range `100.64.0.0/10`
 //! (`100.64.0.0` ..= `100.127.255.255`); that range is the trust boundary used
 //! throughout this crate.
 
-#![warn(missing_debug_implementations)]
-#![warn(rust_2018_idioms)]
-#![warn(unreachable_pub)]
 #![forbid(unsafe_code)]
 
 mod bind;
@@ -40,11 +37,11 @@ pub use status::{
     parse_status, run_status, run_status_with_program, NetbirdError, NetbirdStatus, Peer,
 };
 
-/// True when `ip` is an IPv4 address inside the NetBird CGNAT range
+/// True when `ip` is an IPv4 address inside the `NetBird` CGNAT range
 /// `100.64.0.0/10` (RFC 6598).
 ///
 /// `100.64.0.0/10` is exactly: first octet `100` AND second octet in `64..=127`.
-/// IPv6 is never a NetBird address.
+/// IPv6 is never a `NetBird` address.
 ///
 /// Public so callers that dial a peer address (e.g. the CLI's `host discover`
 /// probe) can apply the same fail-closed range gate the resolver and bind
