@@ -1,0 +1,97 @@
+//! Typed payloads for assistant-specific protocol methods.
+
+use serde::{Deserialize, Serialize};
+
+/// Parameters for `assistant.materialize`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssistantMaterializeParams {
+    /// Redacted live snapshot JSON to persist beside the materialized bundle.
+    pub snapshot: String,
+}
+
+/// Result returned by `assistant.materialize`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssistantMaterializeResult {
+    /// Host-local path to the materialized assistant knowledge bundle.
+    pub bundle_path: String,
+    /// Host-local path to the persisted redacted snapshot.
+    pub snapshot_path: String,
+    /// Pohunek version that produced the embedded bundle.
+    pub version: String,
+    /// Stable content hash for the materialized bundle.
+    pub content_hash: String,
+    /// Allowlisted concept metadata used by callers to build the assistant TOC.
+    pub concepts: Vec<ConceptMeta>,
+}
+
+/// Public-safe concept metadata exposed through the protocol.
+///
+/// This mirrors the allowlisted knowledge bundle index fields without depending
+/// on the knowledge crate, keeping the protocol contract self-contained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConceptMeta {
+    /// Concept type from the knowledge frontmatter.
+    #[serde(rename = "type")]
+    pub r#type: ConceptType,
+    /// Stable concept id.
+    pub id: String,
+    /// Human-readable concept title.
+    pub title: String,
+    /// Short concept description.
+    pub description: String,
+    /// Assistant intents this concept can support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intents: Option<Vec<ConceptIntent>>,
+    /// First Pohunek version this concept applies to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// Last Pohunek version where this concept changed materially.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_in: Option<Vec<String>>,
+    /// Whether the concept is deprecated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecated: Option<ConceptDeprecation>,
+}
+
+/// Protocol-local copy of the knowledge concept type enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum ConceptType {
+    Concept,
+    Guide,
+    Runbook,
+    Troubleshooting,
+    SafetyPolicy,
+    CliCommand,
+    ConfigReference,
+    ProtocolMethod,
+    ProtocolEvent,
+    SetupAsset,
+    PromptTemplate,
+    SourceMap,
+    SnapshotTemplate,
+    ReleaseNote,
+}
+
+/// Protocol-local copy of assistant intent names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConceptIntent {
+    Setup,
+    Project,
+    Update,
+    Debug,
+    Help,
+}
+
+/// Deprecation metadata exposed for concepts that describe retired behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ConceptDeprecation {
+    Version(String),
+    Details {
+        version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        successor: Option<String>,
+    },
+}

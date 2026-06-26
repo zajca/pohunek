@@ -22,8 +22,10 @@
 #![warn(unreachable_pub)]
 #![forbid(unsafe_code)]
 
+mod assistant;
 mod capabilities;
 mod discovery;
+mod doctor;
 mod envelope;
 mod error;
 mod integration;
@@ -31,8 +33,13 @@ mod project;
 mod session;
 mod version;
 
+pub use assistant::{
+    AssistantMaterializeParams, AssistantMaterializeResult, ConceptDeprecation, ConceptIntent,
+    ConceptMeta, ConceptType,
+};
 pub use capabilities::{AgentRuntime, HostCapabilities};
 pub use discovery::{HostClass, HostDiscoverParams, HostRecord};
+pub use doctor::{DaemonDoctorResult, DoctorCheck, DoctorReport, DoctorStatus};
 pub use envelope::{Event, Request, Response, StateSource};
 pub use error::{ErrorClass, ProtocolError};
 pub use integration::{
@@ -87,6 +94,10 @@ pub mod method {
     /// Live host capability probe (Phase 2 / remote hosts over NetBird). Returns
     /// a [`HostCapabilities`](crate::HostCapabilities) snapshot.
     pub const HOST_INSPECT: &str = "host.inspect";
+    /// Materialize the embedded assistant knowledge bundle on the agent host.
+    pub const ASSISTANT_MATERIALIZE: &str = "assistant.materialize";
+    /// Run daemon-local doctor checks on the host that owns the daemon.
+    pub const DAEMON_DOCTOR: &str = "daemon.doctor";
     /// Enumerate and classify the local host's NetBird peers. Handled by the
     /// local daemon, which caches the result for a short TTL. Returns a
     /// `Vec<`[`HostRecord`](crate::HostRecord)`>`.

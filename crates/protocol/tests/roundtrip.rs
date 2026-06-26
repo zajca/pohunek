@@ -4,14 +4,16 @@
 use std::path::PathBuf;
 
 use protocol::{
-    event, method, negotiate, AgentActivity, AgentKind, AgentRuntime, AttachHeader, ErrorClass,
-    Event, HostCapabilities, IntegrationInstallParams, IntegrationInstallReport,
-    IntegrationInstallResult, ProtocolError, ProtocolVersion, Request, Response,
-    SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
-    SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
-    SessionNewParams, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, SessionWarning,
-    SessionWarningKind, StateSource, PROTOCOL_VERSION,
+    event, method, negotiate, AgentActivity, AgentKind, AgentRuntime, AssistantMaterializeParams,
+    AssistantMaterializeResult, AttachHeader, ConceptDeprecation, ConceptIntent, ConceptMeta,
+    ConceptType, DaemonDoctorResult, DoctorCheck, DoctorReport, DoctorStatus, ErrorClass, Event,
+    HostCapabilities, IntegrationInstallParams, IntegrationInstallReport, IntegrationInstallResult,
+    ProtocolError, ProtocolVersion, Request, Response, SessionAttachParams, SessionAttachResult,
+    SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionState, SessionStopResult, SessionWarning, SessionWarningKind,
+    StateSource, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 
@@ -1031,6 +1033,151 @@ fn host_inspect_method_name_is_stable() {
 }
 
 #[test]
+fn assistant_method_names_are_stable() {
+    assert_eq!(method::ASSISTANT_MATERIALIZE, "assistant.materialize");
+    assert_eq!(method::DAEMON_DOCTOR, "daemon.doctor");
+}
+
+#[test]
+fn assistant_materialize_params_json_shape_roundtrips() {
+    let params = AssistantMaterializeParams {
+        snapshot: r#"{"sessions":[],"projects":[]}"#.to_owned(),
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize params");
+    assert_eq!(
+        value,
+        json!({
+            "snapshot": r#"{"sessions":[],"projects":[]}"#
+        })
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn assistant_materialize_result_json_shape_roundtrips() {
+    let result = AssistantMaterializeResult {
+        bundle_path: "/cache/pohunek/knowledge/v1".to_owned(),
+        snapshot_path: "/run/pohunek/assistant/launch-42/snapshot.json".to_owned(),
+        version: "0.1.0".to_owned(),
+        content_hash: "sha256:abc123".to_owned(),
+        concepts: vec![ConceptMeta {
+            r#type: ConceptType::Guide,
+            id: "launcher".to_owned(),
+            title: "Assistant launcher".to_owned(),
+            description: "How the assistant launch flow uses materialized knowledge.".to_owned(),
+            intents: Some(vec![ConceptIntent::Project, ConceptIntent::Help]),
+            since: Some("0.1.0".to_owned()),
+            changed_in: Some(vec!["0.2.0".to_owned()]),
+            deprecated: Some(ConceptDeprecation::Details {
+                version: "0.3.0".to_owned(),
+                successor: Some("launcher-v2".to_owned()),
+            }),
+        }],
+    };
+
+    let value = serde_json::to_value(&result).expect("serialize result");
+    assert_eq!(
+        value,
+        json!({
+            "bundle_path": "/cache/pohunek/knowledge/v1",
+            "snapshot_path": "/run/pohunek/assistant/launch-42/snapshot.json",
+            "version": "0.1.0",
+            "content_hash": "sha256:abc123",
+            "concepts": [{
+                "type": "Guide",
+                "id": "launcher",
+                "title": "Assistant launcher",
+                "description": "How the assistant launch flow uses materialized knowledge.",
+                "intents": ["project", "help"],
+                "since": "0.1.0",
+                "changed_in": ["0.2.0"],
+                "deprecated": {
+                    "version": "0.3.0",
+                    "successor": "launcher-v2"
+                }
+            }]
+        })
+    );
+
+    let back = line_roundtrip(&result);
+    assert_eq!(back, result);
+}
+
+#[test]
+fn concept_meta_omits_absent_optional_fields() {
+    let concept = ConceptMeta {
+        r#type: ConceptType::Concept,
+        id: "architecture".to_owned(),
+        title: "Architecture".to_owned(),
+        description: "Assistant architecture overview.".to_owned(),
+        intents: None,
+        since: None,
+        changed_in: None,
+        deprecated: None,
+    };
+
+    let value = serde_json::to_value(&concept).expect("serialize concept");
+    assert_eq!(
+        value,
+        json!({
+            "type": "Concept",
+            "id": "architecture",
+            "title": "Architecture",
+            "description": "Assistant architecture overview."
+        })
+    );
+
+    let object = value.as_object().expect("concept object");
+    for absent in ["intents", "since", "changed_in", "deprecated"] {
+        assert!(
+            !object.contains_key(absent),
+            "absent {absent} must be omitted: {value}"
+        );
+    }
+
+    let back = line_roundtrip(&concept);
+    assert_eq!(back, concept);
+}
+
+#[test]
+fn daemon_doctor_report_json_shape_roundtrips() {
+    let result = DaemonDoctorResult {
+        report: DoctorReport::from_checks(vec![
+            DoctorCheck::new("bin:git", DoctorStatus::Ok, "found at /usr/bin/git"),
+            DoctorCheck::new("bin:codex", DoctorStatus::Warn, "'codex' not found on PATH"),
+        ]),
+    };
+
+    let value = serde_json::to_value(&result).expect("serialize doctor result");
+    assert_eq!(
+        value,
+        json!({
+            "report": {
+                "checks": [
+                    {
+                        "name": "bin:git",
+                        "status": "ok",
+                        "detail": "found at /usr/bin/git"
+                    },
+                    {
+                        "name": "bin:codex",
+                        "status": "warn",
+                        "detail": "'codex' not found on PATH"
+                    }
+                ],
+                "overall": "ok"
+            }
+        })
+    );
+
+    let back = line_roundtrip(&result);
+    assert_eq!(back, result);
+}
+
+#[test]
 fn agent_runtime_json_shape_roundtrips_with_path() {
     let runtime = AgentRuntime {
         agent: "codex".to_owned(),
@@ -1241,6 +1388,51 @@ fn new_remote_error_codes_are_distinct() {
         unique.len(),
         codes.len(),
         "error codes must all be distinct: {codes:?}"
+    );
+}
+
+#[test]
+fn assistant_error_codes_have_expected_classes_and_recovery() {
+    let no_agent = ProtocolError::no_capable_agent();
+    assert_eq!(no_agent.class, ErrorClass::Runtime);
+    assert_eq!(no_agent.code, "no_capable_agent");
+    assert!(no_agent.recover.is_some());
+
+    let unavailable = ProtocolError::bundle_unavailable("/cache/knowledge");
+    assert_eq!(unavailable.class, ErrorClass::Runtime);
+    assert_eq!(unavailable.code, "bundle_unavailable");
+    assert!(unavailable.msg.contains("/cache/knowledge"));
+
+    let materialization = ProtocolError::materialization_failed("/cache/knowledge", "denied");
+    assert_eq!(materialization.class, ErrorClass::Runtime);
+    assert_eq!(materialization.code, "materialization_failed");
+    assert!(materialization.msg.contains("denied"));
+
+    let unreadable = ProtocolError::agent_cannot_read_bundle("/cache/knowledge", "sandbox");
+    assert_eq!(unreadable.class, ErrorClass::Runtime);
+    assert_eq!(unreadable.code, "agent_cannot_read_bundle");
+    assert!(unreadable.msg.contains("sandbox"));
+
+    let unsupported = ProtocolError::assistant_method_unsupported("assistant.materialize");
+    assert_eq!(unsupported.class, ErrorClass::Daemon);
+    assert_eq!(unsupported.code, "assistant_method_unsupported");
+    assert!(unsupported.recover.is_some());
+}
+
+#[test]
+fn assistant_error_codes_are_distinct() {
+    let codes = [
+        ProtocolError::no_capable_agent().code,
+        ProtocolError::bundle_unavailable("p").code,
+        ProtocolError::materialization_failed("p", "e").code,
+        ProtocolError::agent_cannot_read_bundle("p", "c").code,
+        ProtocolError::assistant_method_unsupported("m").code,
+    ];
+    let unique: std::collections::HashSet<&str> = codes.iter().map(String::as_str).collect();
+    assert_eq!(
+        unique.len(),
+        codes.len(),
+        "assistant error codes must all be distinct: {codes:?}"
     );
 }
 

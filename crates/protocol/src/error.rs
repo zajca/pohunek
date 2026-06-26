@@ -219,4 +219,106 @@ impl ProtocolError {
             Some("ensure a matching pohunek daemon is running on the host".to_owned()),
         )
     }
+
+    /// The canonical `runtime/no_capable_agent` error for assistant launch.
+    ///
+    /// Raised when no available runtime can satisfy the assistant's requirement
+    /// for a capable coding agent. Code is stable: `no_capable_agent`.
+    #[must_use]
+    pub fn no_capable_agent() -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "no_capable_agent",
+            "no capable assistant agent runtime is available",
+            Some(
+                "install or configure a codex/claude runtime, or pass --agent with a capable host profile"
+                    .to_owned(),
+            ),
+        )
+    }
+
+    /// The canonical `runtime/bundle_unavailable` error for missing assistant
+    /// knowledge.
+    ///
+    /// Raised before session launch when the materialized bundle path is absent
+    /// or otherwise unavailable. Code is stable: `bundle_unavailable`.
+    #[must_use]
+    pub fn bundle_unavailable(path: &str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "bundle_unavailable",
+            format!("assistant knowledge bundle is unavailable at {path}"),
+            Some("rebuild or reinstall pohunek so the assistant knowledge bundle can be materialized".to_owned()),
+        )
+    }
+
+    /// The canonical `runtime/assistant_bundle_mismatch` error for remote
+    /// materialization that returned a bundle from a different binary build.
+    ///
+    /// Code is stable: `assistant_bundle_mismatch`.
+    #[must_use]
+    pub fn assistant_bundle_mismatch(
+        expected_version: &str,
+        expected_hash: &str,
+        actual_version: &str,
+        actual_hash: &str,
+    ) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "assistant_bundle_mismatch",
+            format!(
+                "remote assistant bundle {actual_version}/{actual_hash} does not match local binary {expected_version}/{expected_hash}"
+            ),
+            Some("upgrade the older pohunek side so the CLI and daemon use the same assistant knowledge bundle".to_owned()),
+        )
+    }
+
+    /// The canonical `runtime/materialization_failed` error for assistant
+    /// bundle extraction or snapshot persistence failures.
+    ///
+    /// Code is stable: `materialization_failed`.
+    #[must_use]
+    pub fn materialization_failed(path: &str, detail: &str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "materialization_failed",
+            format!("failed to materialize assistant knowledge at {path}: {detail}"),
+            Some(
+                "check filesystem permissions and available space, then retry the assistant launch"
+                    .to_owned(),
+            ),
+        )
+    }
+
+    /// The canonical `runtime/agent_cannot_read_bundle` error.
+    ///
+    /// Raised when preflight proves the selected agent cannot read the bundle or
+    /// snapshot path. Code is stable: `agent_cannot_read_bundle`.
+    #[must_use]
+    pub fn agent_cannot_read_bundle(path: &str, constraint: &str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "agent_cannot_read_bundle",
+            format!("selected agent cannot read assistant knowledge at {path}: {constraint}"),
+            Some("materialize the bundle inside the agent-readable root, relax the profile filesystem constraint, or choose another profile".to_owned()),
+        )
+    }
+
+    /// The canonical `daemon/assistant_method_unsupported` error.
+    ///
+    /// CLI code uses this when an older daemon reports `method_not_found` for an
+    /// assistant-specific method. Code is stable:
+    /// `assistant_method_unsupported`.
+    #[must_use]
+    pub fn assistant_method_unsupported(method: &str) -> Self {
+        Self::new(
+            ErrorClass::Daemon,
+            "assistant_method_unsupported",
+            format!("daemon does not support assistant method: {method}"),
+            Some(
+                "upgrade the daemon to a pohunek version with universal assistant support"
+                    .to_owned(),
+            ),
+        )
+    }
 }
