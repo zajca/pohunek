@@ -49,7 +49,7 @@ use crate::agent::{InputRules, ResumeMode, SessionRefKind};
 use crate::project::detect::project_id;
 
 /// One session's resume binding: everything needed to relaunch-and-resume.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResumeBinding {
     /// The pohunek session id (stable across restart).
     pub session_id: String,
@@ -112,6 +112,78 @@ pub struct ResumeBinding {
     /// frozen at creation. Serde default (`false`) for a legacy line.
     #[serde(default)]
     pub resumable: bool,
+}
+
+impl<'de> Deserialize<'de> for ResumeBinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawResumeBinding {
+            session_id: String,
+            agent: String,
+            #[serde(default)]
+            agent_base: Option<AgentKind>,
+            cwd: PathBuf,
+            cols: u16,
+            rows: u16,
+            #[serde(default)]
+            native_session_id: Option<String>,
+            #[serde(default)]
+            native_session_path: Option<String>,
+            #[serde(default)]
+            project_id: Option<String>,
+            #[serde(default)]
+            is_linked_worktree: Option<bool>,
+            #[serde(default)]
+            program: String,
+            #[serde(default)]
+            args: Vec<String>,
+            #[serde(default)]
+            input_rules: StoredInputRules,
+            #[serde(default)]
+            resume_mode: Option<ResumeMode>,
+            #[serde(default)]
+            ref_kind: Option<SessionRefKind>,
+            #[serde(default)]
+            resumable: bool,
+        }
+
+        let raw = RawResumeBinding::deserialize(deserializer)?;
+        let agent_base = raw
+            .agent_base
+            .or_else(|| legacy_agent_base_from_agent(&raw.agent))
+            .ok_or_else(|| serde::de::Error::missing_field("agent_base"))?;
+
+        Ok(Self {
+            session_id: raw.session_id,
+            agent: raw.agent,
+            agent_base,
+            cwd: raw.cwd,
+            cols: raw.cols,
+            rows: raw.rows,
+            native_session_id: raw.native_session_id,
+            native_session_path: raw.native_session_path,
+            project_id: raw.project_id,
+            is_linked_worktree: raw.is_linked_worktree,
+            program: raw.program,
+            args: raw.args,
+            input_rules: raw.input_rules,
+            resume_mode: raw.resume_mode,
+            ref_kind: raw.ref_kind,
+            resumable: raw.resumable,
+        })
+    }
+}
+
+fn legacy_agent_base_from_agent(agent: &str) -> Option<AgentKind> {
+    match agent {
+        "shell" => Some(AgentKind::Shell),
+        "codex" => Some(AgentKind::Codex),
+        "claude" => Some(AgentKind::Claude),
+        _ => None,
+    }
 }
 
 /// Serializable mirror of [`crate::agent::InputRules`] for the resume snapshot
@@ -780,6 +852,34 @@ mod tests {
         assert_eq!(b.resume_mode, None);
         assert_eq!(b.ref_kind, None);
         assert!(!b.resumable);
+    }
+
+    #[test]
+    fn resume_legacy_line_without_agent_base_infers_base_kind_from_agent_name() {
+        let store = Store::new(temp_store_path("resume-legacy-agent-base"));
+        let legacy = concat!(
+            r#"{"kind":"resume","session_id":"s-codex","agent":"codex","#,
+            r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"native-codex"}"#,
+            "\n",
+            r#"{"kind":"resume","session_id":"s-claude","agent":"claude","#,
+            r#""cwd":"/w","cols":100,"rows":30,"native_session_id":"native-claude"}"#,
+            "\n"
+        );
+        fs::write(store.path(), legacy).expect("write legacy lines");
+
+        let loaded = store.load_resume().expect("load legacy lines");
+
+        assert_eq!(loaded.len(), 2);
+        let codex = loaded
+            .iter()
+            .find(|binding| binding.session_id == "s-codex")
+            .expect("codex legacy binding");
+        let claude = loaded
+            .iter()
+            .find(|binding| binding.session_id == "s-claude")
+            .expect("claude legacy binding");
+        assert_eq!(codex.agent_base, AgentKind::Codex);
+        assert_eq!(claude.agent_base, AgentKind::Claude);
     }
 
     #[test]
