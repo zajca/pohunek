@@ -46,9 +46,28 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-features
 
+  docs-gate:
+    name: docs check (deterministic build + secret scan)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: docs
+
+      - name: docs check
+        run: cargo xtask docs check
+
   build:
     name: Build ${{ matrix.target }}
-    needs: gate
+    needs: [gate, docs-gate]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
