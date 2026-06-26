@@ -1,0 +1,24 @@
+[package]
+name = "pohunek-knowledge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Knowledge bundle primitives for pohunek assistant and docs."
+
+[lib]
+name = "knowledge"
+path = "src/lib.rs"
+
+[dependencies]
+include_dir = { workspace = true }
+pohunek-protocol = { path = "../protocol", optional = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+
+[features]
+protocol = ["dep:pohunek-protocol"]
+
+[build-dependencies]
+sha2 = { workspace = true }
