@@ -6,10 +6,10 @@ sequencing** source of truth; the per-phase design docs under
 for *what* and *why* inside each track.
 
 Status reflects the **code on `main`**, verified against the tree (releases
-v0.1.0 → v0.4.1). Where a phase/plan doc's own status header lags the code, the
+v0.1.0 -> v0.4.3). Where a phase/plan doc's own status header lags the code, the
 code wins and the lag is noted.
 
-Last reconciled: 2026-06-26.
+Last reconciled: 2026-06-27.
 
 ---
 
@@ -67,14 +67,15 @@ versioned public API**, consumed only through SDKs (never hand-rolled wire code)
 This is the shared base for every client below; it is broken out of the old
 Phase 4 so the desktop app and the browser app build on the same contract.
 
-- **S.1 — Rust SDK (`crates/client`).** Extract the transport-agnostic client that
-  today lives `pub(crate)` in `crates/cli/src/client.rs`: connect (Unix socket /
-  NetBird TCP), request/response, event subscription, and the **attach duplex
-  byte stream**, with its own error type. The CLI becomes a consumer with no
-  behavior change. **Low-risk standalone refactor; lands first.**
-- **S.2 — Public API doc + version negotiation.** Document methods, envelopes,
-  error classes/codes, events, and the attach stream as a versioned public API
-  (negotiation already governs skew).
+- **S.1 — Rust SDK (`crates/client`) — complete.** Extract the
+  transport-agnostic client that lived `pub(crate)` in `crates/cli/src/client.rs`:
+  connect (Unix socket / NetBird TCP), request/response, event subscription, and
+  the **attach duplex byte stream**, with its own error type. The CLI is now a
+  consumer with no behavior change.
+- **S.2 — Public API doc + version negotiation — complete.** The versioned
+  public API is documented in [`docs/public-api.md`](public-api.md): methods,
+  envelopes, error classes/codes, events, version negotiation, and the attach
+  stream as public protocol surface.
 - **S.3 — TS SDK (`web/sdk`).** Needed only when the browser track starts:
   `ts-rs`-generated types (`web/shared`) + a runtime client with pluggable
   transports (TCP for Node/Bun → daemon direct; WebSocket for browser → backend).

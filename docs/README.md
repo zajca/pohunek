@@ -42,6 +42,8 @@ sessions across your own machines on a NetBird (WireGuard) network.
 ## Detailed Plans
 
 - [Phase 1 implementation plan](plan-phase-1.md)
+- [Public API](public-api.md) — versioned control protocol, envelopes, methods,
+  errors, events, attach stream, and Rust SDK surface.
 
 ## Design Notes (proposals, pre-phase)
 
