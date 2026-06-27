@@ -118,7 +118,11 @@ jobs:
           cp -R target/pohunek-docs/offline "${staging}/docs/offline"
           cp target/pohunek-docs/manifest.json "${staging}/docs/manifest.json"
           for extra in README.md LICENSE; do
-            [ -f "${extra}" ] && cp "${extra}" "${staging}/" || true
+            if [ ! -f "${extra}" ]; then
+              echo "::error file=${extra}::required release file is missing"
+              exit 1
+            fi
+            cp "${extra}" "${staging}/"
           done
           tar -czf "dist/${name}.tar.gz" -C dist "${name}"
           ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )

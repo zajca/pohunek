@@ -546,21 +546,12 @@ async fn fetch_projects(
     })
 }
 
-// TODO: the `source`/`state`/`activity` strings below are derived with
-// `format!("{:?}", x).to_lowercase()`, which couples the snapshot.json contract
-// to the Debug derives of the protocol enums. The values happen to equal each
-// enum's serde `snake_case` repr today (all variants are single PascalCase
-// words). Switching to the canonical serde repr would decouple the contract, but
-// the protocol enums expose neither an `as_str()` nor a clean in-crate
-// string-repr helper, and adding one is out of scope here (protocol lives in
-// another crate). Left as-is to avoid risking the pinned snapshot output.
-
 /// Pure mapping from a [`ProjectInfo`] to a [`ProjectSummary`] (no paths).
 fn map_project_summary(info: &ProjectInfo) -> ProjectSummary {
     ProjectSummary {
         id: info.id.clone(),
         label: info.label.clone(),
-        source: format!("{:?}", info.source).to_lowercase(),
+        source: info.source.as_str().to_owned(),
     }
 }
 
@@ -575,7 +566,7 @@ fn map_selected_project(
     SelectedProjectDetail {
         id: info.id.clone(),
         label: info.label.clone(),
-        source: format!("{:?}", info.source).to_lowercase(),
+        source: info.source.as_str().to_owned(),
         default_base_branch: info.default_base_branch.clone(),
         is_bare: info.is_bare,
         // Only action names — no template bodies, provider keys, or paths.
@@ -605,8 +596,8 @@ fn map_session_summary(info: &SessionInfo) -> SessionSummary {
     SessionSummary {
         id: info.id.0.clone(),
         agent: info.agent.clone(),
-        state: format!("{:?}", info.state).to_lowercase(),
-        activity: info.activity.map(|a| format!("{a:?}").to_lowercase()),
+        state: info.state.as_str().to_owned(),
+        activity: info.activity.map(|activity| activity.as_str().to_owned()),
         project_id: info.project_id.clone(),
         project_label: info.project_label.clone(),
         warning_count: info.warnings.len(),
@@ -1452,6 +1443,21 @@ mod tests {
         assert_eq!(summary.project_id.as_deref(), Some("p-abc123"));
         assert_eq!(summary.project_label.as_deref(), Some("ui"));
         assert_eq!(summary.warning_count, 0);
+    }
+
+    #[test]
+    fn snapshot_protocol_labels_are_not_derived_from_debug() {
+        let source = include_str!("snapshot.rs");
+        let old_project_source = concat!("format!(\"", "{:?}", "\", info.source).to_lowercase()");
+        let old_session_state = concat!("format!(\"", "{:?}", "\", info.state).to_lowercase()");
+        let old_activity = concat!("format!(\"{", "a:", "?", "}\").to_lowercase()");
+
+        for pattern in [old_project_source, old_session_state, old_activity] {
+            assert!(
+                !source.contains(pattern),
+                "snapshot protocol labels must come from protocol-owned string helpers"
+            );
+        }
     }
 
     #[test]

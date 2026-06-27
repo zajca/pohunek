@@ -8,12 +8,12 @@ use protocol::{
     AssistantMaterializeResult, AttachHeader, ConceptDeprecation, ConceptIntent, ConceptMeta,
     ConceptType, DaemonDoctorResult, DoctorCheck, DoctorReport, DoctorStatus, ErrorClass, Event,
     HostCapabilities, IntegrationInstallParams, IntegrationInstallReport, IntegrationInstallResult,
-    ProtocolError, ProtocolVersion, Request, Response, SessionAttachParams, SessionAttachResult,
-    SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
-    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
-    SessionResizeResult, SessionState, SessionStopResult, SessionWarning, SessionWarningKind,
-    StateSource, PROTOCOL_VERSION,
+    ProjectSource, ProtocolError, ProtocolVersion, ProviderKind, Request, Response,
+    SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
+    SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
+    SessionNewParams, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, SessionWarning,
+    SessionWarningKind, StateSource, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 
@@ -89,6 +89,37 @@ fn agent_activity_json_shape_roundtrips() {
         let back = line_roundtrip(&activity);
         assert_eq!(back, activity);
     }
+}
+
+#[test]
+fn public_enum_string_helpers_match_wire_shapes() {
+    macro_rules! assert_wire_label {
+        ($value:expr, $label:literal) => {{
+            let value = $value;
+            assert_eq!(value.as_str(), $label);
+            assert_eq!(
+                serde_json::to_value(&value).expect("serialize enum"),
+                json!($label)
+            );
+        }};
+    }
+
+    assert_wire_label!(ProjectSource::Auto, "auto");
+    assert_wire_label!(ProjectSource::Manual, "manual");
+    assert_wire_label!(SessionState::Starting, "starting");
+    assert_wire_label!(SessionState::Running, "running");
+    assert_wire_label!(SessionState::Stopped, "stopped");
+    assert_wire_label!(SessionState::Done, "done");
+    assert_wire_label!(SessionState::Failed, "failed");
+    assert_wire_label!(AgentActivity::Working, "working");
+    assert_wire_label!(AgentActivity::Blocked, "blocked");
+    assert_wire_label!(AgentActivity::Idle, "idle");
+    assert_wire_label!(DoctorStatus::Ok, "ok");
+    assert_wire_label!(DoctorStatus::Warn, "warn");
+    assert_wire_label!(DoctorStatus::Fail, "fail");
+    assert_wire_label!(ProviderKind::LinearIssue, "linear_issue");
+    assert_wire_label!(ProviderKind::GithubPr, "github_pr");
+    assert_wire_label!(ProviderKind::None, "none");
 }
 
 #[test]

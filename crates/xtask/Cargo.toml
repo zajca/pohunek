@@ -11,14 +11,14 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
-knowledge = { package = "pohunek-knowledge", path = "../knowledge" }
-cli = { package = "pohunek-cli", path = "../cli" }
+knowledge = { workspace = true }
+cli = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 regex = { workspace = true }
 clap = { workspace = true }
-pulldown-cmark = "0.12"
+pulldown-cmark = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

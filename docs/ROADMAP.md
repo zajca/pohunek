@@ -25,9 +25,8 @@ Last reconciled: 2026-06-26.
 | **Per-project actions + worktree hooks + agent profiles** | All slices incl. session/agent-state hooks (B2, `ed6b778`); env-clear + allowlist; host agent profiles. | [`design/per-project-actions-*`](design/) |
 | **Phase 5 / Milestone 12 — rofi/sway launcher** | `session list --filter` (chassis); `session new --input` (atomic launch); `scripts/` (launch-issue/pr, rofi, banner); `pohunek setup` for sway/rofi. | [`phases/05`](phases/05-rofi-sway-launcher.md), `scripts/` |
 
-> **`NEXT.md` is stale** — it still frames Milestone 12 (rofi/sway) as the
-> immediate next step, but that milestone shipped. The forward path below
-> supersedes it.
+> This roadmap supersedes older milestone notes. Use the recommended sequence
+> below for next work.
 
 ---
 

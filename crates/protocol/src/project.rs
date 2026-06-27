@@ -25,6 +25,17 @@ pub enum ProjectSource {
     Manual,
 }
 
+impl ProjectSource {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+        }
+    }
+}
+
 /// Summary of one project, the wire/list shape returned by `project.*` methods
 /// (mirrors [`crate::SessionInfo`]'s role for sessions). The `id` and `label` are
 /// the daemon-derived display handles; the canonical `git_common_dir` is the key.
@@ -210,6 +221,18 @@ pub enum ProviderKind {
     None,
 }
 
+impl ProviderKind {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::LinearIssue => "linear_issue",
+            Self::GithubPr => "github_pr",
+            Self::None => "none",
+        }
+    }
+}
+
 /// Parameters for `project.action`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectActionParams {
@@ -277,4 +300,22 @@ pub struct ProjectRemoveResult {
     /// unless `prune_worktrees` and a session was live in an owned worktree.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped_worktrees: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProjectSource, ProviderKind};
+
+    #[test]
+    fn project_source_strings_match_wire_repr() {
+        assert_eq!(ProjectSource::Auto.as_str(), "auto");
+        assert_eq!(ProjectSource::Manual.as_str(), "manual");
+    }
+
+    #[test]
+    fn provider_kind_strings_match_wire_repr() {
+        assert_eq!(ProviderKind::LinearIssue.as_str(), "linear_issue");
+        assert_eq!(ProviderKind::GithubPr.as_str(), "github_pr");
+        assert_eq!(ProviderKind::None.as_str(), "none");
+    }
 }

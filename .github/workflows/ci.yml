@@ -45,7 +45,7 @@ jobs:
         run: cargo build --workspace --release
 
   docs:
-    name: docs check (schema + drift + source-map + runbooks + secrets)
+    name: docs check (schema + drift + source-map + runbooks + secrets + release extras)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

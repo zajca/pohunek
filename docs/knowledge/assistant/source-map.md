@@ -59,7 +59,7 @@ Agent runtime and profile resolution:
 - `crates/daemon/src/agent/codex.rs`
 - `crates/daemon/src/agent/claude.rs`
 - `crates/daemon/src/agent/shell.rs`
-- `crates/daemon/src/detect/manifest.rs`
+- `crates/daemon/src/detect/manifest/mod.rs`
 - `crates/daemon/src/detect/manifests/codex.toml`
 - `crates/daemon/src/detect/manifests/claude.toml`
 - `crates/daemon/src/detect/manifests/shell.toml`

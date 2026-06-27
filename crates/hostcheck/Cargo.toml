@@ -11,8 +11,8 @@ name = "hostcheck"
 path = "src/lib.rs"
 
 [dependencies]
-pohunek-protocol = { path = "../protocol" }
-pohunek-netbird = { path = "../netbird" }
+pohunek-protocol = { workspace = true }
+pohunek-netbird = { workspace = true }
 
 [lints]
 workspace = true

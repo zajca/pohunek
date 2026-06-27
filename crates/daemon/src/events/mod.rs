@@ -30,6 +30,9 @@ use tracing::warn;
 /// File name of the append-only event log inside the events directory.
 const EVENT_LOG_NAME: &str = "events.jsonl";
 
+#[cfg(unix)]
+const OWNER_PRIVATE_FILE_MODE: u32 = 0o600;
+
 /// Synthetic event recorded when the broadcast channel drops events faster than
 /// the log can drain them, so the audit trail stays honest about gaps.
 const EVENT_DROPPED: &str = "events_dropped";
@@ -57,12 +60,8 @@ impl EventLog {
     pub fn open(dir: &Path) -> io::Result<Self> {
         create_private_dir(dir)?;
         let path = dir.join(EVENT_LOG_NAME);
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        };
+        let file = owner_private_append_options().open(&path)?;
+        set_owner_private_file_permissions(&path)?;
         Ok(Self {
             path,
             file: Mutex::new(file),
@@ -90,14 +89,45 @@ impl EventLog {
     }
 }
 
+fn owner_private_append_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(OWNER_PRIVATE_FILE_MODE)
+    };
+    options
+}
+
+#[cfg(unix)]
+fn set_owner_private_file_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(OWNER_PRIVATE_FILE_MODE))
+}
+
+#[cfg(not(unix))]
+fn set_owner_private_file_permissions(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 /// Create a directory (and parents) owner-private (`0700`).
 fn create_private_dir(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    };
+    set_owner_private_dir_permissions(dir)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_owner_private_dir_permissions(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn set_owner_private_dir_permissions(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -293,6 +323,54 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(file_mode & 0o777, 0o600, "event log must be owner-private");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn event_log_sets_create_mode_before_opening() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_events_dir("append-options");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join(super::EVENT_LOG_NAME);
+        let file = super::owner_private_append_options()
+            .open(&path)
+            .expect("open owner-private event log");
+        drop(file);
+
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            super::OWNER_PRIVATE_FILE_MODE,
+            "event logs must be created with the final owner-private mode"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_tightens_existing_event_log_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_events_dir("tighten-existing");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join(super::EVENT_LOG_NAME);
+        fs::write(&path, "old\n").expect("write loose log");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).expect("set loose mode");
+
+        let log = EventLog::open(&dir).expect("open log");
+        log.append(&Event::new(event::SESSION_CREATED, json!({ "n": 1 })))
+            .expect("append");
+
+        let mode = fs::metadata(log.path())
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, super::OWNER_PRIVATE_FILE_MODE);
+        assert_eq!(
+            read_lines(log.path()).len(),
+            2,
+            "opening an existing event log must append"
+        );
     }
 
     #[tokio::test]

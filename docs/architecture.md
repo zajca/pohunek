@@ -25,11 +25,9 @@ Key consequences of that scope, decided explicitly:
 - **Discovery is tokenless NetBird-local**, with live capability queries instead
   of signed manifest exchange.
 - **The GUI is deferred.** Interactive control happens by attaching to a session
-  from your existing terminal. The eventual GUI is a **browser control center**
-  reached through a standalone TypeScript aggregator backend (see
-  `docs/phases/04-browser-control-center.md`); the daemon gains no GUI surface. A
-  native libghostty GUI was the earlier target and is **dropped**. Either way the
-  GUI is built only after the core is in daily use.
+  from your existing terminal. The next GUI path is a Rust SDK followed by a
+  pure-native Rust desktop companion app. The browser control center is later and
+  optional; the daemon gains no GUI surface.
 - **Provider integration (Linear/GitHub) is deferred and shell-out based**
   (`gh`, Linear GraphQL/MCP), not maintained in-tree adapters, and lives in the
   client surfaces (the Phase 5 sway scripts and the Phase 4 browser backend),
@@ -58,16 +56,14 @@ Key consequences of that scope, decided explicitly:
 ## Non-Goals
 
 - Multi-user authorization or a shared-host trust model. Single operator only.
-- A central coordinator, SaaS control plane, or hosted dashboard. (The eventual
-  browser GUI's aggregator backend is a **user-run client** on a mesh host that
-  holds no authoritative state — not a central coordinator; each host's daemon
-  stays authoritative, and the CLI keeps working directly without it.)
+- A central coordinator, SaaS control plane, or hosted dashboard. Future desktop
+  and browser clients are **user-run clients** that hold no authoritative state;
+  each host's daemon stays authoritative, and the CLI keeps working directly.
 - SSH bridging as the remote transport (NetBird direct transport replaces it).
 - A cryptographic mesh: signed manifests, snapshot reconciliation, key rotation.
 - In-tree provider adapters in the core path (shell-out instead).
-- A GUI in the first version (deferred; the eventual GUI is a browser control
-  center via a standalone TS backend — see Phase 4. A native libghostty GUI is
-  dropped).
+- A GUI in the first version. GUI work is deferred to the SDK-first path in
+  `docs/ROADMAP.md`: native desktop first, browser later/optional.
 - ACP as the first agent runtime (deferred; PTY/TUI-first).
 - WebSocket as the core daemon protocol.
 
@@ -452,8 +448,8 @@ Integration tests:
   interface; rely on NetBird policies; no `0.0.0.0`.
 - **Worktree cleanup conflicts.** Mitigation: explicit session ownership and
   recorded bindings; ownership checks before reuse/cleanup.
-- **libghostty (future GUI) maturity.** Mitigation: GUI deferred; re-verify
-  libghostty status at build time; the CLI attach path needs no GUI.
+- **Embedded terminal maturity.** Mitigation: GUI deferred; choose and verify the
+  desktop terminal component when Track D starts. The CLI attach path needs no GUI.
 - **Agent CLIs change under us.** Mitigation: keep the agent boundary thin; rely
   on documented modes (hooks, native resume) and pin behavior with fixtures.
 
@@ -468,6 +464,6 @@ Integration tests:
 | Audit | Tamper-evident considered | Plain local event log (debug) |
 | Agent state | Terminal heuristics | OSC title + screen-manifest + PTY activity (per herdr); hooks only capture the session ID for resume |
 | Providers | In-tree Linear/GitHub adapters | Deferred, shell-out (`gh`, Linear GraphQL/MCP) in the client surfaces, not the chassis |
-| GUI | libghostty client (MVP5) + spike (MVP0) | Deferred; browser control center via a standalone TS aggregator backend (Phase 4). libghostty dropped |
+| GUI | libghostty client (MVP5) + spike (MVP0) | Deferred; SDK first, native Rust desktop primary, browser control center later/optional. libghostty client dropped |
 | Attach framing | "separate stream mode" (unspecified) | Separate connection per PTY (specified) |
 | Agents | Codex + Claude Code | Codex + Claude Code (unchanged) |

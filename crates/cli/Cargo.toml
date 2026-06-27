@@ -11,10 +11,10 @@ name = "pohunek"
 path = "src/main.rs"
 
 [dependencies]
-pohunek-knowledge = { path = "../knowledge", features = ["protocol"] }
-pohunek-hostcheck = { path = "../hostcheck" }
-pohunek-protocol = { path = "../protocol" }
-pohunek-netbird = { path = "../netbird" }
+pohunek-knowledge = { workspace = true, features = ["protocol"] }
+pohunek-hostcheck = { workspace = true }
+pohunek-protocol = { workspace = true }
+pohunek-netbird = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

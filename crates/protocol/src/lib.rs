@@ -30,19 +30,27 @@ mod project;
 mod session;
 mod version;
 
+#[doc(inline)]
 pub use assistant::{
     AssistantMaterializeParams, AssistantMaterializeResult, ConceptDeprecation, ConceptIntent,
     ConceptMeta, ConceptType,
 };
+#[doc(inline)]
 pub use capabilities::{AgentRuntime, HostCapabilities};
+#[doc(inline)]
 pub use discovery::{HostClass, HostDiscoverParams, HostRecord};
+#[doc(inline)]
 pub use doctor::{DaemonDoctorResult, DoctorCheck, DoctorReport, DoctorStatus};
+#[doc(inline)]
 pub use envelope::{Event, Request, Response, StateSource};
+#[doc(inline)]
 pub use error::{ErrorClass, ProtocolError};
+#[doc(inline)]
 pub use integration::{
     IntegrationInstallParams, IntegrationInstallReport, IntegrationInstallResult, ENV_DAEMON_ID,
     ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
+#[doc(inline)]
 pub use project::{
     ActionSummary, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
     ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListFilter, ProjectListParams,
@@ -50,6 +58,7 @@ pub use project::{
     ProjectRenameParams, ProjectShowParams, ProjectShowResult, ProjectSource, ProjectWorktree,
     PromptLayer, ProviderKind,
 };
+#[doc(inline)]
 pub use session::{
     AgentActivity, AgentKind, AttachHeader, SessionAttachParams, SessionAttachResult,
     SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
@@ -57,6 +66,7 @@ pub use session::{
     SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
     SessionResizeResult, SessionState, SessionStopResult, SessionWarning, SessionWarningKind,
 };
+#[doc(inline)]
 pub use version::{negotiate, ProtocolVersion, PROTOCOL_VERSION};
 
 /// Control-protocol method names (Phase 1).

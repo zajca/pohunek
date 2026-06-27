@@ -23,6 +23,13 @@ members = [
 # Crates shared across implemented milestones and current state-engine work are
 # declared here as individual crates opt in.
 [workspace.dependencies]
+cli = { package = "pohunek-cli", path = "crates/cli" }
+knowledge = { package = "pohunek-knowledge", path = "crates/knowledge" }
+pohunek-cli = { path = "crates/cli" }
+pohunek-hostcheck = { path = "crates/hostcheck" }
+pohunek-knowledge = { path = "crates/knowledge" }
+pohunek-netbird = { path = "crates/netbird" }
+pohunek-protocol = { path = "crates/protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -44,6 +51,8 @@ libc = "0.2"
 # RFC3339 timestamps for session metadata (milestone 3). Formatting only.
 time = { version = "0.3", features = ["formatting"] }
 vt100 = "0.16.2"
+portable-pty = "0.9"
+pulldown-cmark = "0.12"
 
 # Single source of truth for the released version. Every crate opts in via
 # `version.workspace = true`, so `scripts/release` only bumps it here.

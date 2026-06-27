@@ -34,6 +34,18 @@ pub enum AgentActivity {
     Idle,
 }
 
+impl AgentActivity {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Blocked => "blocked",
+            Self::Idle => "idle",
+        }
+    }
+}
+
 /// Parameters for `session.new`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionNewParams {
@@ -267,6 +279,18 @@ pub enum SessionState {
 }
 
 impl SessionState {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+            Self::Done => "done",
+            Self::Failed => "failed",
+        }
+    }
+
     /// Whether this is a **terminal** state — the session has stopped, completed,
     /// or failed and no longer holds resources (its worktree is free again, no
     /// process is attached). `Starting` and `Running` are the non-terminal,
@@ -482,6 +506,22 @@ mod tests {
         assert!(SessionState::Stopped.is_terminal());
         assert!(SessionState::Done.is_terminal());
         assert!(SessionState::Failed.is_terminal());
+    }
+
+    #[test]
+    fn session_state_strings_match_wire_repr() {
+        assert_eq!(SessionState::Starting.as_str(), "starting");
+        assert_eq!(SessionState::Running.as_str(), "running");
+        assert_eq!(SessionState::Stopped.as_str(), "stopped");
+        assert_eq!(SessionState::Done.as_str(), "done");
+        assert_eq!(SessionState::Failed.as_str(), "failed");
+    }
+
+    #[test]
+    fn agent_activity_strings_match_wire_repr() {
+        assert_eq!(AgentActivity::Working.as_str(), "working");
+        assert_eq!(AgentActivity::Blocked.as_str(), "blocked");
+        assert_eq!(AgentActivity::Idle.as_str(), "idle");
     }
 
     #[test]

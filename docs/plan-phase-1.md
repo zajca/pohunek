@@ -267,9 +267,8 @@ Model from Kandev (`kandev/.../worktree/worktree.go:24-115`):
 > **Not built in Phase 1.** The live metadata store is file-based JSON-lines
 > (`resume-bindings.jsonl` + `worktree-bindings.jsonl`, folded into one consistent
 > write-path in milestone 9). This schema is kept only as a reference for *if/when*
-> an embedded SQLite `state.db` is later adopted (see the Decision note in
-> `NEXT.md`). Adopt it only when scale, query needs, or transactional requirements
-> the file store cannot meet actually appear.
+> an embedded SQLite `state.db` is later adopted. Adopt it only when scale, query
+> needs, or transactional requirements the file store cannot meet actually appear.
 
 ```sql
 CREATE TABLE session (

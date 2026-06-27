@@ -8,7 +8,7 @@
 //! `rename`, so a write of one record kind can never corrupt or drop a record of
 //! another kind, and any single update is crash-atomic (one `rename(2)` commits
 //! it). This is the transactional consistency a `SQLite` store would have given,
-//! without the dependency (see `NEXT.md` milestone 9).
+//! without the dependency (see `docs/ROADMAP.md`).
 //!
 //! This is a consistency guarantee about the *write path*, not a lifecycle
 //! pairing: the records are written by independent triggers (a worktree binding
@@ -36,7 +36,7 @@
 //! persisted (a deleted profile resumes from the structural snapshot with no env).
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -47,6 +47,9 @@ use tracing::warn;
 
 use crate::agent::{InputRules, ResumeMode, SessionRefKind};
 use crate::project::detect::project_id;
+
+#[cfg(unix)]
+const OWNER_PRIVATE_FILE_MODE: u32 = 0o600;
 
 /// One session's resume binding: everything needed to relaunch-and-resume.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -702,12 +705,33 @@ fn append_line(body: &mut String, record: &Record) -> io::Result<()> {
 
 /// Write a file with owner-only permissions (`0600`).
 fn write_owner_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    fs::write(path, bytes)?;
+    let mut file = owner_private_replace_options().open(path)?;
+    set_owner_private_file_permissions(path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    Ok(())
+}
+
+fn owner_private_replace_options() -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(OWNER_PRIVATE_FILE_MODE)
     };
+    options
+}
+
+#[cfg(unix)]
+fn set_owner_private_file_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(OWNER_PRIVATE_FILE_MODE))
+}
+
+#[cfg(not(unix))]
+fn set_owner_private_file_permissions(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -1003,6 +1027,42 @@ mod tests {
             .expect("record");
         let mode = fs::metadata(&path).expect("metadata").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "store file must be owner-private");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_private_replace_options_create_files_0600() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_store_path("replace-options");
+        let mut file = super::owner_private_replace_options()
+            .open(&path)
+            .expect("open owner-private file");
+        file.write_all(b"data").expect("write owner-private file");
+
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            super::OWNER_PRIVATE_FILE_MODE,
+            "owner-private store files must be created with the final mode"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_owner_private_tightens_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_store_path("tighten-existing");
+        fs::write(&path, b"old").expect("write loose file");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).expect("set loose mode");
+
+        super::write_owner_private(&path, b"new").expect("rewrite private file");
+
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+        assert_eq!(mode & 0o777, super::OWNER_PRIVATE_FILE_MODE);
+        assert_eq!(fs::read(&path).expect("read"), b"new");
     }
 
     // --- projects (milestone: projects M2) -----------------------------------

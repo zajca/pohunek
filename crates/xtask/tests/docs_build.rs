@@ -111,6 +111,25 @@ fn build_site_writes_matching_site_and_offline_outputs_with_relative_nav() {
     assert!(manifest.contains("\"pohunek_version\": \"1.2.3-test\""));
 }
 
+#[test]
+fn public_local_reexports_are_doc_inline() {
+    for relative in ["crates/protocol/src/lib.rs", "crates/knowledge/src/lib.rs"] {
+        let path = repo_root().join(relative);
+        let content = fs::read_to_string(&path).expect("read crate root");
+        let lines: Vec<_> = content.lines().collect();
+
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("pub use ") {
+                assert!(
+                    index > 0 && lines[index - 1].trim() == "#[doc(inline)]",
+                    "{relative}:{} public local re-export must be #[doc(inline)]",
+                    index + 1
+                );
+            }
+        }
+    }
+}
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

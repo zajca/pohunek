@@ -10,7 +10,7 @@
 //! `daemon.health`, PTY-backed local sessions, raw attach streaming over a
 //! separate connection, agents, detection (the state engine), worktree-per-session
 //! binding, a unified JSON-lines metadata store (resume + worktree bindings), and
-//! an append-only event log. The `SQLite` store is deferred (see `NEXT.md`).
+//! an append-only event log. The `SQLite` store is deferred (see `docs/ROADMAP.md`).
 
 // Unsafe is denied by default; the few FFI sites (advisory flock, socket chmod)
 // opt back in with a localized `#[allow(unsafe_code)]` and a SAFETY comment.

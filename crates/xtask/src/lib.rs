@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 
 const MANUAL_SOURCE: &str = "docs/knowledge";
 const GENERATED_REFERENCE: &str = "generated";
+const REQUIRED_RELEASE_EXTRAS: &[&str] = &["README.md", "LICENSE"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidationSummary {
@@ -389,6 +390,7 @@ fn render_index_html(version: &str, pages: &[(String, String)]) -> String {
 ///      against the live `pohunek_cli::command()` clap tree.
 ///   5. Secret scan — the built knowledge bundle contains no secret-like
 ///      strings matching known credential patterns.
+///   6. Release extras — required root files packaged with releases exist.
 pub fn check_docs(
     source_dir: impl AsRef<Path>,
     output_root: impl AsRef<Path>,
@@ -405,6 +407,7 @@ pub fn check_docs(
     all_pass &= check_source_map_paths(source_dir, &repo);
     all_pass &= check_runbook_commands(source_dir)?;
     all_pass &= check_secret_scan(source_dir, output_root)?;
+    all_pass &= check_release_extras(&repo);
 
     Ok(all_pass)
 }
@@ -529,6 +532,31 @@ fn check_source_map_paths(source_dir: &Path, repo: &Path) -> bool {
             false
         }
     }
+}
+
+fn check_release_extras(repo: &Path) -> bool {
+    let missing = missing_release_extras(repo);
+    if missing.is_empty() {
+        println!("[PASS] release-extras: required release files exist");
+        true
+    } else {
+        println!(
+            "[FAIL] release-extras: {} required file(s) missing:",
+            missing.len()
+        );
+        for path in missing {
+            println!("        {path}");
+        }
+        false
+    }
+}
+
+fn missing_release_extras(repo: &Path) -> Vec<&'static str> {
+    REQUIRED_RELEASE_EXTRAS
+        .iter()
+        .copied()
+        .filter(|relative| !repo.join(relative).is_file())
+        .collect()
 }
 
 fn check_runbook_commands(source_dir: &Path) -> Result<bool, XtaskError> {
@@ -985,4 +1013,38 @@ fn usage_error() -> XtaskError {
     XtaskError::Usage(
         "usage: cargo xtask eval\n       cargo xtask docs <validate|build|check|site>".to_string(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "pohunek-xtask-{tag}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn release_extra_check_requires_root_readme_and_license() {
+        let root = temp_root("release-extras");
+        fs::create_dir_all(&root).expect("create temp root");
+
+        assert_eq!(missing_release_extras(&root), vec!["README.md", "LICENSE"]);
+
+        fs::write(root.join("README.md"), "readme\n").expect("write README");
+        assert_eq!(missing_release_extras(&root), vec!["LICENSE"]);
+
+        fs::write(root.join("LICENSE"), "license\n").expect("write LICENSE");
+        assert!(missing_release_extras(&root).is_empty());
+
+        fs::remove_dir_all(&root).expect("remove temp root");
+    }
 }

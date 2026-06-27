@@ -1043,7 +1043,8 @@ then three parallel tracks that don't share files: A1 → A2 → A3 (Part A) ∥
 ## No backward compatibility (experimental project)
 
 Same stance as the Projects work ([`projects-plan.md`](projects-plan.md)) and
-[`NEXT.md`](../../NEXT.md): **backward compatibility is an explicit non-goal.** This
+the current roadmap ([`ROADMAP.md`](../ROADMAP.md)): **backward compatibility is
+an explicit non-goal.** This
 RFC contains genuinely breaking changes; none of them carry a compat shim.
 
 - **CLI and daemon are assumed to be the same build.** We never handle an old CLI
@@ -1072,7 +1073,7 @@ RFC contains genuinely breaking changes; none of them carry a compat shim.
   …). The operator re-runs `pohunek setup` rather than relying on a migrator; removed
   keys are **not** kept valid.
 - **The public stability promise stays deferred** until the protocol settles in daily
-  use (per `NEXT.md`); these surfaces are explicitly unstable until then.
+  use; these surfaces are explicitly unstable until then.
 
 ## Out of scope
 
@@ -1180,4 +1181,4 @@ RFC contains genuinely breaking changes; none of them carry a compat shim.
   templates + launcher actions.
 - [`../phases/04-browser-control-center.md`](../phases/04-browser-control-center.md) —
   "one source of truth, two clients"; this RFC makes the daemon that source.
-- [`NEXT.md`](../../NEXT.md) — experimental / no-backward-compatibility stance.
+- [`../ROADMAP.md`](../ROADMAP.md) — current sequencing and pre-1.0 stability stance.

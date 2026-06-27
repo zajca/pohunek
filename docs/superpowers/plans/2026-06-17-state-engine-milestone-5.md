@@ -10,7 +10,7 @@
 
 ---
 
-## Constraints From `NEXT.md`
+## Constraints From Former Milestone Notes
 
 - Use `AgentActivity { Working, Blocked, Idle }`; do not overload lifecycle `SessionState`.
 - Activity is optional on `SessionInfo` until first detection.

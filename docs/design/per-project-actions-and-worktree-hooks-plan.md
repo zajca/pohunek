@@ -1115,7 +1115,8 @@ until their last slice; A3, B1–B3, and C2 are the observable changes.
 ## No backward compatibility (experimental project)
 
 Same stance as the Projects work ([`projects-plan.md`](projects-plan.md)) and
-[`NEXT.md`](../../NEXT.md): **backward compatibility is an explicit non-goal.** This plan ships
+the current roadmap ([`ROADMAP.md`](../ROADMAP.md)): **backward compatibility is
+an explicit non-goal.** This plan ships
 genuinely breaking changes; none carry a compat shim or migration.
 
 - **CLI and daemon are the same build.** We never handle an old CLI talking to a new daemon (or vice

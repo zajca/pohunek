@@ -12,7 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 include_dir = { workspace = true }
-pohunek-protocol = { path = "../protocol", optional = true }
+pohunek-protocol = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }
