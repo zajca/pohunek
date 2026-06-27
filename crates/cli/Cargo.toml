@@ -15,6 +15,7 @@ pohunek-knowledge = { workspace = true, features = ["protocol"] }
 pohunek-hostcheck = { workspace = true }
 pohunek-protocol = { workspace = true }
 pohunek-netbird = { workspace = true }
+pohunek-client = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -150,11 +150,13 @@ fn map_assistant_method_error(err: CliError, method: &str) -> CliError {
         CliError::Protocol(source) if source.code == "method_not_found" => {
             CliError::Protocol(ProtocolError::assistant_method_unsupported(method))
         }
-        CliError::RemoteProtocol { host, source } if source.code == "method_not_found" => {
-            CliError::RemoteProtocol {
+        CliError::Client(pohunek_client::ClientError::RemoteProtocol { host, source })
+            if source.code == "method_not_found" =>
+        {
+            CliError::Client(pohunek_client::ClientError::RemoteProtocol {
                 host,
                 source: ProtocolError::assistant_method_unsupported(method),
-            }
+            })
         }
         other => other,
     }
@@ -223,14 +225,15 @@ mod tests {
 
     #[test]
     fn remote_assistant_method_not_found_preserves_host_context() {
-        let err = CliError::RemoteProtocol {
+        let err = CliError::Client(pohunek_client::ClientError::RemoteProtocol {
             host: "build-box".to_owned(),
             source: ProtocolError::method_not_found("assistant.materialize"),
-        };
+        });
 
         let mapped = map_assistant_method_error(err, method::ASSISTANT_MATERIALIZE);
 
-        let CliError::RemoteProtocol { host, source } = mapped else {
+        let CliError::Client(pohunek_client::ClientError::RemoteProtocol { host, source }) = mapped
+        else {
             panic!("expected remote protocol error");
         };
         assert_eq!(host, "build-box");

@@ -15,6 +15,7 @@ members = [
     "crates/hostcheck",
     "crates/xtask",
     "crates/netbird",
+    "crates/client",
     "crates/daemon",
     "crates/cli",
 ]
@@ -26,6 +27,7 @@ members = [
 cli = { package = "pohunek-cli", path = "crates/cli" }
 knowledge = { package = "pohunek-knowledge", path = "crates/knowledge" }
 pohunek-cli = { path = "crates/cli" }
+pohunek-client = { path = "crates/client" }
 pohunek-hostcheck = { path = "crates/hostcheck" }
 pohunek-knowledge = { path = "crates/knowledge" }
 pohunek-netbird = { path = "crates/netbird" }

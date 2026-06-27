@@ -497,6 +497,7 @@ dependencies = [
  "clap",
  "futures",
  "libc",
+ "pohunek-client",
  "pohunek-hostcheck",
  "pohunek-knowledge",
  "pohunek-netbird",
@@ -507,6 +508,19 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+]
+
+[[package]]
+name = "pohunek-client"
+version = "0.4.3"
+dependencies = [
+ "futures",
+ "pohunek-netbird",
+ "pohunek-protocol",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

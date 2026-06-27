@@ -728,13 +728,16 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             // flag. It still governs error rendering through `wants_json` above.
             let paths = Paths::resolve()?;
             let host = effective_host(&global_host, None);
-            let mut client = crate::client::Client::connect(&host, &paths).await?;
+            let client = crate::client::Client::connect(&host, &paths).await?;
             let request = Request::new(
                 commands::request_id(method::SUBSCRIBE),
                 method::SUBSCRIBE,
                 serde_json::Value::Null,
             );
-            client.subscribe(&request).await?;
+            let mut subscription = client.into_sdk().subscribe(&request).await?;
+            while let Some(line) = subscription.next_line().await? {
+                println!("{line}");
+            }
             Ok(ExitCode::SUCCESS)
         }
         Commands::Integration { action } => {
