@@ -34,9 +34,13 @@ impl Client {
     }
 }
 
-/// Open a raw, unframed control connection for `host`.
-pub(crate) async fn connect_raw(host: &str, paths: &Paths) -> Result<RawStream, CliError> {
-    pohunek_client::connect_raw(host, &paths.socket)
+/// Open an attach byte stream for `host`.
+pub(crate) async fn attach_raw(
+    host: &str,
+    paths: &Paths,
+    stream_id: &str,
+) -> Result<RawStream, CliError> {
+    pohunek_client::attach_raw(host, &paths.socket, stream_id)
         .await
         .map_err(map_connect_error)
 }

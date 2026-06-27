@@ -4,7 +4,10 @@ use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pohunek_client::protocol::AttachHeader;
-use pohunek_client::{connect_raw, connect_raw_local, connect_raw_tcp_addr, RawStream};
+use pohunek_client::{
+    attach_raw, attach_raw_local, attach_raw_tcp_addr, connect_raw, connect_raw_local,
+    connect_raw_tcp_addr, RawStream,
+};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::oneshot;
@@ -57,6 +60,7 @@ async fn raw_stream_connect_raw_local_carries_attach_header_and_unframed_bytes()
             write_attach_stream(&mut stream, "stream-local", &body).await;
         }
         RawStream::Remote(_) => panic!("local raw connection returned remote stream"),
+        _ => panic!("local raw connection returned unknown stream"),
     }
 
     assert_captured(
@@ -64,6 +68,34 @@ async fn raw_stream_connect_raw_local_carries_attach_header_and_unframed_bytes()
             .captured
             .await
             .expect("daemon captured local raw stream"),
+        "stream-local",
+        &body,
+    );
+    daemon.task.await.expect("raw unix daemon task completed");
+}
+
+#[tokio::test]
+async fn raw_stream_attach_raw_local_writes_attach_header_before_unframed_bytes() {
+    let daemon = spawn_unix_raw_daemon();
+    let body = vec![0x00, b'p', b't', b'y', b'\n', 0xff, b'x'];
+
+    let raw = attach_raw_local(&daemon.socket_path, "stream-local")
+        .await
+        .expect("connect local attach stream");
+    match raw {
+        RawStream::Local(mut stream) => {
+            stream.write_all(&body).await.expect("write raw body");
+            stream.shutdown().await.expect("close raw stream");
+        }
+        RawStream::Remote(_) => panic!("local attach stream returned remote stream"),
+        _ => panic!("local attach stream returned unknown stream"),
+    }
+
+    assert_captured(
+        &daemon
+            .captured
+            .await
+            .expect("daemon captured local attach stream"),
         "stream-local",
         &body,
     );
@@ -83,6 +115,7 @@ async fn raw_stream_connect_raw_routes_local_host_to_unix_socket() {
             write_attach_stream(&mut stream, "stream-routed-local", &body).await;
         }
         RawStream::Remote(_) => panic!("routed local raw connection returned remote stream"),
+        _ => panic!("routed local raw connection returned unknown stream"),
     }
 
     assert_captured(
@@ -90,6 +123,34 @@ async fn raw_stream_connect_raw_routes_local_host_to_unix_socket() {
             .captured
             .await
             .expect("daemon captured routed local raw stream"),
+        "stream-routed-local",
+        &body,
+    );
+    daemon.task.await.expect("raw unix daemon task completed");
+}
+
+#[tokio::test]
+async fn raw_stream_attach_raw_routes_local_host_to_unix_socket_and_writes_attach_header() {
+    let daemon = spawn_unix_raw_daemon();
+    let body = b"local-routing-bytes".to_vec();
+
+    let raw = attach_raw("local", &daemon.socket_path, "stream-routed-local")
+        .await
+        .expect("connect routed local attach stream");
+    match raw {
+        RawStream::Local(mut stream) => {
+            stream.write_all(&body).await.expect("write raw body");
+            stream.shutdown().await.expect("close raw stream");
+        }
+        RawStream::Remote(_) => panic!("routed local attach stream returned remote stream"),
+        _ => panic!("routed local attach stream returned unknown stream"),
+    }
+
+    assert_captured(
+        &daemon
+            .captured
+            .await
+            .expect("daemon captured routed local attach stream"),
         "stream-routed-local",
         &body,
     );
@@ -109,6 +170,7 @@ async fn raw_stream_connect_raw_tcp_addr_carries_attach_header_and_unframed_byte
             write_attach_stream(&mut stream, "stream-remote", &body).await;
         }
         RawStream::Local(_) => panic!("tcp raw connection returned local stream"),
+        _ => panic!("tcp raw connection returned unknown stream"),
     }
 
     assert_captured(
@@ -116,6 +178,34 @@ async fn raw_stream_connect_raw_tcp_addr_carries_attach_header_and_unframed_byte
             .captured
             .await
             .expect("daemon captured tcp raw stream"),
+        "stream-remote",
+        &body,
+    );
+    daemon.task.await.expect("raw tcp daemon task completed");
+}
+
+#[tokio::test]
+async fn raw_stream_attach_raw_tcp_addr_writes_attach_header_before_unframed_bytes() {
+    let daemon = spawn_tcp_raw_daemon().await;
+    let body = vec![b'r', b'e', b'm', b'o', b't', b'e', 0x00, 0xfe, b'\n'];
+
+    let raw = attach_raw_tcp_addr(HOST, daemon.addr, "stream-remote")
+        .await
+        .expect("connect tcp attach stream");
+    match raw {
+        RawStream::Remote(mut stream) => {
+            stream.write_all(&body).await.expect("write raw body");
+            stream.shutdown().await.expect("close raw stream");
+        }
+        RawStream::Local(_) => panic!("tcp attach stream returned local stream"),
+        _ => panic!("tcp attach stream returned unknown stream"),
+    }
+
+    assert_captured(
+        &daemon
+            .captured
+            .await
+            .expect("daemon captured tcp attach stream"),
         "stream-remote",
         &body,
     );

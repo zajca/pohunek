@@ -2,20 +2,20 @@
 //!
 //! Works against a local or remote host: the control RPCs go through the
 //! transport-agnostic [`Client`], and the raw second connection (the attach byte
-//! stream) is opened over the *same* transport via [`crate::client::connect_raw`].
+//! stream) is opened over the *same* transport via [`crate::client::attach_raw`].
 //! Press Ctrl-] (0x1d) while attached to detach from the session without
 //! stopping the PTY process.
 
 use std::os::fd::RawFd;
 
 use protocol::{
-    method, AttachHeader, Request, SessionAttachParams, SessionAttachResult, SessionDetachParams,
-    SessionId, SessionResizeParams, ENV_DAEMON_ID, ENV_SESSION_ID,
+    method, Request, SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionId,
+    SessionResizeParams, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
 
-use crate::client::{connect_raw, Client, RawStream};
+use crate::client::{attach_raw, Client, RawStream};
 use crate::commands::request_with_params;
 use crate::error::CliError;
 use crate::paths::Paths;
@@ -44,10 +44,9 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
     let attach: SessionAttachResult = serde_json::from_value(result)?;
 
     // Open the raw second connection over the same transport as the control
-    // connection, so the attach byte stream rides the local socket or the remote
-    // NetBird TCP connection consistently. Dispatch on the transport once, then
-    // run the identical (generic) header -> resize -> forward sequence in each arm.
-    match connect_raw(host, paths).await? {
+    // connection. The SDK writes the daemon attach prelude before returning, so
+    // the CLI only owns terminal resize/forward/detach behavior.
+    match attach_raw(host, paths, &attach.stream_id).await? {
         // Box the large attach future to keep this enclosing future small.
         RawStream::Local(stream) => {
             Box::pin(attach_over_stream(
@@ -67,16 +66,17 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
             ))
             .await
         }
+        _ => unreachable!("unsupported raw attach stream transport"),
     }
 }
 
-/// Send the attach header, push an initial resize, then bridge the terminal and
-/// the stream until detach/EOF — generic over the transport.
+/// Push an initial resize, then bridge the terminal and the stream until
+/// detach/EOF — generic over the transport.
 ///
-/// Mirrors the original local sequence exactly: header first, then a best-effort
+/// Mirrors the original local sequence after SDK attach negotiation: best-effort
 /// resize on the control connection, then the forward loop.
 async fn attach_over_stream<S>(
-    mut stream: S,
+    stream: S,
     mut client: Client,
     stream_id: &str,
     target: &Target,
@@ -84,8 +84,6 @@ async fn attach_over_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    send_attach_header(&mut stream, stream_id).await?;
-
     if let Some((cols, rows)) = terminal_size(libc::STDOUT_FILENO) {
         if let Ok(request) = build_resize_request(target, cols, rows) {
             let _ = client.request(&request).await;
@@ -160,23 +158,6 @@ fn build_resize_request(target: &Target, cols: u16, rows: u16) -> Result<Request
             rows,
         },
     )
-}
-
-/// Write the attach header line over any byte stream.
-///
-/// Generic over the transport so the local Unix socket and the remote `NetBird`
-/// TCP connection share one implementation.
-async fn send_attach_header<S>(stream: &mut S, stream_id: &str) -> Result<(), CliError>
-where
-    S: AsyncWrite + Unpin,
-{
-    let mut header = serde_json::to_vec(&AttachHeader {
-        attach: stream_id.to_owned(),
-    })?;
-    header.push(b'\n');
-    stream.write_all(&header).await?;
-    stream.flush().await?;
-    Ok(())
 }
 
 /// Bidirectionally bridge the terminal and the attach byte stream until detach

@@ -49,6 +49,15 @@ struct LateResponseDaemon {
 }
 
 #[derive(Debug)]
+struct ReusableDaemon {
+    socket_path: PathBuf,
+    first_request_line: oneshot::Receiver<String>,
+    second_request_line: oneshot::Receiver<Option<String>>,
+    task: JoinHandle<()>,
+    _socket_file: SocketFile,
+}
+
+#[derive(Debug)]
 struct SocketFile(PathBuf);
 
 impl Drop for SocketFile {
@@ -78,6 +87,22 @@ fn request_response_client_options_default_timeout_matches_convenience_apis() {
     assert_eq!(
         ClientOptions::default().request_timeout,
         Duration::from_secs(5)
+    );
+    assert_eq!(
+        ClientOptions::default().connect_timeout,
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        ClientOptions::default()
+            .with_request_timeout(Duration::from_millis(50))
+            .request_timeout,
+        Duration::from_millis(50)
+    );
+    assert_eq!(
+        ClientOptions::default()
+            .with_connect_timeout(Duration::from_millis(75))
+            .connect_timeout,
+        Duration::from_millis(75)
     );
 }
 
@@ -188,9 +213,7 @@ async fn request_response_timeout_poisons_connection_before_late_response_can_be
         response_ok_line_for(&first_request, json!({"request": 1})),
         Duration::from_millis(60),
     );
-    let options = ClientOptions {
-        request_timeout: Duration::from_millis(20),
-    };
+    let options = ClientOptions::default().with_request_timeout(Duration::from_millis(20));
     let mut client = Client::connect_local_with_options(&daemon.socket_path, options)
         .await
         .expect("connect local test daemon");
@@ -256,6 +279,58 @@ async fn request_response_id_mismatch_maps_by_transport() {
         ClientError::RemoteDaemonUnavailable { host } => assert_eq!(host, HOST),
         other => panic!("expected remote RemoteDaemonUnavailable error, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn request_response_id_mismatch_poisons_connection_before_it_can_be_reused() {
+    let first_request = request_with_id("req-id-mismatch-1");
+    let second_request = request_with_id("req-id-mismatch-2");
+    let wrong_id_reply = response_ok_line_for(&request_with_id("wrong-response-id"), ok_payload());
+    let daemon = spawn_reusable_daemon(wrong_id_reply);
+    let mut client = Client::connect_local(&daemon.socket_path)
+        .await
+        .expect("connect local reusable daemon");
+
+    match client
+        .request(&first_request)
+        .await
+        .expect_err("first request sees id mismatch")
+    {
+        ClientError::Framing(msg) => assert!(
+            msg.contains("response id"),
+            "id mismatch message is clear: {msg}"
+        ),
+        other => panic!("expected local Framing error, got {other:?}"),
+    }
+    assert_sent_specific_request(
+        &daemon
+            .first_request_line
+            .await
+            .expect("daemon saw first request"),
+        &first_request,
+    );
+
+    match client
+        .request(&second_request)
+        .await
+        .expect_err("id-mismatched connection must be poisoned")
+    {
+        ClientError::Framing(msg) => assert!(
+            msg.contains("unusable"),
+            "poisoned connection message is clear: {msg}"
+        ),
+        other => panic!("expected poisoned Framing error, got {other:?}"),
+    }
+
+    let maybe_second_request = daemon
+        .second_request_line
+        .await
+        .expect("daemon reports whether it saw a second request");
+    assert_eq!(
+        maybe_second_request, None,
+        "poisoned client must fail before sending a second request"
+    );
+    daemon.task.await.expect("reusable daemon completed");
 }
 
 async fn run_local(reply: Reply) -> (Result<Value, ClientError>, String) {
@@ -352,6 +427,33 @@ fn spawn_late_response_daemon(reply_line: String, delay: Duration) -> LateRespon
     }
 }
 
+fn spawn_reusable_daemon(first_reply_line: String) -> ReusableDaemon {
+    let socket_path = unique_socket_path();
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).expect("bind unix reusable test daemon");
+    let (first_request_tx, first_request_line) = oneshot::channel();
+    let (second_request_tx, second_request_line) = oneshot::channel();
+
+    let task = tokio::spawn(async move {
+        let (stream, _addr) = listener.accept().await.expect("accept unix client");
+        handle_reusable_connection(
+            stream,
+            first_request_tx,
+            second_request_tx,
+            first_reply_line,
+        )
+        .await;
+    });
+
+    ReusableDaemon {
+        socket_path: socket_path.clone(),
+        first_request_line,
+        second_request_line,
+        task,
+        _socket_file: SocketFile(socket_path),
+    }
+}
+
 async fn handle_connection<S>(stream: S, request_tx: oneshot::Sender<String>, reply: Reply)
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -422,6 +524,50 @@ async fn handle_late_response_connection<S>(
         .write_all(b"\n")
         .await
         .expect("write late reply newline");
+
+    let mut second_request_line = String::new();
+    let second_request = match tokio::time::timeout(
+        Duration::from_millis(80),
+        reader.read_line(&mut second_request_line),
+    )
+    .await
+    {
+        Ok(Ok(0)) | Err(_) => None,
+        Ok(Ok(_bytes)) => Some(trim_line_end(&second_request_line).to_owned()),
+        Ok(Err(err)) => panic!("read second request line failed: {err}"),
+    };
+    second_request_tx
+        .send(second_request)
+        .expect("send second request result to test");
+}
+
+async fn handle_reusable_connection<S>(
+    stream: S,
+    first_request_tx: oneshot::Sender<String>,
+    second_request_tx: oneshot::Sender<Option<String>>,
+    first_reply_line: String,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut reader = BufReader::new(stream);
+    let mut first_request_line = String::new();
+    reader
+        .read_line(&mut first_request_line)
+        .await
+        .expect("read first request line");
+    first_request_tx
+        .send(trim_line_end(&first_request_line).to_owned())
+        .expect("send first request line to test");
+
+    let stream = reader.get_mut();
+    stream
+        .write_all(first_reply_line.as_bytes())
+        .await
+        .expect("write first reply line");
+    stream
+        .write_all(b"\n")
+        .await
+        .expect("write first reply newline");
 
     let mut second_request_line = String::new();
     let second_request = match tokio::time::timeout(

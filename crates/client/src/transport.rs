@@ -1,13 +1,14 @@
 //! Framed request/response transport for the public SDK client.
 
+use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
-use protocol::{ProtocolError, Request, Response};
+use protocol::{AttachHeader, ProtocolError, Request, Response};
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
@@ -15,6 +16,7 @@ use crate::ClientError;
 
 const LOCAL_HOST: &str = "local";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 
 /// A connected SDK client over either the local Unix socket or remote TCP.
@@ -31,6 +33,7 @@ pub struct Subscription {
 
 /// A raw, unframed control connection used for attach byte streams.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum RawStream {
     /// Local Unix-socket transport.
     Local(UnixStream),
@@ -40,16 +43,36 @@ pub enum RawStream {
 
 /// Client transport settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ClientOptions {
     /// Maximum time to wait for one daemon response.
     pub request_timeout: Duration,
+    /// Maximum time to wait for connection setup and remote discovery.
+    pub connect_timeout: Duration,
 }
 
 impl Default for ClientOptions {
     fn default() -> Self {
         Self {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         }
+    }
+}
+
+impl ClientOptions {
+    /// Return options with a custom per-request response timeout.
+    #[must_use]
+    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
+    }
+
+    /// Return options with a custom connection setup timeout.
+    #[must_use]
+    pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
+        self
     }
 }
 
@@ -91,7 +114,7 @@ impl Client {
         if is_local_host(host) {
             Self::connect_local_with_options(socket_path, options).await
         } else {
-            let addr = resolve_remote_addr(host.to_owned()).await?;
+            let addr = resolve_remote_addr(host.to_owned(), options.connect_timeout).await?;
             Self::connect_tcp_addr_with_options(host, addr, options).await
         }
     }
@@ -107,7 +130,7 @@ impl Client {
         options: ClientOptions,
     ) -> Result<Self, ClientError> {
         let socket_path = socket_path.as_ref();
-        let stream = connect_unix(socket_path).await?;
+        let stream = connect_unix(socket_path, options.connect_timeout).await?;
 
         Ok(Self {
             inner: ClientInner::Local(Conn::new(stream, None, options)),
@@ -129,7 +152,7 @@ impl Client {
         options: ClientOptions,
     ) -> Result<Self, ClientError> {
         let host = host.into();
-        let stream = connect_tcp(&host, addr).await?;
+        let stream = connect_tcp(&host, addr, options.connect_timeout).await?;
 
         Ok(Self {
             inner: ClientInner::Remote(Conn::new(stream, Some(host), options)),
@@ -221,16 +244,10 @@ where
         let line = serde_json::to_string(request)?;
         match tokio::time::timeout(self.request_timeout, self.exchange(&request.id, line)).await {
             Ok(result) => result.map(|_ok| ()),
-            Err(_elapsed) => {
-                self.poisoned = Some(
-                    "previous subscription timed out; pending daemon response may be stale"
-                        .to_owned(),
-                );
-                Err(no_response_error(
-                    self.remote_host.as_deref(),
-                    "timed out waiting for subscription ack",
-                ))
-            }
+            Err(_elapsed) => Err(no_response_error(
+                self.remote_host.as_deref(),
+                "timed out waiting for subscription ack",
+            )),
         }
     }
 
@@ -258,7 +275,12 @@ where
         };
 
         if response.id() != request_id {
-            return Err(response_id_mismatch_error(host, request_id, response.id()));
+            let err = response_id_mismatch_error(host, request_id, response.id());
+            self.poisoned = Some(format!(
+                "previous response id mismatch; expected '{request_id}', got '{}'",
+                response.id()
+            ));
+            return Err(err);
         }
 
         match response {
@@ -282,17 +304,37 @@ pub async fn connect_raw(
     host: &str,
     socket_path: impl AsRef<Path>,
 ) -> Result<RawStream, ClientError> {
+    connect_raw_with_options(host, socket_path, ClientOptions::default()).await
+}
+
+/// Open a raw, unframed control connection with explicit transport settings.
+pub async fn connect_raw_with_options(
+    host: &str,
+    socket_path: impl AsRef<Path>,
+    options: ClientOptions,
+) -> Result<RawStream, ClientError> {
     if is_local_host(host) {
-        connect_raw_local(socket_path).await
+        connect_raw_local_with_options(socket_path, options).await
     } else {
-        let addr = resolve_remote_addr(host.to_owned()).await?;
-        connect_raw_tcp_addr(host, addr).await
+        let addr = resolve_remote_addr(host.to_owned(), options.connect_timeout).await?;
+        connect_raw_tcp_addr_with_options(host, addr, options).await
     }
 }
 
 /// Open a raw, unframed connection to the local daemon Unix socket.
 pub async fn connect_raw_local(socket_path: impl AsRef<Path>) -> Result<RawStream, ClientError> {
-    Ok(RawStream::Local(connect_unix(socket_path.as_ref()).await?))
+    connect_raw_local_with_options(socket_path, ClientOptions::default()).await
+}
+
+/// Open a raw, unframed connection to the local daemon Unix socket with explicit
+/// transport settings.
+pub async fn connect_raw_local_with_options(
+    socket_path: impl AsRef<Path>,
+    options: ClientOptions,
+) -> Result<RawStream, ClientError> {
+    Ok(RawStream::Local(
+        connect_unix(socket_path.as_ref(), options.connect_timeout).await?,
+    ))
 }
 
 /// Open a raw, unframed TCP connection to a daemon on `addr`.
@@ -300,43 +342,174 @@ pub async fn connect_raw_tcp_addr(
     host: impl Into<String>,
     addr: SocketAddr,
 ) -> Result<RawStream, ClientError> {
-    let host = host.into();
-    Ok(RawStream::Remote(connect_tcp(&host, addr).await?))
+    connect_raw_tcp_addr_with_options(host, addr, ClientOptions::default()).await
 }
 
-async fn connect_unix(socket_path: &Path) -> Result<UnixStream, ClientError> {
-    UnixStream::connect(socket_path)
-        .await
-        .map_err(|source| ClientError::DaemonUnreachable {
+/// Open a raw, unframed TCP connection to a daemon on `addr` with explicit
+/// transport settings.
+pub async fn connect_raw_tcp_addr_with_options(
+    host: impl Into<String>,
+    addr: SocketAddr,
+    options: ClientOptions,
+) -> Result<RawStream, ClientError> {
+    let host = host.into();
+    Ok(RawStream::Remote(
+        connect_tcp(&host, addr, options.connect_timeout).await?,
+    ))
+}
+
+/// Open an attach byte stream and write the daemon's attach prelude before
+/// returning the raw transport to the caller.
+pub async fn attach_raw(
+    host: &str,
+    socket_path: impl AsRef<Path>,
+    stream_id: &str,
+) -> Result<RawStream, ClientError> {
+    attach_raw_with_options(host, socket_path, stream_id, ClientOptions::default()).await
+}
+
+/// Open an attach byte stream with explicit transport settings.
+pub async fn attach_raw_with_options(
+    host: &str,
+    socket_path: impl AsRef<Path>,
+    stream_id: &str,
+    options: ClientOptions,
+) -> Result<RawStream, ClientError> {
+    let mut stream = connect_raw_with_options(host, socket_path, options).await?;
+    stream.write_attach_header(stream_id).await?;
+    Ok(stream)
+}
+
+/// Open a local attach byte stream and write the daemon's attach prelude before
+/// returning the raw transport to the caller.
+pub async fn attach_raw_local(
+    socket_path: impl AsRef<Path>,
+    stream_id: &str,
+) -> Result<RawStream, ClientError> {
+    attach_raw_local_with_options(socket_path, stream_id, ClientOptions::default()).await
+}
+
+/// Open a local attach byte stream with explicit transport settings.
+pub async fn attach_raw_local_with_options(
+    socket_path: impl AsRef<Path>,
+    stream_id: &str,
+    options: ClientOptions,
+) -> Result<RawStream, ClientError> {
+    let mut stream = connect_raw_local_with_options(socket_path, options).await?;
+    stream.write_attach_header(stream_id).await?;
+    Ok(stream)
+}
+
+/// Open a TCP attach byte stream and write the daemon's attach prelude before
+/// returning the raw transport to the caller.
+pub async fn attach_raw_tcp_addr(
+    host: impl Into<String>,
+    addr: SocketAddr,
+    stream_id: &str,
+) -> Result<RawStream, ClientError> {
+    attach_raw_tcp_addr_with_options(host, addr, stream_id, ClientOptions::default()).await
+}
+
+/// Open a TCP attach byte stream with explicit transport settings.
+pub async fn attach_raw_tcp_addr_with_options(
+    host: impl Into<String>,
+    addr: SocketAddr,
+    stream_id: &str,
+    options: ClientOptions,
+) -> Result<RawStream, ClientError> {
+    let mut stream = connect_raw_tcp_addr_with_options(host, addr, options).await?;
+    stream.write_attach_header(stream_id).await?;
+    Ok(stream)
+}
+
+impl RawStream {
+    async fn write_attach_header(&mut self, stream_id: &str) -> Result<(), ClientError> {
+        match self {
+            RawStream::Local(stream) => write_attach_header(stream, stream_id).await,
+            RawStream::Remote(stream) => write_attach_header(stream, stream_id).await,
+        }
+    }
+}
+
+async fn write_attach_header<S>(stream: &mut S, stream_id: &str) -> Result<(), ClientError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut header = serde_json::to_vec(&AttachHeader {
+        attach: stream_id.to_owned(),
+    })?;
+    header.push(b'\n');
+    stream.write_all(&header).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn connect_unix(
+    socket_path: &Path,
+    connect_timeout: Duration,
+) -> Result<UnixStream, ClientError> {
+    match tokio::time::timeout(connect_timeout, UnixStream::connect(socket_path)).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(source)) => Err(ClientError::DaemonUnreachable {
             socket: socket_path.to_path_buf(),
             source,
-        })
+        }),
+        Err(_elapsed) => Err(ClientError::DaemonUnreachable {
+            socket: socket_path.to_path_buf(),
+            source: timeout_error("daemon socket connect", connect_timeout),
+        }),
+    }
 }
 
-async fn connect_tcp(host: &str, addr: SocketAddr) -> Result<TcpStream, ClientError> {
-    TcpStream::connect(addr)
-        .await
-        .map_err(|source| ClientError::HostUnreachable {
+async fn connect_tcp(
+    host: &str,
+    addr: SocketAddr,
+    connect_timeout: Duration,
+) -> Result<TcpStream, ClientError> {
+    match tokio::time::timeout(connect_timeout, TcpStream::connect(addr)).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(source)) => Err(ClientError::HostUnreachable {
             host: host.to_owned(),
             source,
-        })
+        }),
+        Err(_elapsed) => Err(ClientError::HostUnreachable {
+            host: host.to_owned(),
+            source: timeout_error("daemon tcp connect", connect_timeout),
+        }),
+    }
 }
 
 fn is_local_host(host: &str) -> bool {
     host.is_empty() || host == LOCAL_HOST
 }
 
-async fn resolve_remote_addr(host: String) -> Result<SocketAddr, ClientError> {
-    tokio::task::spawn_blocking(move || {
+async fn resolve_remote_addr(
+    host: String,
+    connect_timeout: Duration,
+) -> Result<SocketAddr, ClientError> {
+    let discovery_host = host.clone();
+    let task = tokio::task::spawn_blocking(move || {
         let status = netbird::run_status()?;
-        let ip = netbird::resolve_host(&status, &host)?;
+        let ip = netbird::resolve_host(&status, &discovery_host)?;
         let port = netbird::remote_port()?;
         Ok(SocketAddr::new(ip, port))
-    })
-    .await
-    .map_err(|err| ClientError::RemoteDiscoveryFailed {
-        detail: err.to_string(),
-    })?
+    });
+
+    match tokio::time::timeout(connect_timeout, task).await {
+        Ok(result) => result.map_err(|err| ClientError::RemoteDiscoveryFailed {
+            detail: err.to_string(),
+        })?,
+        Err(_elapsed) => Err(ClientError::RemoteDiscoveryFailed {
+            detail: format!("timed out resolving remote host '{host}' after {connect_timeout:?}"),
+        }),
+    }
+}
+
+fn timeout_error(action: &str, timeout: Duration) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("{action} timed out after {timeout:?}"),
+    )
 }
 
 fn no_response_error(remote_host: Option<&str>, local_msg: &str) -> ClientError {
