@@ -23,9 +23,11 @@
 //! re-reads the whole file under the write lock, edits the relevant record kind,
 //! and rewrites **all** records, preserving the other kinds untouched. The file
 //! is small (one line per resumable session, per bound worktree, and per known
-//! project) so a full rewrite per mutation is cheap. No secrets are ever written:
-//! a native session id, a cwd, a repository path, a branch, a worktree path, and
-//! a project's git common dir / credential-redacted origin URL are not secrets.
+//! project) so a full rewrite per mutation is cheap. No daemon-derived secrets
+//! are ever written: a native session id, a cwd, a repository path, a branch, a
+//! worktree path, and a project's git common dir / credential-redacted origin URL
+//! are not secrets. Owner-controlled session metadata is also persisted and must
+//! not contain secrets.
 //!
 //! The resume binding additionally carries the **structural relaunch snapshot**
 //! (Part C, C.4): `program`, `args`, `input_rules`, `resume_mode`, `ref_kind`,
@@ -35,6 +37,7 @@
 //! it may hold secrets, so it is re-resolved by agent name at resume, never
 //! persisted (a deleted profile resumes from the structural snapshot with no env).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -87,6 +90,10 @@ pub struct ResumeBinding {
     /// reason. `None` when there is no project / it was never known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_linked_worktree: Option<bool>,
+    /// Owner-controlled metadata for the session. The daemon validates size
+    /// limits but does not classify values; callers must not store secrets here.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
     /// Structural relaunch snapshot (C.4): the resolved launch program, frozen at
     /// creation so a host profile's `program` override survives a restart even if
     /// the profile is later edited or deleted. Serde default (`""`) for a legacy
@@ -140,6 +147,8 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             #[serde(default)]
             is_linked_worktree: Option<bool>,
             #[serde(default)]
+            metadata: BTreeMap<String, String>,
+            #[serde(default)]
             program: String,
             #[serde(default)]
             args: Vec<String>,
@@ -170,6 +179,7 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             native_session_path: raw.native_session_path,
             project_id: raw.project_id,
             is_linked_worktree: raw.is_linked_worktree,
+            metadata: raw.metadata,
             program: raw.program,
             args: raw.args,
             input_rules: raw.input_rules,
@@ -737,6 +747,7 @@ fn set_owner_private_file_permissions(_path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -773,6 +784,7 @@ mod tests {
             native_session_path: None,
             project_id: None,
             is_linked_worktree: None,
+            metadata: BTreeMap::new(),
             program: "claude".to_owned(),
             args: Vec::new(),
             input_rules: StoredInputRules {
@@ -858,6 +870,10 @@ mod tests {
             native_session_path: Some("/home/u/.claude/t.jsonl".to_owned()),
             project_id: Some("p-abc".to_owned()),
             is_linked_worktree: Some(true),
+            metadata: BTreeMap::from([
+                ("owner".to_owned(), "daemon".to_owned()),
+                ("ticket".to_owned(), "DMD-1356".to_owned()),
+            ]),
             program: "/opt/claude".to_owned(),
             args: vec!["--model".to_owned(), "sonnet".to_owned()],
             input_rules: StoredInputRules {
@@ -896,6 +912,7 @@ mod tests {
         assert_eq!(b.resume_mode, None);
         assert_eq!(b.ref_kind, None);
         assert!(!b.resumable);
+        assert!(b.metadata.is_empty());
     }
 
     #[test]

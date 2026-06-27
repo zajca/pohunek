@@ -186,6 +186,7 @@ fn session_params() -> SessionNewParams {
         branch: None,
         base_branch: None,
         input: None,
+        metadata: std::collections::BTreeMap::new(),
     }
 }
 

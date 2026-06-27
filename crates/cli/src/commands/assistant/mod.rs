@@ -440,6 +440,7 @@ async fn launch_session(
         branch: opts.branch.clone(),
         base_branch: opts.base_branch.clone(),
         input: Some(prompt),
+        metadata: std::collections::BTreeMap::new(),
     };
     let request = crate::commands::request_with_params(method::SESSION_NEW, &params)?;
     let value = client.request(&request).await?;

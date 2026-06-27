@@ -72,6 +72,7 @@ impl SessionRegistry {
                     // re-detecting (F5): a restart reads these back verbatim.
                     project_id: entry.info.project_id.clone(),
                     is_linked_worktree: entry.info.is_linked_worktree,
+                    metadata: entry.info.metadata.clone(),
                     // Structural relaunch snapshot (C.4): copied verbatim from the
                     // frozen entry snapshot on EVERY persist (creation, native-id
                     // capture, the hot resize path), so a resize re-persist can never
@@ -301,6 +302,7 @@ impl SessionRegistry {
             repo,
             branch,
             worktree_path,
+            metadata: binding.metadata,
             warnings: Vec::new(),
         })
         .await

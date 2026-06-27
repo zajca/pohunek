@@ -398,6 +398,7 @@ fn build_new_request(args: &NewArgs) -> Result<Request, CliError> {
             branch: args.branch.clone(),
             base_branch: args.base_branch.clone(),
             input: args.input.clone(),
+            metadata: std::collections::BTreeMap::new(),
         },
     )
 }
@@ -774,6 +775,7 @@ mod tests {
             native_session_path: None,
             project_id: None,
             project_label: None,
+            metadata: std::collections::BTreeMap::new(),
             is_linked_worktree: None,
             repo: None,
             branch: None,

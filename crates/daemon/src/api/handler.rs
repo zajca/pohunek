@@ -16,7 +16,8 @@ use protocol::{
     ProjectAddParams, ProjectListParams, ProjectPromptParams, ProjectRemoveParams,
     ProjectRenameParams, ProjectShowParams, ProtocolError, Request, Response, SessionAttachParams,
     SessionDetachParams, SessionId, SessionInputParams, SessionListParams, SessionNewParams,
-    SessionNewResult, SessionReportNativeIdParams, SessionResizeParams, PROTOCOL_VERSION,
+    SessionNewResult, SessionReportNativeIdParams, SessionResizeParams, SessionSetMetadataParams,
+    PROTOCOL_VERSION,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -157,6 +158,7 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::SESSION_ATTACH => handle_session_attach(request, &state.sessions).await,
         method::SESSION_DETACH => handle_session_detach(request, &state.sessions).await,
         method::SESSION_RESIZE => handle_session_resize(request, &state.sessions).await,
+        method::SESSION_SET_METADATA => handle_session_set_metadata(request, &state.sessions).await,
         method::SESSION_INPUT => handle_session_input(request, &state.sessions).await,
         method::SESSION_REPORT_NATIVE_ID => {
             handle_session_report_native_id(request, &state.sessions).await
@@ -570,6 +572,20 @@ async fn handle_session_resize(request: &Request, sessions: &SessionRegistry) ->
     }
 }
 
+async fn handle_session_set_metadata(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_params::<SessionSetMetadataParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    match sessions
+        .set_metadata(&params.session_id, params.metadata)
+        .await
+    {
+        Ok(result) => ok_value(request, &result),
+        Err(err) => Response::err(request.id.clone(), err),
+    }
+}
+
 async fn handle_session_input(request: &Request, sessions: &SessionRegistry) -> Response {
     let params = match parse_params::<SessionInputParams>(request) {
         Ok(params) => params,
@@ -743,15 +759,18 @@ fn parse_attach_prelude(line: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use protocol::{
         method, AgentKind, AssistantMaterializeParams, AssistantMaterializeResult,
-        DaemonDoctorResult, Request, SessionId, SessionInfo, SessionState, StateSource,
+        DaemonDoctorResult, Request, SessionId, SessionInfo, SessionNewParams,
+        SessionSetMetadataParams, SessionSetMetadataResult, SessionState, StateSource,
     };
 
     use super::{handle_request, live_sessions, parse_attach_prelude, DaemonState, HealthInfo};
-    use crate::session::{SessionRegistry, SessionRegistryConfig};
+    use crate::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 
     /// A minimal `SessionInfo` for the given id/state with a worktree path, so a
     /// test can assert which sessions survive the `project show` live filter.
@@ -772,6 +791,7 @@ mod tests {
             native_session_path: None,
             project_id: None,
             project_label: None,
+            metadata: BTreeMap::new(),
             is_linked_worktree: Some(true),
             repo: None,
             branch: None,
@@ -781,6 +801,72 @@ mod tests {
             updated_at: "2026-06-23T00:00:00Z".to_owned(),
             exit_code: None,
         }
+    }
+
+    fn metadata(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn session_set_metadata_dispatch_updates_session() {
+        let sessions = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let created = sessions
+            .create(SessionNewParams {
+                agent: "shell".to_owned(),
+                cwd: Some(PathBuf::from("/tmp")),
+                cols: 80,
+                rows: 24,
+                project: None,
+                repo: None,
+                branch: None,
+                base_branch: None,
+                input: None,
+                metadata: metadata(&[("owner", "cli")]),
+            })
+            .await
+            .expect("create session");
+        let state = DaemonState::new(HealthInfo::new("test"), sessions.clone());
+        let params = SessionSetMetadataParams {
+            session_id: created.id.clone(),
+            metadata: BTreeMap::from([
+                ("owner".to_owned(), Some("daemon".to_owned())),
+                ("ticket".to_owned(), Some("DMD-1356".to_owned())),
+            ]),
+        };
+        let request = Request::new(
+            "set-metadata",
+            method::SESSION_SET_METADATA,
+            serde_json::to_value(params).expect("params serialize"),
+        );
+
+        let response = handle_request(&request, &state).await;
+
+        let protocol::Response::Ok { ok, .. } = response else {
+            panic!("expected session.set_metadata ok response: {response:?}");
+        };
+        let result: SessionSetMetadataResult =
+            serde_json::from_value(ok).expect("result deserializes");
+        assert_eq!(
+            result.session.metadata,
+            metadata(&[("owner", "daemon"), ("ticket", "DMD-1356")])
+        );
+        assert_eq!(
+            sessions
+                .inspect(&created.id)
+                .await
+                .expect("inspect")
+                .metadata,
+            result.session.metadata
+        );
+
+        let _ = sessions.stop(&created.id).await;
     }
 
     #[tokio::test]

@@ -1,9 +1,11 @@
 //! In-memory session registry and supervisor.
 //!
-//! Milestone 3 keeps session metadata in memory only. Each session owns a PTY
-//! handle and has a watcher task that records process exit.
+//! Runtime session state lives in memory: each live session owns a PTY handle and
+//! has a watcher task that records process exit. The resumable subset of a
+//! session's public info, including owner-controlled metadata, is persisted via
+//! the resume binding store.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,8 +14,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use protocol::{
     event, AgentActivity, AgentKind, ErrorClass, Event, ProjectRemoveResult, ProtocolError,
     SessionAttachParams, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionNewParams, SessionReportNativeIdParams, SessionReportNativeIdResult, SessionState,
-    SessionStopResult, SessionWarning, StateSource, PROTOCOL_VERSION,
+    SessionNewParams, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWarning, StateSource,
+    PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
@@ -95,6 +98,11 @@ const DEFAULT_INITIAL_INPUT_STARTUP_GRACE: Duration = Duration::from_millis(500)
 /// resyncs on every lag — only the logging is rate-limited. Overridable via
 /// [`SessionRegistryConfig::detector_lag_warn_interval`].
 const DEFAULT_DETECTOR_LAG_WARN_INTERVAL: Duration = Duration::from_secs(5);
+
+const MAX_SESSION_METADATA_KEYS: usize = 32;
+const MAX_SESSION_METADATA_KEY_BYTES: usize = 64;
+const MAX_SESSION_METADATA_VALUE_BYTES: usize = 4096;
+const MAX_SESSION_METADATA_SERIALIZED_BYTES: usize = 16 * 1024;
 
 /// Shell command configuration used for `AgentKind::Shell`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -686,6 +694,7 @@ impl SessionRegistry {
                     repo,
                     branch,
                     worktree_path,
+                    metadata: params.metadata.clone(),
                     warnings,
                 })
                 .await?;
@@ -938,6 +947,44 @@ impl SessionRegistry {
         self.inspect(&SessionId(id.to_owned())).await
     }
 
+    /// Merge owner-controlled metadata into a session and return the updated info.
+    pub async fn set_metadata(
+        &self,
+        id: &SessionId,
+        merge: BTreeMap<String, Option<String>>,
+    ) -> Result<SessionSetMetadataResult, ProtocolError> {
+        let (info, has_native) = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let entry = sessions
+                .get_mut(id)
+                .ok_or_else(|| session_not_found(&id.0))?;
+            let mut candidate = entry.info.metadata.clone();
+            for (key, value) in merge {
+                match value {
+                    Some(value) => {
+                        candidate.insert(key, value);
+                    }
+                    None => {
+                        candidate.remove(&key);
+                    }
+                }
+            }
+            validate_session_metadata(&candidate)?;
+            entry.info.metadata = candidate;
+            entry.info.updated_at = timestamp_now();
+            let has_native =
+                entry.info.native_session_id.is_some() || entry.info.native_session_path.is_some();
+            (entry.info.clone(), has_native)
+        };
+
+        if has_native {
+            self.persist_resume_binding(id).await;
+        }
+
+        self.emit(event::SESSION_UPDATED, &info);
+        Ok(SessionSetMetadataResult { session: info })
+    }
+
     /// Resize a running session PTY and return the updated session info.
     pub async fn resize(
         &self,
@@ -1181,6 +1228,38 @@ fn validate_new_params(params: &SessionNewParams) -> Result<(), ProtocolError> {
             "session.new: --project and --repo are mutually exclusive (both name the target repository)",
         ));
     }
+    validate_session_metadata(&params.metadata)?;
+    Ok(())
+}
+
+fn validate_session_metadata(metadata: &BTreeMap<String, String>) -> Result<(), ProtocolError> {
+    if metadata.len() > MAX_SESSION_METADATA_KEYS {
+        return Err(ProtocolError::bad_request(format!(
+            "session metadata must contain at most {MAX_SESSION_METADATA_KEYS} keys"
+        )));
+    }
+    for (key, value) in metadata {
+        let key_len = key.len();
+        if key_len > MAX_SESSION_METADATA_KEY_BYTES {
+            return Err(ProtocolError::bad_request(format!(
+                "session metadata key exceeds {MAX_SESSION_METADATA_KEY_BYTES} bytes"
+            )));
+        }
+        let value_len = value.len();
+        if value_len > MAX_SESSION_METADATA_VALUE_BYTES {
+            return Err(ProtocolError::bad_request(format!(
+                "session metadata value for key {key:?} exceeds {MAX_SESSION_METADATA_VALUE_BYTES} bytes"
+            )));
+        }
+    }
+    let serialized_len = serde_json::to_vec(metadata)
+        .map_err(|err| ProtocolError::bad_request(format!("session metadata is invalid: {err}")))?
+        .len();
+    if serialized_len > MAX_SESSION_METADATA_SERIALIZED_BYTES {
+        return Err(ProtocolError::bad_request(format!(
+            "session metadata serialized size exceeds {MAX_SESSION_METADATA_SERIALIZED_BYTES} bytes"
+        )));
+    }
     Ok(())
 }
 
@@ -1257,6 +1336,7 @@ fn timestamp_now() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1264,7 +1344,7 @@ mod tests {
 
     use protocol::{
         AgentActivity, AgentKind, Event, ProjectSource, SessionAttachParams, SessionId,
-        SessionNewParams, SessionReportNativeIdParams, SessionState,
+        SessionInfo, SessionNewParams, SessionReportNativeIdParams, SessionState,
     };
 
     use crate::agent::{InputRules, ResumeMode, SessionRefKind};
@@ -1289,7 +1369,22 @@ mod tests {
             branch: None,
             base_branch: None,
             input: None,
+            metadata: BTreeMap::new(),
         }
+    }
+
+    fn metadata(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    fn metadata_patch(entries: &[(&str, Option<&str>)]) -> BTreeMap<String, Option<String>> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), value.map(str::to_owned)))
+            .collect()
     }
 
     /// A plain attach (no self-feed origin) for the given session id.
@@ -1405,6 +1500,20 @@ mod tests {
         keys
     }
 
+    async fn next_session_updated(rx: &mut tokio::sync::broadcast::Receiver<Event>) -> SessionInfo {
+        let event = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = rx.recv().await.expect("receive session event");
+                if event.event == protocol::event::SESSION_UPDATED {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("session_updated event");
+        serde_json::from_value(event.payload["session"].clone()).expect("session info payload")
+    }
+
     /// Run git in `dir`, asserting success (test helper for the worktree path).
     fn git_in(dir: &std::path::Path, args: &[&str]) {
         let output = std::process::Command::new("git")
@@ -1464,6 +1573,204 @@ mod tests {
             String::from_utf8_lossy(&clone.stderr)
         );
         bare
+    }
+
+    #[tokio::test]
+    async fn session_new_metadata_is_validated_and_exposed() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let expected = metadata(&[("owner", "cli"), ("ticket", "DMD-1356")]);
+
+        let created = registry
+            .create(SessionNewParams {
+                metadata: expected.clone(),
+                ..params()
+            })
+            .await
+            .expect("create session with metadata");
+        assert_eq!(created.metadata, expected);
+        assert_eq!(
+            registry
+                .inspect(&created.id)
+                .await
+                .expect("inspect")
+                .metadata,
+            expected
+        );
+        let listed = registry.list().await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].metadata, expected);
+
+        let invalid: BTreeMap<String, String> = (0..33)
+            .map(|index| (format!("key-{index}"), "value".to_owned()))
+            .collect();
+        let err = registry
+            .create(SessionNewParams {
+                metadata: invalid,
+                ..params()
+            })
+            .await
+            .expect_err("too many metadata keys must be rejected");
+        assert_eq!(err.code, "bad_request");
+        assert!(
+            err.msg.contains("metadata"),
+            "metadata validation error must be clear: {err:?}"
+        );
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn set_metadata_merges_deletes_updates_timestamp_and_emits_event() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry
+            .create(SessionNewParams {
+                metadata: metadata(&[("drop", "soon"), ("keep", "yes"), ("ticket", "old")]),
+                ..params()
+            })
+            .await
+            .expect("create session");
+        let before_updated_at = created.updated_at.clone();
+        let mut events = registry.subscribe();
+        let expected = metadata(&[("keep", "yes"), ("owner", "daemon"), ("ticket", "new")]);
+
+        let result = registry
+            .set_metadata(
+                &created.id,
+                metadata_patch(&[
+                    ("drop", None),
+                    ("owner", Some("daemon")),
+                    ("ticket", Some("new")),
+                ]),
+            )
+            .await
+            .expect("set metadata");
+
+        assert_eq!(result.session.metadata, expected);
+        assert_ne!(result.session.updated_at, before_updated_at);
+        assert_eq!(
+            registry
+                .inspect(&created.id)
+                .await
+                .expect("inspect")
+                .metadata,
+            expected
+        );
+        let event_info = next_session_updated(&mut events).await;
+        assert_eq!(event_info.id, created.id);
+        assert_eq!(event_info.metadata, expected);
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn set_metadata_unknown_session_returns_not_found() {
+        let registry = SessionRegistry::default();
+
+        let err = registry
+            .set_metadata(&SessionId("s-missing".to_owned()), BTreeMap::new())
+            .await
+            .expect_err("unknown session id must fail");
+
+        assert_eq!(err.code, "session_not_found");
+    }
+
+    #[tokio::test]
+    async fn invalid_metadata_rejected_for_create_or_set_and_set_leaves_session_unchanged() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let mut invalid_create = BTreeMap::new();
+        invalid_create.insert("owner".to_owned(), "x".repeat(4097));
+        let err = registry
+            .create(SessionNewParams {
+                metadata: invalid_create,
+                ..params()
+            })
+            .await
+            .expect_err("oversized metadata value must be rejected");
+        assert_eq!(err.code, "bad_request");
+        assert!(registry.list().await.is_empty());
+
+        let created = registry
+            .create(SessionNewParams {
+                metadata: metadata(&[("owner", "cli")]),
+                ..params()
+            })
+            .await
+            .expect("create valid session");
+        let original = created.metadata.clone();
+        let original_updated_at = created.updated_at.clone();
+        let err = registry
+            .set_metadata(
+                &created.id,
+                BTreeMap::from([("x".repeat(65), Some("bad".to_owned()))]),
+            )
+            .await
+            .expect_err("oversized metadata key must be rejected");
+        assert_eq!(err.code, "bad_request");
+
+        let inspected = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(inspected.metadata, original);
+        assert_eq!(
+            inspected.updated_at, original_updated_at,
+            "failed metadata patch must not mutate the session"
+        );
+
+        let _ = registry.stop(&created.id).await;
+
+        let key_64_bytes = "é".repeat(32);
+        assert_eq!(key_64_bytes.len(), 64);
+        let accepted = registry
+            .create(SessionNewParams {
+                metadata: BTreeMap::from([(key_64_bytes, "byte-boundary".to_owned())]),
+                ..params()
+            })
+            .await
+            .expect("64-byte UTF-8 metadata key is accepted");
+        let _ = registry.stop(&accepted.id).await;
+
+        let key_66_bytes = "é".repeat(33);
+        assert_eq!(key_66_bytes.len(), 66);
+        let err = registry
+            .create(SessionNewParams {
+                metadata: BTreeMap::from([(key_66_bytes, "too-long".to_owned())]),
+                ..params()
+            })
+            .await
+            .expect_err("metadata key limit is measured in bytes");
+        assert_eq!(err.code, "bad_request");
+
+        let serialized_too_large: BTreeMap<String, String> = (0..super::MAX_SESSION_METADATA_KEYS)
+            .map(|index| (format!("key-{index:02}"), "x".repeat(512)))
+            .collect();
+        assert!(
+            serde_json::to_vec(&serialized_too_large)
+                .expect("metadata serializes")
+                .len()
+                > super::MAX_SESSION_METADATA_SERIALIZED_BYTES
+        );
+        let err = registry
+            .create(SessionNewParams {
+                metadata: serialized_too_large,
+                ..params()
+            })
+            .await
+            .expect_err("metadata serialized size limit must be enforced");
+        assert_eq!(err.code, "bad_request");
+        assert!(
+            err.msg.contains("serialized size"),
+            "serialized-size rejection should be clear: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -3292,6 +3599,7 @@ mod tests {
             native_session_path: None,
             project_id: None,
             is_linked_worktree: None,
+            metadata: BTreeMap::new(),
             program: "/bin/sh".to_owned(),
             args: Vec::new(),
             input_rules: crate::store::StoredInputRules::default(),
@@ -3455,6 +3763,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_metadata_after_capture_updates_persisted_binding() {
+        let store_path = temp_store_path("metadata-binding");
+        let agents_dir = temp_resumable_agents_dir("metadata-binding");
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path.clone()),
+            agents_dir: Some(agents_dir),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry
+            .create(SessionNewParams {
+                metadata: metadata(&[("owner", "cli"), ("ticket", "old")]),
+                ..resumable_params()
+            })
+            .await
+            .expect("create session");
+        let recorded = registry
+            .report_native_id(SessionReportNativeIdParams {
+                session_id: created.id.clone(),
+                agent: "claude".to_owned(),
+                native_session_id: "native-metadata".to_owned(),
+                transcript_path: None,
+            })
+            .await;
+        assert!(recorded.recorded);
+
+        let expected = metadata(&[("owner", "daemon"), ("reviewer", "qa"), ("ticket", "old")]);
+        registry
+            .set_metadata(
+                &created.id,
+                metadata_patch(&[("owner", Some("daemon")), ("reviewer", Some("qa"))]),
+            )
+            .await
+            .expect("set metadata after capture");
+
+        let persisted = crate::store::Store::new(store_path)
+            .load_resume()
+            .expect("load binding");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].session_id, created.id.0);
+        assert_eq!(persisted[0].metadata, expected);
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn resume_binding_restores_metadata_from_store() {
+        let store_path = temp_store_path("resume-metadata");
+        let expected = metadata(&[("owner", "daemon"), ("ticket", "DMD-1356")]);
+        let store = crate::store::Store::new(store_path.clone());
+        store
+            .record_resume(&crate::store::ResumeBinding {
+                session_id: "s-42".to_owned(),
+                agent: "claude".to_owned(),
+                agent_base: AgentKind::Claude,
+                cwd: temp_dir("resume-metadata-cwd"),
+                cols: 80,
+                rows: 24,
+                native_session_id: Some("native-metadata".to_owned()),
+                native_session_path: None,
+                project_id: None,
+                is_linked_worktree: None,
+                metadata: expected.clone(),
+                program: "/bin/sh".to_owned(),
+                args: vec!["-c".to_owned(), "sleep 30".to_owned()],
+                input_rules: crate::store::StoredInputRules::default(),
+                resume_mode: Some(ResumeMode::Flag),
+                ref_kind: Some(SessionRefKind::Id),
+                resumable: true,
+            })
+            .expect("seed resume binding");
+        let binding = crate::store::Store::new(store_path.clone())
+            .load_resume()
+            .expect("load resume binding")
+            .into_iter()
+            .next()
+            .expect("one binding");
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path),
+            ..SessionRegistryConfig::default()
+        });
+
+        let resumed = registry
+            .resume_binding(binding)
+            .await
+            .expect("resume binding");
+
+        assert_eq!(resumed.metadata, expected);
+        assert_eq!(
+            registry
+                .inspect(&resumed.id)
+                .await
+                .expect("inspect resumed")
+                .metadata,
+            expected
+        );
+
+        let _ = registry.stop(&resumed.id).await;
+    }
+
+    #[tokio::test]
     async fn resize_without_captured_native_id_persists_no_binding() {
         let store_path = temp_store_path("resize-no-binding");
         let registry = SessionRegistry::new(SessionRegistryConfig {
@@ -3500,6 +3910,7 @@ mod tests {
                 native_session_path: None,
                 project_id: None,
                 is_linked_worktree: None,
+                metadata: BTreeMap::new(),
                 program: String::new(),
                 args: Vec::new(),
                 input_rules: crate::store::StoredInputRules::default(),
@@ -3551,6 +3962,7 @@ mod tests {
                 native_session_path: None,
                 project_id: None,
                 is_linked_worktree: None,
+                metadata: BTreeMap::new(),
                 program: script.display().to_string(),
                 args: vec!["--model".to_owned(), "sonnet".to_owned()],
                 input_rules: crate::store::StoredInputRules::default(),

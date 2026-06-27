@@ -958,6 +958,7 @@ mod tests {
             native_session_path: Some("/home/user/.codex/sessions/s-001".to_owned()),
             project_id: Some("p-abc123".to_owned()),
             project_label: Some("ui".to_owned()),
+            metadata: std::collections::BTreeMap::new(),
             is_linked_worktree: Some(false),
             repo: Some("/home/user/projects/ui".into()),
             branch: Some("main".to_owned()),

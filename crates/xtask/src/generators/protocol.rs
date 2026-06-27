@@ -112,6 +112,10 @@ static METHODS: &[MethodDescriptor] = &[
         description: "Resize a session's terminal.",
     },
     MethodDescriptor {
+        wire_name: "session.set_metadata",
+        description: "Merge a session's metadata map (null value deletes a key).",
+    },
+    MethodDescriptor {
         wire_name: "session.stop",
         description: "Stop one session.",
     },

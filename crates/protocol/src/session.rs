@@ -4,7 +4,7 @@
 //! values. These shared types define the JSON shape both sides should use inside
 //! those values for session lifecycle methods and events.
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +86,9 @@ pub struct SessionNewParams {
     /// submit framing used by `session.input`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<String>,
+    /// Owner-controlled metadata for the session. Must not contain secrets.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
 }
 
 /// Parameters for `session.list`.
@@ -414,6 +417,10 @@ pub struct SessionInfo {
     /// when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<SessionWarning>,
+    /// Metadata set at creation or updated via `session.set_metadata`.
+    /// Owner-controlled; must not contain secrets.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
     /// Creation timestamp in the daemon's wire timestamp format.
     pub created_at: String,
     /// Last update timestamp in the daemon's wire timestamp format.
@@ -461,6 +468,23 @@ pub struct SessionResizeResult {
     pub session: SessionInfo,
 }
 
+/// Parameters for `session.set_metadata`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSetMetadataParams {
+    /// Session whose metadata should be merged.
+    pub session_id: SessionId,
+    /// Owner-controlled metadata patch. `Some(value)` sets a key and `None`
+    /// removes it. Values must not contain secrets.
+    pub metadata: BTreeMap<String, Option<String>>,
+}
+
+/// Result returned by `session.set_metadata`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSetMetadataResult {
+    /// Updated session summary after the metadata merge.
+    pub session: SessionInfo,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,6 +514,7 @@ mod tests {
             branch: None,
             worktree_path: None,
             warnings: Vec::new(),
+            metadata: BTreeMap::new(),
             created_at: "2026-01-01T00:00:00Z".to_owned(),
             updated_at: "2026-01-01T00:00:00Z".to_owned(),
             exit_code: None,

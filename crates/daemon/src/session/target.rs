@@ -1,5 +1,7 @@
 //! Launch-target resolution (project / in-place / worktree) and PTY registration.
 
+use std::collections::BTreeMap;
+
 use super::{
     build_pty_command, debug, detect_at, event, launch_adapter_for, plan_initial_input_delivery,
     runtime_error, spawn_error_to_protocol, timestamp_now, warn, watch, AgentKind,
@@ -46,6 +48,8 @@ pub(super) struct PtySessionSpec {
     pub(super) branch: Option<String>,
     /// Bound worktree path (equal to `cwd` for worktree sessions).
     pub(super) worktree_path: Option<PathBuf>,
+    /// Owner-controlled metadata attached to the session.
+    pub(super) metadata: BTreeMap<String, String>,
     /// Non-fatal worktree-setup warnings to surface on the session.
     pub(super) warnings: Vec<SessionWarning>,
 }
@@ -369,6 +373,7 @@ impl SessionRegistry {
             repo,
             branch,
             worktree_path,
+            metadata,
             warnings,
         } = spec;
 
@@ -406,6 +411,7 @@ impl SessionRegistry {
             repo,
             branch,
             worktree_path,
+            metadata,
             warnings,
             created_at: now.clone(),
             updated_at: now,

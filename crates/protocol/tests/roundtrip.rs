@@ -1,7 +1,7 @@
 //! Round-trip serialize/deserialize tests and version-negotiation tests for the
 //! control protocol (milestone 1 checkpoint: "round-trip serde unit tests pass").
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use protocol::{
     event, method, negotiate, AgentActivity, AgentKind, AgentRuntime, AssistantMaterializeParams,
@@ -12,8 +12,9 @@ use protocol::{
     SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
     SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
     SessionNewParams, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, SessionWarning,
-    SessionWarningKind, StateSource, PROTOCOL_VERSION,
+    SessionResizeParams, SessionResizeResult, SessionSetMetadataParams, SessionSetMetadataResult,
+    SessionState, SessionStopResult, SessionWarning, SessionWarningKind, StateSource,
+    PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 
@@ -28,6 +29,13 @@ where
         "wire form must be a single line (newline-delimited framing): {line}"
     );
     serde_json::from_str(&line).expect("deserialize")
+}
+
+fn metadata(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+    entries
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+        .collect()
 }
 
 fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
@@ -51,6 +59,7 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         branch: None,
         worktree_path: None,
         warnings: Vec::new(),
+        metadata: BTreeMap::new(),
         created_at: "2026-06-17T10:00:00Z".to_owned(),
         updated_at: "2026-06-17T10:01:00Z".to_owned(),
         exit_code,
@@ -134,6 +143,7 @@ fn session_new_params_json_shape_roundtrips() {
         branch: None,
         base_branch: None,
         input: None,
+        metadata: BTreeMap::new(),
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -144,6 +154,40 @@ fn session_new_params_json_shape_roundtrips() {
             "cwd": "/workspace/project",
             "cols": 120,
             "rows": 40
+        })
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn session_new_params_roundtrips_with_metadata() {
+    let params = SessionNewParams {
+        agent: "shell".to_owned(),
+        cwd: Some(PathBuf::from("/workspace/project")),
+        cols: 120,
+        rows: 40,
+        project: None,
+        repo: None,
+        branch: None,
+        base_branch: None,
+        input: None,
+        metadata: metadata(&[("owner", "cli"), ("ticket", "DMD-1356")]),
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize params");
+    assert_eq!(
+        value,
+        json!({
+            "agent": "shell",
+            "cwd": "/workspace/project",
+            "cols": 120,
+            "rows": 40,
+            "metadata": {
+                "owner": "cli",
+                "ticket": "DMD-1356"
+            }
         })
     );
 
@@ -163,6 +207,7 @@ fn session_new_params_roundtrips_with_worktree_fields() {
         branch: Some("feature/login".to_owned()),
         base_branch: Some("main".to_owned()),
         input: None,
+        metadata: BTreeMap::new(),
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -194,6 +239,7 @@ fn session_new_params_omits_absent_worktree_fields() {
         branch: None,
         base_branch: None,
         input: None,
+        metadata: BTreeMap::new(),
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -221,6 +267,7 @@ fn session_new_params_roundtrips_with_initial_input() {
         branch: None,
         base_branch: None,
         input: Some("run tests".to_owned()),
+        metadata: BTreeMap::new(),
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -326,6 +373,21 @@ fn session_info_json_shape_roundtrips_with_activity() {
             "updated_at": "2026-06-17T10:01:00Z"
         })
     );
+
+    let back = line_roundtrip(&info);
+    assert_eq!(back, info);
+}
+
+#[test]
+fn session_info_json_shape_roundtrips_with_metadata() {
+    let info = SessionInfo {
+        metadata: metadata(&[("owner", "cli"), ("ticket", "DMD-1356")]),
+        ..running_shell_session(None)
+    };
+
+    let value = serde_json::to_value(&info).expect("serialize session info");
+    assert_eq!(value["metadata"]["owner"], json!("cli"));
+    assert_eq!(value["metadata"]["ticket"], json!("DMD-1356"));
 
     let back = line_roundtrip(&info);
     assert_eq!(back, info);
@@ -441,6 +503,11 @@ fn session_input_result_json_shape_roundtrips() {
 #[test]
 fn session_report_native_id_method_name_is_stable() {
     assert_eq!(method::SESSION_REPORT_NATIVE_ID, "session.report_native_id");
+}
+
+#[test]
+fn session_set_metadata_method_name_is_stable() {
+    assert_eq!(method::SESSION_SET_METADATA, "session.set_metadata");
 }
 
 #[test]
@@ -811,6 +878,84 @@ fn session_resize_result_carries_updated_session_info() {
 
     let back = line_roundtrip(&result);
     assert_eq!(back, result);
+}
+
+#[test]
+fn session_set_metadata_params_deserializes_null_to_none_and_roundtrips() {
+    let value = json!({
+        "session_id": "s-42",
+        "metadata": {
+            "owner": "cli",
+            "ticket": null
+        }
+    });
+
+    let params: SessionSetMetadataParams =
+        serde_json::from_value(value.clone()).expect("deserialize set metadata params");
+    assert_eq!(
+        params
+            .metadata
+            .get("owner")
+            .and_then(|value| value.as_deref()),
+        Some("cli")
+    );
+    assert_eq!(params.metadata.get("ticket"), Some(&None));
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+    assert_eq!(
+        serde_json::to_value(&params).expect("serialize set metadata params"),
+        value
+    );
+}
+
+#[test]
+fn session_set_metadata_params_requires_metadata_field() {
+    let value = json!({ "session_id": "s-42" });
+
+    assert!(
+        serde_json::from_value::<SessionSetMetadataParams>(value).is_err(),
+        "session.set_metadata params must require the metadata patch field"
+    );
+}
+
+#[test]
+fn session_set_metadata_params_serializes_empty_metadata_patch() {
+    let params = SessionSetMetadataParams {
+        session_id: SessionId("s-42".to_owned()),
+        metadata: BTreeMap::new(),
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize set metadata params");
+    assert_eq!(
+        value,
+        json!({
+            "session_id": "s-42",
+            "metadata": {}
+        })
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn session_set_metadata_result_wraps_updated_session_info() {
+    let session = SessionInfo {
+        metadata: metadata(&[("owner", "cli"), ("ticket", "DMD-1356")]),
+        ..running_shell_session(None)
+    };
+    let result = SessionSetMetadataResult {
+        session: session.clone(),
+    };
+
+    let value = serde_json::to_value(&result).expect("serialize set metadata result");
+    assert_eq!(value["session"]["metadata"]["owner"], json!("cli"));
+    assert_eq!(value["session"]["metadata"]["ticket"], json!("DMD-1356"));
+
+    let back = line_roundtrip(&result);
+    assert_eq!(back, result);
+    assert_eq!(back.session, session);
 }
 
 #[test]

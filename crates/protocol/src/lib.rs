@@ -64,7 +64,8 @@ pub use session::{
     SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
     SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams, SessionNewResult,
     SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
-    SessionResizeResult, SessionState, SessionStopResult, SessionWarning, SessionWarningKind,
+    SessionResizeResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
+    SessionStopResult, SessionWarning, SessionWarningKind,
 };
 #[doc(inline)]
 pub use version::{negotiate, ProtocolVersion, PROTOCOL_VERSION};
@@ -96,6 +97,8 @@ pub mod method {
     pub const SUBSCRIBE: &str = "subscribe";
     /// Fire-and-forget native-session-id capture from the agent hook.
     pub const SESSION_REPORT_NATIVE_ID: &str = "session.report_native_id";
+    /// Merge owner-controlled metadata for a session.
+    pub const SESSION_SET_METADATA: &str = "session.set_metadata";
     /// Install the per-agent `SessionStart` hook that captures the native id.
     pub const INTEGRATION_INSTALL: &str = "integration.install";
     /// Live host capability probe (Phase 2 / remote hosts over `NetBird`). Returns

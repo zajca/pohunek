@@ -308,6 +308,7 @@ fn session_params() -> SessionNewParams {
         branch: None,
         base_branch: None,
         input: None,
+        metadata: std::collections::BTreeMap::new(),
     }
 }
 
@@ -322,6 +323,7 @@ fn session_params_for_agent(agent: AgentKind, cwd: PathBuf) -> SessionNewParams 
         branch: None,
         base_branch: None,
         input: None,
+        metadata: std::collections::BTreeMap::new(),
     }
 }
 
@@ -337,6 +339,7 @@ fn session_params_for_worktree(agent: AgentKind, repo: PathBuf, branch: &str) ->
         branch: Some(branch.to_owned()),
         base_branch: None,
         input: None,
+        metadata: std::collections::BTreeMap::new(),
     }
 }
 
