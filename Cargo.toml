@@ -17,8 +17,10 @@ members = [
     "crates/netbird",
     "crates/prompt",
     "crates/client",
+    "crates/gui-core",
     "crates/daemon",
     "crates/cli",
+    "crates/gui",
 ]
 
 # Shared dependency versions. Individual crates opt in via `workspace = true`.
@@ -29,11 +31,14 @@ cli = { package = "pohunek-cli", path = "crates/cli" }
 knowledge = { package = "pohunek-knowledge", path = "crates/knowledge" }
 pohunek-cli = { path = "crates/cli" }
 pohunek-client = { path = "crates/client" }
+pohunek-daemon = { path = "crates/daemon" }
+pohunek-gui-core = { path = "crates/gui-core" }
 pohunek-hostcheck = { path = "crates/hostcheck" }
 pohunek-knowledge = { path = "crates/knowledge" }
 pohunek-netbird = { path = "crates/netbird" }
 pohunek-prompt = { path = "crates/prompt" }
 pohunek-protocol = { path = "crates/protocol" }
+iced = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

@@ -1,0 +1,23 @@
+[package]
+name = "pohunek-gui-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Pure state and SDK bridge logic for the pohunek native GUI."
+
+[dependencies]
+futures = { workspace = true }
+pohunek-client = { workspace = true }
+pohunek-prompt = { workspace = true }
+pohunek-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+pohunek-daemon = { workspace = true }
+
+[lints]
+workspace = true
