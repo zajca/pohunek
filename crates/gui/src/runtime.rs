@@ -8,7 +8,9 @@ use std::sync::LazyLock;
 
 use futures::channel::{mpsc, oneshot};
 use futures::{SinkExt, Stream, StreamExt};
-use pohunek_gui_core::{HostConfig, Message as CoreMessage};
+use pohunek_gui_core::{
+    workspace_connection_stream, ConnectionOptions, HostConfig, Message as CoreMessage,
+};
 use tokio::runtime::{Builder, Runtime};
 
 static TOKIO: LazyLock<Runtime> = LazyLock::new(|| {
@@ -32,11 +34,13 @@ where
     async move { receiver.await.expect("tokio task completed") }
 }
 
-pub(crate) fn host_subscription(config: &HostConfig) -> impl Stream<Item = CoreMessage> {
+pub(crate) fn host_subscription(
+    input: &(HostConfig, ConnectionOptions),
+) -> impl Stream<Item = CoreMessage> {
     let (mut sender, receiver) = mpsc::channel(128);
-    let config = config.clone();
+    let (config, options) = input.clone();
     TOKIO.spawn(async move {
-        let mut stream = Box::pin(pohunek_gui_core::host_subscription_stream(config));
+        let mut stream = Box::pin(workspace_connection_stream(vec![config], options));
         while let Some(message) = stream.next().await {
             if sender.send(message).await.is_err() {
                 break;

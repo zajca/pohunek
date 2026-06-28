@@ -14,6 +14,7 @@ path = "src/main.rs"
 futures = { workspace = true }
 iced = { workspace = true }
 pohunek-gui-core = { workspace = true }
+pohunek-protocol = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

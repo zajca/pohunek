@@ -37,7 +37,7 @@ const DEFAULT_WINDOW_WIDTH: u32 = 960;
 const DEFAULT_WINDOW_HEIGHT: u32 = 640;
 
 /// Connection and reconciliation timing for host workers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConnectionOptions {
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
@@ -96,7 +96,7 @@ impl std::fmt::Display for HostId {
 pub enum HostTransport {
     /// Local daemon over Unix socket.
     Local { socket_path: PathBuf },
-    /// Remote daemon resolved by the SDK through NetBird.
+    /// Remote daemon resolved by the SDK through `NetBird`.
     Remote { host: String, socket_path: PathBuf },
     /// Remote daemon over a concrete TCP address.
     Tcp { addr: SocketAddr },
@@ -196,6 +196,10 @@ pub enum HostEvent {
 
 /// Message emitted by async host workers and applied to [`Workspace`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "GUI worker messages carry protocol snapshots and live events by value across stream boundaries"
+)]
 pub enum Message {
     HostConnecting { host_id: HostId },
     HostSnapshotLoaded { snapshot: HostSnapshot },
@@ -785,6 +789,10 @@ pub fn workspace_connection_stream(
     )
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the reconnecting host worker is a single explicit async state machine"
+)]
 fn host_connection_stream(
     config: HostConfig,
     options: ConnectionOptions,
@@ -1010,9 +1018,9 @@ fn parse_event_message(host_id: &HostId, line: &str) -> Result<Message, CoreErro
     let raw: Event = serde_json::from_str(line)?;
     let event = match raw.event.as_str() {
         event::AGENT_STATE => HostEvent::AgentState(parse_agent_state(raw)?),
-        event::SESSION_CREATED => HostEvent::SessionCreated(parse_session_event(raw)?),
-        event::SESSION_UPDATED => HostEvent::SessionUpdated(parse_session_event(raw)?),
-        event::SESSION_STOPPED => HostEvent::SessionStopped(parse_session_event(raw)?),
+        event::SESSION_CREATED => HostEvent::SessionCreated(parse_session_event(&raw)?),
+        event::SESSION_UPDATED => HostEvent::SessionUpdated(parse_session_event(&raw)?),
+        event::SESSION_STOPPED => HostEvent::SessionStopped(parse_session_event(&raw)?),
         _ => HostEvent::Other(raw),
     };
     Ok(Message::HostEvent {
@@ -1033,7 +1041,7 @@ fn parse_agent_state(raw: Event) -> Result<AgentStateEvent, CoreError> {
     })
 }
 
-fn parse_session_event(raw: Event) -> Result<SessionInfo, CoreError> {
+fn parse_session_event(raw: &Event) -> Result<SessionInfo, CoreError> {
     let session = raw
         .payload
         .get("session")
