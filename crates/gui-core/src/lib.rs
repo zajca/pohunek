@@ -331,7 +331,7 @@ pub fn host_subscription_stream(config: HostConfig) -> impl futures::Stream<Item
                     },
                     StreamState::Reading {
                         config,
-                        subscription,
+                        subscription: Box::new(subscription),
                     },
                 )),
                 Err(err) => Some((
@@ -393,7 +393,7 @@ enum StreamState {
     Subscribing(HostConfig),
     Reading {
         config: HostConfig,
-        subscription: pohunek_client::Subscription,
+        subscription: Box<pohunek_client::Subscription>,
     },
     Waiting(HostConfig),
 }
