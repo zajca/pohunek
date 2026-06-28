@@ -501,6 +501,7 @@ dependencies = [
  "pohunek-hostcheck",
  "pohunek-knowledge",
  "pohunek-netbird",
+ "pohunek-prompt",
  "pohunek-protocol",
  "serde",
  "serde_json",

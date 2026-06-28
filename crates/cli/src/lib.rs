@@ -122,6 +122,12 @@ enum Commands {
         action: HostAction,
     },
 
+    /// Render provider prompt templates locally.
+    Prompt {
+        #[command(subcommand)]
+        action: PromptAction,
+    },
+
     /// List, add, show, rename, and forget projects (git-repo awareness) on a host.
     Project {
         #[command(subcommand)]
@@ -358,6 +364,22 @@ enum HostAction {
 }
 
 #[derive(Debug, Subcommand)]
+enum PromptAction {
+    /// Render a provider prompt template using context JSON from stdin.
+    Render {
+        /// Provider context shape to build.
+        #[arg(long, value_parser = parse_prompt_provider)]
+        provider: pohunek_prompt::Provider,
+        /// Provider item identifier (Linear key or GitHub PR number).
+        #[arg(long)]
+        item_id: String,
+        /// Template file to render.
+        #[arg(long)]
+        template_file: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum IntegrationAction {
     /// Install the `SessionStart` hook that captures native session ids for
     /// resume. Without `--agent`, installs for every supported agent present.
@@ -535,7 +557,7 @@ impl Commands {
                 action.as_ref().map_or(args.json, |a| a.parts().1.json)
             }
             Commands::Subscribe { json } => *json,
-            Commands::Attach { .. } | Commands::Daemon { .. } => false,
+            Commands::Attach { .. } | Commands::Daemon { .. } | Commands::Prompt { .. } => false,
         }
     }
 }
@@ -794,6 +816,20 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 Ok(ExitCode::SUCCESS)
             }
         },
+        Commands::Prompt { action } => {
+            match action {
+                PromptAction::Render {
+                    provider,
+                    item_id,
+                    template_file,
+                } => {
+                    let rendered =
+                        commands::prompt::render_prompt(provider, &item_id, &template_file)?;
+                    print!("{rendered}");
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Commands::Project { action } => {
             // Projects are per-host; references resolve daemon-side, so the whole
             // surface routes through the effective host like `session`.
@@ -920,6 +956,12 @@ fn effective_host(global: &str, target: Option<&Target>) -> String {
     }
 }
 
+fn parse_prompt_provider(value: &str) -> Result<pohunek_prompt::Provider, String> {
+    value
+        .parse()
+        .map_err(|err: pohunek_prompt::Error| err.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use crate as pohunek_cli;
@@ -963,6 +1005,7 @@ mod tests {
             "integration",
             "setup",
             "host",
+            "prompt",
             "project",
             "assistant",
         ] {

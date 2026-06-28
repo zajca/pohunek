@@ -21,6 +21,7 @@ pub(crate) mod health;
 pub(crate) mod host;
 pub(crate) mod integration;
 pub(crate) mod project;
+pub(crate) mod prompt;
 pub(crate) mod session;
 pub(crate) mod setup;
 

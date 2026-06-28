@@ -105,6 +105,9 @@ printf '{"title":"Fix filters","body":"Body text","headRefName":"feature/filters
         &pohunek,
         r#"#!/bin/sh
 for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
+if [ "${1:-}" = "prompt" ] && [ "${2:-}" = "render" ]; then
+  exec "$POHUNEK_TEST_REAL_POHUNEK" "$@"
+fi
 case " $* " in
   *" project action "*)
     if [ -n "${POHUNEK_TEST_RECIPE_FAIL:-}" ]; then
@@ -134,6 +137,7 @@ esac
         .arg("7")
         .arg("review-pr")
         .env("POHUNEK_CONFIG_DIR", &config_dir)
+        .env("POHUNEK_TEST_REAL_POHUNEK", env!("CARGO_BIN_EXE_pohunek"))
         .env("POHUNEK_TEST_GH_ARGS", &gh_args)
         .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
         .env("POHUNEK_TEST_RECIPE_JSON", recipe)
@@ -154,6 +158,9 @@ esac
         args.contains("project\naction\nui\nreview-pr\n--json\n"),
         "{args}"
     );
+    assert!(args.contains("prompt\nrender\n"), "{args}");
+    assert!(args.contains("--provider\ngithub_pr\n"), "{args}");
+    assert!(args.contains("--item-id\n7\n"), "{args}");
     assert!(args.contains("--host\nlocal\nsession\nnew\n"), "{args}");
     assert!(args.contains("--agent\nclaude\n"), "{args}");
     // The launcher references the project (resolved on the host); no --repo path
@@ -193,6 +200,9 @@ printf '{"id":"LIN-123","title":"Fix launcher","description":"Issue body","branc
         &pohunek,
         r#"#!/bin/sh
 for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
+if [ "${1:-}" = "prompt" ] && [ "${2:-}" = "render" ]; then
+  exec "$POHUNEK_TEST_REAL_POHUNEK" "$@"
+fi
 case " $* " in
   *" project action "*) printf '%s' "$POHUNEK_TEST_RECIPE_JSON" ;;
 esac
@@ -215,6 +225,7 @@ esac
         .arg("ui")
         .arg("LIN-123")
         .env("POHUNEK_CONFIG_DIR", &config_dir)
+        .env("POHUNEK_TEST_REAL_POHUNEK", env!("CARGO_BIN_EXE_pohunek"))
         .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
         .env("POHUNEK_TEST_RECIPE_JSON", recipe)
         .env("LINEAR_API_KEY", "lin_secret_should_not_leak")
@@ -232,6 +243,9 @@ esac
         args.contains("--host\nbuild-box\nproject\naction\nui\nprocess-issue\n--json\n"),
         "{args}"
     );
+    assert!(args.contains("prompt\nrender\n"), "{args}");
+    assert!(args.contains("--provider\nlinear_issue\n"), "{args}");
+    assert!(args.contains("--item-id\nLIN-123\n"), "{args}");
     assert!(args.contains("--host\nbuild-box\nsession\nnew\n"), "{args}");
     assert!(args.contains("--agent\ncodex\n"), "{args}");
     assert!(args.contains("--project\nui\n"), "{args}");
@@ -269,6 +283,9 @@ printf '{"id":"LIN-1","title":"T","description":"B","branchName":"lin-1","url":"
         &pohunek,
         r#"#!/bin/sh
 for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
+if [ "${1:-}" = "prompt" ] && [ "${2:-}" = "render" ]; then
+  exec "$POHUNEK_TEST_REAL_POHUNEK" "$@"
+fi
 case " $* " in
   *" project action "*) printf '%s' "$POHUNEK_TEST_RECIPE_JSON" ;;
 esac
@@ -293,6 +310,7 @@ esac
             .arg(project)
             .arg("LIN-1")
             .env("POHUNEK_CONFIG_DIR", &config_dir)
+            .env("POHUNEK_TEST_REAL_POHUNEK", env!("CARGO_BIN_EXE_pohunek"))
             .env("POHUNEK_TEST_POHUNEK_ARGS", args_file)
             .env("POHUNEK_TEST_RECIPE_JSON", recipe)
             .output()
@@ -337,6 +355,9 @@ printf '{"id":"LIN-1","title":"T","description":"B","branchName":"lin-1","url":"
         &pohunek,
         r#"#!/bin/sh
 for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
+if [ "${1:-}" = "prompt" ] && [ "${2:-}" = "render" ]; then
+  exec "$POHUNEK_TEST_REAL_POHUNEK" "$@"
+fi
 case " $* " in
   *" project action "*) printf 'pohunek: prompt_not_found\n' >&2; exit 1 ;;
 esac
@@ -357,6 +378,7 @@ esac
         .arg("ui")
         .arg("LIN-1")
         .env("POHUNEK_CONFIG_DIR", &config_dir)
+        .env("POHUNEK_TEST_REAL_POHUNEK", env!("CARGO_BIN_EXE_pohunek"))
         .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
         .output()
         .expect("run launch-issue");
@@ -395,6 +417,9 @@ printf '{"id":"LIN-1","title":"T","description":"B","branchName":"lin-1","url":"
         &pohunek,
         r#"#!/bin/sh
 for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
+if [ "${1:-}" = "prompt" ] && [ "${2:-}" = "render" ]; then
+  exec "$POHUNEK_TEST_REAL_POHUNEK" "$@"
+fi
 case " $* " in
   *" project action "*) printf '%s' "$POHUNEK_TEST_RECIPE_JSON" ;;
 esac
@@ -415,6 +440,7 @@ esac
         .arg("ui")
         .arg("LIN-1")
         .env("POHUNEK_CONFIG_DIR", &config_dir)
+        .env("POHUNEK_TEST_REAL_POHUNEK", env!("CARGO_BIN_EXE_pohunek"))
         .env("POHUNEK_TEST_LINEAR_ARGS", &linear_args)
         .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
         .env("POHUNEK_TEST_RECIPE_JSON", recipe)
@@ -458,6 +484,9 @@ printf '{"title":"T","body":"B","headRefName":"feat/x","url":"u"}\n'
         &pohunek,
         r#"#!/bin/sh
 for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
+if [ "${1:-}" = "prompt" ] && [ "${2:-}" = "render" ]; then
+  exec "$POHUNEK_TEST_REAL_POHUNEK" "$@"
+fi
 case " $* " in
   *" project action "*) printf '%s' "$POHUNEK_TEST_RECIPE_JSON" ;;
 esac
@@ -478,6 +507,7 @@ esac
         .arg("ui")
         .arg("7")
         .env("POHUNEK_CONFIG_DIR", &config_dir)
+        .env("POHUNEK_TEST_REAL_POHUNEK", env!("CARGO_BIN_EXE_pohunek"))
         .env("POHUNEK_TEST_GH_ARGS", &gh_args)
         .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
         .env("POHUNEK_TEST_RECIPE_JSON", recipe)
@@ -519,6 +549,9 @@ printf '{"id":"LIN-1","title":"T","description":"B","branchName":"lin-1","url":"
         &pohunek,
         r#"#!/bin/sh
 for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
+if [ "${1:-}" = "prompt" ] && [ "${2:-}" = "render" ]; then
+  exec "$POHUNEK_TEST_REAL_POHUNEK" "$@"
+fi
 case " $* " in
   *" project action "*) printf '%s' "$POHUNEK_TEST_RECIPE_JSON" ;;
 esac
@@ -539,6 +572,7 @@ esac
         .arg("ui")
         .arg("LIN-1")
         .env("POHUNEK_CONFIG_DIR", &config_dir)
+        .env("POHUNEK_TEST_REAL_POHUNEK", env!("CARGO_BIN_EXE_pohunek"))
         .env("POHUNEK_TEST_POHUNEK_ARGS", &pohunek_args)
         .env("POHUNEK_TEST_RECIPE_JSON", recipe)
         .output()

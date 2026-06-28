@@ -52,6 +52,10 @@ pub(crate) enum CliError {
     #[error(transparent)]
     Client(#[from] SdkClientError),
 
+    /// Prompt rendering failed before any daemon request was made.
+    #[error(transparent)]
+    Prompt(#[from] pohunek_prompt::Error),
+
     /// A remote `session new` named no target. No filesystem path crosses the
     /// wire to another host, so a remote session must be referenced by `--project`
     /// (or, for first-introduction, `--repo` with a path valid on that host). Fails
@@ -120,6 +124,12 @@ impl CliError {
         match self {
             CliError::Protocol(err) => err.clone(),
             CliError::Client(err) => err.to_protocol_error(),
+            CliError::Prompt(err) => ProtocolError::new(
+                ErrorClass::Configuration,
+                "prompt_render_failed",
+                err.to_string(),
+                None,
+            ),
             CliError::MissingEnv { var } => ProtocolError::new(
                 ErrorClass::Configuration,
                 "missing_env",

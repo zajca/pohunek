@@ -144,72 +144,15 @@ PY
 }
 
 pohunek_render_provider_prompt() {
-  pohunek_need_cmd python3
   template="$1"
   provider="$2"
   item_id="$3"
   json="$4"
-  python3 - "$template" "$provider" "$item_id" "$json" <<'PY'
-import json
-import re
-import sys
-
-template_path, provider, item_id, raw_json = sys.argv[1:5]
-try:
-    data = json.loads(raw_json)
-except json.JSONDecodeError as exc:
-    raise SystemExit(f"provider returned invalid JSON: {exc}")
-
-def pick(*names, required=False):
-    for name in names:
-        value = data.get(name)
-        if isinstance(value, str) and value:
-            return value
-    if required:
-        raise SystemExit(f"provider JSON missing required field: {'/'.join(names)}")
-    return ""
-
-if provider == "github_pr":
-    context = {
-        "provider": "github",
-        "number": item_id,
-        "id": item_id,
-        "title": pick("title", required=True),
-        "body": pick("body", "description"),
-        "branch": pick("headRefName", "branch", "branchName", required=True),
-        "url": pick("url"),
-    }
-elif provider == "linear_issue":
-    context = {
-        "provider": "linear",
-        "id": pick("identifier", "id") or item_id,
-        "number": pick("identifier", "id") or item_id,
-        "title": pick("title", required=True),
-        "body": pick("description", "body"),
-        "branch": pick("branchName", "branch", required=True),
-        "url": pick("url"),
-    }
-else:
-    raise SystemExit(f"unknown provider: {provider}")
-
-with open(template_path, encoding="utf-8") as handle:
-    template = handle.read()
-
-unknown = sorted(set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", template)) - set(context))
-if unknown:
-    raise SystemExit(f"template references unknown variable(s): {', '.join(unknown)}")
-
-# Single pass: substitute every ${var} once, so a provider-controlled value
-# (issue/PR title or body) that itself contains a literal ${other} is never
-# re-expanded by a later substitution. The unknown-var check above guarantees
-# every matched key is present in context.
-rendered = re.sub(
-    r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}",
-    lambda match: context[match.group(1)],
-    template,
-)
-sys.stdout.write(rendered)
-PY
+  pohunek_bin="$(pohunek_optional_config pohunek_bin pohunek)"
+  printf '%s' "$json" | "$pohunek_bin" prompt render \
+    --provider "$provider" \
+    --item-id "$item_id" \
+    --template-file "$template"
 }
 
 pohunek_run_session_new() {
