@@ -451,17 +451,16 @@ impl Workspace {
                 let previous_sessions = self.hosts.get(&host_id).map(|host| host.sessions.clone());
                 if let Some(previous_sessions) = &previous_sessions {
                     for session in &snapshot.sessions {
-                        let previous = previous_sessions
-                            .get(&session.id.0)
-                            .and_then(|existing| existing.activity);
-                        push_blocked_effects(
-                            previous,
-                            session,
-                            &host_id,
-                            &mut self.notification_intents,
-                            &mut self.toasts,
-                            &mut self.next_intent_id,
-                        );
+                        if let Some(previous_session) = previous_sessions.get(&session.id.0) {
+                            push_blocked_effects(
+                                previous_session.activity,
+                                session,
+                                &host_id,
+                                &mut self.notification_intents,
+                                &mut self.toasts,
+                                &mut self.next_intent_id,
+                            );
+                        }
                     }
                 }
                 let sessions = snapshot
@@ -972,9 +971,10 @@ struct Backoff {
 
 impl Backoff {
     fn new(options: ConnectionOptions) -> Self {
+        let max = options.backoff_max.min(DEFAULT_BACKOFF_MAX);
         Self {
-            current: options.backoff_initial,
-            max: options.backoff_max,
+            current: options.backoff_initial.min(max),
+            max,
         }
     }
 
@@ -1072,7 +1072,7 @@ pub async fn discover_hosts(
     let mut hosts = vec![local.clone()];
     for record in records {
         if matches!(record.class, HostClass::ReachableDaemon { .. }) {
-            let host = discovered_host_name(&record)?;
+            let host = discovered_transport_host(&record)?;
             let id = record
                 .name
                 .clone()
@@ -1089,12 +1089,12 @@ pub async fn discover_hosts(
     Ok(hosts)
 }
 
-fn discovered_host_name(record: &HostRecord) -> Result<String, CoreError> {
+fn discovered_transport_host(record: &HostRecord) -> Result<String, CoreError> {
     record
-        .name
+        .netbird_ip
         .clone()
         .or_else(|| record.fqdn.clone())
-        .or_else(|| record.netbird_ip.clone())
+        .or_else(|| record.name.clone())
         .ok_or(CoreError::MissingDiscoveredHostName)
 }
 
@@ -1132,43 +1132,9 @@ mod tests {
     #[test]
     fn workspace_applies_agent_state_to_known_session() {
         let mut workspace = Workspace::default();
-        let session = SessionInfo {
-            id: SessionId("s-1".to_owned()),
-            agent: "codex".to_owned(),
-            agent_base: protocol::AgentKind::Codex,
-            cwd: PathBuf::from("/repo"),
-            pid: 42,
-            cols: 80,
-            rows: 24,
-            state: protocol::SessionState::Running,
-            state_source: StateSource::Process,
-            activity: None,
-            native_session_id: None,
-            native_session_path: None,
-            project_id: None,
-            project_label: None,
-            is_linked_worktree: None,
-            repo: None,
-            branch: None,
-            worktree_path: None,
-            warnings: Vec::new(),
-            metadata: BTreeMap::new(),
-            created_at: "2026-01-01T00:00:00Z".to_owned(),
-            updated_at: "2026-01-01T00:00:00Z".to_owned(),
-            exit_code: None,
-        };
+        let session = session("s-1", None);
         workspace.apply(Message::HostSnapshotLoaded {
-            snapshot: HostSnapshot {
-                host_id: HostId::new("local"),
-                health: HealthSummary {
-                    status: "ok".to_owned(),
-                    daemon_version: "0.0.0".to_owned(),
-                    protocol_version: protocol::PROTOCOL_VERSION,
-                },
-                sessions: vec![session],
-                projects: Vec::new(),
-                project_error: None,
-            },
+            snapshot: snapshot("local", vec![session]),
         });
 
         let raw = Event::new(
@@ -1200,6 +1166,70 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_seed_does_not_notify_existing_blocked_session() {
+        let mut workspace = Workspace::default();
+        let host_id = HostId::new("local");
+        workspace.apply(Message::HostConnecting {
+            host_id: host_id.clone(),
+        });
+        workspace.apply(Message::HostSubscribed {
+            host_id: host_id.clone(),
+        });
+
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot("local", vec![session("s-1", Some(AgentActivity::Blocked))]),
+        });
+
+        assert!(workspace.notification_intents.is_empty());
+        assert!(workspace.toasts.is_empty());
+    }
+
+    #[test]
+    fn snapshot_relist_notifies_known_session_transition_to_blocked() {
+        let mut workspace = Workspace::default();
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot("local", vec![session("s-1", Some(AgentActivity::Working))]),
+        });
+
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot("local", vec![session("s-1", Some(AgentActivity::Blocked))]),
+        });
+
+        assert_eq!(workspace.notification_intents.len(), 1);
+        assert_eq!(workspace.notification_intents[0].session_id.0, "s-1");
+        assert_eq!(workspace.toasts.len(), 1);
+    }
+
+    #[test]
+    fn discovered_transport_prefers_netbird_ip_over_short_name() {
+        let record = HostRecord {
+            name: Some("dev".to_owned()),
+            fqdn: Some("dev.example.netbird.cloud".to_owned()),
+            netbird_ip: Some("100.92.30.40".to_owned()),
+            class: HostClass::ReachableDaemon {
+                daemon_version: "0.5.0".to_owned(),
+            },
+        };
+
+        assert_eq!(
+            discovered_transport_host(&record).expect("transport host"),
+            "100.92.30.40"
+        );
+    }
+
+    #[test]
+    fn reconnect_backoff_is_capped_at_thirty_seconds() {
+        let backoff = Backoff::new(ConnectionOptions {
+            backoff_initial: Duration::from_secs(45),
+            backoff_max: DEFAULT_BACKOFF_MAX.saturating_mul(4),
+            ..ConnectionOptions::default()
+        });
+
+        assert_eq!(backoff.current, Duration::from_secs(30));
+        assert_eq!(backoff.max, Duration::from_secs(30));
+    }
+
+    #[test]
     fn attach_command_replaces_declared_tokens() {
         let command = render_attach_command(
             "{bin} attach --host {host} {id}",
@@ -1211,5 +1241,47 @@ mod tests {
         );
 
         assert_eq!(command, "pohunek attach --host devbox s-7");
+    }
+
+    fn snapshot(host_id: &str, sessions: Vec<SessionInfo>) -> HostSnapshot {
+        HostSnapshot {
+            host_id: HostId::new(host_id),
+            health: HealthSummary {
+                status: "ok".to_owned(),
+                daemon_version: "0.0.0".to_owned(),
+                protocol_version: protocol::PROTOCOL_VERSION,
+            },
+            sessions,
+            projects: Vec::new(),
+            project_error: None,
+        }
+    }
+
+    fn session(id: &str, activity: Option<AgentActivity>) -> SessionInfo {
+        SessionInfo {
+            id: SessionId(id.to_owned()),
+            agent: "codex".to_owned(),
+            agent_base: protocol::AgentKind::Codex,
+            cwd: PathBuf::from("/repo"),
+            pid: 42,
+            cols: 80,
+            rows: 24,
+            state: protocol::SessionState::Running,
+            state_source: StateSource::Process,
+            activity,
+            native_session_id: None,
+            native_session_path: None,
+            project_id: None,
+            project_label: None,
+            is_linked_worktree: None,
+            repo: None,
+            branch: None,
+            worktree_path: None,
+            warnings: Vec::new(),
+            metadata: BTreeMap::new(),
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            exit_code: None,
+        }
     }
 }

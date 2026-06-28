@@ -5,6 +5,7 @@
 
 mod runtime;
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
@@ -328,12 +329,49 @@ fn push_project_rows<'a>(
     for project in host.projects.values() {
         tree = push_project_row(tree, app, host_id, host, Some(project));
     }
+    let missing_project_ids = host
+        .sessions
+        .values()
+        .filter_map(|session| {
+            let project_id = session.project_id.as_ref()?;
+            (!host.projects.contains_key(project_id)).then(|| project_id.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    for project_id in missing_project_ids {
+        tree = push_missing_project_row(tree, app, host_id, host, &project_id);
+    }
     if host
         .sessions
         .values()
         .any(|session| session.project_id.is_none())
     {
         tree = push_project_row(tree, app, host_id, host, None);
+    }
+    tree
+}
+
+fn push_missing_project_row<'a>(
+    mut tree: iced::widget::Column<'a, Message>,
+    app: &'a PohunekApp,
+    host_id: &'a HostId,
+    host: &'a pohunek_gui_core::HostView,
+    project_id: &str,
+) -> iced::widget::Column<'a, Message> {
+    let node = TreeNodeId::project(host_id.clone(), project_id);
+    let expanded = app.ui_state.expanded_nodes.contains(&node);
+    tree = tree.push(row![
+        text("  "),
+        button(if expanded { "v" } else { ">" }).on_press(Message::ToggleNode(node)),
+        text(format!("Unknown project {project_id}")).size(15)
+    ]);
+    if expanded {
+        for session in host
+            .sessions
+            .values()
+            .filter(|session| session.project_id.as_deref() == Some(project_id))
+        {
+            tree = tree.push(session_tree_row(host_id, session));
+        }
     }
     tree
 }
