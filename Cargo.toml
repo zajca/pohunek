@@ -15,6 +15,7 @@ members = [
     "crates/hostcheck",
     "crates/xtask",
     "crates/netbird",
+    "crates/prompt",
     "crates/client",
     "crates/daemon",
     "crates/cli",
@@ -31,6 +32,7 @@ pohunek-client = { path = "crates/client" }
 pohunek-hostcheck = { path = "crates/hostcheck" }
 pohunek-knowledge = { path = "crates/knowledge" }
 pohunek-netbird = { path = "crates/netbird" }
+pohunek-prompt = { path = "crates/prompt" }
 pohunek-protocol = { path = "crates/protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

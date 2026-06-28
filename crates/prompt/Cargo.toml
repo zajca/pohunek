@@ -1,0 +1,14 @@
+[package]
+name = "pohunek-prompt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared prompt rendering for pohunek provider launch flows."
+
+[dependencies]
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
