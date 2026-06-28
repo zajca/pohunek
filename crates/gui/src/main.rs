@@ -70,7 +70,10 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             host_id,
             session_id,
         } => match app.attach_command(&host_id, &session_id) {
-            Ok(command) => Task::perform(spawn_attach(command), Message::AttachSpawned),
+            Ok(command) => Task::perform(
+                async move { spawn_attach(&command) },
+                Message::AttachSpawned,
+            ),
             Err(err) => {
                 app.status = Some(err);
                 Task::none()
@@ -193,10 +196,10 @@ fn theme(_app: &PohunekApp) -> Theme {
     Theme::TokyoNight
 }
 
-async fn spawn_attach(command: String) -> Result<(), String> {
+fn spawn_attach(command: &str) -> Result<(), String> {
     Command::new("sh")
         .arg("-c")
-        .arg(&command)
+        .arg(command)
         .spawn()
         .map(|_| ())
         .map_err(|err| format!("failed to spawn attach command `{command}`: {err}"))
