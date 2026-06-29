@@ -281,6 +281,7 @@ enum Message {
         prune_worktrees: bool,
     },
     SelectAction(String),
+    SelectProviderPanel(ProviderPanel),
     FetchLinearIssues,
     FetchGitHubPullRequests,
     FetchGitHubIssues,
@@ -422,6 +423,50 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             }
         }
         Message::SelectAction(name) => app.selected_action = Some(name),
+        Message::SelectProviderPanel(panel) => {
+            if let Ok(host_id) = selected_host_id(app) {
+                app.workspace
+                    .apply(CoreMessage::ProviderPanelSelected { host_id, panel });
+                // Auto-fetch the panel's data so switching tabs immediately shows
+                // results instead of requiring a separate Fetch click.
+                match panel {
+                    ProviderPanel::Linear => {
+                        if let Ok(request_id) = begin_linear_issues_request(app) {
+                            push_provider_task_result(
+                                app,
+                                &mut tasks,
+                                SessionLinkProvider::Linear,
+                                ProviderOperation::LinearIssues,
+                                Some(request_id),
+                                fetch_linear_issues_task(app, request_id),
+                            );
+                        }
+                    }
+                    ProviderPanel::GitHub => {
+                        if let Ok(request_id) = begin_github_pull_requests_request(app) {
+                            push_provider_task_result(
+                                app,
+                                &mut tasks,
+                                SessionLinkProvider::GitHub,
+                                ProviderOperation::GitHubPullRequests,
+                                Some(request_id),
+                                fetch_github_pull_requests_task(app, request_id),
+                            );
+                        }
+                        if let Ok(request_id) = begin_github_issues_request(app) {
+                            push_provider_task_result(
+                                app,
+                                &mut tasks,
+                                SessionLinkProvider::GitHub,
+                                ProviderOperation::GitHubIssues,
+                                Some(request_id),
+                                fetch_github_issues_task(app, request_id),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         Message::FetchLinearIssues => match begin_linear_issues_request(app) {
             Ok(request_id) => push_provider_task_result(
                 app,
@@ -2155,16 +2200,10 @@ fn provider_browser_view(app: &PohunekApp) -> Element<'_, Message> {
     };
     let tabs = row![
         button("Linear")
-            .on_press(Message::Core(CoreMessage::ProviderPanelSelected {
-                host_id: host_id.clone(),
-                panel: ProviderPanel::Linear,
-            }))
+            .on_press(Message::SelectProviderPanel(ProviderPanel::Linear))
             .style(tab_style(ProviderPanel::Linear)),
         button("GitHub")
-            .on_press(Message::Core(CoreMessage::ProviderPanelSelected {
-                host_id: host_id.clone(),
-                panel: ProviderPanel::GitHub,
-            }))
+            .on_press(Message::SelectProviderPanel(ProviderPanel::GitHub))
             .style(tab_style(ProviderPanel::GitHub))
     ]
     .spacing(8);
