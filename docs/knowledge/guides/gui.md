@@ -80,6 +80,8 @@ From an installed build:
 pohunek-gui
 ```
 
+Release archives include `pohunek-gui` alongside the CLI and daemon binaries.
+
 If the GUI starts but shows no sessions, verify daemon health and `session.list`
 first. If host discovery fails, the GUI should still try the local host and
 surface a per-host error instead of treating the whole app as failed.

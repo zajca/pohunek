@@ -1,5 +1,10 @@
 # Knowledge Bundle Log
 
+## 0.7.1
+
+- Documented that release archives include the native `pohunek-gui` binary and
+  linked release packaging files from the assistant source map.
+
 ## 0.7.0
 
 - Added native GUI provider-integration guidance for Linear and GitHub, including

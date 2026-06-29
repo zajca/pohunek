@@ -51,6 +51,12 @@ Native GUI client:
 - `docs/phases/06-native-app.md`
 - `docs/design/track-d-native-app.md`
 
+Release packaging:
+
+- `.github/workflows/release.yml`
+- `README.md`
+- `scripts/release`
+
 Daemon, sessions, integrations, and project state:
 
 - `crates/daemon/src/assistant.rs`
