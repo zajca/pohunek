@@ -102,6 +102,33 @@ Worktree creation is represented by `session.new` with a project or repo and a
 branch. There is no standalone worktree daemon method. When explaining or fixing
 GUI worktree behavior, preserve that protocol boundary.
 
+## Prompt Management
+
+The native GUI can browse project actions and prompt templates in read-only
+form. It must resolve that data through the selected host's daemon, using the
+same project layers that the daemon resolves for CLI project commands. Do not
+read prompt files directly from the GUI process to explain or implement this
+flow.
+
+The supported daemon methods are:
+
+- `project.actions` to list actions for a project.
+- `project.action` to resolve a named action recipe.
+- `project.prompt` to resolve a named prompt template.
+- `session.new` to launch the rendered action prompt with `input` set to the
+  rendered prompt.
+
+Preview rendering uses the shared `crates/prompt` renderer. A GUI-rendered
+preview should be byte-identical to `pohunek prompt render` for the same
+template, provider, item id, and provider JSON. Launching from a preview should
+create one session on the selected host and project. The GUI should not attach a
+raw stream and should not embed a terminal for that session.
+
+Provider browsing and provider API integration are separate from this GUI v1
+prompt management flow. If a provider context is needed, collect or pass the
+provider item id and context JSON; do not add Linear or GitHub browsing as part
+of prompt management.
+
 ## Secrets
 
 Do not put token values in `gui.toml`, session metadata, prompts, snapshots, or
@@ -118,7 +145,10 @@ tokens to make the GUI start.
 When behavior must be checked against implementation, inspect:
 
 - `crates/gui/src/main.rs` for config loading, attach spawning, and Iced shell
-  behavior.
-- `crates/gui-core/src/lib.rs` for headless state transitions, SDK requests, and
-  attach command rendering.
+  behavior and prompt management controls.
+- `crates/gui-core/src/lib.rs` for headless state transitions, SDK requests,
+  prompt/action state, prompt preview rendering, and attach command rendering.
+- `crates/gui-core/tests/loopback.rs` for loopback coverage of host-resolved
+  prompt/action browse, preview, and launch behavior.
+- `crates/prompt/src/lib.rs` for prompt rendering rules shared by CLI and GUI.
 - `docs/phases/06-native-app.md` for Track D milestone scope and constraints.

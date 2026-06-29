@@ -41,7 +41,10 @@ Native GUI client:
 - `crates/gui/src/runtime.rs`
 - `crates/gui-core/src/lib.rs`
 - `crates/gui-core/tests/loopback.rs`
+- `crates/prompt/src/lib.rs`
+- `crates/cli/tests/gui_prompt_parity.rs`
 - `docs/phases/06-native-app.md`
+- `docs/design/track-d-native-app.md`
 
 Daemon, sessions, integrations, and project state:
 
@@ -74,6 +77,7 @@ Agent runtime and profile resolution:
 
 Protocol contracts and transport:
 
+- `crates/client/src/lib.rs`
 - `crates/protocol/src/assistant.rs`
 - `crates/protocol/src/lib.rs`
 - `crates/protocol/src/session.rs`
@@ -96,3 +100,4 @@ Design inputs:
 
 - `docs/design/universal-assistant.md`
 - `docs/design/universal-assistant-plan.md`
+- `docs/public-api.md`

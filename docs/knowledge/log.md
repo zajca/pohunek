@@ -5,6 +5,9 @@
 - Added GUI setup guidance for `pohunek-gui`, including `gui.toml`, external
   attach delegation, Wayland startup diagnostics, project/worktree method
   boundaries, and secret-handling rules.
+- Added native GUI prompt-management guidance covering host-resolved
+  prompt/action browse, preview rendering through `crates/prompt`, and
+  `session.new input` launch behavior.
 - Linked GUI setup from the knowledge index and source map.
 
 ## 0.3.3
