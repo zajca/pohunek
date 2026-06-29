@@ -115,6 +115,8 @@ map_err_ignore = "warn"
 redundant_type_annotations = "warn"
 renamed_function_params = "warn"
 semicolon_outside_block = "warn"
+# Replacement for the removed `string_to_string` lint from older guideline sets.
+implicit_clone = "warn"
 undocumented_unsafe_blocks = "warn"
 unnecessary_safety_comment = "warn"
 unnecessary_safety_doc = "warn"

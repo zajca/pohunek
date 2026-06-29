@@ -781,6 +781,10 @@ pub enum DetailTab {
 }
 
 /// Persisted window dimensions.
+///
+/// These remain `u32` for compatibility with existing TOML state; the Iced
+/// shell clamps values to the platform window range when converting to/from
+/// floating-point pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowSize {
     pub width: u32,
@@ -1311,16 +1315,31 @@ impl Workspace {
                 search,
                 issues,
             } => {
+                let trace_host_id = host_id.clone();
                 let host = self
                     .hosts
                     .entry(host_id)
                     .or_insert_with(HostView::connecting);
                 if host.provider.linear.active_request != Some(request_id) {
+                    trace_ignored_provider_result(
+                        &trace_host_id,
+                        SessionLinkProvider::Linear,
+                        ProviderOperation::LinearIssues,
+                        request_id,
+                        "stale_request",
+                    );
                     return;
                 }
                 if host.provider.linear.state_filter != state_filter
                     || host.provider.linear.search != search
                 {
+                    trace_ignored_provider_result(
+                        &trace_host_id,
+                        SessionLinkProvider::Linear,
+                        ProviderOperation::LinearIssues,
+                        request_id,
+                        "filter_changed",
+                    );
                     return;
                 }
                 host.provider.linear.active_request = None;
@@ -1353,13 +1372,28 @@ impl Workspace {
                     .as_ref()
                     .is_some_and(|current| current != &scope)
                 {
+                    trace_ignored_provider_result(
+                        &host_id,
+                        SessionLinkProvider::GitHub,
+                        ProviderOperation::GitHubPullRequests,
+                        request_id,
+                        "selection_changed",
+                    );
                     return;
                 }
+                let trace_host_id = host_id.clone();
                 let host = self
                     .hosts
                     .entry(host_id)
                     .or_insert_with(HostView::connecting);
                 if host.provider.github.pull_requests_request != Some(request_id) {
+                    trace_ignored_provider_result(
+                        &trace_host_id,
+                        SessionLinkProvider::GitHub,
+                        ProviderOperation::GitHubPullRequests,
+                        request_id,
+                        "stale_request",
+                    );
                     return;
                 }
                 host.provider.github.pull_requests_request = None;
@@ -1383,13 +1417,28 @@ impl Workspace {
                     .as_ref()
                     .is_some_and(|current| current != &scope)
                 {
+                    trace_ignored_provider_result(
+                        &host_id,
+                        SessionLinkProvider::GitHub,
+                        ProviderOperation::GitHubIssues,
+                        request_id,
+                        "selection_changed",
+                    );
                     return;
                 }
+                let trace_host_id = host_id.clone();
                 let host = self
                     .hosts
                     .entry(host_id)
                     .or_insert_with(HostView::connecting);
                 if host.provider.github.issues_request != Some(request_id) {
+                    trace_ignored_provider_result(
+                        &trace_host_id,
+                        SessionLinkProvider::GitHub,
+                        ProviderOperation::GitHubIssues,
+                        request_id,
+                        "stale_request",
+                    );
                     return;
                 }
                 host.provider.github.issues_request = None;
@@ -1427,13 +1476,28 @@ impl Workspace {
                     .as_ref()
                     .is_some_and(|current| current != &status_key.scope)
                 {
+                    trace_ignored_provider_result(
+                        &host_id,
+                        SessionLinkProvider::GitHub,
+                        ProviderOperation::GitHubPullRequestStatus,
+                        request_id,
+                        "selection_changed",
+                    );
                     return;
                 }
+                let trace_host_id = host_id.clone();
                 let host = self
                     .hosts
                     .entry(host_id)
                     .or_insert_with(HostView::connecting);
                 if host.provider.github.pull_request_status_request != Some(request_id) {
+                    trace_ignored_provider_result(
+                        &trace_host_id,
+                        SessionLinkProvider::GitHub,
+                        ProviderOperation::GitHubPullRequestStatus,
+                        request_id,
+                        "stale_request",
+                    );
                     return;
                 }
                 host.provider.github.pull_request_status_request = None;
@@ -1452,9 +1516,10 @@ impl Workspace {
             } => {
                 let host = self
                     .hosts
-                    .entry(host_id)
+                    .entry(host_id.clone())
                     .or_insert_with(HostView::connecting);
-                if !apply_provider_request_failure(host, provider, operation, request_id) {
+                if !apply_provider_request_failure(&host_id, host, provider, operation, request_id)
+                {
                     return;
                 }
                 match provider {
@@ -1524,6 +1589,7 @@ impl Workspace {
 }
 
 fn apply_provider_request_failure(
+    host_id: &HostId,
     host: &mut HostView,
     provider: SessionLinkProvider,
     operation: ProviderOperation,
@@ -1535,6 +1601,13 @@ fn apply_provider_request_failure(
     match (provider, operation) {
         (SessionLinkProvider::Linear, ProviderOperation::LinearIssues) => {
             if host.provider.linear.active_request != Some(request_id) {
+                trace_ignored_provider_failure(
+                    host_id,
+                    provider,
+                    operation,
+                    request_id,
+                    "stale_request",
+                );
                 return false;
             }
             host.provider.linear.active_request = None;
@@ -1542,6 +1615,13 @@ fn apply_provider_request_failure(
         }
         (SessionLinkProvider::GitHub, ProviderOperation::GitHubPullRequests) => {
             if host.provider.github.pull_requests_request != Some(request_id) {
+                trace_ignored_provider_failure(
+                    host_id,
+                    provider,
+                    operation,
+                    request_id,
+                    "stale_request",
+                );
                 return false;
             }
             host.provider.github.pull_requests_request = None;
@@ -1549,6 +1629,13 @@ fn apply_provider_request_failure(
         }
         (SessionLinkProvider::GitHub, ProviderOperation::GitHubIssues) => {
             if host.provider.github.issues_request != Some(request_id) {
+                trace_ignored_provider_failure(
+                    host_id,
+                    provider,
+                    operation,
+                    request_id,
+                    "stale_request",
+                );
                 return false;
             }
             host.provider.github.issues_request = None;
@@ -1556,6 +1643,13 @@ fn apply_provider_request_failure(
         }
         (SessionLinkProvider::GitHub, ProviderOperation::GitHubPullRequestStatus) => {
             if host.provider.github.pull_request_status_request != Some(request_id) {
+                trace_ignored_provider_failure(
+                    host_id,
+                    provider,
+                    operation,
+                    request_id,
+                    "stale_request",
+                );
                 return false;
             }
             host.provider.github.pull_request_status_request = None;
@@ -1564,6 +1658,44 @@ fn apply_provider_request_failure(
         (_, ProviderOperation::Launch) => true,
         _ => false,
     }
+}
+
+fn trace_ignored_provider_result(
+    host_id: &HostId,
+    provider: SessionLinkProvider,
+    operation: ProviderOperation,
+    request_id: ProviderRequestId,
+    reason: &'static str,
+) {
+    tracing::event!(
+        name: "gui.provider.result.ignored",
+        tracing::Level::DEBUG,
+        host_id = %host_id,
+        provider = ?provider,
+        operation = ?operation,
+        request_id = request_id.get(),
+        reason,
+        "ignoring provider result"
+    );
+}
+
+fn trace_ignored_provider_failure(
+    host_id: &HostId,
+    provider: SessionLinkProvider,
+    operation: ProviderOperation,
+    request_id: ProviderRequestId,
+    reason: &'static str,
+) {
+    tracing::event!(
+        name: "gui.provider.failure.ignored",
+        tracing::Level::DEBUG,
+        host_id = %host_id,
+        provider = ?provider,
+        operation = ?operation,
+        request_id = request_id.get(),
+        reason,
+        "ignoring provider failure"
+    );
 }
 
 /// Derived row for the flat agents monitor.
@@ -1736,6 +1868,8 @@ pub enum CoreError {
     },
     #[error("provider launch item is inconsistent: {message}")]
     ProviderLaunchItemMismatch { message: &'static str },
+    #[error("provider `{provider}` cannot be converted to a prompt provider")]
+    UnsupportedPromptProvider { provider: &'static str },
 }
 
 /// Load one host snapshot with `daemon.health` and `session.list`.
@@ -2066,7 +2200,7 @@ pub fn preview_action_prompt(
 ) -> Result<PromptPreview, CoreError> {
     match &action.provider {
         ProviderKind::LinearIssue | ProviderKind::GithubPr => {
-            let prompt_provider = action_prompt_provider(&action.provider);
+            let prompt_provider = action_prompt_provider(&action.provider)?;
             preview_prompt_content(
                 action.prompt_name.clone(),
                 &action.prompt_content,
@@ -2169,19 +2303,21 @@ pub async fn launch_provider_item_with_options(
     .await
 }
 
-fn action_prompt_provider(provider: &ProviderKind) -> PromptProvider {
+fn action_prompt_provider(provider: &ProviderKind) -> Result<PromptProvider, CoreError> {
     match provider {
-        ProviderKind::LinearIssue => PromptProvider::LinearIssue,
-        ProviderKind::GithubPr => PromptProvider::GitHubPr,
-        ProviderKind::None => unreachable!("provider none is handled before provider conversion"),
+        ProviderKind::LinearIssue => Ok(PromptProvider::LinearIssue),
+        ProviderKind::GithubPr => Ok(PromptProvider::GitHubPr),
+        ProviderKind::None => Err(CoreError::UnsupportedPromptProvider {
+            provider: provider.as_str(),
+        }),
     }
 }
 
 fn branch_from_context(provider: PromptProvider, raw_json: &str) -> Result<String, CoreError> {
     let data: Value = serde_json::from_str(raw_json)?;
     let fields = match provider {
-        PromptProvider::LinearIssue => &["branchName", "branch"][..],
-        PromptProvider::GitHubPr => &["headRefName", "branch", "branchName"][..],
+        PromptProvider::LinearIssue => providers::linear::ISSUE_BRANCH_FIELDS,
+        PromptProvider::GitHubPr => providers::github::PULL_REQUEST_BRANCH_FIELDS,
     };
     fields
         .iter()
@@ -2235,6 +2371,8 @@ async fn load_host_snapshot_with_options(
     })
 }
 
+/// Each GUI command opens a short-lived client so reconnect state is localized
+/// to the operation and does not share failure state with subscriptions.
 async fn request_host_json<T>(
     config: &HostConfig,
     options: ConnectionOptions,
@@ -2245,8 +2383,54 @@ async fn request_host_json<T>(
 where
     T: serde::de::DeserializeOwned,
 {
-    let mut client = connect_client(config, options).await?;
-    request_json(&mut client, id, method, params).await
+    tracing::event!(
+        name: "gui.host_request.client.open",
+        tracing::Level::DEBUG,
+        host_id = %config.id,
+        request_id = id,
+        method,
+        "opening per-request GUI host client"
+    );
+    let mut client = match connect_client(config, options).await {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::event!(
+                name: "gui.host_request.connect.failed",
+                tracing::Level::WARN,
+                host_id = %config.id,
+                request_id = id,
+                method,
+                error = %err,
+                "GUI host request connection failed"
+            );
+            return Err(err);
+        }
+    };
+    match request_json(&mut client, id, method, params).await {
+        Ok(value) => {
+            tracing::event!(
+                name: "gui.host_request.completed",
+                tracing::Level::DEBUG,
+                host_id = %config.id,
+                request_id = id,
+                method,
+                "GUI host request completed"
+            );
+            Ok(value)
+        }
+        Err(err) => {
+            tracing::event!(
+                name: "gui.host_request.failed",
+                tracing::Level::WARN,
+                host_id = %config.id,
+                request_id = id,
+                method,
+                error = %err,
+                "GUI host request failed"
+            );
+            Err(err)
+        }
+    }
 }
 
 async fn request_json<T>(
@@ -2620,13 +2804,60 @@ pub trait AttachCommandSpawner {
     fn spawn(&mut self, command: &str) -> Result<(), String>;
 }
 
-/// Render the configured attach command by replacing `{bin}`, `{host}`, and `{id}`.
+/// Render the configured attach command.
+///
+/// Replaces `{bin}`, `{host}`, and `{id}` with shell-escaped values because the
+/// GUI shell spawner executes the rendered command through `sh -c`.
 #[must_use]
 pub fn render_attach_command(template: &str, values: &AttachTemplateValues) -> String {
+    let bin = shell_escape(&values.bin);
+    let host = shell_escape(&values.host);
+    let id = shell_escape(&values.id);
     template
-        .replace("{bin}", &values.bin)
-        .replace("{host}", &values.host)
-        .replace("{id}", &values.id)
+        .replace("{bin}", &bin)
+        .replace("{host}", &host)
+        .replace("{id}", &id)
+}
+
+fn shell_escape(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_owned();
+    }
+    if value.bytes().all(is_shell_safe_byte) {
+        return value.to_owned();
+    }
+
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('\'');
+    for character in value.chars() {
+        if character == '\'' {
+            escaped.push_str("'\\''");
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped.push('\'');
+    escaped
+}
+
+const fn is_shell_safe_byte(byte: u8) -> bool {
+    // POSIX shell metacharacters are intentionally excluded from this allowlist.
+    matches!(
+        byte,
+        b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'0'..=b'9'
+            | b'_'
+            | b'-'
+            | b'.'
+            | b'/'
+            | b':'
+            | b'@'
+            | b'%'
+            | b'+'
+            | b','
+            | b'='
+    )
 }
 
 /// Resolve and spawn an external attach command.
@@ -3053,6 +3284,33 @@ mod tests {
         );
 
         assert_eq!(command, "pohunek attach --host devbox s-7");
+    }
+
+    #[test]
+    fn attach_command_shell_escapes_substituted_tokens() {
+        let command = render_attach_command(
+            "{bin} attach --host {host} {id}",
+            &AttachTemplateValues {
+                bin: "/opt/pohunek bin".to_owned(),
+                host: "devbox; touch /tmp/pwn".to_owned(),
+                id: "s-7'$(touch /tmp/pwn)".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            command,
+            "'/opt/pohunek bin' attach --host 'devbox; touch /tmp/pwn' 's-7'\\''$(touch /tmp/pwn)'"
+        );
+    }
+
+    #[test]
+    fn provider_none_conversion_returns_error() {
+        let err = action_prompt_provider(&ProviderKind::None).expect_err("provider none");
+
+        assert!(matches!(
+            err,
+            CoreError::UnsupportedPromptProvider { provider: "none" }
+        ));
     }
 
     fn snapshot(host_id: &str, sessions: Vec<SessionInfo>) -> HostSnapshot {

@@ -34,6 +34,10 @@ query PohunekAssignedIssues($first: Int!, $filter: IssueFilter) {
   }
 }
 ";
+/// Primary Linear issue branch field emitted by Linear and prompt JSON.
+pub const ISSUE_PRIMARY_BRANCH_FIELD: &str = "branchName";
+/// Branch fields accepted for Linear issue prompt contexts.
+pub const ISSUE_BRANCH_FIELDS: &[&str] = &[ISSUE_PRIMARY_BRANCH_FIELD, super::COMPAT_BRANCH_FIELD];
 
 /// Future returned by a token source.
 pub type TokenFuture<'a> = Pin<Box<dyn Future<Output = Result<String, TokenError>> + Send + 'a>>;
@@ -101,16 +105,16 @@ impl LinearIssue {
     /// Converts this issue to the shared prompt renderer JSON shape.
     #[must_use]
     pub fn to_prompt_json(&self) -> Value {
-        json!({
-            "id": self.id,
-            "identifier": self.identifier,
-            "title": self.title,
-            "description": self.body,
-            "body": self.body,
-            "branchName": self.branch,
-            "branch": self.branch,
-            "url": self.url,
-        })
+        let mut value = Map::new();
+        value.insert("id".to_owned(), json!(self.id));
+        value.insert("identifier".to_owned(), json!(self.identifier));
+        value.insert("title".to_owned(), json!(self.title));
+        value.insert("description".to_owned(), json!(self.body));
+        value.insert("body".to_owned(), json!(self.body));
+        value.insert(ISSUE_PRIMARY_BRANCH_FIELD.to_owned(), json!(self.branch));
+        value.insert(super::COMPAT_BRANCH_FIELD.to_owned(), json!(self.branch));
+        value.insert("url".to_owned(), json!(self.url));
+        Value::Object(value)
     }
 }
 
@@ -541,7 +545,7 @@ fn issue_from_value(index: usize, value: &Value) -> Result<LinearIssue, LinearEr
         identifier: required_str(index, value, "identifier")?,
         title: required_str(index, value, "title")?,
         body: optional_str(value, &["description", "body"]),
-        branch: required_any_str(index, value, &["branchName", "branch"])?,
+        branch: required_any_str(index, value, ISSUE_BRANCH_FIELDS)?,
         url: required_str(index, value, "url")?,
     })
 }
@@ -608,9 +612,10 @@ fn optional_str(value: &Value, fields: &[&str]) -> String {
 }
 
 fn joined_field_name(fields: &'static [&'static str]) -> &'static str {
-    match fields {
-        ["branchName", "branch"] => "branchName/branch",
-        _ => "unknown",
+    if fields == ISSUE_BRANCH_FIELDS {
+        "branchName/branch"
+    } else {
+        "unknown"
     }
 }
 

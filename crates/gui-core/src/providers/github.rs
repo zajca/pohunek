@@ -12,7 +12,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -22,6 +22,14 @@ const CHECK_FIELDS: &str = "name,state,bucket,link";
 const REVIEW_FIELDS: &str = "reviewDecision";
 const DEFAULT_GH_TIMEOUT: Duration = Duration::from_secs(20);
 const PENDING_CHECKS_EXIT_CODE: i32 = 8;
+/// Primary GitHub pull request branch field emitted by `gh` and prompt JSON.
+pub const PULL_REQUEST_PRIMARY_BRANCH_FIELD: &str = "headRefName";
+/// Branch fields accepted for GitHub pull request prompt contexts.
+pub const PULL_REQUEST_BRANCH_FIELDS: &[&str] = &[
+    PULL_REQUEST_PRIMARY_BRANCH_FIELD,
+    super::COMPAT_BRANCH_FIELD,
+    "branchName",
+];
 
 /// Future returned by a GitHub CLI runner.
 pub type GhFuture<'a> = Pin<Box<dyn Future<Output = Result<GhOutput, GitHubError>> + Send + 'a>>;
@@ -113,15 +121,21 @@ impl GitHubPullRequest {
     #[must_use]
     pub fn to_prompt_json(&self) -> Value {
         let id = self.prompt_item_id();
-        json!({
-            "id": id,
-            "number": self.number,
-            "title": self.title,
-            "body": self.body,
-            "headRefName": self.head_ref_name,
-            "branch": self.head_ref_name,
-            "url": self.url,
-        })
+        let mut value = Map::new();
+        value.insert("id".to_owned(), json!(id));
+        value.insert("number".to_owned(), json!(self.number));
+        value.insert("title".to_owned(), json!(self.title));
+        value.insert("body".to_owned(), json!(self.body));
+        value.insert(
+            PULL_REQUEST_PRIMARY_BRANCH_FIELD.to_owned(),
+            json!(self.head_ref_name),
+        );
+        value.insert(
+            super::COMPAT_BRANCH_FIELD.to_owned(),
+            json!(self.head_ref_name),
+        );
+        value.insert("url".to_owned(), json!(self.url));
+        Value::Object(value)
     }
 }
 

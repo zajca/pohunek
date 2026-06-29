@@ -35,6 +35,10 @@ use protocol::{
 use serde::Deserialize;
 use thiserror::Error;
 
+// 80x24 is the traditional terminal size expected by many CLI tools.
+const DEFAULT_TERMINAL_COLS: u16 = 80;
+const DEFAULT_TERMINAL_ROWS: u16 = 24;
+// notify-send is the freedesktop notification CLI available on target Linux desktops.
 const DEFAULT_NOTIFICATION_COMMAND: &str = "notify-send";
 
 pub fn main() -> iced::Result {
@@ -103,6 +107,10 @@ impl PohunekApp {
             Ok(config) => discover_hosts_task(config),
             Err(_) => Task::none(),
         };
+        let new_session = config.as_ref().map_or_else(
+            |_| NewSessionForm::default(),
+            |config| NewSessionForm::with_terminal_size(config.terminal_size),
+        );
         let mut workspace = Workspace::default();
         workspace.selection.clone_from(&boot.ui_state.selection);
         (
@@ -111,7 +119,7 @@ impl PohunekApp {
                 config,
                 hosts: Vec::new(),
                 ui_state: boot.ui_state,
-                new_session: NewSessionForm::default(),
+                new_session,
                 metadata_edit: MetadataEdit::default(),
                 project_edit: ProjectEdit::default(),
                 prompt_edit: PromptEdit::default(),
@@ -160,8 +168,23 @@ struct NewSessionForm {
     rows: String,
 }
 
-impl Default for NewSessionForm {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalSize {
+    cols: u16,
+    rows: u16,
+}
+
+impl Default for TerminalSize {
     fn default() -> Self {
+        Self {
+            cols: DEFAULT_TERMINAL_COLS,
+            rows: DEFAULT_TERMINAL_ROWS,
+        }
+    }
+}
+
+impl NewSessionForm {
+    fn with_terminal_size(terminal_size: TerminalSize) -> Self {
         Self {
             agent: "codex".to_owned(),
             cwd: String::new(),
@@ -172,9 +195,15 @@ impl Default for NewSessionForm {
             input: String::new(),
             metadata_key: String::new(),
             metadata_value: String::new(),
-            cols: "80".to_owned(),
-            rows: "24".to_owned(),
+            cols: terminal_size.cols.to_string(),
+            rows: terminal_size.rows.to_string(),
         }
+    }
+}
+
+impl Default for NewSessionForm {
+    fn default() -> Self {
+        Self::with_terminal_size(TerminalSize::default())
     }
 }
 
@@ -935,6 +964,7 @@ fn launch_prompt_action_task(app: &PohunekApp) -> Result<Task<Message>, String> 
         .resolved_action
         .clone()
         .ok_or_else(|| "resolve an action first".to_owned())?;
+    let terminal_size = terminal_size(app)?;
     let preview = host_view
         .prompt
         .preview
@@ -952,8 +982,8 @@ fn launch_prompt_action_task(app: &PohunekApp) -> Result<Task<Message>, String> 
                     project,
                     action,
                     preview,
-                    cols: 80,
-                    rows: 24,
+                    cols: terminal_size.cols,
+                    rows: terminal_size.rows,
                     metadata: BTreeMap::new(),
                 },
                 options,
@@ -1128,6 +1158,7 @@ fn launch_linear_issue_task(app: &PohunekApp) -> Result<Task<Message>, String> {
     let (project, _) = selected_project_identity(app)?;
     let action_name = required_field(&app.prompt_edit.action_name, "action name")?;
     let options = connection_options(app)?;
+    let terminal_size = terminal_size(app)?;
     let issue = selected_linear_issue(app)?;
     let context_json = issue.to_prompt_json().to_string();
     let issue_id = issue.prompt_item_id().to_owned();
@@ -1141,8 +1172,8 @@ fn launch_linear_issue_task(app: &PohunekApp) -> Result<Task<Message>, String> {
                     project,
                     action_name,
                     item,
-                    cols: 80,
-                    rows: 24,
+                    cols: terminal_size.cols,
+                    rows: terminal_size.rows,
                 },
                 options,
             )
@@ -1168,6 +1199,7 @@ fn launch_github_pull_request_task(app: &PohunekApp) -> Result<Task<Message>, St
     let (project, _) = selected_project_identity(app)?;
     let action_name = required_field(&app.prompt_edit.action_name, "action name")?;
     let options = connection_options(app)?;
+    let terminal_size = terminal_size(app)?;
     let pull_request = selected_github_pull_request(app)?;
     let context_json = pull_request.to_prompt_json().to_string();
     let item = ProviderLaunchItem::github_pull_request(
@@ -1184,8 +1216,8 @@ fn launch_github_pull_request_task(app: &PohunekApp) -> Result<Task<Message>, St
                     project,
                     action_name,
                     item,
-                    cols: 80,
-                    rows: 24,
+                    cols: terminal_size.cols,
+                    rows: terminal_size.rows,
                 },
                 options,
             )
@@ -1445,6 +1477,13 @@ fn connection_options(app: &PohunekApp) -> Result<ConnectionOptions, String> {
     app.config
         .as_ref()
         .map(|config| config.connection_options)
+        .map_err(Clone::clone)
+}
+
+fn terminal_size(app: &PohunekApp) -> Result<TerminalSize, String> {
+    app.config
+        .as_ref()
+        .map(|config| config.terminal_size)
         .map_err(Clone::clone)
 }
 
@@ -2407,6 +2446,7 @@ struct AppConfig {
     pohunek_bin: String,
     local_host: HostConfig,
     connection_options: ConnectionOptions,
+    terminal_size: TerminalSize,
     notification_command: String,
     providers: ProviderAppConfig,
 }
@@ -2424,12 +2464,15 @@ impl AppConfig {
             source,
         })?;
         let local_host = HostConfig::local("local", local_socket_path()?);
-        let connection_options = raw.gui.unwrap_or_default().connection_options()?;
+        let raw_gui = raw.gui.unwrap_or_default();
+        let connection_options = raw_gui.connection_options()?;
+        let terminal_size = raw_gui.terminal_size()?;
         Ok(Self {
             attach_command: raw.attach_command,
             pohunek_bin: raw.pohunek_bin,
             local_host,
             connection_options,
+            terminal_size,
             notification_command: raw
                 .notification_command
                 .unwrap_or_else(|| DEFAULT_NOTIFICATION_COMMAND.to_owned()),
@@ -2481,6 +2524,10 @@ struct RawGuiConfig {
     backoff_initial_ms: Option<u64>,
     #[serde(default)]
     backoff_max_ms: Option<u64>,
+    #[serde(default)]
+    terminal_cols: Option<u16>,
+    #[serde(default)]
+    terminal_rows: Option<u16>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2547,7 +2594,7 @@ impl RawGitHubProviderConfig {
 }
 
 impl RawGuiConfig {
-    fn connection_options(self) -> Result<ConnectionOptions, ConfigError> {
+    fn connection_options(&self) -> Result<ConnectionOptions, ConfigError> {
         let defaults = ConnectionOptions::default();
         Ok(ConnectionOptions {
             connect_timeout: duration_millis(
@@ -2574,6 +2621,21 @@ impl RawGuiConfig {
                 self.backoff_max_ms,
                 "gui.backoff_max_ms",
                 defaults.backoff_max,
+            )?,
+        })
+    }
+
+    fn terminal_size(&self) -> Result<TerminalSize, ConfigError> {
+        Ok(TerminalSize {
+            cols: terminal_dimension(
+                self.terminal_cols,
+                "gui.terminal_cols",
+                DEFAULT_TERMINAL_COLS,
+            )?,
+            rows: terminal_dimension(
+                self.terminal_rows,
+                "gui.terminal_rows",
+                DEFAULT_TERMINAL_ROWS,
             )?,
         })
     }
@@ -2673,6 +2735,23 @@ fn required_duration_millis(value: u64, field: &'static str) -> Result<Duration,
     } else {
         Ok(Duration::from_millis(value))
     }
+}
+
+fn terminal_dimension(
+    value: Option<u16>,
+    field: &'static str,
+    default: u16,
+) -> Result<u16, ConfigError> {
+    value.map_or(Ok(default), |dimension| {
+        if dimension == 0 {
+            Err(ConfigError::Invalid {
+                field,
+                message: "must be greater than zero".to_owned(),
+            })
+        } else {
+            Ok(dimension)
+        }
+    })
 }
 
 fn duration_secs(
@@ -2807,6 +2886,32 @@ mod tests {
         .expect_err("zero token timeout");
 
         assert!(err.to_string().contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn gui_config_rejects_zero_terminal_columns() {
+        let err = RawGuiConfig {
+            terminal_cols: Some(0),
+            ..RawGuiConfig::default()
+        }
+        .terminal_size()
+        .expect_err("zero terminal columns");
+
+        assert!(err.to_string().contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn gui_config_accepts_custom_terminal_size() {
+        let size = RawGuiConfig {
+            terminal_cols: Some(132),
+            terminal_rows: Some(40),
+            ..RawGuiConfig::default()
+        }
+        .terminal_size()
+        .expect("custom terminal size");
+
+        assert_eq!(size.cols, 132);
+        assert_eq!(size.rows, 40);
     }
 
     #[test]
