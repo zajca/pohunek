@@ -1,5 +1,14 @@
 # Knowledge Bundle Log
 
+## Unreleased
+
+- Added native GUI provider-integration guidance for Linear and GitHub, including
+  `gui.toml` provider configuration, keyring and `gh` boundaries, request
+  staleness handling, provider launch flow, `link.*` metadata, and PR status
+  degradation rules.
+- Linked the new GUI provider implementation and provider test files from the
+  assistant source map.
+
 ## 0.5.0
 
 - Added GUI setup guidance for `pohunek-gui`, including `gui.toml`, external

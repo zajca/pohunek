@@ -40,9 +40,14 @@ Native GUI client:
 - `crates/gui/src/main.rs`
 - `crates/gui/src/runtime.rs`
 - `crates/gui-core/src/lib.rs`
+- `crates/gui-core/src/providers/linear.rs`
+- `crates/gui-core/src/providers/github.rs`
 - `crates/gui-core/tests/loopback.rs`
+- `crates/gui-core/tests/linear_provider.rs`
+- `crates/gui-core/tests/github_provider.rs`
 - `crates/prompt/src/lib.rs`
 - `crates/cli/tests/gui_prompt_parity.rs`
+- `docs/knowledge/guides/gui.md`
 - `docs/phases/06-native-app.md`
 - `docs/design/track-d-native-app.md`
 

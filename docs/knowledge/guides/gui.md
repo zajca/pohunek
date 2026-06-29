@@ -124,10 +124,68 @@ template, provider, item id, and provider JSON. Launching from a preview should
 create one session on the selected host and project. The GUI should not attach a
 raw stream and should not embed a terminal for that session.
 
-Provider browsing and provider API integration are separate from this GUI v1
-prompt management flow. If a provider context is needed, collect or pass the
-provider item id and context JSON; do not add Linear or GitHub browsing as part
-of prompt management.
+## Provider Integration
+
+The native GUI v1 includes provider browse and launch flows for Linear issues
+and GitHub pull requests. Provider integration lives in the GUI application and
+`gui-core`; the daemon still sees only opaque session input, branch values, and
+metadata. Do not add daemon methods or protocol types to implement provider UI.
+
+Provider configuration belongs in `gui.toml` under `[providers]`:
+
+```toml
+[providers.linear]
+token_key = "linear-token-ref"
+endpoint = "https://api.linear.app/graphql"
+token_timeout_ms = 5000
+
+[providers.github]
+gh_bin = "gh"
+timeout_ms = 20000
+```
+
+Linear uses `token_key` as a keyring entry reference. The GUI reads the token at
+call time through the keyring boundary and must never offer a token input field.
+`token_timeout_ms` is required when Linear is configured so a stuck keyring
+backend cannot leave the provider task pending forever.
+
+GitHub uses the `gh` CLI for all provider reads. Do not read GitHub auth files,
+store GitHub tokens, or add token fields to GUI configuration. If `gh` is
+missing, unauthenticated, or returns invalid JSON, surface the error in provider
+state and leave existing sessions, projects, and workspace state intact.
+
+Provider list and status requests are stateful GUI operations. The core state
+must guard async completions with request ids so stale success or failure
+responses cannot overwrite newer data. GitHub provider state is scoped by both
+project id and repository root because `gh` commands run in the selected
+project's checkout.
+
+Launching a provider item uses the existing project prompt/action surface:
+
+1. Resolve the selected project action with `project.action`.
+2. Resolve the prompt template with `project.prompt`.
+3. Render through `crates/prompt`; the rendered bytes must match
+   `pohunek prompt render` for the same context.
+4. Create exactly one session with `session.new`, setting `input` to the
+   rendered prompt and branch to the provider/action result.
+
+At session creation, linked provider launches write only these metadata keys:
+
+- `link.provider = "linear" | "github"`
+- `link.kind = "issue" | "pull_request"`
+- `link.id`
+- `link.url`
+- `link.branch`
+
+The daemon treats those values as opaque. Do not write provider tokens, raw
+provider payloads, GraphQL responses, `gh` output, or secret-bearing config into
+metadata, logs, snapshots, fixtures, or prompt text.
+
+GitHub PR sessions may display PR checks and review status next to the live
+agent badge. That status is best effort and should degrade to an unknown/error
+state when `gh` is unavailable or unauthenticated. GitHub issues can be browsed
+for context, but native provider launch is currently implemented for GitHub pull
+requests and Linear issues.
 
 ## Secrets
 
@@ -145,10 +203,23 @@ tokens to make the GUI start.
 When behavior must be checked against implementation, inspect:
 
 - `crates/gui/src/main.rs` for config loading, attach spawning, and Iced shell
-  behavior and prompt management controls.
+  behavior, provider task spawning, prompt management controls, and provider
+  panels.
 - `crates/gui-core/src/lib.rs` for headless state transitions, SDK requests,
-  prompt/action state, prompt preview rendering, and attach command rendering.
+  prompt/action state, prompt preview rendering, provider request state, linked
+  metadata helpers, and attach command rendering.
+- `crates/gui-core/src/providers/linear.rs` for Linear GraphQL requests,
+  keyring-token lookup boundaries, and token lookup timeouts.
+- `crates/gui-core/src/providers/github.rs` for `gh` command execution, timeout
+  handling, JSON parsing, and stderr redaction.
 - `crates/gui-core/tests/loopback.rs` for loopback coverage of host-resolved
-  prompt/action browse, preview, and launch behavior.
+  prompt/action browse, preview, provider launch, and linked metadata
+  persistence behavior.
+- `crates/gui-core/tests/linear_provider.rs` and
+  `crates/gui-core/tests/github_provider.rs` for provider fixtures, fake token
+  sources, fake `gh` scripts, parsing coverage, timeout behavior, and error
+  paths.
 - `crates/prompt/src/lib.rs` for prompt rendering rules shared by CLI and GUI.
+- `crates/cli/tests/gui_prompt_parity.rs` for byte-identical GUI/CLI prompt
+  rendering coverage.
 - `docs/phases/06-native-app.md` for Track D milestone scope and constraints.
