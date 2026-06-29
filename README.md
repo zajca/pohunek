@@ -10,15 +10,15 @@ change before a stable SDK contract is published.
 
 ## Install
 
-Download a release archive for your target, or build the two binaries from a
+Download a release archive for your target, or build the three binaries from a
 checked-out repository:
 
 ```bash
-cargo build --release --locked --bin pohunek --bin pohunekd
+cargo build --release --locked --bin pohunek --bin pohunekd --bin pohunek-gui
 ```
 
-The release archive includes the CLI, daemon, root README, MIT license, and the
-offline documentation bundle.
+The release archive includes the CLI, daemon, native GUI, root README, MIT
+license, and the offline documentation bundle.
 
 ## Quick Start
 

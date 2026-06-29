@@ -2,9 +2,10 @@ name: Release
 
 # Triggered by pushing a `vX.Y.Z` tag (created by `scripts/release`). First runs
 # the full quality gate (fmt/clippy/test) on the tagged commit, and only if that
-# passes builds the `pohunek` (CLI) and `pohunekd` (daemon) binaries for each
-# target on a native runner, packages them into per-target tarballs with sha256
-# checksums, and attaches everything to a GitHub Release for that tag.
+# passes builds the `pohunek` (CLI), `pohunekd` (daemon), and `pohunek-gui`
+# binaries for each target on a native runner, packages them into per-target
+# tarballs with sha256 checksums, and attaches everything to a GitHub Release
+# for that tag.
 #
 # A tag push does NOT run the CI workflow (CI runs on branch pushes and PRs), so
 # the gate is duplicated here: no binary is published from a commit that fails
@@ -98,7 +99,9 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build release binaries
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin pohunek --bin pohunekd
+        run: >
+          cargo build --release --locked --target ${{ matrix.target }}
+          --bin pohunek --bin pohunekd --bin pohunek-gui
 
       - name: Build docs artifacts
         run: cargo xtask docs site
@@ -113,7 +116,7 @@ jobs:
           staging="dist/${name}"
           mkdir -p "${staging}"
           bindir="target/${{ matrix.target }}/release"
-          cp "${bindir}/pohunek" "${bindir}/pohunekd" "${staging}/"
+          cp "${bindir}/pohunek" "${bindir}/pohunekd" "${bindir}/pohunek-gui" "${staging}/"
           mkdir -p "${staging}/docs"
           cp -R target/pohunek-docs/offline "${staging}/docs/offline"
           cp target/pohunek-docs/manifest.json "${staging}/docs/manifest.json"
