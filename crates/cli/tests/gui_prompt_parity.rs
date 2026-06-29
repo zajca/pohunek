@@ -82,3 +82,63 @@ fn gui_prompt_preview_is_byte_identical_to_pohunek_prompt_render() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn gui_github_pr_preview_is_byte_identical_to_pohunek_prompt_render() {
+    let dir = temp_dir("github-pr");
+    let template = dir.join("pr.tmpl");
+    let template_content = "PR ${number}: ${title}\n${body}\nbranch=${branch}\nurl=${url}\n";
+    let context_json = r#"{"number":7,"title":"Fix filters","body":"Body text","headRefName":"feature/filters","url":"https://github.example/repo/pull/7"}"#;
+    fs::write(&template, template_content).expect("write template");
+
+    let preview = preview_prompt_content(
+        "pr",
+        template_content,
+        &PromptContext {
+            provider: PromptProvider::GitHubPr,
+            item_id: "7".to_owned(),
+            json: context_json.to_owned(),
+        },
+    )
+    .expect("render GUI preview");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pohunek"))
+        .args([
+            "prompt",
+            "render",
+            "--provider",
+            "github_pr",
+            "--item-id",
+            "7",
+            "--template-file",
+            template.to_str().expect("utf8 template path"),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn pohunek");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(context_json.as_bytes())
+        .expect("write stdin");
+
+    let out = child.wait_with_output().expect("wait pohunek");
+
+    assert!(
+        out.status.success(),
+        "prompt render failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(out.stdout).expect("utf8 stdout"),
+        preview.rendered
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "successful render must not write stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

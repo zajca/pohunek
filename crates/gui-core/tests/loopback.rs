@@ -15,20 +15,21 @@ use pohunek_daemon::api::{DaemonState, HealthInfo, RemoteServer};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use pohunek_gui_core::{
     add_project, host_subscription_stream, inspect_session, launch_action_prompt_with_options,
-    list_project_actions, list_projects, load_host_snapshot, preview_action_prompt,
-    preview_prompt_content, remove_project, rename_project, resolve_project_action,
-    resolve_project_prompt, session_metadata_rows, set_session_metadata, show_project,
-    spawn_attach_command, stop_session as stop_gui_session, workspace_connection_stream,
-    AgentStateEvent, AttachCommandSpawner, AttachSpawnIntent, AttachTemplateValues, ConnState,
-    ConnectionOptions, DetailTab, HealthSummary, HostConfig, HostEvent, HostId, HostSnapshot,
-    Message, PromptContext, PromptLaunchParams, PromptPreview, Selection, TreeNodeId, UiState,
-    WindowSize, Workspace,
+    launch_provider_item_with_options, list_project_actions, list_projects, load_host_snapshot,
+    preview_action_prompt, preview_prompt_content, remove_project, rename_project,
+    resolve_project_action, resolve_project_prompt, session_link_metadata, session_metadata_rows,
+    set_session_metadata, show_project, spawn_attach_command, stop_session as stop_gui_session,
+    workspace_connection_stream, AgentStateEvent, AttachCommandSpawner, AttachSpawnIntent,
+    AttachTemplateValues, ConnState, ConnectionOptions, DetailTab, HealthSummary, HostConfig,
+    HostEvent, HostId, HostSnapshot, Message, PromptContext, PromptLaunchParams, PromptPreview,
+    ProviderLaunchItem, ProviderLaunchParams, Selection, SessionLinkKind, SessionLinkProvider,
+    TreeNodeId, UiState, WindowSize, Workspace,
 };
 use protocol::{
     method, AgentActivity, AgentKind, ProjectActionParams, ProjectActionResult,
     ProjectActionsParams, ProjectAddParams, ProjectPromptParams, ProjectRemoveParams,
     ProjectRenameParams, ProjectShowParams, ProviderKind, Request, SessionId, SessionInfo,
-    SessionNewParams, SessionSetMetadataParams, StateSource,
+    SessionNewParams, SessionReportNativeIdParams, SessionSetMetadataParams, StateSource,
 };
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -593,6 +594,8 @@ async fn remote_prompt_resolution_uses_target_daemon_config_not_operator_filesys
         "0.3.0-remote",
         Some(remote_config_dir),
         None,
+        None,
+        false,
     )
     .await;
     let host = HostConfig::tcp("remote-host", daemon.addr);
@@ -768,6 +771,7 @@ provider = "linear_issue"
             preview: preview.clone(),
             cols: 80,
             rows: 24,
+            metadata: std::collections::BTreeMap::new(),
         },
         test_connection_options(),
     )
@@ -790,6 +794,232 @@ provider = "linear_issue"
     let after = load_host_snapshot(&host)
         .await
         .expect("snapshot after launch")
+        .sessions;
+    assert_eq!(after.len(), before + 1);
+    assert_eq!(
+        after
+            .iter()
+            .filter(|session| session.id == launched.session.id)
+            .count(),
+        1
+    );
+
+    stop_session(&host, &launched.session.id).await;
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps the linked launch and restart persistence flow in one end-to-end assertion"
+)]
+async fn provider_launch_linear_issue_creates_one_linked_session_and_persists_metadata() {
+    let _path_lock = PATH_LOCK.lock().await;
+    let bin_dir = temp_dir("gui-core-m4-linear-bin");
+    let record_dir = temp_dir("gui-core-m4-linear-record");
+    let prompt_out = record_dir.join("prompt.txt");
+    let _prompt_out = EnvGuard::set("POHUNEK_TEST_PROMPT_OUT", &prompt_out);
+    write_executable(
+        &bin_dir.join("codex"),
+        "#!/bin/sh\nprintf '%s' \"${1:-}\" > \"$POHUNEK_TEST_PROMPT_OUT\"\n/bin/sleep 30\n",
+    );
+    let _path = PathGuard::prepend(&bin_dir);
+
+    let store_path = temp_dir("gui-core-m4-linear-store").join("metadata.jsonl");
+    let daemon = LoopbackDaemon::spawn_with_store_path(
+        "m4-linear",
+        "0.4.0-linear",
+        store_path.clone(),
+        false,
+    )
+    .await;
+    let host = HostConfig::tcp("host-linear", daemon.addr);
+    let repo = init_git_repo("gui-core-m4-linear-repo");
+    write_provider_action_fixture(
+        &repo,
+        "issue",
+        "process-issue",
+        "linear_issue",
+        "Issue ${id}: ${title}\n${body}\nbranch=${branch}\n",
+    );
+    let project = add_project(
+        &host,
+        ProjectAddParams {
+            path: Some(repo),
+            name: Some("Linear Launch Project".to_owned()),
+            base_branch: Some("main".to_owned()),
+        },
+    )
+    .await
+    .expect("project.add");
+    let before = load_host_snapshot(&host)
+        .await
+        .expect("snapshot before linear launch")
+        .sessions
+        .len();
+    let context_json = r#"{"identifier":"LIN-123","title":"Fix launcher","description":"Issue body","branchName":"lin-123-fix-launcher","url":"https://linear.test/LIN-123","token":"lin_api_secret_fixture"}"#;
+    let item =
+        ProviderLaunchItem::linear_issue("LIN-123", context_json, "https://linear.test/LIN-123")
+            .expect("linear launch item");
+
+    let launched = launch_provider_item_with_options(
+        &host,
+        ProviderLaunchParams {
+            project: project.id.clone(),
+            action_name: "process-issue".to_owned(),
+            item,
+            cols: 80,
+            rows: 24,
+        },
+        test_connection_options(),
+    )
+    .await
+    .expect("launch linked Linear issue");
+
+    let expected_prompt = "Issue LIN-123: Fix launcher\nIssue body\nbranch=lin-123-fix-launcher\n";
+    assert_eq!(wait_for_file(&prompt_out).await, expected_prompt);
+    assert_eq!(
+        launched.session.branch.as_deref(),
+        Some("lin-123-fix-launcher")
+    );
+    assert_eq!(
+        launched.session.project_id.as_deref(),
+        Some(project.id.as_str())
+    );
+    let expected_link = expected_linear_link_metadata();
+    assert_eq!(
+        launched.session.metadata,
+        expected_link.to_session_metadata()
+    );
+    assert_eq!(
+        session_link_metadata(&launched.session),
+        Some(expected_link)
+    );
+    let metadata_json = serde_json::to_string(&launched.session.metadata).expect("metadata json");
+    assert!(!metadata_json.contains("lin_api_secret_fixture"));
+
+    let after = load_host_snapshot(&host)
+        .await
+        .expect("snapshot after linear launch")
+        .sessions;
+    assert_eq!(after.len(), before + 1);
+    assert_eq!(
+        after
+            .iter()
+            .filter(|session| session.id == launched.session.id)
+            .count(),
+        1
+    );
+
+    report_native_id(&host, &launched.session.id, "codex", "native-linear-1").await;
+    let captured = wait_for_native_id_tcp(&host, &launched.session.id, "native-linear-1").await;
+    assert_eq!(captured.metadata, launched.session.metadata);
+
+    daemon.shutdown().await;
+    let restarted = LoopbackDaemon::spawn_with_store_path(
+        "m4-linear-restart",
+        "0.4.0-linear",
+        store_path,
+        true,
+    )
+    .await;
+    let restarted_host = HostConfig::tcp("host-linear-restart", restarted.addr);
+    let resumed = wait_for_session_with_metadata(
+        &restarted_host,
+        &launched.session.id,
+        &launched.session.metadata,
+    )
+    .await;
+    assert_eq!(
+        session_link_metadata(&resumed),
+        session_link_metadata(&launched.session)
+    );
+
+    stop_session(&restarted_host, &launched.session.id).await;
+    restarted.shutdown().await;
+}
+
+#[tokio::test]
+async fn provider_launch_github_pr_creates_one_linked_session_with_rendered_input() {
+    let _path_lock = PATH_LOCK.lock().await;
+    let bin_dir = temp_dir("gui-core-m4-github-bin");
+    let record_dir = temp_dir("gui-core-m4-github-record");
+    let prompt_out = record_dir.join("prompt.txt");
+    let _prompt_out = EnvGuard::set("POHUNEK_TEST_PROMPT_OUT", &prompt_out);
+    write_executable(
+        &bin_dir.join("claude"),
+        "#!/bin/sh\nprintf '%s' \"${1:-}\" > \"$POHUNEK_TEST_PROMPT_OUT\"\n/bin/sleep 30\n",
+    );
+    let _path = PathGuard::prepend(&bin_dir);
+
+    let daemon = LoopbackDaemon::spawn("m4-github", "0.4.0-github").await;
+    let host = HostConfig::tcp("host-github", daemon.addr);
+    let repo = init_git_repo("gui-core-m4-github-repo");
+    write_provider_action_fixture(
+        &repo,
+        "pr",
+        "review-pr",
+        "github_pr",
+        "PR ${number}: ${title}\n${body}\nbranch=${branch}\nurl=${url}\n",
+    );
+    let project = add_project(
+        &host,
+        ProjectAddParams {
+            path: Some(repo),
+            name: Some("GitHub Launch Project".to_owned()),
+            base_branch: Some("main".to_owned()),
+        },
+    )
+    .await
+    .expect("project.add");
+    let before = load_host_snapshot(&host)
+        .await
+        .expect("snapshot before github launch")
+        .sessions
+        .len();
+    let context_json = r#"{"number":7,"title":"Fix filters","body":"Body text","headRefName":"feature/filters","branch":"feature/filters","url":"https://github.example/repo/pull/7"}"#;
+    let item = ProviderLaunchItem::github_pull_request(
+        "7",
+        context_json,
+        "https://github.example/repo/pull/7",
+    )
+    .expect("GitHub PR launch item");
+
+    let launched = launch_provider_item_with_options(
+        &host,
+        ProviderLaunchParams {
+            project: project.id.clone(),
+            action_name: "review-pr".to_owned(),
+            item,
+            cols: 80,
+            rows: 24,
+        },
+        test_connection_options(),
+    )
+    .await
+    .expect("launch linked GitHub PR");
+
+    let expected_prompt =
+        "PR 7: Fix filters\nBody text\nbranch=feature/filters\nurl=https://github.example/repo/pull/7\n";
+    assert_eq!(wait_for_file(&prompt_out).await, expected_prompt);
+    assert_eq!(launched.session.branch.as_deref(), Some("feature/filters"));
+    assert_eq!(
+        launched.session.metadata,
+        std::collections::BTreeMap::from([
+            ("link.provider".to_owned(), "github".to_owned()),
+            ("link.kind".to_owned(), "pull_request".to_owned()),
+            ("link.id".to_owned(), "7".to_owned()),
+            (
+                "link.url".to_owned(),
+                "https://github.example/repo/pull/7".to_owned(),
+            ),
+            ("link.branch".to_owned(), "feature/filters".to_owned()),
+        ])
+    );
+
+    let after = load_host_snapshot(&host)
+        .await
+        .expect("snapshot after github launch")
         .sessions;
     assert_eq!(after.len(), before + 1);
     assert_eq!(
@@ -1008,7 +1238,16 @@ struct LoopbackDaemon {
 
 impl LoopbackDaemon {
     async fn spawn(tag: &str, version: &str) -> Self {
-        Self::spawn_with_config(tag, version, None, None).await
+        Self::spawn_with_config(tag, version, None, None, None, false).await
+    }
+
+    async fn spawn_with_store_path(
+        tag: &str,
+        version: &str,
+        store_path: PathBuf,
+        load_resume: bool,
+    ) -> Self {
+        Self::spawn_with_config(tag, version, None, None, Some(store_path), load_resume).await
     }
 
     async fn spawn_with_config(
@@ -1016,14 +1255,18 @@ impl LoopbackDaemon {
         version: &str,
         config_dir: Option<PathBuf>,
         shell_command: Option<pohunek_daemon::session::ShellCommand>,
+        store_path: Option<PathBuf>,
+        load_resume: bool,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("loopback bind");
         let addr = listener.local_addr().expect("local addr");
+        let store_path =
+            store_path.unwrap_or_else(|| temp_dir(&format!("{tag}-state")).join("metadata.jsonl"));
         let mut config = SessionRegistryConfig {
             stop_grace: Duration::from_millis(50),
-            store_path: Some(temp_dir(&format!("{tag}-state")).join("metadata.jsonl")),
+            store_path: Some(store_path),
             worktree_root: Some(temp_dir(&format!("{tag}-worktrees"))),
             config_dir,
             ..SessionRegistryConfig::default()
@@ -1031,7 +1274,11 @@ impl LoopbackDaemon {
         if let Some(shell_command) = shell_command {
             config.shell_command = shell_command;
         }
-        let state = DaemonState::new(HealthInfo::new(version), SessionRegistry::new(config));
+        let sessions = SessionRegistry::new(config);
+        if load_resume {
+            sessions.load_and_resume().await;
+        }
+        let state = DaemonState::new(HealthInfo::new(version), sessions);
         let server = RemoteServer::from_listener(listener, state);
         let (shutdown, rx) = oneshot::channel();
         let tag = tag.to_owned();
@@ -1227,6 +1474,55 @@ fn write_file(path: &Path, body: &str) {
     std::fs::write(path, body).expect("write file");
 }
 
+fn write_provider_action_fixture(
+    repo: &Path,
+    prompt_name: &str,
+    action_name: &str,
+    provider: &str,
+    prompt_content: &str,
+) {
+    let agent = if provider == "github_pr" {
+        "claude"
+    } else {
+        "codex"
+    };
+    write_file(
+        &repo.join(".pohunek/templates.toml"),
+        &format!(
+            r#"
+[template.{prompt_name}]
+agent = "{agent}"
+prompt = "{prompt_name}"
+base_branch = "develop"
+"#
+        ),
+    );
+    write_file(
+        &repo.join(".pohunek/actions.toml"),
+        &format!(
+            r#"
+[action.{action_name}]
+template = "{prompt_name}"
+provider = "{provider}"
+"#
+        ),
+    );
+    write_file(
+        &repo.join(format!(".pohunek/prompts/{prompt_name}.tmpl")),
+        prompt_content,
+    );
+}
+
+fn expected_linear_link_metadata() -> pohunek_gui_core::SessionLinkMetadata {
+    pohunek_gui_core::SessionLinkMetadata {
+        provider: SessionLinkProvider::Linear,
+        kind: SessionLinkKind::Issue,
+        id: "LIN-123".to_owned(),
+        url: "https://linear.test/LIN-123".to_owned(),
+        branch: "lin-123-fix-launcher".to_owned(),
+    }
+}
+
 async fn wait_for_file(path: &Path) -> String {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -1240,6 +1536,64 @@ async fn wait_for_file(path: &Path) -> String {
             now < deadline,
             "file {} was not written before deadline",
             path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn report_native_id(host: &HostConfig, id: &SessionId, agent: &str, native_id: &str) {
+    let mut client = client(host).await;
+    let request = Request::new(
+        "gui-core-report-native-id",
+        method::SESSION_REPORT_NATIVE_ID,
+        serde_json::to_value(SessionReportNativeIdParams {
+            session_id: id.clone(),
+            agent: agent.to_owned(),
+            native_session_id: native_id.to_owned(),
+            transcript_path: None,
+        })
+        .expect("serialize native id params"),
+    );
+    let _ = client
+        .request(&request)
+        .await
+        .expect("session.report_native_id");
+}
+
+async fn wait_for_native_id_tcp(host: &HostConfig, id: &SessionId, native_id: &str) -> SessionInfo {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let inspected = inspect_session(host, id).await.expect("inspect native id");
+        if inspected.native_session_id.as_deref() == Some(native_id) {
+            return inspected;
+        }
+        let now = tokio::time::Instant::now();
+        assert!(now < deadline, "native id was not captured before deadline");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_session_with_metadata(
+    host: &HostConfig,
+    id: &SessionId,
+    metadata: &std::collections::BTreeMap<String, String>,
+) -> SessionInfo {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let sessions = load_host_snapshot(host)
+            .await
+            .expect("snapshot while waiting for resumed session")
+            .sessions;
+        if let Some(session) = sessions
+            .into_iter()
+            .find(|session| session.id == *id && session.metadata == *metadata)
+        {
+            return session;
+        }
+        let now = tokio::time::Instant::now();
+        assert!(
+            now < deadline,
+            "resumed session metadata was not visible before deadline"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

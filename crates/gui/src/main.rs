@@ -15,14 +15,17 @@ use iced::{window, Element, Fill, Size, Subscription, Task, Theme};
 use pohunek_gui_core::{
     add_project_with_options, create_session_with_options, default_state_dir, discover_hosts,
     inspect_session_with_options, launch_action_prompt_with_options,
-    list_project_actions_with_options, list_projects_with_options, preview_action_prompt,
-    preview_prompt_content, remove_project_with_options, rename_project_with_options,
-    resolve_project_action_with_options, resolve_project_prompt_with_options,
-    session_metadata_rows, set_session_metadata_with_options, show_project_with_options,
-    spawn_attach_command, stop_session_with_options, AttachCommandSpawner, AttachTemplateValues,
-    ConnState, ConnectionOptions, HostConfig, HostId, Message as CoreMessage, NotificationIntent,
-    PromptContext, PromptLaunchParams, PromptProvider, Selection, Toast, TreeNodeId, UiState,
-    WindowSize, Workspace,
+    launch_provider_item_with_options, list_project_actions_with_options,
+    list_projects_with_options, preview_action_prompt, preview_prompt_content, providers,
+    remove_project_with_options, rename_project_with_options, resolve_project_action_with_options,
+    resolve_project_prompt_with_options, session_link_metadata, session_metadata_rows,
+    set_session_metadata_with_options, show_project_with_options, spawn_attach_command,
+    stop_session_with_options, AttachCommandSpawner, AttachTemplateValues, ConnState,
+    ConnectionOptions, GitHubProviderScope, GitHubPullRequestStatusKey, HostConfig, HostId,
+    Message as CoreMessage, NotificationIntent, PromptContext, PromptLaunchParams, PromptProvider,
+    ProviderLaunchItem, ProviderLaunchParams, ProviderOperation, ProviderPanel, ProviderRequestId,
+    Selection, SessionLinkKind, SessionLinkProvider, Toast, TreeNodeId, UiState, WindowSize,
+    Workspace,
 };
 use protocol::{
     ProjectActionParams, ProjectActionsParams, ProjectAddParams, ProjectInfo, ProjectPromptParams,
@@ -272,6 +275,12 @@ enum Message {
     PreviewPrompt,
     PreviewAction,
     LaunchPromptAction,
+    FetchLinearIssues,
+    FetchGitHubPullRequests,
+    FetchGitHubIssues,
+    FetchGitHubPullRequestStatus,
+    LaunchLinearIssue,
+    LaunchGitHubPullRequest,
     CoreCommandCompleted(Result<CoreMessage, String>),
     AttachSpawned(Result<(), String>),
     NotificationSent(Result<(), String>),
@@ -324,10 +333,8 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             host_id,
             project_id,
         } => {
-            app.workspace.selection = Some(Selection::Project {
-                host_id: host_id.clone(),
-                project_id: project_id.clone(),
-            });
+            app.workspace
+                .select_project(host_id.clone(), project_id.clone());
             app.ui_state.selection = app.workspace.selection.clone();
             app.project_edit.reference = project_id;
             app.prompt_edit.reference = app.project_edit.reference.clone();
@@ -433,6 +440,68 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             Ok(task) => tasks.push(task),
             Err(err) => app.status = Some(err),
         },
+        Message::FetchLinearIssues => match begin_linear_issues_request(app) {
+            Ok(request_id) => push_provider_task_result(
+                app,
+                &mut tasks,
+                SessionLinkProvider::Linear,
+                ProviderOperation::LinearIssues,
+                Some(request_id),
+                fetch_linear_issues_task(app, request_id),
+            ),
+            Err(err) => app.status = Some(err),
+        },
+        Message::FetchGitHubPullRequests => match begin_github_pull_requests_request(app) {
+            Ok(request_id) => push_provider_task_result(
+                app,
+                &mut tasks,
+                SessionLinkProvider::GitHub,
+                ProviderOperation::GitHubPullRequests,
+                Some(request_id),
+                fetch_github_pull_requests_task(app, request_id),
+            ),
+            Err(err) => app.status = Some(err),
+        },
+        Message::FetchGitHubIssues => match begin_github_issues_request(app) {
+            Ok(request_id) => push_provider_task_result(
+                app,
+                &mut tasks,
+                SessionLinkProvider::GitHub,
+                ProviderOperation::GitHubIssues,
+                Some(request_id),
+                fetch_github_issues_task(app, request_id),
+            ),
+            Err(err) => app.status = Some(err),
+        },
+        Message::FetchGitHubPullRequestStatus => {
+            match begin_github_pull_request_status_request(app) {
+                Ok(request_id) => push_provider_task_result(
+                    app,
+                    &mut tasks,
+                    SessionLinkProvider::GitHub,
+                    ProviderOperation::GitHubPullRequestStatus,
+                    Some(request_id),
+                    fetch_github_pr_status_task(app, request_id),
+                ),
+                Err(err) => app.status = Some(err),
+            }
+        }
+        Message::LaunchLinearIssue => push_provider_task_result(
+            app,
+            &mut tasks,
+            SessionLinkProvider::Linear,
+            ProviderOperation::Launch,
+            None,
+            launch_linear_issue_task(app),
+        ),
+        Message::LaunchGitHubPullRequest => push_provider_task_result(
+            app,
+            &mut tasks,
+            SessionLinkProvider::GitHub,
+            ProviderOperation::Launch,
+            None,
+            launch_github_pull_request_task(app),
+        ),
         Message::CoreCommandCompleted(result) => match result {
             Ok(message) => app.workspace.apply(message),
             Err(err) => app.status = Some(err),
@@ -457,6 +526,53 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         }
     }
     Task::batch(tasks)
+}
+
+fn push_provider_task_result(
+    app: &mut PohunekApp,
+    tasks: &mut Vec<Task<Message>>,
+    provider: SessionLinkProvider,
+    operation: ProviderOperation,
+    request_id: Option<ProviderRequestId>,
+    result: Result<Task<Message>, String>,
+) {
+    match result {
+        Ok(task) => tasks.push(task),
+        Err(error) => match selected_host_id(app) {
+            Ok(host_id) => app.workspace.apply(CoreMessage::ProviderOperationFailed {
+                host_id,
+                provider,
+                operation,
+                request_id,
+                error,
+            }),
+            Err(_) => app.status = Some(error),
+        },
+    }
+}
+
+fn begin_linear_issues_request(app: &mut PohunekApp) -> Result<ProviderRequestId, String> {
+    let host_id = selected_host_id(app)?;
+    Ok(app.workspace.begin_linear_issues_request(host_id))
+}
+
+fn begin_github_pull_requests_request(app: &mut PohunekApp) -> Result<ProviderRequestId, String> {
+    let host_id = selected_host_id(app)?;
+    Ok(app.workspace.begin_github_pull_requests_request(host_id))
+}
+
+fn begin_github_issues_request(app: &mut PohunekApp) -> Result<ProviderRequestId, String> {
+    let host_id = selected_host_id(app)?;
+    Ok(app.workspace.begin_github_issues_request(host_id))
+}
+
+fn begin_github_pull_request_status_request(
+    app: &mut PohunekApp,
+) -> Result<ProviderRequestId, String> {
+    let host_id = selected_host_id(app)?;
+    Ok(app
+        .workspace
+        .begin_github_pull_request_status_request(host_id))
 }
 
 fn discover_hosts_task(config: &AppConfig) -> Task<Message> {
@@ -838,6 +954,238 @@ fn launch_prompt_action_task(app: &PohunekApp) -> Result<Task<Message>, String> 
                     preview,
                     cols: 80,
                     rows: 24,
+                    metadata: BTreeMap::new(),
+                },
+                options,
+            )
+            .await
+            {
+                Ok(result) => Ok(CoreMessage::SessionCreated {
+                    host_id,
+                    session: result.session,
+                }),
+                Err(err) => Ok(CoreMessage::HostOperationFailed {
+                    host_id,
+                    error: err.to_string(),
+                }),
+            }
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn fetch_linear_issues_task(
+    app: &PohunekApp,
+    request_id: ProviderRequestId,
+) -> Result<Task<Message>, String> {
+    let host_id = selected_host_id(app)?;
+    let config = app.config.as_ref().map_err(Clone::clone)?;
+    let linear = config
+        .providers
+        .linear
+        .clone()
+        .ok_or_else(|| "Linear provider is not configured".to_owned())?;
+    let host = app
+        .workspace
+        .hosts
+        .get(&host_id)
+        .ok_or_else(|| format!("unknown host `{host_id}`"))?;
+    let query = providers::linear::LinearQuery {
+        state: optional_field(&host.provider.linear.state_filter),
+        search: optional_field(&host.provider.linear.search),
+        ..providers::linear::LinearQuery::default()
+    };
+    let state_filter = host.provider.linear.state_filter.clone();
+    let search = host.provider.linear.search.clone();
+    Ok(Task::perform(
+        runtime::perform(async move {
+            let client = match providers::linear::HttpGraphqlTransport::try_new() {
+                Ok(transport) => providers::linear::LinearClient::new(
+                    providers::linear::LinearConfig {
+                        token_key: linear.token_key,
+                        endpoint: linear.endpoint,
+                        token_lookup_timeout: linear.token_lookup_timeout,
+                    },
+                    providers::linear::KeyringTokenSource::new("pohunek-linear"),
+                    transport,
+                ),
+                Err(err) => {
+                    return Ok(CoreMessage::ProviderOperationFailed {
+                        host_id,
+                        provider: SessionLinkProvider::Linear,
+                        operation: ProviderOperation::LinearIssues,
+                        request_id: Some(request_id),
+                        error: err.to_string(),
+                    });
+                }
+            };
+            match client.assigned_issues(query).await {
+                Ok(issues) => Ok(CoreMessage::LinearProviderIssuesLoaded {
+                    host_id,
+                    request_id,
+                    state_filter,
+                    search,
+                    issues,
+                }),
+                Err(err) => Ok(CoreMessage::ProviderOperationFailed {
+                    host_id,
+                    provider: SessionLinkProvider::Linear,
+                    operation: ProviderOperation::LinearIssues,
+                    request_id: Some(request_id),
+                    error: err.to_string(),
+                }),
+            }
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn fetch_github_pull_requests_task(
+    app: &PohunekApp,
+    request_id: ProviderRequestId,
+) -> Result<Task<Message>, String> {
+    let (host_id, scope, client) = github_client_for_selected_project(app)?;
+    Ok(Task::perform(
+        runtime::perform(async move {
+            match client.list_pull_requests().await {
+                Ok(pull_requests) => Ok(CoreMessage::GitHubProviderPullRequestsLoaded {
+                    host_id,
+                    request_id,
+                    scope,
+                    pull_requests,
+                }),
+                Err(err) => Ok(CoreMessage::ProviderOperationFailed {
+                    host_id,
+                    provider: SessionLinkProvider::GitHub,
+                    operation: ProviderOperation::GitHubPullRequests,
+                    request_id: Some(request_id),
+                    error: err.to_string(),
+                }),
+            }
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn fetch_github_issues_task(
+    app: &PohunekApp,
+    request_id: ProviderRequestId,
+) -> Result<Task<Message>, String> {
+    let (host_id, scope, client) = github_client_for_selected_project(app)?;
+    Ok(Task::perform(
+        runtime::perform(async move {
+            match client.list_issues().await {
+                Ok(issues) => Ok(CoreMessage::GitHubProviderIssuesLoaded {
+                    host_id,
+                    request_id,
+                    scope,
+                    issues,
+                }),
+                Err(err) => Ok(CoreMessage::ProviderOperationFailed {
+                    host_id,
+                    provider: SessionLinkProvider::GitHub,
+                    operation: ProviderOperation::GitHubIssues,
+                    request_id: Some(request_id),
+                    error: err.to_string(),
+                }),
+            }
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn fetch_github_pr_status_task(
+    app: &PohunekApp,
+    request_id: ProviderRequestId,
+) -> Result<Task<Message>, String> {
+    let target = selected_github_pr_status_target(app)?;
+    let (host_id, _scope, client) = github_client_for_selected_project(app)?;
+    Ok(Task::perform(
+        runtime::perform(async move {
+            match client.pull_request_status(target.number).await {
+                Ok(status) => Ok(CoreMessage::GitHubProviderPullRequestStatusLoaded {
+                    host_id,
+                    request_id,
+                    status_key: target.status_key,
+                    status,
+                }),
+                Err(err) => Ok(CoreMessage::ProviderOperationFailed {
+                    host_id,
+                    provider: SessionLinkProvider::GitHub,
+                    operation: ProviderOperation::GitHubPullRequestStatus,
+                    request_id: Some(request_id),
+                    error: err.to_string(),
+                }),
+            }
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn launch_linear_issue_task(app: &PohunekApp) -> Result<Task<Message>, String> {
+    let host = selected_host_config(app)?;
+    let host_id = host.id.clone();
+    let (project, _) = selected_project_identity(app)?;
+    let action_name = required_field(&app.prompt_edit.action_name, "action name")?;
+    let options = connection_options(app)?;
+    let issue = selected_linear_issue(app)?;
+    let context_json = issue.to_prompt_json().to_string();
+    let issue_id = issue.prompt_item_id().to_owned();
+    let item = ProviderLaunchItem::linear_issue(issue_id, context_json, issue.url)
+        .map_err(|err| err.to_string())?;
+    Ok(Task::perform(
+        runtime::perform(async move {
+            match launch_provider_item_with_options(
+                &host,
+                ProviderLaunchParams {
+                    project,
+                    action_name,
+                    item,
+                    cols: 80,
+                    rows: 24,
+                },
+                options,
+            )
+            .await
+            {
+                Ok(result) => Ok(CoreMessage::SessionCreated {
+                    host_id,
+                    session: result.session,
+                }),
+                Err(err) => Ok(CoreMessage::HostOperationFailed {
+                    host_id,
+                    error: err.to_string(),
+                }),
+            }
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn launch_github_pull_request_task(app: &PohunekApp) -> Result<Task<Message>, String> {
+    let host = selected_host_config(app)?;
+    let host_id = host.id.clone();
+    let (project, _) = selected_project_identity(app)?;
+    let action_name = required_field(&app.prompt_edit.action_name, "action name")?;
+    let options = connection_options(app)?;
+    let pull_request = selected_github_pull_request(app)?;
+    let context_json = pull_request.to_prompt_json().to_string();
+    let item = ProviderLaunchItem::github_pull_request(
+        pull_request.prompt_item_id(),
+        context_json,
+        pull_request.url,
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(Task::perform(
+        runtime::perform(async move {
+            match launch_provider_item_with_options(
+                &host,
+                ProviderLaunchParams {
+                    project,
+                    action_name,
+                    item,
+                    cols: 80,
+                    rows: 24,
                 },
                 options,
             )
@@ -936,6 +1284,149 @@ fn selected_project_reference(app: &PohunekApp) -> Result<String, String> {
             _ => None,
         })
         .ok_or_else(|| "select or enter a project reference".to_owned())
+}
+
+fn selected_project_identity(app: &PohunekApp) -> Result<(String, PathBuf), String> {
+    match app.ui_state.selection.as_ref() {
+        Some(Selection::Project {
+            host_id,
+            project_id,
+        }) => app
+            .workspace
+            .hosts
+            .get(host_id)
+            .and_then(|host| host.projects.get(project_id))
+            .map(|project| (project.id.clone(), project.repo_root.clone())),
+        Some(Selection::Session {
+            host_id,
+            session_id,
+        }) => app.workspace.hosts.get(host_id).and_then(|host| {
+            let project_id = host.sessions.get(&session_id.0)?.project_id.as_ref()?;
+            host.projects
+                .get(project_id)
+                .map(|project| (project.id.clone(), project.repo_root.clone()))
+        }),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        "select a project or linked project session before browsing providers".to_owned()
+    })
+}
+
+fn selected_github_scope(app: &PohunekApp) -> Result<GitHubProviderScope, String> {
+    let (project_id, repo_root) = selected_project_identity(app)?;
+    Ok(GitHubProviderScope::new(project_id, repo_root))
+}
+
+fn github_client_for_selected_project(
+    app: &PohunekApp,
+) -> Result<
+    (
+        HostId,
+        GitHubProviderScope,
+        providers::github::GitHubClient<providers::github::CommandGhRunner>,
+    ),
+    String,
+> {
+    let host_id = selected_host_id(app)?;
+    let (project_id, repo_cwd) = selected_project_identity(app)?;
+    let scope = GitHubProviderScope::new(project_id, repo_cwd.clone());
+    let github = app
+        .config
+        .as_ref()
+        .map_err(Clone::clone)?
+        .providers
+        .github
+        .clone()
+        .ok_or_else(|| "GitHub provider is not configured".to_owned())?;
+    let config = providers::github::GitHubConfig::new(github.gh_bin)
+        .with_repo_cwd(repo_cwd)
+        .with_timeout(github.timeout);
+    Ok((
+        host_id,
+        scope,
+        providers::github::GitHubClient::with_config(config),
+    ))
+}
+
+fn selected_linear_issue(app: &PohunekApp) -> Result<providers::linear::LinearIssue, String> {
+    let host_id = selected_host_id(app)?;
+    let host = app
+        .workspace
+        .hosts
+        .get(&host_id)
+        .ok_or_else(|| format!("unknown host `{host_id}`"))?;
+    let selected = host
+        .provider
+        .linear
+        .selected_issue_id
+        .as_ref()
+        .ok_or_else(|| "select a Linear issue first".to_owned())?;
+    host.provider
+        .linear
+        .issues
+        .iter()
+        .find(|issue| issue.prompt_item_id() == selected)
+        .cloned()
+        .ok_or_else(|| format!("selected Linear issue `{selected}` is not loaded"))
+}
+
+fn selected_github_pull_request(
+    app: &PohunekApp,
+) -> Result<providers::github::GitHubPullRequest, String> {
+    let host_id = selected_host_id(app)?;
+    let scope = selected_github_scope(app)?;
+    let host = app
+        .workspace
+        .hosts
+        .get(&host_id)
+        .ok_or_else(|| format!("unknown host `{host_id}`"))?;
+    if host.provider.github.scope.as_ref() != Some(&scope) {
+        return Err("fetch GitHub pull requests for the selected project first".to_owned());
+    }
+    let selected = host
+        .provider
+        .github
+        .selected_pull_request
+        .ok_or_else(|| "select a GitHub pull request first".to_owned())?;
+    host.provider
+        .github
+        .pull_requests
+        .iter()
+        .find(|pull_request| pull_request.number == selected)
+        .cloned()
+        .ok_or_else(|| format!("selected GitHub pull request `{selected}` is not loaded"))
+}
+
+#[derive(Debug, Clone)]
+struct GitHubStatusTarget {
+    number: u64,
+    status_key: GitHubPullRequestStatusKey,
+}
+
+fn selected_github_pr_status_target(app: &PohunekApp) -> Result<GitHubStatusTarget, String> {
+    let scope = selected_github_scope(app)?;
+    if let Some((_, session)) = selected_session(app) {
+        if let Some(link) = session_link_metadata(session) {
+            if link.provider == SessionLinkProvider::GitHub
+                && link.kind == SessionLinkKind::PullRequest
+            {
+                let number = link
+                    .id
+                    .parse::<u64>()
+                    .map_err(|err| format!("invalid linked GitHub PR id `{}`: {err}", link.id))?;
+                return Ok(GitHubStatusTarget {
+                    number,
+                    status_key: GitHubPullRequestStatusKey::new(scope, link.url),
+                });
+            }
+        }
+    }
+    let pull_request = selected_github_pull_request(app)?;
+    Ok(GitHubStatusTarget {
+        number: pull_request.number,
+        status_key: GitHubPullRequestStatusKey::new(scope, pull_request.url),
+    })
 }
 
 fn selected_prompt_project_reference(app: &PohunekApp) -> Result<String, String> {
@@ -1105,7 +1596,7 @@ fn push_missing_project_row<'a>(
             .values()
             .filter(|session| session.project_id.as_deref() == Some(project_id))
         {
-            tree = tree.push(session_tree_row(host_id, session));
+            tree = tree.push(session_tree_row(host_id, host, session));
         }
     }
     tree
@@ -1137,21 +1628,26 @@ fn push_project_row<'a>(
                 |project| session.project_id.as_deref() == Some(project.id.as_str()),
             )
         }) {
-            tree = tree.push(session_tree_row(host_id, session));
+            tree = tree.push(session_tree_row(host_id, host, session));
         }
     }
     tree
 }
 
-fn session_tree_row(host_id: &HostId, session: &SessionInfo) -> Element<'static, Message> {
+fn session_tree_row(
+    host_id: &HostId,
+    host: &pohunek_gui_core::HostView,
+    session: &SessionInfo,
+) -> Element<'static, Message> {
     let activity = session
         .activity
         .map_or("unknown", |activity| activity.as_str());
+    let provider_status = linked_pr_status_label(host, session);
     row![
         text("    "),
         button(text(format!(
-            "{}  {}  [{}]",
-            session.id.0, session.agent, activity
+            "{}  {}  [{}]{}",
+            session.id.0, session.agent, activity, provider_status
         )))
         .on_press(Message::SelectSession {
             host_id: host_id.clone(),
@@ -1207,6 +1703,7 @@ fn detail_view(app: &PohunekApp) -> Element<'_, Message> {
     detail = detail
         .push(new_session_view(app))
         .push(project_management_view(app))
+        .push(provider_browser_view(app))
         .push(prompt_management_view(app));
     for toast in app.workspace.toasts.iter().rev().take(3).rev() {
         detail = detail.push(toast_view(toast));
@@ -1238,6 +1735,29 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
             }
             if let Some(branch) = &session.branch {
                 detail = detail.push(text(format!("branch: {branch}")).size(14));
+            }
+            if let Some(link) = session_link_metadata(session) {
+                detail = detail.push(text(format!(
+                    "linked: {} {} {}",
+                    link.provider.as_str(),
+                    link.kind.as_str(),
+                    link.id
+                )));
+                if link.provider == SessionLinkProvider::GitHub
+                    && link.kind == SessionLinkKind::PullRequest
+                {
+                    let status = selected_host_config(app)
+                        .ok()
+                        .and_then(|host| app.workspace.hosts.get(&host.id))
+                        .and_then(|host| linked_github_status(host, session));
+                    detail = detail.push(text(format!(
+                        "PR status: {}",
+                        status.unwrap_or_else(|| "unknown".to_owned())
+                    )));
+                    detail = detail.push(
+                        button("Refresh PR status").on_press(Message::FetchGitHubPullRequestStatus),
+                    );
+                }
             }
             if let Some(path) = &session.worktree_path {
                 detail = detail.push(text(format!("worktree: {}", path.display())).size(14));
@@ -1398,6 +1918,183 @@ fn project_management_view(app: &PohunekApp) -> Element<'_, Message> {
     .into()
 }
 
+fn provider_browser_view(app: &PohunekApp) -> Element<'_, Message> {
+    let host_id = match selected_host_id(app) {
+        Ok(host_id) => host_id,
+        Err(err) => return column![text("Providers").size(18), text(err).size(13)].into(),
+    };
+    let Some(host) = app.workspace.hosts.get(&host_id) else {
+        return column![
+            text("Providers").size(18),
+            text("Host is not loaded").size(13)
+        ]
+        .into();
+    };
+    let tabs = row![
+        button("Linear").on_press(Message::Core(CoreMessage::ProviderPanelSelected {
+            host_id: host_id.clone(),
+            panel: ProviderPanel::Linear,
+        })),
+        button("GitHub").on_press(Message::Core(CoreMessage::ProviderPanelSelected {
+            host_id: host_id.clone(),
+            panel: ProviderPanel::GitHub,
+        }))
+    ]
+    .spacing(8);
+    let current_scope = selected_github_scope(app).ok();
+    let body = match host.provider.active_panel {
+        ProviderPanel::Linear => linear_provider_view(host_id.clone(), host),
+        ProviderPanel::GitHub => github_provider_view(host_id.clone(), current_scope, host),
+    };
+    column![text("Providers").size(18), tabs, body]
+        .spacing(8)
+        .into()
+}
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "owning host_id keeps the returned Iced element lifetime tied only to host state"
+)]
+fn linear_provider_view(
+    host_id: HostId,
+    host: &pohunek_gui_core::HostView,
+) -> Element<'_, Message> {
+    let state = &host.provider.linear;
+    let mut view = column![row![
+        text_input("state", &state.state_filter).on_input({
+            let host_id = host_id.clone();
+            move |value| {
+                Message::Core(CoreMessage::LinearProviderStateFilterChanged {
+                    host_id: host_id.clone(),
+                    value,
+                })
+            }
+        }),
+        text_input("search", &state.search).on_input({
+            let host_id = host_id.clone();
+            move |value| {
+                Message::Core(CoreMessage::LinearProviderSearchChanged {
+                    host_id: host_id.clone(),
+                    value,
+                })
+            }
+        }),
+        button("Fetch assigned").on_press(Message::FetchLinearIssues),
+    ]
+    .spacing(8)]
+    .spacing(8);
+    for issue in &state.issues {
+        view = view.push(
+            button(text(format!("{}  {}", issue.prompt_item_id(), issue.title)).size(13)).on_press(
+                Message::Core(CoreMessage::LinearProviderIssueSelected {
+                    host_id: host_id.clone(),
+                    issue_id: issue.prompt_item_id().to_owned(),
+                }),
+            ),
+        );
+    }
+    if let Some(issue) = selected_linear_issue_in_state(state) {
+        view = view
+            .push(text(format!("{}  {}", issue.prompt_item_id(), issue.url)).size(13))
+            .push(text(issue.body.clone()).size(13))
+            .push(button("Launch issue").on_press(Message::LaunchLinearIssue));
+    }
+    if let Some(error) = &state.last_error {
+        view = view.push(text(error).size(13));
+    }
+    view.into()
+}
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "owning host_id keeps the returned Iced element lifetime tied only to host state"
+)]
+fn github_provider_view(
+    host_id: HostId,
+    current_scope: Option<GitHubProviderScope>,
+    host: &pohunek_gui_core::HostView,
+) -> Element<'_, Message> {
+    let state = &host.provider.github;
+    let mut view = column![row![
+        text_input("search", &state.search).on_input({
+            let host_id = host_id.clone();
+            move |value| {
+                Message::Core(CoreMessage::GitHubProviderSearchChanged {
+                    host_id: host_id.clone(),
+                    value,
+                })
+            }
+        }),
+        button("Fetch PRs").on_press(Message::FetchGitHubPullRequests),
+        button("Fetch issues").on_press(Message::FetchGitHubIssues),
+        button("Refresh PR status").on_press(Message::FetchGitHubPullRequestStatus),
+    ]
+    .spacing(8)]
+    .spacing(8);
+    if state.scope != current_scope {
+        if state.scope.is_some() {
+            view = view.push(text("Fetch GitHub data for the selected project").size(13));
+        }
+        if let Some(error) = &state.last_error {
+            view = view.push(text(error).size(13));
+        }
+        return view.into();
+    }
+    view = view.push(text("Pull requests").size(15));
+    for pull_request in filtered_pull_requests(state) {
+        view = view.push(
+            button(text(format!("#{}  {}", pull_request.number, pull_request.title)).size(13))
+                .on_press(Message::Core(
+                    CoreMessage::GitHubProviderPullRequestSelected {
+                        host_id: host_id.clone(),
+                        number: pull_request.number,
+                    },
+                )),
+        );
+    }
+    if let Some(pull_request) = selected_pull_request_in_state(state) {
+        let status_key = state
+            .scope
+            .clone()
+            .map(|scope| GitHubPullRequestStatusKey::new(scope, pull_request.url.clone()));
+        let status = status_key
+            .as_ref()
+            .and_then(|key| state.pull_request_statuses.get(key))
+            .map_or_else(|| "status unknown".to_owned(), format_pr_status);
+        view = view
+            .push(
+                text(format!(
+                    "{}  {}",
+                    pull_request.head_ref_name, pull_request.url
+                ))
+                .size(13),
+            )
+            .push(text(format!("status: {status}")).size(13))
+            .push(text(pull_request.body.clone()).size(13))
+            .push(button("Launch PR").on_press(Message::LaunchGitHubPullRequest));
+    }
+    view = view.push(text("Issues").size(15));
+    for issue in filtered_github_issues(state) {
+        view = view.push(
+            button(text(format!("#{}  {}", issue.number, issue.title)).size(13)).on_press(
+                Message::Core(CoreMessage::GitHubProviderIssueSelected {
+                    host_id: host_id.clone(),
+                    number: issue.number,
+                }),
+            ),
+        );
+    }
+    if let Some(issue) = selected_github_issue_in_state(state) {
+        view = view
+            .push(text(format!("#{}  {}", issue.number, issue.url)).size(13))
+            .push(text(issue.body.clone()).size(13));
+    }
+    if let Some(error) = &state.last_error {
+        view = view.push(text(error).size(13));
+    }
+    view.into()
+}
+
 fn prompt_management_view(app: &PohunekApp) -> Element<'_, Message> {
     let mut view = column![
         text("Prompts").size(18),
@@ -1489,6 +2186,105 @@ fn push_prompt_state<'a>(
             .push(text(preview.rendered.clone()).size(13));
     }
     view
+}
+
+fn selected_linear_issue_in_state(
+    state: &pohunek_gui_core::LinearProviderState,
+) -> Option<&providers::linear::LinearIssue> {
+    let selected = state.selected_issue_id.as_ref()?;
+    state
+        .issues
+        .iter()
+        .find(|issue| issue.prompt_item_id() == selected)
+}
+
+fn selected_pull_request_in_state(
+    state: &pohunek_gui_core::GitHubProviderState,
+) -> Option<&providers::github::GitHubPullRequest> {
+    let selected = state.selected_pull_request?;
+    state
+        .pull_requests
+        .iter()
+        .find(|pull_request| pull_request.number == selected)
+}
+
+fn selected_github_issue_in_state(
+    state: &pohunek_gui_core::GitHubProviderState,
+) -> Option<&providers::github::GitHubIssue> {
+    let selected = state.selected_issue?;
+    state.issues.iter().find(|issue| issue.number == selected)
+}
+
+fn filtered_pull_requests(
+    state: &pohunek_gui_core::GitHubProviderState,
+) -> impl Iterator<Item = &providers::github::GitHubPullRequest> {
+    let search = state.search.trim().to_lowercase();
+    state.pull_requests.iter().filter(move |pull_request| {
+        search.is_empty()
+            || pull_request.title.to_lowercase().contains(&search)
+            || pull_request.number.to_string().contains(&search)
+            || pull_request.head_ref_name.to_lowercase().contains(&search)
+    })
+}
+
+fn filtered_github_issues(
+    state: &pohunek_gui_core::GitHubProviderState,
+) -> impl Iterator<Item = &providers::github::GitHubIssue> {
+    let search = state.search.trim().to_lowercase();
+    state.issues.iter().filter(move |issue| {
+        search.is_empty()
+            || issue.title.to_lowercase().contains(&search)
+            || issue.number.to_string().contains(&search)
+    })
+}
+
+fn linked_pr_status_label(host: &pohunek_gui_core::HostView, session: &SessionInfo) -> String {
+    linked_github_status(host, session)
+        .map(|status| format!("  [{status}]"))
+        .unwrap_or_default()
+}
+
+fn linked_github_status(
+    host: &pohunek_gui_core::HostView,
+    session: &SessionInfo,
+) -> Option<String> {
+    let link = session_link_metadata(session)?;
+    if link.provider != SessionLinkProvider::GitHub || link.kind != SessionLinkKind::PullRequest {
+        return None;
+    }
+    let scope = session
+        .project_id
+        .as_ref()
+        .and_then(|project_id| host.projects.get(project_id))
+        .map(GitHubProviderScope::from_project);
+    let status_key = scope.map(|scope| GitHubPullRequestStatusKey::new(scope, link.url.clone()));
+    Some(
+        status_key
+            .as_ref()
+            .and_then(|key| host.provider.github.pull_request_statuses.get(key))
+            .map_or_else(|| "pr status unknown".to_owned(), format_pr_status),
+    )
+}
+
+fn format_pr_status(status: &providers::github::PullRequestStatus) -> String {
+    let review = match &status.review_decision {
+        providers::github::ReviewDecision::Approved => "approved",
+        providers::github::ReviewDecision::ChangesRequested => "changes requested",
+        providers::github::ReviewDecision::ReviewRequired => "review required",
+        providers::github::ReviewDecision::None => "no review",
+        providers::github::ReviewDecision::Unknown(value) => value.as_str(),
+    };
+    let mut pass = 0;
+    let mut fail = 0;
+    let mut pending = 0;
+    for check in &status.checks {
+        match check.conclusion.as_deref().unwrap_or(check.status.as_str()) {
+            "pass" | "SUCCESS" | "COMPLETED" => pass += 1,
+            "fail" | "FAILURE" | "ERROR" | "cancel" => fail += 1,
+            _ => pending += 1,
+        }
+    }
+    format!("review={review} checks={pass} pass/{fail} fail/{pending} pending")
 }
 
 fn provider_kind_label(provider: &ProviderKind) -> &'static str {
@@ -1612,6 +2408,7 @@ struct AppConfig {
     local_host: HostConfig,
     connection_options: ConnectionOptions,
     notification_command: String,
+    providers: ProviderAppConfig,
 }
 
 impl AppConfig {
@@ -1636,8 +2433,28 @@ impl AppConfig {
             notification_command: raw
                 .notification_command
                 .unwrap_or_else(|| DEFAULT_NOTIFICATION_COMMAND.to_owned()),
+            providers: raw.providers.unwrap_or_default().into_provider_config()?,
         })
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProviderAppConfig {
+    linear: Option<LinearAppConfig>,
+    github: Option<GitHubAppConfig>,
+}
+
+#[derive(Debug, Clone)]
+struct LinearAppConfig {
+    token_key: String,
+    endpoint: String,
+    token_lookup_timeout: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct GitHubAppConfig {
+    gh_bin: PathBuf,
+    timeout: Duration,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1648,6 +2465,8 @@ struct RawConfig {
     notification_command: Option<String>,
     #[serde(default)]
     gui: Option<RawGuiConfig>,
+    #[serde(default)]
+    providers: Option<RawProvidersConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1662,6 +2481,69 @@ struct RawGuiConfig {
     backoff_initial_ms: Option<u64>,
     #[serde(default)]
     backoff_max_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawProvidersConfig {
+    #[serde(default)]
+    linear: Option<RawLinearProviderConfig>,
+    #[serde(default)]
+    github: Option<RawGitHubProviderConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLinearProviderConfig {
+    token_key: String,
+    endpoint: String,
+    token_timeout_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawGitHubProviderConfig {
+    gh_bin: PathBuf,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+impl RawProvidersConfig {
+    fn into_provider_config(self) -> Result<ProviderAppConfig, ConfigError> {
+        Ok(ProviderAppConfig {
+            linear: self
+                .linear
+                .map(RawLinearProviderConfig::into_app_config)
+                .transpose()?,
+            github: self
+                .github
+                .map(RawGitHubProviderConfig::into_app_config)
+                .transpose()?,
+        })
+    }
+}
+
+impl RawLinearProviderConfig {
+    fn into_app_config(self) -> Result<LinearAppConfig, ConfigError> {
+        Ok(LinearAppConfig {
+            token_key: non_empty_config_value(self.token_key, "providers.linear.token_key")?,
+            endpoint: validate_http_endpoint(self.endpoint, "providers.linear.endpoint")?,
+            token_lookup_timeout: required_duration_millis(
+                self.token_timeout_ms,
+                "providers.linear.token_timeout_ms",
+            )?,
+        })
+    }
+}
+
+impl RawGitHubProviderConfig {
+    fn into_app_config(self) -> Result<GitHubAppConfig, ConfigError> {
+        Ok(GitHubAppConfig {
+            gh_bin: non_empty_config_path(self.gh_bin, "providers.github.gh_bin")?,
+            timeout: duration_millis(
+                self.timeout_ms,
+                "providers.github.timeout_ms",
+                Duration::from_secs(20),
+            )?,
+        })
+    }
 }
 
 impl RawGuiConfig {
@@ -1718,6 +2600,53 @@ enum ConfigError {
     },
 }
 
+fn non_empty_config_value(value: String, field: &'static str) -> Result<String, ConfigError> {
+    if value.trim().is_empty() {
+        Err(ConfigError::Invalid {
+            field,
+            message: "must not be empty".to_owned(),
+        })
+    } else {
+        Ok(value)
+    }
+}
+
+fn non_empty_config_path(value: PathBuf, field: &'static str) -> Result<PathBuf, ConfigError> {
+    if value.as_os_str().is_empty() {
+        Err(ConfigError::Invalid {
+            field,
+            message: "must not be empty".to_owned(),
+        })
+    } else if value.components().count() > 1 && !value.exists() {
+        Err(ConfigError::Invalid {
+            field,
+            message: "path does not exist".to_owned(),
+        })
+    } else {
+        Ok(value)
+    }
+}
+
+fn validate_http_endpoint(value: String, field: &'static str) -> Result<String, ConfigError> {
+    let value = non_empty_config_value(value, field)?;
+    let Some(rest) = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+    else {
+        return Err(ConfigError::Invalid {
+            field,
+            message: "must start with http:// or https://".to_owned(),
+        });
+    };
+    if rest.split('/').next().is_none_or(str::is_empty) {
+        return Err(ConfigError::Invalid {
+            field,
+            message: "must include a host".to_owned(),
+        });
+    }
+    Ok(value)
+}
+
 fn duration_millis(
     value: Option<u64>,
     field: &'static str,
@@ -1733,6 +2662,17 @@ fn duration_millis(
             Ok(Duration::from_millis(millis))
         }
     })
+}
+
+fn required_duration_millis(value: u64, field: &'static str) -> Result<Duration, ConfigError> {
+    if value == 0 {
+        Err(ConfigError::Invalid {
+            field,
+            message: "must be greater than zero".to_owned(),
+        })
+    } else {
+        Ok(Duration::from_millis(value))
+    }
 }
 
 fn duration_secs(
@@ -1775,5 +2715,115 @@ fn require_env(key: &'static str) -> Result<String, ConfigError> {
         _ => Err(ConfigError::MissingEnv {
             var: key.to_owned(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_project_identity_ignores_manual_project_reference() {
+        let host_id = HostId::new("local");
+        let project = ProjectInfo {
+            id: "selected-project".to_owned(),
+            label: "Selected project".to_owned(),
+            repo_root: PathBuf::from("/tmp/selected-project"),
+            git_common_dir: PathBuf::from("/tmp/selected-project/.git"),
+            origin_url: None,
+            default_base_branch: None,
+            source: protocol::ProjectSource::Manual,
+            is_bare: false,
+            added_at: "2026-06-29T00:00:00Z".to_owned(),
+            last_used_at: "2026-06-29T00:00:00Z".to_owned(),
+        };
+        let mut host = pohunek_gui_core::HostView {
+            conn: ConnState::Connected,
+            health: None,
+            sessions: BTreeMap::new(),
+            projects: BTreeMap::new(),
+            project_details: BTreeMap::new(),
+            prompt: pohunek_gui_core::PromptState::default(),
+            provider: pohunek_gui_core::ProviderState::default(),
+            last_agent_state: None,
+            last_error: None,
+        };
+        host.projects.insert(project.id.clone(), project.clone());
+
+        let mut app = PohunekApp {
+            workspace: Workspace::default(),
+            config: Err("test config is intentionally absent".to_owned()),
+            hosts: Vec::new(),
+            ui_state: UiState::default(),
+            new_session: NewSessionForm::default(),
+            metadata_edit: MetadataEdit::default(),
+            project_edit: ProjectEdit {
+                reference: "manual-project".to_owned(),
+                ..ProjectEdit::default()
+            },
+            prompt_edit: PromptEdit::default(),
+            state_dir: None,
+            status: None,
+            notified_intents: 0,
+        };
+        app.workspace.hosts.insert(host_id.clone(), host);
+        app.ui_state.selection = Some(Selection::Project {
+            host_id: host_id.clone(),
+            project_id: project.id.clone(),
+        });
+        app.workspace.selection.clone_from(&app.ui_state.selection);
+
+        let (project_id, repo_root) = selected_project_identity(&app).expect("selected project");
+
+        assert_eq!(project_id, project.id);
+        assert_eq!(repo_root, project.repo_root);
+        assert_eq!(
+            selected_project_reference(&app).expect("manual reference"),
+            "manual-project"
+        );
+    }
+
+    #[test]
+    fn provider_config_rejects_linear_endpoint_without_http_scheme() {
+        let err = validate_http_endpoint(
+            "linear.example/graphql".to_owned(),
+            "providers.linear.endpoint",
+        )
+        .expect_err("endpoint without scheme");
+
+        assert!(err
+            .to_string()
+            .contains("must start with http:// or https://"));
+    }
+
+    #[test]
+    fn provider_config_rejects_zero_linear_token_timeout() {
+        let err = RawLinearProviderConfig {
+            token_key: "linear-token-ref".to_owned(),
+            endpoint: "https://linear.example/graphql".to_owned(),
+            token_timeout_ms: 0,
+        }
+        .into_app_config()
+        .expect_err("zero token timeout");
+
+        assert!(err.to_string().contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn provider_config_accepts_command_name_for_gh_bin() {
+        let path = non_empty_config_path(PathBuf::from("gh"), "providers.github.gh_bin")
+            .expect("command name");
+
+        assert_eq!(path, PathBuf::from("gh"));
+    }
+
+    #[test]
+    fn provider_config_rejects_missing_explicit_gh_path() {
+        let missing =
+            std::env::temp_dir().join(format!("pohunek-gui-missing-gh-bin-{}", std::process::id()));
+        let err = non_empty_config_path(missing, "providers.github.gh_bin")
+            .expect_err("missing explicit path");
+
+        assert!(err.to_string().contains("path does not exist"));
     }
 }

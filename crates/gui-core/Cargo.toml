@@ -8,9 +8,11 @@ description = "Pure state and SDK bridge logic for the pohunek native GUI."
 
 [dependencies]
 futures = { workspace = true }
+keyring = { workspace = true }
 pohunek-client = { workspace = true }
 pohunek-prompt = { workspace = true }
 pohunek-protocol = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

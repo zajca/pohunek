@@ -6,6 +6,8 @@
 // Rust guideline compliant 2026-06-26
 #![forbid(unsafe_code)]
 
+pub mod providers;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -204,6 +206,230 @@ pub struct PromptLaunchParams {
     pub preview: PromptPreview,
     pub cols: u16,
     pub rows: u16,
+    pub metadata: BTreeMap<String, String>,
+}
+
+/// Provider session link owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionLinkProvider {
+    /// Linear issue provider.
+    Linear,
+    /// GitHub provider.
+    GitHub,
+}
+
+impl SessionLinkProvider {
+    /// Stable metadata value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Linear => "linear",
+            Self::GitHub => "github",
+        }
+    }
+
+    const fn from_metadata(value: &str) -> Option<Self> {
+        match value.as_bytes() {
+            b"linear" => Some(Self::Linear),
+            b"github" => Some(Self::GitHub),
+            _ => None,
+        }
+    }
+}
+
+/// Provider item kind stored in session link metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionLinkKind {
+    /// Issue work item.
+    Issue,
+    /// Pull request work item.
+    PullRequest,
+}
+
+impl SessionLinkKind {
+    /// Stable metadata value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Issue => "issue",
+            Self::PullRequest => "pull_request",
+        }
+    }
+
+    const fn from_metadata(value: &str) -> Option<Self> {
+        match value.as_bytes() {
+            b"issue" => Some(Self::Issue),
+            b"pull_request" => Some(Self::PullRequest),
+            _ => None,
+        }
+    }
+}
+
+/// Opaque provider link metadata written at `session.new`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLinkMetadata {
+    pub provider: SessionLinkProvider,
+    pub kind: SessionLinkKind,
+    pub id: String,
+    pub url: String,
+    pub branch: String,
+}
+
+impl SessionLinkMetadata {
+    /// Creates validated link metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::MissingLinkField`] when an opaque link value is empty.
+    pub fn new(
+        provider: SessionLinkProvider,
+        kind: SessionLinkKind,
+        id: impl Into<String>,
+        url: impl Into<String>,
+        branch: impl Into<String>,
+    ) -> Result<Self, CoreError> {
+        let link = Self {
+            provider,
+            kind,
+            id: id.into(),
+            url: url.into(),
+            branch: branch.into(),
+        };
+        link.validate()?;
+        Ok(link)
+    }
+
+    /// Returns metadata keys accepted by `session.new`.
+    #[must_use]
+    pub fn to_session_metadata(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                "link.provider".to_owned(),
+                self.provider.as_str().to_owned(),
+            ),
+            ("link.kind".to_owned(), self.kind.as_str().to_owned()),
+            ("link.id".to_owned(), self.id.clone()),
+            ("link.url".to_owned(), self.url.clone()),
+            ("link.branch".to_owned(), self.branch.clone()),
+        ])
+    }
+
+    fn validate(&self) -> Result<(), CoreError> {
+        checked_link_value("link.id", self.id.clone())?;
+        checked_link_value("link.url", self.url.clone())?;
+        checked_link_value("link.branch", self.branch.clone())?;
+        Ok(())
+    }
+}
+
+fn checked_link_value(field: &'static str, value: String) -> Result<String, CoreError> {
+    if value.trim().is_empty() {
+        Err(CoreError::MissingLinkField { field })
+    } else {
+        Ok(value)
+    }
+}
+
+/// Provider item context used to resolve, render, launch, and link a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderLaunchItem {
+    action_provider: ProviderKind,
+    prompt_provider: PromptProvider,
+    item_id: String,
+    context_json: String,
+    link_provider: SessionLinkProvider,
+    link_kind: SessionLinkKind,
+    link_url: String,
+}
+
+/// Provider launch request that resolves a project action before `session.new`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderLaunchParams {
+    pub project: String,
+    pub action_name: String,
+    pub item: ProviderLaunchItem,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+impl ProviderLaunchItem {
+    /// Builds a launch context for a Linear issue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::MissingLinkField`] when required link metadata is empty.
+    pub fn linear_issue(
+        item_id: impl Into<String>,
+        context_json: impl Into<String>,
+        url: impl Into<String>,
+    ) -> Result<Self, CoreError> {
+        let item_id = checked_link_value("link.id", item_id.into())?;
+        Ok(Self {
+            action_provider: ProviderKind::LinearIssue,
+            prompt_provider: PromptProvider::LinearIssue,
+            link_provider: SessionLinkProvider::Linear,
+            link_kind: SessionLinkKind::Issue,
+            link_url: checked_link_value("link.url", url.into())?,
+            item_id,
+            context_json: context_json.into(),
+        })
+    }
+
+    /// Builds a launch context for a GitHub pull request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::MissingLinkField`] when required link metadata is empty.
+    pub fn github_pull_request(
+        number: impl Into<String>,
+        context_json: impl Into<String>,
+        url: impl Into<String>,
+    ) -> Result<Self, CoreError> {
+        let number = checked_link_value("link.id", number.into())?;
+        Ok(Self {
+            action_provider: ProviderKind::GithubPr,
+            prompt_provider: PromptProvider::GitHubPr,
+            link_provider: SessionLinkProvider::GitHub,
+            link_kind: SessionLinkKind::PullRequest,
+            link_url: checked_link_value("link.url", url.into())?,
+            item_id: number,
+            context_json: context_json.into(),
+        })
+    }
+
+    fn validate_link_invariants(&self) -> Result<(), CoreError> {
+        let expected = match (
+            &self.action_provider,
+            self.prompt_provider,
+            self.link_provider,
+            self.link_kind,
+        ) {
+            (
+                ProviderKind::LinearIssue,
+                PromptProvider::LinearIssue,
+                SessionLinkProvider::Linear,
+                SessionLinkKind::Issue,
+            )
+            | (
+                ProviderKind::GithubPr,
+                PromptProvider::GitHubPr,
+                SessionLinkProvider::GitHub,
+                SessionLinkKind::PullRequest,
+            ) => return Ok(()),
+            _ => "action provider, prompt provider, and link metadata must describe the same provider item",
+        };
+        Err(CoreError::ProviderLaunchItemMismatch { message: expected })
+    }
+
+    fn to_session_link(&self, branch: impl Into<String>) -> Result<SessionLinkMetadata, CoreError> {
+        SessionLinkMetadata::new(
+            self.link_provider,
+            self.link_kind,
+            self.item_id.clone(),
+            self.link_url.clone(),
+            branch,
+        )
+    }
 }
 
 /// Prompt/action browse and preview state for one host.
@@ -213,6 +439,121 @@ pub struct PromptState {
     pub resolved_prompt: Option<ProjectPromptResult>,
     pub resolved_action: Option<ProjectActionResult>,
     pub preview: Option<PromptPreview>,
+}
+
+/// Active provider browser panel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProviderPanel {
+    /// Linear issues.
+    #[default]
+    Linear,
+    /// GitHub issues and pull requests.
+    GitHub,
+}
+
+/// Provider browser state owned by gui-core.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderState {
+    pub active_panel: ProviderPanel,
+    pub linear: LinearProviderState,
+    pub github: GitHubProviderState,
+}
+
+/// Monotonic id for one provider request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProviderRequestId(u64);
+
+impl ProviderRequestId {
+    /// Borrow the numeric request id.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Provider operation used to reject stale async completions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderOperation {
+    /// Linear assigned issue fetch.
+    LinearIssues,
+    /// GitHub pull request list fetch.
+    GitHubPullRequests,
+    /// GitHub issue list fetch.
+    GitHubIssues,
+    /// GitHub PR status fetch.
+    GitHubPullRequestStatus,
+    /// Provider launch action.
+    Launch,
+}
+
+/// Linear provider browser state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinearProviderState {
+    pub state_filter: String,
+    pub search: String,
+    pub issues: Vec<providers::linear::LinearIssue>,
+    pub selected_issue_id: Option<String>,
+    pub active_request: Option<ProviderRequestId>,
+    pub last_error: Option<String>,
+}
+
+/// GitHub provider browser state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitHubProviderState {
+    pub scope: Option<GitHubProviderScope>,
+    pub search: String,
+    pub pull_requests: Vec<providers::github::GitHubPullRequest>,
+    pub issues: Vec<providers::github::GitHubIssue>,
+    pub selected_pull_request: Option<u64>,
+    pub selected_issue: Option<u64>,
+    pub pull_requests_request: Option<ProviderRequestId>,
+    pub issues_request: Option<ProviderRequestId>,
+    pub pull_request_status_request: Option<ProviderRequestId>,
+    pub pull_request_statuses:
+        BTreeMap<GitHubPullRequestStatusKey, providers::github::PullRequestStatus>,
+    pub last_error: Option<String>,
+}
+
+/// GitHub repository scope for provider data loaded through `gh`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GitHubProviderScope {
+    pub project_id: String,
+    pub repo_root: PathBuf,
+}
+
+impl GitHubProviderScope {
+    /// Construct a GitHub provider scope from the selected project identity.
+    #[must_use]
+    pub fn new(project_id: impl Into<String>, repo_root: impl Into<PathBuf>) -> Self {
+        Self {
+            project_id: project_id.into(),
+            repo_root: repo_root.into(),
+        }
+    }
+
+    /// Construct a GitHub provider scope from a daemon project record.
+    #[must_use]
+    pub fn from_project(project: &ProjectInfo) -> Self {
+        Self::new(project.id.clone(), project.repo_root.clone())
+    }
+}
+
+/// Cache key for GitHub PR status loaded for a specific repository scope.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GitHubPullRequestStatusKey {
+    pub scope: GitHubProviderScope,
+    pub url: String,
+}
+
+impl GitHubPullRequestStatusKey {
+    /// Construct a PR status cache key.
+    #[must_use]
+    pub fn new(scope: GitHubProviderScope, url: impl Into<String>) -> Self {
+        Self {
+            scope,
+            url: url.into(),
+        }
+    }
 }
 
 /// Parsed `agent_state` event payload.
@@ -312,6 +653,66 @@ pub enum Message {
     PromptPreviewRendered {
         host_id: HostId,
         preview: PromptPreview,
+    },
+    ProviderPanelSelected {
+        host_id: HostId,
+        panel: ProviderPanel,
+    },
+    LinearProviderStateFilterChanged {
+        host_id: HostId,
+        value: String,
+    },
+    LinearProviderSearchChanged {
+        host_id: HostId,
+        value: String,
+    },
+    LinearProviderIssuesLoaded {
+        host_id: HostId,
+        request_id: ProviderRequestId,
+        state_filter: String,
+        search: String,
+        issues: Vec<providers::linear::LinearIssue>,
+    },
+    LinearProviderIssueSelected {
+        host_id: HostId,
+        issue_id: String,
+    },
+    GitHubProviderSearchChanged {
+        host_id: HostId,
+        value: String,
+    },
+    GitHubProviderPullRequestsLoaded {
+        host_id: HostId,
+        request_id: ProviderRequestId,
+        scope: GitHubProviderScope,
+        pull_requests: Vec<providers::github::GitHubPullRequest>,
+    },
+    GitHubProviderIssuesLoaded {
+        host_id: HostId,
+        request_id: ProviderRequestId,
+        scope: GitHubProviderScope,
+        issues: Vec<providers::github::GitHubIssue>,
+    },
+    GitHubProviderPullRequestSelected {
+        host_id: HostId,
+        number: u64,
+    },
+    GitHubProviderIssueSelected {
+        host_id: HostId,
+        number: u64,
+    },
+    GitHubProviderPullRequestStatusLoaded {
+        host_id: HostId,
+        request_id: ProviderRequestId,
+        status_key: GitHubPullRequestStatusKey,
+        status: providers::github::PullRequestStatus,
+    },
+    ProviderOperationFailed {
+        host_id: HostId,
+        provider: SessionLinkProvider,
+        operation: ProviderOperation,
+        request_id: Option<ProviderRequestId>,
+        error: String,
     },
     HostOperationFailed {
         host_id: HostId,
@@ -518,6 +919,7 @@ pub struct HostView {
     pub projects: BTreeMap<String, ProjectInfo>,
     pub project_details: BTreeMap<String, ProjectShowResult>,
     pub prompt: PromptState,
+    pub provider: ProviderState,
     pub last_agent_state: Option<AgentStateEvent>,
     pub last_error: Option<String>,
 }
@@ -531,6 +933,7 @@ impl HostView {
             projects: BTreeMap::new(),
             project_details: BTreeMap::new(),
             prompt: PromptState::default(),
+            provider: ProviderState::default(),
             last_agent_state: None,
             last_error: None,
         }
@@ -545,9 +948,100 @@ pub struct Workspace {
     pub notification_intents: Vec<NotificationIntent>,
     pub toasts: Vec<Toast>,
     next_intent_id: u64,
+    next_provider_request_id: u64,
 }
 
 impl Workspace {
+    fn next_provider_request_id(&mut self) -> ProviderRequestId {
+        self.next_provider_request_id = self.next_provider_request_id.saturating_add(1);
+        ProviderRequestId(self.next_provider_request_id)
+    }
+
+    /// Mark a Linear issue fetch as the current request for `host_id`.
+    pub fn begin_linear_issues_request(&mut self, host_id: HostId) -> ProviderRequestId {
+        let request_id = self.next_provider_request_id();
+        let host = self
+            .hosts
+            .entry(host_id)
+            .or_insert_with(HostView::connecting);
+        host.provider.linear.active_request = Some(request_id);
+        host.provider.linear.last_error = None;
+        request_id
+    }
+
+    /// Mark a GitHub pull request list fetch as the current request for `host_id`.
+    pub fn begin_github_pull_requests_request(&mut self, host_id: HostId) -> ProviderRequestId {
+        let request_id = self.next_provider_request_id();
+        let host = self
+            .hosts
+            .entry(host_id)
+            .or_insert_with(HostView::connecting);
+        host.provider.github.pull_requests_request = Some(request_id);
+        host.provider.github.last_error = None;
+        request_id
+    }
+
+    /// Mark a GitHub issue list fetch as the current request for `host_id`.
+    pub fn begin_github_issues_request(&mut self, host_id: HostId) -> ProviderRequestId {
+        let request_id = self.next_provider_request_id();
+        let host = self
+            .hosts
+            .entry(host_id)
+            .or_insert_with(HostView::connecting);
+        host.provider.github.issues_request = Some(request_id);
+        host.provider.github.last_error = None;
+        request_id
+    }
+
+    /// Mark a GitHub pull request status fetch as the current request for `host_id`.
+    pub fn begin_github_pull_request_status_request(
+        &mut self,
+        host_id: HostId,
+    ) -> ProviderRequestId {
+        let request_id = self.next_provider_request_id();
+        let host = self
+            .hosts
+            .entry(host_id)
+            .or_insert_with(HostView::connecting);
+        host.provider.github.pull_request_status_request = Some(request_id);
+        host.provider.github.last_error = None;
+        request_id
+    }
+
+    /// Invalidate pending GitHub provider requests for `host_id`.
+    pub fn invalidate_github_provider_requests(&mut self, host_id: &HostId) {
+        if let Some(host) = self.hosts.get_mut(host_id) {
+            host.provider.github.pull_requests_request = None;
+            host.provider.github.issues_request = None;
+            host.provider.github.pull_request_status_request = None;
+        }
+    }
+
+    fn selected_github_scope(&self, host_id: &HostId) -> Option<GitHubProviderScope> {
+        match self.selection.as_ref()? {
+            Selection::Project {
+                host_id: selected_host,
+                project_id,
+            } if selected_host == host_id => self
+                .hosts
+                .get(host_id)?
+                .projects
+                .get(project_id)
+                .map(GitHubProviderScope::from_project),
+            Selection::Session {
+                host_id: selected_host,
+                session_id,
+            } if selected_host == host_id => {
+                let host = self.hosts.get(host_id)?;
+                let project_id = host.sessions.get(&session_id.0)?.project_id.as_ref()?;
+                host.projects
+                    .get(project_id)
+                    .map(GitHubProviderScope::from_project)
+            }
+            _ => None,
+        }
+    }
+
     /// Apply one async message to the workspace state.
     #[expect(
         clippy::too_many_lines,
@@ -601,6 +1095,10 @@ impl Workspace {
                     .hosts
                     .get(&host_id)
                     .map_or_else(PromptState::default, |host| host.prompt.clone());
+                let previous_provider = self
+                    .hosts
+                    .get(&host_id)
+                    .map_or_else(ProviderState::default, |host| host.provider.clone());
                 self.hosts.insert(
                     snapshot.host_id,
                     HostView {
@@ -610,6 +1108,7 @@ impl Workspace {
                         projects,
                         project_details: previous_details,
                         prompt: previous_prompt,
+                        provider: previous_provider,
                         last_agent_state: None,
                         last_error: snapshot.project_error,
                     },
@@ -782,6 +1281,187 @@ impl Workspace {
                 host.prompt.preview = Some(preview);
                 host.last_error = None;
             }
+            Message::ProviderPanelSelected { host_id, panel } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                host.provider.active_panel = panel;
+            }
+            Message::LinearProviderStateFilterChanged { host_id, value } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                host.provider.linear.state_filter = value;
+                host.provider.linear.active_request = None;
+            }
+            Message::LinearProviderSearchChanged { host_id, value } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                host.provider.linear.search = value;
+                host.provider.linear.active_request = None;
+            }
+            Message::LinearProviderIssuesLoaded {
+                host_id,
+                request_id,
+                state_filter,
+                search,
+                issues,
+            } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                if host.provider.linear.active_request != Some(request_id) {
+                    return;
+                }
+                if host.provider.linear.state_filter != state_filter
+                    || host.provider.linear.search != search
+                {
+                    return;
+                }
+                host.provider.linear.active_request = None;
+                host.provider.linear.issues = issues;
+                host.provider.linear.selected_issue_id = None;
+                host.provider.linear.last_error = None;
+            }
+            Message::LinearProviderIssueSelected { host_id, issue_id } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                host.provider.linear.selected_issue_id = Some(issue_id);
+            }
+            Message::GitHubProviderSearchChanged { host_id, value } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                host.provider.github.search = value;
+            }
+            Message::GitHubProviderPullRequestsLoaded {
+                host_id,
+                request_id,
+                scope,
+                pull_requests,
+            } => {
+                if self
+                    .selected_github_scope(&host_id)
+                    .as_ref()
+                    .is_some_and(|current| current != &scope)
+                {
+                    return;
+                }
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                if host.provider.github.pull_requests_request != Some(request_id) {
+                    return;
+                }
+                host.provider.github.pull_requests_request = None;
+                if host.provider.github.scope.as_ref() != Some(&scope) {
+                    host.provider.github.issues.clear();
+                    host.provider.github.selected_issue = None;
+                }
+                host.provider.github.scope = Some(scope);
+                host.provider.github.pull_requests = pull_requests;
+                host.provider.github.selected_pull_request = None;
+                host.provider.github.last_error = None;
+            }
+            Message::GitHubProviderIssuesLoaded {
+                host_id,
+                request_id,
+                scope,
+                issues,
+            } => {
+                if self
+                    .selected_github_scope(&host_id)
+                    .as_ref()
+                    .is_some_and(|current| current != &scope)
+                {
+                    return;
+                }
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                if host.provider.github.issues_request != Some(request_id) {
+                    return;
+                }
+                host.provider.github.issues_request = None;
+                if host.provider.github.scope.as_ref() != Some(&scope) {
+                    host.provider.github.pull_requests.clear();
+                    host.provider.github.selected_pull_request = None;
+                }
+                host.provider.github.scope = Some(scope);
+                host.provider.github.issues = issues;
+                host.provider.github.selected_issue = None;
+                host.provider.github.last_error = None;
+            }
+            Message::GitHubProviderPullRequestSelected { host_id, number } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                host.provider.github.selected_pull_request = Some(number);
+            }
+            Message::GitHubProviderIssueSelected { host_id, number } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                host.provider.github.selected_issue = Some(number);
+            }
+            Message::GitHubProviderPullRequestStatusLoaded {
+                host_id,
+                request_id,
+                status_key,
+                status,
+            } => {
+                if self
+                    .selected_github_scope(&host_id)
+                    .as_ref()
+                    .is_some_and(|current| current != &status_key.scope)
+                {
+                    return;
+                }
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                if host.provider.github.pull_request_status_request != Some(request_id) {
+                    return;
+                }
+                host.provider.github.pull_request_status_request = None;
+                host.provider
+                    .github
+                    .pull_request_statuses
+                    .insert(status_key, status);
+                host.provider.github.last_error = None;
+            }
+            Message::ProviderOperationFailed {
+                host_id,
+                provider,
+                operation,
+                request_id,
+                error,
+            } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                if !apply_provider_request_failure(host, provider, operation, request_id) {
+                    return;
+                }
+                match provider {
+                    SessionLinkProvider::Linear => host.provider.linear.last_error = Some(error),
+                    SessionLinkProvider::GitHub => host.provider.github.last_error = Some(error),
+                }
+            }
             Message::HostOperationFailed { host_id, error } => {
                 let host = self
                     .hosts
@@ -794,9 +1474,19 @@ impl Workspace {
 
     /// Select a session in the detail pane.
     pub fn select_session(&mut self, host_id: HostId, session_id: SessionId) {
+        self.invalidate_github_provider_requests(&host_id);
         self.selection = Some(Selection::Session {
             host_id,
             session_id,
+        });
+    }
+
+    /// Select a project in the detail pane.
+    pub fn select_project(&mut self, host_id: HostId, project_id: String) {
+        self.invalidate_github_provider_requests(&host_id);
+        self.selection = Some(Selection::Project {
+            host_id,
+            project_id,
         });
     }
 
@@ -830,6 +1520,49 @@ impl Workspace {
                 .then_with(|| left.session_id.0.cmp(&right.session_id.0))
         });
         monitor
+    }
+}
+
+fn apply_provider_request_failure(
+    host: &mut HostView,
+    provider: SessionLinkProvider,
+    operation: ProviderOperation,
+    request_id: Option<ProviderRequestId>,
+) -> bool {
+    let Some(request_id) = request_id else {
+        return true;
+    };
+    match (provider, operation) {
+        (SessionLinkProvider::Linear, ProviderOperation::LinearIssues) => {
+            if host.provider.linear.active_request != Some(request_id) {
+                return false;
+            }
+            host.provider.linear.active_request = None;
+            true
+        }
+        (SessionLinkProvider::GitHub, ProviderOperation::GitHubPullRequests) => {
+            if host.provider.github.pull_requests_request != Some(request_id) {
+                return false;
+            }
+            host.provider.github.pull_requests_request = None;
+            true
+        }
+        (SessionLinkProvider::GitHub, ProviderOperation::GitHubIssues) => {
+            if host.provider.github.issues_request != Some(request_id) {
+                return false;
+            }
+            host.provider.github.issues_request = None;
+            true
+        }
+        (SessionLinkProvider::GitHub, ProviderOperation::GitHubPullRequestStatus) => {
+            if host.provider.github.pull_request_status_request != Some(request_id) {
+                return false;
+            }
+            host.provider.github.pull_request_status_request = None;
+            true
+        }
+        (_, ProviderOperation::Launch) => true,
+        _ => false,
     }
 }
 
@@ -873,6 +1606,18 @@ pub fn session_metadata_rows(session: &SessionInfo) -> Vec<MetadataRow> {
             value: value.clone(),
         })
         .collect()
+}
+
+/// Return parsed provider link metadata when a session is linked.
+#[must_use]
+pub fn session_link_metadata(session: &SessionInfo) -> Option<SessionLinkMetadata> {
+    let provider =
+        SessionLinkProvider::from_metadata(session.metadata.get("link.provider")?.as_str())?;
+    let kind = SessionLinkKind::from_metadata(session.metadata.get("link.kind")?.as_str())?;
+    let id = session.metadata.get("link.id")?.clone();
+    let url = session.metadata.get("link.url")?.clone();
+    let branch = session.metadata.get("link.branch")?.clone();
+    SessionLinkMetadata::new(provider, kind, id, url, branch).ok()
 }
 
 fn activity_rank(activity: Option<AgentActivity>) -> u8 {
@@ -982,6 +1727,15 @@ pub enum CoreError {
     MissingDiscoveredHostName,
     #[error("provider `{provider}` context is missing a branch field")]
     MissingPromptBranch { provider: &'static str },
+    #[error("provider link metadata is missing `{field}`")]
+    MissingLinkField { field: &'static str },
+    #[error("project action resolved provider `{actual}` but provider item requires `{expected}`")]
+    ProviderActionMismatch {
+        expected: &'static str,
+        actual: &'static str,
+    },
+    #[error("provider launch item is inconsistent: {message}")]
+    ProviderLaunchItemMismatch { message: &'static str },
 }
 
 /// Load one host snapshot with `daemon.health` and `session.list`.
@@ -1357,7 +2111,58 @@ pub async fn launch_action_prompt_with_options(
             branch,
             base_branch: params.action.base_branch,
             input: Some(params.preview.rendered),
-            metadata: BTreeMap::new(),
+            metadata: params.metadata,
+        },
+        options,
+    )
+    .await
+}
+
+/// Resolve a provider action, render its prompt, and launch exactly one linked session.
+pub async fn launch_provider_item_with_options(
+    config: &HostConfig,
+    params: ProviderLaunchParams,
+    options: ConnectionOptions,
+) -> Result<SessionNewResult, CoreError> {
+    params.item.validate_link_invariants()?;
+    let action = resolve_project_action_with_options(
+        config,
+        ProjectActionParams {
+            reference: params.project.clone(),
+            name: params.action_name,
+        },
+        options,
+    )
+    .await?;
+    if action.provider != params.item.action_provider {
+        return Err(CoreError::ProviderActionMismatch {
+            expected: params.item.action_provider.as_str(),
+            actual: action.provider.as_str(),
+        });
+    }
+
+    let preview = preview_action_prompt(
+        &action,
+        params.item.item_id.clone(),
+        params.item.context_json.clone(),
+    )?;
+    let branch = preview
+        .branch
+        .clone()
+        .or_else(|| action.branch.clone())
+        .ok_or(CoreError::MissingPromptBranch {
+            provider: params.item.prompt_provider.as_str(),
+        })?;
+    let link = params.item.to_session_link(branch)?;
+    launch_action_prompt_with_options(
+        config,
+        PromptLaunchParams {
+            project: params.project,
+            action,
+            preview,
+            cols: params.cols,
+            rows: params.rows,
+            metadata: link.to_session_metadata(),
         },
         options,
     )
@@ -1879,6 +2684,300 @@ mod tests {
     }
 
     #[test]
+    fn workspace_applies_provider_browser_state() {
+        let host_id = HostId::new("local");
+        let mut workspace = Workspace::default();
+        workspace.apply(Message::ProviderPanelSelected {
+            host_id: host_id.clone(),
+            panel: ProviderPanel::GitHub,
+        });
+        workspace.apply(Message::LinearProviderSearchChanged {
+            host_id: host_id.clone(),
+            value: "launcher".to_owned(),
+        });
+        let request_id = workspace.begin_linear_issues_request(host_id.clone());
+        workspace.apply(Message::LinearProviderIssuesLoaded {
+            host_id: host_id.clone(),
+            request_id,
+            state_filter: String::new(),
+            search: "launcher".to_owned(),
+            issues: vec![providers::linear::LinearIssue {
+                id: "opaque".to_owned(),
+                identifier: "LIN-123".to_owned(),
+                title: "Fix launcher".to_owned(),
+                body: "Issue body".to_owned(),
+                branch: "lin-123-fix-launcher".to_owned(),
+                url: "https://linear.test/LIN-123".to_owned(),
+            }],
+        });
+        workspace.apply(Message::LinearProviderIssueSelected {
+            host_id: host_id.clone(),
+            issue_id: "LIN-123".to_owned(),
+        });
+
+        let host = workspace.hosts.get(&host_id).expect("host");
+        assert_eq!(host.provider.active_panel, ProviderPanel::GitHub);
+        assert_eq!(host.provider.linear.search, "launcher");
+        assert_eq!(
+            host.provider.linear.selected_issue_id.as_deref(),
+            Some("LIN-123")
+        );
+    }
+
+    #[test]
+    fn workspace_records_github_pr_status_without_session_mutation() {
+        let host_id = HostId::new("local");
+        let scope = GitHubProviderScope::new("project-a", "/repo/a");
+        let status_key =
+            GitHubPullRequestStatusKey::new(scope, "https://github.example/repo/pull/7");
+        let mut workspace = Workspace::default();
+        let request_id = workspace.begin_github_pull_request_status_request(host_id.clone());
+        workspace.apply(Message::GitHubProviderPullRequestStatusLoaded {
+            host_id: host_id.clone(),
+            request_id,
+            status_key: status_key.clone(),
+            status: providers::github::PullRequestStatus {
+                review_decision: providers::github::ReviewDecision::Approved,
+                checks: vec![providers::github::CheckRun {
+                    name: "test".to_owned(),
+                    status: "SUCCESS".to_owned(),
+                    conclusion: Some("pass".to_owned()),
+                    details_url: None,
+                }],
+            },
+        });
+
+        let host = workspace.hosts.get(&host_id).expect("host");
+        assert!(host.sessions.is_empty());
+        assert!(host
+            .provider
+            .github
+            .pull_request_statuses
+            .contains_key(&status_key));
+    }
+
+    #[test]
+    fn workspace_ignores_stale_linear_provider_results() {
+        let host_id = HostId::new("local");
+        let mut workspace = Workspace::default();
+        let request_id = workspace.begin_linear_issues_request(host_id.clone());
+        workspace.apply(Message::LinearProviderSearchChanged {
+            host_id: host_id.clone(),
+            value: "new".to_owned(),
+        });
+        workspace.apply(Message::LinearProviderIssuesLoaded {
+            host_id: host_id.clone(),
+            request_id,
+            state_filter: String::new(),
+            search: "old".to_owned(),
+            issues: vec![providers::linear::LinearIssue {
+                id: "opaque".to_owned(),
+                identifier: "LIN-123".to_owned(),
+                title: "Stale issue".to_owned(),
+                body: String::new(),
+                branch: "lin-123".to_owned(),
+                url: "https://linear.test/LIN-123".to_owned(),
+            }],
+        });
+
+        let host = workspace.hosts.get(&host_id).expect("host");
+        assert!(host.provider.linear.issues.is_empty());
+    }
+
+    #[test]
+    fn github_provider_lists_are_scoped_to_project() {
+        let host_id = HostId::new("local");
+        let mut workspace = Workspace::default();
+        let pull_requests_request = workspace.begin_github_pull_requests_request(host_id.clone());
+        workspace.apply(Message::GitHubProviderPullRequestsLoaded {
+            host_id: host_id.clone(),
+            request_id: pull_requests_request,
+            scope: GitHubProviderScope::new("project-a", "/repo/a"),
+            pull_requests: vec![providers::github::GitHubPullRequest {
+                number: 7,
+                title: "A".to_owned(),
+                body: String::new(),
+                head_ref_name: "feature/a".to_owned(),
+                url: "https://github.example/a/pull/7".to_owned(),
+            }],
+        });
+        let issues_request = workspace.begin_github_issues_request(host_id.clone());
+        workspace.apply(Message::GitHubProviderIssuesLoaded {
+            host_id: host_id.clone(),
+            request_id: issues_request,
+            scope: GitHubProviderScope::new("project-b", "/repo/b"),
+            issues: vec![providers::github::GitHubIssue {
+                number: 7,
+                title: "B".to_owned(),
+                body: String::new(),
+                url: "https://github.example/b/issues/7".to_owned(),
+                branch: None,
+            }],
+        });
+
+        let host = workspace.hosts.get(&host_id).expect("host");
+        assert_eq!(
+            host.provider.github.scope.as_ref(),
+            Some(&GitHubProviderScope::new("project-b", "/repo/b"))
+        );
+        assert!(host.provider.github.pull_requests.is_empty());
+        assert_eq!(host.provider.github.issues.len(), 1);
+    }
+
+    #[test]
+    fn github_provider_lists_are_scoped_to_repo_root() {
+        let host_id = HostId::new("local");
+        let mut workspace = Workspace::default();
+        let pull_requests_request = workspace.begin_github_pull_requests_request(host_id.clone());
+        workspace.apply(Message::GitHubProviderPullRequestsLoaded {
+            host_id: host_id.clone(),
+            request_id: pull_requests_request,
+            scope: GitHubProviderScope::new("project-a", "/repo/a"),
+            pull_requests: vec![providers::github::GitHubPullRequest {
+                number: 7,
+                title: "A".to_owned(),
+                body: String::new(),
+                head_ref_name: "feature/a".to_owned(),
+                url: "https://github.example/a/pull/7".to_owned(),
+            }],
+        });
+        let issues_request = workspace.begin_github_issues_request(host_id.clone());
+        workspace.apply(Message::GitHubProviderIssuesLoaded {
+            host_id: host_id.clone(),
+            request_id: issues_request,
+            scope: GitHubProviderScope::new("project-a", "/repo/b"),
+            issues: vec![providers::github::GitHubIssue {
+                number: 8,
+                title: "B".to_owned(),
+                body: String::new(),
+                url: "https://github.example/b/issues/8".to_owned(),
+                branch: None,
+            }],
+        });
+
+        let host = workspace.hosts.get(&host_id).expect("host");
+        assert_eq!(
+            host.provider.github.scope.as_ref(),
+            Some(&GitHubProviderScope::new("project-a", "/repo/b"))
+        );
+        assert!(host.provider.github.pull_requests.is_empty());
+        assert_eq!(host.provider.github.issues.len(), 1);
+    }
+
+    #[test]
+    fn github_provider_ignores_stale_repo_scope_response() {
+        let host_id = HostId::new("local");
+        let mut workspace = Workspace::default();
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: HostSnapshot {
+                host_id: host_id.clone(),
+                health: HealthSummary {
+                    status: "ok".to_owned(),
+                    daemon_version: "0.0.0".to_owned(),
+                    protocol_version: protocol::PROTOCOL_VERSION,
+                },
+                sessions: Vec::new(),
+                projects: vec![project("project-a", "/repo/current")],
+                project_error: None,
+            },
+        });
+        workspace.selection = Some(Selection::Project {
+            host_id: host_id.clone(),
+            project_id: "project-a".to_owned(),
+        });
+        let request_id = workspace.begin_github_pull_requests_request(host_id.clone());
+        workspace.apply(Message::GitHubProviderPullRequestsLoaded {
+            host_id: host_id.clone(),
+            request_id,
+            scope: GitHubProviderScope::new("project-a", "/repo/stale"),
+            pull_requests: vec![providers::github::GitHubPullRequest {
+                number: 7,
+                title: "Stale".to_owned(),
+                body: String::new(),
+                head_ref_name: "feature/stale".to_owned(),
+                url: "https://github.example/stale/pull/7".to_owned(),
+            }],
+        });
+
+        let host = workspace.hosts.get(&host_id).expect("host");
+        assert!(host.provider.github.scope.is_none());
+        assert!(host.provider.github.pull_requests.is_empty());
+    }
+
+    #[test]
+    fn github_provider_ignores_stale_same_scope_success() {
+        let host_id = HostId::new("local");
+        let scope = GitHubProviderScope::new("project-a", "/repo/current");
+        let mut workspace = Workspace::default();
+        let stale_request = workspace.begin_github_pull_requests_request(host_id.clone());
+        let current_request = workspace.begin_github_pull_requests_request(host_id.clone());
+        workspace.apply(Message::GitHubProviderPullRequestsLoaded {
+            host_id: host_id.clone(),
+            request_id: current_request,
+            scope: scope.clone(),
+            pull_requests: vec![providers::github::GitHubPullRequest {
+                number: 9,
+                title: "Current".to_owned(),
+                body: String::new(),
+                head_ref_name: "feature/current".to_owned(),
+                url: "https://github.example/current/pull/9".to_owned(),
+            }],
+        });
+        workspace.apply(Message::GitHubProviderPullRequestsLoaded {
+            host_id: host_id.clone(),
+            request_id: stale_request,
+            scope,
+            pull_requests: vec![providers::github::GitHubPullRequest {
+                number: 7,
+                title: "Stale".to_owned(),
+                body: String::new(),
+                head_ref_name: "feature/stale".to_owned(),
+                url: "https://github.example/stale/pull/7".to_owned(),
+            }],
+        });
+
+        let host = workspace.hosts.get(&host_id).expect("host");
+        assert_eq!(host.provider.github.pull_requests.len(), 1);
+        assert_eq!(host.provider.github.pull_requests[0].number, 9);
+    }
+
+    #[test]
+    fn provider_operation_failed_ignores_stale_request() {
+        let host_id = HostId::new("local");
+        let mut workspace = Workspace::default();
+        let stale_request = workspace.begin_linear_issues_request(host_id.clone());
+        let _current_request = workspace.begin_linear_issues_request(host_id.clone());
+        workspace.apply(Message::ProviderOperationFailed {
+            host_id: host_id.clone(),
+            provider: SessionLinkProvider::Linear,
+            operation: ProviderOperation::LinearIssues,
+            request_id: Some(stale_request),
+            error: "stale failure".to_owned(),
+        });
+
+        let host = workspace.hosts.get(&host_id).expect("host");
+        assert!(host.provider.linear.last_error.is_none());
+    }
+
+    #[test]
+    fn provider_operation_failed_ignores_request_invalidated_by_selection() {
+        let host_id = HostId::new("local");
+        let mut workspace = Workspace::default();
+        let stale_request = workspace.begin_github_pull_requests_request(host_id.clone());
+        workspace.select_project(host_id.clone(), "project-a".to_owned());
+        workspace.apply(Message::ProviderOperationFailed {
+            host_id: host_id.clone(),
+            provider: SessionLinkProvider::GitHub,
+            operation: ProviderOperation::GitHubPullRequests,
+            request_id: Some(stale_request),
+            error: "stale failure".to_owned(),
+        });
+
+        let host = workspace.hosts.get(&host_id).expect("host");
+        assert!(host.provider.github.last_error.is_none());
+    }
+
+    #[test]
     fn snapshot_seed_does_not_notify_existing_blocked_session() {
         let mut workspace = Workspace::default();
         let host_id = HostId::new("local");
@@ -1995,6 +3094,21 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_owned(),
             updated_at: "2026-01-01T00:00:00Z".to_owned(),
             exit_code: None,
+        }
+    }
+
+    fn project(id: &str, repo_root: &str) -> ProjectInfo {
+        ProjectInfo {
+            id: id.to_owned(),
+            label: id.to_owned(),
+            repo_root: PathBuf::from(repo_root),
+            git_common_dir: PathBuf::from(repo_root).join(".git"),
+            origin_url: None,
+            default_base_branch: None,
+            source: protocol::ProjectSource::Manual,
+            is_bare: false,
+            added_at: "2026-01-01T00:00:00Z".to_owned(),
+            last_used_at: "2026-01-01T00:00:00Z".to_owned(),
         }
     }
 }
