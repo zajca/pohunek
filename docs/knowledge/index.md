@@ -12,8 +12,8 @@ Start here:
   [worktrees](concepts/worktrees.md), and
   [agent profiles](concepts/agent-profiles.md) describe the operating model.
 - [Setup](guides/setup.md), [project setup](guides/project-setup.md),
-  [remote hosts](guides/remote-hosts.md), and [launcher](guides/launcher.md)
-  cover common configuration paths.
+  [remote hosts](guides/remote-hosts.md), [launcher](guides/launcher.md), and
+  [GUI setup](guides/gui.md) cover common configuration paths.
 - [Debug daemon](runbooks/debug-daemon.md),
   [debug launcher](runbooks/debug-launcher.md), and
   [update after release](runbooks/update-after-release.md) are operational

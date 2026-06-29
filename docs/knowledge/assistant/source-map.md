@@ -35,6 +35,14 @@ Current CLI and command surface:
 - `crates/cli/src/paths.rs`
 - `crates/cli/src/error.rs`
 
+Native GUI client:
+
+- `crates/gui/src/main.rs`
+- `crates/gui/src/runtime.rs`
+- `crates/gui-core/src/lib.rs`
+- `crates/gui-core/tests/loopback.rs`
+- `docs/phases/06-native-app.md`
+
 Daemon, sessions, integrations, and project state:
 
 - `crates/daemon/src/assistant.rs`

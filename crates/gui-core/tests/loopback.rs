@@ -14,12 +14,16 @@ use pohunek_client::Client;
 use pohunek_daemon::api::{DaemonState, HealthInfo, RemoteServer};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use pohunek_gui_core::{
-    host_subscription_stream, load_host_snapshot, workspace_connection_stream, AgentStateEvent,
-    ConnState, ConnectionOptions, DetailTab, HostConfig, HostEvent, Message, Selection, TreeNodeId,
-    UiState, WindowSize, Workspace,
+    add_project, host_subscription_stream, inspect_session, list_projects, load_host_snapshot,
+    remove_project, rename_project, session_metadata_rows, set_session_metadata, show_project,
+    spawn_attach_command, stop_session as stop_gui_session, workspace_connection_stream,
+    AgentStateEvent, AttachCommandSpawner, AttachSpawnIntent, AttachTemplateValues, ConnState,
+    ConnectionOptions, DetailTab, HostConfig, HostEvent, Message, Selection, TreeNodeId, UiState,
+    WindowSize, Workspace,
 };
 use protocol::{
-    method, AgentActivity, AgentKind, Request, SessionId, SessionInfo, SessionNewParams,
+    method, AgentActivity, AgentKind, ProjectAddParams, ProjectRemoveParams, ProjectRenameParams,
+    ProjectShowParams, Request, SessionId, SessionInfo, SessionNewParams, SessionSetMetadataParams,
     StateSource,
 };
 use tokio::net::TcpListener;
@@ -200,6 +204,326 @@ async fn unreachable_host_marks_error_without_breaking_other_hosts() {
     daemon.shutdown().await;
 }
 
+#[tokio::test]
+async fn session_lifecycle_create_inspect_and_stop_reconciles_workspace_state() {
+    let _path_lock = PATH_LOCK.lock().await;
+    let bin_dir = temp_dir("gui-core-m2-session-bin");
+    write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
+    let _path = PathGuard::prepend(&bin_dir);
+
+    let daemon = LoopbackDaemon::spawn("m2-session", "0.2.0-session").await;
+    let host = HostConfig::tcp("host-session", daemon.addr);
+    let mut workspace = Workspace::default();
+    let mut stream = Box::pin(workspace_connection_stream(
+        vec![host.clone()],
+        test_connection_options(),
+    ));
+    wait_for_host_connected(&mut workspace, &mut stream, &host).await;
+
+    let created = pohunek_gui_core::create_session(
+        &host,
+        SessionNewParams {
+            agent: agent_name(AgentKind::Codex).to_owned(),
+            cwd: Some(temp_dir("gui-core-m2-session-cwd")),
+            cols: 100,
+            rows: 32,
+            project: None,
+            repo: None,
+            branch: None,
+            base_branch: None,
+            input: None,
+            metadata: std::collections::BTreeMap::from([("source".to_owned(), "gui".to_owned())]),
+        },
+    )
+    .await
+    .expect("session.new through gui-core");
+    workspace.apply(Message::SessionCreated {
+        host_id: host.id.clone(),
+        session: created.session.clone(),
+    });
+    assert!(workspace
+        .hosts
+        .get(&host.id)
+        .expect("host view")
+        .sessions
+        .contains_key(&created.session.id.0));
+
+    let inspected = inspect_session(&host, &created.session.id)
+        .await
+        .expect("session.inspect through gui-core");
+    workspace.apply(Message::SessionInspected {
+        host_id: host.id.clone(),
+        session: inspected.clone(),
+    });
+    assert_eq!(inspected.id, created.session.id);
+    assert_eq!(session_metadata_rows(&inspected)[0].key, "source");
+
+    let stopped = stop_gui_session(&host, &created.session.id)
+        .await
+        .expect("session.stop through gui-core");
+    assert!(stopped.stopped);
+    workspace.apply(Message::SessionStopCompleted {
+        host_id: host.id.clone(),
+        session_id: created.session.id.clone(),
+        result: stopped,
+    });
+    assert_eq!(
+        workspace
+            .hosts
+            .get(&host.id)
+            .and_then(|view| view.sessions.get(&created.session.id.0))
+            .map(|session| session.state),
+        Some(protocol::SessionState::Stopped)
+    );
+
+    wait_for_session_state(
+        &mut workspace,
+        &mut stream,
+        &host,
+        &created.session.id,
+        protocol::SessionState::Stopped,
+    )
+    .await;
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn session_metadata_merge_and_clear_round_trips() {
+    let _path_lock = PATH_LOCK.lock().await;
+    let bin_dir = temp_dir("gui-core-m2-metadata-bin");
+    write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
+    let _path = PathGuard::prepend(&bin_dir);
+
+    let daemon = LoopbackDaemon::spawn("m2-metadata", "0.2.0-metadata").await;
+    let host = HostConfig::tcp("host-metadata", daemon.addr);
+    let created = pohunek_gui_core::create_session(
+        &host,
+        SessionNewParams {
+            agent: agent_name(AgentKind::Codex).to_owned(),
+            cwd: Some(temp_dir("gui-core-m2-metadata-cwd")),
+            cols: 80,
+            rows: 24,
+            project: None,
+            repo: None,
+            branch: None,
+            base_branch: None,
+            input: None,
+            metadata: std::collections::BTreeMap::from([
+                ("keep".to_owned(), "original".to_owned()),
+                ("remove".to_owned(), "gone".to_owned()),
+            ]),
+        },
+    )
+    .await
+    .expect("session.new with metadata");
+
+    let updated = set_session_metadata(
+        &host,
+        SessionSetMetadataParams {
+            session_id: created.session.id.clone(),
+            metadata: std::collections::BTreeMap::from([
+                ("keep".to_owned(), Some("updated".to_owned())),
+                ("remove".to_owned(), None),
+                ("added".to_owned(), Some("value".to_owned())),
+            ]),
+        },
+    )
+    .await
+    .expect("session.set_metadata");
+
+    assert_eq!(
+        updated.session.metadata,
+        std::collections::BTreeMap::from([
+            ("added".to_owned(), "value".to_owned()),
+            ("keep".to_owned(), "updated".to_owned()),
+        ])
+    );
+    let inspected = inspect_session(&host, &created.session.id)
+        .await
+        .expect("session.inspect after metadata update");
+    assert_eq!(inspected.metadata, updated.session.metadata);
+    assert_eq!(
+        session_metadata_rows(&inspected)
+            .into_iter()
+            .map(|row| (row.key, row.value))
+            .collect::<Vec<_>>(),
+        vec![
+            ("added".to_owned(), "value".to_owned()),
+            ("keep".to_owned(), "updated".to_owned()),
+        ]
+    );
+
+    stop_session(&host, &created.session.id).await;
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn project_add_list_show_rename_and_remove_round_trips() {
+    let _path_lock = PATH_LOCK.lock().await;
+    let daemon = LoopbackDaemon::spawn("m2-project", "0.2.0-project").await;
+    let host = HostConfig::tcp("host-project", daemon.addr);
+    let repo = init_git_repo("gui-core-m2-project-repo");
+
+    let added = add_project(
+        &host,
+        ProjectAddParams {
+            path: Some(repo.clone()),
+            name: Some("M2 Project".to_owned()),
+            base_branch: Some("main".to_owned()),
+        },
+    )
+    .await
+    .expect("project.add");
+    assert_eq!(added.label, "M2 Project");
+
+    let listed = list_projects(&host).await.expect("project.list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, added.id);
+
+    let shown = show_project(
+        &host,
+        ProjectShowParams {
+            reference: added.id.clone(),
+        },
+    )
+    .await
+    .expect("project.show");
+    assert_eq!(shown.project.id, added.id);
+    assert!(shown
+        .worktrees
+        .iter()
+        .any(|worktree| worktree.path == std::fs::canonicalize(&repo).expect("canonical repo")));
+
+    let renamed = rename_project(
+        &host,
+        ProjectRenameParams {
+            reference: added.id.clone(),
+            name: "Renamed M2 Project".to_owned(),
+        },
+    )
+    .await
+    .expect("project.rename");
+    assert_eq!(renamed.label, "Renamed M2 Project");
+
+    let removed = remove_project(
+        &host,
+        ProjectRemoveParams {
+            reference: renamed.id.clone(),
+            prune_worktrees: false,
+        },
+    )
+    .await
+    .expect("project.remove");
+    assert!(removed.removed);
+    assert!(list_projects(&host)
+        .await
+        .expect("project.list after remove")
+        .is_empty());
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn worktree_creation_is_session_new_with_branch_and_visible_in_project_show() {
+    let _path_lock = PATH_LOCK.lock().await;
+    let bin_dir = temp_dir("gui-core-m2-worktree-bin");
+    write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
+    let _path = PathGuard::prepend(&bin_dir);
+
+    let daemon = LoopbackDaemon::spawn("m2-worktree", "0.2.0-worktree").await;
+    let host = HostConfig::tcp("host-worktree", daemon.addr);
+    let repo = init_git_repo("gui-core-m2-worktree-repo");
+    let project = add_project(
+        &host,
+        ProjectAddParams {
+            path: Some(repo),
+            name: Some("Worktree Project".to_owned()),
+            base_branch: Some("main".to_owned()),
+        },
+    )
+    .await
+    .expect("project.add for worktree");
+
+    let created = pohunek_gui_core::create_session(
+        &host,
+        SessionNewParams {
+            agent: agent_name(AgentKind::Codex).to_owned(),
+            cwd: None,
+            cols: 80,
+            rows: 24,
+            project: Some(project.id.clone()),
+            repo: None,
+            branch: Some("feature/gui-m2".to_owned()),
+            base_branch: Some("main".to_owned()),
+            input: None,
+            metadata: std::collections::BTreeMap::new(),
+        },
+    )
+    .await
+    .expect("session.new creates worktree when branch is set");
+
+    assert_eq!(
+        created.session.project_id.as_deref(),
+        Some(project.id.as_str())
+    );
+    assert_eq!(created.session.branch.as_deref(), Some("feature/gui-m2"));
+    assert!(
+        created.session.worktree_path.is_some(),
+        "worktree creation must be represented by session.new with branch"
+    );
+
+    let shown = show_project(
+        &host,
+        ProjectShowParams {
+            reference: project.id.clone(),
+        },
+    )
+    .await
+    .expect("project.show after worktree session");
+    assert!(shown.worktrees.iter().any(|worktree| {
+        worktree.owned && worktree.session_id.as_deref() == Some(created.session.id.0.as_str())
+    }));
+
+    stop_session(&host, &created.session.id).await;
+    daemon.shutdown().await;
+}
+
+#[test]
+fn attach_command_spawn_intent_is_resolved_without_embedded_terminal() {
+    #[derive(Debug, Default)]
+    struct RecordingSpawner {
+        commands: Vec<String>,
+    }
+
+    impl AttachCommandSpawner for RecordingSpawner {
+        fn spawn(&mut self, command: &str) -> Result<(), String> {
+            self.commands.push(command.to_owned());
+            Ok(())
+        }
+    }
+
+    let mut spawner = RecordingSpawner::default();
+    let intent = spawn_attach_command(
+        &mut spawner,
+        "$TERMINAL -e {bin} attach --host {host} {id}",
+        &AttachTemplateValues {
+            bin: "pohunek".to_owned(),
+            host: "devbox".to_owned(),
+            id: "s-42".to_owned(),
+        },
+    )
+    .expect("spawn attach command");
+
+    assert_eq!(
+        intent,
+        AttachSpawnIntent {
+            command: "$TERMINAL -e pohunek attach --host devbox s-42".to_owned(),
+        }
+    );
+    assert_eq!(spawner.commands, vec![intent.command]);
+}
+
 #[test]
 fn ui_state_persists_and_restores() {
     let state_dir = temp_dir("gui-core-m1-ui-state");
@@ -246,6 +570,7 @@ impl LoopbackDaemon {
             SessionRegistry::new(SessionRegistryConfig {
                 stop_grace: Duration::from_millis(50),
                 store_path: Some(temp_dir(&format!("{tag}-state")).join("metadata.jsonl")),
+                worktree_root: Some(temp_dir(&format!("{tag}-worktrees"))),
                 ..SessionRegistryConfig::default()
             }),
         );
@@ -347,6 +672,26 @@ async fn wait_for_session_activity<S>(
     .await;
 }
 
+async fn wait_for_session_state<S>(
+    workspace: &mut Workspace,
+    events: &mut S,
+    host: &HostConfig,
+    session_id: &SessionId,
+    state: protocol::SessionState,
+) where
+    S: futures::Stream<Item = Message> + Unpin,
+{
+    wait_for_workspace(events, workspace, |workspace| {
+        workspace
+            .hosts
+            .get(&host.id)
+            .and_then(|view| view.sessions.get(&session_id.0))
+            .map(|session| session.state)
+            == Some(state)
+    })
+    .await;
+}
+
 async fn wait_for_workspace<S, F>(events: &mut S, workspace: &mut Workspace, mut done: F)
 where
     S: futures::Stream<Item = Message> + Unpin,
@@ -375,12 +720,47 @@ async fn unused_loopback_addr() -> SocketAddr {
 
 fn init_git_repo(tag: &str) -> PathBuf {
     let dir = temp_dir(tag);
-    let status = std::process::Command::new("git")
-        .arg("init")
+    let output = std::process::Command::new("git")
+        .args(["-c", "init.defaultBranch=main", "init", "-q"])
         .arg(&dir)
-        .status()
+        .output()
         .expect("run git init");
-    assert!(status.success(), "git init failed");
+    assert!(
+        output.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for args in [
+        ["config", "user.email", "test@example.com"],
+        ["config", "user.name", "Test"],
+        ["config", "commit.gpgsign", "false"],
+    ] {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(args)
+            .output()
+            .expect("run git config");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    std::fs::write(dir.join("README.md"), "init\n").expect("write README");
+    for args in [vec!["add", "."], vec!["commit", "-q", "-m", "init"]] {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(&args)
+            .output()
+            .expect("run git commit");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     dir
 }
 

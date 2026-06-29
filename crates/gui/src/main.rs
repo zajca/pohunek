@@ -5,19 +5,26 @@
 
 mod runtime;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use iced::widget::{button, column, container, row, scrollable, text};
+use iced::widget::{button, column, container, row, scrollable, text, text_input};
 use iced::{window, Element, Fill, Size, Subscription, Task, Theme};
 use pohunek_gui_core::{
-    default_state_dir, discover_hosts, render_attach_command, AttachTemplateValues, ConnState,
-    ConnectionOptions, HostConfig, HostId, Message as CoreMessage, NotificationIntent, Selection,
-    Toast, TreeNodeId, UiState, WindowSize, Workspace,
+    add_project_with_options, create_session_with_options, default_state_dir, discover_hosts,
+    inspect_session_with_options, list_projects_with_options, remove_project_with_options,
+    rename_project_with_options, session_metadata_rows, set_session_metadata_with_options,
+    show_project_with_options, spawn_attach_command, stop_session_with_options,
+    AttachCommandSpawner, AttachTemplateValues, ConnState, ConnectionOptions, HostConfig, HostId,
+    Message as CoreMessage, NotificationIntent, Selection, Toast, TreeNodeId, UiState, WindowSize,
+    Workspace,
 };
-use protocol::{ProjectInfo, SessionId, SessionInfo};
+use protocol::{
+    ProjectAddParams, ProjectInfo, ProjectRemoveParams, ProjectRenameParams, ProjectShowParams,
+    SessionId, SessionInfo, SessionNewParams, SessionSetMetadataParams,
+};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -73,6 +80,9 @@ struct PohunekApp {
     config: Result<AppConfig, String>,
     hosts: Vec<HostConfig>,
     ui_state: UiState,
+    new_session: NewSessionForm,
+    metadata_edit: MetadataEdit,
+    project_edit: ProjectEdit,
     state_dir: Option<PathBuf>,
     status: Option<String>,
     notified_intents: usize,
@@ -93,6 +103,9 @@ impl PohunekApp {
                 config,
                 hosts: Vec::new(),
                 ui_state: boot.ui_state,
+                new_session: NewSessionForm::default(),
+                metadata_edit: MetadataEdit::default(),
+                project_edit: ProjectEdit::default(),
                 state_dir: boot.state_dir,
                 status: boot.status,
                 notified_intents: 0,
@@ -101,16 +114,20 @@ impl PohunekApp {
         )
     }
 
-    fn attach_command(&self, host_id: &HostId, session_id: &SessionId) -> Result<String, String> {
+    fn attach_values(
+        &self,
+        host_id: &HostId,
+        session_id: &SessionId,
+    ) -> Result<(String, AttachTemplateValues), String> {
         let config = self.config.as_ref().map_err(Clone::clone)?;
         let host = self
             .hosts
             .iter()
             .find(|host| &host.id == host_id)
             .ok_or_else(|| format!("unknown host `{host_id}`"))?;
-        Ok(render_attach_command(
-            &config.attach_command,
-            &AttachTemplateValues {
+        Ok((
+            config.attach_command.clone(),
+            AttachTemplateValues {
                 bin: config.pohunek_bin.clone(),
                 host: host.attach_host().to_owned(),
                 id: session_id.0.clone(),
@@ -120,10 +137,54 @@ impl PohunekApp {
 }
 
 #[derive(Debug, Clone)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Iced messages carry core protocol messages directly from subscriptions"
-)]
+struct NewSessionForm {
+    agent: String,
+    cwd: String,
+    project: String,
+    repo: String,
+    branch: String,
+    base_branch: String,
+    input: String,
+    metadata_key: String,
+    metadata_value: String,
+    cols: String,
+    rows: String,
+}
+
+impl Default for NewSessionForm {
+    fn default() -> Self {
+        Self {
+            agent: "codex".to_owned(),
+            cwd: String::new(),
+            project: String::new(),
+            repo: String::new(),
+            branch: String::new(),
+            base_branch: String::new(),
+            input: String::new(),
+            metadata_key: String::new(),
+            metadata_value: String::new(),
+            cols: "80".to_owned(),
+            rows: "24".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct MetadataEdit {
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProjectEdit {
+    path: String,
+    name: String,
+    base_branch: String,
+    reference: String,
+    rename_to: String,
+}
+
+#[derive(Debug, Clone)]
 enum Message {
     Core(CoreMessage),
     HostsDiscovered(DiscoveryResult),
@@ -132,10 +193,45 @@ enum Message {
         host_id: HostId,
         session_id: SessionId,
     },
+    SelectProject {
+        host_id: HostId,
+        project_id: String,
+    },
     OpenSession {
         host_id: HostId,
         session_id: SessionId,
     },
+    NewSessionAgentChanged(String),
+    NewSessionCwdChanged(String),
+    NewSessionProjectChanged(String),
+    NewSessionRepoChanged(String),
+    NewSessionBranchChanged(String),
+    NewSessionBaseBranchChanged(String),
+    NewSessionInputChanged(String),
+    NewSessionMetadataKeyChanged(String),
+    NewSessionMetadataValueChanged(String),
+    NewSessionColsChanged(String),
+    NewSessionRowsChanged(String),
+    CreateSession,
+    InspectSelectedSession,
+    StopSelectedSession,
+    MetadataKeyChanged(String),
+    MetadataValueChanged(String),
+    SetMetadata,
+    ClearMetadata,
+    ProjectPathChanged(String),
+    ProjectNameChanged(String),
+    ProjectBaseBranchChanged(String),
+    ProjectReferenceChanged(String),
+    ProjectRenameToChanged(String),
+    ListProjects,
+    AddProject,
+    ShowProject,
+    RenameProject,
+    RemoveProject {
+        prune_worktrees: bool,
+    },
+    CoreCommandCompleted(Result<CoreMessage, String>),
     AttachSpawned(Result<(), String>),
     NotificationSent(Result<(), String>),
     WindowResized(Size),
@@ -148,6 +244,10 @@ struct DiscoveryResult {
     warning: Option<String>,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Iced update centralizes shell messages and delegates domain transitions to gui-core"
+)]
 fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
     let mut tasks = Vec::new();
     match message {
@@ -179,14 +279,90 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             });
             tasks.push(save_ui_state_task(app));
         }
+        Message::SelectProject {
+            host_id,
+            project_id,
+        } => {
+            app.workspace.selection = Some(Selection::Project {
+                host_id: host_id.clone(),
+                project_id: project_id.clone(),
+            });
+            app.ui_state.selection = app.workspace.selection.clone();
+            app.project_edit.reference = project_id;
+            tasks.push(save_ui_state_task(app));
+        }
         Message::OpenSession {
             host_id,
             session_id,
-        } => match app.attach_command(&host_id, &session_id) {
-            Ok(command) => tasks.push(Task::perform(
-                async move { spawn_attach(&command) },
+        } => match app.attach_values(&host_id, &session_id) {
+            Ok((template, values)) => tasks.push(Task::perform(
+                async move { spawn_attach(&template, &values) },
                 Message::AttachSpawned,
             )),
+            Err(err) => app.status = Some(err),
+        },
+        Message::NewSessionAgentChanged(value) => app.new_session.agent = value,
+        Message::NewSessionCwdChanged(value) => app.new_session.cwd = value,
+        Message::NewSessionProjectChanged(value) => app.new_session.project = value,
+        Message::NewSessionRepoChanged(value) => app.new_session.repo = value,
+        Message::NewSessionBranchChanged(value) => app.new_session.branch = value,
+        Message::NewSessionBaseBranchChanged(value) => app.new_session.base_branch = value,
+        Message::NewSessionInputChanged(value) => app.new_session.input = value,
+        Message::NewSessionMetadataKeyChanged(value) => app.new_session.metadata_key = value,
+        Message::NewSessionMetadataValueChanged(value) => app.new_session.metadata_value = value,
+        Message::NewSessionColsChanged(value) => app.new_session.cols = value,
+        Message::NewSessionRowsChanged(value) => app.new_session.rows = value,
+        Message::CreateSession => match create_session_task(app) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
+        Message::InspectSelectedSession => match inspect_selected_session_task(app) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
+        Message::StopSelectedSession => match stop_selected_session_task(app) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
+        Message::MetadataKeyChanged(value) => app.metadata_edit.key = value,
+        Message::MetadataValueChanged(value) => app.metadata_edit.value = value,
+        Message::SetMetadata => match metadata_task(app, MetadataAction::Set) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
+        Message::ClearMetadata => match metadata_task(app, MetadataAction::Clear) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
+        Message::ProjectPathChanged(value) => app.project_edit.path = value,
+        Message::ProjectNameChanged(value) => app.project_edit.name = value,
+        Message::ProjectBaseBranchChanged(value) => app.project_edit.base_branch = value,
+        Message::ProjectReferenceChanged(value) => app.project_edit.reference = value,
+        Message::ProjectRenameToChanged(value) => app.project_edit.rename_to = value,
+        Message::ListProjects => match list_projects_task(app) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
+        Message::AddProject => match add_project_task(app) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
+        Message::ShowProject => match show_project_task(app) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
+        Message::RenameProject => match rename_project_task(app) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
+        Message::RemoveProject { prune_worktrees } => {
+            match remove_project_task(app, prune_worktrees) {
+                Ok(task) => tasks.push(task),
+                Err(err) => app.status = Some(err),
+            }
+        }
+        Message::CoreCommandCompleted(result) => match result {
+            Ok(message) => app.workspace.apply(message),
             Err(err) => app.status = Some(err),
         },
         Message::AttachSpawned(result) => {
@@ -245,6 +421,291 @@ fn notification_tasks(app: &mut PohunekApp) -> Task<Message> {
             Message::NotificationSent,
         )
     }))
+}
+
+fn create_session_task(app: &PohunekApp) -> Result<Task<Message>, String> {
+    let host = selected_host_config(app)?;
+    let host_id = host.id.clone();
+    let options = connection_options(app)?;
+    let params = build_session_params(&app.new_session)?;
+    Ok(Task::perform(
+        runtime::perform(async move {
+            create_session_with_options(&host, params, options)
+                .await
+                .map(|result| CoreMessage::SessionCreated {
+                    host_id,
+                    session: result.session,
+                })
+                .map_err(|err| err.to_string())
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn inspect_selected_session_task(app: &PohunekApp) -> Result<Task<Message>, String> {
+    let (host, session_id) = selected_session_target(app)?;
+    let host_id = host.id.clone();
+    let options = connection_options(app)?;
+    Ok(Task::perform(
+        runtime::perform(async move {
+            inspect_session_with_options(&host, &session_id, options)
+                .await
+                .map(|session| CoreMessage::SessionInspected { host_id, session })
+                .map_err(|err| err.to_string())
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn stop_selected_session_task(app: &PohunekApp) -> Result<Task<Message>, String> {
+    let (host, session_id) = selected_session_target(app)?;
+    let host_id = host.id.clone();
+    let options = connection_options(app)?;
+    Ok(Task::perform(
+        runtime::perform(async move {
+            stop_session_with_options(&host, &session_id, options)
+                .await
+                .map(|result| CoreMessage::SessionStopCompleted {
+                    host_id,
+                    session_id,
+                    result,
+                })
+                .map_err(|err| err.to_string())
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MetadataAction {
+    Set,
+    Clear,
+}
+
+fn metadata_task(app: &PohunekApp, action: MetadataAction) -> Result<Task<Message>, String> {
+    let (host, session_id) = selected_session_target(app)?;
+    let host_id = host.id.clone();
+    let options = connection_options(app)?;
+    let key = required_field(&app.metadata_edit.key, "metadata key")?;
+    let value = match action {
+        MetadataAction::Set => Some(app.metadata_edit.value.clone()),
+        MetadataAction::Clear => None,
+    };
+    let params = SessionSetMetadataParams {
+        session_id,
+        metadata: BTreeMap::from([(key, value)]),
+    };
+    Ok(Task::perform(
+        runtime::perform(async move {
+            set_session_metadata_with_options(&host, params, options)
+                .await
+                .map(|result| CoreMessage::SessionMetadataUpdated { host_id, result })
+                .map_err(|err| err.to_string())
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn list_projects_task(app: &PohunekApp) -> Result<Task<Message>, String> {
+    let host = selected_host_config(app)?;
+    let host_id = host.id.clone();
+    let options = connection_options(app)?;
+    Ok(Task::perform(
+        runtime::perform(async move {
+            list_projects_with_options(&host, options)
+                .await
+                .map(|projects| CoreMessage::ProjectListLoaded { host_id, projects })
+                .map_err(|err| err.to_string())
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn add_project_task(app: &PohunekApp) -> Result<Task<Message>, String> {
+    let host = selected_host_config(app)?;
+    let host_id = host.id.clone();
+    let options = connection_options(app)?;
+    let params = ProjectAddParams {
+        path: Some(PathBuf::from(required_field(
+            &app.project_edit.path,
+            "project path",
+        )?)),
+        name: optional_field(&app.project_edit.name),
+        base_branch: optional_field(&app.project_edit.base_branch),
+    };
+    Ok(Task::perform(
+        runtime::perform(async move {
+            add_project_with_options(&host, params, options)
+                .await
+                .map(|project| CoreMessage::ProjectAdded { host_id, project })
+                .map_err(|err| err.to_string())
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn show_project_task(app: &PohunekApp) -> Result<Task<Message>, String> {
+    let host = selected_host_config(app)?;
+    let host_id = host.id.clone();
+    let options = connection_options(app)?;
+    let params = ProjectShowParams {
+        reference: selected_project_reference(app)?,
+    };
+    Ok(Task::perform(
+        runtime::perform(async move {
+            show_project_with_options(&host, params, options)
+                .await
+                .map(|result| CoreMessage::ProjectShown { host_id, result })
+                .map_err(|err| err.to_string())
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn rename_project_task(app: &PohunekApp) -> Result<Task<Message>, String> {
+    let host = selected_host_config(app)?;
+    let host_id = host.id.clone();
+    let options = connection_options(app)?;
+    let params = ProjectRenameParams {
+        reference: selected_project_reference(app)?,
+        name: required_field(&app.project_edit.rename_to, "new project name")?,
+    };
+    Ok(Task::perform(
+        runtime::perform(async move {
+            rename_project_with_options(&host, params, options)
+                .await
+                .map(|project| CoreMessage::ProjectRenamed { host_id, project })
+                .map_err(|err| err.to_string())
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn remove_project_task(app: &PohunekApp, prune_worktrees: bool) -> Result<Task<Message>, String> {
+    let host = selected_host_config(app)?;
+    let host_id = host.id.clone();
+    let options = connection_options(app)?;
+    let reference = selected_project_reference(app)?;
+    let params = ProjectRemoveParams {
+        reference: reference.clone(),
+        prune_worktrees,
+    };
+    Ok(Task::perform(
+        runtime::perform(async move {
+            remove_project_with_options(&host, params, options)
+                .await
+                .map(|result| CoreMessage::ProjectRemoved {
+                    host_id,
+                    reference,
+                    result,
+                })
+                .map_err(|err| err.to_string())
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn build_session_params(form: &NewSessionForm) -> Result<SessionNewParams, String> {
+    let metadata = optional_metadata(&form.metadata_key, &form.metadata_value)?;
+    Ok(SessionNewParams {
+        agent: required_field(&form.agent, "agent")?,
+        cwd: optional_field(&form.cwd).map(PathBuf::from),
+        cols: parse_u16(&form.cols, "columns")?,
+        rows: parse_u16(&form.rows, "rows")?,
+        project: optional_field(&form.project),
+        repo: optional_field(&form.repo).map(PathBuf::from),
+        branch: optional_field(&form.branch),
+        base_branch: optional_field(&form.base_branch),
+        input: optional_field(&form.input),
+        metadata,
+    })
+}
+
+fn optional_metadata(key: &str, value: &str) -> Result<BTreeMap<String, String>, String> {
+    let Some(key) = optional_field(key) else {
+        return Ok(BTreeMap::new());
+    };
+    if value.is_empty() {
+        return Err("metadata value must not be empty when metadata key is set".to_owned());
+    }
+    Ok(BTreeMap::from([(key, value.to_owned())]))
+}
+
+fn selected_session_target(app: &PohunekApp) -> Result<(HostConfig, SessionId), String> {
+    let Some(Selection::Session {
+        host_id,
+        session_id,
+    }) = app.ui_state.selection.clone()
+    else {
+        return Err("select a session first".to_owned());
+    };
+    Ok((host_config(app, &host_id)?, session_id))
+}
+
+fn selected_host_config(app: &PohunekApp) -> Result<HostConfig, String> {
+    let host_id = match app.ui_state.selection.as_ref() {
+        Some(
+            Selection::Host { host_id }
+            | Selection::Project { host_id, .. }
+            | Selection::Session { host_id, .. },
+        ) => Some(host_id.clone()),
+        None => app.hosts.first().map(|host| host.id.clone()),
+    }
+    .ok_or_else(|| "no host is available yet".to_owned())?;
+    host_config(app, &host_id)
+}
+
+fn host_config(app: &PohunekApp, host_id: &HostId) -> Result<HostConfig, String> {
+    app.hosts
+        .iter()
+        .find(|host| &host.id == host_id)
+        .cloned()
+        .ok_or_else(|| format!("unknown host `{host_id}`"))
+}
+
+fn selected_project_reference(app: &PohunekApp) -> Result<String, String> {
+    optional_field(&app.project_edit.reference)
+        .or_else(|| match app.ui_state.selection.as_ref() {
+            Some(Selection::Project { project_id, .. }) => Some(project_id.clone()),
+            Some(Selection::Session {
+                host_id,
+                session_id,
+            }) => app
+                .workspace
+                .hosts
+                .get(host_id)
+                .and_then(|host| host.sessions.get(&session_id.0))
+                .and_then(|session| session.project_id.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| "select or enter a project reference".to_owned())
+}
+
+fn connection_options(app: &PohunekApp) -> Result<ConnectionOptions, String> {
+    app.config
+        .as_ref()
+        .map(|config| config.connection_options)
+        .map_err(Clone::clone)
+}
+
+fn optional_field(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn required_field(value: &str, label: &str) -> Result<String, String> {
+    optional_field(value).ok_or_else(|| format!("{label} is required"))
+}
+
+fn parse_u16(value: &str, label: &str) -> Result<u16, String> {
+    let parsed = required_field(value, label)?
+        .parse::<u16>()
+        .map_err(|err| format!("invalid {label}: {err}"))?;
+    if parsed == 0 {
+        Err(format!("{label} must be greater than zero"))
+    } else {
+        Ok(parsed)
+    }
 }
 
 fn save_ui_state_task(app: &PohunekApp) -> Task<Message> {
@@ -362,7 +823,12 @@ fn push_missing_project_row<'a>(
     tree = tree.push(row![
         text("  "),
         button(if expanded { "v" } else { ">" }).on_press(Message::ToggleNode(node)),
-        text(format!("Unknown project {project_id}")).size(15)
+        button(text(format!("Unknown project {project_id}")).size(15)).on_press(
+            Message::SelectProject {
+                host_id: host_id.clone(),
+                project_id: project_id.to_owned(),
+            },
+        )
     ]);
     if expanded {
         for session in host
@@ -390,7 +856,10 @@ fn push_project_row<'a>(
     tree = tree.push(row![
         text("  "),
         button(if expanded { "v" } else { ">" }).on_press(Message::ToggleNode(node)),
-        text(label).size(15)
+        button(text(label).size(15)).on_press(Message::SelectProject {
+            host_id: host_id.clone(),
+            project_id,
+        })
     ]);
     if expanded {
         for session in host.sessions.values().filter(|session| {
@@ -451,7 +920,35 @@ fn agents_monitor(app: &PohunekApp) -> Element<'_, Message> {
 }
 
 fn detail_view(app: &PohunekApp) -> Element<'_, Message> {
-    let mut detail = column![text("Session").size(22)].spacing(8);
+    let mut detail = column![text("Workspace detail").size(22)].spacing(12);
+    match app.ui_state.selection.as_ref() {
+        Some(Selection::Session { .. }) => {
+            detail = detail.push(session_detail(app));
+        }
+        Some(Selection::Project { .. }) => {
+            detail = detail.push(project_detail(app));
+        }
+        Some(Selection::Host { host_id }) => {
+            detail = detail.push(text(format!("host: {host_id}")).size(16));
+        }
+        None => {
+            detail = detail.push(text("No session or project selected").size(16));
+        }
+    }
+    detail = detail
+        .push(new_session_view(app))
+        .push(project_management_view(app));
+    for toast in app.workspace.toasts.iter().rev().take(3).rev() {
+        detail = detail.push(toast_view(toast));
+    }
+    if let Some(status) = &app.status {
+        detail = detail.push(text(status).size(13));
+    }
+    scrollable(detail).into()
+}
+
+fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
+    let mut detail = column![text("Session").size(18)].spacing(8);
     match selected_session(app) {
         Some((host_id, session)) => {
             let activity = session
@@ -469,23 +966,166 @@ fn detail_view(app: &PohunekApp) -> Element<'_, Message> {
             {
                 detail = detail.push(text(format!("project: {project}")).size(14));
             }
+            if let Some(branch) = &session.branch {
+                detail = detail.push(text(format!("branch: {branch}")).size(14));
+            }
+            if let Some(path) = &session.worktree_path {
+                detail = detail.push(text(format!("worktree: {}", path.display())).size(14));
+            }
             detail = detail.push(text(format!("cwd: {}", session.cwd.display())).size(14));
-            detail = detail.push(button("Open in terminal").on_press(Message::OpenSession {
-                host_id: host_id.clone(),
-                session_id: session.id.clone(),
-            }));
+            detail = detail.push(row![
+                button("Open in terminal").on_press(Message::OpenSession {
+                    host_id: host_id.clone(),
+                    session_id: session.id.clone(),
+                }),
+                button("Inspect").on_press(Message::InspectSelectedSession),
+                button("Stop").on_press(Message::StopSelectedSession)
+            ]);
+            detail = detail.push(metadata_view(app, session));
         }
         None => {
             detail = detail.push(text("No session selected").size(16));
         }
     }
-    for toast in app.workspace.toasts.iter().rev().take(3).rev() {
-        detail = detail.push(toast_view(toast));
+    detail.into()
+}
+
+fn metadata_view<'a>(app: &'a PohunekApp, session: &'a SessionInfo) -> Element<'a, Message> {
+    let mut metadata = column![text("Metadata").size(16)].spacing(6);
+    let rows = session_metadata_rows(session);
+    if rows.is_empty() {
+        metadata = metadata.push(text("No metadata").size(13));
+    } else {
+        for row in rows {
+            metadata = metadata.push(text(format!("{} = {}", row.key, row.value)).size(13));
+        }
     }
-    if let Some(status) = &app.status {
-        detail = detail.push(text(status).size(13));
+    metadata = metadata
+        .push(
+            row![
+                text_input("key", &app.metadata_edit.key).on_input(Message::MetadataKeyChanged),
+                text_input("value", &app.metadata_edit.value)
+                    .on_input(Message::MetadataValueChanged)
+            ]
+            .spacing(8),
+        )
+        .push(row![
+            button("Set metadata").on_press(Message::SetMetadata),
+            button("Clear key").on_press(Message::ClearMetadata)
+        ]);
+    metadata.into()
+}
+
+fn project_detail(app: &PohunekApp) -> Element<'_, Message> {
+    let mut detail = column![text("Project").size(18)].spacing(8);
+    if let Some((host_id, project)) = selected_project(app) {
+        detail = detail
+            .push(text(format!("{} / {}", host_id, project.id)).size(16))
+            .push(text(format!("label: {}", project.label)).size(14))
+            .push(text(format!("repo: {}", project.repo_root.display())).size(14))
+            .push(text(format!("source: {}", project.source.as_str())).size(14));
+        if let Some(details) = app
+            .workspace
+            .hosts
+            .get(host_id)
+            .and_then(|host| host.project_details.get(&project.id))
+        {
+            detail = detail.push(text("Worktrees").size(16));
+            for worktree in &details.worktrees {
+                let branch = worktree.branch.as_deref().unwrap_or("detached");
+                let owner = if worktree.owned { "owned" } else { "external" };
+                let session = worktree.session_id.as_deref().unwrap_or("-");
+                detail = detail.push(
+                    text(format!(
+                        "{}  branch={}  {}  session={}",
+                        worktree.path.display(),
+                        branch,
+                        owner,
+                        session
+                    ))
+                    .size(13),
+                );
+            }
+        }
+    } else {
+        detail = detail.push(text("No project selected").size(16));
     }
-    scrollable(detail).into()
+    detail
+        .push(button("Show project").on_press(Message::ShowProject))
+        .into()
+}
+
+fn new_session_view(app: &PohunekApp) -> Element<'_, Message> {
+    column![
+        text("New session").size(18),
+        row![
+            text_input("agent", &app.new_session.agent).on_input(Message::NewSessionAgentChanged),
+            text_input("cols", &app.new_session.cols).on_input(Message::NewSessionColsChanged),
+            text_input("rows", &app.new_session.rows).on_input(Message::NewSessionRowsChanged)
+        ]
+        .spacing(8),
+        row![
+            text_input("cwd", &app.new_session.cwd).on_input(Message::NewSessionCwdChanged),
+            text_input("project", &app.new_session.project)
+                .on_input(Message::NewSessionProjectChanged),
+            text_input("repo", &app.new_session.repo).on_input(Message::NewSessionRepoChanged)
+        ]
+        .spacing(8),
+        row![
+            text_input("branch", &app.new_session.branch)
+                .on_input(Message::NewSessionBranchChanged),
+            text_input("base branch", &app.new_session.base_branch)
+                .on_input(Message::NewSessionBaseBranchChanged)
+        ]
+        .spacing(8),
+        text_input("initial input", &app.new_session.input)
+            .on_input(Message::NewSessionInputChanged),
+        row![
+            text_input("metadata key", &app.new_session.metadata_key)
+                .on_input(Message::NewSessionMetadataKeyChanged),
+            text_input("metadata value", &app.new_session.metadata_value)
+                .on_input(Message::NewSessionMetadataValueChanged)
+        ]
+        .spacing(8),
+        button("Create session").on_press(Message::CreateSession)
+    ]
+    .spacing(8)
+    .into()
+}
+
+fn project_management_view(app: &PohunekApp) -> Element<'_, Message> {
+    column![
+        text("Projects").size(18),
+        row![
+            text_input("path", &app.project_edit.path).on_input(Message::ProjectPathChanged),
+            text_input("name", &app.project_edit.name).on_input(Message::ProjectNameChanged),
+            text_input("base branch", &app.project_edit.base_branch)
+                .on_input(Message::ProjectBaseBranchChanged),
+            button("Add").on_press(Message::AddProject)
+        ]
+        .spacing(8),
+        row![
+            text_input("reference", &app.project_edit.reference)
+                .on_input(Message::ProjectReferenceChanged),
+            text_input("rename to", &app.project_edit.rename_to)
+                .on_input(Message::ProjectRenameToChanged)
+        ]
+        .spacing(8),
+        row![
+            button("List").on_press(Message::ListProjects),
+            button("Show").on_press(Message::ShowProject),
+            button("Rename").on_press(Message::RenameProject),
+            button("Remove").on_press(Message::RemoveProject {
+                prune_worktrees: false
+            }),
+            button("Remove + prune").on_press(Message::RemoveProject {
+                prune_worktrees: true
+            })
+        ]
+        .spacing(8)
+    ]
+    .spacing(8)
+    .into()
 }
 
 fn toast_view(toast: &Toast) -> Element<'_, Message> {
@@ -515,6 +1155,24 @@ fn selected_session(app: &PohunekApp) -> Option<(&HostId, &SessionInfo)> {
         })
 }
 
+fn selected_project(app: &PohunekApp) -> Option<(&HostId, &ProjectInfo)> {
+    let Some(Selection::Project {
+        host_id,
+        project_id,
+    }) = app.ui_state.selection.as_ref()
+    else {
+        return None;
+    };
+    app.workspace
+        .hosts
+        .get_key_value(host_id)
+        .and_then(|(host_id, host)| {
+            host.projects
+                .get(project_id)
+                .map(|project| (host_id, project))
+        })
+}
+
 fn conn_label(conn: &ConnState) -> &'static str {
     match conn {
         ConnState::Connecting => "connecting",
@@ -528,13 +1186,23 @@ fn theme(_app: &PohunekApp) -> Theme {
     Theme::TokyoNight
 }
 
-fn spawn_attach(command: &str) -> Result<(), String> {
-    Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .spawn()
-        .map(|_| ())
-        .map_err(|err| format!("failed to spawn attach command `{command}`: {err}"))
+#[derive(Debug, Default)]
+struct ShellAttachSpawner;
+
+impl AttachCommandSpawner for ShellAttachSpawner {
+    fn spawn(&mut self, command: &str) -> Result<(), String> {
+        Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .spawn()
+            .map(|_| ())
+            .map_err(|err| format!("failed to spawn attach command `{command}`: {err}"))
+    }
+}
+
+fn spawn_attach(template: &str, values: &AttachTemplateValues) -> Result<(), String> {
+    let mut spawner = ShellAttachSpawner;
+    spawn_attach_command(&mut spawner, template, values).map(|_| ())
 }
 
 fn spawn_notification(command: &str, intent: &NotificationIntent) -> Result<(), String> {

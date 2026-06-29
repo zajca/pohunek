@@ -14,8 +14,11 @@ use std::time::Duration;
 use futures::{stream, StreamExt};
 use pohunek_client::{Client, ClientOptions};
 use protocol::{
-    event, method, AgentActivity, Event, HostClass, HostDiscoverParams, HostRecord, ProjectInfo,
-    ProtocolVersion, Request, SessionId, SessionInfo, StateSource,
+    event, method, AgentActivity, Event, HostClass, HostDiscoverParams, HostRecord,
+    ProjectAddParams, ProjectInfo, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
+    ProjectShowParams, ProjectShowResult, ProtocolVersion, Request, SessionId, SessionInfo,
+    SessionNewParams, SessionNewResult, SessionSetMetadataParams, SessionSetMetadataResult,
+    SessionState, SessionStopResult, StateSource,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -196,17 +199,66 @@ pub enum HostEvent {
 
 /// Message emitted by async host workers and applied to [`Workspace`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "GUI worker messages carry protocol snapshots and live events by value across stream boundaries"
-)]
 pub enum Message {
-    HostConnecting { host_id: HostId },
-    HostSnapshotLoaded { snapshot: HostSnapshot },
-    HostSubscribed { host_id: HostId },
-    HostEvent { host_id: HostId, event: HostEvent },
-    HostDisconnected { host_id: HostId, error: String },
-    HostUnreachable { host_id: HostId, error: String },
+    HostConnecting {
+        host_id: HostId,
+    },
+    HostSnapshotLoaded {
+        snapshot: HostSnapshot,
+    },
+    HostSubscribed {
+        host_id: HostId,
+    },
+    HostEvent {
+        host_id: HostId,
+        event: HostEvent,
+    },
+    HostDisconnected {
+        host_id: HostId,
+        error: String,
+    },
+    HostUnreachable {
+        host_id: HostId,
+        error: String,
+    },
+    SessionCreated {
+        host_id: HostId,
+        session: SessionInfo,
+    },
+    SessionInspected {
+        host_id: HostId,
+        session: SessionInfo,
+    },
+    SessionStopCompleted {
+        host_id: HostId,
+        session_id: SessionId,
+        result: SessionStopResult,
+    },
+    SessionMetadataUpdated {
+        host_id: HostId,
+        result: SessionSetMetadataResult,
+    },
+    ProjectListLoaded {
+        host_id: HostId,
+        projects: Vec<ProjectInfo>,
+    },
+    ProjectAdded {
+        host_id: HostId,
+        project: ProjectInfo,
+    },
+    ProjectShown {
+        host_id: HostId,
+        result: ProjectShowResult,
+    },
+    ProjectRenamed {
+        host_id: HostId,
+        project: ProjectInfo,
+    },
+    ProjectRemoved {
+        host_id: HostId,
+        reference: String,
+        result: ProjectRemoveResult,
+    },
 }
 
 /// Per-host connection state for the headless workspace model.
@@ -406,6 +458,7 @@ pub struct HostView {
     pub health: Option<HealthSummary>,
     pub sessions: BTreeMap<String, SessionInfo>,
     pub projects: BTreeMap<String, ProjectInfo>,
+    pub project_details: BTreeMap<String, ProjectShowResult>,
     pub last_agent_state: Option<AgentStateEvent>,
     pub last_error: Option<String>,
 }
@@ -417,6 +470,7 @@ impl HostView {
             health: None,
             sessions: BTreeMap::new(),
             projects: BTreeMap::new(),
+            project_details: BTreeMap::new(),
             last_agent_state: None,
             last_error: None,
         }
@@ -435,6 +489,10 @@ pub struct Workspace {
 
 impl Workspace {
     /// Apply one async message to the workspace state.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "workspace updates are centralized so GUI transitions stay deterministic and testable"
+    )]
     pub fn apply(&mut self, message: Message) {
         match message {
             Message::HostConnecting { host_id } => {
@@ -475,6 +533,10 @@ impl Workspace {
                     .cloned()
                     .map(|project| (project.id.clone(), project))
                     .collect();
+                let previous_details = self
+                    .hosts
+                    .get(&host_id)
+                    .map_or_else(BTreeMap::new, |host| host.project_details.clone());
                 self.hosts.insert(
                     snapshot.host_id,
                     HostView {
@@ -482,6 +544,7 @@ impl Workspace {
                         health: Some(snapshot.health),
                         sessions,
                         projects,
+                        project_details: previous_details,
                         last_agent_state: None,
                         last_error: snapshot.project_error,
                     },
@@ -530,6 +593,91 @@ impl Workspace {
                     .or_insert_with(HostView::connecting);
                 host.conn = ConnState::Unreachable;
                 host.last_error = Some(error);
+            }
+            Message::SessionCreated { host_id, session }
+            | Message::SessionInspected { host_id, session } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                host.sessions.insert(session.id.0.clone(), session);
+            }
+            Message::SessionStopCompleted {
+                host_id,
+                session_id,
+                result,
+            } => {
+                if !result.stopped {
+                    return;
+                }
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                if let Some(session) = host.sessions.get_mut(&session_id.0) {
+                    session.state = SessionState::Stopped;
+                    session.activity = None;
+                }
+            }
+            Message::SessionMetadataUpdated { host_id, result } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                host.sessions
+                    .insert(result.session.id.0.clone(), result.session);
+            }
+            Message::ProjectListLoaded { host_id, projects } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                host.projects = projects
+                    .iter()
+                    .cloned()
+                    .map(|project| (project.id.clone(), project))
+                    .collect();
+                host.project_details
+                    .retain(|id, _details| host.projects.contains_key(id));
+            }
+            Message::ProjectAdded { host_id, project }
+            | Message::ProjectRenamed { host_id, project } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                host.projects.insert(project.id.clone(), project);
+            }
+            Message::ProjectShown { host_id, result } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                host.projects
+                    .insert(result.project.id.clone(), result.project.clone());
+                host.project_details
+                    .insert(result.project.id.clone(), result);
+            }
+            Message::ProjectRemoved {
+                host_id,
+                reference,
+                result,
+            } => {
+                if !result.removed {
+                    return;
+                }
+                if let Some(host) = self.hosts.get_mut(&host_id) {
+                    let removed_ids = host
+                        .projects
+                        .iter()
+                        .filter(|(id, project)| *id == &reference || project.label == reference)
+                        .map(|(id, _project)| id.clone())
+                        .collect::<Vec<_>>();
+                    for id in removed_ids {
+                        host.projects.remove(&id);
+                        host.project_details.remove(&id);
+                    }
+                }
             }
         }
     }
@@ -595,6 +743,26 @@ pub struct AgentMonitor {
     pub idle: usize,
     pub unknown: usize,
     pub sessions: Vec<AgentRow>,
+}
+
+/// One stable metadata row for rendering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataRow {
+    pub key: String,
+    pub value: String,
+}
+
+/// Return metadata rows in wire-stable key order.
+#[must_use]
+pub fn session_metadata_rows(session: &SessionInfo) -> Vec<MetadataRow> {
+    session
+        .metadata
+        .iter()
+        .map(|(key, value)| MetadataRow {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect()
 }
 
 fn activity_rank(activity: Option<AgentActivity>) -> u8 {
@@ -718,6 +886,218 @@ pub async fn load_host_snapshot(config: &HostConfig) -> Result<HostSnapshot, Cor
     load_host_snapshot_with_options(config, ConnectionOptions::default()).await
 }
 
+/// Create a session on a host through the SDK.
+pub async fn create_session(
+    config: &HostConfig,
+    params: SessionNewParams,
+) -> Result<SessionNewResult, CoreError> {
+    create_session_with_options(config, params, ConnectionOptions::default()).await
+}
+
+/// Create a session with explicit connection options.
+pub async fn create_session_with_options(
+    config: &HostConfig,
+    params: SessionNewParams,
+    options: ConnectionOptions,
+) -> Result<SessionNewResult, CoreError> {
+    request_host_json(
+        config,
+        options,
+        "gui-session-new",
+        method::SESSION_NEW,
+        serde_json::to_value(params)?,
+    )
+    .await
+}
+
+/// Inspect a session on a host through the SDK.
+pub async fn inspect_session(
+    config: &HostConfig,
+    session_id: &SessionId,
+) -> Result<SessionInfo, CoreError> {
+    inspect_session_with_options(config, session_id, ConnectionOptions::default()).await
+}
+
+/// Inspect a session with explicit connection options.
+pub async fn inspect_session_with_options(
+    config: &HostConfig,
+    session_id: &SessionId,
+    options: ConnectionOptions,
+) -> Result<SessionInfo, CoreError> {
+    request_host_json(
+        config,
+        options,
+        "gui-session-inspect",
+        method::SESSION_INSPECT,
+        serde_json::to_value(session_id)?,
+    )
+    .await
+}
+
+/// Stop a session on a host through the SDK.
+pub async fn stop_session(
+    config: &HostConfig,
+    session_id: &SessionId,
+) -> Result<SessionStopResult, CoreError> {
+    stop_session_with_options(config, session_id, ConnectionOptions::default()).await
+}
+
+/// Stop a session with explicit connection options.
+pub async fn stop_session_with_options(
+    config: &HostConfig,
+    session_id: &SessionId,
+    options: ConnectionOptions,
+) -> Result<SessionStopResult, CoreError> {
+    request_host_json(
+        config,
+        options,
+        "gui-session-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(session_id)?,
+    )
+    .await
+}
+
+/// Merge or clear session metadata on a host.
+pub async fn set_session_metadata(
+    config: &HostConfig,
+    params: SessionSetMetadataParams,
+) -> Result<SessionSetMetadataResult, CoreError> {
+    set_session_metadata_with_options(config, params, ConnectionOptions::default()).await
+}
+
+/// Merge or clear metadata with explicit connection options.
+pub async fn set_session_metadata_with_options(
+    config: &HostConfig,
+    params: SessionSetMetadataParams,
+    options: ConnectionOptions,
+) -> Result<SessionSetMetadataResult, CoreError> {
+    request_host_json(
+        config,
+        options,
+        "gui-session-set-metadata",
+        method::SESSION_SET_METADATA,
+        serde_json::to_value(params)?,
+    )
+    .await
+}
+
+/// List projects on a host through the SDK.
+pub async fn list_projects(config: &HostConfig) -> Result<Vec<ProjectInfo>, CoreError> {
+    list_projects_with_options(config, ConnectionOptions::default()).await
+}
+
+/// List projects with explicit connection options.
+pub async fn list_projects_with_options(
+    config: &HostConfig,
+    options: ConnectionOptions,
+) -> Result<Vec<ProjectInfo>, CoreError> {
+    request_host_json(
+        config,
+        options,
+        "gui-project-list",
+        method::PROJECT_LIST,
+        Value::Null,
+    )
+    .await
+}
+
+/// Add a project on a host through the SDK.
+pub async fn add_project(
+    config: &HostConfig,
+    params: ProjectAddParams,
+) -> Result<ProjectInfo, CoreError> {
+    add_project_with_options(config, params, ConnectionOptions::default()).await
+}
+
+/// Add a project with explicit connection options.
+pub async fn add_project_with_options(
+    config: &HostConfig,
+    params: ProjectAddParams,
+    options: ConnectionOptions,
+) -> Result<ProjectInfo, CoreError> {
+    request_host_json(
+        config,
+        options,
+        "gui-project-add",
+        method::PROJECT_ADD,
+        serde_json::to_value(params)?,
+    )
+    .await
+}
+
+/// Show a project and its live worktrees.
+pub async fn show_project(
+    config: &HostConfig,
+    params: ProjectShowParams,
+) -> Result<ProjectShowResult, CoreError> {
+    show_project_with_options(config, params, ConnectionOptions::default()).await
+}
+
+/// Show a project with explicit connection options.
+pub async fn show_project_with_options(
+    config: &HostConfig,
+    params: ProjectShowParams,
+    options: ConnectionOptions,
+) -> Result<ProjectShowResult, CoreError> {
+    request_host_json(
+        config,
+        options,
+        "gui-project-show",
+        method::PROJECT_SHOW,
+        serde_json::to_value(params)?,
+    )
+    .await
+}
+
+/// Rename a project on a host through the SDK.
+pub async fn rename_project(
+    config: &HostConfig,
+    params: ProjectRenameParams,
+) -> Result<ProjectInfo, CoreError> {
+    rename_project_with_options(config, params, ConnectionOptions::default()).await
+}
+
+/// Rename a project with explicit connection options.
+pub async fn rename_project_with_options(
+    config: &HostConfig,
+    params: ProjectRenameParams,
+    options: ConnectionOptions,
+) -> Result<ProjectInfo, CoreError> {
+    request_host_json(
+        config,
+        options,
+        "gui-project-rename",
+        method::PROJECT_RENAME,
+        serde_json::to_value(params)?,
+    )
+    .await
+}
+
+/// Remove a project from a host.
+pub async fn remove_project(
+    config: &HostConfig,
+    params: ProjectRemoveParams,
+) -> Result<ProjectRemoveResult, CoreError> {
+    remove_project_with_options(config, params, ConnectionOptions::default()).await
+}
+
+/// Remove a project with explicit connection options.
+pub async fn remove_project_with_options(
+    config: &HostConfig,
+    params: ProjectRemoveParams,
+    options: ConnectionOptions,
+) -> Result<ProjectRemoveResult, CoreError> {
+    request_host_json(
+        config,
+        options,
+        "gui-project-remove",
+        method::PROJECT_REMOVE,
+        serde_json::to_value(params)?,
+    )
+    .await
+}
+
 async fn load_host_snapshot_with_options(
     config: &HostConfig,
     options: ConnectionOptions,
@@ -755,6 +1135,20 @@ async fn load_host_snapshot_with_options(
         projects: projects.0,
         project_error: projects.1,
     })
+}
+
+async fn request_host_json<T>(
+    config: &HostConfig,
+    options: ConnectionOptions,
+    id: &'static str,
+    method: &'static str,
+    params: Value,
+) -> Result<T, CoreError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let mut client = connect_client(config, options).await?;
+    request_json(&mut client, id, method, params).await
 }
 
 async fn request_json<T>(
@@ -1116,6 +1510,18 @@ pub struct AttachTemplateValues {
     pub id: String,
 }
 
+/// Intent recorded after resolving and spawning attach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachSpawnIntent {
+    pub command: String,
+}
+
+/// Port used by the shell to spawn external attach commands.
+pub trait AttachCommandSpawner {
+    /// Spawn `command` in the platform shell.
+    fn spawn(&mut self, command: &str) -> Result<(), String>;
+}
+
 /// Render the configured attach command by replacing `{bin}`, `{host}`, and `{id}`.
 #[must_use]
 pub fn render_attach_command(template: &str, values: &AttachTemplateValues) -> String {
@@ -1123,6 +1529,20 @@ pub fn render_attach_command(template: &str, values: &AttachTemplateValues) -> S
         .replace("{bin}", &values.bin)
         .replace("{host}", &values.host)
         .replace("{id}", &values.id)
+}
+
+/// Resolve and spawn an external attach command.
+pub fn spawn_attach_command<S>(
+    spawner: &mut S,
+    template: &str,
+    values: &AttachTemplateValues,
+) -> Result<AttachSpawnIntent, String>
+where
+    S: AttachCommandSpawner + ?Sized,
+{
+    let command = render_attach_command(template, values);
+    spawner.spawn(&command)?;
+    Ok(AttachSpawnIntent { command })
 }
 
 #[cfg(test)]

@@ -90,47 +90,62 @@ daemon. (TS SDK check deferred to the browser track.)
 
 ### Track D — Native Desktop Companion App *(primary GUI)*
 
+> **Detailed design:** [`design/track-d-native-app.md`](design/track-d-native-app.md)
+> is the source of truth for Track D and supersedes this summary where they differ.
+> Key pivots since the original framing: **no embedded terminal** (attach is
+> delegated to an external terminal), **GUI = Iced** (decided), **Linux only** v1,
+> **v1 = D.1+D.3+D.4+D.5** (D.6 is v1.1).
+
 A **pure-native Rust desktop app** (no webview, no JS) and the **primary GUI**
-going forward. It is a client of the chassis over the **Rust SDK (Track S)**,
-talking **directly to each host's daemon over NetBird** — **no aggregator
-backend**, no central server. It is the operator's cockpit for everyday agent
-work: projects, worktrees, agents, prompts, Linear, and PRs in one window.
+going forward. It is a **control plane** — it does *not* render a terminal. It is
+a client of the chassis over the **Rust SDK (Track S)**, talking **directly to
+each host's daemon over NetBird** — **no aggregator backend**, no central server.
+It is the operator's cockpit for everyday agent work: sessions, hosts, agents,
+projects, worktrees, prompts, Linear, and PRs in one window.
 
 This supersedes the dropped libghostty native-GUI direction (Phase 3) and the
 Phase-4 "Tauri later, optional" note: the desktop client is promoted to primary
 and built pure-native.
 
-**Tech (decided):** pure-native Rust GUI (**egui or Iced** — pick at the start
-via a short spike). Terminal panes render the daemon's attach byte stream through
-a VT **grid renderer** — **`alacritty_terminal`** (stable, pure-Rust, no-regret)
-is the default candidate; `libghostty-vt` is the alternative to re-verify when the
-work starts. **PTY ownership stays in the daemon** — the app renders the attach
-stream and relays input/resize/detach; it never owns the PTY. No TS/JS layer.
+**Tech (decided):** pure-native Rust GUI on **Iced** (Elm-style). **No terminal
+renderer** — "attach" spawns the operator's terminal via a configurable
+`attach_command` template running `pohunek attach` (the CLI already streams the
+remote PTY over NetBird). **PTY ownership stays in the daemon**; the GUI uses only
+the SDK `Client` + event `Subscription` (not the attach duplex stream). No TS/JS
+layer.
 
 **Provider integration lives in the app** (it is a real native process, so it can
-shell out and call APIs directly — no backend needed): **Linear via GraphQL
-(token), GitHub via `gh`**. It reuses the **same conventions** the sway launcher
-scripts already use, so the two surfaces share one source of truth:
-- prompt templates in `~/.config/pohunek/prompts/*.tmpl` (`${var}` substitution);
+shell out and call APIs directly — no backend needed): **Linear via in-app GraphQL
+(keyring token), GitHub via `gh`**. It reuses the **same conventions** the sway
+launcher scripts already use, so the two surfaces share one source of truth:
+- prompt templates in `~/.config/pohunek/prompts/*.tmpl` (`${var}` substitution),
+  rendered by a **shared implementation** (`crates/prompt` + `pohunek prompt
+  render`) the GUI and the rewritten scripts both call;
 - atomic launch via `session new --input`;
-- work-item / PR links stored as **opaque metadata** in the daemon store (the
-  chassis never interprets them) — the same store the sway scripts write, so a
-  link made in one surface shows in the other.
+- work-item / PR links stored as **opaque `link.*` metadata** on the session in
+  the daemon store (the chassis never interprets them) — the same keys the
+  (to-be-updated) sway scripts write, so a link made in one surface shows in the
+  other. *(Today the scripts write no link; defining the schema + updating them is
+  part of D.5.)*
 
-Provider credentials live **only** in the app (gh's own auth; a Linear token) —
-never in daemon state, session metadata, or the event log.
+Provider credentials live **only** in the app (gh's own auth; a Linear token read
+by name from the OS keyring) — never in daemon state, session metadata, or the
+event log.
 
 Suggested slices (each independently valuable):
 
-- **D.1 — Workspace shell + multi-host connect.** Enumerate reachable hosts
-  (`host discover`), per-host `session list` concurrently (short timeout, partial
-  results with per-host error markers), unified workspace with **live agent-state
-  badges** off the event subscription (`agent_state`, `session_*`).
-- **D.2 — In-app terminal attach.** Attach a session in a pane via the SDK attach
-  duplex stream rendered through the grid renderer; resize/detach relayed; detach
+- **D.1 — Workspace shell + multi-host connect.** Auto-discover (`host discover`)
+  + localhost and auto-connect all reachable hosts concurrently (short timeout,
+  partial results with per-host error markers), unified workspace with **live
+  agent-state badges** off the event subscription (`agent_state`, `session_*`),
+  plus an **agents monitor** (blocked-first).
+- **D.2 — Attach delegation.** *(Redefined — no longer an in-app terminal.)* The
+  "open in terminal" action spawns the configured `attach_command` for the
+  selected session. The GUI is not on the terminal I/O path; closing the terminal
   leaves the session running on its host.
 - **D.3 — Session + project + worktree management.** Full lifecycle (new / stop /
-  inspect), project list/add/show/rename/forget, and worktree create/inspect —
+  inspect), project list/add/show/rename/forget, and worktree inspect (creation is
+  a side effect of `session new --branch` — no standalone worktree method exists) —
   driven through the existing protocol.
 - **D.4 — Prompt management.** Browse/edit the shared `~/.config/pohunek/prompts/`
   templates; launch a session with a rendered preset prompt (`session new --input`).
@@ -146,14 +161,15 @@ Suggested slices (each independently valuable):
   review is rendered into a preset prompt (the shared `~/.config/pohunek/prompts/`
   convention) and launched atomically via `session new --input` on the **same
   branch/worktree**, so the agent picks up the review and acts on it. Optionally
-  also post the review to the PR via `gh pr review` / `gh pr comment`. Comments and
-  the review→session link are stored as **opaque metadata** in the daemon store
-  (the same store as provider links), so the review is visible across surfaces and
-  shared with the browser app later.
+  also post the review to the PR via `gh pr review` / `gh pr comment`. Comments
+  live **app-local until dispatch** (to keep the chassis free of a new surface);
+  on dispatch the **review→session link** is written into the new session's `link.*`
+  metadata, so a dispatched review is visible across surfaces. *(v1.1.)*
 
 *Done when:* against ≥2 loopback-TCP stand-in daemons (CI for the SDK/data layer)
-the app lists both hosts' sessions, shows a state change, attaches and round-trips
-terminal I/O, and detaches leaving the session running; launching on a fixture
+the app lists both hosts' sessions, shows a state change, and **spawns the
+configured `attach_command`** for a selected session (the GUI is not on the
+terminal I/O path); launching on a fixture
 issue starts exactly one session on the expected branch with the rendered prompt;
 the link persists across daemon restart and is byte-identical to a sway-script
 link; given a session/worktree/PR with changes the app renders the diff, accepts
@@ -196,9 +212,11 @@ changes the daemon (no gateway, no embedded assets, no daemon-side auth).
 1. **Track S.1** — extract the **Rust SDK** (`crates/client`); low-risk refactor,
    unblocks the desktop app.
 2. **Track S.2** — document the public API + version negotiation.
-3. **Track D** — build the **native desktop companion app** on the Rust SDK:
-   D.1 (workspace + multi-host) → D.2 (attach) → D.3 (session/project/worktree) →
-   D.4 (prompts) → D.5 (Linear + PRs) → D.6 (diff review + comment-to-session loop).
+3. **Track D** — build the **native desktop companion app** (Iced control plane)
+   on the Rust SDK; see [`design/track-d-native-app.md`](design/track-d-native-app.md)
+   and [`phases/06`](phases/06-native-app.md). **v1:** D.1 (workspace + multi-host)
+   → D.3 (session/project/worktree) → D.4 (prompts) → D.5 (Linear + PRs); attach is
+   delegated (D.2 folded in). **v1.1:** D.6 (diff review + comment-to-session loop).
 4. **Track B (later/optional)** — when mobile / from-any-device access is wanted:
    S.3 (TS SDK + drift check) → aggregator backend → Svelte SPA → PWA → provider
    parity, reusing the desktop app's provider seam and the shared link store.
