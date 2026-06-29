@@ -11,7 +11,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_input};
-use iced::{window, Element, Fill, Size, Subscription, Task, Theme};
+use iced::{window, Background, Center, Element, Fill, Size, Subscription, Task, Theme};
 use pohunek_gui_core::{
     add_project_with_options, create_session_with_options, default_state_dir, discover_hosts,
     inspect_session_with_options, launch_provider_item_with_options,
@@ -1315,16 +1315,82 @@ fn subscription(app: &PohunekApp) -> Subscription<Message> {
     Subscription::batch(subscriptions)
 }
 
+/// Subtle rounded card that groups a detail section so the pane reads as panels
+/// rather than a flat stack of text and buttons.
+fn card<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    container(content)
+        .padding(16)
+        .width(Fill)
+        .style(iced::widget::container::rounded_box)
+        .into()
+}
+
+/// Heading for a detail card.
+fn section_title(label: &str) -> Element<'_, Message> {
+    text(label).size(18).into()
+}
+
+/// Button style for selectable list rows (tree nodes, provider items, monitor
+/// rows): flat and transparent, with a hover tint and a filled accent when
+/// selected, so lists read as lists rather than a wall of identical buttons.
+fn list_row_style(
+    selected: bool,
+) -> impl Fn(&Theme, iced::widget::button::Status) -> iced::widget::button::Style {
+    move |theme, status| {
+        use iced::widget::button::{Status, Style};
+        let palette = theme.extended_palette();
+        let mut style = Style {
+            background: None,
+            text_color: palette.background.base.text,
+            border: iced::border::rounded(6.0),
+            ..Style::default()
+        };
+        if selected {
+            style.background = Some(Background::Color(palette.primary.weak.color));
+            style.text_color = palette.primary.weak.text;
+        } else if matches!(status, Status::Hovered | Status::Pressed) {
+            style.background = Some(Background::Color(palette.background.weak.color));
+        }
+        style
+    }
+}
+
+/// A full-width selectable list row.
+fn list_button<'a>(
+    content: impl Into<Element<'a, Message>>,
+    message: Message,
+    selected: bool,
+) -> Element<'a, Message> {
+    button(content)
+        .width(Fill)
+        .padding([6, 10])
+        .on_press(message)
+        .style(list_row_style(selected))
+        .into()
+}
+
+/// A flat expand/collapse caret toggle.
+fn caret(expanded: bool, node: TreeNodeId) -> Element<'static, Message> {
+    button(text(if expanded { "v" } else { ">" }).size(13))
+        .padding([2, 6])
+        .on_press(Message::ToggleNode(node))
+        .style(iced::widget::button::text)
+        .into()
+}
+
 fn view(app: &PohunekApp) -> Element<'_, Message> {
     let left = column![
         container(workspace_tree(app)).height(Fill),
-        container(agents_monitor(app)).height(u32::from(app.ui_state.agents_pane_height))
+        container(agents_monitor(app))
+            .padding(8)
+            .height(u32::from(app.ui_state.agents_pane_height))
+            .style(iced::widget::container::rounded_box)
     ]
     .spacing(12);
 
     container(row![
         container(left).width(u32::from(app.ui_state.left_pane_width)),
-        container(detail_view(app)).width(Fill)
+        container(detail_view(app)).padding([0, 16]).width(Fill)
     ])
     .padding(16)
     .width(Fill)
@@ -1343,11 +1409,12 @@ fn workspace_tree(app: &PohunekApp) -> Element<'_, Message> {
         let expanded = app.ui_state.expanded_nodes.contains(&node);
         tree = tree.push(
             row![
-                button(if expanded { "v" } else { ">" }).on_press(Message::ToggleNode(node)),
+                caret(expanded, node),
                 conn_dot(host.conn.clone()),
                 text(format!("{host_id}   {}", conn_label(&host.conn))).size(16)
             ]
-            .spacing(6),
+            .spacing(6)
+            .align_y(Center),
         );
         if let Some(error) = &host.last_error {
             tree = tree.push(text(format!("  {error}")).size(13));
@@ -1401,23 +1468,30 @@ fn push_missing_project_row<'a>(
 ) -> iced::widget::Column<'a, Message> {
     let node = TreeNodeId::project(host_id.clone(), project_id);
     let expanded = app.ui_state.expanded_nodes.contains(&node);
-    tree = tree.push(row![
-        text("  "),
-        button(if expanded { "v" } else { ">" }).on_press(Message::ToggleNode(node)),
-        button(text(format!("Unknown project {project_id}")).size(15)).on_press(
-            Message::SelectProject {
-                host_id: host_id.clone(),
-                project_id: project_id.to_owned(),
-            },
-        )
-    ]);
+    let selected = project_is_selected(app, host_id, project_id);
+    tree = tree.push(
+        row![
+            text("  "),
+            caret(expanded, node),
+            list_button(
+                text(format!("Unknown project {project_id}")).size(15),
+                Message::SelectProject {
+                    host_id: host_id.clone(),
+                    project_id: project_id.to_owned(),
+                },
+                selected,
+            ),
+        ]
+        .spacing(4)
+        .align_y(Center),
+    );
     if expanded {
         for session in host
             .sessions
             .values()
             .filter(|session| session.project_id.as_deref() == Some(project_id))
         {
-            tree = tree.push(session_tree_row(host_id, host, session));
+            tree = tree.push(session_tree_row(app, host_id, host, session));
         }
     }
     tree
@@ -1434,14 +1508,23 @@ fn push_project_row<'a>(
     let label = project.map_or("No project", |project| project.label.as_str());
     let node = TreeNodeId::project(host_id.clone(), project_id.clone());
     let expanded = app.ui_state.expanded_nodes.contains(&node);
-    tree = tree.push(row![
-        text("  "),
-        button(if expanded { "v" } else { ">" }).on_press(Message::ToggleNode(node)),
-        button(text(label).size(15)).on_press(Message::SelectProject {
-            host_id: host_id.clone(),
-            project_id,
-        })
-    ]);
+    let selected = project_is_selected(app, host_id, &project_id);
+    tree = tree.push(
+        row![
+            text("  "),
+            caret(expanded, node),
+            list_button(
+                text(label).size(15),
+                Message::SelectProject {
+                    host_id: host_id.clone(),
+                    project_id,
+                },
+                selected,
+            ),
+        ]
+        .spacing(4)
+        .align_y(Center),
+    );
     if expanded {
         for session in host.sessions.values().filter(|session| {
             project.map_or_else(
@@ -1449,31 +1532,54 @@ fn push_project_row<'a>(
                 |project| session.project_id.as_deref() == Some(project.id.as_str()),
             )
         }) {
-            tree = tree.push(session_tree_row(host_id, host, session));
+            tree = tree.push(session_tree_row(app, host_id, host, session));
         }
     }
     tree
 }
 
+/// Whether the given project is the current selection (drives row highlight).
+fn project_is_selected(app: &PohunekApp, host_id: &HostId, project_id: &str) -> bool {
+    matches!(
+        app.ui_state.selection.as_ref(),
+        Some(Selection::Project { host_id: h, project_id: p }) if h == host_id && p == project_id
+    )
+}
+
+/// Whether the given session is the current selection (drives row highlight).
+fn session_is_selected(app: &PohunekApp, host_id: &HostId, session_id: &SessionId) -> bool {
+    matches!(
+        app.ui_state.selection.as_ref(),
+        Some(Selection::Session { host_id: h, session_id: s }) if h == host_id && s == session_id
+    )
+}
+
 fn session_tree_row(
+    app: &PohunekApp,
     host_id: &HostId,
     host: &pohunek_gui_core::HostView,
     session: &SessionInfo,
 ) -> Element<'static, Message> {
     let provider_status = linked_pr_status_label(host, session);
+    let selected = session_is_selected(app, host_id, &session.id);
     row![
         text("    "),
         status_dot(session.activity),
-        button(text(format!(
-            "{}  {}{}",
-            session.id.0, session.agent, provider_status
-        )))
-        .on_press(Message::SelectSession {
-            host_id: host_id.clone(),
-            session_id: session.id.clone(),
-        })
+        list_button(
+            text(format!(
+                "{}  {}{}",
+                session.id.0, session.agent, provider_status
+            ))
+            .size(14),
+            Message::SelectSession {
+                host_id: host_id.clone(),
+                session_id: session.id.clone(),
+            },
+            selected,
+        ),
     ]
     .spacing(6)
+    .align_y(Center)
     .into()
 }
 
@@ -1495,19 +1601,25 @@ fn agents_monitor(app: &PohunekApp) -> Element<'_, Message> {
             continue;
         }
         shown += 1;
+        let selected = session_is_selected(app, &agent.host_id, &agent.session_id);
         list = list.push(
             row![
                 status_dot(agent.activity),
-                button(text(format!(
-                    "{} / {}  {}",
-                    agent.host_id, agent.session_id.0, agent.agent
-                )))
-                .on_press(Message::SelectSession {
-                    host_id: agent.host_id,
-                    session_id: agent.session_id,
-                }),
+                list_button(
+                    text(format!(
+                        "{} / {}  {}",
+                        agent.host_id, agent.session_id.0, agent.agent
+                    ))
+                    .size(14),
+                    Message::SelectSession {
+                        host_id: agent.host_id,
+                        session_id: agent.session_id,
+                    },
+                    selected,
+                ),
             ]
-            .spacing(6),
+            .spacing(6)
+            .align_y(Center),
         );
     }
     if shown == 0 {
@@ -1569,32 +1681,34 @@ fn detail_view(app: &PohunekApp) -> Element<'_, Message> {
 /// lets the operator jump straight into any known project rather than facing an
 /// empty form.
 fn start_work_pane(app: &PohunekApp) -> Element<'_, Message> {
-    let mut pane = column![
-        text("Start work").size(22),
-        text("Pick a project to start an agent, browse Linear issues, or open a pull request.")
-            .size(14),
-    ]
-    .spacing(12);
+    let mut projects = column![].spacing(4);
     let mut any_project = false;
     for (host_id, host) in &app.workspace.hosts {
         for project in host.projects.values() {
             any_project = true;
-            pane = pane.push(
-                button(text(format!("{}   ·   {host_id}", project.label)).size(15)).on_press(
-                    Message::SelectProject {
-                        host_id: host_id.clone(),
-                        project_id: project.id.clone(),
-                    },
-                ),
-            );
+            projects = projects.push(list_button(
+                text(format!("{}   ·   {host_id}", project.label)).size(15),
+                Message::SelectProject {
+                    host_id: host_id.clone(),
+                    project_id: project.id.clone(),
+                },
+                false,
+            ));
         }
     }
     if !any_project {
-        pane = pane.push(
+        projects = projects.push(
             text("No projects yet. Select a host in the workspace tree to add one.").size(13),
         );
     }
-    pane.into()
+    column![
+        text("Start work").size(22),
+        text("Pick a project to start an agent, browse Linear issues, or open a pull request.")
+            .size(14),
+        card(projects),
+    ]
+    .spacing(12)
+    .into()
 }
 
 /// Host surface: connection summary plus project management for that host.
@@ -1631,7 +1745,7 @@ fn session_pane(app: &PohunekApp) -> Element<'_, Message> {
 }
 
 fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
-    let mut detail = column![text("Session").size(18)].spacing(8);
+    let mut detail = column![section_title("Session")].spacing(8);
     match selected_session(app) {
         Some((host_id, session)) => {
             let activity = session
@@ -1671,7 +1785,9 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
                         status.unwrap_or_else(|| "unknown".to_owned())
                     )));
                     detail = detail.push(
-                        button("Refresh PR status").on_press(Message::FetchGitHubPullRequestStatus),
+                        button("Refresh PR status")
+                            .on_press(Message::FetchGitHubPullRequestStatus)
+                            .style(iced::widget::button::secondary),
                     );
                 }
             }
@@ -1679,21 +1795,30 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
                 detail = detail.push(text(format!("worktree: {}", path.display())).size(14));
             }
             detail = detail.push(text(format!("cwd: {}", session.cwd.display())).size(14));
-            detail = detail.push(row![
-                button("Open in terminal").on_press(Message::OpenSession {
-                    host_id: host_id.clone(),
-                    session_id: session.id.clone(),
-                }),
-                button("Inspect").on_press(Message::InspectSelectedSession),
-                button("Stop").on_press(Message::StopSelectedSession)
-            ]);
+            detail = detail.push(
+                row![
+                    button("Open in terminal")
+                        .on_press(Message::OpenSession {
+                            host_id: host_id.clone(),
+                            session_id: session.id.clone(),
+                        })
+                        .style(iced::widget::button::primary),
+                    button("Inspect")
+                        .on_press(Message::InspectSelectedSession)
+                        .style(iced::widget::button::secondary),
+                    button("Stop")
+                        .on_press(Message::StopSelectedSession)
+                        .style(iced::widget::button::danger)
+                ]
+                .spacing(8),
+            );
             detail = detail.push(metadata_view(app, session));
         }
         None => {
             detail = detail.push(text("No session selected").size(16));
         }
     }
-    detail.into()
+    card(detail)
 }
 
 fn metadata_view<'a>(app: &'a PohunekApp, session: &'a SessionInfo) -> Element<'a, Message> {
@@ -1715,15 +1840,22 @@ fn metadata_view<'a>(app: &'a PohunekApp, session: &'a SessionInfo) -> Element<'
             ]
             .spacing(8),
         )
-        .push(row![
-            button("Set metadata").on_press(Message::SetMetadata),
-            button("Clear key").on_press(Message::ClearMetadata)
-        ]);
+        .push(
+            row![
+                button("Set metadata")
+                    .on_press(Message::SetMetadata)
+                    .style(iced::widget::button::secondary),
+                button("Clear key")
+                    .on_press(Message::ClearMetadata)
+                    .style(iced::widget::button::secondary)
+            ]
+            .spacing(8),
+        );
     metadata.into()
 }
 
 fn project_detail(app: &PohunekApp) -> Element<'_, Message> {
-    let mut detail = column![text("Project").size(18)].spacing(8);
+    let mut detail = column![section_title("Project")].spacing(8);
     if let Some((host_id, project)) = selected_project(app) {
         detail = detail
             .push(text(format!("{} / {}", host_id, project.id)).size(16))
@@ -1756,29 +1888,39 @@ fn project_detail(app: &PohunekApp) -> Element<'_, Message> {
     } else {
         detail = detail.push(text("No project selected").size(16));
     }
-    detail
-        .push(button("Refresh").on_press(Message::ShowProject))
+    let detail = detail
+        .push(
+            button("Refresh")
+                .on_press(Message::ShowProject)
+                .style(iced::widget::button::secondary),
+        )
         .push(text("Rename / remove").size(15))
         .push(
             row![
                 text_input("new name", &app.project_edit.rename_to)
                     .on_input(Message::ProjectRenameToChanged),
-                button("Rename").on_press(Message::RenameProject),
+                button("Rename")
+                    .on_press(Message::RenameProject)
+                    .style(iced::widget::button::secondary),
             ]
             .spacing(8),
         )
         .push(
             row![
-                button("Remove").on_press(Message::RemoveProject {
-                    prune_worktrees: false
-                }),
-                button("Remove + prune").on_press(Message::RemoveProject {
-                    prune_worktrees: true
-                }),
+                button("Remove")
+                    .on_press(Message::RemoveProject {
+                        prune_worktrees: false
+                    })
+                    .style(iced::widget::button::danger),
+                button("Remove + prune")
+                    .on_press(Message::RemoveProject {
+                        prune_worktrees: true
+                    })
+                    .style(iced::widget::button::danger),
             ]
             .spacing(8),
-        )
-        .into()
+        );
+    card(detail)
 }
 
 /// Intent-driven "Start session" panel for the selected project. The operator
@@ -1791,7 +1933,7 @@ fn start_session_view(app: &PohunekApp) -> Element<'_, Message> {
         "Advanced >"
     };
     let mut panel = column![
-        text("Start a blank session").size(18),
+        section_title("Start a blank session"),
         row![
             text("Agent").size(14),
             pick_list(
@@ -1800,10 +1942,13 @@ fn start_session_view(app: &PohunekApp) -> Element<'_, Message> {
                 Message::StartAgentSelected
             ),
         ]
-        .spacing(8),
+        .spacing(8)
+        .align_y(Center),
         text_input("initial input (optional)", &app.start.input)
             .on_input(Message::StartInputChanged),
-        button(text(advanced_label).size(13)).on_press(Message::ToggleStartAdvanced),
+        button(text(advanced_label).size(13))
+            .on_press(Message::ToggleStartAdvanced)
+            .style(iced::widget::button::text),
     ]
     .spacing(8);
     if app.start.show_advanced {
@@ -1817,43 +1962,48 @@ fn start_session_view(app: &PohunekApp) -> Element<'_, Message> {
             .spacing(8),
         );
     }
-    panel
-        .push(button("Start session").on_press(Message::CreateSession))
-        .into()
+    let panel = panel.push(
+        button("Start session")
+            .on_press(Message::CreateSession)
+            .style(iced::widget::button::primary),
+    );
+    card(panel)
 }
 
 /// Host-scoped project surface: the host's registered projects (each selectable)
 /// plus an "Add project" form. Rename/remove live in the project surface, scoped
 /// to the selected project, instead of a generic reference field here.
 fn host_projects_view<'a>(app: &'a PohunekApp, host_id: &'a HostId) -> Element<'a, Message> {
-    let mut view = column![text("Projects").size(18)].spacing(8);
+    let mut view = column![section_title("Projects")].spacing(8);
     match app.workspace.hosts.get(host_id) {
         Some(host) if !host.projects.is_empty() => {
             for project in host.projects.values() {
-                view = view.push(
-                    button(text(format!("{}   ({})", project.label, project.id)).size(14))
-                        .on_press(Message::SelectProject {
-                            host_id: host_id.clone(),
-                            project_id: project.id.clone(),
-                        }),
-                );
+                view = view.push(list_button(
+                    text(format!("{}   ({})", project.label, project.id)).size(14),
+                    Message::SelectProject {
+                        host_id: host_id.clone(),
+                        project_id: project.id.clone(),
+                    },
+                    project_is_selected(app, host_id, &project.id),
+                ));
             }
         }
         _ => view = view.push(text("No projects registered on this host").size(13)),
     }
-    view.push(text("Add project").size(15))
-        .push(
-            row![
-                text_input("path", &app.project_edit.path).on_input(Message::ProjectPathChanged),
-                text_input("name (optional)", &app.project_edit.name)
-                    .on_input(Message::ProjectNameChanged),
-                text_input("base branch (optional)", &app.project_edit.base_branch)
-                    .on_input(Message::ProjectBaseBranchChanged),
-                button("Add").on_press(Message::AddProject),
-            ]
-            .spacing(8),
-        )
-        .into()
+    let view = view.push(text("Add project").size(15)).push(
+        row![
+            text_input("path", &app.project_edit.path).on_input(Message::ProjectPathChanged),
+            text_input("name (optional)", &app.project_edit.name)
+                .on_input(Message::ProjectNameChanged),
+            text_input("base branch (optional)", &app.project_edit.base_branch)
+                .on_input(Message::ProjectBaseBranchChanged),
+            button("Add")
+                .on_press(Message::AddProject)
+                .style(iced::widget::button::secondary),
+        ]
+        .spacing(8),
+    );
+    card(view)
 }
 
 fn provider_browser_view(app: &PohunekApp) -> Element<'_, Message> {
@@ -1868,20 +2018,32 @@ fn provider_browser_view(app: &PohunekApp) -> Element<'_, Message> {
         ]
         .into();
     };
+    let active = host.provider.active_panel;
+    let tab_style = |panel: ProviderPanel| {
+        if panel == active {
+            iced::widget::button::primary
+        } else {
+            iced::widget::button::secondary
+        }
+    };
     let tabs = row![
-        button("Linear").on_press(Message::Core(CoreMessage::ProviderPanelSelected {
-            host_id: host_id.clone(),
-            panel: ProviderPanel::Linear,
-        })),
-        button("GitHub").on_press(Message::Core(CoreMessage::ProviderPanelSelected {
-            host_id: host_id.clone(),
-            panel: ProviderPanel::GitHub,
-        }))
+        button("Linear")
+            .on_press(Message::Core(CoreMessage::ProviderPanelSelected {
+                host_id: host_id.clone(),
+                panel: ProviderPanel::Linear,
+            }))
+            .style(tab_style(ProviderPanel::Linear)),
+        button("GitHub")
+            .on_press(Message::Core(CoreMessage::ProviderPanelSelected {
+                host_id: host_id.clone(),
+                panel: ProviderPanel::GitHub,
+            }))
+            .style(tab_style(ProviderPanel::GitHub))
     ]
     .spacing(8);
     let current_scope = selected_github_scope(app).ok();
     let selected_action = app.selected_action.clone();
-    let body = match host.provider.active_panel {
+    let body = match active {
         ProviderPanel::Linear => linear_provider_view(
             host_id.clone(),
             host,
@@ -1896,9 +2058,7 @@ fn provider_browser_view(app: &PohunekApp) -> Element<'_, Message> {
             selected_action,
         ),
     };
-    column![text("Providers").size(18), tabs, body]
-        .spacing(8)
-        .into()
+    card(column![section_title("Providers"), tabs, body].spacing(10))
 }
 
 /// Renders the action picker and launch button for a selected provider item.
@@ -1918,9 +2078,12 @@ fn action_launcher(
     row![
         text("Action").size(13),
         pick_list(actions, selected, Message::SelectAction),
-        button("Launch").on_press(launch),
+        button("Launch")
+            .on_press(launch)
+            .style(iced::widget::button::primary),
     ]
     .spacing(8)
+    .align_y(Center)
     .into()
 }
 
@@ -1954,19 +2117,23 @@ fn linear_provider_view(
                 })
             }
         }),
-        button("Fetch assigned").on_press(Message::FetchLinearIssues),
+        button("Fetch assigned")
+            .on_press(Message::FetchLinearIssues)
+            .style(iced::widget::button::secondary),
     ]
     .spacing(8)]
     .spacing(8);
     for issue in &state.issues {
-        view = view.push(
-            button(text(format!("{}  {}", issue.prompt_item_id(), issue.title)).size(13)).on_press(
-                Message::Core(CoreMessage::LinearProviderIssueSelected {
-                    host_id: host_id.clone(),
-                    issue_id: issue.prompt_item_id().to_owned(),
-                }),
-            ),
-        );
+        let issue_id = issue.prompt_item_id().to_owned();
+        let selected = state.selected_issue_id.as_deref() == Some(issue_id.as_str());
+        view = view.push(list_button(
+            text(format!("{}  {}", issue.prompt_item_id(), issue.title)).size(13),
+            Message::Core(CoreMessage::LinearProviderIssueSelected {
+                host_id: host_id.clone(),
+                issue_id,
+            }),
+            selected,
+        ));
     }
     if let Some(issue) = selected_linear_issue_in_state(state) {
         view = view
@@ -2006,9 +2173,15 @@ fn github_provider_view(
                 })
             }
         }),
-        button("Fetch PRs").on_press(Message::FetchGitHubPullRequests),
-        button("Fetch issues").on_press(Message::FetchGitHubIssues),
-        button("Refresh PR status").on_press(Message::FetchGitHubPullRequestStatus),
+        button("Fetch PRs")
+            .on_press(Message::FetchGitHubPullRequests)
+            .style(iced::widget::button::secondary),
+        button("Fetch issues")
+            .on_press(Message::FetchGitHubIssues)
+            .style(iced::widget::button::secondary),
+        button("Refresh PR status")
+            .on_press(Message::FetchGitHubPullRequestStatus)
+            .style(iced::widget::button::secondary),
     ]
     .spacing(8)]
     .spacing(8);
@@ -2023,15 +2196,15 @@ fn github_provider_view(
     }
     view = view.push(text("Pull requests").size(15));
     for pull_request in filtered_pull_requests(state) {
-        view = view.push(
-            button(text(format!("#{}  {}", pull_request.number, pull_request.title)).size(13))
-                .on_press(Message::Core(
-                    CoreMessage::GitHubProviderPullRequestSelected {
-                        host_id: host_id.clone(),
-                        number: pull_request.number,
-                    },
-                )),
-        );
+        let selected = state.selected_pull_request == Some(pull_request.number);
+        view = view.push(list_button(
+            text(format!("#{}  {}", pull_request.number, pull_request.title)).size(13),
+            Message::Core(CoreMessage::GitHubProviderPullRequestSelected {
+                host_id: host_id.clone(),
+                number: pull_request.number,
+            }),
+            selected,
+        ));
     }
     if let Some(pull_request) = selected_pull_request_in_state(state) {
         let status_key = state
@@ -2060,14 +2233,15 @@ fn github_provider_view(
     }
     view = view.push(text("Issues").size(15));
     for issue in filtered_github_issues(state) {
-        view = view.push(
-            button(text(format!("#{}  {}", issue.number, issue.title)).size(13)).on_press(
-                Message::Core(CoreMessage::GitHubProviderIssueSelected {
-                    host_id: host_id.clone(),
-                    number: issue.number,
-                }),
-            ),
-        );
+        let selected = state.selected_issue == Some(issue.number);
+        view = view.push(list_button(
+            text(format!("#{}  {}", issue.number, issue.title)).size(13),
+            Message::Core(CoreMessage::GitHubProviderIssueSelected {
+                host_id: host_id.clone(),
+                number: issue.number,
+            }),
+            selected,
+        ));
     }
     if let Some(issue) = selected_github_issue_in_state(state) {
         view = view
