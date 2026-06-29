@@ -1,6 +1,6 @@
 # Knowledge Bundle Log
 
-## Unreleased
+## 0.7.0
 
 - Added native GUI provider-integration guidance for Linear and GitHub, including
   `gui.toml` provider configuration, keyring and `gh` boundaries, request
