@@ -29,6 +29,7 @@ toml = { workspace = true }
 
 [dev-dependencies]
 # Exercise the host-aware target parser without a running daemon.
+pohunek-gui-core = { workspace = true }
 
 [lints]
 workspace = true

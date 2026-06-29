@@ -87,6 +87,20 @@ pub fn render(
     Ok(substitute(template.as_ref(), &context))
 }
 
+/// Renders a static prompt template.
+///
+/// Static templates have no provider context. Any `${var}` reference is rejected
+/// so callers do not accidentally launch a partially-rendered prompt.
+///
+/// # Errors
+///
+/// Returns an error when the template references any variable.
+pub fn render_static(template: impl AsRef<str>) -> Result<String, Error> {
+    let context = BTreeMap::new();
+    validate_variables(template.as_ref(), &context)?;
+    Ok(substitute(template.as_ref(), &context))
+}
+
 fn build_context(
     provider: Provider,
     item_id: &str,
@@ -232,4 +246,23 @@ fn is_variable_name(name: &str) -> bool {
         return false;
     }
     chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{render_static, Error};
+
+    #[test]
+    fn static_render_accepts_literal_template() {
+        let rendered = render_static("Run the static checklist\n").expect("static render");
+
+        assert_eq!(rendered, "Run the static checklist\n");
+    }
+
+    #[test]
+    fn static_render_rejects_unknown_variables() {
+        let err = render_static("Issue ${title}").expect_err("unknown variable");
+
+        assert!(matches!(err, Error::UnknownVariables(names) if names == vec!["title"]));
+    }
 }

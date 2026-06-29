@@ -14,16 +14,20 @@ use iced::widget::{button, column, container, row, scrollable, text, text_input}
 use iced::{window, Element, Fill, Size, Subscription, Task, Theme};
 use pohunek_gui_core::{
     add_project_with_options, create_session_with_options, default_state_dir, discover_hosts,
-    inspect_session_with_options, list_projects_with_options, remove_project_with_options,
-    rename_project_with_options, session_metadata_rows, set_session_metadata_with_options,
-    show_project_with_options, spawn_attach_command, stop_session_with_options,
-    AttachCommandSpawner, AttachTemplateValues, ConnState, ConnectionOptions, HostConfig, HostId,
-    Message as CoreMessage, NotificationIntent, Selection, Toast, TreeNodeId, UiState, WindowSize,
-    Workspace,
+    inspect_session_with_options, launch_action_prompt_with_options,
+    list_project_actions_with_options, list_projects_with_options, preview_action_prompt,
+    preview_prompt_content, remove_project_with_options, rename_project_with_options,
+    resolve_project_action_with_options, resolve_project_prompt_with_options,
+    session_metadata_rows, set_session_metadata_with_options, show_project_with_options,
+    spawn_attach_command, stop_session_with_options, AttachCommandSpawner, AttachTemplateValues,
+    ConnState, ConnectionOptions, HostConfig, HostId, Message as CoreMessage, NotificationIntent,
+    PromptContext, PromptLaunchParams, PromptProvider, Selection, Toast, TreeNodeId, UiState,
+    WindowSize, Workspace,
 };
 use protocol::{
-    ProjectAddParams, ProjectInfo, ProjectRemoveParams, ProjectRenameParams, ProjectShowParams,
-    SessionId, SessionInfo, SessionNewParams, SessionSetMetadataParams,
+    ProjectActionParams, ProjectActionsParams, ProjectAddParams, ProjectInfo, ProjectPromptParams,
+    ProjectRemoveParams, ProjectRenameParams, ProjectShowParams, ProviderKind, SessionId,
+    SessionInfo, SessionNewParams, SessionSetMetadataParams,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -83,6 +87,7 @@ struct PohunekApp {
     new_session: NewSessionForm,
     metadata_edit: MetadataEdit,
     project_edit: ProjectEdit,
+    prompt_edit: PromptEdit,
     state_dir: Option<PathBuf>,
     status: Option<String>,
     notified_intents: usize,
@@ -106,6 +111,7 @@ impl PohunekApp {
                 new_session: NewSessionForm::default(),
                 metadata_edit: MetadataEdit::default(),
                 project_edit: ProjectEdit::default(),
+                prompt_edit: PromptEdit::default(),
                 state_dir: boot.state_dir,
                 status: boot.status,
                 notified_intents: 0,
@@ -185,6 +191,29 @@ struct ProjectEdit {
 }
 
 #[derive(Debug, Clone)]
+struct PromptEdit {
+    reference: String,
+    prompt_name: String,
+    action_name: String,
+    provider: String,
+    item_id: String,
+    context_json: String,
+}
+
+impl Default for PromptEdit {
+    fn default() -> Self {
+        Self {
+            reference: String::new(),
+            prompt_name: "issue".to_owned(),
+            action_name: "process-issue".to_owned(),
+            provider: "linear_issue".to_owned(),
+            item_id: String::new(),
+            context_json: "{}".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 enum Message {
     Core(CoreMessage),
     HostsDiscovered(DiscoveryResult),
@@ -231,6 +260,18 @@ enum Message {
     RemoveProject {
         prune_worktrees: bool,
     },
+    PromptReferenceChanged(String),
+    PromptNameChanged(String),
+    PromptActionChanged(String),
+    PromptProviderChanged(String),
+    PromptItemIdChanged(String),
+    PromptContextChanged(String),
+    ListProjectActions,
+    ResolveProjectPrompt,
+    ResolveProjectAction,
+    PreviewPrompt,
+    PreviewAction,
+    LaunchPromptAction,
     CoreCommandCompleted(Result<CoreMessage, String>),
     AttachSpawned(Result<(), String>),
     NotificationSent(Result<(), String>),
@@ -289,6 +330,7 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             });
             app.ui_state.selection = app.workspace.selection.clone();
             app.project_edit.reference = project_id;
+            app.prompt_edit.reference = app.project_edit.reference.clone();
             tasks.push(save_ui_state_task(app));
         }
         Message::OpenSession {
@@ -361,6 +403,36 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                 Err(err) => app.status = Some(err),
             }
         }
+        Message::PromptReferenceChanged(value) => app.prompt_edit.reference = value,
+        Message::PromptNameChanged(value) => app.prompt_edit.prompt_name = value,
+        Message::PromptActionChanged(value) => app.prompt_edit.action_name = value,
+        Message::PromptProviderChanged(value) => app.prompt_edit.provider = value,
+        Message::PromptItemIdChanged(value) => app.prompt_edit.item_id = value,
+        Message::PromptContextChanged(value) => app.prompt_edit.context_json = value,
+        Message::ListProjectActions => match list_project_actions_task(app) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
+        Message::ResolveProjectPrompt => match resolve_project_prompt_task(app) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
+        Message::ResolveProjectAction => match resolve_project_action_task(app) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
+        Message::PreviewPrompt => match preview_prompt_message(app) {
+            Ok(message) => app.workspace.apply(message),
+            Err(err) => app.status = Some(err),
+        },
+        Message::PreviewAction => match preview_action_message(app) {
+            Ok(message) => app.workspace.apply(message),
+            Err(err) => app.status = Some(err),
+        },
+        Message::LaunchPromptAction => match launch_prompt_action_task(app) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
         Message::CoreCommandCompleted(result) => match result {
             Ok(message) => app.workspace.apply(message),
             Err(err) => app.status = Some(err),
@@ -605,6 +677,186 @@ fn remove_project_task(app: &PohunekApp, prune_worktrees: bool) -> Result<Task<M
     ))
 }
 
+fn list_project_actions_task(app: &PohunekApp) -> Result<Task<Message>, String> {
+    let host = selected_host_config(app)?;
+    let host_id = host.id.clone();
+    let options = connection_options(app)?;
+    let reference = selected_prompt_project_reference(app)?;
+    let params = ProjectActionsParams {
+        reference: reference.clone(),
+    };
+    Ok(Task::perform(
+        runtime::perform(async move {
+            match list_project_actions_with_options(&host, params, options).await {
+                Ok(result) => Ok(CoreMessage::ProjectActionsLoaded {
+                    host_id,
+                    reference,
+                    result,
+                }),
+                Err(err) => Ok(CoreMessage::HostOperationFailed {
+                    host_id,
+                    error: err.to_string(),
+                }),
+            }
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn resolve_project_prompt_task(app: &PohunekApp) -> Result<Task<Message>, String> {
+    let host = selected_host_config(app)?;
+    let host_id = host.id.clone();
+    let options = connection_options(app)?;
+    let params = ProjectPromptParams {
+        reference: selected_prompt_project_reference(app)?,
+        name: required_field(&app.prompt_edit.prompt_name, "prompt name")?,
+    };
+    Ok(Task::perform(
+        runtime::perform(async move {
+            match resolve_project_prompt_with_options(&host, params, options).await {
+                Ok(prompt) => Ok(CoreMessage::ProjectPromptResolved { host_id, prompt }),
+                Err(err) => Ok(CoreMessage::HostOperationFailed {
+                    host_id,
+                    error: err.to_string(),
+                }),
+            }
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn resolve_project_action_task(app: &PohunekApp) -> Result<Task<Message>, String> {
+    let host = selected_host_config(app)?;
+    let host_id = host.id.clone();
+    let options = connection_options(app)?;
+    let params = ProjectActionParams {
+        reference: selected_prompt_project_reference(app)?,
+        name: required_field(&app.prompt_edit.action_name, "action name")?,
+    };
+    Ok(Task::perform(
+        runtime::perform(async move {
+            match resolve_project_action_with_options(&host, params, options).await {
+                Ok(action) => Ok(CoreMessage::ProjectActionResolved { host_id, action }),
+                Err(err) => Ok(CoreMessage::HostOperationFailed {
+                    host_id,
+                    error: err.to_string(),
+                }),
+            }
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn preview_prompt_message(app: &PohunekApp) -> Result<CoreMessage, String> {
+    let host_id = selected_host_id(app)?;
+    let host = app
+        .workspace
+        .hosts
+        .get(&host_id)
+        .ok_or_else(|| format!("unknown host `{host_id}`"))?;
+    let prompt = host
+        .prompt
+        .resolved_prompt
+        .as_ref()
+        .ok_or_else(|| "resolve a prompt first".to_owned())?;
+    match preview_prompt_content(
+        prompt.name.clone(),
+        &prompt.content,
+        &PromptContext {
+            provider: parse_prompt_provider(&app.prompt_edit.provider)?,
+            item_id: required_field(&app.prompt_edit.item_id, "item id")?,
+            json: required_field(&app.prompt_edit.context_json, "context JSON")?,
+        },
+    ) {
+        Ok(preview) => Ok(CoreMessage::PromptPreviewRendered { host_id, preview }),
+        Err(err) => Ok(CoreMessage::HostOperationFailed {
+            host_id,
+            error: err.to_string(),
+        }),
+    }
+}
+
+fn preview_action_message(app: &PohunekApp) -> Result<CoreMessage, String> {
+    let host_id = selected_host_id(app)?;
+    let host = app
+        .workspace
+        .hosts
+        .get(&host_id)
+        .ok_or_else(|| format!("unknown host `{host_id}`"))?;
+    let action = host
+        .prompt
+        .resolved_action
+        .as_ref()
+        .ok_or_else(|| "resolve an action first".to_owned())?;
+    let (item_id, context_json) = if action.provider == ProviderKind::None {
+        (String::new(), String::new())
+    } else {
+        (
+            required_field(&app.prompt_edit.item_id, "item id")?,
+            required_field(&app.prompt_edit.context_json, "context JSON")?,
+        )
+    };
+    match preview_action_prompt(action, item_id, context_json) {
+        Ok(preview) => Ok(CoreMessage::PromptPreviewRendered { host_id, preview }),
+        Err(err) => Ok(CoreMessage::HostOperationFailed {
+            host_id,
+            error: err.to_string(),
+        }),
+    }
+}
+
+fn launch_prompt_action_task(app: &PohunekApp) -> Result<Task<Message>, String> {
+    let host = selected_host_config(app)?;
+    let host_id = host.id.clone();
+    let options = connection_options(app)?;
+    let host_view = app
+        .workspace
+        .hosts
+        .get(&host_id)
+        .ok_or_else(|| format!("unknown host `{host_id}`"))?;
+    let action = host_view
+        .prompt
+        .resolved_action
+        .clone()
+        .ok_or_else(|| "resolve an action first".to_owned())?;
+    let preview = host_view
+        .prompt
+        .preview
+        .clone()
+        .ok_or_else(|| "preview a rendered action first".to_owned())?;
+    if preview.prompt_name != action.prompt_name {
+        return Err("preview the resolved action before launching it".to_owned());
+    }
+    let project = selected_prompt_project_reference(app)?;
+    Ok(Task::perform(
+        runtime::perform(async move {
+            match launch_action_prompt_with_options(
+                &host,
+                PromptLaunchParams {
+                    project,
+                    action,
+                    preview,
+                    cols: 80,
+                    rows: 24,
+                },
+                options,
+            )
+            .await
+            {
+                Ok(result) => Ok(CoreMessage::SessionCreated {
+                    host_id,
+                    session: result.session,
+                }),
+                Err(err) => Ok(CoreMessage::HostOperationFailed {
+                    host_id,
+                    error: err.to_string(),
+                }),
+            }
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
 fn build_session_params(form: &NewSessionForm) -> Result<SessionNewParams, String> {
     let metadata = optional_metadata(&form.metadata_key, &form.metadata_value)?;
     Ok(SessionNewParams {
@@ -643,6 +895,11 @@ fn selected_session_target(app: &PohunekApp) -> Result<(HostConfig, SessionId), 
 }
 
 fn selected_host_config(app: &PohunekApp) -> Result<HostConfig, String> {
+    let host_id = selected_host_id(app)?;
+    host_config(app, &host_id)
+}
+
+fn selected_host_id(app: &PohunekApp) -> Result<HostId, String> {
     let host_id = match app.ui_state.selection.as_ref() {
         Some(
             Selection::Host { host_id }
@@ -652,7 +909,7 @@ fn selected_host_config(app: &PohunekApp) -> Result<HostConfig, String> {
         None => app.hosts.first().map(|host| host.id.clone()),
     }
     .ok_or_else(|| "no host is available yet".to_owned())?;
-    host_config(app, &host_id)
+    Ok(host_id)
 }
 
 fn host_config(app: &PohunekApp, host_id: &HostId) -> Result<HostConfig, String> {
@@ -679,6 +936,18 @@ fn selected_project_reference(app: &PohunekApp) -> Result<String, String> {
             _ => None,
         })
         .ok_or_else(|| "select or enter a project reference".to_owned())
+}
+
+fn selected_prompt_project_reference(app: &PohunekApp) -> Result<String, String> {
+    optional_field(&app.prompt_edit.reference)
+        .or_else(|| selected_project_reference(app).ok())
+        .ok_or_else(|| "select or enter a project reference".to_owned())
+}
+
+fn parse_prompt_provider(value: &str) -> Result<PromptProvider, String> {
+    value
+        .parse::<PromptProvider>()
+        .map_err(|err| err.to_string())
 }
 
 fn connection_options(app: &PohunekApp) -> Result<ConnectionOptions, String> {
@@ -937,7 +1206,8 @@ fn detail_view(app: &PohunekApp) -> Element<'_, Message> {
     }
     detail = detail
         .push(new_session_view(app))
-        .push(project_management_view(app));
+        .push(project_management_view(app))
+        .push(prompt_management_view(app));
     for toast in app.workspace.toasts.iter().rev().take(3).rev() {
         detail = detail.push(toast_view(toast));
     }
@@ -1126,6 +1396,114 @@ fn project_management_view(app: &PohunekApp) -> Element<'_, Message> {
     ]
     .spacing(8)
     .into()
+}
+
+fn prompt_management_view(app: &PohunekApp) -> Element<'_, Message> {
+    let mut view = column![
+        text("Prompts").size(18),
+        row![
+            text_input("project reference", &app.prompt_edit.reference)
+                .on_input(Message::PromptReferenceChanged),
+            button("List actions").on_press(Message::ListProjectActions)
+        ]
+        .spacing(8),
+        row![
+            text_input("action", &app.prompt_edit.action_name)
+                .on_input(Message::PromptActionChanged),
+            button("Resolve action").on_press(Message::ResolveProjectAction),
+            button("Preview action").on_press(Message::PreviewAction),
+            button("Launch").on_press(Message::LaunchPromptAction)
+        ]
+        .spacing(8),
+        row![
+            text_input("prompt", &app.prompt_edit.prompt_name).on_input(Message::PromptNameChanged),
+            button("Resolve prompt").on_press(Message::ResolveProjectPrompt),
+            button("Preview prompt").on_press(Message::PreviewPrompt)
+        ]
+        .spacing(8),
+        row![
+            text_input("provider", &app.prompt_edit.provider)
+                .on_input(Message::PromptProviderChanged),
+            text_input("item id", &app.prompt_edit.item_id).on_input(Message::PromptItemIdChanged)
+        ]
+        .spacing(8),
+        text_input("provider context JSON", &app.prompt_edit.context_json)
+            .on_input(Message::PromptContextChanged),
+    ]
+    .spacing(8);
+
+    if let Some(host) = selected_prompt_host(app) {
+        view = push_prompt_state(view, host);
+    }
+    view.into()
+}
+
+fn selected_prompt_host(app: &PohunekApp) -> Option<&pohunek_gui_core::HostView> {
+    let host_id = selected_host_id(app).ok()?;
+    app.workspace.hosts.get(&host_id)
+}
+
+fn push_prompt_state<'a>(
+    mut view: iced::widget::Column<'a, Message>,
+    host: &'a pohunek_gui_core::HostView,
+) -> iced::widget::Column<'a, Message> {
+    for (reference, actions) in &host.prompt.actions_by_project {
+        view = view.push(text(format!("actions for {reference}")).size(15));
+        for action in &actions.actions {
+            view = view.push(
+                text(format!(
+                    "{}  provider={}  template={}  layer={}",
+                    action.name,
+                    provider_kind_label(&action.provider),
+                    action.template,
+                    prompt_layer_label(action.layer)
+                ))
+                .size(13),
+            );
+        }
+    }
+    if let Some(prompt) = &host.prompt.resolved_prompt {
+        view = view.push(
+            text(format!(
+                "prompt {} resolved from {}",
+                prompt.name,
+                prompt_layer_label(prompt.layer)
+            ))
+            .size(13),
+        );
+    }
+    if let Some(action) = &host.prompt.resolved_action {
+        view = view.push(
+            text(format!(
+                "action recipe: agent={} provider={} prompt={}",
+                action.agent,
+                provider_kind_label(&action.provider),
+                action.prompt_name
+            ))
+            .size(13),
+        );
+    }
+    if let Some(preview) = &host.prompt.preview {
+        view = view
+            .push(text(format!("preview: {}", preview.prompt_name)).size(15))
+            .push(text(preview.rendered.clone()).size(13));
+    }
+    view
+}
+
+fn provider_kind_label(provider: &ProviderKind) -> &'static str {
+    match provider {
+        ProviderKind::LinearIssue => "linear_issue",
+        ProviderKind::GithubPr => "github_pr",
+        ProviderKind::None => "none",
+    }
+}
+
+fn prompt_layer_label(layer: protocol::PromptLayer) -> &'static str {
+    match layer {
+        protocol::PromptLayer::InRepo => "in-repo",
+        protocol::PromptLayer::Host => "host",
+    }
 }
 
 fn toast_view(toast: &Toast) -> Element<'_, Message> {

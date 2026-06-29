@@ -2503,6 +2503,7 @@ dependencies = [
  "futures",
  "libc",
  "pohunek-client",
+ "pohunek-gui-core",
  "pohunek-hostcheck",
  "pohunek-knowledge",
  "pohunek-netbird",

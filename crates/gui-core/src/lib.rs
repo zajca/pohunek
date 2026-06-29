@@ -15,10 +15,12 @@ use futures::{stream, StreamExt};
 use pohunek_client::{Client, ClientOptions};
 use protocol::{
     event, method, AgentActivity, Event, HostClass, HostDiscoverParams, HostRecord,
-    ProjectAddParams, ProjectInfo, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
-    ProjectShowParams, ProjectShowResult, ProtocolVersion, Request, SessionId, SessionInfo,
-    SessionNewParams, SessionNewResult, SessionSetMetadataParams, SessionSetMetadataResult,
-    SessionState, SessionStopResult, StateSource,
+    ProjectActionParams, ProjectActionResult, ProjectActionsParams, ProjectActionsResult,
+    ProjectAddParams, ProjectInfo, ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams,
+    ProjectRemoveResult, ProjectRenameParams, ProjectShowParams, ProjectShowResult,
+    ProtocolVersion, ProviderKind, Request, SessionId, SessionInfo, SessionNewParams,
+    SessionNewResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
+    SessionStopResult, StateSource,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -178,6 +180,41 @@ pub struct HostSnapshot {
     pub project_error: Option<String>,
 }
 
+/// Provider context used to render a prompt preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptContext {
+    pub provider: PromptProvider,
+    pub item_id: String,
+    pub json: String,
+}
+
+/// Rendered prompt preview ready for launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptPreview {
+    pub prompt_name: String,
+    pub rendered: String,
+    pub branch: Option<String>,
+}
+
+/// Launch request for a rendered project action prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptLaunchParams {
+    pub project: String,
+    pub action: ProjectActionResult,
+    pub preview: PromptPreview,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// Prompt/action browse and preview state for one host.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptState {
+    pub actions_by_project: BTreeMap<String, ProjectActionsResult>,
+    pub resolved_prompt: Option<ProjectPromptResult>,
+    pub resolved_action: Option<ProjectActionResult>,
+    pub preview: Option<PromptPreview>,
+}
+
 /// Parsed `agent_state` event payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentStateEvent {
@@ -258,6 +295,27 @@ pub enum Message {
         host_id: HostId,
         reference: String,
         result: ProjectRemoveResult,
+    },
+    ProjectActionsLoaded {
+        host_id: HostId,
+        reference: String,
+        result: ProjectActionsResult,
+    },
+    ProjectPromptResolved {
+        host_id: HostId,
+        prompt: ProjectPromptResult,
+    },
+    ProjectActionResolved {
+        host_id: HostId,
+        action: ProjectActionResult,
+    },
+    PromptPreviewRendered {
+        host_id: HostId,
+        preview: PromptPreview,
+    },
+    HostOperationFailed {
+        host_id: HostId,
+        error: String,
     },
 }
 
@@ -459,6 +517,7 @@ pub struct HostView {
     pub sessions: BTreeMap<String, SessionInfo>,
     pub projects: BTreeMap<String, ProjectInfo>,
     pub project_details: BTreeMap<String, ProjectShowResult>,
+    pub prompt: PromptState,
     pub last_agent_state: Option<AgentStateEvent>,
     pub last_error: Option<String>,
 }
@@ -471,6 +530,7 @@ impl HostView {
             sessions: BTreeMap::new(),
             projects: BTreeMap::new(),
             project_details: BTreeMap::new(),
+            prompt: PromptState::default(),
             last_agent_state: None,
             last_error: None,
         }
@@ -537,6 +597,10 @@ impl Workspace {
                     .hosts
                     .get(&host_id)
                     .map_or_else(BTreeMap::new, |host| host.project_details.clone());
+                let previous_prompt = self
+                    .hosts
+                    .get(&host_id)
+                    .map_or_else(PromptState::default, |host| host.prompt.clone());
                 self.hosts.insert(
                     snapshot.host_id,
                     HostView {
@@ -545,6 +609,7 @@ impl Workspace {
                         sessions,
                         projects,
                         project_details: previous_details,
+                        prompt: previous_prompt,
                         last_agent_state: None,
                         last_error: snapshot.project_error,
                     },
@@ -678,6 +743,51 @@ impl Workspace {
                         host.project_details.remove(&id);
                     }
                 }
+            }
+            Message::ProjectActionsLoaded {
+                host_id,
+                reference,
+                result,
+            } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                host.prompt.actions_by_project.insert(reference, result);
+                host.last_error = None;
+            }
+            Message::ProjectPromptResolved { host_id, prompt } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                host.prompt.resolved_prompt = Some(prompt);
+                host.prompt.preview = None;
+                host.last_error = None;
+            }
+            Message::ProjectActionResolved { host_id, action } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                host.prompt.resolved_action = Some(action);
+                host.prompt.preview = None;
+                host.last_error = None;
+            }
+            Message::PromptPreviewRendered { host_id, preview } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                host.prompt.preview = Some(preview);
+                host.last_error = None;
+            }
+            Message::HostOperationFailed { host_id, error } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                host.last_error = Some(error);
             }
         }
     }
@@ -862,12 +972,16 @@ pub enum CoreError {
     Client(#[from] pohunek_client::ClientError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Prompt(#[from] PromptError),
     #[error("agent_state event is missing `{field}`")]
     MissingAgentStateField { field: &'static str },
     #[error("session event is missing `session`")]
     MissingSessionEventPayload,
     #[error("host discovery record does not contain a usable host name")]
     MissingDiscoveredHostName,
+    #[error("provider `{provider}` context is missing a branch field")]
+    MissingPromptBranch { provider: &'static str },
 }
 
 /// Load one host snapshot with `daemon.health` and `session.list`.
@@ -1096,6 +1210,185 @@ pub async fn remove_project_with_options(
         serde_json::to_value(params)?,
     )
     .await
+}
+
+/// List project actions on a host through the SDK.
+pub async fn list_project_actions(
+    config: &HostConfig,
+    params: ProjectActionsParams,
+) -> Result<ProjectActionsResult, CoreError> {
+    list_project_actions_with_options(config, params, ConnectionOptions::default()).await
+}
+
+/// List project actions with explicit connection options.
+pub async fn list_project_actions_with_options(
+    config: &HostConfig,
+    params: ProjectActionsParams,
+    options: ConnectionOptions,
+) -> Result<ProjectActionsResult, CoreError> {
+    request_host_json(
+        config,
+        options,
+        "gui-project-actions",
+        method::PROJECT_ACTIONS,
+        serde_json::to_value(params)?,
+    )
+    .await
+}
+
+/// Resolve a project prompt on a host through the SDK.
+pub async fn resolve_project_prompt(
+    config: &HostConfig,
+    params: ProjectPromptParams,
+) -> Result<ProjectPromptResult, CoreError> {
+    resolve_project_prompt_with_options(config, params, ConnectionOptions::default()).await
+}
+
+/// Resolve a project prompt with explicit connection options.
+pub async fn resolve_project_prompt_with_options(
+    config: &HostConfig,
+    params: ProjectPromptParams,
+    options: ConnectionOptions,
+) -> Result<ProjectPromptResult, CoreError> {
+    request_host_json(
+        config,
+        options,
+        "gui-project-prompt",
+        method::PROJECT_PROMPT,
+        serde_json::to_value(params)?,
+    )
+    .await
+}
+
+/// Resolve a project action on a host through the SDK.
+pub async fn resolve_project_action(
+    config: &HostConfig,
+    params: ProjectActionParams,
+) -> Result<ProjectActionResult, CoreError> {
+    resolve_project_action_with_options(config, params, ConnectionOptions::default()).await
+}
+
+/// Resolve a project action with explicit connection options.
+pub async fn resolve_project_action_with_options(
+    config: &HostConfig,
+    params: ProjectActionParams,
+    options: ConnectionOptions,
+) -> Result<ProjectActionResult, CoreError> {
+    request_host_json(
+        config,
+        options,
+        "gui-project-action",
+        method::PROJECT_ACTION,
+        serde_json::to_value(params)?,
+    )
+    .await
+}
+
+/// Render a resolved prompt template for preview.
+pub fn preview_prompt_content(
+    prompt_name: impl Into<String>,
+    template_content: impl AsRef<str>,
+    context: &PromptContext,
+) -> Result<PromptPreview, CoreError> {
+    let rendered = render_prompt(
+        template_content.as_ref(),
+        context.provider,
+        context.item_id.as_str(),
+        context.json.as_str(),
+    )?;
+    let branch = branch_from_context(context.provider, context.json.as_str())?;
+    Ok(PromptPreview {
+        prompt_name: prompt_name.into(),
+        rendered,
+        branch: Some(branch),
+    })
+}
+
+/// Render a resolved project action prompt for preview.
+pub fn preview_action_prompt(
+    action: &ProjectActionResult,
+    item_id: impl Into<String>,
+    context_json: impl Into<String>,
+) -> Result<PromptPreview, CoreError> {
+    match &action.provider {
+        ProviderKind::LinearIssue | ProviderKind::GithubPr => {
+            let prompt_provider = action_prompt_provider(&action.provider);
+            preview_prompt_content(
+                action.prompt_name.clone(),
+                &action.prompt_content,
+                &PromptContext {
+                    provider: prompt_provider,
+                    item_id: item_id.into(),
+                    json: context_json.into(),
+                },
+            )
+        }
+        ProviderKind::None => {
+            let rendered = pohunek_prompt::render_static(&action.prompt_content)?;
+            Ok(PromptPreview {
+                prompt_name: action.prompt_name.clone(),
+                rendered,
+                branch: action.branch.clone(),
+            })
+        }
+    }
+}
+
+/// Launch a rendered action prompt on a host.
+pub async fn launch_action_prompt_with_options(
+    config: &HostConfig,
+    params: PromptLaunchParams,
+    options: ConnectionOptions,
+) -> Result<SessionNewResult, CoreError> {
+    let branch = params
+        .preview
+        .branch
+        .clone()
+        .or_else(|| params.action.branch.clone());
+    create_session_with_options(
+        config,
+        SessionNewParams {
+            agent: params.action.agent,
+            cwd: None,
+            cols: params.cols,
+            rows: params.rows,
+            project: Some(params.project),
+            repo: None,
+            branch,
+            base_branch: params.action.base_branch,
+            input: Some(params.preview.rendered),
+            metadata: BTreeMap::new(),
+        },
+        options,
+    )
+    .await
+}
+
+fn action_prompt_provider(provider: &ProviderKind) -> PromptProvider {
+    match provider {
+        ProviderKind::LinearIssue => PromptProvider::LinearIssue,
+        ProviderKind::GithubPr => PromptProvider::GitHubPr,
+        ProviderKind::None => unreachable!("provider none is handled before provider conversion"),
+    }
+}
+
+fn branch_from_context(provider: PromptProvider, raw_json: &str) -> Result<String, CoreError> {
+    let data: Value = serde_json::from_str(raw_json)?;
+    let fields = match provider {
+        PromptProvider::LinearIssue => &["branchName", "branch"][..],
+        PromptProvider::GitHubPr => &["headRefName", "branch", "branchName"][..],
+    };
+    fields
+        .iter()
+        .find_map(|field| {
+            data.get(*field)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .ok_or(CoreError::MissingPromptBranch {
+            provider: provider.as_str(),
+        })
 }
 
 async fn load_host_snapshot_with_options(

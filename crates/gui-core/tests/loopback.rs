@@ -14,17 +14,21 @@ use pohunek_client::Client;
 use pohunek_daemon::api::{DaemonState, HealthInfo, RemoteServer};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use pohunek_gui_core::{
-    add_project, host_subscription_stream, inspect_session, list_projects, load_host_snapshot,
-    remove_project, rename_project, session_metadata_rows, set_session_metadata, show_project,
+    add_project, host_subscription_stream, inspect_session, launch_action_prompt_with_options,
+    list_project_actions, list_projects, load_host_snapshot, preview_action_prompt,
+    preview_prompt_content, remove_project, rename_project, resolve_project_action,
+    resolve_project_prompt, session_metadata_rows, set_session_metadata, show_project,
     spawn_attach_command, stop_session as stop_gui_session, workspace_connection_stream,
     AgentStateEvent, AttachCommandSpawner, AttachSpawnIntent, AttachTemplateValues, ConnState,
-    ConnectionOptions, DetailTab, HostConfig, HostEvent, Message, Selection, TreeNodeId, UiState,
+    ConnectionOptions, DetailTab, HealthSummary, HostConfig, HostEvent, HostId, HostSnapshot,
+    Message, PromptContext, PromptLaunchParams, PromptPreview, Selection, TreeNodeId, UiState,
     WindowSize, Workspace,
 };
 use protocol::{
-    method, AgentActivity, AgentKind, ProjectAddParams, ProjectRemoveParams, ProjectRenameParams,
-    ProjectShowParams, Request, SessionId, SessionInfo, SessionNewParams, SessionSetMetadataParams,
-    StateSource,
+    method, AgentActivity, AgentKind, ProjectActionParams, ProjectActionResult,
+    ProjectActionsParams, ProjectAddParams, ProjectPromptParams, ProjectRemoveParams,
+    ProjectRenameParams, ProjectShowParams, ProviderKind, Request, SessionId, SessionInfo,
+    SessionNewParams, SessionSetMetadataParams, StateSource,
 };
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -489,6 +493,449 @@ async fn worktree_creation_is_session_new_with_branch_and_visible_in_project_sho
     daemon.shutdown().await;
 }
 
+#[tokio::test]
+async fn prompt_actions_and_prompt_resolve_from_target_host() {
+    let _path_lock = PATH_LOCK.lock().await;
+    let daemon = LoopbackDaemon::spawn("m3-resolve", "0.3.0-resolve").await;
+    let host = HostConfig::tcp("host-prompts", daemon.addr);
+    let repo = init_git_repo("gui-core-m3-resolve-repo");
+    write_file(
+        &repo.join(".pohunek/templates.toml"),
+        r#"
+[template.issue]
+agent = "codex"
+prompt = "issue"
+base_branch = "main"
+"#,
+    );
+    write_file(
+        &repo.join(".pohunek/actions.toml"),
+        r#"
+[action.process-issue]
+template = "issue"
+provider = "linear_issue"
+"#,
+    );
+    write_file(
+        &repo.join(".pohunek/prompts/issue.tmpl"),
+        "Issue ${id}: ${title}\n${body}\nbranch=${branch}\n",
+    );
+    let project = add_project(
+        &host,
+        ProjectAddParams {
+            path: Some(repo),
+            name: Some("Prompt Project".to_owned()),
+            base_branch: Some("main".to_owned()),
+        },
+    )
+    .await
+    .expect("project.add");
+
+    let actions = list_project_actions(
+        &host,
+        ProjectActionsParams {
+            reference: project.id.clone(),
+        },
+    )
+    .await
+    .expect("project.actions through gui-core");
+    assert_eq!(actions.actions.len(), 1);
+    assert_eq!(actions.actions[0].name, "process-issue");
+    assert_eq!(actions.actions[0].provider, ProviderKind::LinearIssue);
+
+    let prompt = resolve_project_prompt(
+        &host,
+        ProjectPromptParams {
+            reference: project.id.clone(),
+            name: "issue".to_owned(),
+        },
+    )
+    .await
+    .expect("project.prompt through gui-core");
+    assert_eq!(
+        prompt.content,
+        "Issue ${id}: ${title}\n${body}\nbranch=${branch}\n"
+    );
+
+    let action = resolve_project_action(
+        &host,
+        ProjectActionParams {
+            reference: project.id,
+            name: "process-issue".to_owned(),
+        },
+    )
+    .await
+    .expect("project.action through gui-core");
+    assert_eq!(action.agent, "codex");
+    assert_eq!(action.base_branch.as_deref(), Some("main"));
+    assert_eq!(action.prompt_content, prompt.content);
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_prompt_resolution_uses_target_daemon_config_not_operator_filesystem() {
+    let _path_lock = PATH_LOCK.lock().await;
+    let operator_config_home = temp_dir("gui-core-m3-operator-config-home");
+    write_file(
+        &operator_config_home.join("pohunek/prompts/issue.tmpl"),
+        "OPERATOR LOCAL ${title}",
+    );
+    let _xdg = EnvGuard::set("XDG_CONFIG_HOME", operator_config_home);
+
+    let remote_config_dir = temp_dir("gui-core-m3-remote-config");
+    write_file(
+        &remote_config_dir.join("prompts/issue.tmpl"),
+        "REMOTE TARGET ${title}",
+    );
+    let daemon = LoopbackDaemon::spawn_with_config(
+        "m3-remote",
+        "0.3.0-remote",
+        Some(remote_config_dir),
+        None,
+    )
+    .await;
+    let host = HostConfig::tcp("remote-host", daemon.addr);
+    let repo = init_git_repo("gui-core-m3-remote-repo");
+    let project = add_project(
+        &host,
+        ProjectAddParams {
+            path: Some(repo),
+            name: Some("Remote Prompt Project".to_owned()),
+            base_branch: Some("main".to_owned()),
+        },
+    )
+    .await
+    .expect("project.add");
+
+    let prompt = resolve_project_prompt(
+        &host,
+        ProjectPromptParams {
+            reference: project.id,
+            name: "issue".to_owned(),
+        },
+    )
+    .await
+    .expect("project.prompt through remote daemon");
+
+    assert_eq!(prompt.content, "REMOTE TARGET ${title}");
+    assert!(!prompt.content.contains("OPERATOR LOCAL"));
+
+    daemon.shutdown().await;
+}
+
+#[test]
+fn rendered_gui_prompt_matches_shared_prompt_render_for_same_context() {
+    let action = ProjectActionResult {
+        provider: ProviderKind::LinearIssue,
+        agent: "codex".to_owned(),
+        base_branch: Some("develop".to_owned()),
+        branch: None,
+        prompt_name: "issue".to_owned(),
+        prompt_content: "Issue ${id}: ${title}\n${body}\nbranch=${branch}\n".to_owned(),
+    };
+    let context_json = r#"{"identifier":"LIN-123","title":"Fix launcher","description":"Issue body","branchName":"lin-123-fix-launcher","url":"https://linear.test/LIN-123"}"#;
+
+    let preview =
+        preview_action_prompt(&action, "LIN-123", context_json).expect("GUI action prompt preview");
+    let direct_preview = preview_prompt_content(
+        "issue",
+        &action.prompt_content,
+        &PromptContext {
+            provider: pohunek_gui_core::PromptProvider::LinearIssue,
+            item_id: "LIN-123".to_owned(),
+            json: context_json.to_owned(),
+        },
+    )
+    .expect("GUI direct prompt preview");
+    let expected = pohunek_gui_core::render_prompt(
+        &action.prompt_content,
+        pohunek_gui_core::PromptProvider::LinearIssue,
+        "LIN-123",
+        context_json,
+    )
+    .expect("shared prompt render");
+
+    assert_eq!(preview.rendered, expected);
+    assert_eq!(direct_preview.rendered, expected);
+    assert_eq!(preview.prompt_name, "issue");
+    assert_eq!(preview.branch.as_deref(), Some("lin-123-fix-launcher"));
+}
+
+#[test]
+fn preview_state_updates_without_launching_session() {
+    let host_id = HostId::new("preview-host");
+    let mut workspace = Workspace::default();
+    workspace.apply(Message::HostSnapshotLoaded {
+        snapshot: HostSnapshot {
+            host_id: host_id.clone(),
+            health: HealthSummary {
+                status: "ok".to_owned(),
+                daemon_version: "0.3.0-preview".to_owned(),
+                protocol_version: protocol::PROTOCOL_VERSION,
+            },
+            sessions: Vec::new(),
+            projects: Vec::new(),
+            project_error: None,
+        },
+    });
+    let preview = PromptPreview {
+        prompt_name: "issue".to_owned(),
+        rendered: "Issue LIN-123".to_owned(),
+        branch: Some("lin-123".to_owned()),
+    };
+
+    workspace.apply(Message::PromptPreviewRendered {
+        host_id: host_id.clone(),
+        preview: preview.clone(),
+    });
+
+    let host = workspace.hosts.get(&host_id).expect("host view");
+    assert_eq!(host.prompt.preview, Some(preview));
+    assert!(host.sessions.is_empty());
+}
+
+#[tokio::test]
+async fn launch_from_rendered_preset_creates_one_session_with_rendered_input() {
+    let _path_lock = PATH_LOCK.lock().await;
+    let bin_dir = temp_dir("gui-core-m3-launch-bin");
+    let record_dir = temp_dir("gui-core-m3-launch-record");
+    let prompt_out = record_dir.join("prompt.txt");
+    let _prompt_out = EnvGuard::set("POHUNEK_TEST_PROMPT_OUT", &prompt_out);
+    write_executable(
+        &bin_dir.join("codex"),
+        "#!/bin/sh\nprintf '%s' \"${1:-}\" > \"$POHUNEK_TEST_PROMPT_OUT\"\n/bin/sleep 30\n",
+    );
+    let _path = PathGuard::prepend(&bin_dir);
+
+    let daemon = LoopbackDaemon::spawn("m3-launch", "0.3.0-launch").await;
+    let host = HostConfig::tcp("host-launch", daemon.addr);
+    let repo = init_git_repo("gui-core-m3-launch-repo");
+    write_file(
+        &repo.join(".pohunek/templates.toml"),
+        r#"
+[template.issue]
+agent = "codex"
+prompt = "issue"
+base_branch = "develop"
+"#,
+    );
+    write_file(
+        &repo.join(".pohunek/actions.toml"),
+        r#"
+[action.process-issue]
+template = "issue"
+provider = "linear_issue"
+"#,
+    );
+    write_file(
+        &repo.join(".pohunek/prompts/issue.tmpl"),
+        "Issue ${id}: ${title}\n${body}\nbranch=${branch}\n",
+    );
+    let project = add_project(
+        &host,
+        ProjectAddParams {
+            path: Some(repo),
+            name: Some("Launch Project".to_owned()),
+            base_branch: Some("main".to_owned()),
+        },
+    )
+    .await
+    .expect("project.add");
+    let before = load_host_snapshot(&host)
+        .await
+        .expect("snapshot before launch")
+        .sessions
+        .len();
+    let action = resolve_project_action(
+        &host,
+        ProjectActionParams {
+            reference: project.id.clone(),
+            name: "process-issue".to_owned(),
+        },
+    )
+    .await
+    .expect("project.action");
+    let context_json = r#"{"identifier":"LIN-123","title":"Fix launcher","description":"Issue body","branchName":"lin-123-fix-launcher","url":"https://linear.test/LIN-123"}"#;
+    let preview =
+        preview_action_prompt(&action, "LIN-123", context_json).expect("render action preview");
+
+    let launched = launch_action_prompt_with_options(
+        &host,
+        PromptLaunchParams {
+            project: project.id.clone(),
+            action,
+            preview: preview.clone(),
+            cols: 80,
+            rows: 24,
+        },
+        test_connection_options(),
+    )
+    .await
+    .expect("launch rendered prompt");
+
+    assert_eq!(
+        launched.session.branch.as_deref(),
+        Some("lin-123-fix-launcher")
+    );
+    assert_eq!(
+        launched.session.project_id.as_deref(),
+        Some(project.id.as_str())
+    );
+    assert!(launched.session.metadata.is_empty());
+
+    let recorded = wait_for_file(&prompt_out).await;
+    assert_eq!(recorded, preview.rendered);
+
+    let after = load_host_snapshot(&host)
+        .await
+        .expect("snapshot after launch")
+        .sessions;
+    assert_eq!(after.len(), before + 1);
+    assert_eq!(
+        after
+            .iter()
+            .filter(|session| session.id == launched.session.id)
+            .count(),
+        1
+    );
+
+    stop_session(&host, &launched.session.id).await;
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn prompt_errors_surface_without_corrupting_workspace_state() {
+    let _path_lock = PATH_LOCK.lock().await;
+    let bin_dir = temp_dir("gui-core-m3-error-bin");
+    write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
+    let _path = PathGuard::prepend(&bin_dir);
+
+    let daemon = LoopbackDaemon::spawn("m3-error", "0.3.0-error").await;
+    let host = HostConfig::tcp("host-error", daemon.addr);
+    let repo = init_git_repo("gui-core-m3-error-repo");
+    write_prompt_error_fixture(&repo);
+    let project = add_project(
+        &host,
+        ProjectAddParams {
+            path: Some(repo),
+            name: Some("Error Project".to_owned()),
+            base_branch: Some("main".to_owned()),
+        },
+    )
+    .await
+    .expect("project.add");
+    let existing =
+        create_agent_session(&host, AgentKind::Codex, temp_dir("gui-core-m3-existing")).await;
+    let mut workspace = Workspace::default();
+    workspace.apply(Message::HostSnapshotLoaded {
+        snapshot: load_host_snapshot(&host).await.expect("seed workspace"),
+    });
+    let before_sessions = workspace
+        .hosts
+        .get(&host.id)
+        .expect("host view")
+        .sessions
+        .clone();
+    let before_projects = workspace
+        .hosts
+        .get(&host.id)
+        .expect("host view")
+        .projects
+        .clone();
+
+    apply_prompt_error_cases(&mut workspace, &host, project.id).await;
+
+    let host_view = workspace
+        .hosts
+        .get(&host.id)
+        .expect("host view after errors");
+    assert!(host_view.last_error.is_some());
+    assert_eq!(host_view.sessions, before_sessions);
+    assert_eq!(host_view.projects, before_projects);
+    assert!(host_view.sessions.contains_key(&existing.id.0));
+
+    stop_session(&host, &existing.id).await;
+    daemon.shutdown().await;
+}
+
+fn write_prompt_error_fixture(repo: &Path) {
+    write_file(
+        &repo.join(".pohunek/templates.toml"),
+        r#"
+[template.issue]
+agent = "codex"
+prompt = "issue"
+"#,
+    );
+    write_file(
+        &repo.join(".pohunek/actions.toml"),
+        r#"
+[action.process-issue]
+template = "issue"
+provider = "linear_issue"
+"#,
+    );
+    write_file(
+        &repo.join(".pohunek/prompts/issue.tmpl"),
+        "Issue ${id}: ${missing}\n",
+    );
+}
+
+async fn apply_prompt_error_cases(
+    workspace: &mut Workspace,
+    host: &HostConfig,
+    project_id: String,
+) {
+    let missing_prompt = resolve_project_prompt(
+        host,
+        ProjectPromptParams {
+            reference: project_id.clone(),
+            name: "missing".to_owned(),
+        },
+    )
+    .await
+    .expect_err("missing prompt should fail");
+    workspace.apply(Message::HostOperationFailed {
+        host_id: host.id.clone(),
+        error: missing_prompt.to_string(),
+    });
+
+    let missing_action = resolve_project_action(
+        host,
+        ProjectActionParams {
+            reference: project_id.clone(),
+            name: "missing-action".to_owned(),
+        },
+    )
+    .await
+    .expect_err("missing action should fail");
+    workspace.apply(Message::HostOperationFailed {
+        host_id: host.id.clone(),
+        error: missing_action.to_string(),
+    });
+
+    let action = resolve_project_action(
+        host,
+        ProjectActionParams {
+            reference: project_id,
+            name: "process-issue".to_owned(),
+        },
+    )
+    .await
+    .expect("project.action");
+    let render_error = preview_action_prompt(
+        &action,
+        "LIN-123",
+        r#"{"identifier":"LIN-123","title":"Fix launcher","description":"Issue body","branchName":"lin-123-fix-launcher"}"#,
+    )
+    .expect_err("unknown variable should fail");
+    workspace.apply(Message::HostOperationFailed {
+        host_id: host.id.clone(),
+        error: render_error.to_string(),
+    });
+}
+
 #[test]
 fn attach_command_spawn_intent_is_resolved_without_embedded_terminal() {
     #[derive(Debug, Default)]
@@ -561,19 +1008,30 @@ struct LoopbackDaemon {
 
 impl LoopbackDaemon {
     async fn spawn(tag: &str, version: &str) -> Self {
+        Self::spawn_with_config(tag, version, None, None).await
+    }
+
+    async fn spawn_with_config(
+        tag: &str,
+        version: &str,
+        config_dir: Option<PathBuf>,
+        shell_command: Option<pohunek_daemon::session::ShellCommand>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("loopback bind");
         let addr = listener.local_addr().expect("local addr");
-        let state = DaemonState::new(
-            HealthInfo::new(version),
-            SessionRegistry::new(SessionRegistryConfig {
-                stop_grace: Duration::from_millis(50),
-                store_path: Some(temp_dir(&format!("{tag}-state")).join("metadata.jsonl")),
-                worktree_root: Some(temp_dir(&format!("{tag}-worktrees"))),
-                ..SessionRegistryConfig::default()
-            }),
-        );
+        let mut config = SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(temp_dir(&format!("{tag}-state")).join("metadata.jsonl")),
+            worktree_root: Some(temp_dir(&format!("{tag}-worktrees"))),
+            config_dir,
+            ..SessionRegistryConfig::default()
+        };
+        if let Some(shell_command) = shell_command {
+            config.shell_command = shell_command;
+        }
+        let state = DaemonState::new(HealthInfo::new(version), SessionRegistry::new(config));
         let server = RemoteServer::from_listener(listener, state);
         let (shutdown, rx) = oneshot::channel();
         let tag = tag.to_owned();
@@ -764,6 +1222,29 @@ fn init_git_repo(tag: &str) -> PathBuf {
     dir
 }
 
+fn write_file(path: &Path, body: &str) {
+    std::fs::create_dir_all(path.parent().expect("path has parent")).expect("create parent dir");
+    std::fs::write(path, body).expect("write file");
+}
+
+async fn wait_for_file(path: &Path) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match std::fs::read_to_string(path) {
+            Ok(value) => return value,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("failed to read {}: {err}", path.display()),
+        }
+        let now = tokio::time::Instant::now();
+        assert!(
+            now < deadline,
+            "file {} was not written before deadline",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn create_agent_session(host: &HostConfig, agent: AgentKind, cwd: PathBuf) -> SessionInfo {
     let mut client = client(host).await;
     let request = Request::new(
@@ -874,6 +1355,28 @@ fn write_executable(path: &Path, body: &str) {
 
 struct PathGuard {
     old_path: Option<OsString>,
+}
+
+struct EnvGuard {
+    key: &'static str,
+    old_value: Option<OsString>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let old_value = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, old_value }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.old_value {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
 }
 
 impl PathGuard {
