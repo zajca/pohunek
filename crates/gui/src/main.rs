@@ -14,20 +14,21 @@ use iced::widget::{button, column, container, pick_list, row, scrollable, text, 
 use iced::{window, Background, Center, Element, Fill, Size, Subscription, Task, Theme};
 use pohunek_gui_core::{
     add_project_with_options, create_session_with_options, default_state_dir, discover_hosts,
-    inspect_session_with_options, launch_provider_item_with_options,
-    list_project_actions_with_options, providers, remove_project_with_options,
-    rename_project_with_options, session_link_metadata, session_metadata_rows,
+    inspect_session_with_options, launch_action_prompt_with_options,
+    launch_provider_item_with_options, list_project_actions_with_options, preview_action_prompt,
+    providers, remove_project_with_options, rename_project_with_options,
+    resolve_project_action_with_options, session_link_metadata, session_metadata_rows,
     set_session_metadata_with_options, show_project_with_options, spawn_attach_command,
     stop_session_with_options, AttachCommandSpawner, AttachTemplateValues, ConnState,
     ConnectionOptions, GitHubProviderScope, GitHubPullRequestStatusKey, HostConfig, HostId,
-    Message as CoreMessage, NotificationIntent, ProviderLaunchItem, ProviderLaunchParams,
-    ProviderOperation, ProviderPanel, ProviderRequestId, Selection, SessionLinkKind,
-    SessionLinkProvider, Toast, TreeNodeId, UiState, WindowSize, Workspace,
+    Message as CoreMessage, NotificationIntent, PromptLaunchParams, ProviderLaunchItem,
+    ProviderLaunchParams, ProviderOperation, ProviderPanel, ProviderRequestId, Selection,
+    SessionLinkKind, SessionLinkProvider, Toast, TreeNodeId, UiState, WindowSize, Workspace,
 };
 use protocol::{
-    AgentActivity, ProjectActionsParams, ProjectAddParams, ProjectInfo, ProjectRemoveParams,
-    ProjectRenameParams, ProjectShowParams, ProviderKind, SessionId, SessionInfo, SessionNewParams,
-    SessionSetMetadataParams,
+    AgentActivity, ProjectActionParams, ProjectActionsParams, ProjectAddParams, ProjectInfo,
+    ProjectRemoveParams, ProjectRenameParams, ProjectShowParams, ProviderKind, SessionId,
+    SessionInfo, SessionNewParams, SessionSetMetadataParams,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -37,6 +38,8 @@ const DEFAULT_TERMINAL_COLS: u16 = 80;
 const DEFAULT_TERMINAL_ROWS: u16 = 24;
 // notify-send is the freedesktop notification CLI available on target Linux desktops.
 const DEFAULT_NOTIFICATION_COMMAND: &str = "notify-send";
+// Sentinel option in the Start template picker meaning "no template, blank session".
+const BLANK_TEMPLATE_LABEL: &str = "— blank —";
 
 pub fn main() -> iced::Result {
     let boot = BootState::load();
@@ -184,6 +187,9 @@ impl std::fmt::Display for AgentChoice {
 #[derive(Debug, Clone)]
 struct StartForm {
     agent: AgentChoice,
+    /// Selected prompt template (a `None`-provider action name); `None` means a
+    /// blank session whose input is the free-text field.
+    template: Option<String>,
     input: String,
     show_advanced: bool,
     branch: String,
@@ -209,6 +215,7 @@ impl Default for StartForm {
     fn default() -> Self {
         Self {
             agent: AgentChoice::Codex,
+            template: None,
             input: String::new(),
             show_advanced: false,
             branch: String::new(),
@@ -251,6 +258,7 @@ enum Message {
         session_id: SessionId,
     },
     StartAgentSelected(AgentChoice),
+    StartTemplateSelected(String),
     StartInputChanged(String),
     ToggleStartAdvanced,
     StartBranchChanged(String),
@@ -337,6 +345,7 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             app.ui_state.selection = app.workspace.selection.clone();
             app.project_edit.reference = project_id;
             app.selected_action = None;
+            app.start.template = None;
             // Load the project's actions eagerly so the launch action picker is
             // populated without a manual step.
             if let Ok(task) = list_project_actions_task(app) {
@@ -355,14 +364,23 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             Err(err) => app.status = Some(err),
         },
         Message::StartAgentSelected(agent) => app.start.agent = agent,
+        Message::StartTemplateSelected(template) => {
+            app.start.template = (template != BLANK_TEMPLATE_LABEL).then_some(template);
+        }
         Message::StartInputChanged(value) => app.start.input = value,
         Message::ToggleStartAdvanced => app.start.show_advanced = !app.start.show_advanced,
         Message::StartBranchChanged(value) => app.start.branch = value,
         Message::StartBaseBranchChanged(value) => app.start.base_branch = value,
-        Message::CreateSession => match create_session_task(app) {
-            Ok(task) => tasks.push(task),
-            Err(err) => app.status = Some(err),
-        },
+        Message::CreateSession => {
+            let result = match app.start.template.clone() {
+                Some(action_name) => launch_template_session_task(app, action_name),
+                None => create_session_task(app),
+            };
+            match result {
+                Ok(task) => tasks.push(task),
+                Err(err) => app.status = Some(err),
+            }
+        }
         Message::InspectSelectedSession => match inspect_selected_session_task(app) {
             Ok(task) => tasks.push(task),
             Err(err) => app.status = Some(err),
@@ -605,6 +623,76 @@ fn inspect_selected_session_task(app: &PohunekApp) -> Result<Task<Message>, Stri
                 .await
                 .map(|session| CoreMessage::SessionInspected { host_id, session })
                 .map_err(|err| err.to_string())
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+/// Creates a session from a prompt template: resolves the chosen `None`-provider
+/// action, renders its static prompt, and launches a session whose input is that
+/// rendered prompt (with the action's agent and branch). This is the GUI path for
+/// "start a session pre-filled from a template".
+fn launch_template_session_task(
+    app: &PohunekApp,
+    action_name: String,
+) -> Result<Task<Message>, String> {
+    let host = selected_host_config(app)?;
+    let host_id = host.id.clone();
+    let options = connection_options(app)?;
+    let project = selected_project_reference(app)?;
+    let terminal_size = terminal_size(app)?;
+    Ok(Task::perform(
+        runtime::perform(async move {
+            let action = match resolve_project_action_with_options(
+                &host,
+                ProjectActionParams {
+                    reference: project.clone(),
+                    name: action_name,
+                },
+                options,
+            )
+            .await
+            {
+                Ok(action) => action,
+                Err(err) => {
+                    return Ok(CoreMessage::HostOperationFailed {
+                        host_id,
+                        error: err.to_string(),
+                    })
+                }
+            };
+            let preview = match preview_action_prompt(&action, String::new(), String::new()) {
+                Ok(preview) => preview,
+                Err(err) => {
+                    return Ok(CoreMessage::HostOperationFailed {
+                        host_id,
+                        error: err.to_string(),
+                    })
+                }
+            };
+            match launch_action_prompt_with_options(
+                &host,
+                PromptLaunchParams {
+                    project,
+                    action,
+                    preview,
+                    cols: terminal_size.cols,
+                    rows: terminal_size.rows,
+                    metadata: BTreeMap::new(),
+                },
+                options,
+            )
+            .await
+            {
+                Ok(result) => Ok(CoreMessage::SessionCreated {
+                    host_id,
+                    session: result.session,
+                }),
+                Err(err) => Ok(CoreMessage::HostOperationFailed {
+                    host_id,
+                    error: err.to_string(),
+                }),
+            }
         }),
         Message::CoreCommandCompleted,
     ))
@@ -1380,9 +1468,12 @@ fn caret(expanded: bool, node: TreeNodeId) -> Element<'static, Message> {
 
 fn view(app: &PohunekApp) -> Element<'_, Message> {
     let left = column![
-        container(workspace_tree(app)).height(Fill),
+        container(workspace_tree(app))
+            .padding(12)
+            .height(Fill)
+            .style(iced::widget::container::rounded_box),
         container(agents_monitor(app))
-            .padding(8)
+            .padding(12)
             .height(u32::from(app.ui_state.agents_pane_height))
             .style(iced::widget::container::rounded_box)
     ]
@@ -1398,8 +1489,16 @@ fn view(app: &PohunekApp) -> Element<'_, Message> {
     .into()
 }
 
+/// Indents a tree row by depth so the host > project > session hierarchy reads
+/// visually without spacer hacks.
+fn indent<'a>(depth: u16, content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    container(content)
+        .padding(iced::Padding::ZERO.left(f32::from(depth) * 16.0))
+        .into()
+}
+
 fn workspace_tree(app: &PohunekApp) -> Element<'_, Message> {
-    let mut tree = column![text("Workspace").size(20)].spacing(6);
+    let mut tree = column![text("Workspace").size(16)].spacing(4);
     if let Err(err) = &app.config {
         tree = tree.push(text(format!("configuration error: {err}")).size(14));
         return scrollable(tree).into();
@@ -1411,20 +1510,20 @@ fn workspace_tree(app: &PohunekApp) -> Element<'_, Message> {
             row![
                 caret(expanded, node),
                 conn_dot(host.conn.clone()),
-                text(format!("{host_id}   {}", conn_label(&host.conn))).size(16)
+                text(host_id.to_string()).size(15)
             ]
             .spacing(6)
             .align_y(Center),
         );
         if let Some(error) = &host.last_error {
-            tree = tree.push(text(format!("  {error}")).size(13));
+            tree = tree.push(indent(1, text(error).size(12)));
         }
         if expanded {
             tree = push_project_rows(tree, app, host_id, host);
         }
     }
     if app.workspace.hosts.is_empty() {
-        tree = tree.push(text("connecting").size(14));
+        tree = tree.push(text("connecting…").size(13));
     }
     scrollable(tree).into()
 }
@@ -1469,12 +1568,12 @@ fn push_missing_project_row<'a>(
     let node = TreeNodeId::project(host_id.clone(), project_id);
     let expanded = app.ui_state.expanded_nodes.contains(&node);
     let selected = project_is_selected(app, host_id, project_id);
-    tree = tree.push(
+    tree = tree.push(indent(
+        1,
         row![
-            text("  "),
             caret(expanded, node),
             list_button(
-                text(format!("Unknown project {project_id}")).size(15),
+                text(format!("Unknown project {project_id}")).size(14),
                 Message::SelectProject {
                     host_id: host_id.clone(),
                     project_id: project_id.to_owned(),
@@ -1484,7 +1583,7 @@ fn push_missing_project_row<'a>(
         ]
         .spacing(4)
         .align_y(Center),
-    );
+    ));
     if expanded {
         for session in host
             .sessions
@@ -1509,12 +1608,12 @@ fn push_project_row<'a>(
     let node = TreeNodeId::project(host_id.clone(), project_id.clone());
     let expanded = app.ui_state.expanded_nodes.contains(&node);
     let selected = project_is_selected(app, host_id, &project_id);
-    tree = tree.push(
+    tree = tree.push(indent(
+        1,
         row![
-            text("  "),
             caret(expanded, node),
             list_button(
-                text(label).size(15),
+                text(label).size(14),
                 Message::SelectProject {
                     host_id: host_id.clone(),
                     project_id,
@@ -1524,7 +1623,7 @@ fn push_project_row<'a>(
         ]
         .spacing(4)
         .align_y(Center),
-    );
+    ));
     if expanded {
         for session in host.sessions.values().filter(|session| {
             project.map_or_else(
@@ -1562,25 +1661,26 @@ fn session_tree_row(
 ) -> Element<'static, Message> {
     let provider_status = linked_pr_status_label(host, session);
     let selected = session_is_selected(app, host_id, &session.id);
-    row![
-        text("    "),
-        status_dot(session.activity),
-        list_button(
-            text(format!(
-                "{}  {}{}",
-                session.id.0, session.agent, provider_status
-            ))
-            .size(14),
-            Message::SelectSession {
-                host_id: host_id.clone(),
-                session_id: session.id.clone(),
-            },
-            selected,
-        ),
-    ]
-    .spacing(6)
-    .align_y(Center)
-    .into()
+    indent(
+        2,
+        row![
+            status_dot(session.activity),
+            list_button(
+                text(format!(
+                    "{}  {}{}",
+                    session.id.0, session.agent, provider_status
+                ))
+                .size(14),
+                Message::SelectSession {
+                    host_id: host_id.clone(),
+                    session_id: session.id.clone(),
+                },
+                selected,
+            ),
+        ]
+        .spacing(6)
+        .align_y(Center),
+    )
 }
 
 fn agents_monitor(app: &PohunekApp) -> Element<'_, Message> {
@@ -1932,8 +2032,16 @@ fn start_session_view(app: &PohunekApp) -> Element<'_, Message> {
     } else {
         "Advanced >"
     };
+    let mut template_options = vec![BLANK_TEMPLATE_LABEL.to_owned()];
+    template_options.extend(available_actions(app, &ProviderKind::None));
+    let template_selected = Some(
+        app.start
+            .template
+            .clone()
+            .unwrap_or_else(|| BLANK_TEMPLATE_LABEL.to_owned()),
+    );
     let mut panel = column![
-        section_title("Start a blank session"),
+        section_title("Start a session"),
         row![
             text("Agent").size(14),
             pick_list(
@@ -1944,13 +2052,32 @@ fn start_session_view(app: &PohunekApp) -> Element<'_, Message> {
         ]
         .spacing(8)
         .align_y(Center),
-        text_input("initial input (optional)", &app.start.input)
-            .on_input(Message::StartInputChanged),
+        row![
+            text("Template").size(14),
+            pick_list(
+                template_options,
+                template_selected,
+                Message::StartTemplateSelected
+            ),
+        ]
+        .spacing(8)
+        .align_y(Center),
+    ]
+    .spacing(8);
+    // Free input is only used for a blank session; a template supplies its own.
+    if app.start.template.is_none() {
+        panel = panel.push(
+            text_input("initial input (optional)", &app.start.input)
+                .on_input(Message::StartInputChanged),
+        );
+    } else {
+        panel = panel.push(text("Input comes from the selected template's prompt.").size(13));
+    }
+    panel = panel.push(
         button(text(advanced_label).size(13))
             .on_press(Message::ToggleStartAdvanced)
             .style(iced::widget::button::text),
-    ]
-    .spacing(8);
+    );
     if app.start.show_advanced {
         panel = panel.push(
             row![
@@ -2123,6 +2250,9 @@ fn linear_provider_view(
     ]
     .spacing(8)]
     .spacing(8);
+    if !state.issues.is_empty() {
+        view = view.push(text("Pick an issue, choose an action, then Launch.").size(12));
+    }
     for issue in &state.issues {
         let issue_id = issue.prompt_item_id().to_owned();
         let selected = state.selected_issue_id.as_deref() == Some(issue_id.as_str());
@@ -2194,6 +2324,7 @@ fn github_provider_view(
         }
         return view.into();
     }
+    view = view.push(text("Pick a pull request or issue, choose an action, then Launch.").size(12));
     view = view.push(text("Pull requests").size(15));
     for pull_request in filtered_pull_requests(state) {
         let selected = state.selected_pull_request == Some(pull_request.number);
