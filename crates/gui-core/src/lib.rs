@@ -3104,13 +3104,13 @@ mod tests {
             host_id: host_id.clone(),
             request_id: pull_requests_request,
             scope: GitHubProviderScope::new("project-a", "/repo/a"),
-            pull_requests: vec![providers::github::GitHubPullRequest {
-                number: 7,
-                title: "A".to_owned(),
-                body: String::new(),
-                head_ref_name: "feature/a".to_owned(),
-                url: "https://github.example/a/pull/7".to_owned(),
-            }],
+            pull_requests: vec![providers::github::GitHubPullRequest::new(
+                7,
+                "A",
+                "",
+                "feature/a",
+                "https://github.example/a/pull/7",
+            )],
         });
         let issues_request = workspace.begin_github_issues_request(host_id.clone());
         workspace.apply(Message::GitHubProviderIssuesLoaded {
@@ -3144,13 +3144,13 @@ mod tests {
             host_id: host_id.clone(),
             request_id: pull_requests_request,
             scope: GitHubProviderScope::new("project-a", "/repo/a"),
-            pull_requests: vec![providers::github::GitHubPullRequest {
-                number: 7,
-                title: "A".to_owned(),
-                body: String::new(),
-                head_ref_name: "feature/a".to_owned(),
-                url: "https://github.example/a/pull/7".to_owned(),
-            }],
+            pull_requests: vec![providers::github::GitHubPullRequest::new(
+                7,
+                "A",
+                "",
+                "feature/a",
+                "https://github.example/a/pull/7",
+            )],
         });
         let issues_request = workspace.begin_github_issues_request(host_id.clone());
         workspace.apply(Message::GitHubProviderIssuesLoaded {
@@ -3201,13 +3201,13 @@ mod tests {
             host_id: host_id.clone(),
             request_id,
             scope: GitHubProviderScope::new("project-a", "/repo/stale"),
-            pull_requests: vec![providers::github::GitHubPullRequest {
-                number: 7,
-                title: "Stale".to_owned(),
-                body: String::new(),
-                head_ref_name: "feature/stale".to_owned(),
-                url: "https://github.example/stale/pull/7".to_owned(),
-            }],
+            pull_requests: vec![providers::github::GitHubPullRequest::new(
+                7,
+                "Stale",
+                "",
+                "feature/stale",
+                "https://github.example/stale/pull/7",
+            )],
         });
 
         let host = workspace.hosts.get(&host_id).expect("host");
@@ -3226,25 +3226,25 @@ mod tests {
             host_id: host_id.clone(),
             request_id: current_request,
             scope: scope.clone(),
-            pull_requests: vec![providers::github::GitHubPullRequest {
-                number: 9,
-                title: "Current".to_owned(),
-                body: String::new(),
-                head_ref_name: "feature/current".to_owned(),
-                url: "https://github.example/current/pull/9".to_owned(),
-            }],
+            pull_requests: vec![providers::github::GitHubPullRequest::new(
+                9,
+                "Current",
+                "",
+                "feature/current",
+                "https://github.example/current/pull/9",
+            )],
         });
         workspace.apply(Message::GitHubProviderPullRequestsLoaded {
             host_id: host_id.clone(),
             request_id: stale_request,
             scope,
-            pull_requests: vec![providers::github::GitHubPullRequest {
-                number: 7,
-                title: "Stale".to_owned(),
-                body: String::new(),
-                head_ref_name: "feature/stale".to_owned(),
-                url: "https://github.example/stale/pull/7".to_owned(),
-            }],
+            pull_requests: vec![providers::github::GitHubPullRequest::new(
+                7,
+                "Stale",
+                "",
+                "feature/stale",
+                "https://github.example/stale/pull/7",
+            )],
         });
 
         let host = workspace.hosts.get(&host_id).expect("host");

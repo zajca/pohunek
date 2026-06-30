@@ -2907,11 +2907,8 @@ fn github_provider_view(
     view = view.push(text("Open a pull request to launch a session.").size(12));
     view = view.push(text("Pull requests").size(15));
     for pull_request in filtered_pull_requests(state) {
-        view = view.push(list_button(
-            text(format!("#{}  {}", pull_request.number, pull_request.title)).size(13),
-            Message::OpenGitHubPullRequest(pull_request.number),
-            false,
-        ));
+        let selected = state.selected_pull_request == Some(pull_request.number);
+        view = view.push(pull_request_row(pull_request, selected));
     }
     view = view.push(text("Issues").size(15));
     for issue in filtered_github_issues(state) {
@@ -3006,24 +3003,208 @@ fn linked_github_status(
 }
 
 fn format_pr_status(status: &providers::github::PullRequestStatus) -> String {
-    let review = match &status.review_decision {
+    let review = review_label(&status.review_decision);
+    let summary = providers::github::CheckSummary::from_checks(&status.checks);
+    format!(
+        "review={review} checks={} pass/{} fail/{} pending",
+        summary.passed, summary.failed, summary.pending
+    )
+}
+
+/// Short human label for a review decision.
+fn review_label(decision: &providers::github::ReviewDecision) -> &str {
+    match decision {
         providers::github::ReviewDecision::Approved => "approved",
         providers::github::ReviewDecision::ChangesRequested => "changes requested",
         providers::github::ReviewDecision::ReviewRequired => "review required",
         providers::github::ReviewDecision::None => "no review",
         providers::github::ReviewDecision::Unknown(value) => value.as_str(),
-    };
-    let mut pass = 0;
-    let mut fail = 0;
-    let mut pending = 0;
-    for check in &status.checks {
-        match check.conclusion.as_deref().unwrap_or(check.status.as_str()) {
-            "pass" | "SUCCESS" | "COMPLETED" => pass += 1,
-            "fail" | "FAILURE" | "ERROR" | "cancel" => fail += 1,
-            _ => pending += 1,
-        }
     }
-    format!("review={review} checks={pass} pass/{fail} fail/{pending} pending")
+}
+
+/// Semantic background tone for a status pill.
+#[derive(Debug, Clone, Copy)]
+enum PillTone {
+    Success,
+    Danger,
+    Warning,
+    Neutral,
+}
+
+/// Muted text style for secondary row metadata.
+fn muted_style(theme: &Theme) -> iced::widget::text::Style {
+    // Dim the foreground text (not a background-derived gray, which is nearly
+    // invisible on dark themes) so metadata stays clearly legible.
+    let mut color = theme.extended_palette().background.base.text;
+    color.a = 0.75;
+    iced::widget::text::Style { color: Some(color) }
+}
+
+/// A small rounded status pill backed by a themed semantic color.
+fn status_pill(label: impl Into<String>, tone: PillTone) -> Element<'static, Message> {
+    let label = label.into();
+    container(text(label).size(11))
+        .padding([1, 6])
+        .style(move |theme: &Theme| {
+            let palette = theme.extended_palette();
+            let pair = match tone {
+                PillTone::Success => palette.success.weak,
+                PillTone::Danger => palette.danger.weak,
+                PillTone::Warning => palette.warning.weak,
+                PillTone::Neutral => palette.secondary.weak,
+            };
+            iced::widget::container::Style {
+                background: Some(Background::Color(pair.color)),
+                text_color: Some(pair.text),
+                border: iced::border::rounded(4.0),
+                ..iced::widget::container::Style::default()
+            }
+        })
+        .into()
+}
+
+/// A pill summarizing the pull request review decision.
+fn review_pill(decision: &providers::github::ReviewDecision) -> Element<'static, Message> {
+    use providers::github::ReviewDecision;
+    let (label, tone) = match decision {
+        ReviewDecision::Approved => ("review ok", PillTone::Success),
+        ReviewDecision::ChangesRequested => ("changes req", PillTone::Danger),
+        ReviewDecision::ReviewRequired => ("review req", PillTone::Warning),
+        ReviewDecision::None => ("no review", PillTone::Neutral),
+        ReviewDecision::Unknown(value) => (value.as_str(), PillTone::Neutral),
+    };
+    status_pill(label.to_owned(), tone)
+}
+
+/// A pill summarizing CI checks as `pass/fail/pending` counts.
+fn ci_pill(checks: &[providers::github::CheckRun]) -> Element<'static, Message> {
+    use providers::github::CiState;
+    let summary = providers::github::CheckSummary::from_checks(checks);
+    if summary.total() == 0 {
+        return status_pill("no CI", PillTone::Neutral);
+    }
+    let tone = match summary.state() {
+        CiState::Passing => PillTone::Success,
+        CiState::Failing => PillTone::Danger,
+        CiState::Pending => PillTone::Warning,
+        CiState::None => PillTone::Neutral,
+    };
+    status_pill(
+        format!(
+            "CI {}/{}/{}",
+            summary.passed, summary.failed, summary.pending
+        ),
+        tone,
+    )
+}
+
+/// A label pill colored with GitHub's hex color when one is available.
+fn label_pill(label: &providers::github::GitHubLabel) -> Element<'static, Message> {
+    let name = label.name.clone();
+    match color_from_hex(&label.color) {
+        Some(background) => {
+            let foreground = contrast_text_color(background);
+            container(text(name).size(11))
+                .padding([1, 6])
+                .style(move |_theme: &Theme| iced::widget::container::Style {
+                    background: Some(Background::Color(background)),
+                    text_color: Some(foreground),
+                    border: iced::border::rounded(4.0),
+                    ..iced::widget::container::Style::default()
+                })
+                .into()
+        }
+        None => status_pill(name, PillTone::Neutral),
+    }
+}
+
+/// Parses a 6-digit hex color (optional leading `#`) into an opaque color.
+fn color_from_hex(hex: &str) -> Option<Color> {
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    if hex.len() != 6 {
+        return None;
+    }
+    let red = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let green = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let blue = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(Color::from_rgb8(red, green, blue))
+}
+
+/// Extracts the `YYYY-MM-DD` date from an RFC 3339 timestamp.
+fn date_part(timestamp: &str) -> &str {
+    timestamp
+        .split_once('T')
+        .map_or(timestamp, |(date, _)| date)
+}
+
+/// Chooses black or white text for legibility on `background`.
+fn contrast_text_color(background: Color) -> Color {
+    // Perceived luminance (Rec. 601 weights), the same heuristic GitHub uses to
+    // pick black-on-light vs white-on-dark label text.
+    let luminance = 0.299 * background.r + 0.587 * background.g + 0.114 * background.b;
+    // 0.6 keeps mid-tone labels (such as GitHub's yellow) on black text.
+    if luminance > 0.6 {
+        Color::BLACK
+    } else {
+        Color::WHITE
+    }
+}
+
+/// A two-line pull request row: a title line and a metadata line.
+///
+/// The draft badge leads the title so it stays visible when the title wraps.
+/// On the metadata line, fixed-size chips (review, CI, labels) come first and
+/// the free-text fields (author, branch, diff, date) trail — so if the narrow
+/// panel clips, it clips the least-critical text rather than the status chips.
+fn pull_request_row(
+    pull_request: &providers::github::GitHubPullRequest,
+    selected: bool,
+) -> Element<'_, Message> {
+    let number = text(format!("#{}", pull_request.number))
+        .size(13)
+        .style(muted_style);
+    let title = text(pull_request.title.as_str()).size(13);
+    let title_line = if pull_request.is_draft {
+        row![status_pill("draft", PillTone::Neutral), number, title]
+    } else {
+        row![number, title]
+    }
+    .spacing(8)
+    .align_y(Center);
+
+    let mut meta_line = row![
+        review_pill(&pull_request.review_decision),
+        ci_pill(&pull_request.checks),
+    ]
+    .spacing(6)
+    .align_y(Center);
+    for label in &pull_request.labels {
+        meta_line = meta_line.push(label_pill(label));
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(author) = &pull_request.author {
+        parts.push(format!("@{author}"));
+    }
+    parts.push(pull_request.head_ref_name.clone());
+    if pull_request.additions > 0 || pull_request.deletions > 0 {
+        parts.push(format!(
+            "+{}/-{}",
+            pull_request.additions, pull_request.deletions
+        ));
+    }
+    if let Some(updated) = &pull_request.updated_at {
+        parts.push(date_part(updated).to_owned());
+    }
+    if !parts.is_empty() {
+        meta_line = meta_line.push(text(parts.join("  ·  ")).size(11).style(muted_style));
+    }
+
+    list_button(
+        column![title_line, meta_line].spacing(4),
+        Message::OpenGitHubPullRequest(pull_request.number),
+        selected,
+    )
 }
 
 fn toast_view(toast: &Toast) -> Element<'_, Message> {

@@ -16,7 +16,11 @@ use serde_json::{json, Map, Value};
 use thiserror::Error;
 use tokio::process::Command;
 
-const PR_FIELDS: &str = "number,title,body,headRefName,url";
+// Prompt rendering needs `number,title,body,headRefName,url`; the remaining
+// fields enrich the GUI list (author, draft flag, labels, review/CI status, diff
+// size). `reviewDecision` and `statusCheckRollup` make per-PR status available
+// from the single `gh pr list` call, avoiding extra per-PR requests.
+const PR_FIELDS: &str = "number,title,body,headRefName,url,author,isDraft,labels,reviewDecision,statusCheckRollup,additions,deletions,updatedAt";
 const ISSUE_FIELDS: &str = "number,title,body,url";
 const CHECK_FIELDS: &str = "name,state,bucket,link";
 const REVIEW_FIELDS: &str = "reviewDecision";
@@ -93,7 +97,7 @@ pub trait GhRunner: Send + Sync {
     fn run(&self, args: Vec<String>) -> GhFuture<'_>;
 }
 
-/// GitHub pull request fields used by prompt rendering and launch flows.
+/// GitHub pull request fields used by prompt rendering and the GUI list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubPullRequest {
     /// Pull request number.
@@ -108,9 +112,66 @@ pub struct GitHubPullRequest {
     pub head_ref_name: String,
     /// Browser URL for the pull request.
     pub url: String,
+    /// Author login, when reported.
+    #[serde(default, deserialize_with = "author_login")]
+    pub author: Option<String>,
+    /// Whether the pull request is a draft.
+    #[serde(rename = "isDraft", default)]
+    pub is_draft: bool,
+    /// Labels attached to the pull request.
+    #[serde(default, deserialize_with = "labels_from_gh")]
+    pub labels: Vec<GitHubLabel>,
+    /// Review decision reported by GitHub.
+    #[serde(rename = "reviewDecision", default)]
+    pub review_decision: ReviewDecision,
+    /// Check runs from the status check rollup.
+    #[serde(
+        rename = "statusCheckRollup",
+        default,
+        deserialize_with = "checks_from_rollup"
+    )]
+    pub checks: Vec<CheckRun>,
+    /// Lines added by the pull request.
+    #[serde(default)]
+    pub additions: u64,
+    /// Lines removed by the pull request.
+    #[serde(default)]
+    pub deletions: u64,
+    /// Last update timestamp (RFC 3339), when reported.
+    #[serde(rename = "updatedAt", default)]
+    pub updated_at: Option<String>,
 }
 
 impl GitHubPullRequest {
+    /// Creates a pull request with empty list metadata.
+    ///
+    /// Display fields (author, labels, status, diff size) default to empty;
+    /// production values arrive via deserialization of `gh` output.
+    #[must_use]
+    pub fn new(
+        number: u64,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        head_ref_name: impl Into<String>,
+        url: impl Into<String>,
+    ) -> Self {
+        Self {
+            number,
+            title: title.into(),
+            body: body.into(),
+            head_ref_name: head_ref_name.into(),
+            url: url.into(),
+            author: None,
+            is_draft: false,
+            labels: Vec::new(),
+            review_decision: ReviewDecision::None,
+            checks: Vec::new(),
+            additions: 0,
+            deletions: 0,
+            updated_at: None,
+        }
+    }
+
     /// Returns the item id used by shared prompt rendering.
     #[must_use]
     pub fn prompt_item_id(&self) -> String {
@@ -154,6 +215,16 @@ pub struct GitHubIssue {
     pub branch: Option<String>,
 }
 
+/// A GitHub label name and its display color.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubLabel {
+    /// Label name.
+    pub name: String,
+    /// Hex color without a leading `#`, as emitted by `gh` (for example `d73a4a`).
+    #[serde(default)]
+    pub color: String,
+}
+
 /// Pull request status summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequestStatus {
@@ -176,8 +247,71 @@ pub struct CheckRun {
     pub details_url: Option<String>,
 }
 
+/// Aggregate outcome of a pull request's check runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CiState {
+    /// At least one check ran and none failed or remain pending.
+    Passing,
+    /// At least one check failed, errored, or was cancelled.
+    Failing,
+    /// At least one check is still running and none failed.
+    Pending,
+    /// No checks are reported.
+    None,
+}
+
+/// Counts of passing, failing, and pending pull request check runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CheckSummary {
+    /// Checks that concluded successfully.
+    pub passed: u32,
+    /// Checks that failed, errored, or were cancelled.
+    pub failed: u32,
+    /// Checks that are queued or still running.
+    pub pending: u32,
+}
+
+impl CheckSummary {
+    /// Summarizes check runs into pass, fail, and pending counts.
+    #[must_use]
+    pub fn from_checks(checks: &[CheckRun]) -> Self {
+        let mut summary = Self::default();
+        for check in checks {
+            // `gh pr checks` reports lowercase buckets (`pass`/`fail`) while
+            // `statusCheckRollup` reports GraphQL enums (`SUCCESS`/`FAILURE`/...);
+            // prefer the conclusion when present and fall back to the raw status.
+            match check.conclusion.as_deref().unwrap_or(check.status.as_str()) {
+                "pass" | "SUCCESS" | "COMPLETED" => summary.passed += 1,
+                "fail" | "FAILURE" | "ERROR" | "cancel" => summary.failed += 1,
+                _ => summary.pending += 1,
+            }
+        }
+        summary
+    }
+
+    /// Returns the total number of reported checks.
+    #[must_use]
+    pub fn total(&self) -> u32 {
+        self.passed + self.failed + self.pending
+    }
+
+    /// Returns the overall CI state implied by these counts.
+    #[must_use]
+    pub fn state(&self) -> CiState {
+        if self.failed > 0 {
+            CiState::Failing
+        } else if self.pending > 0 {
+            CiState::Pending
+        } else if self.passed > 0 {
+            CiState::Passing
+        } else {
+            CiState::None
+        }
+    }
+}
+
 /// Review decision reported by GitHub for a pull request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ReviewDecision {
     /// The pull request has been approved.
     Approved,
@@ -186,6 +320,7 @@ pub enum ReviewDecision {
     /// A review is required before merge.
     ReviewRequired,
     /// GitHub returned no review decision.
+    #[default]
     None,
     /// GitHub returned a value this client does not yet classify.
     Unknown(String),
@@ -626,6 +761,86 @@ impl From<GhCheckRun> for CheckRun {
 struct GhReviewDecision {
     #[serde(rename = "reviewDecision")]
     review_decision: ReviewDecision,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhAuthor {
+    #[serde(default)]
+    login: Option<String>,
+}
+
+/// Extracts the author login from the `gh` author object, dropping empties.
+fn author_login<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let author = Option::<GhAuthor>::deserialize(deserializer)?;
+    Ok(author.and_then(|author| non_empty_string(author.login)))
+}
+
+#[derive(Debug, Deserialize)]
+struct GhLabel {
+    name: String,
+    #[serde(default)]
+    color: String,
+}
+
+/// Maps the `gh` label array to [`GitHubLabel`] values.
+fn labels_from_gh<'de, D>(deserializer: D) -> Result<Vec<GitHubLabel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let labels = Vec::<GhLabel>::deserialize(deserializer)?;
+    Ok(labels
+        .into_iter()
+        .map(|label| GitHubLabel {
+            name: label.name,
+            color: label.color,
+        })
+        .collect())
+}
+
+/// One `statusCheckRollup` entry, covering both the `CheckRun` and
+/// `StatusContext` GraphQL shapes that `gh` returns.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhRollupEntry {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
+    #[serde(default)]
+    details_url: Option<String>,
+    #[serde(default)]
+    target_url: Option<String>,
+}
+
+impl From<GhRollupEntry> for CheckRun {
+    fn from(entry: GhRollupEntry) -> Self {
+        Self {
+            // `CheckRun` carries `name`/`status`/`conclusion`; `StatusContext`
+            // carries `context`/`state` and no separate conclusion.
+            name: entry.name.or(entry.context).unwrap_or_default(),
+            status: entry.status.or(entry.state).unwrap_or_default(),
+            conclusion: non_empty_string(entry.conclusion),
+            details_url: non_empty_string(entry.details_url.or(entry.target_url)),
+        }
+    }
+}
+
+/// Maps the `statusCheckRollup` array to [`CheckRun`] values.
+fn checks_from_rollup<'de, D>(deserializer: D) -> Result<Vec<CheckRun>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let entries = Vec::<GhRollupEntry>::deserialize(deserializer)?;
+    Ok(entries.into_iter().map(CheckRun::from).collect())
 }
 
 fn parse_json<T>(command: &'static str, raw: &str) -> Result<T, GitHubError>

@@ -10,8 +10,8 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use pohunek_gui_core::providers::github::{
-    CheckRun, GhOutput, GhRunner, GitHubClient, GitHubConfig, GitHubError, GitHubPullRequest,
-    PullRequestStatus, ReviewDecision,
+    CheckRun, CheckSummary, CiState, GhOutput, GhRunner, GitHubClient, GitHubConfig, GitHubError,
+    GitHubLabel, GitHubPullRequest, PullRequestStatus, ReviewDecision,
 };
 use serde_json::json;
 
@@ -111,7 +111,7 @@ async fn list_pull_requests_shells_out_with_prompt_fields() {
                 "pr".to_owned(),
                 "list".to_owned(),
                 "--json".to_owned(),
-                "number,title,body,headRefName,url".to_owned(),
+                "number,title,body,headRefName,url,author,isDraft,labels,reviewDecision,statusCheckRollup,additions,deletions,updatedAt".to_owned(),
             ],
         }]
     );
@@ -123,6 +123,127 @@ async fn list_pull_requests_shells_out_with_prompt_fields() {
     assert_eq!(pr.head_ref_name, "feature/filters");
     assert_eq!(pr.url, "https://github.example/repo/pull/7");
     assert_eq!(pr.prompt_item_id(), "7");
+}
+
+#[tokio::test]
+async fn list_pull_requests_parses_list_metadata() {
+    // Mixed rollup: a `CheckRun` (status/conclusion) and a `StatusContext`
+    // (context/state), plus author, draft flag, labels, and diff size.
+    let client = client_with_json(
+        r#"[
+            {
+                "number": 7,
+                "title": "Fix filters",
+                "body": "Body text",
+                "headRefName": "feature/filters",
+                "url": "https://github.example/repo/pull/7",
+                "author": {"login": "octocat"},
+                "isDraft": true,
+                "labels": [
+                    {"name": "bug", "color": "d73a4a"},
+                    {"name": "ui", "color": ""}
+                ],
+                "reviewDecision": "APPROVED",
+                "statusCheckRollup": [
+                    {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS", "detailsUrl": "https://ci.example/build"},
+                    {"__typename": "StatusContext", "context": "legacy", "state": "FAILURE", "targetUrl": "https://ci.example/legacy"},
+                    {"__typename": "CheckRun", "name": "lint", "status": "IN_PROGRESS", "conclusion": null}
+                ],
+                "additions": 84,
+                "deletions": 12,
+                "updatedAt": "2026-06-28T10:00:00Z"
+            }
+        ]"#,
+    );
+
+    let prs = client.list_pull_requests(&[]).await.expect("pull requests");
+    let pr = &prs[0];
+
+    assert_eq!(pr.author.as_deref(), Some("octocat"));
+    assert!(pr.is_draft);
+    assert_eq!(
+        pr.labels,
+        vec![
+            GitHubLabel {
+                name: "bug".to_owned(),
+                color: "d73a4a".to_owned(),
+            },
+            GitHubLabel {
+                name: "ui".to_owned(),
+                color: String::new(),
+            },
+        ]
+    );
+    assert_eq!(pr.review_decision, ReviewDecision::Approved);
+    assert_eq!(pr.additions, 84);
+    assert_eq!(pr.deletions, 12);
+    assert_eq!(pr.updated_at.as_deref(), Some("2026-06-28T10:00:00Z"));
+
+    let summary = CheckSummary::from_checks(&pr.checks);
+    assert_eq!(summary.passed, 1);
+    assert_eq!(summary.failed, 1);
+    assert_eq!(summary.pending, 1);
+    assert_eq!(summary.total(), 3);
+    assert_eq!(summary.state(), CiState::Failing);
+}
+
+#[test]
+fn check_summary_state_prefers_failing_then_pending() {
+    assert_eq!(CheckSummary::default().state(), CiState::None);
+    assert_eq!(
+        CheckSummary {
+            passed: 3,
+            failed: 0,
+            pending: 0,
+        }
+        .state(),
+        CiState::Passing
+    );
+    assert_eq!(
+        CheckSummary {
+            passed: 2,
+            failed: 0,
+            pending: 1,
+        }
+        .state(),
+        CiState::Pending
+    );
+    assert_eq!(
+        CheckSummary {
+            passed: 2,
+            failed: 1,
+            pending: 1,
+        }
+        .state(),
+        CiState::Failing
+    );
+}
+
+#[tokio::test]
+async fn list_pull_requests_tolerates_missing_metadata() {
+    // Older/minimal `gh` output without the new fields still parses.
+    let client = client_with_json(
+        r#"[
+            {
+                "number": 7,
+                "title": "Fix filters",
+                "body": "Body text",
+                "headRefName": "feature/filters",
+                "url": "https://github.example/repo/pull/7"
+            }
+        ]"#,
+    );
+
+    let prs = client.list_pull_requests(&[]).await.expect("pull requests");
+    let pr = &prs[0];
+
+    assert_eq!(pr.author, None);
+    assert!(!pr.is_draft);
+    assert!(pr.labels.is_empty());
+    assert_eq!(pr.review_decision, ReviewDecision::None);
+    assert!(pr.checks.is_empty());
+    assert_eq!(pr.additions, 0);
+    assert_eq!(pr.updated_at, None);
 }
 
 #[tokio::test]
@@ -148,7 +269,7 @@ async fn list_pull_requests_appends_filter_args() {
                 "pr".to_owned(),
                 "list".to_owned(),
                 "--json".to_owned(),
-                "number,title,body,headRefName,url".to_owned(),
+                "number,title,body,headRefName,url,author,isDraft,labels,reviewDecision,statusCheckRollup,additions,deletions,updatedAt".to_owned(),
                 "--state".to_owned(),
                 "open".to_owned(),
                 "--search".to_owned(),
@@ -210,13 +331,13 @@ async fn pull_request_detail_maps_to_prompt_json_shape() {
 
     assert_eq!(
         pr,
-        GitHubPullRequest {
-            number: 7,
-            title: "Fix filters".to_owned(),
-            body: "Body text".to_owned(),
-            head_ref_name: "feature/filters".to_owned(),
-            url: "https://github.example/repo/pull/7".to_owned(),
-        }
+        GitHubPullRequest::new(
+            7,
+            "Fix filters",
+            "Body text",
+            "feature/filters",
+            "https://github.example/repo/pull/7",
+        )
     );
     assert_eq!(
         pr.to_prompt_json(),
@@ -424,7 +545,7 @@ async fn command_runner_uses_fake_gh_script_for_provider_commands() {
 set -eu
 pwd > __SEEN_CWD__
 case "$*" in
-  "pr list --json number,title,body,headRefName,url")
+  "pr list --json number,title,body,headRefName,url,author,isDraft,labels,reviewDecision,statusCheckRollup,additions,deletions,updatedAt")
     printf '%s' '[{"number":7,"title":"Fix filters","body":"Body text","headRefName":"feature/filters","url":"https://github.example/repo/pull/7"}]'
     ;;
   "issue list --json number,title,body,url")
