@@ -123,7 +123,8 @@ All params and result type names below refer to structs exported by
 | `session.new` | `SessionNewParams` | `SessionNewResult` | Starts an agent PTY session. |
 | `session.list` | `SessionListParams` or `null` | `Vec<SessionInfo>` | Lists sessions; filters use AND semantics. |
 | `session.inspect` | `SessionId` | `SessionInfo` | `SessionId` is a JSON string, e.g. `"s-1"`. |
-| `session.stop` | `SessionId` | `SessionStopResult` | Stops a live session. |
+| `session.stop` | `SessionId` | `SessionStopResult` | Stops a live session (the entry stays in `list`). |
+| `session.remove` | `SessionId` | `SessionRemoveResult` | Evicts a session from the registry, stopping it first if still live. Unknown id is `session_not_found`. |
 | `session.attach` | `SessionAttachParams` | `SessionAttachResult` | Mints a one-shot attach stream id. |
 | `session.detach` | `SessionDetachParams` | `SessionDetachResult` | Cancels an active attach stream. Unknown streams return `detached: false`. |
 | `session.resize` | `SessionResizeParams` | `SessionResizeResult` | Resizes the PTY on the control connection. |
@@ -241,6 +242,7 @@ The daemon then writes these events:
 | `session_created` | `{session: SessionInfo}` | A session was created. |
 | `session_updated` | `{session: SessionInfo}` | Session metadata, state, resize, resume binding, or terminal state changed. |
 | `session_stopped` | `{session: SessionInfo}` | A user-requested stop completed. |
+| `session_removed` | `{session: SessionInfo}` | A session was evicted from the registry; clients drop it from their view. |
 | `agent_state` | `{session_id: SessionId, activity: AgentActivity, source: StateSource}` | Agent activity changed. |
 | `attach_opened` | `{session_id: SessionId, stream_id: string}` | A pending attach token was redeemed and a raw stream opened. |
 | `attach_closed` | `{session_id: SessionId, stream_id: string}` | A raw attach stream ended or was detached. |

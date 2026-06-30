@@ -12,8 +12,8 @@ use std::path::PathBuf;
 
 use protocol::{
     method, AgentActivity, Request, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionListFilter, SessionListParams, SessionNewParams, SessionNewResult, SessionState,
-    SessionStopResult, SessionWarningKind, StateSource,
+    SessionListFilter, SessionListParams, SessionNewParams, SessionNewResult, SessionRemoveResult,
+    SessionState, SessionStopResult, SessionWarningKind, StateSource,
 };
 use serde_json::Value;
 
@@ -358,6 +358,35 @@ pub(crate) async fn run_stop(
     Ok(())
 }
 
+/// Run `session rm` against the daemon for `host`.
+///
+/// Removal evicts the session from the daemon's registry, stopping it first if
+/// it is still live. Unlike `stop`, the session no longer appears in `list`.
+///
+/// # Errors
+///
+/// Returns [`CliError`] if the daemon is unreachable, the host cannot be
+/// resolved, the daemon rejects the request, or the payload does not match the
+/// contract.
+pub(crate) async fn run_remove(
+    host: &str,
+    paths: &Paths,
+    target: &Target,
+    json: bool,
+) -> Result<(), CliError> {
+    let request = build_remove_request(target)?;
+    let mut client = Client::connect(host, paths).await?;
+    let result = client.request(&request).await?;
+    let removed: SessionRemoveResult = serde_json::from_value(result)?;
+
+    if json {
+        print!("{}", crate::commands::render_json(&removed)?);
+    } else {
+        print!("{}", render_remove_human(&target.session_id, &removed));
+    }
+    Ok(())
+}
+
 /// Run `session input` against the daemon for `host`.
 ///
 /// # Errors
@@ -455,6 +484,13 @@ fn build_inspect_request(target: &Target) -> Result<Request, CliError> {
 
 fn build_stop_request(target: &Target) -> Result<Request, CliError> {
     request_with_params(method::SESSION_STOP, &SessionId(target.session_id.clone()))
+}
+
+fn build_remove_request(target: &Target) -> Result<Request, CliError> {
+    request_with_params(
+        method::SESSION_REMOVE,
+        &SessionId(target.session_id.clone()),
+    )
 }
 
 fn build_input_request(target: &Target, text: &str) -> Result<Request, CliError> {
@@ -684,6 +720,13 @@ fn render_inspect_human(info: &SessionInfo) -> String {
 
 fn render_stop_human(session_id: &str, result: &SessionStopResult) -> String {
     format!("session {session_id}: stopped={}\n", result.stopped)
+}
+
+fn render_remove_human(session_id: &str, result: &SessionRemoveResult) -> String {
+    format!(
+        "session {session_id}: removed={} stopped={}\n",
+        result.removed, result.stopped
+    )
 }
 
 fn render_input_human(session_id: &str, result: &SessionInputResult) -> String {
@@ -1543,6 +1586,27 @@ mod tests {
         let output = render_stop_human("s-42", &protocol::SessionStopResult { stopped: true });
 
         assert_eq!(output, "session s-42: stopped=true\n");
+    }
+
+    #[test]
+    fn renders_remove_result_with_target_id() {
+        let output = render_remove_human(
+            "s-42",
+            &SessionRemoveResult {
+                removed: true,
+                stopped: true,
+            },
+        );
+
+        assert_eq!(output, "session s-42: removed=true stopped=true\n");
+    }
+
+    #[test]
+    fn build_remove_request_targets_session_remove_method() {
+        let target: Target = "local/s-42".parse().expect("parse target");
+        let request = build_remove_request(&target).expect("build remove request");
+
+        assert_request(&request, method::SESSION_REMOVE, serde_json::json!("s-42"));
     }
 
     #[test]

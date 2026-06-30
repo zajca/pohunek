@@ -19,14 +19,14 @@ use pohunek_gui_core::{
     add_project_with_options, create_session_with_options, default_state_dir, discover_hosts,
     inspect_session_with_options, launch_provider_item_with_options,
     list_project_actions_with_options, preview_action_prompt, providers,
-    remove_worktree_with_options, rename_project_with_options, resolve_project_action_with_options,
-    session_link_metadata, session_metadata_rows, set_session_metadata_with_options,
-    show_project_with_options, spawn_attach_command, stop_session_with_options,
-    AttachCommandSpawner, AttachTemplateValues, ConnState, ConnectionOptions, GitHubProviderScope,
-    GitHubPullRequestStatusKey, HostConfig, HostId, Message as CoreMessage, NotificationIntent,
-    ProviderLaunchItem, ProviderLaunchParams, ProviderOperation, ProviderPanel, ProviderRequestId,
-    Selection, SessionLinkKind, SessionLinkProvider, Toast, TreeNodeId, UiState, WindowSize,
-    Workspace,
+    remove_session_with_options, remove_worktree_with_options, rename_project_with_options,
+    resolve_project_action_with_options, session_link_metadata, session_metadata_rows,
+    set_session_metadata_with_options, show_project_with_options, spawn_attach_command,
+    stop_session_with_options, AttachCommandSpawner, AttachTemplateValues, ConnState,
+    ConnectionOptions, GitHubProviderScope, GitHubPullRequestStatusKey, HostConfig, HostId,
+    Message as CoreMessage, NotificationIntent, ProviderLaunchItem, ProviderLaunchParams,
+    ProviderOperation, ProviderPanel, ProviderRequestId, Selection, SessionLinkKind,
+    SessionLinkProvider, Toast, TreeNodeId, UiState, WindowSize, Workspace,
 };
 use protocol::{
     AgentActivity, ProjectActionParams, ProjectActionsParams, ProjectAddParams, ProjectInfo,
@@ -334,6 +334,8 @@ enum Message {
     OpenGitHubIssue(u64),
     InspectSelectedSession,
     StopSelectedSession,
+    /// Remove the selected session from the daemon, stopping it first if live.
+    RemoveSelectedSession,
     MetadataKeyChanged(String),
     MetadataValueChanged(String),
     SetMetadata,
@@ -523,6 +525,10 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             Err(err) => app.status = Some(err),
         },
         Message::StopSelectedSession => match stop_selected_session_task(app) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
+        Message::RemoveSelectedSession => match remove_selected_session_task(app) {
             Ok(task) => tasks.push(task),
             Err(err) => app.status = Some(err),
         },
@@ -733,7 +739,31 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                 } else {
                     None
                 };
+                // A removed session is gone from the workspace, so clear a
+                // selection still pointing at it to avoid a stale detail pane.
+                let removed_session = if let CoreMessage::SessionRemoveCompleted {
+                    host_id,
+                    session_id,
+                    result,
+                } = &message
+                {
+                    result
+                        .removed
+                        .then(|| (host_id.clone(), session_id.clone()))
+                } else {
+                    None
+                };
                 app.workspace.apply(message);
+                if let Some((host_id, session_id)) = removed_session {
+                    if app.ui_state.selection
+                        == Some(Selection::Session {
+                            host_id,
+                            session_id,
+                        })
+                    {
+                        app.ui_state.selection = None;
+                    }
+                }
                 if let Some((host_id, session_id)) = new_session {
                     match attach_task(app, &host_id, &session_id) {
                         Ok(task) => tasks.push(task),
@@ -951,6 +981,25 @@ fn stop_selected_session_task(app: &PohunekApp) -> Result<Task<Message>, String>
             stop_session_with_options(&host, &session_id, options)
                 .await
                 .map(|result| CoreMessage::SessionStopCompleted {
+                    host_id,
+                    session_id,
+                    result,
+                })
+                .map_err(|err| err.to_string())
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn remove_selected_session_task(app: &PohunekApp) -> Result<Task<Message>, String> {
+    let (host, session_id) = selected_session_target(app)?;
+    let host_id = host.id.clone();
+    let options = connection_options(app)?;
+    Ok(Task::perform(
+        runtime::perform(async move {
+            remove_session_with_options(&host, &session_id, options)
+                .await
+                .map(|result| CoreMessage::SessionRemoveCompleted {
                     host_id,
                     session_id,
                     result,
@@ -2281,6 +2330,9 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
                         .style(iced::widget::button::secondary),
                     button("Stop")
                         .on_press(Message::StopSelectedSession)
+                        .style(iced::widget::button::danger),
+                    button("Remove")
+                        .on_press(Message::RemoveSelectedSession)
                         .style(iced::widget::button::danger)
                 ]
                 .spacing(8),

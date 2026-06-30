@@ -523,6 +523,15 @@ enum SessionAction {
         json: bool,
     },
 
+    /// Remove one session from the daemon, stopping it first if still live.
+    Rm {
+        /// Session target: `session-id` or `local/session-id`.
+        target: Target,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Send text to one session.
     Input {
         /// Session target: `session-id` or `local/session-id`.
@@ -604,6 +613,7 @@ impl SessionAction {
             | SessionAction::List { json, .. }
             | SessionAction::Inspect { json, .. }
             | SessionAction::Stop { json, .. }
+            | SessionAction::Rm { json, .. }
             | SessionAction::Input { json, .. } => *json,
         }
     }
@@ -736,6 +746,10 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 SessionAction::Stop { target, json } => {
                     let host = effective_host(&global_host, Some(&target));
                     commands::session::run_stop(&host, &paths, &target, json).await?;
+                }
+                SessionAction::Rm { target, json } => {
+                    let host = effective_host(&global_host, Some(&target));
+                    commands::session::run_remove(&host, &paths, &target, json).await?;
                 }
                 SessionAction::Input { target, text, json } => {
                     let host = effective_host(&global_host, Some(&target));

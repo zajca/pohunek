@@ -14,9 +14,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use protocol::{
     event, AgentActivity, AgentKind, ErrorClass, Event, ProjectRemoveResult, ProtocolError,
     SessionAttachParams, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionNewParams, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWarning, StateSource,
-    WorktreeRemoveResult, PROTOCOL_VERSION,
+    SessionNewParams, SessionRemoveResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionSetMetadataResult, SessionState, SessionStopResult,
+    SessionWarning, StateSource, WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
@@ -1144,6 +1144,58 @@ impl SessionRegistry {
         Ok(SessionStopResult { stopped: true })
     }
 
+    /// Evict a session from the registry, stopping it first if still live.
+    ///
+    /// `stop` only flips a live session to a terminal state; the entry stays in
+    /// the registry so `list`/`inspect` keep showing it, which is why a stopped
+    /// session otherwise lingers forever. `remove` is the eviction step. A
+    /// still-live session is stopped first (so removal never orphans a live PTY),
+    /// then the entry is dropped and its resume binding cleared so a daemon
+    /// restart cannot resurrect it. A `session_removed` event is emitted with the
+    /// final snapshot so subscribed clients drop their view of the session.
+    ///
+    /// # Errors
+    ///
+    /// Returns `session_not_found` when no session has the given id, and
+    /// surfaces any PTY shutdown error from the implied stop of a live session.
+    pub async fn remove(&self, id: &SessionId) -> Result<SessionRemoveResult, ProtocolError> {
+        let was_live = {
+            let sessions = self.inner.sessions.lock().await;
+            let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
+            !is_terminal(entry.info.state)
+        };
+
+        let stopped = if was_live {
+            self.stop(id).await?.stopped
+        } else {
+            false
+        };
+
+        let info = {
+            let mut sessions = self.inner.sessions.lock().await;
+            match sessions.remove(id) {
+                Some(entry) => entry.info,
+                // A concurrent `remove` won the race and already evicted it.
+                None => {
+                    return Ok(SessionRemoveResult {
+                        removed: false,
+                        stopped,
+                    })
+                }
+            }
+        };
+
+        // The entry is gone, so this re-reads as "no live session" and clears any
+        // lingering resume binding (idempotent for a session that already dropped
+        // its binding on exit or stop).
+        self.persist_resume_binding(id).await;
+        self.emit(event::SESSION_REMOVED, &info);
+        Ok(SessionRemoveResult {
+            removed: true,
+            stopped,
+        })
+    }
+
     /// Wait until a session reaches a terminal process-exit state.
     pub async fn wait_for_exit(
         &self,
@@ -1579,6 +1631,20 @@ mod tests {
         })
         .await
         .expect("session_updated event");
+        serde_json::from_value(event.payload["session"].clone()).expect("session info payload")
+    }
+
+    async fn next_session_removed(rx: &mut tokio::sync::broadcast::Receiver<Event>) -> SessionInfo {
+        let event = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = rx.recv().await.expect("receive session event");
+                if event.event == protocol::event::SESSION_REMOVED {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("session_removed event");
         serde_json::from_value(event.payload["session"].clone()).expect("session info payload")
     }
 
@@ -3189,6 +3255,66 @@ mod tests {
 
         assert!(stopped.stopped);
         assert_eq!(inspected.state, SessionState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn remove_evicts_an_already_stopped_session() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+
+        let created = registry.create(params()).await.expect("create session");
+        registry.stop(&created.id).await.expect("stop session");
+        let mut events = registry.subscribe();
+
+        let removed = registry.remove(&created.id).await.expect("remove session");
+
+        assert!(removed.removed);
+        // The session was already terminal, so removal did not stop it again.
+        assert!(!removed.stopped);
+        let event = next_session_removed(&mut events).await;
+        assert_eq!(event.id, created.id);
+        let err = registry
+            .inspect(&created.id)
+            .await
+            .expect_err("removed session is gone");
+        assert_eq!(err.code, "session_not_found");
+    }
+
+    #[tokio::test]
+    async fn remove_stops_a_live_session_then_evicts() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+
+        let created = registry.create(params()).await.expect("create session");
+
+        let removed = registry.remove(&created.id).await.expect("remove session");
+
+        assert!(removed.removed);
+        // The session was still live, so removal stopped it first.
+        assert!(removed.stopped);
+        let err = registry
+            .inspect(&created.id)
+            .await
+            .expect_err("removed session is gone");
+        assert_eq!(err.code, "session_not_found");
+    }
+
+    #[tokio::test]
+    async fn remove_unknown_session_is_session_not_found() {
+        let registry = SessionRegistry::default();
+
+        let err = registry
+            .remove(&SessionId("s-missing".to_owned()))
+            .await
+            .expect_err("unknown session cannot be removed");
+
+        assert_eq!(err.code, "session_not_found");
     }
 
     #[tokio::test]
