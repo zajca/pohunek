@@ -717,25 +717,11 @@ async fn launch_from_rendered_preset_creates_one_session_with_rendered_input() {
     let daemon = LoopbackDaemon::spawn("m3-launch", "0.3.0-launch").await;
     let host = HostConfig::tcp("host-launch", daemon.addr);
     let repo = init_git_repo("gui-core-m3-launch-repo");
-    write_file(
-        &repo.join(".pohunek/templates.toml"),
-        r#"
-[template.issue]
-agent = "codex"
-prompt = "issue"
-base_branch = "develop"
-"#,
-    );
-    write_file(
-        &repo.join(".pohunek/actions.toml"),
-        r#"
-[action.process-issue]
-template = "issue"
-provider = "linear_issue"
-"#,
-    );
-    write_file(
-        &repo.join(".pohunek/prompts/issue.tmpl"),
+    write_provider_action_fixture(
+        &repo,
+        "issue",
+        "process-issue",
+        "linear_issue",
         "Issue ${id}: ${title}\n${body}\nbranch=${branch}\n",
     );
     let project = add_project(

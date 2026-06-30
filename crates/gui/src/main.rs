@@ -6,6 +6,7 @@
 mod runtime;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -2205,7 +2206,7 @@ fn agents_monitor(app: &PohunekApp) -> Element<'_, Message> {
         // a name hid it), project, branch, and the activity word.
         let mut meta = String::new();
         if agent.name.is_some() {
-            meta.push_str(&format!("{} / {}", agent.host_id, agent.session_id.0));
+            let _ = write!(&mut meta, "{} / {}", agent.host_id, agent.session_id.0);
         }
         if let Some(project) = agent.project_label.as_ref().or(agent.project_id.as_ref()) {
             push_meta(&mut meta, project);

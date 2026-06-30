@@ -1632,6 +1632,17 @@ mod tests {
         fs::set_permissions(path, perms).expect("chmod executable");
     }
 
+    #[cfg(unix)]
+    fn write_resume_agent_script(path: &std::path::Path, marker: &std::path::Path) {
+        write_executable(
+            path,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nsleep 30\n",
+                marker.display()
+            ),
+        );
+    }
+
     async fn wait_for_file_contains(path: &std::path::Path, needle: &str) -> String {
         for _ in 0..500 {
             if let Ok(contents) = fs::read_to_string(path) {
@@ -4448,20 +4459,8 @@ mod tests {
         let script_v2 = dir.join("agent-v2");
         let marker_v1 = dir.join("v1-argv.txt");
         let marker_v2 = dir.join("v2-argv.txt");
-        write_executable(
-            &script_v1,
-            &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nsleep 30\n",
-                marker_v1.display()
-            ),
-        );
-        write_executable(
-            &script_v2,
-            &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nsleep 30\n",
-                marker_v2.display()
-            ),
-        );
+        write_resume_agent_script(&script_v1, &marker_v1);
+        write_resume_agent_script(&script_v2, &marker_v2);
         let agents_dir = temp_agents_dir_with(
             "resume-edit-resize",
             "editable",
