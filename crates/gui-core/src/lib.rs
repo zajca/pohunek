@@ -489,7 +489,8 @@ pub enum ProviderOperation {
 /// Linear provider browser state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LinearProviderState {
-    pub state_filter: String,
+    /// Name of the picked predefined filter; `None` until one is chosen.
+    pub selected_filter: Option<String>,
     pub search: String,
     pub issues: Vec<providers::linear::LinearIssue>,
     pub selected_issue_id: Option<String>,
@@ -501,6 +502,8 @@ pub struct LinearProviderState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GitHubProviderState {
     pub scope: Option<GitHubProviderScope>,
+    /// Name of the picked predefined pull request filter; `None` until chosen.
+    pub selected_filter: Option<String>,
     pub search: String,
     pub pull_requests: Vec<providers::github::GitHubPullRequest>,
     pub issues: Vec<providers::github::GitHubIssue>,
@@ -664,9 +667,9 @@ pub enum Message {
         host_id: HostId,
         panel: ProviderPanel,
     },
-    LinearProviderStateFilterChanged {
+    LinearProviderFilterSelected {
         host_id: HostId,
-        value: String,
+        name: String,
     },
     LinearProviderSearchChanged {
         host_id: HostId,
@@ -675,13 +678,17 @@ pub enum Message {
     LinearProviderIssuesLoaded {
         host_id: HostId,
         request_id: ProviderRequestId,
-        state_filter: String,
+        filter_name: Option<String>,
         search: String,
         issues: Vec<providers::linear::LinearIssue>,
     },
     LinearProviderIssueSelected {
         host_id: HostId,
         issue_id: String,
+    },
+    GitHubProviderFilterSelected {
+        host_id: HostId,
+        name: String,
     },
     GitHubProviderSearchChanged {
         host_id: HostId,
@@ -1317,12 +1324,12 @@ impl Workspace {
                     .or_insert_with(HostView::connecting);
                 host.provider.active_panel = panel;
             }
-            Message::LinearProviderStateFilterChanged { host_id, value } => {
+            Message::LinearProviderFilterSelected { host_id, name } => {
                 let host = self
                     .hosts
                     .entry(host_id)
                     .or_insert_with(HostView::connecting);
-                host.provider.linear.state_filter = value;
+                host.provider.linear.selected_filter = Some(name);
                 host.provider.linear.active_request = None;
             }
             Message::LinearProviderSearchChanged { host_id, value } => {
@@ -1336,7 +1343,7 @@ impl Workspace {
             Message::LinearProviderIssuesLoaded {
                 host_id,
                 request_id,
-                state_filter,
+                filter_name,
                 search,
                 issues,
             } => {
@@ -1355,7 +1362,7 @@ impl Workspace {
                     );
                     return;
                 }
-                if host.provider.linear.state_filter != state_filter
+                if host.provider.linear.selected_filter != filter_name
                     || host.provider.linear.search != search
                 {
                     trace_ignored_provider_result(
@@ -1378,6 +1385,14 @@ impl Workspace {
                     .entry(host_id)
                     .or_insert_with(HostView::connecting);
                 host.provider.linear.selected_issue_id = Some(issue_id);
+            }
+            Message::GitHubProviderFilterSelected { host_id, name } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                host.provider.github.selected_filter = Some(name);
+                host.provider.github.pull_requests_request = None;
             }
             Message::GitHubProviderSearchChanged { host_id, value } => {
                 let host = self
@@ -2971,6 +2986,14 @@ mod tests {
             host_id: host_id.clone(),
             panel: ProviderPanel::GitHub,
         });
+        workspace.apply(Message::LinearProviderFilterSelected {
+            host_id: host_id.clone(),
+            name: "Assigned to me".to_owned(),
+        });
+        workspace.apply(Message::GitHubProviderFilterSelected {
+            host_id: host_id.clone(),
+            name: "My PRs".to_owned(),
+        });
         workspace.apply(Message::LinearProviderSearchChanged {
             host_id: host_id.clone(),
             value: "launcher".to_owned(),
@@ -2979,7 +3002,7 @@ mod tests {
         workspace.apply(Message::LinearProviderIssuesLoaded {
             host_id: host_id.clone(),
             request_id,
-            state_filter: String::new(),
+            filter_name: Some("Assigned to me".to_owned()),
             search: "launcher".to_owned(),
             issues: vec![providers::linear::LinearIssue {
                 id: "opaque".to_owned(),
@@ -2998,6 +3021,14 @@ mod tests {
         let host = workspace.hosts.get(&host_id).expect("host");
         assert_eq!(host.provider.active_panel, ProviderPanel::GitHub);
         assert_eq!(host.provider.linear.search, "launcher");
+        assert_eq!(
+            host.provider.linear.selected_filter.as_deref(),
+            Some("Assigned to me")
+        );
+        assert_eq!(
+            host.provider.github.selected_filter.as_deref(),
+            Some("My PRs")
+        );
         assert_eq!(
             host.provider.linear.selected_issue_id.as_deref(),
             Some("LIN-123")
@@ -3048,7 +3079,7 @@ mod tests {
         workspace.apply(Message::LinearProviderIssuesLoaded {
             host_id: host_id.clone(),
             request_id,
-            state_filter: String::new(),
+            filter_name: None,
             search: "old".to_owned(),
             issues: vec![providers::linear::LinearIssue {
                 id: "opaque".to_owned(),

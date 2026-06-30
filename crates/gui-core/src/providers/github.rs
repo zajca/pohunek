@@ -335,14 +335,21 @@ where
 {
     /// Lists GitHub pull requests for the current repository.
     ///
+    /// `filter_args` are extra `gh pr list` arguments (such as `--state` and
+    /// `--search`) selecting a named filter view; pass an empty slice for the
+    /// default open listing. See [`crate::providers::filters::GitHubFilter::gh_args`].
+    ///
     /// # Errors
     ///
     /// Returns a typed [`GitHubError`] for missing `gh`, nonzero exit, invalid
     /// UTF-8, or invalid JSON output.
-    pub async fn list_pull_requests(&self) -> Result<Vec<GitHubPullRequest>, GitHubError> {
-        let output = self
-            .run_gh("pr list", args(["pr", "list", "--json", PR_FIELDS]))
-            .await?;
+    pub async fn list_pull_requests(
+        &self,
+        filter_args: &[String],
+    ) -> Result<Vec<GitHubPullRequest>, GitHubError> {
+        let mut command = args(["pr", "list", "--json", PR_FIELDS]);
+        command.extend_from_slice(filter_args);
+        let output = self.run_gh("pr list", command).await?;
         parse_json("pr list", &output.stdout)
     }
 

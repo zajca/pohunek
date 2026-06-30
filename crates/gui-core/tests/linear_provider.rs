@@ -132,22 +132,20 @@ fn config(token_key: impl Into<String>) -> LinearConfig {
     }
 }
 
-fn assigned_issues_response() -> Value {
+fn issues_response() -> Value {
     json!({
         "data": {
-            "viewer": {
-                "assignedIssues": {
-                    "nodes": [
-                        {
-                            "id": "opaque-linear-id",
-                            "identifier": "LIN-123",
-                            "title": "Fix launcher",
-                            "description": "Issue body",
-                            "branchName": "lin-123-fix-launcher",
-                            "url": "https://linear.example/LIN-123"
-                        }
-                    ]
-                }
+            "issues": {
+                "nodes": [
+                    {
+                        "id": "opaque-linear-id",
+                        "identifier": "LIN-123",
+                        "title": "Fix launcher",
+                        "description": "Issue body",
+                        "branchName": "lin-123-fix-launcher",
+                        "url": "https://linear.example/LIN-123"
+                    }
+                ]
             }
         }
     })
@@ -156,15 +154,15 @@ fn assigned_issues_response() -> Value {
 fn assert_send<T: Send>(_: T) {}
 
 #[tokio::test]
-async fn assigned_issues_reads_token_at_call_time_and_builds_query() {
+async fn list_issues_reads_token_at_call_time_and_builds_query() {
     let tokens = FakeTokenSource::new(SECRET_TOKEN);
-    let transport = FakeTransport::new(assigned_issues_response());
+    let transport = FakeTransport::new(issues_response());
     let client = LinearClient::new(config(TOKEN_KEY), tokens.clone(), transport.clone());
-    assert_send(client.assigned_issues(LinearQuery::default()));
+    assert_send(client.list_issues(LinearQuery::default()));
 
     let issues = client
-        .assigned_issues(LinearQuery {
-            state: Some("started".to_owned()),
+        .list_issues(LinearQuery {
+            filter: Some(json!({ "state": { "type": { "in": ["started"] } } })),
             search: Some("launcher".to_owned()),
             limit: 25,
         })
@@ -197,7 +195,7 @@ async fn assigned_issues_reads_token_at_call_time_and_builds_query() {
 
     tokens.set_token("rotated_linear_token_fixture");
     client
-        .assigned_issues(LinearQuery::default())
+        .list_issues(LinearQuery::default())
         .await
         .expect("assigned issues after token rotation");
 
@@ -212,8 +210,7 @@ async fn assigned_issues_reads_token_at_call_time_and_builds_query() {
         .get("query")
         .and_then(Value::as_str)
         .expect("GraphQL query string");
-    assert!(query.contains("viewer"));
-    assert!(query.contains("assignedIssues"));
+    assert!(query.contains("issues"));
     assert!(query.contains("id"));
     assert!(query.contains("identifier"));
     assert!(query.contains("title"));
@@ -223,12 +220,13 @@ async fn assigned_issues_reads_token_at_call_time_and_builds_query() {
     assert!(query.contains("IssueFilter"));
 
     assert_eq!(request["variables"]["first"], 25);
+    // The raw filter and the search term are combined with a logical AND.
     assert_eq!(
-        request["variables"]["filter"]["state"]["name"]["eq"],
+        request["variables"]["filter"]["and"][0]["state"]["type"]["in"][0],
         "started"
     );
     assert_eq!(
-        request["variables"]["filter"]["searchableContent"]["containsIgnoreCase"],
+        request["variables"]["filter"]["and"][1]["searchableContent"]["containsIgnoreCase"],
         "launcher"
     );
     assert!(!request.to_string().contains(SECRET_TOKEN));
@@ -242,11 +240,11 @@ async fn assigned_issues_reads_token_at_call_time_and_builds_query() {
 #[tokio::test]
 async fn missing_token_key_fails_before_token_or_transport_lookup() {
     let tokens = FakeTokenSource::new(SECRET_TOKEN);
-    let transport = FakeTransport::new(assigned_issues_response());
+    let transport = FakeTransport::new(issues_response());
     let client = LinearClient::new(config("  "), tokens.clone(), transport.clone());
 
     let err = client
-        .assigned_issues(LinearQuery::default())
+        .list_issues(LinearQuery::default())
         .await
         .expect_err("missing token key");
 
@@ -259,7 +257,7 @@ async fn missing_token_key_fails_before_token_or_transport_lookup() {
 #[tokio::test]
 async fn missing_endpoint_fails_before_token_or_transport_lookup() {
     let tokens = FakeTokenSource::new(SECRET_TOKEN);
-    let transport = FakeTransport::new(assigned_issues_response());
+    let transport = FakeTransport::new(issues_response());
     let client = LinearClient::new(
         LinearConfig {
             token_key: TOKEN_KEY.to_owned(),
@@ -271,7 +269,7 @@ async fn missing_endpoint_fails_before_token_or_transport_lookup() {
     );
 
     let err = client
-        .assigned_issues(LinearQuery::default())
+        .list_issues(LinearQuery::default())
         .await
         .expect_err("missing endpoint");
 
@@ -284,11 +282,11 @@ async fn missing_endpoint_fails_before_token_or_transport_lookup() {
 #[tokio::test]
 async fn invalid_limit_fails_before_token_or_transport_lookup() {
     let tokens = FakeTokenSource::new(SECRET_TOKEN);
-    let transport = FakeTransport::new(assigned_issues_response());
+    let transport = FakeTransport::new(issues_response());
     let client = LinearClient::new(config(TOKEN_KEY), tokens.clone(), transport.clone());
 
     let err = client
-        .assigned_issues(LinearQuery {
+        .list_issues(LinearQuery {
             limit: 0,
             ..LinearQuery::default()
         })
@@ -306,7 +304,7 @@ async fn invalid_limit_fails_before_token_or_transport_lookup() {
 
 #[tokio::test]
 async fn token_lookup_timeout_is_enforced() {
-    let transport = FakeTransport::new(assigned_issues_response());
+    let transport = FakeTransport::new(issues_response());
     let client = LinearClient::new(
         LinearConfig {
             token_key: TOKEN_KEY.to_owned(),
@@ -318,7 +316,7 @@ async fn token_lookup_timeout_is_enforced() {
     );
 
     let err = client
-        .assigned_issues(LinearQuery::default())
+        .list_issues(LinearQuery::default())
         .await
         .expect_err("token lookup timeout");
 
@@ -338,7 +336,7 @@ async fn token_lookup_timeout_is_enforced() {
 #[tokio::test]
 async fn zero_token_lookup_timeout_is_rejected() {
     let tokens = FakeTokenSource::new(SECRET_TOKEN);
-    let transport = FakeTransport::new(assigned_issues_response());
+    let transport = FakeTransport::new(issues_response());
     let client = LinearClient::new(
         LinearConfig {
             token_key: TOKEN_KEY.to_owned(),
@@ -350,7 +348,7 @@ async fn zero_token_lookup_timeout_is_rejected() {
     );
 
     let err = client
-        .assigned_issues(LinearQuery::default())
+        .list_issues(LinearQuery::default())
         .await
         .expect_err("invalid token timeout");
 
@@ -362,11 +360,11 @@ async fn zero_token_lookup_timeout_is_rejected() {
 #[tokio::test]
 async fn token_lookup_failure_is_typed_and_skips_transport() {
     let tokens = FakeTokenSource::failing("keyring unavailable");
-    let transport = FakeTransport::new(assigned_issues_response());
+    let transport = FakeTransport::new(issues_response());
     let client = LinearClient::new(config(TOKEN_KEY), tokens.clone(), transport.clone());
 
     let err = client
-        .assigned_issues(LinearQuery::default())
+        .list_issues(LinearQuery::default())
         .await
         .expect_err("token lookup failure");
 
@@ -392,7 +390,7 @@ async fn transport_failure_is_typed_without_token_leak() {
     );
 
     let err = client
-        .assigned_issues(LinearQuery::default())
+        .list_issues(LinearQuery::default())
         .await
         .expect_err("transport failure");
 
@@ -415,7 +413,7 @@ async fn graphql_response_errors_are_typed_without_token_leak() {
     );
 
     let err = client
-        .assigned_issues(LinearQuery::default())
+        .list_issues(LinearQuery::default())
         .await
         .expect_err("GraphQL errors");
 
@@ -432,9 +430,7 @@ async fn graphql_response_errors_are_typed_without_token_leak() {
 async fn invalid_response_shape_is_typed() {
     let transport = FakeTransport::new(json!({
         "data": {
-            "viewer": {
-                "assignedIssues": {}
-            }
+            "issues": {}
         }
     }));
     let client = LinearClient::new(
@@ -444,14 +440,14 @@ async fn invalid_response_shape_is_typed() {
     );
 
     let err = client
-        .assigned_issues(LinearQuery::default())
+        .list_issues(LinearQuery::default())
         .await
         .expect_err("invalid response shape");
 
     assert!(matches!(
         err,
         LinearError::InvalidResponse { path }
-            if path == "data.viewer.assignedIssues.nodes"
+            if path == "data.issues.nodes"
     ));
 }
 
@@ -459,18 +455,16 @@ async fn invalid_response_shape_is_typed() {
 async fn missing_required_issue_field_is_typed() {
     let transport = FakeTransport::new(json!({
         "data": {
-            "viewer": {
-                "assignedIssues": {
-                    "nodes": [
-                        {
-                            "id": "opaque-linear-id",
-                            "identifier": "LIN-123",
-                            "description": "Issue body",
-                            "branchName": "lin-123-fix-launcher",
-                            "url": "https://linear.example/LIN-123"
-                        }
-                    ]
-                }
+            "issues": {
+                "nodes": [
+                    {
+                        "id": "opaque-linear-id",
+                        "identifier": "LIN-123",
+                        "description": "Issue body",
+                        "branchName": "lin-123-fix-launcher",
+                        "url": "https://linear.example/LIN-123"
+                    }
+                ]
             }
         }
     }));
@@ -481,7 +475,7 @@ async fn missing_required_issue_field_is_typed() {
     );
 
     let err = client
-        .assigned_issues(LinearQuery::default())
+        .list_issues(LinearQuery::default())
         .await
         .expect_err("missing title");
 

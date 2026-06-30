@@ -100,9 +100,9 @@ async fn list_pull_requests_shells_out_with_prompt_fields() {
         ]"#,
     ))]);
     let client = GitHubClient::new(runner.clone());
-    assert_send(client.list_pull_requests());
+    assert_send(client.list_pull_requests(&[]));
 
-    let prs = client.list_pull_requests().await.expect("pull requests");
+    let prs = client.list_pull_requests(&[]).await.expect("pull requests");
 
     assert_eq!(
         runner.calls(),
@@ -123,6 +123,39 @@ async fn list_pull_requests_shells_out_with_prompt_fields() {
     assert_eq!(pr.head_ref_name, "feature/filters");
     assert_eq!(pr.url, "https://github.example/repo/pull/7");
     assert_eq!(pr.prompt_item_id(), "7");
+}
+
+#[tokio::test]
+async fn list_pull_requests_appends_filter_args() {
+    let runner = FakeGhRunner::new(vec![Ok(FakeGhRunner::json("[]"))]);
+    let client = GitHubClient::new(runner.clone());
+
+    let filter_args = vec![
+        "--state".to_owned(),
+        "open".to_owned(),
+        "--search".to_owned(),
+        "review:approved".to_owned(),
+    ];
+    client
+        .list_pull_requests(&filter_args)
+        .await
+        .expect("filtered pull requests");
+
+    assert_eq!(
+        runner.calls(),
+        vec![RecordedGhCall {
+            args: vec![
+                "pr".to_owned(),
+                "list".to_owned(),
+                "--json".to_owned(),
+                "number,title,body,headRefName,url".to_owned(),
+                "--state".to_owned(),
+                "open".to_owned(),
+                "--search".to_owned(),
+                "review:approved".to_owned(),
+            ],
+        }]
+    );
 }
 
 #[tokio::test]
@@ -297,7 +330,7 @@ async fn missing_gh_error_is_typed_and_graceful() {
     let client = GitHubClient::new(runner);
 
     let err = client
-        .list_pull_requests()
+        .list_pull_requests(&[])
         .await
         .expect_err("missing gh error");
 
@@ -316,7 +349,7 @@ async fn nonzero_gh_exit_is_typed_and_graceful() {
     let client = GitHubClient::new(runner);
 
     let err = client
-        .list_pull_requests()
+        .list_pull_requests(&[])
         .await
         .expect_err("nonzero gh exit");
 
@@ -368,7 +401,10 @@ async fn pending_pr_checks_exit_code_still_parses_json() {
 async fn invalid_json_error_is_typed() {
     let client = client_with_json("{not-json");
 
-    let err = client.list_pull_requests().await.expect_err("invalid JSON");
+    let err = client
+        .list_pull_requests(&[])
+        .await
+        .expect_err("invalid JSON");
 
     assert!(matches!(err, GitHubError::InvalidJson { .. }));
 }
@@ -411,7 +447,10 @@ esac
 
     let client = GitHubClient::with_config(GitHubConfig::new(&script).with_repo_cwd(&repo));
 
-    let prs = client.list_pull_requests().await.expect("fake gh PR list");
+    let prs = client
+        .list_pull_requests(&[])
+        .await
+        .expect("fake gh PR list");
     let issues = client.list_issues().await.expect("fake gh issue list");
     let status = client
         .pull_request_status(7)
@@ -457,7 +496,7 @@ exit 1
     let client = GitHubClient::with_config(GitHubConfig::new(&script));
 
     let err = client
-        .list_pull_requests()
+        .list_pull_requests(&[])
         .await
         .expect_err("fake gh failure");
 
@@ -478,7 +517,7 @@ async fn command_runner_missing_gh_is_typed() {
     ));
 
     let err = client
-        .list_pull_requests()
+        .list_pull_requests(&[])
         .await
         .expect_err("missing gh executable");
 

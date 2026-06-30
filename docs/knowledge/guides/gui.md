@@ -146,6 +146,60 @@ gh_bin = "gh"
 timeout_ms = 20000
 ```
 
+## Provider Filters
+
+Both provider panels expose a named-filter picker (for example *My PRs*,
+*Ready to merge*, *Assigned to me*). Filters are resolved entirely client-side
+from three layers, highest priority first:
+
+1. **Project layer** — the selected project's in-repo
+   `<repo_root>/.pohunek/providers.toml`, read by the GUI from the project's
+   repository checkout. It shadows the host layer per filter name (a project
+   filter replaces a host filter with the same name; project-only filters append
+   after the host ones) — the same in-repo-over-host rule prompts and actions
+   use. Because the GUI reads this file locally, it only applies to projects on
+   the local host; a remote project's path is not readable, so only the host and
+   built-in layers apply there.
+2. **Host layer** — `filters` arrays under `[providers.github]` /
+   `[providers.linear]` in `gui.toml`.
+3. **Built-in defaults** — used per provider whenever the merged set for that
+   provider is empty, so the picker is never empty.
+
+A **GitHub** filter is a raw `gh pr list` search query plus an optional state;
+it is passed through as `--search` / `--state` and so applies to pull requests
+(issues keep a plain listing with a local text filter). A **Linear** filter is a
+raw Linear `IssueFilter` object passed verbatim as the `$filter` variable to the
+top-level `issues(filter:)` query, so filters are not limited to issues assigned
+to the viewer — any team-wide filter the `IssueFilter` schema supports works.
+
+Host `gui.toml`:
+
+```toml
+[[providers.github.filters]]
+name = "Ready to merge"
+search = "review:approved"
+state = "open"            # open (default) | closed | merged | all
+
+[[providers.linear.filters]]
+name = "Team active"
+filter = { state = { type = { in = ["started"] } } }
+```
+
+In-repo `<repo_root>/.pohunek/providers.toml`:
+
+```toml
+[[github]]
+name = "Release blockers"
+search = "label:release-blocker"
+
+[[linear]]
+name = "My active"
+filter = { assignee = { isMe = { eq = true } }, state = { type = { in = ["started"] } } }
+```
+
+Filter definitions hold no secrets and never enter session metadata or logs;
+they are plain query strings and `IssueFilter` objects.
+
 Linear uses `token_key` as a keyring entry reference. The GUI reads the token at
 call time through the keyring boundary and must never offer a token input field.
 `token_timeout_ms` is required when Linear is configured so a stuck keyring
@@ -214,6 +268,9 @@ When behavior must be checked against implementation, inspect:
   keyring-token lookup boundaries, and token lookup timeouts.
 - `crates/gui-core/src/providers/github.rs` for `gh` command execution, timeout
   handling, JSON parsing, and stderr redaction.
+- `crates/gui-core/src/providers/filters.rs` for the named-filter types,
+  built-in defaults, and the host/project layer merge (in-repo-over-host
+  shadowing) used by both provider pickers.
 - `crates/gui-core/tests/loopback.rs` for loopback coverage of host-resolved
   prompt/action browse, preview, provider launch, and linked metadata
   persistence behavior.

@@ -117,6 +117,7 @@ struct PohunekApp {
     /// `.pohunek/providers.toml`, keyed by repository root. Populated lazily on
     /// project selection / provider fetch; absent entries fall back to the host
     /// (`gui.toml`) and built-in layers.
+    project_filters: BTreeMap<PathBuf, providers::filters::ProviderFilterSet>,
     /// Last session row click (host, session, instant), used to detect a
     /// double-click that opens the session in a terminal.
     last_session_click: Option<(HostId, SessionId, Instant)>,
@@ -174,6 +175,7 @@ impl PohunekApp {
                 metadata_edit: MetadataEdit::default(),
                 project_edit: ProjectEdit::default(),
                 selected_action: None,
+                project_filters: BTreeMap::new(),
                 last_session_click: None,
                 state_dir: boot.state_dir,
                 status: boot.status,
@@ -349,6 +351,10 @@ enum Message {
     RemoveWorktree(PathBuf),
     SelectAction(String),
     SelectProviderPanel(ProviderPanel),
+    /// Pick a Linear filter and immediately fetch its issues.
+    SelectLinearFilter(String),
+    /// Pick a GitHub pull request filter and immediately fetch.
+    SelectGitHubFilter(String),
     FetchLinearIssues,
     FetchGitHubPullRequests,
     FetchGitHubIssues,
@@ -435,6 +441,9 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             app.project_edit.reference = project_id;
             app.selected_action = None;
             app.start.template = None;
+            // Preload the project's in-repo provider filters so the picker is
+            // populated before the operator opens a provider panel.
+            ensure_project_filters_loaded(app);
             // Load the project's actions eagerly so the launch action picker is
             // populated without a manual step.
             if let Ok(task) = list_project_actions_task(app) {
@@ -557,6 +566,7 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             if let Ok(host_id) = selected_host_id(app) {
                 app.workspace
                     .apply(CoreMessage::ProviderPanelSelected { host_id, panel });
+                ensure_project_filters_loaded(app);
                 // Auto-fetch the panel's data so switching tabs immediately shows
                 // results instead of requiring a separate Fetch click.
                 match panel {
@@ -597,26 +607,74 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                 }
             }
         }
+        Message::SelectLinearFilter(name) => {
+            if let Ok(host_id) = selected_host_id(app) {
+                app.workspace
+                    .apply(CoreMessage::LinearProviderFilterSelected { host_id, name });
+            }
+            // Picking a filter both selects it and fetches with it in one click.
+            match begin_linear_issues_request(app) {
+                Ok(request_id) => {
+                    ensure_project_filters_loaded(app);
+                    push_provider_task_result(
+                        app,
+                        &mut tasks,
+                        SessionLinkProvider::Linear,
+                        ProviderOperation::LinearIssues,
+                        Some(request_id),
+                        fetch_linear_issues_task(app, request_id),
+                    );
+                }
+                Err(err) => app.status = Some(err),
+            }
+        }
+        Message::SelectGitHubFilter(name) => {
+            if let Ok(host_id) = selected_host_id(app) {
+                app.workspace
+                    .apply(CoreMessage::GitHubProviderFilterSelected { host_id, name });
+            }
+            // Picking a filter both selects it and fetches PRs in one click.
+            match begin_github_pull_requests_request(app) {
+                Ok(request_id) => {
+                    ensure_project_filters_loaded(app);
+                    push_provider_task_result(
+                        app,
+                        &mut tasks,
+                        SessionLinkProvider::GitHub,
+                        ProviderOperation::GitHubPullRequests,
+                        Some(request_id),
+                        fetch_github_pull_requests_task(app, request_id),
+                    );
+                }
+                Err(err) => app.status = Some(err),
+            }
+        }
         Message::FetchLinearIssues => match begin_linear_issues_request(app) {
-            Ok(request_id) => push_provider_task_result(
-                app,
-                &mut tasks,
-                SessionLinkProvider::Linear,
-                ProviderOperation::LinearIssues,
-                Some(request_id),
-                fetch_linear_issues_task(app, request_id),
-            ),
+            Ok(request_id) => {
+                ensure_project_filters_loaded(app);
+                push_provider_task_result(
+                    app,
+                    &mut tasks,
+                    SessionLinkProvider::Linear,
+                    ProviderOperation::LinearIssues,
+                    Some(request_id),
+                    fetch_linear_issues_task(app, request_id),
+                );
+            }
             Err(err) => app.status = Some(err),
         },
         Message::FetchGitHubPullRequests => match begin_github_pull_requests_request(app) {
-            Ok(request_id) => push_provider_task_result(
-                app,
-                &mut tasks,
-                SessionLinkProvider::GitHub,
-                ProviderOperation::GitHubPullRequests,
-                Some(request_id),
-                fetch_github_pull_requests_task(app, request_id),
-            ),
+            Ok(request_id) => {
+                ensure_project_filters_loaded(app);
+                push_provider_task_result(
+                    app,
+                    &mut tasks,
+                    SessionLinkProvider::GitHub,
+                    ProviderOperation::GitHubPullRequests,
+                    Some(request_id),
+                    fetch_github_pull_requests_task(app, request_id),
+                );
+            }
             Err(err) => app.status = Some(err),
         },
         Message::FetchGitHubIssues => match begin_github_issues_request(app) {
@@ -1054,18 +1112,22 @@ fn fetch_linear_issues_task(
         .linear
         .clone()
         .ok_or_else(|| "Linear provider is not configured".to_owned())?;
+    // The active filter's raw IssueFilter drives the query; the echoed
+    // `filter_name` mirrors the host's current selection (possibly `None`) so
+    // the stale-result guard rejects results after the picker changes.
+    let active_filter = active_linear_filter(app);
     let host = app
         .workspace
         .hosts
         .get(&host_id)
         .ok_or_else(|| format!("unknown host `{host_id}`"))?;
+    let filter_name = host.provider.linear.selected_filter.clone();
+    let search = host.provider.linear.search.clone();
     let query = providers::linear::LinearQuery {
-        state: optional_field(&host.provider.linear.state_filter),
-        search: optional_field(&host.provider.linear.search),
+        filter: active_filter.map(|filter| filter.filter),
+        search: optional_field(&search),
         ..providers::linear::LinearQuery::default()
     };
-    let state_filter = host.provider.linear.state_filter.clone();
-    let search = host.provider.linear.search.clone();
     Ok(Task::perform(
         runtime::perform(async move {
             let client = match providers::linear::HttpGraphqlTransport::try_new() {
@@ -1088,11 +1150,11 @@ fn fetch_linear_issues_task(
                     });
                 }
             };
-            match client.assigned_issues(query).await {
+            match client.list_issues(query).await {
                 Ok(issues) => Ok(CoreMessage::LinearProviderIssuesLoaded {
                     host_id,
                     request_id,
-                    state_filter,
+                    filter_name,
                     search,
                     issues,
                 }),
@@ -1114,9 +1176,12 @@ fn fetch_github_pull_requests_task(
     request_id: ProviderRequestId,
 ) -> Result<Task<Message>, String> {
     let (host_id, scope, client) = github_client_for_selected_project(app)?;
+    let filter_args = active_github_filter(app)
+        .map(|filter| filter.gh_args())
+        .unwrap_or_default();
     Ok(Task::perform(
         runtime::perform(async move {
-            match client.list_pull_requests().await {
+            match client.list_pull_requests(&filter_args).await {
                 Ok(pull_requests) => Ok(CoreMessage::GitHubProviderPullRequestsLoaded {
                     host_id,
                     request_id,
@@ -1392,6 +1457,95 @@ fn github_client_for_selected_project(
         scope,
         providers::github::GitHubClient::with_config(config),
     ))
+}
+
+/// In-repo provider filter file, relative to a project's repository root.
+const PROJECT_FILTERS_FILE: &str = ".pohunek/providers.toml";
+
+/// Reads a project's in-repo `.pohunek/providers.toml` filter layer, if present.
+///
+/// Returns `Ok(None)` when the file does not exist (the common case, and what a
+/// remote project's locally-unreadable path looks like), so the host and
+/// built-in layers stay in effect.
+fn load_project_filters(
+    repo_root: &std::path::Path,
+) -> Result<Option<providers::filters::ProviderFilterSet>, ConfigError> {
+    let path = repo_root.join(PROJECT_FILTERS_FILE);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(ConfigError::Read { path, source }),
+    };
+    let raw: RawProjectFilters =
+        toml::from_str(&raw).map_err(|source| ConfigError::Parse { path, source })?;
+    Ok(Some(raw.into_filter_set()?))
+}
+
+/// Loads the selected project's in-repo filters into the cache once.
+///
+/// Read or parse failures surface in the status line and leave the host plus
+/// built-in layers in effect; a missing file caches an empty layer so it is not
+/// re-read on every provider fetch.
+fn ensure_project_filters_loaded(app: &mut PohunekApp) {
+    let Ok((_, repo_root)) = selected_project_identity(app) else {
+        return;
+    };
+    if app.project_filters.contains_key(&repo_root) {
+        return;
+    }
+    match load_project_filters(&repo_root) {
+        Ok(Some(filters)) => {
+            app.project_filters.insert(repo_root, filters);
+        }
+        Ok(None) => {
+            app.project_filters
+                .insert(repo_root, providers::filters::ProviderFilterSet::default());
+        }
+        Err(err) => app.status = Some(format!("provider filters: {err}")),
+    }
+}
+
+/// Resolves the effective provider filters for the current selection.
+///
+/// Merges the host (`gui.toml`) layer with the selected project's cached in-repo
+/// layer, falling back to built-in defaults per provider (see
+/// [`providers::filters::merge`]).
+fn effective_filters(app: &PohunekApp) -> providers::filters::ProviderFilterSet {
+    let host = app
+        .config
+        .as_ref()
+        .map(|config| config.providers.filters.clone())
+        .unwrap_or_default();
+    let project = selected_project_identity(app)
+        .ok()
+        .and_then(|(_, repo_root)| app.project_filters.get(&repo_root));
+    providers::filters::merge(&host, project)
+}
+
+/// Returns the GitHub filter to fetch with: the picked one, else the first
+/// effective filter. `None` only when no filters resolve (never, given built-ins).
+fn active_github_filter(app: &PohunekApp) -> Option<providers::filters::GitHubFilter> {
+    let filters = effective_filters(app);
+    let selected = selected_host_id(app)
+        .ok()
+        .and_then(|host_id| app.workspace.hosts.get(&host_id))
+        .and_then(|host| host.provider.github.selected_filter.clone());
+    selected
+        .and_then(|name| filters.github_filter(&name).cloned())
+        .or_else(|| filters.github.first().cloned())
+}
+
+/// Returns the Linear filter to fetch with: the picked one, else the first
+/// effective filter, paired with its name for the stale-result guard.
+fn active_linear_filter(app: &PohunekApp) -> Option<providers::filters::LinearFilter> {
+    let filters = effective_filters(app);
+    let selected = selected_host_id(app)
+        .ok()
+        .and_then(|host_id| app.workspace.hosts.get(&host_id))
+        .and_then(|host| host.provider.linear.selected_filter.clone());
+    selected
+        .and_then(|name| filters.linear_filter(&name).cloned())
+        .or_else(|| filters.linear.first().cloned())
 }
 
 fn selected_linear_issue(app: &PohunekApp) -> Result<providers::linear::LinearIssue, String> {
@@ -2578,9 +2732,14 @@ fn provider_browser_view(app: &PohunekApp) -> Element<'_, Message> {
     ]
     .spacing(8);
     let current_scope = selected_github_scope(app).ok();
+    let filters = effective_filters(app);
     let body = match active {
-        ProviderPanel::Linear => linear_provider_view(host_id.clone(), host),
-        ProviderPanel::GitHub => github_provider_view(host_id.clone(), current_scope, host),
+        ProviderPanel::Linear => {
+            linear_provider_view(host_id.clone(), host, filters.linear_names())
+        }
+        ProviderPanel::GitHub => {
+            github_provider_view(host_id.clone(), current_scope, host, filters.github_names())
+        }
     };
     card(column![section_title("Providers"), tabs, body].spacing(10))
 }
@@ -2613,6 +2772,31 @@ fn action_launcher(
     .into()
 }
 
+/// Renders one selectable button per named filter; the active filter is styled
+/// as primary. The picked name (or the first, when none is picked) highlights.
+fn filter_buttons(
+    filter_names: Vec<String>,
+    selected: Option<&str>,
+    make_message: impl Fn(String) -> Message,
+) -> Element<'static, Message> {
+    let active = selected
+        .filter(|name| filter_names.iter().any(|candidate| candidate == name))
+        .map(ToOwned::to_owned)
+        .or_else(|| filter_names.first().cloned());
+    let mut row = iced::widget::Row::new().spacing(6);
+    for name in filter_names {
+        let is_active = active.as_deref() == Some(name.as_str());
+        let style = if is_active {
+            iced::widget::button::primary
+        } else {
+            iced::widget::button::secondary
+        };
+        let message = make_message(name.clone());
+        row = row.push(button(text(name).size(13)).on_press(message).style(style));
+    }
+    row.into()
+}
+
 #[expect(
     clippy::needless_pass_by_value,
     reason = "owning host_id keeps the returned Iced element lifetime tied only to host state"
@@ -2620,32 +2804,32 @@ fn action_launcher(
 fn linear_provider_view(
     host_id: HostId,
     host: &pohunek_gui_core::HostView,
+    filter_names: Vec<String>,
 ) -> Element<'_, Message> {
     let state = &host.provider.linear;
-    let mut view = column![row![
-        text_input("state", &state.state_filter).on_input({
-            let host_id = host_id.clone();
-            move |value| {
-                Message::Core(CoreMessage::LinearProviderStateFilterChanged {
-                    host_id: host_id.clone(),
-                    value,
-                })
-            }
-        }),
-        text_input("search", &state.search).on_input({
-            let host_id = host_id.clone();
-            move |value| {
-                Message::Core(CoreMessage::LinearProviderSearchChanged {
-                    host_id: host_id.clone(),
-                    value,
-                })
-            }
-        }),
-        button("Fetch assigned")
-            .on_press(Message::FetchLinearIssues)
-            .style(iced::widget::button::secondary),
+    let filters = filter_buttons(
+        filter_names,
+        state.selected_filter.as_deref(),
+        Message::SelectLinearFilter,
+    );
+    let mut view = column![
+        filters,
+        row![
+            text_input("search", &state.search).on_input({
+                let host_id = host_id.clone();
+                move |value| {
+                    Message::Core(CoreMessage::LinearProviderSearchChanged {
+                        host_id: host_id.clone(),
+                        value,
+                    })
+                }
+            }),
+            button("Fetch")
+                .on_press(Message::FetchLinearIssues)
+                .style(iced::widget::button::secondary),
+        ]
+        .spacing(8)
     ]
-    .spacing(8)]
     .spacing(8);
     if !state.issues.is_empty() {
         view = view.push(text("Pick an issue, choose an action, then Launch.").size(12));
@@ -2672,29 +2856,44 @@ fn github_provider_view(
     host_id: HostId,
     current_scope: Option<GitHubProviderScope>,
     host: &pohunek_gui_core::HostView,
+    filter_names: Vec<String>,
 ) -> Element<'_, Message> {
     let state = &host.provider.github;
-    let mut view = column![row![
-        text_input("search", &state.search).on_input({
-            let host_id = host_id.clone();
-            move |value| {
-                Message::Core(CoreMessage::GitHubProviderSearchChanged {
-                    host_id: host_id.clone(),
-                    value,
-                })
-            }
-        }),
+    // The PR filter (gh search) drives `Fetch PRs`; `search` below is a local
+    // text filter applied to the already-fetched rows.
+    let filters = filter_buttons(
+        filter_names,
+        state.selected_filter.as_deref(),
+        Message::SelectGitHubFilter,
+    );
+    let pr_filter_row = row![
+        filters,
         button("Fetch PRs")
             .on_press(Message::FetchGitHubPullRequests)
             .style(iced::widget::button::secondary),
-        button("Fetch issues")
-            .on_press(Message::FetchGitHubIssues)
-            .style(iced::widget::button::secondary),
-        button("Refresh PR status")
-            .on_press(Message::FetchGitHubPullRequestStatus)
-            .style(iced::widget::button::secondary),
     ]
-    .spacing(8)]
+    .spacing(8);
+    let mut view = column![
+        pr_filter_row,
+        row![
+            text_input("search", &state.search).on_input({
+                let host_id = host_id.clone();
+                move |value| {
+                    Message::Core(CoreMessage::GitHubProviderSearchChanged {
+                        host_id: host_id.clone(),
+                        value,
+                    })
+                }
+            }),
+            button("Fetch issues")
+                .on_press(Message::FetchGitHubIssues)
+                .style(iced::widget::button::secondary),
+            button("Refresh PR status")
+                .on_press(Message::FetchGitHubPullRequestStatus)
+                .style(iced::widget::button::secondary),
+        ]
+        .spacing(8)
+    ]
     .spacing(8);
     if state.scope != current_scope {
         if state.scope.is_some() {
@@ -3033,6 +3232,9 @@ impl AppConfig {
 struct ProviderAppConfig {
     linear: Option<LinearAppConfig>,
     github: Option<GitHubAppConfig>,
+    /// Host-layer (`gui.toml`) named filters, merged with the project layer and
+    /// built-in defaults when the provider panels resolve their pickers.
+    filters: providers::filters::ProviderFilterSet,
 }
 
 #[derive(Debug, Clone)]
@@ -3091,6 +3293,8 @@ struct RawLinearProviderConfig {
     token_key: String,
     endpoint: String,
     token_timeout_ms: u64,
+    #[serde(default)]
+    filters: Vec<RawLinearFilter>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3098,46 +3302,150 @@ struct RawGitHubProviderConfig {
     gh_bin: PathBuf,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    filters: Vec<RawGitHubFilter>,
+}
+
+/// One `[providers.github]` (or in-repo) pull request filter as written in TOML.
+#[derive(Debug, Deserialize)]
+struct RawGitHubFilter {
+    name: String,
+    #[serde(default)]
+    search: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+}
+
+/// One `[providers.linear]` (or in-repo) issue filter as written in TOML.
+#[derive(Debug, Deserialize)]
+struct RawLinearFilter {
+    name: String,
+    /// Raw Linear `IssueFilter` as a TOML table, converted to JSON at load time.
+    filter: toml::Value,
+}
+
+/// In-repo `<repo_root>/.pohunek/providers.toml` filter layer.
+#[derive(Debug, Default, Deserialize)]
+struct RawProjectFilters {
+    #[serde(default)]
+    github: Vec<RawGitHubFilter>,
+    #[serde(default)]
+    linear: Vec<RawLinearFilter>,
+}
+
+impl RawGitHubFilter {
+    fn into_filter(self) -> Result<providers::filters::GitHubFilter, ConfigError> {
+        let name = non_empty_config_value(self.name, "providers.github.filters[].name")?;
+        let state = match self.state {
+            Some(state) => providers::filters::GitHubPrState::parse(&state).map_err(|source| {
+                ConfigError::ProviderFilter {
+                    message: source.to_string(),
+                }
+            })?,
+            None => providers::filters::GitHubPrState::default(),
+        };
+        Ok(providers::filters::GitHubFilter::new(
+            name,
+            self.search.unwrap_or_default(),
+            state,
+        ))
+    }
+}
+
+impl RawLinearFilter {
+    fn into_filter(self) -> Result<providers::filters::LinearFilter, ConfigError> {
+        let name = non_empty_config_value(self.name, "providers.linear.filters[].name")?;
+        let filter =
+            serde_json::to_value(self.filter).map_err(|source| ConfigError::ProviderFilter {
+                message: format!("invalid Linear filter `{name}`: {source}"),
+            })?;
+        Ok(providers::filters::LinearFilter::new(name, filter))
+    }
+}
+
+impl RawProjectFilters {
+    fn into_filter_set(self) -> Result<providers::filters::ProviderFilterSet, ConfigError> {
+        Ok(providers::filters::ProviderFilterSet {
+            github: self
+                .github
+                .into_iter()
+                .map(RawGitHubFilter::into_filter)
+                .collect::<Result<_, _>>()?,
+            linear: self
+                .linear
+                .into_iter()
+                .map(RawLinearFilter::into_filter)
+                .collect::<Result<_, _>>()?,
+        })
+    }
 }
 
 impl RawProvidersConfig {
     fn into_provider_config(self) -> Result<ProviderAppConfig, ConfigError> {
+        let mut filters = providers::filters::ProviderFilterSet::default();
+        let linear = match self.linear {
+            Some(raw) => {
+                let (config, linear_filters) = raw.into_app_config()?;
+                filters.linear = linear_filters;
+                Some(config)
+            }
+            None => None,
+        };
+        let github = match self.github {
+            Some(raw) => {
+                let (config, github_filters) = raw.into_app_config()?;
+                filters.github = github_filters;
+                Some(config)
+            }
+            None => None,
+        };
         Ok(ProviderAppConfig {
-            linear: self
-                .linear
-                .map(RawLinearProviderConfig::into_app_config)
-                .transpose()?,
-            github: self
-                .github
-                .map(RawGitHubProviderConfig::into_app_config)
-                .transpose()?,
+            linear,
+            github,
+            filters,
         })
     }
 }
 
 impl RawLinearProviderConfig {
-    fn into_app_config(self) -> Result<LinearAppConfig, ConfigError> {
-        Ok(LinearAppConfig {
+    fn into_app_config(
+        self,
+    ) -> Result<(LinearAppConfig, Vec<providers::filters::LinearFilter>), ConfigError> {
+        let filters = self
+            .filters
+            .into_iter()
+            .map(RawLinearFilter::into_filter)
+            .collect::<Result<Vec<_>, _>>()?;
+        let config = LinearAppConfig {
             token_key: non_empty_config_value(self.token_key, "providers.linear.token_key")?,
             endpoint: validate_http_endpoint(self.endpoint, "providers.linear.endpoint")?,
             token_lookup_timeout: required_duration_millis(
                 self.token_timeout_ms,
                 "providers.linear.token_timeout_ms",
             )?,
-        })
+        };
+        Ok((config, filters))
     }
 }
 
 impl RawGitHubProviderConfig {
-    fn into_app_config(self) -> Result<GitHubAppConfig, ConfigError> {
-        Ok(GitHubAppConfig {
+    fn into_app_config(
+        self,
+    ) -> Result<(GitHubAppConfig, Vec<providers::filters::GitHubFilter>), ConfigError> {
+        let filters = self
+            .filters
+            .into_iter()
+            .map(RawGitHubFilter::into_filter)
+            .collect::<Result<Vec<_>, _>>()?;
+        let config = GitHubAppConfig {
             gh_bin: non_empty_config_path(self.gh_bin, "providers.github.gh_bin")?,
             timeout: duration_millis(
                 self.timeout_ms,
                 "providers.github.timeout_ms",
                 Duration::from_secs(20),
             )?,
-        })
+        };
+        Ok((config, filters))
     }
 }
 
@@ -3208,6 +3516,8 @@ enum ConfigError {
         field: &'static str,
         message: String,
     },
+    #[error("invalid provider filter: {message}")]
+    ProviderFilter { message: String },
 }
 
 fn non_empty_config_value(value: String, field: &'static str) -> Result<String, ConfigError> {
@@ -3393,6 +3703,7 @@ mod tests {
                 ..ProjectEdit::default()
             },
             selected_action: None,
+            project_filters: BTreeMap::new(),
             last_session_click: None,
             state_dir: None,
             status: None,

@@ -17,19 +17,17 @@ const DEFAULT_ISSUE_LIMIT: usize = 50;
 const MAX_ISSUE_LIMIT: usize = 100;
 const DEFAULT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-const ASSIGNED_ISSUES_NODES_PATH: &str = "data.viewer.assignedIssues.nodes";
-const ASSIGNED_ISSUES_QUERY: &str = r"
-query PohunekAssignedIssues($first: Int!, $filter: IssueFilter) {
-  viewer {
-    assignedIssues(first: $first, filter: $filter) {
-      nodes {
-        id
-        identifier
-        title
-        description
-        branchName
-        url
-      }
+const ISSUES_NODES_PATH: &str = "data.issues.nodes";
+const ISSUES_QUERY: &str = r"
+query PohunekIssues($first: Int!, $filter: IssueFilter) {
+  issues(first: $first, filter: $filter) {
+    nodes {
+      id
+      identifier
+      title
+      description
+      branchName
+      url
     }
   }
 }
@@ -57,12 +55,13 @@ pub struct LinearConfig {
     pub token_lookup_timeout: Duration,
 }
 
-/// Query parameters for the assigned-to-me Linear issue view.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Query parameters for a Linear issue list view.
+#[derive(Debug, Clone, PartialEq)]
 pub struct LinearQuery {
-    /// Optional workflow state name filter.
-    pub state: Option<String>,
-    /// Optional fulltext search term.
+    /// Raw Linear `IssueFilter` object passed as the `$filter` variable. `None`
+    /// (or a JSON null) lists issues without a structured filter.
+    pub filter: Option<Value>,
+    /// Optional fulltext search term, combined with `filter` via logical AND.
     pub search: Option<String>,
     /// Maximum number of issues to request.
     pub limit: usize,
@@ -71,7 +70,7 @@ pub struct LinearQuery {
 impl Default for LinearQuery {
     fn default() -> Self {
         Self {
-            state: None,
+            filter: None,
             search: None,
             limit: DEFAULT_ISSUE_LIMIT,
         }
@@ -297,7 +296,7 @@ where
     T: TokenSource,
     H: GraphqlTransport,
 {
-    /// Fetches assigned-to-me Linear issues.
+    /// Fetches Linear issues matching `query`'s filter and search.
     ///
     /// The Linear token is read through [`TokenSource`] for every call, so token
     /// rotation does not require rebuilding the client.
@@ -306,10 +305,7 @@ where
     ///
     /// Returns a typed [`LinearError`] for token, transport, GraphQL, and
     /// response-shape failures.
-    pub async fn assigned_issues(
-        &self,
-        query: LinearQuery,
-    ) -> Result<Vec<LinearIssue>, LinearError> {
+    pub async fn list_issues(&self, query: LinearQuery) -> Result<Vec<LinearIssue>, LinearError> {
         if self.config.token_key.trim().is_empty() {
             return Err(LinearError::MissingTokenKey);
         }
@@ -340,14 +336,14 @@ where
             token_key: self.config.token_key.clone(),
             source,
         })?;
-        let body = assigned_issues_body(&query);
+        let body = issues_body(&query);
         let response = self
             .transport
             .post_graphql(&self.config.endpoint, &token, body)
             .await
             .map_err(|source| LinearError::Transport { source })?;
 
-        parse_assigned_issues(&response)
+        parse_issues(&response)
     }
 }
 
@@ -492,44 +488,41 @@ impl GraphqlTransport for HttpGraphqlTransport {
     }
 }
 
-fn assigned_issues_body(query: &LinearQuery) -> Value {
-    let mut filter = Map::new();
-    if let Some(state) = query.state.as_deref().and_then(non_empty) {
-        filter.insert("state".to_owned(), json!({ "name": { "eq": state } }));
-    }
-    if let Some(search) = query.search.as_deref().and_then(non_empty) {
-        filter.insert(
-            "searchableContent".to_owned(),
-            json!({ "containsIgnoreCase": search }),
-        );
-    }
+fn issues_body(query: &LinearQuery) -> Value {
+    let base = query.filter.clone().filter(|filter| !filter.is_null());
+    let search = query
+        .search
+        .as_deref()
+        .and_then(non_empty)
+        .map(|search| json!({ "searchableContent": { "containsIgnoreCase": search } }));
+    let filter = match (base, search) {
+        (Some(base), Some(search)) => json!({ "and": [base, search] }),
+        (Some(base), None) => base,
+        (None, Some(search)) => search,
+        (None, None) => Value::Null,
+    };
 
     json!({
-        "query": ASSIGNED_ISSUES_QUERY,
+        "query": ISSUES_QUERY,
         "variables": {
             "first": query.limit,
-            "filter": if filter.is_empty() {
-                Value::Null
-            } else {
-                Value::Object(filter)
-            },
+            "filter": filter,
         },
     })
 }
 
-fn parse_assigned_issues(response: &Value) -> Result<Vec<LinearIssue>, LinearError> {
+fn parse_issues(response: &Value) -> Result<Vec<LinearIssue>, LinearError> {
     if let Some(errors) = graphql_error_messages(response) {
         return Err(LinearError::GraphqlErrors { messages: errors });
     }
 
     let nodes = response
         .get("data")
-        .and_then(|value| value.get("viewer"))
-        .and_then(|value| value.get("assignedIssues"))
+        .and_then(|value| value.get("issues"))
         .and_then(|value| value.get("nodes"))
         .and_then(Value::as_array)
         .ok_or(LinearError::InvalidResponse {
-            path: ASSIGNED_ISSUES_NODES_PATH,
+            path: ISSUES_NODES_PATH,
         })?;
 
     nodes
