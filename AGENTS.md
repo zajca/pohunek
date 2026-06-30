@@ -108,6 +108,15 @@ feature — `--all-features` only covers the everything-on case.
 - **Tests for all new logic.** Unit tests inline (`#[cfg(test)]`) for private
   behavior; `tests/` for integration. The protocol/state machines have rich
   test suites — extend them rather than adding untested branches.
+- **Keep the assistant knowledge bundle current.** `docs/knowledge/` is the
+  hand-authored source for the Universal Pohunek Assistant (materialized via
+  `assistant.materialize`). Whenever a change alters something the bundle
+  describes — a CLI command or flag, a protocol method/event, GUI behavior, an
+  operating-model concept (sessions/projects/worktrees/agent profiles), a safety
+  rule, the public-API surface in `docs/public-api.md`, or a path listed in
+  `docs/knowledge/assistant/source-map.md` — update the matching knowledge
+  file(s) in the *same* change and re-run `cargo xtask docs check`. A stale
+  bundle is treated like stale code, not a follow-up.
 - Comments and all repository text are in **English**.
 
 ## Workflow

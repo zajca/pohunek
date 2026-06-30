@@ -31,6 +31,20 @@ CI is the source of truth. Before reporting a Rust change as done, run the gate
 set from AGENTS.md ("Build, test, lint") — clippy is `-D warnings`, so a warning
 is a failure. For docs/knowledge changes, also run `cargo xtask docs check`.
 
+## Keep the assistant knowledge bundle current
+
+`docs/knowledge/` is the hand-authored source for the Universal Pohunek
+Assistant. Per AGENTS.md, treat it as part of the change, never a follow-up:
+whenever you touch something it describes — a CLI command/flag, a protocol
+method/event, GUI behavior, an operating-model concept, a safety rule, the
+`docs/public-api.md` surface, or a path in
+`docs/knowledge/assistant/source-map.md` — update the matching knowledge file in
+the *same* change and re-run `cargo xtask docs check`. For wire-protocol work
+this is one more ripple target alongside `client`/`daemon`/`cli`/`gui-core`: a
+new method/event is not done until the bundle and `docs/public-api.md` reflect
+it. If unsure whether a change is assistant-visible, check whether any file under
+`docs/knowledge/` mentions the surface you changed.
+
 ## Agent teams and sub-agents
 
 This is a layered Rust workspace where reviews and features benefit from
@@ -42,7 +56,9 @@ parallel exploration. Good fits here:
   `product-engineer`.
 - **Protocol changes:** spawn parallel implementers per affected crate
   (`protocol` → `client`/`daemon`/`cli`/`gui-core`), coordinated by `tech-lead`,
-  because one wire change ripples across crates.
+  because one wire change ripples across crates — and out into
+  `docs/public-api.md` and the `docs/knowledge/` bundle (see "Keep the assistant
+  knowledge bundle current").
 - **State-machine bugs:** competing-hypothesis investigation across
   `gui-core`/`daemon` session detection.
 
