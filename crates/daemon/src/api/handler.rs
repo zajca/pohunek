@@ -17,7 +17,7 @@ use protocol::{
     ProjectRenameParams, ProjectShowParams, ProtocolError, Request, Response, SessionAttachParams,
     SessionDetachParams, SessionId, SessionInputParams, SessionListParams, SessionNewParams,
     SessionNewResult, SessionReportNativeIdParams, SessionResizeParams, SessionSetMetadataParams,
-    PROTOCOL_VERSION,
+    WorktreeRemoveParams, PROTOCOL_VERSION,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -176,6 +176,7 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::PROJECT_PROMPT => handle_project_prompt(request, &state.sessions).await,
         method::PROJECT_ACTION => handle_project_action(request, &state.sessions).await,
         method::PROJECT_ACTIONS => handle_project_actions(request, &state.sessions).await,
+        method::WORKTREE_REMOVE => handle_worktree_remove(request, &state.sessions).await,
         other => Response::err(request.id.clone(), ProtocolError::method_not_found(other)),
     }
 }
@@ -477,6 +478,20 @@ async fn handle_project_remove(request: &Request, sessions: &SessionRegistry) ->
         .remove_project(&params.reference, params.prune_worktrees)
         .await
     {
+        Ok(result) => ok_value(request, &result),
+        Err(err) => Response::err(request.id.clone(), err),
+    }
+}
+
+/// `worktree.remove`: remove a single pohunek-owned worktree by path. Fail-closed
+/// — refuses an external (unowned) worktree (`worktree_not_owned`) and one a live
+/// session still uses (`worktree_in_use`); never touches the main checkout.
+async fn handle_worktree_remove(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_params::<WorktreeRemoveParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    match sessions.remove_worktree(&params.path).await {
         Ok(result) => ok_value(request, &result),
         Err(err) => Response::err(request.id.clone(), err),
     }

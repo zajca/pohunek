@@ -56,7 +56,7 @@ pub use project::{
     ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListFilter, ProjectListParams,
     ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult,
     ProjectRenameParams, ProjectShowParams, ProjectShowResult, ProjectSource, ProjectWorktree,
-    PromptLayer, ProviderKind,
+    PromptLayer, ProviderKind, WorktreeRemoveParams, WorktreeRemoveResult,
 };
 #[doc(inline)]
 pub use session::{
@@ -139,6 +139,12 @@ pub mod method {
     /// List available project actions after in-repo-over-host shadowing. Returns a
     /// [`ProjectActionsResult`](crate::ProjectActionsResult).
     pub const PROJECT_ACTIONS: &str = "project.actions";
+
+    // --- Worktrees (single-worktree management within a project). ---
+    /// Remove a single pohunek-owned worktree by path, fail-closed: refuses an
+    /// external (unowned) worktree and a worktree a live session still uses.
+    /// Returns a [`WorktreeRemoveResult`](crate::WorktreeRemoveResult).
+    pub const WORKTREE_REMOVE: &str = "worktree.remove";
 }
 
 /// Control-protocol event names.

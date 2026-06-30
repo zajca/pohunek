@@ -3,7 +3,7 @@
 //! This crate intentionally has no Iced dependency. The native view layer wraps
 //! these async helpers in Iced `Task` and `Subscription` values.
 
-// Rust guideline compliant 2026-06-26
+// Rust guideline compliant 2026-06-30
 #![forbid(unsafe_code)]
 
 pub mod providers;
@@ -22,7 +22,7 @@ use protocol::{
     ProjectRemoveResult, ProjectRenameParams, ProjectShowParams, ProjectShowResult,
     ProtocolVersion, ProviderKind, Request, SessionId, SessionInfo, SessionNewParams,
     SessionNewResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
-    SessionStopResult, StateSource,
+    SessionStopResult, StateSource, WorktreeRemoveParams, WorktreeRemoveResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -637,6 +637,12 @@ pub enum Message {
         reference: String,
         result: ProjectRemoveResult,
     },
+    WorktreeRemoved {
+        host_id: HostId,
+        project_id: String,
+        path: PathBuf,
+        result: WorktreeRemoveResult,
+    },
     ProjectActionsLoaded {
         host_id: HostId,
         reference: String,
@@ -1245,6 +1251,25 @@ impl Workspace {
                         host.projects.remove(&id);
                         host.project_details.remove(&id);
                     }
+                }
+            }
+            Message::WorktreeRemoved {
+                host_id,
+                project_id,
+                path,
+                result,
+            } => {
+                if !result.removed {
+                    return;
+                }
+                // Drop the removed worktree from the cached project detail so the
+                // row disappears immediately, without waiting for a refresh.
+                if let Some(details) = self
+                    .hosts
+                    .get_mut(&host_id)
+                    .and_then(|host| host.project_details.get_mut(&project_id))
+                {
+                    details.worktrees.retain(|worktree| worktree.path != path);
                 }
             }
             Message::ProjectActionsLoaded {
@@ -2095,6 +2120,30 @@ pub async fn remove_project_with_options(
         options,
         "gui-project-remove",
         method::PROJECT_REMOVE,
+        serde_json::to_value(params)?,
+    )
+    .await
+}
+
+/// Remove a single pohunek-owned worktree from a host.
+pub async fn remove_worktree(
+    config: &HostConfig,
+    params: WorktreeRemoveParams,
+) -> Result<WorktreeRemoveResult, CoreError> {
+    remove_worktree_with_options(config, params, ConnectionOptions::default()).await
+}
+
+/// Remove a single worktree with explicit connection options.
+pub async fn remove_worktree_with_options(
+    config: &HostConfig,
+    params: WorktreeRemoveParams,
+    options: ConnectionOptions,
+) -> Result<WorktreeRemoveResult, CoreError> {
+    request_host_json(
+        config,
+        options,
+        "gui-worktree-remove",
+        method::WORKTREE_REMOVE,
         serde_json::to_value(params)?,
     )
     .await

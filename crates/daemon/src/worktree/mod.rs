@@ -569,6 +569,47 @@ impl WorktreeManager {
         Ok(prune)
     }
 
+    /// Remove a single pohunek-owned worktree identified by its path, dropping
+    /// its binding. The binding is the ownership proof: a path with no matching
+    /// binding is an external (or already-removed) worktree, reported as
+    /// `Ok(false)` so the caller can fail closed. Caller is responsible for
+    /// refusing a worktree a live session still uses (this layer has no view of
+    /// the session map).
+    ///
+    /// # Errors
+    ///
+    /// Only the binding-store read/write can fail with a [`ProtocolError`]; git
+    /// failures are non-fatal (the binding is dropped regardless, matching
+    /// [`Self::cleanup_project`]).
+    pub fn remove_one(
+        &self,
+        path: &Path,
+        warnings: &mut Vec<SessionWarning>,
+    ) -> Result<bool, ProtocolError> {
+        let target = canonical_or_original(path);
+        let bindings = self
+            .store
+            .load_worktrees()
+            .map_err(|err| store_error("read worktree binding store", &err))?;
+        let Some(binding) = bindings
+            .into_iter()
+            .find(|binding| canonical_or_original(&binding.path) == target)
+        else {
+            return Ok(false);
+        };
+        self.cleanup_one_worktree(&binding, warnings, |message| {
+            warn!(
+                path = %binding.path.display(),
+                error = %message,
+                "git worktree remove failed during worktree remove; dropping binding anyway"
+            );
+        });
+        self.store
+            .remove_worktree_session(&binding.session_id)
+            .map_err(|err| store_error("drop worktree binding", &err))?;
+        Ok(true)
+    }
+
     /// Run the per-binding cleanup body shared by [`Self::cleanup_session`] and
     /// [`Self::cleanup_project`]: the pre-remove hook (while the worktree exists),
     /// the `git worktree remove` (the binding is the ownership proof), and the

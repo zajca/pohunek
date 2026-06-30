@@ -16,7 +16,7 @@ use protocol::{
     SessionAttachParams, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
     SessionNewParams, SessionReportNativeIdParams, SessionReportNativeIdResult,
     SessionSetMetadataResult, SessionState, SessionStopResult, SessionWarning, StateSource,
-    PROTOCOL_VERSION,
+    WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
@@ -512,6 +512,74 @@ impl SessionRegistry {
         })
         .await
         .map_err(|_| runtime_error("project_remove_failed", "project remove task panicked"))?
+    }
+
+    /// Remove a single pohunek-owned worktree by path, dropping its binding.
+    ///
+    /// Fail-closed in two ways: a worktree a non-terminal (`Starting`/`Running`)
+    /// session still uses is refused (`worktree_in_use`) so its checkout is not
+    /// pulled out from under a live session; a path with no matching binding is
+    /// an external worktree pohunek never created and is refused
+    /// (`worktree_not_owned`) rather than touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProtocolError`] when worktrees are not configured, the
+    /// worktree is in use, the worktree is not owned, the binding store fails, or
+    /// the blocking task panics.
+    pub async fn remove_worktree(
+        &self,
+        path: &Path,
+    ) -> Result<WorktreeRemoveResult, ProtocolError> {
+        let Some(manager) = self.inner.worktree.clone() else {
+            return Err(runtime_error(
+                "worktrees_not_configured",
+                "the daemon is not configured for worktrees",
+            ));
+        };
+        let target = canonical_or_original(path);
+        // Refuse to remove a worktree a live (non-terminal) session still uses —
+        // matching the prune's live-session skip, but surfaced as a hard error
+        // for a targeted single-worktree removal instead of a silent skip.
+        let in_use = self
+            .list()
+            .await
+            .into_iter()
+            .filter(|session| !session.state.is_terminal())
+            .filter_map(|session| session.worktree_path)
+            .any(|worktree_path| canonical_or_original(&worktree_path) == target);
+        if in_use {
+            return Err(runtime_error(
+                "worktree_in_use",
+                "a live session is using this worktree; stop the session before removing it",
+            ));
+        }
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<WorktreeRemoveResult, ProtocolError> {
+            let mut warnings = Vec::new();
+            let removed = manager.remove_one(&path, &mut warnings)?;
+            if !removed {
+                return Err(runtime_error(
+                    "worktree_not_owned",
+                    "pohunek did not create this worktree; remove it manually with git",
+                ));
+            }
+            for warning in &warnings {
+                warn!(
+                    warning = %warning.message,
+                    detail = ?warning.detail,
+                    "remove hook warning during worktree remove"
+                );
+            }
+            Ok(WorktreeRemoveResult { removed: true })
+        })
+        .await
+        .map_err(|err| {
+            runtime_error(
+                "worktree_remove_failed",
+                format!("worktree remove task panicked: {err}"),
+            )
+        })?
     }
 
     /// Start the append-only event log, if [`SessionRegistryConfig::event_log_dir`]
@@ -2327,6 +2395,68 @@ mod tests {
             worktree.exists(),
             "a plain rm must leave the worktree on disk"
         );
+    }
+
+    #[tokio::test]
+    async fn remove_worktree_removes_an_owned_idle_worktree() {
+        let (registry, repo) = project_registry("wt-remove");
+        let info = registry
+            .create(SessionNewParams {
+                cwd: Some(repo.clone()),
+                branch: Some("feat/x".to_owned()),
+                ..params()
+            })
+            .await
+            .expect("worktree session created");
+        let worktree = info.worktree_path.clone().expect("worktree path");
+        assert!(worktree.exists());
+        // Stop the session so it is terminal; its binding (ownership proof) stays.
+        registry.stop(&info.id).await.expect("stop session");
+
+        let result = registry
+            .remove_worktree(&worktree)
+            .await
+            .expect("remove owned worktree");
+        assert!(result.removed, "the owned worktree was removed");
+        assert!(!worktree.exists(), "the worktree directory is gone");
+    }
+
+    #[tokio::test]
+    async fn remove_worktree_refuses_a_live_session() {
+        let (registry, repo) = project_registry("wt-remove-live");
+        let info = registry
+            .create(SessionNewParams {
+                cwd: Some(repo.clone()),
+                branch: Some("feat/x".to_owned()),
+                ..params()
+            })
+            .await
+            .expect("worktree session created");
+        let worktree = info.worktree_path.clone().expect("worktree path");
+        // The session is left RUNNING — it is live in the worktree.
+
+        let err = registry
+            .remove_worktree(&worktree)
+            .await
+            .expect_err("a live worktree is refused");
+        assert_eq!(err.code, "worktree_in_use");
+        assert!(
+            worktree.exists(),
+            "a live session's worktree is left on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_worktree_refuses_an_unowned_path() {
+        // The main checkout has no worktree binding, so it is not pohunek-owned and
+        // must be refused rather than removed.
+        let (registry, repo) = project_registry("wt-remove-unowned");
+        let err = registry
+            .remove_worktree(&repo)
+            .await
+            .expect_err("an unowned path is refused");
+        assert_eq!(err.code, "worktree_not_owned");
+        assert!(repo.exists(), "the main checkout is untouched");
     }
 
     #[tokio::test]

@@ -302,6 +302,24 @@ pub struct ProjectRemoveResult {
     pub skipped_worktrees: Vec<String>,
 }
 
+/// Parameters for `worktree.remove`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeRemoveParams {
+    /// Absolute path of the worktree to remove, as reported by `project.show`.
+    /// The daemon matches it against its worktree bindings (canonicalized), so
+    /// only a pohunek-owned worktree resolves; an external worktree fails closed.
+    pub path: PathBuf,
+}
+
+/// Result of `worktree.remove`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeRemoveResult {
+    /// Whether the worktree (and its binding) was removed. Always `true` on a
+    /// successful response; the failure cases (`worktree_not_owned`,
+    /// `worktree_in_use`) surface as typed errors instead.
+    pub removed: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ProjectSource, ProviderKind};

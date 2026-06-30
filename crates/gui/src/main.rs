@@ -1,6 +1,6 @@
 //! Native Iced shell for the pohunek control plane.
 
-// Rust guideline compliant 2026-06-26
+// Rust guideline compliant 2026-06-30
 #![forbid(unsafe_code)]
 
 mod runtime;
@@ -8,7 +8,7 @@ mod runtime;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iced::widget::{
     button, center, column, container, mouse_area, opaque, pick_list, row, scrollable, stack, text,
@@ -19,7 +19,7 @@ use pohunek_gui_core::{
     add_project_with_options, create_session_with_options, default_state_dir, discover_hosts,
     inspect_session_with_options, launch_provider_item_with_options,
     list_project_actions_with_options, preview_action_prompt, providers,
-    remove_project_with_options, rename_project_with_options, resolve_project_action_with_options,
+    remove_worktree_with_options, rename_project_with_options, resolve_project_action_with_options,
     session_link_metadata, session_metadata_rows, set_session_metadata_with_options,
     show_project_with_options, spawn_attach_command, stop_session_with_options,
     AttachCommandSpawner, AttachTemplateValues, ConnState, ConnectionOptions, GitHubProviderScope,
@@ -30,8 +30,8 @@ use pohunek_gui_core::{
 };
 use protocol::{
     AgentActivity, ProjectActionParams, ProjectActionsParams, ProjectAddParams, ProjectInfo,
-    ProjectRemoveParams, ProjectRenameParams, ProjectShowParams, ProviderKind, SessionId,
-    SessionInfo, SessionNewParams, SessionSetMetadataParams,
+    ProjectRenameParams, ProjectShowParams, ProjectWorktree, ProviderKind, SessionId, SessionInfo,
+    SessionNewParams, SessionSetMetadataParams, WorktreeRemoveParams,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -43,6 +43,9 @@ const DEFAULT_TERMINAL_ROWS: u16 = 24;
 const DEFAULT_NOTIFICATION_COMMAND: &str = "notify-send";
 // Sentinel option in the Start template picker meaning "no template, blank session".
 const BLANK_TEMPLATE_LABEL: &str = "— blank —";
+// A second click on the same session within this window counts as a double-click
+// and opens the session in a terminal (matching the desktop double-click idiom).
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 
 pub fn main() -> iced::Result {
     let boot = BootState::load();
@@ -110,6 +113,13 @@ struct PohunekApp {
     project_edit: ProjectEdit,
     /// Action chosen in the provider browser for launching the selected item.
     selected_action: Option<String>,
+    /// Per-project provider filters read from each project's in-repo
+    /// `.pohunek/providers.toml`, keyed by repository root. Populated lazily on
+    /// project selection / provider fetch; absent entries fall back to the host
+    /// (`gui.toml`) and built-in layers.
+    /// Last session row click (host, session, instant), used to detect a
+    /// double-click that opens the session in a terminal.
+    last_session_click: Option<(HostId, SessionId, Instant)>,
     state_dir: Option<PathBuf>,
     status: Option<String>,
     notified_intents: usize,
@@ -164,6 +174,7 @@ impl PohunekApp {
                 metadata_edit: MetadataEdit::default(),
                 project_edit: ProjectEdit::default(),
                 selected_action: None,
+                last_session_click: None,
                 state_dir: boot.state_dir,
                 status: boot.status,
                 notified_intents: 0,
@@ -332,9 +343,10 @@ enum Message {
     AddProject,
     ShowProject,
     RenameProject,
-    RemoveProject {
-        prune_worktrees: bool,
-    },
+    /// Copy a worktree's absolute path to the system clipboard.
+    CopyWorktreePath(PathBuf),
+    /// Remove a single pohunek-owned worktree by path.
+    RemoveWorktree(PathBuf),
     SelectAction(String),
     SelectProviderPanel(ProviderPanel),
     FetchLinearIssues,
@@ -384,13 +396,34 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             host_id,
             session_id,
         } => {
+            // A second click on the already-clicked session within the window is
+            // a double-click: select as usual, then open it in a terminal.
+            let now = Instant::now();
+            let double_click = matches!(
+                &app.last_session_click,
+                Some((last_host, last_session, at))
+                    if *last_host == host_id
+                        && *last_session == session_id
+                        && now.duration_since(*at) <= DOUBLE_CLICK_WINDOW
+            );
             app.workspace
                 .select_session(host_id.clone(), session_id.clone());
             app.ui_state.selection = Some(Selection::Session {
-                host_id,
-                session_id,
+                host_id: host_id.clone(),
+                session_id: session_id.clone(),
             });
             tasks.push(save_ui_state_task(app));
+            if double_click {
+                // Reset so a third click starts a fresh pair rather than
+                // re-triggering on every subsequent click.
+                app.last_session_click = None;
+                match attach_task(app, &host_id, &session_id) {
+                    Ok(task) => tasks.push(task),
+                    Err(err) => app.status = Some(err),
+                }
+            } else {
+                app.last_session_click = Some((host_id, session_id, now));
+            }
         }
         Message::SelectProject {
             host_id,
@@ -412,11 +445,8 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         Message::OpenSession {
             host_id,
             session_id,
-        } => match app.attach_values(&host_id, &session_id) {
-            Ok((template, values)) => tasks.push(Task::perform(
-                async move { spawn_attach(&template, &values) },
-                Message::AttachSpawned,
-            )),
+        } => match attach_task(app, &host_id, &session_id) {
+            Ok(task) => tasks.push(task),
             Err(err) => app.status = Some(err),
         },
         Message::OpenStartModal => {
@@ -513,12 +543,15 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             Ok(task) => tasks.push(task),
             Err(err) => app.status = Some(err),
         },
-        Message::RemoveProject { prune_worktrees } => {
-            match remove_project_task(app, prune_worktrees) {
-                Ok(task) => tasks.push(task),
-                Err(err) => app.status = Some(err),
-            }
+        Message::CopyWorktreePath(path) => {
+            let display = path.display().to_string();
+            app.status = Some(format!("Copied path to clipboard: {display}"));
+            tasks.push(iced::clipboard::write::<Message>(display));
         }
+        Message::RemoveWorktree(path) => match remove_worktree_task(app, path) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
         Message::SelectAction(name) => app.selected_action = Some(name),
         Message::SelectProviderPanel(panel) => {
             if let Ok(host_id) = selected_host_id(app) {
@@ -633,7 +666,23 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             app.modal = ModalView::None;
         }
         Message::CoreCommandCompleted(result) => match result {
-            Ok(message) => app.workspace.apply(message),
+            Ok(message) => {
+                // A newly created session (manual Start or a provider launch) opens
+                // straight into a terminal, the same as double-clicking it.
+                let new_session = if let CoreMessage::SessionCreated { host_id, session } = &message
+                {
+                    Some((host_id.clone(), session.id.clone()))
+                } else {
+                    None
+                };
+                app.workspace.apply(message);
+                if let Some((host_id, session_id)) = new_session {
+                    match attach_task(app, &host_id, &session_id) {
+                        Ok(task) => tasks.push(task),
+                        Err(err) => app.status = Some(err),
+                    }
+                }
+            }
             Err(err) => app.status = Some(err),
         },
         Message::AttachSpawned(result) => {
@@ -944,22 +993,22 @@ fn rename_project_task(app: &PohunekApp) -> Result<Task<Message>, String> {
     ))
 }
 
-fn remove_project_task(app: &PohunekApp, prune_worktrees: bool) -> Result<Task<Message>, String> {
+fn remove_worktree_task(app: &PohunekApp, path: PathBuf) -> Result<Task<Message>, String> {
     let host = selected_host_config(app)?;
     let host_id = host.id.clone();
     let options = connection_options(app)?;
-    let reference = selected_project_reference(app)?;
-    let params = ProjectRemoveParams {
-        reference: reference.clone(),
-        prune_worktrees,
-    };
+    let (_host_id, project) =
+        selected_project(app).ok_or_else(|| "no project selected".to_owned())?;
+    let project_id = project.id.clone();
+    let params = WorktreeRemoveParams { path: path.clone() };
     Ok(Task::perform(
         runtime::perform(async move {
-            remove_project_with_options(&host, params, options)
+            remove_worktree_with_options(&host, params, options)
                 .await
-                .map(|result| CoreMessage::ProjectRemoved {
+                .map(|result| CoreMessage::WorktreeRemoved {
                     host_id,
-                    reference,
+                    project_id,
+                    path,
                     result,
                 })
                 .map_err(|err| err.to_string())
@@ -2002,6 +2051,7 @@ fn project_pane(app: &PohunekApp) -> Element<'_, Message> {
         button("New session")
             .on_press(Message::OpenStartModal)
             .style(iced::widget::button::primary),
+        project_worktrees(app),
         provider_browser_view(app),
     ]
     .spacing(16)
@@ -2131,65 +2181,205 @@ fn project_detail(app: &PohunekApp) -> Element<'_, Message> {
             .push(text(format!("label: {}", project.label)).size(14))
             .push(text(format!("repo: {}", project.repo_root.display())).size(14))
             .push(text(format!("source: {}", project.source.as_str())).size(14));
-        if let Some(details) = app
-            .workspace
-            .hosts
-            .get(host_id)
-            .and_then(|host| host.project_details.get(&project.id))
-        {
-            detail = detail.push(text("Worktrees").size(16));
-            for worktree in &details.worktrees {
-                let branch = worktree.branch.as_deref().unwrap_or("detached");
-                let owner = if worktree.owned { "owned" } else { "external" };
-                let session = worktree.session_id.as_deref().unwrap_or("-");
-                detail = detail.push(
-                    text(format!(
-                        "{}  branch={}  {}  session={}",
-                        worktree.path.display(),
-                        branch,
-                        owner,
-                        session
-                    ))
-                    .size(13),
-                );
-            }
-        }
     } else {
         detail = detail.push(text("No project selected").size(16));
     }
-    let detail = detail
-        .push(
-            button("Refresh")
-                .on_press(Message::ShowProject)
+    let detail = detail.push(text("Rename").size(15)).push(
+        row![
+            text_input("new name", &app.project_edit.rename_to)
+                .on_input(Message::ProjectRenameToChanged),
+            button("Rename")
+                .on_press(Message::RenameProject)
                 .style(iced::widget::button::secondary),
-        )
-        .push(text("Rename / remove").size(15))
-        .push(
-            row![
-                text_input("new name", &app.project_edit.rename_to)
-                    .on_input(Message::ProjectRenameToChanged),
-                button("Rename")
-                    .on_press(Message::RenameProject)
-                    .style(iced::widget::button::secondary),
-            ]
-            .spacing(8),
-        )
-        .push(
-            row![
-                button("Remove")
-                    .on_press(Message::RemoveProject {
-                        prune_worktrees: false
-                    })
-                    .style(iced::widget::button::danger),
-                button("Remove + prune")
-                    .on_press(Message::RemoveProject {
-                        prune_worktrees: true
-                    })
-                    .style(iced::widget::button::danger),
-            ]
-            .spacing(8),
-        );
+        ]
+        .spacing(8),
+    );
     card(detail)
+}
+
+/// Worktree surface for the selected project: a scannable list of every git
+/// worktree (live session first, then pohunek-owned, then external) with a
+/// status dot, branch, ownership and per-row actions, instead of a flat wall of
+/// `path branch=… session=…` lines. Per-worktree removal is intentionally absent
+/// — the protocol exposes pruning only via project-level Remove + prune.
+fn project_worktrees(app: &PohunekApp) -> Element<'_, Message> {
+    let refresh = button("Refresh")
+        .on_press(Message::ShowProject)
+        .style(iced::widget::button::secondary);
+    let header = row![
+        section_title("Worktrees"),
+        iced::widget::space().width(Fill),
+        refresh,
+    ]
+    .align_y(Center);
+
+    let Some((host_id, project)) = selected_project(app) else {
+        return card(column![header, text("No project selected").size(13)].spacing(10));
+    };
+    let Some(host) = app.workspace.hosts.get(host_id) else {
+        return card(column![header, text("Host is not loaded").size(13)].spacing(10));
+    };
+    let Some(details) = host.project_details.get(&project.id) else {
+        return card(
+            column![
+                header,
+                text("Worktree details not loaded yet — Refresh to list them.").size(13),
+            ]
+            .spacing(10),
+        );
+    };
+
+    if details.worktrees.is_empty() {
+        return card(column![header, text("No worktrees for this project.").size(13)].spacing(10));
+    }
+
+    // Live sessions first, then pohunek-owned, then external; stable by path
+    // within each group so the list does not jump around between refreshes.
+    let mut worktrees: Vec<&ProjectWorktree> = details.worktrees.iter().collect();
+    worktrees.sort_by(|a, b| {
+        b.session_id
+            .is_some()
+            .cmp(&a.session_id.is_some())
+            .then_with(|| b.owned.cmp(&a.owned))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    let total = worktrees.len();
+    let owned = worktrees.iter().filter(|worktree| worktree.owned).count();
+    let active = worktrees
+        .iter()
+        .filter(|worktree| worktree.session_id.is_some())
+        .count();
+
+    let mut list = column![].spacing(6);
+    for worktree in worktrees {
+        list = list.push(worktree_row(host_id, host, worktree));
+    }
+
+    card(
+        column![
+            header,
+            text(format!(
+                "{total} worktrees · {owned} owned · {active} active"
+            ))
+            .size(13),
+            scrollable(list).height(360),
+        ]
+        .spacing(10),
+    )
+}
+
+/// One worktree row: status dot, basename + meta subtitle, and right-aligned
+/// actions (always Copy path; "Open session" when a live session runs in it,
+/// which navigates the detail pane to that session).
+fn worktree_row<'a>(
+    host_id: &'a HostId,
+    host: &'a pohunek_gui_core::HostView,
+    worktree: &'a ProjectWorktree,
+) -> Element<'a, Message> {
+    // The branch is the meaningful identifier — basenames collide (most
+    // worktrees are named after the repo, e.g. "connection"), so it leads the
+    // row; the absolute path and ownership are the wrapping detail line.
+    let branch = worktree.branch.as_deref().unwrap_or("detached");
+    let owner = if worktree.owned { "owned" } else { "external" };
+    let mut meta = format!("{}  ·  {owner}", worktree.path.display());
+    if worktree.locked {
+        meta.push_str("  ·  locked");
+    }
+    // `width(Fill)` lets the info column take the remaining width and wrap the
+    // long path, so the actions stay inside the card instead of being pushed off
+    // the right edge.
+    // Paths and branches have no spaces, so default word wrapping cannot break
+    // them; `WordOrGlyph` falls back to glyph wrapping so a long path folds
+    // inside the column instead of overflowing the card.
+    let info = column![
+        text(branch)
+            .size(14)
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+        text(meta)
+            .size(12)
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+            .style(|theme: &Theme| {
+                iced::widget::text::Style {
+                    color: Some(theme.extended_palette().background.strong.color),
+                }
+            }),
+    ]
+    .spacing(2)
+    .width(Fill);
+
+    let mut actions = row![button(text("Copy path").size(12))
+        .padding([4, 8])
+        .on_press(Message::CopyWorktreePath(worktree.path.clone()))
+        .style(iced::widget::button::secondary)]
+    .spacing(6);
+    // Only offer navigation when the session is actually live on this host, so
+    // the target session pane has something to show.
+    if let Some(session_id) = worktree
+        .session_id
+        .as_ref()
+        .filter(|session_id| host.sessions.contains_key(session_id.as_str()))
+    {
+        actions = actions.push(
+            button(text("Open").size(12))
+                .padding([4, 8])
+                .on_press(Message::OpenSession {
+                    host_id: host_id.clone(),
+                    session_id: SessionId(session_id.clone()),
+                })
+                .style(iced::widget::button::primary),
+        );
+    }
+    // Remove only a pohunek-owned worktree with no live session: the daemon
+    // refuses an external worktree (`worktree_not_owned`) and one a live session
+    // uses (`worktree_in_use`), so do not offer the button in those cases.
+    if worktree.owned && worktree.session_id.is_none() {
+        actions = actions.push(
+            button(text("Remove").size(12))
+                .padding([4, 8])
+                .on_press(Message::RemoveWorktree(worktree.path.clone()))
+                .style(iced::widget::button::danger),
+        );
+    }
+
+    let row = row![
+        worktree_dot(worktree.owned, worktree.session_id.is_some()),
+        info,
+        actions,
+    ]
+    .spacing(10)
+    .align_y(Center);
+
+    container(row)
+        .padding([8, 10])
+        .width(Fill)
+        .style(|theme: &Theme| iced::widget::container::Style {
+            background: Some(Background::Color(
+                theme.extended_palette().background.weak.color,
+            )),
+            border: iced::border::rounded(6.0),
+            ..iced::widget::container::Style::default()
+        })
+        .into()
+}
+
+/// Filled-circle indicator for a worktree: success (green) when a session is
+/// live in it, accent when pohunek owns it but is idle, muted for an external
+/// worktree pohunek did not create.
+fn worktree_dot(owned: bool, active: bool) -> Element<'static, Message> {
+    text(STATUS_DOT)
+        .size(13)
+        .style(move |theme: &Theme| {
+            let palette = theme.extended_palette();
+            let color = if active {
+                palette.success.base.color
+            } else if owned {
+                palette.primary.base.color
+            } else {
+                palette.background.strong.color
+            };
+            iced::widget::text::Style { color: Some(color) }
+        })
+        .into()
 }
 
 /// "Start a session" modal. The operator picks the agent and an optional
@@ -2761,6 +2951,21 @@ fn spawn_attach(template: &str, values: &AttachTemplateValues) -> Result<(), Str
     spawn_attach_command(&mut spawner, template, values).map(|_| ())
 }
 
+/// Build the task that opens a session in a terminal via the configured attach
+/// command. Shared by the "Open in terminal" button, the worktree "Open" action
+/// and the session-row double-click.
+fn attach_task(
+    app: &PohunekApp,
+    host_id: &HostId,
+    session_id: &SessionId,
+) -> Result<Task<Message>, String> {
+    let (template, values) = app.attach_values(host_id, session_id)?;
+    Ok(Task::perform(
+        async move { spawn_attach(&template, &values) },
+        Message::AttachSpawned,
+    ))
+}
+
 fn spawn_notification(command: &str, intent: &NotificationIntent) -> Result<(), String> {
     Command::new(command)
         .arg(&intent.title)
@@ -3188,6 +3393,7 @@ mod tests {
                 ..ProjectEdit::default()
             },
             selected_action: None,
+            last_session_click: None,
             state_dir: None,
             status: None,
             notified_intents: 0,
@@ -3228,6 +3434,7 @@ mod tests {
             token_key: "linear-token-ref".to_owned(),
             endpoint: "https://linear.example/graphql".to_owned(),
             token_timeout_ms: 0,
+            filters: Vec::new(),
         }
         .into_app_config()
         .expect_err("zero token timeout");
