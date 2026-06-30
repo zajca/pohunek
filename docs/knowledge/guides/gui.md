@@ -98,6 +98,7 @@ The GUI must use existing daemon methods:
 - `session.new`
 - `session.inspect`
 - `session.stop`
+- `session.remove`
 - `session.set_metadata`
 
 Worktree creation is represented by `session.new` with a project or repo and a

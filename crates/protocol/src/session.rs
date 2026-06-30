@@ -461,6 +461,22 @@ pub struct SessionStopResult {
     pub stopped: bool,
 }
 
+/// Result returned by `session.remove`.
+///
+/// Removal is the one operation that makes a session truly disappear from the
+/// daemon: `stop` only flips a live session to a terminal state, but the entry
+/// lingers in the registry so `list`/`inspect` keep showing it. `remove` evicts
+/// that entry, stopping a still-live session first so removal never orphans a
+/// live PTY.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRemoveResult {
+    /// Whether the daemon evicted a session entry from its registry. `false`
+    /// only when a concurrent remove already evicted the same session.
+    pub removed: bool,
+    /// Whether a still-live session was stopped as part of this removal.
+    pub stopped: bool,
+}
+
 /// Result returned by `session.resize`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionResizeResult {

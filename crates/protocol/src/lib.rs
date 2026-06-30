@@ -63,9 +63,9 @@ pub use session::{
     AgentActivity, AgentKind, AttachHeader, SessionAttachParams, SessionAttachResult,
     SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
     SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams, SessionNewResult,
-    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
-    SessionResizeResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
-    SessionStopResult, SessionWarning, SessionWarningKind,
+    SessionRemoveResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionSetMetadataParams, SessionSetMetadataResult,
+    SessionState, SessionStopResult, SessionWarning, SessionWarningKind,
 };
 #[doc(inline)]
 pub use version::{negotiate, ProtocolVersion, PROTOCOL_VERSION};
@@ -89,6 +89,9 @@ pub mod method {
     pub const SESSION_LIST: &str = "session.list";
     pub const SESSION_INSPECT: &str = "session.inspect";
     pub const SESSION_STOP: &str = "session.stop";
+    /// Evict a session from the registry, stopping it first if still live.
+    /// Returns a [`SessionRemoveResult`](crate::SessionRemoveResult).
+    pub const SESSION_REMOVE: &str = "session.remove";
     pub const SESSION_ATTACH: &str = "session.attach";
     pub const SESSION_DETACH: &str = "session.detach";
     pub const SESSION_RESIZE: &str = "session.resize";
@@ -158,4 +161,5 @@ pub mod event {
     pub const SESSION_CREATED: &str = "session_created";
     pub const SESSION_UPDATED: &str = "session_updated";
     pub const SESSION_STOPPED: &str = "session_stopped";
+    pub const SESSION_REMOVED: &str = "session_removed";
 }

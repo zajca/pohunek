@@ -21,8 +21,8 @@ use protocol::{
     ProjectAddParams, ProjectInfo, ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams,
     ProjectRemoveResult, ProjectRenameParams, ProjectShowParams, ProjectShowResult,
     ProtocolVersion, ProviderKind, Request, SessionId, SessionInfo, SessionNewParams,
-    SessionNewResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
-    SessionStopResult, StateSource, WorktreeRemoveParams, WorktreeRemoveResult,
+    SessionNewResult, SessionRemoveResult, SessionSetMetadataParams, SessionSetMetadataResult,
+    SessionState, SessionStopResult, StateSource, WorktreeRemoveParams, WorktreeRemoveResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -575,6 +575,7 @@ pub enum HostEvent {
     SessionCreated(SessionInfo),
     SessionUpdated(SessionInfo),
     SessionStopped(SessionInfo),
+    SessionRemoved(SessionInfo),
     Other(Event),
 }
 
@@ -614,6 +615,11 @@ pub enum Message {
         host_id: HostId,
         session_id: SessionId,
         result: SessionStopResult,
+    },
+    SessionRemoveCompleted {
+        host_id: HostId,
+        session_id: SessionId,
+        result: SessionRemoveResult,
     },
     SessionMetadataUpdated {
         host_id: HostId,
@@ -1199,6 +1205,20 @@ impl Workspace {
                     session.state = SessionState::Stopped;
                     session.activity = None;
                 }
+            }
+            Message::SessionRemoveCompleted {
+                host_id,
+                session_id,
+                result,
+            } => {
+                if !result.removed {
+                    return;
+                }
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                host.sessions.remove(&session_id.0);
             }
             Message::SessionMetadataUpdated { host_id, result } => {
                 let host = self
@@ -1843,6 +1863,9 @@ fn apply_host_event(
             );
             host.sessions.insert(session.id.0.clone(), session);
         }
+        HostEvent::SessionRemoved(session) => {
+            host.sessions.remove(&session.id.0);
+        }
         HostEvent::Other(_) => {}
     }
 }
@@ -1995,6 +2018,33 @@ pub async fn stop_session_with_options(
         options,
         "gui-session-stop",
         method::SESSION_STOP,
+        serde_json::to_value(session_id)?,
+    )
+    .await
+}
+
+/// Remove a session from a host through the SDK.
+///
+/// Removal stops a still-live session first, then evicts it from the daemon's
+/// registry so it stops appearing in `list`.
+pub async fn remove_session(
+    config: &HostConfig,
+    session_id: &SessionId,
+) -> Result<SessionRemoveResult, CoreError> {
+    remove_session_with_options(config, session_id, ConnectionOptions::default()).await
+}
+
+/// Remove a session with explicit connection options.
+pub async fn remove_session_with_options(
+    config: &HostConfig,
+    session_id: &SessionId,
+    options: ConnectionOptions,
+) -> Result<SessionRemoveResult, CoreError> {
+    request_host_json(
+        config,
+        options,
+        "gui-session-remove",
+        method::SESSION_REMOVE,
         serde_json::to_value(session_id)?,
     )
     .await
@@ -2761,6 +2811,7 @@ fn parse_event_message(host_id: &HostId, line: &str) -> Result<Message, CoreErro
         event::SESSION_CREATED => HostEvent::SessionCreated(parse_session_event(&raw)?),
         event::SESSION_UPDATED => HostEvent::SessionUpdated(parse_session_event(&raw)?),
         event::SESSION_STOPPED => HostEvent::SessionStopped(parse_session_event(&raw)?),
+        event::SESSION_REMOVED => HostEvent::SessionRemoved(parse_session_event(&raw)?),
         _ => HostEvent::Other(raw),
     };
     Ok(Message::HostEvent {
@@ -2976,6 +3027,92 @@ mod tests {
                 .map(|event| event.session_id.0.as_str()),
             Some("s-1")
         );
+    }
+
+    #[test]
+    fn session_remove_completed_drops_the_session() {
+        let mut workspace = Workspace::default();
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot("local", vec![session("s-1", None), session("s-2", None)]),
+        });
+
+        workspace.apply(Message::SessionRemoveCompleted {
+            host_id: HostId::new("local"),
+            session_id: SessionId("s-1".to_owned()),
+            result: SessionRemoveResult {
+                removed: true,
+                stopped: true,
+            },
+        });
+
+        let host = workspace.hosts.get(&HostId::new("local")).expect("host");
+        assert!(
+            !host.sessions.contains_key("s-1"),
+            "removed session is gone"
+        );
+        assert!(host.sessions.contains_key("s-2"), "other session remains");
+    }
+
+    #[test]
+    fn session_remove_completed_keeps_session_when_not_removed() {
+        let mut workspace = Workspace::default();
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot("local", vec![session("s-1", None)]),
+        });
+
+        // A `removed: false` result (a concurrent remove won the race) must not
+        // touch the local view.
+        workspace.apply(Message::SessionRemoveCompleted {
+            host_id: HostId::new("local"),
+            session_id: SessionId("s-1".to_owned()),
+            result: SessionRemoveResult {
+                removed: false,
+                stopped: false,
+            },
+        });
+
+        let host = workspace.hosts.get(&HostId::new("local")).expect("host");
+        assert!(host.sessions.contains_key("s-1"));
+    }
+
+    #[test]
+    fn session_removed_event_drops_the_session() {
+        let mut workspace = Workspace::default();
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot("local", vec![session("s-1", None), session("s-2", None)]),
+        });
+
+        workspace.apply(Message::HostEvent {
+            host_id: HostId::new("local"),
+            event: HostEvent::SessionRemoved(session("s-1", None)),
+        });
+
+        let host = workspace.hosts.get(&HostId::new("local")).expect("host");
+        assert!(
+            !host.sessions.contains_key("s-1"),
+            "removed session is gone"
+        );
+        assert!(host.sessions.contains_key("s-2"), "other session remains");
+    }
+
+    #[test]
+    fn session_removed_wire_event_parses_to_host_event() {
+        let raw = Event::new(
+            event::SESSION_REMOVED,
+            serde_json::json!({ "session": session("s-1", None) }),
+        );
+        let line = serde_json::to_string(&raw).expect("serialize event");
+
+        let message =
+            parse_event_message(&HostId::new("local"), &line).expect("parse session_removed");
+
+        match message {
+            Message::HostEvent {
+                event: HostEvent::SessionRemoved(info),
+                ..
+            } => assert_eq!(info.id, SessionId("s-1".to_owned())),
+            other => panic!("expected SessionRemoved host event, got {other:?}"),
+        }
     }
 
     #[test]
