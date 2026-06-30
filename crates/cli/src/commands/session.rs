@@ -13,7 +13,8 @@ use std::path::PathBuf;
 use protocol::{
     method, AgentActivity, Request, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
     SessionListFilter, SessionListParams, SessionNewParams, SessionNewResult, SessionRemoveResult,
-    SessionState, SessionStopResult, SessionWarningKind, StateSource,
+    SessionRenameParams, SessionRenameResult, SessionState, SessionStopResult, SessionWarningKind,
+    StateSource,
 };
 use serde_json::Value;
 
@@ -30,6 +31,8 @@ pub(crate) struct NewArgs {
     /// Agent NAME to start: a base kind (`shell`/`codex`/`claude`) or a host
     /// profile, resolved daemon-side on the target host (Part C, free string).
     pub agent: String,
+    /// Owner-set display name for the session, or `None` to show it by id.
+    pub name: Option<String>,
     /// Working directory (ignored when a worktree is bound).
     pub cwd: Option<PathBuf>,
     /// Initial terminal columns.
@@ -414,11 +417,33 @@ pub(crate) async fn run_input(
     Ok(())
 }
 
+/// Set (`Some`) or clear (`None`) a session's display name on the target host.
+pub(crate) async fn run_rename(
+    host: &str,
+    paths: &Paths,
+    target: &Target,
+    name: Option<String>,
+    json: bool,
+) -> Result<(), CliError> {
+    let request = build_rename_request(target, name)?;
+    let mut client = Client::connect(host, paths).await?;
+    let result = client.request(&request).await?;
+    let renamed: SessionRenameResult = serde_json::from_value(result)?;
+
+    if json {
+        print!("{}", crate::commands::render_json(&renamed)?);
+    } else {
+        print!("{}", render_rename_human(&renamed.session));
+    }
+    Ok(())
+}
+
 fn build_new_request(args: &NewArgs) -> Result<Request, CliError> {
     request_with_params(
         method::SESSION_NEW,
         &SessionNewParams {
             agent: args.agent.clone(),
+            name: args.name.clone(),
             cwd: args.cwd.clone(),
             cols: args.cols,
             rows: args.rows,
@@ -503,6 +528,16 @@ fn build_input_request(target: &Target, text: &str) -> Result<Request, CliError>
     )
 }
 
+fn build_rename_request(target: &Target, name: Option<String>) -> Result<Request, CliError> {
+    request_with_params(
+        method::SESSION_RENAME,
+        &SessionRenameParams {
+            session_id: SessionId(target.session_id.clone()),
+            name,
+        },
+    )
+}
+
 fn render_new_human(info: &SessionInfo) -> String {
     let mut output = format!(
         "session {} created (state: {})\n",
@@ -535,6 +570,12 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
         .max()
         .unwrap_or(0)
         .max("ID".len());
+    let name_width = sessions
+        .iter()
+        .map(|s| name_label(s).len())
+        .max()
+        .unwrap_or(0)
+        .max("NAME".len());
     let agent_width = sessions
         .iter()
         .map(|s| agent_label(&s.agent).len())
@@ -557,14 +598,15 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
     let mut output = String::new();
     let _ = writeln!(
         output,
-        "{:<id_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  CWD",
-        "ID", "AGENT", "STATE", "ACTIVITY", "SOURCE", "PID", "SIZE", "PROJECT", "BRANCH", "WARN",
+        "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  CWD",
+        "ID", "NAME", "AGENT", "STATE", "ACTIVITY", "SOURCE", "PID", "SIZE", "PROJECT", "BRANCH", "WARN",
     );
     for session in sessions {
         let _ = writeln!(
             output,
-            "{:<id_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {}",
+            "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {}",
             session.id.0,
+            name_label(session),
             agent_label(&session.agent),
             state_label(session.state),
             activity_label_option(session.activity),
@@ -624,6 +666,12 @@ fn project_label(info: &SessionInfo) -> String {
         .unwrap_or_else(|| "-".to_owned())
 }
 
+/// Name column value: the owner-set display name, or `-` when the session has
+/// none (it is then shown by its id).
+fn name_label(info: &SessionInfo) -> String {
+    info.name.clone().unwrap_or_else(|| "-".to_owned())
+}
+
 /// Branch column value: the bound branch, or `-` for a plain session.
 fn branch_label(info: &SessionInfo) -> String {
     info.branch.clone().unwrap_or_else(|| "-".to_owned())
@@ -642,6 +690,7 @@ fn render_inspect_human(info: &SessionInfo) -> String {
     let none = || "<none>".to_owned();
     let rows: Vec<(&str, String)> = vec![
         ("id", info.id.0.clone()),
+        ("name", info.name.clone().unwrap_or_else(&none)),
         ("agent", agent_label(&info.agent).to_owned()),
         ("cwd", info.cwd.display().to_string()),
         ("pid", info.pid.to_string()),
@@ -737,6 +786,13 @@ fn render_input_human(session_id: &str, result: &SessionInputResult) -> String {
     }
 }
 
+fn render_rename_human(info: &SessionInfo) -> String {
+    match &info.name {
+        Some(name) => format!("session {}: renamed to {name:?}\n", info.id.0),
+        None => format!("session {}: name cleared\n", info.id.0),
+    }
+}
+
 /// The agent name as displayed. Free-string since Part C, so the label is the name
 /// itself (kept as a function so the call sites read uniformly with the other
 /// `*_label` helpers).
@@ -804,6 +860,7 @@ mod tests {
 
     fn running_session(id: &str) -> SessionInfo {
         SessionInfo {
+            name: None,
             id: protocol::SessionId(id.to_owned()),
             agent: "shell".to_owned(),
             agent_base: protocol::AgentKind::Shell,
@@ -833,6 +890,7 @@ mod tests {
     fn new_args(agent: &str, cwd: Option<PathBuf>) -> NewArgs {
         NewArgs {
             agent: agent.to_owned(),
+            name: None,
             cwd,
             cols: 80,
             rows: 24,
@@ -910,6 +968,7 @@ mod tests {
     fn new_request_carries_worktree_repo_branch_and_base() {
         let args = NewArgs {
             agent: "claude".to_owned(),
+            name: None,
             cwd: None,
             cols: 80,
             rows: 24,
@@ -939,6 +998,7 @@ mod tests {
     fn new_request_includes_cwd_and_requested_size() {
         let request = build_new_request(&NewArgs {
             agent: "shell".to_owned(),
+            name: None,
             cwd: Some(PathBuf::from("/workspace/project")),
             cols: 120,
             rows: 40,
@@ -1183,6 +1243,52 @@ mod tests {
     }
 
     #[test]
+    fn rename_request_sends_session_id_and_name() {
+        let target: Target = "host-b/s-42".parse().expect("target");
+        let request =
+            build_rename_request(&target, Some("triage build".to_owned())).expect("request");
+
+        assert_request(
+            &request,
+            method::SESSION_RENAME,
+            json!({"session_id": "s-42", "name": "triage build"}),
+        );
+    }
+
+    #[test]
+    fn rename_request_omits_name_when_clearing() {
+        let target: Target = "local/s-42".parse().expect("target");
+        let request = build_rename_request(&target, None).expect("request");
+
+        // A cleared name is omitted from the wire (the daemon treats absence as
+        // clear), so the body carries only the session id.
+        assert_request(
+            &request,
+            method::SESSION_RENAME,
+            json!({"session_id": "s-42"}),
+        );
+    }
+
+    #[test]
+    fn renders_session_name_in_list_and_inspect() {
+        let mut session = running_session("s-42");
+        session.name = Some("triage".to_owned());
+
+        let list = render_list_human(&[session.clone()]);
+        assert_eq!(
+            list_row(&list, "s-42")[1],
+            "triage",
+            "NAME column shows name"
+        );
+
+        let inspect = render_inspect_human(&session);
+        assert!(
+            has_row(&inspect, "name", "triage"),
+            "inspect shows the name row: {inspect}"
+        );
+    }
+
+    #[test]
     fn inspect_request_sends_only_session_id() {
         let target: Target = "local/s-42".parse().expect("target");
         let request = build_inspect_request(&target).expect("request");
@@ -1342,14 +1448,17 @@ mod tests {
         let output = render_list_human(&[running_session("s-42")]);
 
         let header = output.lines().next().expect("header line");
-        for column in ["ID", "AGENT", "STATE", "PROJECT", "BRANCH", "WARN", "CWD"] {
+        for column in [
+            "ID", "NAME", "AGENT", "STATE", "PROJECT", "BRANCH", "WARN", "CWD",
+        ] {
             assert!(header.contains(column), "header missing {column}: {header}");
         }
-        // Columns: ID AGENT STATE ACTIVITY SOURCE PID SIZE PROJECT BRANCH WARN CWD.
+        // Columns: ID NAME AGENT STATE ACTIVITY SOURCE PID SIZE PROJECT BRANCH WARN CWD.
         assert_eq!(
             list_row(&output, "s-42"),
             vec![
                 "s-42",
+                "-", // NAME
                 "shell",
                 "running",
                 "-",
@@ -1376,6 +1485,7 @@ mod tests {
             list_row(&output, "s-42"),
             vec![
                 "s-42",
+                "-", // NAME
                 "shell",
                 "running",
                 "working",
@@ -1399,8 +1509,8 @@ mod tests {
 
         let output = render_list_human(&[codex, claude]);
 
-        assert_eq!(list_row(&output, "s-codex")[1], "codex");
-        assert_eq!(list_row(&output, "s-claude")[1], "claude");
+        assert_eq!(list_row(&output, "s-codex")[2], "codex");
+        assert_eq!(list_row(&output, "s-claude")[2], "claude");
     }
 
     #[test]
@@ -1420,15 +1530,15 @@ mod tests {
 
         let output = render_list_human(&[session]);
         let row = list_row(&output, "s-42");
-        // Columns: ID AGENT STATE ACTIVITY SOURCE PID SIZE PROJECT BRANCH WARN CWD.
+        // Columns: ID NAME AGENT STATE ACTIVITY SOURCE PID SIZE PROJECT BRANCH WARN CWD.
         assert_eq!(
-            row[7], "login-ui",
+            row[8], "login-ui",
             "project column shows the label: {row:?}"
         );
-        assert_eq!(row[8], "feature/login", "branch column: {row:?}");
-        assert_eq!(row[9], "1", "warning-count column: {row:?}");
+        assert_eq!(row[9], "feature/login", "branch column: {row:?}");
+        assert_eq!(row[10], "1", "warning-count column: {row:?}");
         assert_eq!(
-            row[10], "/data/worktrees/s-42-project-feature-login",
+            row[11], "/data/worktrees/s-42-project-feature-login",
             "cwd is the worktree path: {row:?}"
         );
     }

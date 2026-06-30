@@ -104,6 +104,12 @@ const MAX_SESSION_METADATA_KEY_BYTES: usize = 64;
 const MAX_SESSION_METADATA_VALUE_BYTES: usize = 4096;
 const MAX_SESSION_METADATA_SERIALIZED_BYTES: usize = 16 * 1024;
 
+/// Upper bound on a session display name, in bytes. Generous enough for a short
+/// human label (it renders in a single GUI row and one CLI table cell) while
+/// bounding the per-session state the daemon stores and persists in the resume
+/// binding. A name is cosmetic, so the limit can change freely.
+const MAX_SESSION_NAME_BYTES: usize = 128;
+
 /// Shell command configuration used for `AgentKind::Shell`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellCommand {
@@ -746,6 +752,7 @@ impl SessionRegistry {
             let info = self
                 .register_pty_session(PtySessionSpec {
                     id: id.clone(),
+                    name: validate_session_name(params.name.as_deref())?,
                     agent: resolved.name.clone(),
                     agent_base: base,
                     input_rules,
@@ -1053,6 +1060,43 @@ impl SessionRegistry {
         Ok(SessionSetMetadataResult { session: info })
     }
 
+    /// Set or clear a session's display name and return the updated info.
+    ///
+    /// `name` is normalized and validated like the creation path
+    /// ([`validate_session_name`]); `None` (or an all-whitespace name) clears it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `session_not_found` for an unknown id, or the validation error
+    /// when the trimmed name is too long or holds a control character.
+    pub async fn rename(
+        &self,
+        id: &SessionId,
+        name: Option<String>,
+    ) -> Result<protocol::SessionRenameResult, ProtocolError> {
+        let normalized = validate_session_name(name.as_deref())?;
+        let (info, has_native) = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let entry = sessions
+                .get_mut(id)
+                .ok_or_else(|| session_not_found(&id.0))?;
+            entry.info.name = normalized;
+            entry.info.updated_at = timestamp_now();
+            let has_native =
+                entry.info.native_session_id.is_some() || entry.info.native_session_path.is_some();
+            (entry.info.clone(), has_native)
+        };
+
+        // The name lives in the resume binding so it survives a daemon restart;
+        // refresh it only for a captured session (one with a binding to update).
+        if has_native {
+            self.persist_resume_binding(id).await;
+        }
+
+        self.emit(event::SESSION_UPDATED, &info);
+        Ok(protocol::SessionRenameResult { session: info })
+    }
+
     /// Resize a running session PTY and return the updated session info.
     pub async fn resize(
         &self,
@@ -1349,7 +1393,39 @@ fn validate_new_params(params: &SessionNewParams) -> Result<(), ProtocolError> {
         ));
     }
     validate_session_metadata(&params.metadata)?;
+    validate_session_name(params.name.as_deref())?;
     Ok(())
+}
+
+/// Normalize and validate an owner-set session name.
+///
+/// Trims surrounding whitespace, treats an all-whitespace name as unset
+/// (`None`), and rejects a name that exceeds [`MAX_SESSION_NAME_BYTES`] or
+/// carries control characters (which would corrupt a single-line table/row).
+///
+/// # Errors
+///
+/// Returns a `bad_request` [`ProtocolError`] when the trimmed name is too long
+/// or contains a control character.
+fn validate_session_name(name: Option<&str>) -> Result<Option<String>, ProtocolError> {
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > MAX_SESSION_NAME_BYTES {
+        return Err(ProtocolError::bad_request(format!(
+            "session name exceeds {MAX_SESSION_NAME_BYTES} bytes"
+        )));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(ProtocolError::bad_request(
+            "session name must not contain control characters",
+        ));
+    }
+    Ok(Some(trimmed.to_owned()))
 }
 
 fn validate_session_metadata(metadata: &BTreeMap<String, String>) -> Result<(), ProtocolError> {
@@ -1474,12 +1550,13 @@ mod tests {
     };
     use crate::pty::PtyCommand;
 
-    use super::{SessionRegistry, SessionRegistryConfig, ShellCommand};
+    use super::{SessionRegistry, SessionRegistryConfig, ShellCommand, MAX_SESSION_NAME_BYTES};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn params() -> SessionNewParams {
         SessionNewParams {
+            name: None,
             agent: "shell".to_owned(),
             cwd: Some(PathBuf::from("/tmp")),
             cols: 80,
@@ -1817,6 +1894,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_with_name_trims_and_stores_it() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+
+        let created = registry
+            .create(SessionNewParams {
+                name: Some("  triage build  ".to_owned()),
+                ..params()
+            })
+            .await
+            .expect("create session");
+
+        assert_eq!(created.name.as_deref(), Some("triage build"));
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn rename_sets_then_clears_name_updates_timestamp_and_emits_event() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry.create(params()).await.expect("create session");
+        assert_eq!(created.name, None);
+        let before_updated_at = created.updated_at.clone();
+        let mut events = registry.subscribe();
+
+        let renamed = registry
+            .rename(&created.id, Some("  feature work  ".to_owned()))
+            .await
+            .expect("rename session");
+        assert_eq!(renamed.session.name.as_deref(), Some("feature work"));
+        assert_ne!(renamed.session.updated_at, before_updated_at);
+        let event_info = next_session_updated(&mut events).await;
+        assert_eq!(event_info.id, created.id);
+        assert_eq!(event_info.name.as_deref(), Some("feature work"));
+
+        // An all-whitespace (or `None`) name clears it back to id-only display.
+        let cleared = registry
+            .rename(&created.id, Some("   ".to_owned()))
+            .await
+            .expect("clear name");
+        assert_eq!(cleared.session.name, None);
+        assert_eq!(
+            registry.inspect(&created.id).await.expect("inspect").name,
+            None
+        );
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn rename_rejects_overlong_and_control_character_names() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry.create(params()).await.expect("create session");
+
+        let too_long = registry
+            .rename(&created.id, Some("x".repeat(MAX_SESSION_NAME_BYTES + 1)))
+            .await
+            .expect_err("overlong name must fail");
+        assert_eq!(too_long.code, "bad_request");
+
+        let control = registry
+            .rename(&created.id, Some("line1\nline2".to_owned()))
+            .await
+            .expect_err("control character must fail");
+        assert_eq!(control.code, "bad_request");
+
+        // A rejected rename leaves the prior name untouched.
+        assert_eq!(
+            registry.inspect(&created.id).await.expect("inspect").name,
+            None
+        );
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn rename_unknown_session_returns_not_found() {
+        let registry = SessionRegistry::default();
+
+        let err = registry
+            .rename(&SessionId("s-missing".to_owned()), Some("x".to_owned()))
+            .await
+            .expect_err("unknown session id must fail");
+
+        assert_eq!(err.code, "session_not_found");
+    }
+
+    #[tokio::test]
     async fn invalid_metadata_rejected_for_create_or_set_and_set_leaves_session_unchanged() {
         let registry = SessionRegistry::new(SessionRegistryConfig {
             shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
@@ -1928,6 +2104,7 @@ mod tests {
 
         let create_params = SessionNewParams {
             cwd: None,
+            name: None,
             repo: Some(repo.clone()),
             branch: Some("feat/x".to_owned()),
             ..params()
@@ -1994,6 +2171,7 @@ mod tests {
         let info = registry
             .create(SessionNewParams {
                 cwd: None,
+                name: None,
                 repo: Some(repo.clone()),
                 branch: Some("feat/x".to_owned()),
                 ..params()
@@ -2120,6 +2298,7 @@ mod tests {
         let info = registry
             .create(SessionNewParams {
                 cwd: Some(bare.clone()),
+                name: None,
                 branch: Some("feat/x".to_owned()),
                 base_branch: Some("main".to_owned()),
                 ..params()
@@ -2189,6 +2368,7 @@ mod tests {
         let info = registry
             .create(SessionNewParams {
                 cwd: None,
+                name: None,
                 project: Some(project_id.clone()),
                 ..params()
             })
@@ -2211,6 +2391,7 @@ mod tests {
         let err = registry
             .create(SessionNewParams {
                 cwd: None,
+                name: None,
                 project: Some("does-not-exist".to_owned()),
                 ..params()
             })
@@ -2228,6 +2409,7 @@ mod tests {
         let info = registry
             .create(SessionNewParams {
                 cwd: Some(repo.clone()),
+                name: None,
                 branch: Some("feat/x".to_owned()),
                 ..params()
             })
@@ -2283,6 +2465,7 @@ mod tests {
         registry
             .create(SessionNewParams {
                 cwd: None,
+                name: None,
                 project: Some(project_id),
                 ..params()
             })
@@ -2319,6 +2502,7 @@ mod tests {
         let err = registry
             .create(SessionNewParams {
                 cwd: None,
+                name: None,
                 repo: Some(nonrepo),
                 ..params()
             })
@@ -2335,6 +2519,7 @@ mod tests {
         let err = registry
             .create(SessionNewParams {
                 cwd: None,
+                name: None,
                 project: Some("anything".to_owned()),
                 repo: Some(repo),
                 ..params()
@@ -2351,6 +2536,7 @@ mod tests {
         let info = registry
             .create(SessionNewParams {
                 cwd: Some(repo.clone()),
+                name: None,
                 branch: Some("feat/x".to_owned()),
                 ..params()
             })
@@ -2391,6 +2577,7 @@ mod tests {
         let info = registry
             .create(SessionNewParams {
                 cwd: Some(repo.clone()),
+                name: None,
                 branch: Some("feat/x".to_owned()),
                 ..params()
             })
@@ -2439,6 +2626,7 @@ mod tests {
         let info = registry
             .create(SessionNewParams {
                 cwd: Some(repo.clone()),
+                name: None,
                 branch: Some("feat/x".to_owned()),
                 ..params()
             })
@@ -2469,6 +2657,7 @@ mod tests {
         let info = registry
             .create(SessionNewParams {
                 cwd: Some(repo.clone()),
+                name: None,
                 branch: Some("feat/x".to_owned()),
                 ..params()
             })
@@ -2493,6 +2682,7 @@ mod tests {
         let info = registry
             .create(SessionNewParams {
                 cwd: Some(repo.clone()),
+                name: None,
                 branch: Some("feat/x".to_owned()),
                 ..params()
             })
@@ -3708,6 +3898,7 @@ mod tests {
 
     fn resumable_params() -> SessionNewParams {
         SessionNewParams {
+            name: None,
             agent: "resumable".to_owned(),
             ..params()
         }
@@ -3846,6 +4037,7 @@ mod tests {
         let registry = SessionRegistry::default();
         let binding = crate::store::ResumeBinding {
             session_id: "s-noresume".to_owned(),
+            name: None,
             agent: "noresume".to_owned(),
             agent_base: AgentKind::Codex,
             cwd: temp_dir("noresume-binding-cwd"),
@@ -4072,6 +4264,7 @@ mod tests {
         store
             .record_resume(&crate::store::ResumeBinding {
                 session_id: "s-42".to_owned(),
+                name: None,
                 agent: "claude".to_owned(),
                 agent_base: AgentKind::Claude,
                 cwd: temp_dir("resume-metadata-cwd"),
@@ -4157,6 +4350,7 @@ mod tests {
         store
             .record_resume(&crate::store::ResumeBinding {
                 session_id: "s-corrupt".to_owned(),
+                name: None,
                 agent: "claude".to_owned(),
                 agent_base: AgentKind::Claude,
                 cwd: PathBuf::from("/tmp"),
@@ -4209,6 +4403,7 @@ mod tests {
         store
             .record_resume(&crate::store::ResumeBinding {
                 session_id: "s-44".to_owned(),
+                name: None,
                 agent: "profiled".to_owned(),
                 agent_base: AgentKind::Claude,
                 cwd: dir.clone(),
@@ -4285,6 +4480,7 @@ mod tests {
         let created = registry
             .create(SessionNewParams {
                 agent: "editable".to_owned(),
+                name: None,
                 cwd: Some(dir.clone()),
                 ..params()
             })

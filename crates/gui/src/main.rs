@@ -20,18 +20,18 @@ use pohunek_gui_core::{
     inspect_session_with_options, launch_provider_item_with_options,
     list_project_actions_with_options, preview_action_prompt, providers,
     remove_session_with_options, remove_worktree_with_options, rename_project_with_options,
-    resolve_project_action_with_options, session_link_metadata, session_metadata_rows,
-    set_session_metadata_with_options, show_project_with_options, spawn_attach_command,
-    stop_session_with_options, AttachCommandSpawner, AttachTemplateValues, ConnState,
-    ConnectionOptions, GitHubProviderScope, GitHubPullRequestStatusKey, HostConfig, HostId,
-    Message as CoreMessage, NotificationIntent, ProviderLaunchItem, ProviderLaunchParams,
+    rename_session_with_options, resolve_project_action_with_options, session_link_metadata,
+    session_metadata_rows, set_session_metadata_with_options, show_project_with_options,
+    spawn_attach_command, stop_session_with_options, AttachCommandSpawner, AttachTemplateValues,
+    ConnState, ConnectionOptions, GitHubProviderScope, GitHubPullRequestStatusKey, HostConfig,
+    HostId, Message as CoreMessage, NotificationIntent, ProviderLaunchItem, ProviderLaunchParams,
     ProviderOperation, ProviderPanel, ProviderRequestId, Selection, SessionLinkKind,
     SessionLinkProvider, Toast, TreeNodeId, UiState, WindowSize, Workspace,
 };
 use protocol::{
     AgentActivity, ProjectActionParams, ProjectActionsParams, ProjectAddParams, ProjectInfo,
     ProjectRenameParams, ProjectShowParams, ProjectWorktree, ProviderKind, SessionId, SessionInfo,
-    SessionNewParams, SessionSetMetadataParams, WorktreeRemoveParams,
+    SessionNewParams, SessionRenameParams, SessionSetMetadataParams, WorktreeRemoveParams,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -110,6 +110,8 @@ struct PohunekApp {
     /// Active activity filter for the agents monitor; `None` shows all agents.
     activity_filter: Option<AgentActivity>,
     metadata_edit: MetadataEdit,
+    /// Edit buffer for renaming the selected session's display name.
+    rename_edit: String,
     project_edit: ProjectEdit,
     /// Action chosen in the provider browser for launching the selected item.
     selected_action: Option<String>,
@@ -173,6 +175,7 @@ impl PohunekApp {
                 modal: ModalView::None,
                 activity_filter: None,
                 metadata_edit: MetadataEdit::default(),
+                rename_edit: String::new(),
                 project_edit: ProjectEdit::default(),
                 selected_action: None,
                 project_filters: BTreeMap::new(),
@@ -241,6 +244,10 @@ impl std::fmt::Display for AgentChoice {
 #[derive(Debug, Clone)]
 struct StartForm {
     agent: AgentChoice,
+    /// Owner-set display name to stamp on the session, shared by the manual Start
+    /// modal and the provider-launch modal (only one is open at a time). Empty
+    /// means an unnamed session shown by its id.
+    name: String,
     /// Selected prompt template (a `None`-provider action name); `None` means a
     /// blank session whose input is whatever is typed into the prompt editor.
     template: Option<String>,
@@ -268,6 +275,7 @@ impl Default for StartForm {
     fn default() -> Self {
         Self {
             agent: AgentChoice::Codex,
+            name: String::new(),
             template: None,
             show_advanced: false,
             branch: String::new(),
@@ -328,7 +336,14 @@ enum Message {
     ToggleStartAdvanced,
     StartBranchChanged(String),
     StartBaseBranchChanged(String),
+    StartNameChanged(String),
     CreateSession,
+    /// Edit the rename buffer for the selected session.
+    RenameEditChanged(String),
+    /// Apply the rename buffer as the selected session's display name.
+    RenameSession,
+    /// Clear the selected session's display name.
+    ClearSessionName,
     OpenLinearIssue(String),
     OpenGitHubPullRequest(u64),
     OpenGitHubIssue(u64),
@@ -420,6 +435,15 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                 host_id: host_id.clone(),
                 session_id: session_id.clone(),
             });
+            // Seed the rename buffer with the session's current name so the
+            // operator edits it rather than starting from blank.
+            app.rename_edit = app
+                .workspace
+                .hosts
+                .get(&host_id)
+                .and_then(|host| host.sessions.get(&session_id.0))
+                .and_then(|session| session.name.clone())
+                .unwrap_or_default();
             tasks.push(save_ui_state_task(app));
             if double_click {
                 // Reset so a third click starts a fresh pair rather than
@@ -492,11 +516,21 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         Message::ToggleStartAdvanced => app.start.show_advanced = !app.start.show_advanced,
         Message::StartBranchChanged(value) => app.start.branch = value,
         Message::StartBaseBranchChanged(value) => app.start.base_branch = value,
+        Message::StartNameChanged(value) => app.start.name = value,
         Message::CreateSession => match create_session_task(app) {
             Ok(task) => {
                 tasks.push(task);
                 app.modal = ModalView::None;
             }
+            Err(err) => app.status = Some(err),
+        },
+        Message::RenameEditChanged(value) => app.rename_edit = value,
+        Message::RenameSession => match rename_selected_session_task(app, false) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
+        Message::ClearSessionName => match rename_selected_session_task(app, true) {
+            Ok(task) => tasks.push(task),
             Err(err) => app.status = Some(err),
         },
         Message::OpenLinearIssue(issue_id) => {
@@ -899,6 +933,7 @@ fn create_session_task(app: &PohunekApp) -> Result<Task<Message>, String> {
     };
     let params = SessionNewParams {
         agent: app.start.agent.as_str().to_owned(),
+        name: optional_field(&app.start.name),
         cwd: None,
         cols: terminal_size.cols,
         rows: terminal_size.rows,
@@ -1034,6 +1069,29 @@ fn metadata_task(app: &PohunekApp, action: MetadataAction) -> Result<Task<Messag
             set_session_metadata_with_options(&host, params, options)
                 .await
                 .map(|result| CoreMessage::SessionMetadataUpdated { host_id, result })
+                .map_err(|err| err.to_string())
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+/// Set (`clear == false`) or clear the selected session's display name. The new
+/// name is the rename buffer, trimmed daemon-side; clearing ignores the buffer.
+fn rename_selected_session_task(app: &PohunekApp, clear: bool) -> Result<Task<Message>, String> {
+    let (host, session_id) = selected_session_target(app)?;
+    let host_id = host.id.clone();
+    let options = connection_options(app)?;
+    let name = if clear {
+        None
+    } else {
+        optional_field(&app.rename_edit)
+    };
+    let params = SessionRenameParams { session_id, name };
+    Ok(Task::perform(
+        runtime::perform(async move {
+            rename_session_with_options(&host, params, options)
+                .await
+                .map(|result| CoreMessage::SessionRenamed { host_id, result })
                 .map_err(|err| err.to_string())
         }),
         Message::CoreCommandCompleted,
@@ -1315,6 +1373,7 @@ fn launch_linear_issue_task(app: &PohunekApp) -> Result<Task<Message>, String> {
     let issue = selected_linear_issue(app)?;
     let context_json = issue.to_prompt_json().to_string();
     let issue_id = issue.prompt_item_id().to_owned();
+    let name = optional_field(&app.start.name);
     let item = ProviderLaunchItem::linear_issue(issue_id, context_json, issue.url)
         .map_err(|err| err.to_string())?;
     Ok(Task::perform(
@@ -1327,6 +1386,7 @@ fn launch_linear_issue_task(app: &PohunekApp) -> Result<Task<Message>, String> {
                     item,
                     cols: terminal_size.cols,
                     rows: terminal_size.rows,
+                    name,
                 },
                 options,
             )
@@ -1355,6 +1415,7 @@ fn launch_github_pull_request_task(app: &PohunekApp) -> Result<Task<Message>, St
     let terminal_size = terminal_size(app)?;
     let pull_request = selected_github_pull_request(app)?;
     let context_json = pull_request.to_prompt_json().to_string();
+    let name = optional_field(&app.start.name);
     let item = ProviderLaunchItem::github_pull_request(
         pull_request.prompt_item_id(),
         context_json,
@@ -1371,6 +1432,7 @@ fn launch_github_pull_request_task(app: &PohunekApp) -> Result<Task<Message>, St
                     item,
                     cols: terminal_size.cols,
                     rows: terminal_size.rows,
+                    name,
                 },
                 options,
             )
@@ -2080,16 +2142,17 @@ fn session_tree_row(
 ) -> Element<'static, Message> {
     let provider_status = linked_pr_status_label(host, session);
     let selected = session_is_selected(app, host_id, &session.id);
+    // Lead with the display name when set; otherwise fall back to the id.
+    let label = match &session.name {
+        Some(name) => format!("{name}  {}{provider_status}", session.agent),
+        None => format!("{}  {}{provider_status}", session.id.0, session.agent),
+    };
     indent(
         2,
         row![
             status_dot(session.activity),
             list_button(
-                text(format!(
-                    "{}  {}{}",
-                    session.id.0, session.agent, provider_status
-                ))
-                .size(14),
+                text(label).size(14),
                 Message::SelectSession {
                     host_id: host_id.clone(),
                     session_id: session.id.clone(),
@@ -2100,6 +2163,15 @@ fn session_tree_row(
         .spacing(6)
         .align_y(Center),
     )
+}
+
+/// Append `value` to a middot-separated metadata line, adding the separator only
+/// when `line` already has content (so it never starts with a stray separator).
+fn push_meta(line: &mut String, value: &str) {
+    if !line.is_empty() {
+        line.push_str("  ·  ");
+    }
+    line.push_str(value);
 }
 
 fn agents_monitor(app: &PohunekApp) -> Element<'_, Message> {
@@ -2121,15 +2193,35 @@ fn agents_monitor(app: &PohunekApp) -> Element<'_, Message> {
         }
         shown += 1;
         let selected = session_is_selected(app, &agent.host_id, &agent.session_id);
+        // Primary line leads with the display name when set, else the id.
+        let primary = match &agent.name {
+            Some(name) => format!("{name}  ·  {}", agent.agent),
+            None => format!(
+                "{} / {}  ·  {}",
+                agent.host_id, agent.session_id.0, agent.agent
+            ),
+        };
+        // Secondary line packs the context that was previously missing: host (when
+        // a name hid it), project, branch, and the activity word.
+        let mut meta = String::new();
+        if agent.name.is_some() {
+            meta.push_str(&format!("{} / {}", agent.host_id, agent.session_id.0));
+        }
+        if let Some(project) = agent.project_label.as_ref().or(agent.project_id.as_ref()) {
+            push_meta(&mut meta, project);
+        }
+        if let Some(branch) = &agent.branch {
+            push_meta(&mut meta, branch);
+        }
+        push_meta(
+            &mut meta,
+            agent.activity.map_or("unknown", AgentActivity::as_str),
+        );
         list = list.push(
             row![
                 status_dot(agent.activity),
                 list_button(
-                    text(format!(
-                        "{} / {}  {}",
-                        agent.host_id, agent.session_id.0, agent.agent
-                    ))
-                    .size(14),
+                    column![text(primary).size(14), text(meta).size(11)].spacing(1),
                     Message::SelectSession {
                         host_id: agent.host_id,
                         session_id: agent.session_id,
@@ -2273,8 +2365,14 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
             let activity = session
                 .activity
                 .map_or("unknown", |activity| activity.as_str());
+            // Lead with the display name when set, keeping host/id as a subtitle
+            // so the session stays identifiable.
+            let heading = match &session.name {
+                Some(name) => format!("{name}  ·  {host_id} / {}", session.id.0),
+                None => format!("{} / {}", host_id, session.id.0),
+            };
             detail = detail
-                .push(text(format!("{} / {}", host_id, session.id.0)).size(16))
+                .push(text(heading).size(16))
                 .push(text(format!("agent: {}", session.agent)).size(14))
                 .push(text(format!("state: {}", session.state.as_str())).size(14))
                 .push(text(format!("activity: {activity}")).size(14));
@@ -2337,6 +2435,7 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
                 ]
                 .spacing(8),
             );
+            detail = detail.push(rename_view(app));
             detail = detail.push(metadata_view(app, session));
         }
         None => {
@@ -2344,6 +2443,29 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
         }
     }
     card(detail)
+}
+
+/// Rename control for the selected session: a name field plus set/clear buttons,
+/// wired to the shared rename buffer. Clearing reverts the session to id-only
+/// display.
+fn rename_view(app: &PohunekApp) -> Element<'_, Message> {
+    column![
+        text("Rename").size(16),
+        row![
+            text_input("new session name", &app.rename_edit)
+                .on_input(Message::RenameEditChanged)
+                .on_submit(Message::RenameSession),
+            button("Rename")
+                .on_press(Message::RenameSession)
+                .style(iced::widget::button::secondary),
+            button("Clear name")
+                .on_press(Message::ClearSessionName)
+                .style(iced::widget::button::secondary),
+        ]
+        .spacing(8),
+    ]
+    .spacing(6)
+    .into()
 }
 
 fn metadata_view<'a>(app: &'a PohunekApp, session: &'a SessionInfo) -> Element<'a, Message> {
@@ -2628,6 +2750,7 @@ fn start_modal_content(app: &PohunekApp) -> Element<'_, Message> {
         ]
         .spacing(8)
         .align_y(Center),
+        session_name_input(app),
         text(prompt_label).size(13),
         text_editor(&app.prompt_editor)
             .height(220)
@@ -2656,6 +2779,18 @@ fn start_modal_content(app: &PohunekApp) -> Element<'_, Message> {
     dialog_card("Start a session", panel)
 }
 
+/// A labeled "Name" text input bound to the shared start-form name buffer, used
+/// by every session-creation surface so a session can be named at any creation.
+fn session_name_input(app: &PohunekApp) -> Element<'_, Message> {
+    row![
+        text("Name").size(14),
+        text_input("optional session name", &app.start.name).on_input(Message::StartNameChanged),
+    ]
+    .spacing(8)
+    .align_y(Center)
+    .into()
+}
+
 /// Modal showing the selected provider item's detail and its launch action.
 fn provider_item_modal_content(app: &PohunekApp) -> Element<'_, Message> {
     let host_id = match selected_host_id(app) {
@@ -2675,6 +2810,7 @@ fn provider_item_modal_content(app: &PohunekApp) -> Element<'_, Message> {
                 text(format!("{}  {}", issue.prompt_item_id(), issue.title)).size(16),
                 text(issue.url.clone()).size(13),
                 scrollable(text(issue.body.clone()).size(13)).height(260),
+                session_name_input(app),
                 action_launcher(
                     available_actions(app, &ProviderKind::LinearIssue),
                     selected_action,
@@ -2694,6 +2830,7 @@ fn provider_item_modal_content(app: &PohunekApp) -> Element<'_, Message> {
                     ))
                     .size(13),
                     scrollable(text(pull_request.body.clone()).size(13)).height(260),
+                    session_name_input(app),
                     action_launcher(
                         available_actions(app, &ProviderKind::GithubPr),
                         selected_action,
@@ -3931,6 +4068,7 @@ mod tests {
             modal: ModalView::None,
             activity_filter: None,
             metadata_edit: MetadataEdit::default(),
+            rename_edit: String::new(),
             project_edit: ProjectEdit {
                 reference: "manual-project".to_owned(),
                 ..ProjectEdit::default()

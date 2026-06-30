@@ -229,6 +229,7 @@ async fn session_lifecycle_create_inspect_and_stop_reconciles_workspace_state() 
         &host,
         SessionNewParams {
             agent: agent_name(AgentKind::Codex).to_owned(),
+            name: None,
             cwd: Some(temp_dir("gui-core-m2-session-cwd")),
             cols: 100,
             rows: 32,
@@ -306,6 +307,7 @@ async fn session_metadata_merge_and_clear_round_trips() {
         &host,
         SessionNewParams {
             agent: agent_name(AgentKind::Codex).to_owned(),
+            name: None,
             cwd: Some(temp_dir("gui-core-m2-metadata-cwd")),
             cols: 80,
             rows: 24,
@@ -454,6 +456,7 @@ async fn worktree_creation_is_session_new_with_branch_and_visible_in_project_sho
         &host,
         SessionNewParams {
             agent: agent_name(AgentKind::Codex).to_owned(),
+            name: None,
             cwd: None,
             cols: 80,
             rows: 24,
@@ -772,6 +775,7 @@ provider = "linear_issue"
             cols: 80,
             rows: 24,
             metadata: std::collections::BTreeMap::new(),
+            name: None,
         },
         test_connection_options(),
     )
@@ -870,6 +874,7 @@ async fn provider_launch_linear_issue_creates_one_linked_session_and_persists_me
             item,
             cols: 80,
             rows: 24,
+            name: None,
         },
         test_connection_options(),
     )
@@ -993,6 +998,7 @@ async fn provider_launch_github_pr_creates_one_linked_session_with_rendered_inpu
             item,
             cols: 80,
             rows: 24,
+            name: None,
         },
         test_connection_options(),
     )
@@ -1606,6 +1612,7 @@ async fn create_agent_session(host: &HostConfig, agent: AgentKind, cwd: PathBuf)
         method::SESSION_NEW,
         serde_json::to_value(SessionNewParams {
             agent: agent_name(agent).to_owned(),
+            name: None,
             cwd: Some(cwd),
             cols: 80,
             rows: 24,

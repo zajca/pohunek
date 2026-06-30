@@ -59,6 +59,11 @@ const OWNER_PRIVATE_FILE_MODE: u32 = 0o600;
 pub struct ResumeBinding {
     /// The pohunek session id (stable across restart).
     pub session_id: String,
+    /// Owner-set display name, captured so a restart restores it instead of
+    /// dropping the session back to id-only display. Serde default (`None`) for a
+    /// legacy line; the store carries no compatibility guarantee beyond loading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Resolved agent NAME backing the session (a host-profile name or a base
     /// kind). Free string since Part C; a name only, never a profile body/env.
     pub agent: String,
@@ -132,6 +137,8 @@ impl<'de> Deserialize<'de> for ResumeBinding {
         #[derive(Deserialize)]
         struct RawResumeBinding {
             session_id: String,
+            #[serde(default)]
+            name: Option<String>,
             agent: String,
             #[serde(default)]
             agent_base: Option<AgentKind>,
@@ -170,6 +177,7 @@ impl<'de> Deserialize<'de> for ResumeBinding {
 
         Ok(Self {
             session_id: raw.session_id,
+            name: raw.name,
             agent: raw.agent,
             agent_base,
             cwd: raw.cwd,
@@ -775,6 +783,7 @@ mod tests {
     fn resume(session_id: &str, native: &str) -> ResumeBinding {
         ResumeBinding {
             session_id: session_id.to_owned(),
+            name: None,
             agent: "claude".to_owned(),
             agent_base: AgentKind::Claude,
             cwd: PathBuf::from("/workspace/project"),
@@ -861,6 +870,7 @@ mod tests {
         let store = Store::new(temp_store_path("resume-snapshot-roundtrip"));
         let binding = ResumeBinding {
             session_id: "s-path".to_owned(),
+            name: Some("triage build".to_owned()),
             agent: "claude-sonnet".to_owned(),
             agent_base: AgentKind::Claude,
             cwd: PathBuf::from("/workspace"),

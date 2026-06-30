@@ -40,6 +40,7 @@ fn metadata(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
 
 fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
     SessionInfo {
+        name: None,
         id: SessionId("s-42".to_owned()),
         agent: "shell".to_owned(),
         agent_base: AgentKind::Shell,
@@ -135,6 +136,7 @@ fn public_enum_string_helpers_match_wire_shapes() {
 fn session_new_params_json_shape_roundtrips() {
     let params = SessionNewParams {
         agent: "shell".to_owned(),
+        name: None,
         cwd: Some(PathBuf::from("/workspace/project")),
         cols: 120,
         rows: 40,
@@ -165,6 +167,7 @@ fn session_new_params_json_shape_roundtrips() {
 fn session_new_params_roundtrips_with_metadata() {
     let params = SessionNewParams {
         agent: "shell".to_owned(),
+        name: None,
         cwd: Some(PathBuf::from("/workspace/project")),
         cols: 120,
         rows: 40,
@@ -199,6 +202,7 @@ fn session_new_params_roundtrips_with_metadata() {
 fn session_new_params_roundtrips_with_worktree_fields() {
     let params = SessionNewParams {
         agent: "claude".to_owned(),
+        name: None,
         cwd: None,
         cols: 80,
         rows: 24,
@@ -231,6 +235,7 @@ fn session_new_params_roundtrips_with_worktree_fields() {
 fn session_new_params_omits_absent_worktree_fields() {
     let params = SessionNewParams {
         agent: "shell".to_owned(),
+        name: None,
         cwd: None,
         cols: 80,
         rows: 24,
@@ -259,6 +264,7 @@ fn session_new_params_omits_absent_worktree_fields() {
 fn session_new_params_roundtrips_with_initial_input() {
     let params = SessionNewParams {
         agent: "shell".to_owned(),
+        name: None,
         cwd: Some(PathBuf::from("/workspace/project")),
         cols: 120,
         rows: 40,
@@ -397,6 +403,7 @@ fn session_info_json_shape_roundtrips_with_metadata() {
 fn session_info_json_shape_roundtrips_with_exit_code() {
     let info = SessionInfo {
         state: SessionState::Done,
+        name: None,
         state_source: StateSource::OscTitle,
         exit_code: Some(0),
         ..running_shell_session(None)
@@ -666,6 +673,7 @@ fn session_warning_omits_absent_detail() {
 fn session_info_roundtrips_with_worktree_fields_and_warnings() {
     let info = SessionInfo {
         cwd: PathBuf::from("/data/worktrees/s-42-project-feature-login"),
+        name: None,
         repo: Some(PathBuf::from("/workspace/project")),
         branch: Some("feature/login".to_owned()),
         worktree_path: Some(PathBuf::from("/data/worktrees/s-42-project-feature-login")),

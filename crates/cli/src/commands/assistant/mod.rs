@@ -430,6 +430,7 @@ async fn launch_session(
 
     let params = SessionNewParams {
         agent: selection.name.clone(),
+        name: None,
         cwd: None,
         // The assistant session inherits the same default PTY geometry as
         // `session new`; the attaching terminal resizes it on connect.

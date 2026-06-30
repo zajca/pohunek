@@ -100,10 +100,28 @@ The GUI must use existing daemon methods:
 - `session.stop`
 - `session.remove`
 - `session.set_metadata`
+- `session.rename`
 
 Worktree creation is represented by `session.new` with a project or repo and a
 branch. There is no standalone worktree daemon method. When explaining or fixing
 GUI worktree behavior, preserve that protocol boundary.
+
+## Session Names
+
+Every session-creation surface (the Start modal and the provider-launch modal)
+offers an optional name field, so a session can be named at any creation; the
+name flows through `session.new`'s `name` parameter. The session detail pane also
+renames an existing session through `session.rename` (and clears it). The display
+name leads the row in the workspace tree and the Agents monitor, falling back to
+the session id when unset. The name is cosmetic and never changes targeting.
+
+## Agents Monitor
+
+The Agents monitor lists every session across hosts with a per-row activity dot
+and working/blocked/idle counts. Rows are ordered by the stable `(host, session)`
+identity, never by activity — activity flips constantly as agents work, and
+ordering on it would reshuffle rows under the operator's cursor. Each row shows
+the name (or id), agent, project, branch, and activity word.
 
 ## Prompt Management
 

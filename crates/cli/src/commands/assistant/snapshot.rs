@@ -944,6 +944,7 @@ mod tests {
 
     fn sample_session_info() -> SessionInfo {
         SessionInfo {
+            name: None,
             id: SessionId("s-001".to_owned()),
             agent: "codex".to_owned(),
             agent_base: AgentKind::Codex,

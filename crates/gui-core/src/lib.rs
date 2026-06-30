@@ -21,8 +21,9 @@ use protocol::{
     ProjectAddParams, ProjectInfo, ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams,
     ProjectRemoveResult, ProjectRenameParams, ProjectShowParams, ProjectShowResult,
     ProtocolVersion, ProviderKind, Request, SessionId, SessionInfo, SessionNewParams,
-    SessionNewResult, SessionRemoveResult, SessionSetMetadataParams, SessionSetMetadataResult,
-    SessionState, SessionStopResult, StateSource, WorktreeRemoveParams, WorktreeRemoveResult,
+    SessionNewResult, SessionRemoveResult, SessionRenameParams, SessionRenameResult,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
+    StateSource, WorktreeRemoveParams, WorktreeRemoveResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -207,6 +208,8 @@ pub struct PromptLaunchParams {
     pub cols: u16,
     pub rows: u16,
     pub metadata: BTreeMap<String, String>,
+    /// Owner-set display name for the launched session, or `None` for id-only.
+    pub name: Option<String>,
 }
 
 /// Provider session link owner.
@@ -350,6 +353,8 @@ pub struct ProviderLaunchParams {
     pub item: ProviderLaunchItem,
     pub cols: u16,
     pub rows: u16,
+    /// Owner-set display name for the launched session, or `None` for id-only.
+    pub name: Option<String>,
 }
 
 impl ProviderLaunchItem {
@@ -624,6 +629,10 @@ pub enum Message {
     SessionMetadataUpdated {
         host_id: HostId,
         result: SessionSetMetadataResult,
+    },
+    SessionRenamed {
+        host_id: HostId,
+        result: SessionRenameResult,
     },
     ProjectListLoaded {
         host_id: HostId,
@@ -1228,6 +1237,14 @@ impl Workspace {
                 host.sessions
                     .insert(result.session.id.0.clone(), result.session);
             }
+            Message::SessionRenamed { host_id, result } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                host.sessions
+                    .insert(result.session.id.0.clone(), result.session);
+            }
             Message::ProjectListLoaded { host_id, projects } => {
                 let host = self
                     .hosts
@@ -1630,18 +1647,24 @@ impl Workspace {
                 monitor.sessions.push(AgentRow {
                     host_id: host_id.clone(),
                     session_id: session.id.clone(),
+                    name: session.name.clone(),
                     project_id: session.project_id.clone(),
                     project_label: session.project_label.clone(),
                     agent: session.agent.clone(),
                     activity: session.activity,
                     state: session.state.as_str().to_owned(),
+                    branch: session.branch.clone(),
                 });
             }
         }
+        // Order by the stable (host, session) identity only — NEVER by the
+        // volatile activity. Activity flips as agents work/block/idle on every
+        // poll, and sorting on it would reshuffle rows under the operator's
+        // cursor, making the list impossible to click. The activity is conveyed
+        // by the per-row dot and the header counts instead.
         monitor.sessions.sort_by(|left, right| {
-            activity_rank(left.activity)
-                .cmp(&activity_rank(right.activity))
-                .then_with(|| left.host_id.cmp(&right.host_id))
+            left.host_id
+                .cmp(&right.host_id)
                 .then_with(|| left.session_id.0.cmp(&right.session_id.0))
         });
         monitor
@@ -1763,11 +1786,15 @@ fn trace_ignored_provider_failure(
 pub struct AgentRow {
     pub host_id: HostId,
     pub session_id: SessionId,
+    /// Owner-set display name, or `None` to show the row by its session id.
+    pub name: Option<String>,
     pub project_id: Option<String>,
     pub project_label: Option<String>,
     pub agent: String,
     pub activity: Option<AgentActivity>,
     pub state: String,
+    /// Branch checked out in the session's worktree, when bound.
+    pub branch: Option<String>,
 }
 
 /// Derived agents monitor counts and rows.
@@ -1810,15 +1837,6 @@ pub fn session_link_metadata(session: &SessionInfo) -> Option<SessionLinkMetadat
     let url = session.metadata.get("link.url")?.clone();
     let branch = session.metadata.get("link.branch")?.clone();
     SessionLinkMetadata::new(provider, kind, id, url, branch).ok()
-}
-
-fn activity_rank(activity: Option<AgentActivity>) -> u8 {
-    match activity {
-        Some(AgentActivity::Blocked) => 0,
-        Some(AgentActivity::Working) => 1,
-        Some(AgentActivity::Idle) => 2,
-        None => 3,
-    }
 }
 
 fn apply_host_event(
@@ -2069,6 +2087,30 @@ pub async fn set_session_metadata_with_options(
         options,
         "gui-session-set-metadata",
         method::SESSION_SET_METADATA,
+        serde_json::to_value(params)?,
+    )
+    .await
+}
+
+/// Set or clear a session's display name on a host.
+pub async fn rename_session(
+    config: &HostConfig,
+    params: SessionRenameParams,
+) -> Result<SessionRenameResult, CoreError> {
+    rename_session_with_options(config, params, ConnectionOptions::default()).await
+}
+
+/// Set or clear a session's display name with explicit connection options.
+pub async fn rename_session_with_options(
+    config: &HostConfig,
+    params: SessionRenameParams,
+    options: ConnectionOptions,
+) -> Result<SessionRenameResult, CoreError> {
+    request_host_json(
+        config,
+        options,
+        "gui-session-rename",
+        method::SESSION_RENAME,
         serde_json::to_value(params)?,
     )
     .await
@@ -2351,6 +2393,7 @@ pub async fn launch_action_prompt_with_options(
         config,
         SessionNewParams {
             agent: params.action.agent,
+            name: params.name,
             cwd: None,
             cols: params.cols,
             rows: params.rows,
@@ -2411,6 +2454,7 @@ pub async fn launch_provider_item_with_options(
             cols: params.cols,
             rows: params.rows,
             metadata: link.to_session_metadata(),
+            name: params.name,
         },
         options,
     )
@@ -3054,6 +3098,37 @@ mod tests {
     }
 
     #[test]
+    fn agent_monitor_orders_by_identity_not_activity_and_carries_name() {
+        let mut named = session("s-2", Some(AgentActivity::Working));
+        named.name = Some("triage build".to_owned());
+        let mut workspace = Workspace::default();
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot(
+                "local",
+                vec![
+                    session("s-3", Some(AgentActivity::Idle)),
+                    named,
+                    session("s-1", Some(AgentActivity::Blocked)),
+                ],
+            ),
+        });
+
+        let monitor = workspace.agent_monitor();
+        let ids: Vec<&str> = monitor
+            .sessions
+            .iter()
+            .map(|row| row.session_id.0.as_str())
+            .collect();
+        // Stable (host, id) order regardless of activity, so a row never jumps
+        // out from under the cursor when its activity flips.
+        assert_eq!(ids, ["s-1", "s-2", "s-3"]);
+        assert_eq!(monitor.blocked, 1);
+        assert_eq!(monitor.working, 1);
+        assert_eq!(monitor.idle, 1);
+        assert_eq!(monitor.sessions[1].name.as_deref(), Some("triage build"));
+    }
+
+    #[test]
     fn session_remove_completed_keeps_session_when_not_removed() {
         let mut workspace = Workspace::default();
         workspace.apply(Message::HostSnapshotLoaded {
@@ -3546,6 +3621,7 @@ mod tests {
 
     fn session(id: &str, activity: Option<AgentActivity>) -> SessionInfo {
         SessionInfo {
+            name: None,
             id: SessionId(id.to_owned()),
             agent: "codex".to_owned(),
             agent_base: protocol::AgentKind::Codex,

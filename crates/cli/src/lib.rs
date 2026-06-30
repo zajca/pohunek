@@ -448,6 +448,11 @@ enum SessionAction {
         /// profile, resolved daemon-side on the target host.
         #[arg(long, default_value = "shell")]
         agent: String,
+        /// Owner-set display name for the session (cosmetic). Shown in the GUI
+        /// and `session list`; the daemon trims it and rejects a control
+        /// character or an over-long name.
+        #[arg(long)]
+        name: Option<String>,
         /// Working directory for the session.
         #[arg(long)]
         cwd: Option<PathBuf>,
@@ -542,6 +547,21 @@ enum SessionAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Set or clear a session's display name.
+    Rename {
+        /// Session target: `session-id` or `local/session-id`.
+        target: Target,
+        /// New display name. Omit together with `--clear` to clear the name.
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        name: Option<String>,
+        /// Clear the display name instead of setting one.
+        #[arg(long)]
+        clear: bool,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl Commands {
@@ -614,7 +634,8 @@ impl SessionAction {
             | SessionAction::Inspect { json, .. }
             | SessionAction::Stop { json, .. }
             | SessionAction::Rm { json, .. }
-            | SessionAction::Input { json, .. } => *json,
+            | SessionAction::Input { json, .. }
+            | SessionAction::Rename { json, .. } => *json,
         }
     }
 }
@@ -693,6 +714,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             match action {
                 SessionAction::New {
                     agent,
+                    name,
                     cwd,
                     cols,
                     rows,
@@ -710,6 +732,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                         &paths,
                         commands::session::NewArgs {
                             agent,
+                            name,
                             cwd,
                             cols,
                             rows,
@@ -754,6 +777,17 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 SessionAction::Input { target, text, json } => {
                     let host = effective_host(&global_host, Some(&target));
                     commands::session::run_input(&host, &paths, &target, &text, json).await?;
+                }
+                SessionAction::Rename {
+                    target,
+                    name,
+                    clear,
+                    json,
+                } => {
+                    let host = effective_host(&global_host, Some(&target));
+                    // `--clear` (or no name) clears it; a positional name sets it.
+                    let new_name = if clear { None } else { name };
+                    commands::session::run_rename(&host, &paths, &target, new_name, json).await?;
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -1041,6 +1075,7 @@ mod tests {
                 action:
                     SessionAction::New {
                         agent,
+                        name,
                         cwd,
                         cols,
                         rows,
@@ -1054,6 +1089,7 @@ mod tests {
                     },
             } => {
                 assert_eq!(agent, "shell");
+                assert_eq!(name, None);
                 assert_eq!(cwd, None);
                 assert_eq!(cols, 80);
                 assert_eq!(rows, 24);

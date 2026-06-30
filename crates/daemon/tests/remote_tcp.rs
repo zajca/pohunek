@@ -177,6 +177,7 @@ fn ok_payload(response: Response) -> Value {
 
 fn session_params() -> SessionNewParams {
     SessionNewParams {
+        name: None,
         agent: "shell".to_owned(),
         cwd: Some(std::env::temp_dir()),
         cols: 80,

@@ -61,6 +61,7 @@ impl SessionRegistry {
                 }
                 Some(ResumeBinding {
                     session_id: id.0.clone(),
+                    name: entry.info.name.clone(),
                     agent: entry.info.agent.clone(),
                     agent_base: entry.info.agent_base,
                     cwd: entry.info.cwd.clone(),
@@ -286,6 +287,7 @@ impl SessionRegistry {
         let is_linked_worktree = binding.is_linked_worktree;
         self.register_pty_session(PtySessionSpec {
             id,
+            name: binding.name,
             agent: binding.agent,
             agent_base: binding.agent_base,
             input_rules,

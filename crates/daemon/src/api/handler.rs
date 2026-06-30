@@ -16,8 +16,8 @@ use protocol::{
     ProjectAddParams, ProjectListParams, ProjectPromptParams, ProjectRemoveParams,
     ProjectRenameParams, ProjectShowParams, ProtocolError, Request, Response, SessionAttachParams,
     SessionDetachParams, SessionId, SessionInputParams, SessionListParams, SessionNewParams,
-    SessionNewResult, SessionReportNativeIdParams, SessionResizeParams, SessionSetMetadataParams,
-    WorktreeRemoveParams, PROTOCOL_VERSION,
+    SessionNewResult, SessionRenameParams, SessionReportNativeIdParams, SessionResizeParams,
+    SessionSetMetadataParams, WorktreeRemoveParams, PROTOCOL_VERSION,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -160,6 +160,7 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::SESSION_DETACH => handle_session_detach(request, &state.sessions).await,
         method::SESSION_RESIZE => handle_session_resize(request, &state.sessions).await,
         method::SESSION_SET_METADATA => handle_session_set_metadata(request, &state.sessions).await,
+        method::SESSION_RENAME => handle_session_rename(request, &state.sessions).await,
         method::SESSION_INPUT => handle_session_input(request, &state.sessions).await,
         method::SESSION_REPORT_NATIVE_ID => {
             handle_session_report_native_id(request, &state.sessions).await
@@ -613,6 +614,17 @@ async fn handle_session_set_metadata(request: &Request, sessions: &SessionRegist
     }
 }
 
+async fn handle_session_rename(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_params::<SessionRenameParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    match sessions.rename(&params.session_id, params.name).await {
+        Ok(result) => ok_value(request, &result),
+        Err(err) => Response::err(request.id.clone(), err),
+    }
+}
+
 async fn handle_session_input(request: &Request, sessions: &SessionRegistry) -> Response {
     let params = match parse_params::<SessionInputParams>(request) {
         Ok(params) => params,
@@ -805,6 +817,7 @@ mod tests {
         let path = PathBuf::from(format!("/work/{id}"));
         SessionInfo {
             id: SessionId(id.to_owned()),
+            name: None,
             agent: "shell".to_owned(),
             agent_base: AgentKind::Shell,
             cwd: path.clone(),
@@ -847,6 +860,7 @@ mod tests {
         let created = sessions
             .create(SessionNewParams {
                 agent: "shell".to_owned(),
+                name: None,
                 cwd: Some(PathBuf::from("/tmp")),
                 cols: 80,
                 rows: 24,

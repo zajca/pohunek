@@ -16,6 +16,9 @@ use super::{
 #[derive(Debug)]
 pub(super) struct PtySessionSpec {
     pub(super) id: SessionId,
+    /// Owner-set display name, frozen at creation and restored on resume. `None`
+    /// shows the session by id.
+    pub(super) name: Option<String>,
     /// Resolved agent NAME (a host-profile name, or a bare base-kind name).
     pub(super) agent: String,
     /// Resolved base kind backing the agent (detection/resume/handshake env).
@@ -357,6 +360,7 @@ impl SessionRegistry {
     ) -> Result<SessionInfo, ProtocolError> {
         let PtySessionSpec {
             id,
+            name,
             agent,
             agent_base,
             input_rules,
@@ -393,6 +397,7 @@ impl SessionRegistry {
         let now = timestamp_now();
         let info = SessionInfo {
             id: id.clone(),
+            name,
             agent,
             agent_base,
             cwd,

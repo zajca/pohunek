@@ -51,6 +51,11 @@ impl AgentActivity {
 pub struct SessionNewParams {
     /// Agent profile name to start.
     pub agent: String,
+    /// Owner-set display name for the session. Cosmetic only: it never affects
+    /// targeting or resume, and `None` leaves the session showing its id. The
+    /// daemon trims it and rejects an over-long or control-character name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Working directory for the session. If omitted, the daemon chooses one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
@@ -352,6 +357,10 @@ pub struct SessionWarning {
 pub struct SessionInfo {
     /// Stable session identifier.
     pub id: SessionId,
+    /// Owner-set display name, or `None` when the session is shown by its id.
+    /// Set at `session.new` and changed via `session.rename`; cosmetic only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Agent profile name backing the session.
     pub agent: String,
     /// Resolved base kind backing the session.
@@ -501,6 +510,24 @@ pub struct SessionSetMetadataResult {
     pub session: SessionInfo,
 }
 
+/// Parameters for `session.rename`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRenameParams {
+    /// Session whose display name should change.
+    pub session_id: SessionId,
+    /// New display name. `Some(name)` sets it (trimmed by the daemon) and `None`
+    /// clears it back to id-only display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Result returned by `session.rename`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRenameResult {
+    /// Updated session summary after the rename.
+    pub session: SessionInfo,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,6 +539,7 @@ mod tests {
     fn session(id: &str) -> SessionInfo {
         SessionInfo {
             id: SessionId(id.to_owned()),
+            name: None,
             agent: "claude".to_owned(),
             agent_base: AgentKind::Claude,
             cwd: PathBuf::from("/workspace"),

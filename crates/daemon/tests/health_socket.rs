@@ -299,6 +299,7 @@ fn agent_name(agent: AgentKind) -> &'static str {
 
 fn session_params() -> SessionNewParams {
     SessionNewParams {
+        name: None,
         agent: "shell".to_owned(),
         cwd: Some(std::env::temp_dir()),
         cols: 80,
@@ -314,6 +315,7 @@ fn session_params() -> SessionNewParams {
 
 fn session_params_for_agent(agent: AgentKind, cwd: PathBuf) -> SessionNewParams {
     SessionNewParams {
+        name: None,
         agent: agent_name(agent).to_owned(),
         cwd: Some(cwd),
         cols: 80,
@@ -330,6 +332,7 @@ fn session_params_for_agent(agent: AgentKind, cwd: PathBuf) -> SessionNewParams 
 /// `session.new` params binding a worktree for `repo` + `branch`.
 fn session_params_for_worktree(agent: AgentKind, repo: PathBuf, branch: &str) -> SessionNewParams {
     SessionNewParams {
+        name: None,
         agent: agent_name(agent).to_owned(),
         cwd: None,
         cols: 80,

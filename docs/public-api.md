@@ -131,6 +131,7 @@ All params and result type names below refer to structs exported by
 | `session.input` | `SessionInputParams` | `SessionInputResult` | Injects text using agent-specific input framing. |
 | `session.report_native_id` | `SessionReportNativeIdParams` | `SessionReportNativeIdResult` | Hook callback for resume metadata. |
 | `session.set_metadata` | `SessionSetMetadataParams` | `SessionSetMetadataResult` | Merges owner-controlled metadata. Values must not contain secrets. |
+| `session.rename` | `SessionRenameParams` | `SessionRenameResult` | Sets or clears a session's owner display name (`name: null` clears). Cosmetic; the daemon trims it and rejects a control character or over-long name. |
 | `subscribe` | `null` | `{subscribed: true}` then event stream | Consumes the connection into a one-way event stream. |
 | `integration.install` | `IntegrationInstallParams` or `null` | `IntegrationInstallResult` | Installs agent hooks for native session id capture. |
 | `assistant.materialize` | `AssistantMaterializeParams` | `AssistantMaterializeResult` | Materializes the assistant knowledge bundle on the daemon host. |
@@ -156,6 +157,8 @@ wire shapes are the exported `crates/protocol` structs.
 Important fields:
 
 - `id`: stable session id.
+- `name`: optional owner-set display name; absent means the session is shown by
+  its id. Set at `session.new` and changed via `session.rename`.
 - `agent`: profile name.
 - `agent_base`: `shell`, `codex`, or `claude`.
 - `cwd`: host-local working directory.

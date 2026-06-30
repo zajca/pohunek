@@ -63,9 +63,10 @@ pub use session::{
     AgentActivity, AgentKind, AttachHeader, SessionAttachParams, SessionAttachResult,
     SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
     SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams, SessionNewResult,
-    SessionRemoveResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionSetMetadataParams, SessionSetMetadataResult,
-    SessionState, SessionStopResult, SessionWarning, SessionWarningKind,
+    SessionRemoveResult, SessionRenameParams, SessionRenameResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
+    SessionWarning, SessionWarningKind,
 };
 #[doc(inline)]
 pub use version::{negotiate, ProtocolVersion, PROTOCOL_VERSION};
@@ -102,6 +103,8 @@ pub mod method {
     pub const SESSION_REPORT_NATIVE_ID: &str = "session.report_native_id";
     /// Merge owner-controlled metadata for a session.
     pub const SESSION_SET_METADATA: &str = "session.set_metadata";
+    /// Set or clear a session's owner-set display name.
+    pub const SESSION_RENAME: &str = "session.rename";
     /// Install the per-agent `SessionStart` hook that captures the native id.
     pub const INTEGRATION_INSTALL: &str = "integration.install";
     /// Live host capability probe (Phase 2 / remote hosts over `NetBird`). Returns

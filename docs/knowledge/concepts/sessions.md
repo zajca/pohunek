@@ -20,6 +20,14 @@ Session targets are host-aware. A bare session id targets the local host; a
 the existing confirmation behavior: non-local starts require explicit approval,
 and JSON/non-interactive remote starts require `--yes`.
 
+A session can carry an optional owner-set display name. Set it at creation with
+`pohunek session new --name <NAME>`, and change or clear it later with
+`pohunek session rename <target> <NAME>` (or `--clear`). The name is cosmetic:
+it shows in `pohunek session list`, `session inspect`, and the GUI, but never
+affects targeting or resume — a session is still addressed by its id. The daemon
+trims the name and rejects a control character or an over-long one. The name is
+captured in the resume binding, so it survives a daemon restart.
+
 The assistant feature reuses this session lifecycle. Its opening prompt is just
 initial input to a normal session, so session warnings and applied-input status
 remain the source of truth for whether the agent received that prompt.
