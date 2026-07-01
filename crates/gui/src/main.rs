@@ -12,22 +12,26 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use iced::widget::{
-    button, center, column, container, mouse_area, opaque, pick_list, row, scrollable, stack, text,
-    text_editor, text_input,
+    button, center, checkbox, column, container, mouse_area, opaque, pick_list, row, scrollable,
+    stack, text, text_editor, text_input,
 };
 use iced::{window, Background, Center, Color, Element, Fill, Size, Subscription, Task, Theme};
+use pohunek_gui_core::assistant::{
+    AssistantPaths, Intent as AssistantIntent, LaunchParams as AssistantLaunchParams,
+};
 use pohunek_gui_core::{
-    add_project_with_options, create_session_with_options, default_state_dir, discover_hosts,
-    inspect_session_with_options, launch_provider_item_with_options,
-    list_project_actions_with_options, preview_action_prompt, providers,
-    remove_session_with_options, remove_worktree_with_options, rename_project_with_options,
-    rename_session_with_options, resolve_project_action_with_options, session_link_metadata,
-    session_metadata_rows, set_session_metadata_with_options, show_project_with_options,
-    spawn_attach_command, stop_session_with_options, AttachCommandSpawner, AttachTemplateValues,
-    ConnState, ConnectionOptions, GitHubProviderScope, GitHubPullRequestStatusKey, HostConfig,
-    HostId, Message as CoreMessage, NotificationIntent, ProviderLaunchItem, ProviderLaunchParams,
-    ProviderOperation, ProviderPanel, ProviderRequestId, Selection, SessionLinkKind,
-    SessionLinkProvider, Toast, TreeNodeId, UiState, WindowSize, Workspace,
+    add_project_with_options, assistant as assistant_core, create_session_with_options,
+    default_state_dir, discover_hosts, inspect_session_with_options,
+    launch_provider_item_with_options, list_project_actions_with_options, preview_action_prompt,
+    providers, remove_session_with_options, remove_worktree_with_options,
+    rename_project_with_options, rename_session_with_options, resolve_project_action_with_options,
+    session_link_metadata, session_metadata_rows, set_session_metadata_with_options,
+    show_project_with_options, spawn_attach_command, stop_session_with_options,
+    AttachCommandSpawner, AttachTemplateValues, ConnState, ConnectionOptions, GitHubProviderScope,
+    GitHubPullRequestStatusKey, HostConfig, HostId, Message as CoreMessage, NotificationIntent,
+    ProviderLaunchItem, ProviderLaunchParams, ProviderOperation, ProviderPanel, ProviderRequestId,
+    Selection, SessionLinkKind, SessionLinkProvider, Toast, TreeNodeId, UiState, WindowSize,
+    Workspace,
 };
 use protocol::{
     AgentActivity, ProjectActionParams, ProjectActionsParams, ProjectAddParams, ProjectInfo,
@@ -44,6 +48,7 @@ const DEFAULT_TERMINAL_ROWS: u16 = 24;
 const DEFAULT_NOTIFICATION_COMMAND: &str = "notify-send";
 // Sentinel option in the Start template picker meaning "no template, blank session".
 const BLANK_TEMPLATE_LABEL: &str = "— blank —";
+const ASSISTANT_AUTO_AGENT_LABEL: &str = "Auto";
 // A second click on the same session within this window counts as a double-click
 // and opens the session in a terminal (matching the desktop double-click idiom).
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
@@ -101,8 +106,11 @@ struct PohunekApp {
     hosts: Vec<HostConfig>,
     ui_state: UiState,
     start: StartForm,
+    assistant: AssistantForm,
     /// Editable session input / rendered prompt buffer shown in the Start modal.
     prompt_editor: text_editor::Content,
+    /// Editable request buffer shown in the Assistant modal.
+    assistant_editor: text_editor::Content,
     /// Resolved recipe (agent/branch) for the selected template; `None` when a
     /// blank session or while a template is still resolving.
     template_recipe: Option<TemplateRecipe>,
@@ -136,6 +144,8 @@ enum ModalView {
     None,
     /// The "Start a session" dialog.
     Start,
+    /// The "Start assistant" dialog.
+    Assistant,
     /// The selected provider item (PR/issue) detail and launch dialog.
     ProviderItem,
 }
@@ -171,7 +181,9 @@ impl PohunekApp {
                 hosts: Vec::new(),
                 ui_state: boot.ui_state,
                 start: StartForm::default(),
+                assistant: AssistantForm::default(),
                 prompt_editor: text_editor::Content::new(),
+                assistant_editor: text_editor::Content::new(),
                 template_recipe: None,
                 modal: ModalView::None,
                 activity_filter: None,
@@ -285,6 +297,31 @@ impl Default for StartForm {
     }
 }
 
+#[derive(Debug, Clone)]
+struct AssistantForm {
+    intent: AssistantIntent,
+    agent: Option<String>,
+    show_advanced: bool,
+    branch: String,
+    base_branch: String,
+    no_snapshot: bool,
+    degraded: bool,
+}
+
+impl Default for AssistantForm {
+    fn default() -> Self {
+        Self {
+            intent: AssistantIntent::Help,
+            agent: None,
+            show_advanced: false,
+            branch: String::new(),
+            base_branch: String::new(),
+            no_snapshot: false,
+            degraded: false,
+        }
+    }
+}
+
 impl AgentChoice {
     /// Maps a wire agent string to a selectable choice, defaulting to Codex.
     fn from_wire(value: &str) -> Self {
@@ -329,11 +366,21 @@ enum Message {
         session_id: SessionId,
     },
     OpenStartModal,
+    OpenAssistantModal,
     CloseModal,
     StartAgentSelected(AgentChoice),
     StartTemplateSelected(String),
     TemplateResolved(Result<ResolvedTemplate, String>),
     PromptEdited(text_editor::Action),
+    AssistantRequestEdited(text_editor::Action),
+    AssistantIntentSelected(AssistantIntent),
+    AssistantAgentSelected(String),
+    ToggleAssistantAdvanced,
+    AssistantBranchChanged(String),
+    AssistantBaseBranchChanged(String),
+    AssistantNoSnapshotToggled(bool),
+    AssistantDegradedToggled(bool),
+    LaunchAssistant,
     ToggleStartAdvanced,
     StartBranchChanged(String),
     StartBaseBranchChanged(String),
@@ -491,6 +538,11 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             app.prompt_editor = text_editor::Content::new();
             app.modal = ModalView::Start;
         }
+        Message::OpenAssistantModal => {
+            app.assistant = AssistantForm::default();
+            app.assistant_editor = text_editor::Content::new();
+            app.modal = ModalView::Assistant;
+        }
         Message::CloseModal => app.modal = ModalView::None,
         Message::StartAgentSelected(agent) => app.start.agent = agent,
         Message::StartTemplateSelected(template) => {
@@ -514,11 +566,30 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             Err(err) => app.status = Some(err),
         },
         Message::PromptEdited(action) => app.prompt_editor.perform(action),
+        Message::AssistantRequestEdited(action) => app.assistant_editor.perform(action),
+        Message::AssistantIntentSelected(intent) => app.assistant.intent = intent,
+        Message::AssistantAgentSelected(agent) => {
+            app.assistant.agent = (agent != ASSISTANT_AUTO_AGENT_LABEL).then_some(agent);
+        }
+        Message::ToggleAssistantAdvanced => {
+            app.assistant.show_advanced = !app.assistant.show_advanced;
+        }
+        Message::AssistantBranchChanged(value) => app.assistant.branch = value,
+        Message::AssistantBaseBranchChanged(value) => app.assistant.base_branch = value,
+        Message::AssistantNoSnapshotToggled(value) => app.assistant.no_snapshot = value,
+        Message::AssistantDegradedToggled(value) => app.assistant.degraded = value,
         Message::ToggleStartAdvanced => app.start.show_advanced = !app.start.show_advanced,
         Message::StartBranchChanged(value) => app.start.branch = value,
         Message::StartBaseBranchChanged(value) => app.start.base_branch = value,
         Message::StartNameChanged(value) => app.start.name = value,
         Message::CreateSession => match create_session_task(app) {
+            Ok(task) => {
+                tasks.push(task);
+                app.modal = ModalView::None;
+            }
+            Err(err) => app.status = Some(err),
+        },
+        Message::LaunchAssistant => match launch_assistant_task(app) {
             Ok(task) => {
                 tasks.push(task);
                 app.modal = ModalView::None;
@@ -948,6 +1019,41 @@ fn create_session_task(app: &PohunekApp) -> Result<Task<Message>, String> {
     Ok(Task::perform(
         runtime::perform(async move {
             create_session_with_options(&host, params, options)
+                .await
+                .map(|result| CoreMessage::SessionCreated {
+                    host_id,
+                    session: result.session,
+                })
+                .map_err(|err| err.to_string())
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn launch_assistant_task(app: &PohunekApp) -> Result<Task<Message>, String> {
+    let target = selected_assistant_project(app)?;
+    let host_id = target.host.id.clone();
+    let options = connection_options(app)?;
+    let paths = AssistantPaths::resolve().map_err(|err| err.to_string())?;
+    let terminal_size = terminal_size(app)?;
+    let request = optional_field(&app.assistant_editor.text());
+    let params = AssistantLaunchParams {
+        intent: app.assistant.intent,
+        request,
+        agent: app.assistant.agent.clone(),
+        project: Some(target.project_ref),
+        repo: None,
+        branch: optional_field(&app.assistant.branch),
+        base_branch: optional_field(&app.assistant.base_branch),
+        cols: terminal_size.cols,
+        rows: terminal_size.rows,
+        no_snapshot: app.assistant.no_snapshot,
+        degraded: app.assistant.degraded,
+        auto_started_daemon: false,
+    };
+    Ok(Task::perform(
+        runtime::perform(async move {
+            assistant_core::launch_with_options(&target.host, &paths, params, options)
                 .await
                 .map(|result| CoreMessage::SessionCreated {
                     host_id,
@@ -1508,6 +1614,40 @@ fn selected_project_reference(app: &PohunekApp) -> Result<String, String> {
         .ok_or_else(|| "select or enter a project reference".to_owned())
 }
 
+#[derive(Debug, Clone)]
+struct AssistantProjectTarget {
+    host: HostConfig,
+    project_ref: String,
+}
+
+fn selected_assistant_project(app: &PohunekApp) -> Result<AssistantProjectTarget, String> {
+    let (host_id, project_ref) = match app.ui_state.selection.as_ref() {
+        Some(Selection::Project {
+            host_id,
+            project_id,
+        }) => (host_id.clone(), project_id.clone()),
+        Some(Selection::Session {
+            host_id,
+            session_id,
+        }) => {
+            let project_ref = app
+                .workspace
+                .hosts
+                .get(host_id)
+                .and_then(|host| host.sessions.get(&session_id.0))
+                .and_then(|session| session.project_id.clone())
+                .ok_or_else(|| "selected session is not linked to a project".to_owned())?;
+            (host_id.clone(), project_ref)
+        }
+        _ => return Err("select a project or project-linked session first".to_owned()),
+    };
+
+    Ok(AssistantProjectTarget {
+        host: host_config(app, &host_id)?,
+        project_ref,
+    })
+}
+
 fn selected_project_identity(app: &PohunekApp) -> Result<(String, PathBuf), String> {
     match app.ui_state.selection.as_ref() {
         Some(Selection::Project {
@@ -1897,6 +2037,7 @@ fn caret(expanded: bool, node: TreeNodeId) -> Element<'static, Message> {
 
 fn view(app: &PohunekApp) -> Element<'_, Message> {
     let left = column![
+        assistant_entry_button(),
         container(workspace_tree(app))
             .padding(12)
             .height(Fill)
@@ -1918,12 +2059,30 @@ fn view(app: &PohunekApp) -> Element<'_, Message> {
     match app.modal {
         ModalView::None => base.into(),
         ModalView::Start => modal(base.into(), start_modal_content(app), Message::CloseModal),
+        ModalView::Assistant => modal(
+            base.into(),
+            assistant_modal_content(app),
+            Message::CloseModal,
+        ),
         ModalView::ProviderItem => modal(
             base.into(),
             provider_item_modal_content(app),
             Message::CloseModal,
         ),
     }
+}
+
+fn assistant_entry_button() -> Element<'static, Message> {
+    button(
+        row![text("◎").size(14), text("Assistant").size(14)]
+            .spacing(6)
+            .align_y(Center),
+    )
+    .width(Fill)
+    .padding([8, 10])
+    .on_press(Message::OpenAssistantModal)
+    .style(iced::widget::button::primary)
+    .into()
 }
 
 /// Overlays `dialog` centered on a dimmed backdrop above `base`. Clicking the
@@ -2778,6 +2937,107 @@ fn start_modal_content(app: &PohunekApp) -> Element<'_, Message> {
             .style(iced::widget::button::primary),
     );
     dialog_card("Start a session", panel)
+}
+
+fn assistant_modal_content(app: &PohunekApp) -> Element<'_, Message> {
+    let advanced_label = if app.assistant.show_advanced {
+        "Advanced v"
+    } else {
+        "Advanced >"
+    };
+    let context = selected_assistant_project(app).map_or_else(std::convert::identity, |target| {
+        format!("{}  ·  {}", target.host.id, target.project_ref)
+    });
+    let agent_options = assistant_agent_options(app);
+    let selected_agent = Some(
+        app.assistant
+            .agent
+            .clone()
+            .unwrap_or_else(|| ASSISTANT_AUTO_AGENT_LABEL.to_owned()),
+    );
+    let mut panel = column![
+        text(context).size(13),
+        row![
+            text("Intent").size(14),
+            pick_list(
+                [
+                    AssistantIntent::Help,
+                    AssistantIntent::Setup,
+                    AssistantIntent::Project,
+                    AssistantIntent::Update,
+                    AssistantIntent::Debug,
+                ],
+                Some(app.assistant.intent),
+                Message::AssistantIntentSelected,
+            ),
+            text("Agent").size(14),
+            pick_list(
+                agent_options,
+                selected_agent,
+                Message::AssistantAgentSelected,
+            ),
+        ]
+        .spacing(8)
+        .align_y(Center),
+        text("Request / initial prompt").size(13),
+        text_editor(&app.assistant_editor)
+            .height(180)
+            .on_action(Message::AssistantRequestEdited),
+        button(text(advanced_label).size(13))
+            .on_press(Message::ToggleAssistantAdvanced)
+            .style(iced::widget::button::text),
+    ]
+    .spacing(8);
+    if app.assistant.show_advanced {
+        panel = panel
+            .push(
+                row![
+                    text_input("branch override", &app.assistant.branch)
+                        .on_input(Message::AssistantBranchChanged),
+                    text_input("base branch override", &app.assistant.base_branch)
+                        .on_input(Message::AssistantBaseBranchChanged),
+                ]
+                .spacing(8),
+            )
+            .push(
+                row![
+                    checkbox(app.assistant.no_snapshot)
+                        .label("No snapshot")
+                        .on_toggle(Message::AssistantNoSnapshotToggled),
+                    checkbox(app.assistant.degraded)
+                        .label("Degraded")
+                        .on_toggle(Message::AssistantDegradedToggled),
+                ]
+                .spacing(12),
+            );
+    }
+    let panel = panel.push(
+        button("Start assistant")
+            .on_press(Message::LaunchAssistant)
+            .style(iced::widget::button::primary),
+    );
+    dialog_card("Start assistant", panel)
+}
+
+fn assistant_agent_options(app: &PohunekApp) -> Vec<String> {
+    let mut options = vec![
+        ASSISTANT_AUTO_AGENT_LABEL.to_owned(),
+        "pohunek-assistant".to_owned(),
+        "codex".to_owned(),
+        "claude".to_owned(),
+    ];
+    if let Ok(host_id) = selected_host_id(app) {
+        if let Some(host) = app.workspace.hosts.get(&host_id) {
+            for session in host.sessions.values() {
+                if session.agent != "shell"
+                    && !options.iter().any(|option| option == &session.agent)
+                {
+                    options.push(session.agent.clone());
+                }
+            }
+        }
+    }
+    options
 }
 
 /// A labeled "Name" text input bound to the shared start-form name buffer, used
@@ -4064,7 +4324,9 @@ mod tests {
             hosts: Vec::new(),
             ui_state: UiState::default(),
             start: StartForm::default(),
+            assistant: AssistantForm::default(),
             prompt_editor: text_editor::Content::new(),
+            assistant_editor: text_editor::Content::new(),
             template_recipe: None,
             modal: ModalView::None,
             activity_filter: None,
@@ -4096,6 +4358,100 @@ mod tests {
             selected_project_reference(&app).expect("manual reference"),
             "manual-project"
         );
+    }
+
+    #[test]
+    fn selected_assistant_project_uses_session_project() {
+        let host_id = HostId::new("local");
+        let project = ProjectInfo {
+            id: "selected-project".to_owned(),
+            label: "Selected project".to_owned(),
+            repo_root: PathBuf::from("/tmp/selected-project"),
+            git_common_dir: PathBuf::from("/tmp/selected-project/.git"),
+            origin_url: None,
+            default_base_branch: None,
+            source: protocol::ProjectSource::Manual,
+            is_bare: false,
+            added_at: "2026-06-29T00:00:00Z".to_owned(),
+            last_used_at: "2026-06-29T00:00:00Z".to_owned(),
+        };
+        let session = SessionInfo {
+            name: None,
+            id: SessionId("s-1".to_owned()),
+            agent: "codex".to_owned(),
+            agent_base: protocol::AgentKind::Codex,
+            cwd: PathBuf::from("/tmp/selected-project"),
+            pid: 42,
+            cols: 80,
+            rows: 24,
+            state: protocol::SessionState::Running,
+            state_source: protocol::StateSource::Process,
+            activity: None,
+            native_session_id: None,
+            native_session_path: None,
+            project_id: Some(project.id.clone()),
+            project_label: Some(project.label.clone()),
+            metadata: BTreeMap::new(),
+            is_linked_worktree: Some(false),
+            repo: Some(project.repo_root.clone()),
+            branch: Some("main".to_owned()),
+            worktree_path: Some(project.repo_root.clone()),
+            warnings: Vec::new(),
+            created_at: "2026-06-29T00:00:00Z".to_owned(),
+            updated_at: "2026-06-29T00:00:00Z".to_owned(),
+            exit_code: None,
+        };
+        let mut host = pohunek_gui_core::HostView {
+            conn: ConnState::Connected,
+            health: None,
+            sessions: BTreeMap::new(),
+            projects: BTreeMap::new(),
+            project_details: BTreeMap::new(),
+            prompt: pohunek_gui_core::PromptState::default(),
+            provider: pohunek_gui_core::ProviderState::default(),
+            last_agent_state: None,
+            last_error: None,
+        };
+        host.projects.insert(project.id.clone(), project.clone());
+        host.sessions.insert(session.id.0.clone(), session.clone());
+
+        let mut app = PohunekApp {
+            workspace: Workspace::default(),
+            config: Err("test config is intentionally absent".to_owned()),
+            hosts: Vec::new(),
+            ui_state: UiState::default(),
+            start: StartForm::default(),
+            assistant: AssistantForm::default(),
+            prompt_editor: text_editor::Content::new(),
+            assistant_editor: text_editor::Content::new(),
+            template_recipe: None,
+            modal: ModalView::None,
+            activity_filter: None,
+            metadata_edit: MetadataEdit::default(),
+            rename_edit: String::new(),
+            project_edit: ProjectEdit::default(),
+            selected_action: None,
+            project_filters: BTreeMap::new(),
+            last_session_click: None,
+            state_dir: None,
+            status: None,
+            notified_intents: 0,
+        };
+        app.workspace.hosts.insert(host_id.clone(), host);
+        app.hosts.push(HostConfig::local(
+            "local",
+            PathBuf::from("/tmp/pohunek.sock"),
+        ));
+        app.ui_state.selection = Some(Selection::Session {
+            host_id: host_id.clone(),
+            session_id: session.id.clone(),
+        });
+        app.workspace.selection.clone_from(&app.ui_state.selection);
+
+        let target = selected_assistant_project(&app).expect("session project target");
+
+        assert_eq!(target.host.id, host_id);
+        assert_eq!(target.project_ref, project.id);
     }
 
     #[test]

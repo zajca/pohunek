@@ -101,6 +101,7 @@ The GUI must use existing daemon methods:
 - `session.remove`
 - `session.set_metadata`
 - `session.rename`
+- `assistant.materialize`
 
 Worktree creation is represented by `session.new` with a project or repo and a
 branch. There is no standalone worktree daemon method. When explaining or fixing
@@ -114,6 +115,31 @@ name flows through `session.new`'s `name` parameter. The session detail pane als
 renames an existing session through `session.rename` (and clears it). The display
 name leads the row in the workspace tree and the Agents monitor, falling back to
 the session id when unset. The name is cosmetic and never changes targeting.
+
+## Assistant Launch
+
+The left workspace rail includes an `Assistant` entry above the workspace tree.
+It opens a native `Start assistant` modal rather than shelling out to the CLI.
+The modal chooses:
+
+- assistant intent: `help`, `setup`, `project`, `update`, or `debug`;
+- agent runtime/profile: `Auto`, `pohunek-assistant`, `codex`, `claude`, or a
+  profile name observed in existing sessions;
+- request text, sent as the assistant's initial prompt request;
+- advanced branch/base-branch overrides;
+- explicit snapshot options (`No snapshot`, `Degraded`).
+
+Assistant launch is scoped to the selected project. If a session is selected,
+the GUI uses that session's `project_id`; if no project context is selected, the
+launch fails before contacting the daemon. The shared `gui-core::assistant`
+launcher performs host inspection, agent selection, snapshot creation,
+knowledge materialization, prompt composition, and finally `session.new` with the
+composed prompt as `input`. The resulting session is applied through the normal
+`SessionCreated` path, so it opens through the configured `attach_command`.
+
+The daemon protocol remains unchanged: GUI assistant launch uses existing
+`host.inspect`, `assistant.materialize`, and `session.new` methods. Do not add a
+daemon-side `assistant.launch` method unless the architecture changes.
 
 ## Agents Monitor
 

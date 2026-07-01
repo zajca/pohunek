@@ -8,7 +8,6 @@
 
 #![deny(unsafe_code)]
 
-mod assistant;
 mod client;
 mod commands;
 mod error;

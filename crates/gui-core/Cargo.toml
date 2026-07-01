@@ -10,6 +10,7 @@ description = "Pure state and SDK bridge logic for the pohunek native GUI."
 futures = { workspace = true }
 keyring = { workspace = true }
 pohunek-client = { workspace = true }
+pohunek-knowledge = { workspace = true, features = ["protocol"] }
 pohunek-prompt = { workspace = true }
 pohunek-protocol = { workspace = true }
 reqwest = { workspace = true }

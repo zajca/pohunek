@@ -2,13 +2,12 @@
 //!
 //! The assistant is an ordinary PTY-backed agent session opened with a small
 //! navigational opening prompt that points at a materialized knowledge bundle
-//! and a redacted live snapshot. This module is the orchestration glue; the
-//! steps live in focused submodules:
+//! and a redacted live snapshot. This module owns the CLI surface and delegates
+//! the shared launch orchestration to `pohunek-gui-core`, so the CLI and native
+//! GUI use the same `session.new` path.
 //!
-//! - [`bootstrap`] — bring up the local daemon when needed;
-//! - [`select`] — pick the agent and run the read-access preflight;
-//! - [`snapshot`] — collect the redacted live snapshot (allowlist-built);
-//! - [`prompt`] — compose the navigational opening prompt.
+//! The remaining local submodule is [`bootstrap`], which brings up the local
+//! daemon when needed.
 //!
 //! Knowledge delivery is pull-by-file: the launch never inlines bundle bodies
 //! into the prompt. For local launches the bundle is materialized in-process;
@@ -16,19 +15,13 @@
 //! bundle via `assistant.materialize`.
 
 pub(crate) mod bootstrap;
-pub(crate) mod prompt;
-pub(crate) mod select;
-pub(crate) mod snapshot;
 
 use std::path::PathBuf;
 
-use protocol::{
-    method, AssistantMaterializeResult, ConceptIntent, HostCapabilities, SessionNewParams,
-    SessionNewResult,
-};
+use pohunek_gui_core::assistant as core_assistant;
+use pohunek_gui_core::{ConnectionOptions, HostConfig};
 use serde::Serialize;
 
-use crate::client::Client;
 use crate::commands::session::{confirmation_decision, ConfirmDecision};
 use crate::error::CliError;
 use crate::paths::Paths;
@@ -58,18 +51,6 @@ impl Intent {
             Intent::Update => "update",
             Intent::Debug => "debug",
             Intent::Help => "help",
-        }
-    }
-
-    /// The protocol concept-intent this assistant intent maps to, used to filter
-    /// the table of contents from concept frontmatter.
-    pub(crate) const fn as_concept_intent(self) -> ConceptIntent {
-        match self {
-            Intent::Setup => ConceptIntent::Setup,
-            Intent::Project => ConceptIntent::Project,
-            Intent::Update => ConceptIntent::Update,
-            Intent::Debug => ConceptIntent::Debug,
-            Intent::Help => ConceptIntent::Help,
         }
     }
 }
@@ -107,16 +88,6 @@ impl AssistantOptions {
     fn is_remote(&self) -> bool {
         !crate::target::is_local_host(&self.host)
     }
-}
-
-/// Three-line orientation summary inlined into the opening prompt so the agent
-/// has immediate orientation without a read, while the full state stays in the
-/// snapshot file.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SnapshotOrientation {
-    pub(crate) daemon: String,
-    pub(crate) project: String,
-    pub(crate) agent: String,
 }
 
 /// Assistant metadata emitted under `--json` alongside the session info.
@@ -177,67 +148,8 @@ fn validate_target(opts: &AssistantOptions) -> Result<(), CliError> {
 
 /// Full (non-degraded) launch: requires a readable knowledge bundle.
 async fn run_full(opts: AssistantOptions, paths: &Paths) -> Result<(), CliError> {
-    // 1. Bring up the local daemon if needed (no-op for remote targets).
     let auto_started = bootstrap::ensure_daemon(&opts.host, paths, opts.no_start_daemon).await?;
-
-    // 2. Connect and inspect host capabilities to select a capable agent.
-    let mut client = Client::connect(&opts.host, paths).await?;
-    let capabilities = fetch_capabilities(&mut client).await?;
-    let selection = select::select_agent(&capabilities, opts.agent.as_deref(), None)?;
-
-    // 3. Collect the redacted live snapshot (allowlist-built), unless skipped.
-    let (snapshot_json, orientation) = if opts.no_snapshot {
-        snapshot::skipped_snapshot(&opts, &selection.name, auto_started)
-    } else {
-        snapshot::collect(&mut client, paths, &opts, &selection.name, auto_started).await
-    };
-
-    // 4. Materialize the version-matched bundle on the host that runs the agent.
-    //    Failure here is intentional: the default path must fail rather than
-    //    degrade silently. Use --degraded for an explicit reduced launch.
-    let materialized = if opts.is_remote() {
-        crate::assistant::materialize_remote(&mut client, &snapshot_json).await?
-    } else {
-        crate::assistant::materialize_local(paths, &snapshot_json)?
-    };
-
-    // 5. Read-access preflight: the agent context must be able to read both the
-    //    materialized bundle and the snapshot before we send session.new.
-    select::preflight_read_access(
-        &materialized.bundle_path,
-        &materialized.snapshot_path,
-        opts.is_remote(),
-    )?;
-
-    // 6. Compose the small navigational opening prompt (never inlines bodies).
-    let prompt = prompt::compose(&prompt::ComposeParams {
-        intent: opts.intent,
-        request: opts.request.as_deref(),
-        concepts: &materialized.concepts,
-        bundle_path: &materialized.bundle_path,
-        snapshot_path: &materialized.snapshot_path,
-        orientation: &orientation,
-        version: &materialized.version,
-    });
-
-    // 7. `--print-prompt` is a dry run: show the prompt and resolved paths, then
-    //    exit without starting a session.
-    let knowledge = Knowledge::Materialized(&materialized);
-    if opts.print_prompt {
-        print_prompt(&opts, &selection, &knowledge, &prompt)?;
-        return Ok(());
-    }
-
-    // 8. Launch the session with the composed prompt as initial input.
-    launch_session(
-        &mut client,
-        &opts,
-        &selection,
-        &knowledge,
-        prompt,
-        auto_started,
-    )
-    .await
+    run_prepared(opts, paths, auto_started).await
 }
 
 /// Degraded launch: snapshot + source-map pointer only, no bundle materialization.
@@ -246,124 +158,52 @@ async fn run_full(opts: AssistantOptions, paths: &Paths) -> Result<(), CliError>
 /// bundle. It is an explicit opt-in — the default `run_full` path fails before
 /// session.new if the bundle is unavailable.
 async fn run_degraded(opts: AssistantOptions, paths: &Paths) -> Result<(), CliError> {
-    // 1. Bring up the local daemon if needed (same as full path).
     let auto_started = bootstrap::ensure_daemon(&opts.host, paths, opts.no_start_daemon).await?;
+    run_prepared(opts, paths, auto_started).await
+}
 
-    // 2. Connect and select a capable agent.
-    let mut client = Client::connect(&opts.host, paths).await?;
-    let capabilities = fetch_capabilities(&mut client).await?;
-    let selection = select::select_agent(&capabilities, opts.agent.as_deref(), None)?;
+async fn run_prepared(
+    opts: AssistantOptions,
+    paths: &Paths,
+    auto_started: bool,
+) -> Result<(), CliError> {
+    let host = assistant_host_config(&opts, paths);
+    let assistant_paths = assistant_paths(paths);
+    let params = assistant_params(&opts, auto_started);
+    let prepared = core_assistant::prepare_with_options(
+        &host,
+        &assistant_paths,
+        params,
+        ConnectionOptions::default(),
+    )
+    .await
+    .map_err(core_error)?;
 
-    // 3. Collect the snapshot (unless --no-snapshot). Write to a per-launch
-    //    runtime dir via materialize_degraded (no bundle extraction).
-    let (snapshot_json, orientation) = if opts.no_snapshot {
-        snapshot::skipped_snapshot(&opts, &selection.name, auto_started)
-    } else {
-        snapshot::collect(&mut client, paths, &opts, &selection.name, auto_started).await
-    };
-
-    // 4. Write the snapshot to a per-launch runtime dir. No bundle is extracted.
-    let degraded = crate::assistant::materialize_degraded(paths, &snapshot_json)?;
-
-    // 5. Read-access preflight covers only the snapshot (no bundle to check).
-    if !opts.is_remote() {
-        select::preflight_snapshot_readable(&degraded.snapshot_path)?;
-    }
-
-    // 6. Compose the reduced navigational prompt (no TOC, no bundle path).
-    let prompt = prompt::compose_degraded(&prompt::ComposeDegradedParams {
-        intent: opts.intent,
-        request: opts.request.as_deref(),
-        snapshot_path: &degraded.snapshot_path,
-        orientation: &orientation,
-        version: &degraded.version,
-        bundle_version_note: &degraded.version,
-    });
-
-    // 7. `--print-prompt` dry run.
-    let knowledge = Knowledge::Degraded(&degraded);
     if opts.print_prompt {
-        print_prompt(&opts, &selection, &knowledge, &prompt)?;
+        print_prompt(&opts, &prepared)?;
         return Ok(());
     }
 
-    // 8. Launch the session with the reduced prompt.
-    launch_session(
-        &mut client,
-        &opts,
-        &selection,
-        &knowledge,
-        prompt,
-        auto_started,
-    )
-    .await
-}
-
-async fn fetch_capabilities(client: &mut Client) -> Result<HostCapabilities, CliError> {
-    let request =
-        crate::commands::request_with_params(method::HOST_INSPECT, &serde_json::Value::Null)?;
-    let value = client.request(&request).await?;
-    Ok(serde_json::from_value(value)?)
-}
-
-/// The materialized knowledge a launch carries, abstracting over the full
-/// (bundle + snapshot) and degraded (snapshot-only) results so the launch,
-/// emit, and print-prompt steps share one implementation each.
-///
-/// The two arms differ only in whether a bundle was materialized (full has a
-/// `bundle_path`, degraded does not) and the `materialized`/`degraded` label
-/// that threads through every rendered line; everything else is identical.
-enum Knowledge<'a> {
-    Materialized(&'a AssistantMaterializeResult),
-    Degraded(&'a crate::assistant::DegradedMaterializeResult),
-}
-
-impl Knowledge<'_> {
-    /// The bundle version (embedded, for both arms — degraded annotates it even
-    /// though the bundle files are absent).
-    fn version(&self) -> &str {
-        match self {
-            Knowledge::Materialized(m) => &m.version,
-            Knowledge::Degraded(d) => &d.version,
-        }
+    confirm_remote_launch(&opts)?;
+    let launched =
+        core_assistant::start_prepared_with_options(&host, prepared, ConnectionOptions::default())
+            .await
+            .map_err(core_error)?;
+    if launched.applied_input != Some(true) {
+        eprintln!(
+            "pohunek: warning: host '{}' did not confirm the assistant opening prompt was \
+             delivered; the session is running without it.",
+            opts.host
+        );
     }
-
-    /// The materialized bundle directory path, or `None` for a degraded launch
-    /// (no bundle was extracted).
-    fn bundle_path(&self) -> Option<&str> {
-        match self {
-            Knowledge::Materialized(m) => Some(&m.bundle_path),
-            Knowledge::Degraded(_) => None,
-        }
-    }
-
-    /// The persisted snapshot path (present on both arms).
-    fn snapshot_path(&self) -> &str {
-        match self {
-            Knowledge::Materialized(m) => &m.snapshot_path,
-            Knowledge::Degraded(d) => &d.snapshot_path,
-        }
-    }
-
-    /// The stable `knowledge` label used in JSON output and the human
-    /// `knowledge: <version> (<label>)` line.
-    fn knowledge_label(&self) -> &'static str {
-        match self {
-            Knowledge::Materialized(_) => "materialized",
-            Knowledge::Degraded(_) => "degraded",
-        }
-    }
+    emit_launch_output(&opts, &launched)
 }
 
 fn print_prompt(
     opts: &AssistantOptions,
-    selection: &select::AgentSelection,
-    knowledge: &Knowledge<'_>,
-    prompt: &str,
+    prepared: &core_assistant::PreparedLaunch,
 ) -> Result<(), CliError> {
     if opts.json {
-        // `bundle_path` is skipped for a degraded launch (no bundle exists), so
-        // the JSON shape matches the original per-mode structs exactly.
         #[derive(Serialize)]
         struct PrintPrompt<'a> {
             prompt: &'a str,
@@ -379,91 +219,55 @@ fn print_prompt(
         print!(
             "{}",
             crate::commands::render_json(&PrintPrompt {
-                prompt,
-                agent: &selection.name,
-                agent_reason: &selection.reason,
+                prompt: &prepared.prompt,
+                agent: &prepared.selection.name,
+                agent_reason: &prepared.selection.reason,
                 intent: opts.intent.as_str(),
-                bundle_path: knowledge.bundle_path(),
-                snapshot_path: knowledge.snapshot_path(),
-                knowledge_bundle_version: knowledge.version(),
-                knowledge: knowledge.knowledge_label(),
+                bundle_path: prepared.knowledge.bundle_path.as_deref(),
+                snapshot_path: &prepared.knowledge.snapshot_path,
+                knowledge_bundle_version: &prepared.knowledge.version,
+                knowledge: prepared.knowledge.label,
             })?
         );
     } else {
-        println!("agent: {} ({})", selection.name, selection.reason);
+        println!(
+            "agent: {} ({})",
+            prepared.selection.name, prepared.selection.reason
+        );
         println!("intent: {}", opts.intent.as_str());
         println!(
             "knowledge: {} ({})",
-            knowledge.version(),
-            knowledge.knowledge_label()
+            prepared.knowledge.version, prepared.knowledge.label
         );
-        // The bundle line only appears for a full launch (degraded has no bundle).
-        if let Some(bundle_path) = knowledge.bundle_path() {
+        if let Some(bundle_path) = &prepared.knowledge.bundle_path {
             println!("bundle: {bundle_path}");
         }
-        println!("snapshot: {}", knowledge.snapshot_path());
+        println!("snapshot: {}", prepared.knowledge.snapshot_path);
         println!("--- prompt ---");
-        println!("{prompt}");
+        println!("{}", prepared.prompt);
     }
     Ok(())
 }
 
-async fn launch_session(
-    client: &mut Client,
-    opts: &AssistantOptions,
-    selection: &select::AgentSelection,
-    knowledge: &Knowledge<'_>,
-    prompt: String,
-    auto_started: bool,
-) -> Result<(), CliError> {
+fn confirm_remote_launch(opts: &AssistantOptions) -> Result<(), CliError> {
     match confirmation_decision(&opts.host, opts.json, opts.yes) {
-        ConfirmDecision::Proceed => {}
-        ConfirmDecision::RequireYes => return Err(CliError::RemoteConfirmationRequired),
+        ConfirmDecision::Proceed => Ok(()),
+        ConfirmDecision::RequireYes => Err(CliError::RemoteConfirmationRequired),
         ConfirmDecision::Prompt => {
-            if !crate::commands::session::prompt_confirm(&opts.host)? {
-                return Err(CliError::RemoteConfirmationDeclined {
+            if crate::commands::session::prompt_confirm(&opts.host)? {
+                Ok(())
+            } else {
+                Err(CliError::RemoteConfirmationDeclined {
                     host: opts.host.clone(),
-                });
+                })
             }
         }
     }
-
-    let params = SessionNewParams {
-        agent: selection.name.clone(),
-        name: None,
-        cwd: None,
-        // The assistant session inherits the same default PTY geometry as
-        // `session new`; the attaching terminal resizes it on connect.
-        cols: DEFAULT_COLS,
-        rows: DEFAULT_ROWS,
-        project: opts.project.clone(),
-        repo: opts.repo.clone(),
-        branch: opts.branch.clone(),
-        base_branch: opts.base_branch.clone(),
-        input: Some(prompt),
-        metadata: std::collections::BTreeMap::new(),
-    };
-    let request = crate::commands::request_with_params(method::SESSION_NEW, &params)?;
-    let value = client.request(&request).await?;
-    let result: SessionNewResult = serde_json::from_value(value)?;
-
-    if result.applied_input != Some(true) {
-        eprintln!(
-            "pohunek: warning: host '{}' did not confirm the assistant opening prompt was \
-             delivered; the session is running without it.",
-            opts.host
-        );
-    }
-
-    emit_launch_output(opts, selection, knowledge, &result, auto_started)
 }
 
 fn emit_launch_output(
     opts: &AssistantOptions,
-    selection: &select::AgentSelection,
-    knowledge: &Knowledge<'_>,
-    result: &SessionNewResult,
-    auto_started: bool,
+    result: &core_assistant::LaunchResult,
 ) -> Result<(), CliError> {
     let info = &result.session;
     if opts.json {
@@ -478,11 +282,11 @@ fn emit_launch_output(
                 session: info,
                 assistant: AssistantMeta {
                     intent: opts.intent.as_str(),
-                    agent: &selection.name,
-                    knowledge_bundle_version: knowledge.version(),
-                    snapshot_included: !opts.no_snapshot,
-                    auto_started_daemon: auto_started,
-                    knowledge: knowledge.knowledge_label(),
+                    agent: &result.assistant.agent,
+                    knowledge_bundle_version: &result.assistant.knowledge_bundle_version,
+                    snapshot_included: result.assistant.snapshot_included,
+                    auto_started_daemon: result.assistant.auto_started_daemon,
+                    knowledge: result.assistant.knowledge,
                 },
             })?
         );
@@ -492,18 +296,17 @@ fn emit_launch_output(
         } else {
             format!("{}/{}", opts.host, info.id.0)
         };
-        // The degraded launch annotates the headline; the full launch does not.
-        let degraded_note = match knowledge {
-            Knowledge::Materialized(_) => "",
-            Knowledge::Degraded(_) => " (degraded)",
+        let degraded_note = if result.assistant.knowledge == "degraded" {
+            " (degraded)"
+        } else {
+            ""
         };
         println!("started assistant session{degraded_note}: {target}");
-        println!("agent: {}", selection.name);
+        println!("agent: {}", result.assistant.agent);
         println!("intent: {}", opts.intent.as_str());
         println!(
             "knowledge: {} ({})",
-            knowledge.version(),
-            knowledge.knowledge_label()
+            result.assistant.knowledge_bundle_version, result.assistant.knowledge
         );
         println!(
             "snapshot: {}",
@@ -516,6 +319,73 @@ fn emit_launch_output(
         println!("attach: pohunek attach {target}");
     }
     Ok(())
+}
+
+fn assistant_host_config(opts: &AssistantOptions, paths: &Paths) -> HostConfig {
+    if crate::target::is_local_host(&opts.host) {
+        HostConfig::local(LOCAL_HOST, paths.socket.clone())
+    } else {
+        HostConfig::remote(opts.host.clone(), opts.host.clone(), paths.socket.clone())
+    }
+}
+
+fn assistant_paths(paths: &Paths) -> core_assistant::AssistantPaths {
+    core_assistant::AssistantPaths {
+        runtime_dir: paths.runtime_dir.clone(),
+        data_dir: paths.data_dir.clone(),
+        log_dir: paths.log_dir.clone(),
+        cache_dir: paths.cache_dir.clone(),
+        config_dir: paths.config_dir.clone(),
+    }
+}
+
+fn assistant_params(opts: &AssistantOptions, auto_started: bool) -> core_assistant::LaunchParams {
+    core_assistant::LaunchParams {
+        intent: core_intent(opts.intent),
+        request: opts.request.clone(),
+        agent: opts.agent.clone(),
+        project: opts.project.clone(),
+        repo: opts.repo.clone(),
+        branch: opts.branch.clone(),
+        base_branch: opts.base_branch.clone(),
+        cols: DEFAULT_COLS,
+        rows: DEFAULT_ROWS,
+        no_snapshot: opts.no_snapshot,
+        degraded: opts.degraded,
+        auto_started_daemon: auto_started,
+    }
+}
+
+fn core_intent(intent: Intent) -> core_assistant::Intent {
+    match intent {
+        Intent::Setup => core_assistant::Intent::Setup,
+        Intent::Project => core_assistant::Intent::Project,
+        Intent::Update => core_assistant::Intent::Update,
+        Intent::Debug => core_assistant::Intent::Debug,
+        Intent::Help => core_assistant::Intent::Help,
+    }
+}
+
+fn core_error(err: pohunek_gui_core::CoreError) -> CliError {
+    match err {
+        pohunek_gui_core::CoreError::Client(source) => CliError::Client(source),
+        pohunek_gui_core::CoreError::Json(source) => CliError::Json(source),
+        pohunek_gui_core::CoreError::Protocol(source) => CliError::Protocol(source),
+        pohunek_gui_core::CoreError::Prompt(source) => CliError::Prompt(source),
+        pohunek_gui_core::CoreError::MissingEnv { var } => CliError::MissingEnv { var },
+        pohunek_gui_core::CoreError::RemoteAssistantTargetRequired { .. } => {
+            CliError::RemoteTargetRequired
+        }
+        pohunek_gui_core::CoreError::RemoteAssistantDegradedUnsupported { host } => {
+            CliError::DegradedRemoteUnsupported { host }
+        }
+        other => CliError::Protocol(protocol::ProtocolError::new(
+            protocol::ErrorClass::Runtime,
+            "assistant_launch_failed",
+            other.to_string(),
+            None,
+        )),
+    }
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@
 // Rust guideline compliant 2026-06-30
 #![forbid(unsafe_code)]
 
+pub mod assistant;
 pub mod providers;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1944,7 +1945,15 @@ pub enum CoreError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
+    Protocol(#[from] protocol::ProtocolError),
+    #[error(transparent)]
     Prompt(#[from] PromptError),
+    #[error("missing environment variable `{var}`")]
+    MissingEnv { var: String },
+    #[error("remote assistant launch on `{host}` requires a project or repo target")]
+    RemoteAssistantTargetRequired { host: String },
+    #[error("degraded assistant launch is not supported for remote host `{host}`")]
+    RemoteAssistantDegradedUnsupported { host: String },
     #[error("agent_state event is missing `{field}`")]
     MissingAgentStateField { field: &'static str },
     #[error("session event is missing `session`")]

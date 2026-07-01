@@ -5,7 +5,7 @@
 //! daemon, a missing required base directory is a fail-fast error: no silent
 //! invented fallbacks (hard project rule).
 
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::error::CliError;
 
@@ -85,27 +85,6 @@ impl Paths {
     pub(crate) fn sway_config_dir(&self) -> PathBuf {
         self.config_home.join("sway")
     }
-
-    /// Directory where assistant knowledge bundles are cached.
-    #[must_use]
-    pub(crate) fn assistant_bundle_cache_dir(&self) -> PathBuf {
-        self.cache_dir.join("knowledge")
-    }
-
-    /// Runtime directory for assistant material generated for one session or launch.
-    #[must_use]
-    pub(crate) fn assistant_runtime_dir(&self, session_or_launch_id: &str) -> Option<PathBuf> {
-        valid_runtime_id(session_or_launch_id).map(|id| self.runtime_dir.join("assistant").join(id))
-    }
-}
-
-fn valid_runtime_id(id: &str) -> Option<&Path> {
-    let path = Path::new(id);
-    let mut components = path.components();
-    match (components.next(), components.next()) {
-        (Some(Component::Normal(_)), None) => Some(path),
-        _ => None,
-    }
 }
 
 fn require_env(key: &str) -> Result<String, CliError> {
@@ -141,6 +120,7 @@ fn xdg_or_home_relative(key: &str, home_relative: &[&str]) -> Result<PathBuf, Cl
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -212,42 +192,5 @@ mod tests {
             paths.cache_dir,
             base.join("home").join(".cache").join(APP_DIR)
         );
-    }
-
-    #[test]
-    fn assistant_dirs_have_expected_shape() {
-        let _env = EnvGuard::acquire();
-        let base = tmp_base("assistant");
-        set_all_present(&base);
-        let paths = Paths::resolve().expect("resolve with all base vars set");
-        assert_eq!(
-            paths.assistant_bundle_cache_dir(),
-            base.join("cache").join(APP_DIR).join("knowledge")
-        );
-        assert_eq!(
-            paths.assistant_runtime_dir("launch-123"),
-            Some(
-                base.join("run")
-                    .join(APP_DIR)
-                    .join("assistant")
-                    .join("launch-123")
-            )
-        );
-    }
-
-    #[test]
-    fn assistant_runtime_dir_rejects_unsafe_ids() {
-        let _env = EnvGuard::acquire();
-        let base = tmp_base("assistant-unsafe");
-        set_all_present(&base);
-        let paths = Paths::resolve().expect("resolve with all base vars set");
-
-        for id in ["", "/tmp/launch", "../launch", "launch/child", "launch/.."] {
-            assert_eq!(
-                paths.assistant_runtime_dir(id),
-                None,
-                "unsafe id should be rejected: {id:?}"
-            );
-        }
     }
 }

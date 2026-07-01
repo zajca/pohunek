@@ -13,6 +13,7 @@ use futures::StreamExt;
 use pohunek_client::Client;
 use pohunek_daemon::api::{DaemonState, HealthInfo, RemoteServer};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
+use pohunek_gui_core::assistant::{self, AssistantPaths, Intent, LaunchParams};
 use pohunek_gui_core::{
     add_project, host_subscription_stream, inspect_session, launch_action_prompt_with_options,
     launch_provider_item_with_options, list_project_actions, list_projects, load_host_snapshot,
@@ -793,6 +794,81 @@ async fn launch_from_rendered_preset_creates_one_session_with_rendered_input() {
             .count(),
         1
     );
+
+    stop_session(&host, &launched.session.id).await;
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn assistant_launch_creates_project_session_with_opening_prompt() {
+    let _path_lock = PATH_LOCK.lock().await;
+    let bin_dir = temp_dir("gui-core-assistant-bin");
+    let record_dir = temp_dir("gui-core-assistant-record");
+    let prompt_out = record_dir.join("prompt.txt");
+    let _prompt_out = EnvGuard::set("POHUNEK_TEST_PROMPT_OUT", &prompt_out);
+    write_executable(
+        &bin_dir.join("codex"),
+        "#!/bin/sh\nprintf '%s' \"${1:-}\" > \"$POHUNEK_TEST_PROMPT_OUT\"\n/bin/sleep 30\n",
+    );
+    let _path = PathGuard::prepend(&bin_dir);
+
+    let daemon = LoopbackDaemon::spawn("assistant-launch", "0.4.0-assistant").await;
+    let host = HostConfig::tcp("host-assistant", daemon.addr);
+    let repo = init_git_repo("gui-core-assistant-repo");
+    let project = add_project(
+        &host,
+        ProjectAddParams {
+            path: Some(repo),
+            name: Some("Assistant Project".to_owned()),
+            base_branch: Some("main".to_owned()),
+        },
+    )
+    .await
+    .expect("project.add");
+    let paths = AssistantPaths {
+        runtime_dir: temp_dir("gui-core-assistant-runtime"),
+        data_dir: temp_dir("gui-core-assistant-data"),
+        log_dir: temp_dir("gui-core-assistant-logs"),
+        cache_dir: temp_dir("gui-core-assistant-cache"),
+        config_dir: temp_dir("gui-core-assistant-config"),
+    };
+
+    let launched = assistant::launch_with_options(
+        &host,
+        &paths,
+        LaunchParams {
+            intent: Intent::Debug,
+            request: Some("inspect the GUI assistant launcher".to_owned()),
+            agent: None,
+            project: Some(project.id.clone()),
+            repo: None,
+            branch: None,
+            base_branch: None,
+            cols: 80,
+            rows: 24,
+            no_snapshot: true,
+            degraded: false,
+            auto_started_daemon: false,
+        },
+        test_connection_options(),
+    )
+    .await
+    .expect("assistant launch");
+
+    assert_eq!(
+        launched.session.project_id.as_deref(),
+        Some(project.id.as_str())
+    );
+    assert_eq!(launched.session.agent, "codex");
+    assert_eq!(launched.applied_input, Some(true));
+    assert_eq!(launched.assistant.intent, Intent::Debug);
+    assert_eq!(launched.assistant.agent, "codex");
+    assert_eq!(launched.assistant.knowledge, "materialized");
+
+    let recorded = wait_for_file(&prompt_out).await;
+    assert!(recorded.contains("# Pohunek Assistant"));
+    assert!(recorded.contains("intent: debug"));
+    assert!(recorded.contains("request: inspect the GUI assistant launcher"));
 
     stop_session(&host, &launched.session.id).await;
     daemon.shutdown().await;

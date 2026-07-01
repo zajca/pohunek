@@ -14,14 +14,10 @@ implementation behavior must be verified against the source tree.
 
 Current CLI and command surface:
 
-- `crates/cli/src/assistant.rs`
 - `crates/cli/src/main.rs`
 - `crates/cli/src/commands/mod.rs`
 - `crates/cli/src/commands/assistant/mod.rs`
 - `crates/cli/src/commands/assistant/bootstrap.rs`
-- `crates/cli/src/commands/assistant/prompt.rs`
-- `crates/cli/src/commands/assistant/select.rs`
-- `crates/cli/src/commands/assistant/snapshot.rs`
 - `crates/cli/src/commands/doctor.rs`
 - `crates/cli/src/commands/daemon.rs`
 - `crates/cli/src/commands/attach.rs`
@@ -40,6 +36,7 @@ Native GUI client:
 
 - `crates/gui/src/main.rs`
 - `crates/gui/src/runtime.rs`
+- `crates/gui-core/src/assistant.rs`
 - `crates/gui-core/src/lib.rs`
 - `crates/gui-core/src/providers/linear.rs`
 - `crates/gui-core/src/providers/github.rs`
