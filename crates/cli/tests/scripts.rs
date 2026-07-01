@@ -932,6 +932,16 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_TERMINAL_ARGS"; done
             .contains("[title=\"pohunek-banner:local/s-1\"] mark --add pohunek-banner:local/s-1"),
         "{calls_text}"
     );
+    assert!(
+        calls_text.contains("[title=\"pohunek-banner:local/s-1\"] floating disable"),
+        "banner must be forced back into the tiling tree: {calls_text}"
+    );
+    assert!(
+        calls_text.contains(
+            "[title=\"pohunek-banner:local/s-1\"] move container to mark pohunek:local/s-1"
+        ),
+        "banner must be moved to its attach window mark: {calls_text}"
+    );
     // Both selected sessions get an attach window (terminals are spawned in the
     // background, so wait for the mock terminal's arg log to settle).
     wait_for_file_contains(

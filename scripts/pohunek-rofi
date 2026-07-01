@@ -287,8 +287,10 @@ while IFS= read -r target; do
     "$swaymsg_bin" splitv >/dev/null 2>&1 || true
     "$terminal_bin" -e "$script_dir/pohunek-session-banner" "$target" &
     pohunek_mark_window "pohunek-banner:$target" "pohunek-banner:$target" || true
-    "$swaymsg_bin" "[con_mark=\"pohunek-banner:$target\"]" move up >/dev/null 2>&1 || true
-    "$swaymsg_bin" "[con_mark=\"pohunek-banner:$target\"]" resize set height "$banner_height_px" px >/dev/null 2>&1 || true
+    "$swaymsg_bin" "[title=\"pohunek-banner:$target\"]" floating disable >/dev/null 2>&1 || true
+    "$swaymsg_bin" "[title=\"pohunek-banner:$target\"]" move container to mark "pohunek:$target" >/dev/null 2>&1 || true
+    "$swaymsg_bin" "[title=\"pohunek-banner:$target\"]" move up >/dev/null 2>&1 || true
+    "$swaymsg_bin" "[title=\"pohunek-banner:$target\"]" resize set height "$banner_height_px" px >/dev/null 2>&1 || true
   fi
 done <"$targets_file"
 
