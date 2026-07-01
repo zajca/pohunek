@@ -27,8 +27,8 @@ use crate::target::Target;
 
 const DETACH_BYTE: u8 = 0x1d;
 const IO_BUFFER_BYTES: usize = 8192;
-// Frequent enough to repair fullscreen TUIs that reset margins, while low enough
-// to avoid turning idle attaches into a busy terminal repaint loop.
+// Frequent enough to redraw over fullscreen TUIs that repaint the first row,
+// while low enough to avoid turning idle attaches into a busy terminal loop.
 const DEFAULT_BANNER_REPAINT_INTERVAL: Duration = Duration::from_millis(500);
 // Two rows are not enough for a banner plus a usable agent viewport.
 const MIN_ROWS_WITH_BANNER: u16 = 3;
@@ -351,7 +351,7 @@ fn effective_attach_size((cols, rows): (u16, u16), banner_enabled: bool) -> Opti
     }
 }
 
-fn render_banner_frame(cols: u16, rows: u16, snapshot: &AttachBannerSnapshot) -> String {
+fn render_banner_frame(cols: u16, snapshot: &AttachBannerSnapshot) -> String {
     let text = truncate_banner_text(
         &format!(
             "{}/{}  agent={}  state={}  activity={}",
@@ -359,10 +359,12 @@ fn render_banner_frame(cols: u16, rows: u16, snapshot: &AttachBannerSnapshot) ->
         ),
         cols,
     );
-    format!("\x1b[s\x1b[?6l\x1b[1;1H\x1b[7m\x1b[2K{text}\x1b[0m\x1b[2;{rows}r\x1b[?6h\x1b[u")
+    // DECSC/DECRC preserve origin mode while the banner targets physical row one.
+    format!("\x1b7\x1b[?6l\x1b[1;1H\x1b[7m\x1b[2K{text}\x1b[0m\x1b8")
 }
 
 fn reset_banner_frame() -> &'static str {
+    // Reset the scroll region in case an older banner repaint left it active.
     "\x1b[s\x1b[?6l\x1b[r\x1b[0m\x1b[1;1H\x1b[2K\x1b[u"
 }
 
@@ -427,14 +429,7 @@ where
     W: AsyncWrite + Unpin,
 {
     writer
-        .write_all(
-            render_banner_frame(
-                banner.terminal_size.0,
-                banner.terminal_size.1,
-                &banner.snapshot,
-            )
-            .as_bytes(),
-        )
+        .write_all(render_banner_frame(banner.terminal_size.0, &banner.snapshot).as_bytes())
         .await?;
     writer.flush().await?;
     Ok(())
@@ -903,10 +898,9 @@ mod tests {
     }
 
     #[test]
-    fn attach_banner_frame_draws_top_row_and_restores_session_region() {
+    fn attach_banner_frame_draws_top_row_without_persistent_terminal_modes() {
         let frame = render_banner_frame(
             80,
-            24,
             &AttachBannerSnapshot {
                 host: "local".to_owned(),
                 id: "s-42".to_owned(),
@@ -917,16 +911,24 @@ mod tests {
         );
 
         assert!(
-            frame.starts_with("\x1b[s\x1b[?6l\x1b[1;1H\x1b[7m\x1b[2K"),
-            "banner frame must save cursor and draw on physical row one: {frame:?}"
+            frame.starts_with("\x1b7\x1b[?6l\x1b[1;1H\x1b[7m\x1b[2K"),
+            "banner frame must save DEC cursor state and draw on physical row one: {frame:?}"
         );
         assert!(
             frame.contains("local/s-42  agent=claude  state=running  activity=blocked"),
             "banner text should include session state: {frame:?}"
         );
         assert!(
-            frame.ends_with("\x1b[0m\x1b[2;24r\x1b[?6h\x1b[u"),
-            "banner frame must restore the scroll region below the banner: {frame:?}"
+            frame.ends_with("\x1b[0m\x1b8"),
+            "banner frame must restore saved DEC cursor state without changing terminal modes: {frame:?}"
+        );
+        assert!(
+            !frame.contains("\x1b[2;24r"),
+            "banner repaint must not leave a scroll region active: {frame:?}"
+        );
+        assert!(
+            !frame.contains("\x1b[?6h"),
+            "banner repaint must not force DEC origin mode on the session: {frame:?}"
         );
     }
 

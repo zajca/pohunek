@@ -139,10 +139,11 @@ low-risk proof that "the chassis is an API," and it can land **before** Phase 4.
 - **Closing a window might stop instead of detach.** Mitigation: assert the attach
   client treats window close / SIGHUP as detach; cover with the Slice D check
   (session still listed after close).
-- **Banner vs full-screen TUI.** A reserved scroll-region row fights a TUI that
-  resets margins. Mitigation: make the banner an optional `pohunek attach`
-  overlay, resize the daemon PTY to one fewer row, and repaint the banner after
-  output, resize, event updates, and a short periodic interval.
+- **Banner vs full-screen TUI.** A banner repaint that changes terminal modes
+  fights a TUI that owns cursor addressing. Mitigation: make the banner an
+  optional `pohunek attach` overlay, resize the daemon PTY to one fewer row, and
+  repaint the banner without persistent terminal mode changes after output,
+  resize, event updates, and a short periodic interval.
 - **Cross-host fan-out latency.** Probing/listing many hosts per rofi invocation
   can be slow. Mitigation: query hosts concurrently, honor a short timeout, and
   show partial results with a per-host error marker.
