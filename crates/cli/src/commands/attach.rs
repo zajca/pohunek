@@ -32,6 +32,8 @@ const IO_BUFFER_BYTES: usize = 8192;
 const DEFAULT_BANNER_REPAINT_INTERVAL: Duration = Duration::from_millis(500);
 // Two rows are not enough for a banner plus a usable agent viewport.
 const MIN_ROWS_WITH_BANNER: u16 = 3;
+// Row 1 is reserved for the attach banner; the PTY viewport begins below it.
+const BANNER_VIEWPORT_TOP_ROW: u16 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AttachBannerConfig {
@@ -92,6 +94,8 @@ impl AttachBannerConfig {
 struct AttachBannerSnapshot {
     host: String,
     id: String,
+    name: String,
+    project: String,
     agent: String,
     state: String,
     activity: String,
@@ -109,6 +113,8 @@ impl AttachBannerSnapshot {
         Self {
             host: host.to_owned(),
             id: id.to_owned(),
+            name: id.to_owned(),
+            project: "-".to_owned(),
             agent: "<unknown>".to_owned(),
             state: "<unknown>".to_owned(),
             activity: "-".to_owned(),
@@ -119,6 +125,21 @@ impl AttachBannerSnapshot {
         if value.get("id").and_then(serde_json::Value::as_str) != Some(self.id.as_str()) {
             return;
         }
+        replace_string(
+            &mut self.name,
+            value
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(self.id.as_str()),
+        );
+        replace_string(
+            &mut self.project,
+            value
+                .get("project_label")
+                .or_else(|| value.get("project_id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-"),
+        );
         if let Some(agent) = value.get("agent").and_then(serde_json::Value::as_str) {
             replace_string(&mut self.agent, agent);
         }
@@ -354,13 +375,23 @@ fn effective_attach_size((cols, rows): (u16, u16), banner_enabled: bool) -> Opti
 fn render_banner_frame(cols: u16, snapshot: &AttachBannerSnapshot) -> String {
     let text = truncate_banner_text(
         &format!(
-            "{}/{}  agent={}  state={}  activity={}",
-            snapshot.host, snapshot.id, snapshot.agent, snapshot.state, snapshot.activity
+            "host={}  project={}  session={}  id={}  agent={}  state={}  activity={}",
+            snapshot.host,
+            snapshot.project,
+            snapshot.name,
+            snapshot.id,
+            snapshot.agent,
+            snapshot.state,
+            snapshot.activity
         ),
         cols,
     );
     // DECSC/DECRC preserve origin mode while the banner targets physical row one.
     format!("\x1b7\x1b[?6l\x1b[1;1H\x1b[7m\x1b[2K{text}\x1b[0m\x1b8")
+}
+
+fn render_banner_viewport_frame(rows: u16) -> String {
+    format!("\x1b[?6l\x1b[{BANNER_VIEWPORT_TOP_ROW};{rows}r\x1b[?6h\x1b[1;1H")
 }
 
 fn reset_banner_frame() -> &'static str {
@@ -435,12 +466,39 @@ where
     Ok(())
 }
 
+async fn enter_banner_viewport<W>(
+    writer: &mut W,
+    banner: &AttachBannerRuntime,
+) -> Result<(), CliError>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer
+        .write_all(render_banner_viewport_frame(banner.terminal_size.1).as_bytes())
+        .await?;
+    writer.flush().await?;
+    Ok(())
+}
+
 async fn reset_banner<W>(writer: &mut W) -> Result<(), CliError>
 where
     W: AsyncWrite + Unpin,
 {
     writer.write_all(reset_banner_frame().as_bytes()).await?;
     writer.flush().await?;
+    Ok(())
+}
+
+async fn enter_banner_viewport_if_active<W>(
+    writer: &mut W,
+    banner: Option<&AttachBannerRuntime>,
+) -> Result<(), CliError>
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Some(banner) = banner {
+        enter_banner_viewport(writer, banner).await?;
+    }
     Ok(())
 }
 
@@ -534,6 +592,7 @@ where
     );
     repaint_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    enter_banner_viewport_if_active(&mut stdout, banner.as_ref()).await?;
     repaint_banner_if_active(&mut stdout, banner.as_ref()).await?;
 
     loop {
@@ -586,6 +645,7 @@ where
                     if let Ok(request) = build_resize_request(target, effective_size.0, effective_size.1) {
                         let _ = client.request(&request).await;
                     }
+                    enter_banner_viewport_if_active(&mut stdout, banner.as_ref()).await?;
                     repaint_banner_if_active(&mut stdout, banner.as_ref()).await?;
                 }
             }
@@ -898,25 +958,38 @@ mod tests {
     }
 
     #[test]
-    fn attach_banner_frame_draws_top_row_without_persistent_terminal_modes() {
-        let frame = render_banner_frame(
-            80,
-            &AttachBannerSnapshot {
-                host: "local".to_owned(),
-                id: "s-42".to_owned(),
-                agent: "claude".to_owned(),
-                state: "running".to_owned(),
-                activity: "blocked".to_owned(),
-            },
+    fn attach_banner_viewport_keeps_session_scroll_below_reserved_row() {
+        let frame = render_banner_viewport_frame(40);
+
+        assert_eq!(
+            frame, "\x1b[?6l\x1b[2;40r\x1b[?6h\x1b[1;1H",
+            "banner viewport must constrain session output to rows 2..N"
         );
+    }
+
+    #[test]
+    fn attach_banner_frame_draws_top_row_without_persistent_terminal_modes() {
+        let mut snapshot = AttachBannerSnapshot::unknown("local", "s-42");
+        snapshot.update_from_session_value(&json!({
+            "id": "s-42",
+            "name": "review branch",
+            "agent": "claude",
+            "state": "running",
+            "activity": "blocked",
+            "project_id": "p-abc123",
+            "project_label": "ui"
+        }));
+        let frame = render_banner_frame(120, &snapshot);
 
         assert!(
             frame.starts_with("\x1b7\x1b[?6l\x1b[1;1H\x1b[7m\x1b[2K"),
             "banner frame must save DEC cursor state and draw on physical row one: {frame:?}"
         );
         assert!(
-            frame.contains("local/s-42  agent=claude  state=running  activity=blocked"),
-            "banner text should include session state: {frame:?}"
+            frame.contains(
+                "host=local  project=ui  session=review branch  id=s-42  agent=claude  state=running  activity=blocked"
+            ),
+            "banner text should include project, session name, and state: {frame:?}"
         );
         assert!(
             frame.ends_with("\x1b[0m\x1b8"),
@@ -938,10 +1011,18 @@ mod tests {
 
         snapshot.update_from_session_value(&json!({
             "id": "s-42",
+            "name": "review branch",
             "agent": "claude",
             "state": "running",
-            "activity": "working"
+            "activity": "working",
+            "project_id": "p-abc123",
+            "project_label": "ui"
         }));
+        assert!(
+            render_banner_frame(120, &snapshot)
+                .contains("host=local  project=ui  session=review branch"),
+            "banner frame should include project and session name"
+        );
         assert_eq!(snapshot.agent, "claude");
         assert_eq!(snapshot.state, "running");
         assert_eq!(snapshot.activity, "working");
@@ -971,5 +1052,24 @@ mod tests {
             "activity": "idle"
         }));
         assert_eq!(snapshot.activity, "blocked");
+    }
+
+    #[test]
+    fn attach_banner_snapshot_falls_back_to_ids_for_missing_display_labels() {
+        let mut snapshot = AttachBannerSnapshot::unknown("local", "s-42");
+
+        snapshot.update_from_session_value(&json!({
+            "id": "s-42",
+            "agent": "claude",
+            "state": "running",
+            "activity": "working",
+            "project_id": "p-abc123"
+        }));
+
+        let frame = render_banner_frame(120, &snapshot);
+        assert!(
+            frame.contains("host=local  project=p-abc123  session=s-42"),
+            "banner frame should fall back to ids when display labels are absent: {frame:?}"
+        );
     }
 }

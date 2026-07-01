@@ -117,8 +117,8 @@ low-risk proof that "the chassis is an API," and it can land **before** Phase 4.
 ### Slice E — Optional session banner
 
 8. An attach terminal can show a one-line banner at the top naming
-   host / session / agent / live agent-state, refreshed on state change, surviving
-   the agent's full-screen TUI.
+   host / project / session name / session id / agent / live agent-state,
+   refreshed on state change, surviving the agent's full-screen TUI.
    *Check:* the banner reflects a state transition (e.g. `running` → `blocked`)
    while the agent TUI is active, and does not corrupt the TUI's rendering.
 
@@ -141,9 +141,10 @@ low-risk proof that "the chassis is an API," and it can land **before** Phase 4.
   (session still listed after close).
 - **Banner vs full-screen TUI.** A banner repaint that changes terminal modes
   fights a TUI that owns cursor addressing. Mitigation: make the banner an
-  optional `pohunek attach` overlay, resize the daemon PTY to one fewer row, and
-  repaint the banner without persistent terminal mode changes after output,
-  resize, event updates, and a short periodic interval.
+  optional `pohunek attach` overlay, resize the daemon PTY to one fewer row,
+  constrain the local session viewport to rows below the banner while attached,
+  and repaint the banner after output, resize, event updates, and a short
+  periodic interval.
 - **Cross-host fan-out latency.** Probing/listing many hosts per rofi invocation
   can be slow. Mitigation: query hosts concurrently, honor a short timeout, and
   show partial results with a per-host error marker.
