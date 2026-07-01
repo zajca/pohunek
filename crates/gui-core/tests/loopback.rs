@@ -1202,7 +1202,7 @@ fn ui_state_persists_and_restores() {
     expanded.insert(TreeNodeId::project(host.id.clone(), "p-1"));
     let state = UiState {
         left_pane_width: 312,
-        agents_pane_height: 180,
+        agents_pane_height: 420,
         window_size: WindowSize {
             width: 1440,
             height: 900,
@@ -1220,6 +1220,20 @@ fn ui_state_persists_and_restores() {
     let restored = UiState::load_from_dir(&state_dir).expect("restore ui state");
 
     assert_eq!(restored, state);
+}
+
+#[test]
+fn ui_state_load_raises_legacy_agents_pane_height() {
+    let state_dir = temp_dir("gui-core-m1-ui-state-agents-height");
+    let state = UiState {
+        agents_pane_height: 220,
+        ..UiState::default()
+    };
+
+    state.save_to_dir(&state_dir).expect("save ui state");
+    let restored = UiState::load_from_dir(&state_dir).expect("restore ui state");
+
+    assert_eq!(restored.agents_pane_height, 360);
 }
 
 struct LoopbackDaemon {

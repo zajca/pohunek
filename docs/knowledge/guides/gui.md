@@ -121,7 +121,9 @@ The Agents monitor lists every session across hosts with a per-row activity dot
 and working/blocked/idle counts. Rows are ordered by the stable `(host, session)`
 identity, never by activity — activity flips constantly as agents work, and
 ordering on it would reshuffle rows under the operator's cursor. Each row shows
-the name (or id), agent, project, branch, and activity word.
+the name (or id), agent, project, branch, and activity word. The left-rail
+monitor is at least 360px tall so roughly five session rows are visible; older
+persisted UI state below that height is raised when the GUI loads.
 
 ## Prompt Management
 

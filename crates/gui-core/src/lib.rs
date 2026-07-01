@@ -40,7 +40,12 @@ const DEFAULT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const DEFAULT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const UI_STATE_FILE: &str = "ui-state.toml";
 const DEFAULT_LEFT_PANE_WIDTH: u16 = 280;
-const DEFAULT_AGENTS_PANE_HEIGHT: u16 = 220;
+/// Minimum height for the Agents monitor.
+///
+/// This leaves room for about five compact two-line session rows in the
+/// default-height window; the previous 220px layout fit only about three.
+const MIN_AGENTS_PANE_HEIGHT: u16 = 360;
+const DEFAULT_AGENTS_PANE_HEIGHT: u16 = MIN_AGENTS_PANE_HEIGHT;
 const DEFAULT_WINDOW_WIDTH: u32 = 960;
 const DEFAULT_WINDOW_HEIGHT: u32 = 640;
 
@@ -856,10 +861,13 @@ impl UiState {
     pub fn load_from_dir(dir: impl AsRef<std::path::Path>) -> Result<Self, UiStateError> {
         let path = dir.as_ref().join(UI_STATE_FILE);
         match std::fs::read_to_string(&path) {
-            Ok(raw) => Ok(toml::from_str(&raw).map_err(|source| UiStateError::Parse {
-                path: path.clone(),
-                source,
-            })?),
+            Ok(raw) => {
+                let state = toml::from_str(&raw).map_err(|source| UiStateError::Parse {
+                    path: path.clone(),
+                    source,
+                })?;
+                Ok(normalize_loaded_ui_state(state))
+            }
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(source) => Err(UiStateError::Read { path, source }),
         }
@@ -876,6 +884,11 @@ impl UiState {
         let raw = toml::to_string_pretty(self).map_err(UiStateError::Serialize)?;
         std::fs::write(&path, raw).map_err(|source| UiStateError::Write { path, source })
     }
+}
+
+fn normalize_loaded_ui_state(mut state: UiState) -> UiState {
+    state.agents_pane_height = state.agents_pane_height.max(MIN_AGENTS_PANE_HEIGHT);
+    state
 }
 
 /// Errors raised while loading or saving persistent UI state.
