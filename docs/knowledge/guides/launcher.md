@@ -25,3 +25,9 @@ After setup, verify daemon health and project/action resolution before blaming
 the launcher UI. The launcher ultimately depends on the same daemon, project,
 session, and action surfaces described in [sessions](../concepts/sessions.md)
 and [projects](../concepts/projects.md).
+
+`launcher.conf` also controls the optional attach banner. When `banner=true`,
+`pohunek attach` reserves the first terminal row for host/session/agent state and
+refreshes it during attach; `banner_interval_seconds` controls the periodic
+repaint interval. The rofi/sway switcher only opens marked attach terminals; it
+does not create a separate banner window.

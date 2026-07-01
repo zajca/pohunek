@@ -40,9 +40,9 @@ const DEFAULT_SWAY_KEYBIND: &str = "$mod+p";
 const DEFAULT_SWAY_ISSUE_KEYBIND: &str = "$mod+i";
 
 /// The launcher scripts, embedded at build time so `pohunek setup scripts` can
-/// materialize them without shipping a separate data dir. All five are written
-/// into the SAME directory because `pohunek-rofi` sources `lib.sh` and spawns
-/// `pohunek-session-banner` as siblings (it resolves them from its own dir).
+/// materialize them without shipping a separate data dir. They are written into
+/// the SAME directory because `pohunek-rofi` and the provider launchers source
+/// `lib.sh` as a sibling.
 const SCRIPTS: &[(&str, &str)] = &[
     ("lib.sh", include_str!("../../../../scripts/lib.sh")),
     (
@@ -61,16 +61,17 @@ const SCRIPTS: &[(&str, &str)] = &[
         "pohunek-launch-pr",
         include_str!("../../../../scripts/pohunek-launch-pr"),
     ),
-    (
-        "pohunek-session-banner",
-        include_str!("../../../../scripts/pohunek-session-banner"),
-    ),
 ];
 
-/// Default `launcher.conf` contents read by the launcher scripts via `lib.sh`.
+/// Script names that used to be materialized by `setup scripts` but are now
+/// owned by another path or removed entirely.
+const OBSOLETE_SCRIPTS: &[&str] = &["pohunek-session-banner"];
+
+/// Default `launcher.conf` contents read by the launcher scripts and `attach`.
 /// Keys must match what `pohunek_required_config`/`pohunek_optional_config` look
-/// up; the `project`/`terminal` values are intentionally left blank for the user
-/// to fill in (the scripts fail fast when a required value is empty).
+/// up, plus the banner keys read by the Rust attach path. The `terminal` value is
+/// intentionally left blank for the user to fill in (the scripts fail fast when a
+/// required value is empty).
 const LAUNCHER_CONF: &str = "# pohunek launcher configuration.
 # Lines are key=value; '#' starts a comment. Edit the values below.
 
@@ -96,9 +97,9 @@ linear_cli=linear
 # Issue picker: which Linear workflow-state types are 'actionable' (space-separated:
 # triage backlog unstarted started completed canceled).
 #linear_issue_states=started unstarted
+# Attach overlay: reserve the first terminal row for host/session/agent state.
 #banner=false
-#banner_height_px=24
-#banner_interval_seconds=1
+#banner_interval_seconds=0.5
 #mark_retry_count=20
 #mark_retry_interval_seconds=0.1
 ";
@@ -138,6 +139,7 @@ Please address the outstanding work on this PR, then summarize what you did.
 #[derive(Debug, Serialize)]
 struct ScriptsResult {
     installed: Vec<String>,
+    removed: Vec<String>,
 }
 
 /// Result of `setup config`: which files were created vs left untouched.
@@ -274,7 +276,18 @@ fn install_scripts(paths: &Paths) -> Result<ScriptsResult, CliError> {
         fs::set_permissions(&path, fs::Permissions::from_mode(SCRIPT_MODE))?;
         installed.push(path.display().to_string());
     }
-    Ok(ScriptsResult { installed })
+
+    let mut removed = Vec::new();
+    for name in OBSOLETE_SCRIPTS {
+        let path = dir.join(name);
+        match fs::remove_file(&path) {
+            Ok(()) => removed.push(path.display().to_string()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Ok(ScriptsResult { installed, removed })
 }
 
 /// Write the default config + prompt templates, skipping any file that already
@@ -418,6 +431,9 @@ fn render_scripts_human(result: &ScriptsResult) -> String {
     for path in &result.installed {
         let _ = writeln!(out, "installed script: {path}");
     }
+    for path in &result.removed {
+        let _ = writeln!(out, "removed obsolete script: {path}");
+    }
     out
 }
 
@@ -497,16 +513,24 @@ mod tests {
     #[test]
     fn install_scripts_writes_all_embedded_scripts_executable() {
         let tp = temp_paths();
+        let dir = tp.paths.launcher_bin_dir();
+        fs::create_dir_all(&dir).expect("create launcher bin dir");
+        fs::write(dir.join("pohunek-session-banner"), "#!/bin/sh\n").expect("write stale script");
+
         let result = install_scripts(&tp.paths).expect("install scripts");
 
         assert_eq!(result.installed.len(), SCRIPTS.len());
-        let dir = tp.paths.launcher_bin_dir();
         for (name, _) in SCRIPTS {
             let path = dir.join(name);
             assert!(path.is_file(), "missing script: {}", path.display());
             let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
             assert_eq!(mode, SCRIPT_MODE, "mode for {name}: {mode:o}");
         }
+        assert_eq!(result.removed.len(), OBSOLETE_SCRIPTS.len());
+        assert!(
+            !dir.join("pohunek-session-banner").exists(),
+            "banner is rendered by `pohunek attach`, not a setup script"
+        );
     }
 
     #[test]

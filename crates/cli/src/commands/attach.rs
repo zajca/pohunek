@@ -7,22 +7,155 @@
 //! stopping the PTY process.
 
 use std::os::fd::RawFd;
+use std::path::Path;
+use std::time::Duration;
 
 use protocol::{
-    method, Request, SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionId,
-    SessionResizeParams, ENV_DAEMON_ID, ENV_SESSION_ID,
+    event, method, Request, SessionAttachParams, SessionAttachResult, SessionDetachParams,
+    SessionId, SessionResizeParams, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::mpsc;
+use tokio::time::{self, MissedTickBehavior};
 
 use crate::client::{attach_raw, Client, RawStream};
-use crate::commands::request_with_params;
+use crate::commands::{request_id, request_with_params};
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::Target;
 
 const DETACH_BYTE: u8 = 0x1d;
 const IO_BUFFER_BYTES: usize = 8192;
+// Frequent enough to repair fullscreen TUIs that reset margins, while low enough
+// to avoid turning idle attaches into a busy terminal repaint loop.
+const DEFAULT_BANNER_REPAINT_INTERVAL: Duration = Duration::from_millis(500);
+// Two rows are not enough for a banner plus a usable agent viewport.
+const MIN_ROWS_WITH_BANNER: u16 = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachBannerConfig {
+    enabled: bool,
+    repaint_interval: Duration,
+}
+
+impl AttachBannerConfig {
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            repaint_interval: DEFAULT_BANNER_REPAINT_INTERVAL,
+        }
+    }
+
+    fn load_from_config_dir(config_dir: &Path) -> Result<Self, CliError> {
+        let path = config_dir.join("launcher.conf");
+        if !path.try_exists()? {
+            return Ok(Self::disabled());
+        }
+
+        let contents = std::fs::read_to_string(&path)?;
+        let mut config = Self::disabled();
+        for (number, raw) in contents.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                return Err(config_error(format!(
+                    "{}:{}: expected key=value",
+                    path.display(),
+                    number + 1
+                )));
+            };
+            match key.trim() {
+                "banner" => config.enabled = parse_bool(value.trim(), &path, number + 1)?,
+                "banner_interval_seconds" => {
+                    config.repaint_interval =
+                        parse_duration_seconds(value.trim(), &path, number + 1)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(config)
+    }
+
+    fn load(paths: &Paths) -> Result<Self, CliError> {
+        let config_dir = std::env::var("POHUNEK_CONFIG_DIR")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map_or_else(|| paths.config_dir.clone(), std::path::PathBuf::from);
+        Self::load_from_config_dir(&config_dir)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachBannerSnapshot {
+    host: String,
+    id: String,
+    agent: String,
+    state: String,
+    activity: String,
+}
+
+#[derive(Debug)]
+struct AttachBannerRuntime {
+    snapshot: AttachBannerSnapshot,
+    terminal_size: (u16, u16),
+    repaint_interval: Duration,
+}
+
+impl AttachBannerSnapshot {
+    fn unknown(host: &str, id: &str) -> Self {
+        Self {
+            host: host.to_owned(),
+            id: id.to_owned(),
+            agent: "<unknown>".to_owned(),
+            state: "<unknown>".to_owned(),
+            activity: "-".to_owned(),
+        }
+    }
+
+    fn update_from_session_value(&mut self, value: &serde_json::Value) {
+        if value.get("id").and_then(serde_json::Value::as_str) != Some(self.id.as_str()) {
+            return;
+        }
+        if let Some(agent) = value.get("agent").and_then(serde_json::Value::as_str) {
+            replace_string(&mut self.agent, agent);
+        }
+        if let Some(state) = value.get("state").and_then(serde_json::Value::as_str) {
+            replace_string(&mut self.state, state);
+        }
+        if let Some(activity) = value.get("activity").and_then(serde_json::Value::as_str) {
+            replace_string(&mut self.activity, activity);
+        }
+    }
+
+    fn update_from_event_value(&mut self, value: &serde_json::Value) {
+        match value.get("event").and_then(serde_json::Value::as_str) {
+            Some(event::AGENT_STATE) => {
+                if value.get("session_id").and_then(serde_json::Value::as_str)
+                    != Some(self.id.as_str())
+                {
+                    return;
+                }
+                if let Some(activity) = value.get("activity").and_then(serde_json::Value::as_str) {
+                    replace_string(&mut self.activity, activity);
+                }
+            }
+            Some(event::SESSION_CREATED | event::SESSION_UPDATED | event::SESSION_STOPPED) => {
+                if let Some(session) = value.get("session") {
+                    self.update_from_session_value(session);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn replace_string(target: &mut String, value: &str) {
+    target.clear();
+    target.push_str(value);
+}
 
 /// Run top-level `attach` against the daemon for `host`.
 ///
@@ -39,6 +172,7 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
     // different daemon that reuses the same session-id string.
     let (origin_session_id, origin_daemon_id) = self_feedback_origin();
     let attach_request = build_attach_request(target, origin_session_id, origin_daemon_id)?;
+    let banner_config = AttachBannerConfig::load(paths)?;
     let mut client = Client::connect(host, paths).await?;
     let result = client.request(&attach_request).await?;
     let attach: SessionAttachResult = serde_json::from_value(result)?;
@@ -53,7 +187,10 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
                 stream,
                 client,
                 &attach.stream_id,
+                host,
+                paths,
                 target,
+                banner_config,
             ))
             .await
         }
@@ -62,7 +199,10 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
                 stream,
                 client,
                 &attach.stream_id,
+                host,
+                paths,
                 target,
+                banner_config,
             ))
             .await
         }
@@ -79,18 +219,58 @@ async fn attach_over_stream<S>(
     stream: S,
     mut client: Client,
     stream_id: &str,
+    host: &str,
+    paths: &Paths,
     target: &Target,
+    banner_config: AttachBannerConfig,
 ) -> Result<(), CliError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if let Some((cols, rows)) = terminal_size(libc::STDOUT_FILENO) {
+    let terminal_size = terminal_size(libc::STDOUT_FILENO);
+    let banner_terminal_size =
+        terminal_size.filter(|size| effective_attach_size(*size, true).is_some());
+    let banner_enabled = banner_config.enabled && banner_terminal_size.is_some();
+
+    if let Some((cols, rows)) =
+        terminal_size.and_then(|size| effective_attach_size(size, banner_enabled))
+    {
         if let Ok(request) = build_resize_request(target, cols, rows) {
             let _ = client.request(&request).await;
         }
     }
 
-    forward_attached_stream(stream, client, stream_id.to_owned(), target).await
+    let (banner, banner_updates) = if let Some(terminal_size) =
+        banner_terminal_size.filter(|_| banner_config.enabled)
+    {
+        let snapshot = AttachBannerSnapshot::unknown(&banner_host_label(host), &target.session_id);
+        let updates = spawn_banner_updates(
+            host.to_owned(),
+            paths.clone(),
+            target.session_id.clone(),
+            snapshot.clone(),
+        );
+        (
+            Some(AttachBannerRuntime {
+                snapshot,
+                terminal_size,
+                repaint_interval: banner_config.repaint_interval,
+            }),
+            Some(updates),
+        )
+    } else {
+        (None, None)
+    };
+
+    forward_attached_stream(
+        stream,
+        client,
+        stream_id.to_owned(),
+        target,
+        banner,
+        banner_updates,
+    )
+    .await
 }
 
 // Host routing is the transport's job; the request carries only the session id
@@ -160,6 +340,172 @@ fn build_resize_request(target: &Target, cols: u16, rows: u16) -> Result<Request
     )
 }
 
+fn effective_attach_size((cols, rows): (u16, u16), banner_enabled: bool) -> Option<(u16, u16)> {
+    if !banner_enabled {
+        return Some((cols, rows));
+    }
+    if rows < MIN_ROWS_WITH_BANNER {
+        None
+    } else {
+        Some((cols, rows - 1))
+    }
+}
+
+fn render_banner_frame(cols: u16, rows: u16, snapshot: &AttachBannerSnapshot) -> String {
+    let text = truncate_banner_text(
+        &format!(
+            "{}/{}  agent={}  state={}  activity={}",
+            snapshot.host, snapshot.id, snapshot.agent, snapshot.state, snapshot.activity
+        ),
+        cols,
+    );
+    format!("\x1b[s\x1b[?6l\x1b[1;1H\x1b[7m\x1b[2K{text}\x1b[0m\x1b[2;{rows}r\x1b[?6h\x1b[u")
+}
+
+fn reset_banner_frame() -> &'static str {
+    "\x1b[s\x1b[?6l\x1b[r\x1b[0m\x1b[1;1H\x1b[2K\x1b[u"
+}
+
+fn truncate_banner_text(text: &str, cols: u16) -> String {
+    text.chars().take(usize::from(cols)).collect()
+}
+
+fn banner_host_label(host: &str) -> String {
+    if host.is_empty() {
+        "local".to_owned()
+    } else {
+        host.to_owned()
+    }
+}
+
+fn spawn_banner_updates(
+    host: String,
+    paths: Paths,
+    session_id: String,
+    initial: AttachBannerSnapshot,
+) -> mpsc::UnboundedReceiver<AttachBannerSnapshot> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut snapshot = initial;
+        let Ok(mut client) = Client::connect(&host, &paths).await else {
+            return;
+        };
+
+        if let Ok(request) =
+            request_with_params(method::SESSION_INSPECT, &SessionId(session_id.clone()))
+        {
+            if let Ok(info) = client.request(&request).await {
+                snapshot.update_from_session_value(&info);
+                let _ = tx.send(snapshot.clone());
+            }
+        }
+
+        let request = Request::new(
+            request_id(method::SUBSCRIBE),
+            method::SUBSCRIBE,
+            serde_json::Value::Null,
+        );
+        let Ok(mut subscription) = client.into_sdk().subscribe(&request).await else {
+            return;
+        };
+        while let Ok(Some(line)) = subscription.next_line().await {
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let before = snapshot.clone();
+            snapshot.update_from_event_value(&event);
+            if snapshot != before {
+                let _ = tx.send(snapshot.clone());
+            }
+        }
+    });
+    rx
+}
+
+async fn repaint_banner<W>(writer: &mut W, banner: &AttachBannerRuntime) -> Result<(), CliError>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer
+        .write_all(
+            render_banner_frame(
+                banner.terminal_size.0,
+                banner.terminal_size.1,
+                &banner.snapshot,
+            )
+            .as_bytes(),
+        )
+        .await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn reset_banner<W>(writer: &mut W) -> Result<(), CliError>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(reset_banner_frame().as_bytes()).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn repaint_banner_if_active<W>(
+    writer: &mut W,
+    banner: Option<&AttachBannerRuntime>,
+) -> Result<(), CliError>
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Some(banner) = banner {
+        repaint_banner(writer, banner).await?;
+    }
+    Ok(())
+}
+
+async fn reset_banner_if_active<W>(writer: &mut W, banner_enabled: bool) -> Result<(), CliError>
+where
+    W: AsyncWrite + Unpin,
+{
+    if banner_enabled {
+        reset_banner(writer).await?;
+    }
+    Ok(())
+}
+
+fn parse_bool(value: &str, path: &Path, number: usize) -> Result<bool, CliError> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(config_error(format!(
+            "{}:{number}: invalid boolean value {other:?}; expected true or false",
+            path.display()
+        ))),
+    }
+}
+
+fn parse_duration_seconds(value: &str, path: &Path, number: usize) -> Result<Duration, CliError> {
+    let seconds = value.parse::<f64>().map_err(|err| {
+        config_error(format!(
+            "{}:{number}: invalid duration value {value:?}: {err}",
+            path.display()
+        ))
+    })?;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(config_error(format!(
+            "{}:{number}: banner_interval_seconds must be greater than zero",
+            path.display()
+        )));
+    }
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+fn config_error(message: String) -> CliError {
+    CliError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message,
+    ))
+}
+
 /// Bidirectionally bridge the terminal and the attach byte stream until detach
 /// or EOF, over any transport.
 ///
@@ -171,6 +517,8 @@ async fn forward_attached_stream<S>(
     mut client: Client,
     stream_id: String,
     target: &Target,
+    mut banner: Option<AttachBannerRuntime>,
+    mut banner_updates: Option<mpsc::UnboundedReceiver<AttachBannerSnapshot>>,
 ) -> Result<(), CliError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -182,21 +530,34 @@ where
     let mut stdout = tokio::io::stdout();
     let mut stdin_buf = [0_u8; IO_BUFFER_BYTES];
     let mut socket_buf = [0_u8; IO_BUFFER_BYTES];
+    let mut repaint_tick = time::interval(
+        banner
+            .as_ref()
+            .map_or(DEFAULT_BANNER_REPAINT_INTERVAL, |banner| {
+                banner.repaint_interval
+            }),
+    );
+    repaint_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    repaint_banner_if_active(&mut stdout, banner.as_ref()).await?;
 
     loop {
         tokio::select! {
             read = socket_read.read(&mut socket_buf) => {
                 let bytes_read = read?;
                 if bytes_read == 0 {
+                    reset_banner_if_active(&mut stdout, banner.is_some()).await?;
                     return Ok(());
                 }
                 stdout.write_all(&socket_buf[..bytes_read]).await?;
                 stdout.flush().await?;
+                repaint_banner_if_active(&mut stdout, banner.as_ref()).await?;
             }
             read = stdin.read(&mut stdin_buf) => {
                 let bytes_read = read?;
                 if bytes_read == 0 {
                     socket_write.shutdown().await?;
+                    reset_banner_if_active(&mut stdout, banner.is_some()).await?;
                     return Ok(());
                 }
 
@@ -210,6 +571,7 @@ where
                     }
                     drop(terminal);
                     let _ = send_detach(&mut client, &stream_id).await;
+                    reset_banner_if_active(&mut stdout, banner.is_some()).await?;
                     return Ok(());
                 }
 
@@ -221,10 +583,34 @@ where
                     continue;
                 }
                 if let Some((cols, rows)) = terminal_size(libc::STDOUT_FILENO) {
-                    if let Ok(request) = build_resize_request(target, cols, rows) {
+                    if let Some(banner) = banner.as_mut() {
+                        banner.terminal_size = (cols, rows);
+                    }
+                    let effective_size = effective_attach_size((cols, rows), banner.is_some())
+                        .unwrap_or((cols, rows));
+                    if let Ok(request) = build_resize_request(target, effective_size.0, effective_size.1) {
                         let _ = client.request(&request).await;
                     }
+                    repaint_banner_if_active(&mut stdout, banner.as_ref()).await?;
                 }
+            }
+            update = async {
+                match banner_updates.as_mut() {
+                    Some(updates) => updates.recv().await,
+                    None => None,
+                }
+            }, if banner_updates.is_some() => {
+                if let Some(snapshot) = update {
+                    if let Some(banner) = banner.as_mut() {
+                        banner.snapshot = snapshot;
+                    }
+                    repaint_banner_if_active(&mut stdout, banner.as_ref()).await?;
+                } else {
+                    banner_updates = None;
+                }
+            }
+            _ = repaint_tick.tick(), if banner.is_some() => {
+                repaint_banner_if_active(&mut stdout, banner.as_ref()).await?;
             }
         }
     }
@@ -484,5 +870,104 @@ mod tests {
                 "rows": 40
             }),
         );
+    }
+
+    #[test]
+    fn attach_banner_config_reads_launcher_conf_from_override_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "pohunek-attach-banner-config-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create config dir");
+        std::fs::write(
+            root.join("launcher.conf"),
+            "banner=true\nbanner_interval_seconds=0.25\n",
+        )
+        .expect("write config");
+
+        let config = AttachBannerConfig::load_from_config_dir(&root).expect("load config");
+
+        assert!(config.enabled, "banner=true should enable attach overlay");
+        assert_eq!(
+            config.repaint_interval,
+            std::time::Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn attach_banner_reserves_one_terminal_row_for_daemon_resize() {
+        assert_eq!(effective_attach_size((120, 40), true), Some((120, 39)));
+        assert_eq!(effective_attach_size((120, 40), false), Some((120, 40)));
+        assert_eq!(effective_attach_size((120, 2), true), None);
+    }
+
+    #[test]
+    fn attach_banner_frame_draws_top_row_and_restores_session_region() {
+        let frame = render_banner_frame(
+            80,
+            24,
+            &AttachBannerSnapshot {
+                host: "local".to_owned(),
+                id: "s-42".to_owned(),
+                agent: "claude".to_owned(),
+                state: "running".to_owned(),
+                activity: "blocked".to_owned(),
+            },
+        );
+
+        assert!(
+            frame.starts_with("\x1b[s\x1b[?6l\x1b[1;1H\x1b[7m\x1b[2K"),
+            "banner frame must save cursor and draw on physical row one: {frame:?}"
+        );
+        assert!(
+            frame.contains("local/s-42  agent=claude  state=running  activity=blocked"),
+            "banner text should include session state: {frame:?}"
+        );
+        assert!(
+            frame.ends_with("\x1b[0m\x1b[2;24r\x1b[?6h\x1b[u"),
+            "banner frame must restore the scroll region below the banner: {frame:?}"
+        );
+    }
+
+    #[test]
+    fn attach_banner_snapshot_updates_from_inspect_and_event_payloads() {
+        let mut snapshot = AttachBannerSnapshot::unknown("local", "s-42");
+
+        snapshot.update_from_session_value(&json!({
+            "id": "s-42",
+            "agent": "claude",
+            "state": "running",
+            "activity": "working"
+        }));
+        assert_eq!(snapshot.agent, "claude");
+        assert_eq!(snapshot.state, "running");
+        assert_eq!(snapshot.activity, "working");
+
+        snapshot.update_from_event_value(&json!({
+            "event": "agent_state",
+            "session_id": "s-42",
+            "activity": "blocked"
+        }));
+        assert_eq!(snapshot.activity, "blocked");
+
+        snapshot.update_from_event_value(&json!({
+            "event": "session_updated",
+            "session": {
+                "id": "s-42",
+                "agent": "codex",
+                "state": "done"
+            }
+        }));
+        assert_eq!(snapshot.agent, "codex");
+        assert_eq!(snapshot.state, "done");
+        assert_eq!(snapshot.activity, "blocked");
+
+        snapshot.update_from_event_value(&json!({
+            "event": "agent_state",
+            "session_id": "s-99",
+            "activity": "idle"
+        }));
+        assert_eq!(snapshot.activity, "blocked");
     }
 }

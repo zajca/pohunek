@@ -502,7 +502,6 @@ Passed:
   - `scripts/pohunek-launch-issue`
   - `scripts/pohunek-rofi`
   - `scripts/pohunek-rofi-issue`
-  - `scripts/pohunek-session-banner`
 
 Failed:
 

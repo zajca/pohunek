@@ -24,6 +24,7 @@ Current CLI and command surface:
 - `crates/cli/src/commands/assistant/snapshot.rs`
 - `crates/cli/src/commands/doctor.rs`
 - `crates/cli/src/commands/daemon.rs`
+- `crates/cli/src/commands/attach.rs`
 - `crates/cli/src/commands/health.rs`
 - `crates/cli/src/commands/session.rs`
 - `crates/cli/src/commands/project.rs`

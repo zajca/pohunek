@@ -28,8 +28,6 @@ rofi_bin="$(pohunek_optional_config rofi_bin rofi)"
 swaymsg_bin="$(pohunek_optional_config swaymsg_bin swaymsg)"
 terminal_bin="$(pohunek_optional_config terminal "${TERMINAL:-}")"
 timeout_seconds="$(pohunek_required_config list_timeout_seconds)"
-banner_enabled="$(pohunek_optional_config banner false)"
-banner_height_px="$(pohunek_optional_config banner_height_px 24)"
 mark_retry_count="$(pohunek_optional_config mark_retry_count 20)"
 mark_retry_interval_seconds="$(pohunek_optional_config mark_retry_interval_seconds 0.1)"
 
@@ -189,13 +187,11 @@ PY
 
 marks_file="$tmp_dir/marks"
 tree_file="$tmp_dir/tree.json"
-banner_marks_file="$tmp_dir/banner-marks"
 # Pre-create the mark files so the read-redirects below can never abort the
 # script under `set -eu` if the tree enumeration exits before writing them.
 : >"$marks_file"
-: >"$banner_marks_file"
 tree_ok=true
-if "$swaymsg_bin" -t get_tree >"$tree_file" 2>/dev/null && python3 - "$tree_file" "$marks_file" "$banner_marks_file" <<'PY'
+if "$swaymsg_bin" -t get_tree >"$tree_file" 2>/dev/null && python3 - "$tree_file" "$marks_file" <<'PY'
 import json
 import sys
 
@@ -209,23 +205,17 @@ except Exception as exc:
     raise SystemExit(1)
 
 attach = []
-banner = []
 
 def walk(node):
     for mark in node.get("marks", []) or []:
         if isinstance(mark, str) and mark.startswith("pohunek:"):
             attach.append(mark[len("pohunek:"):])
-        elif isinstance(mark, str) and mark.startswith("pohunek-banner:"):
-            banner.append(mark[len("pohunek-banner:"):])
     for child in (node.get("nodes", []) or []) + (node.get("floating_nodes", []) or []):
         walk(child)
 
 walk(tree)
 with open(sys.argv[2], "w", encoding="utf-8") as handle:
     for target in attach:
-        handle.write(target + "\n")
-with open(sys.argv[3], "w", encoding="utf-8") as handle:
-    for target in banner:
         handle.write(target + "\n")
 PY
 then
@@ -251,22 +241,11 @@ while IFS= read -r existing; do
   fi
 done <"$marks_file"
 
-while IFS= read -r existing; do
-  [ -n "$existing" ] || continue
-  if ! grep -Fxq "$existing" "$targets_file"; then
-    "$swaymsg_bin" "[con_mark=\"pohunek-banner:$existing\"]" kill >/dev/null 2>&1 || true
-  fi
-done <"$banner_marks_file"
-
 while IFS= read -r target; do
   [ -n "$target" ] || continue
   attach_exists=false
   if grep -Fxq "$target" "$marks_file"; then
     attach_exists=true
-  fi
-  banner_exists=false
-  if grep -Fxq "$target" "$banner_marks_file"; then
-    banner_exists=true
   fi
 
   if [ "$attach_exists" != "true" ]; then
@@ -274,23 +253,6 @@ while IFS= read -r target; do
     # Mark synchronously so a later switch can find and close this window
     # (close == detach; the session keeps running on its host).
     pohunek_mark_window "pohunek:$target" "pohunek:$target" || true
-  fi
-
-  # Decide the banner independently of the attach window: an attach pane may
-  # already exist while its banner died or never got marked, so (re)create it.
-  if [ "$banner_enabled" = "true" ] && [ "$banner_exists" != "true" ]; then
-    # Anchor the split on this session's attach window (now marked) so the banner
-    # lands beside its own session rather than whatever rofi happened to leave
-    # focused. Exact above/below placement stays best-effort (sway-version
-    # dependent); the banner is opt-in.
-    "$swaymsg_bin" "[con_mark=\"pohunek:$target\"]" focus >/dev/null 2>&1 || true
-    "$swaymsg_bin" splitv >/dev/null 2>&1 || true
-    "$terminal_bin" -e "$script_dir/pohunek-session-banner" "$target" &
-    pohunek_mark_window "pohunek-banner:$target" "pohunek-banner:$target" || true
-    "$swaymsg_bin" "[title=\"pohunek-banner:$target\"]" floating disable >/dev/null 2>&1 || true
-    "$swaymsg_bin" "[title=\"pohunek-banner:$target\"]" move container to mark "pohunek:$target" >/dev/null 2>&1 || true
-    "$swaymsg_bin" "[title=\"pohunek-banner:$target\"]" move up >/dev/null 2>&1 || true
-    "$swaymsg_bin" "[title=\"pohunek-banner:$target\"]" resize set height "$banner_height_px" px >/dev/null 2>&1 || true
   fi
 done <"$targets_file"
 

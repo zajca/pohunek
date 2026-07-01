@@ -52,12 +52,6 @@ static ASSETS: &[AssetDescriptor] = &[
         title_suffix: "Rofi-based Linear issue picker",
         description: "Rofi-based Linear issue picker.",
     },
-    AssetDescriptor {
-        id: "pohunek-session-banner",
-        script_name: "pohunek-session-banner",
-        title_suffix: "Session status banner",
-        description: "Session status banner for the terminal.",
-    },
 ];
 
 fn write_concept_file(path: &Path, content: &str) -> Result<(), XtaskError> {

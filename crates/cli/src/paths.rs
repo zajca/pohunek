@@ -70,9 +70,9 @@ impl Paths {
     }
 
     /// Directory the launcher scripts (`pohunek-rofi`, `pohunek-launch-*`,
-    /// `pohunek-session-banner`, `lib.sh`) are materialized into by
-    /// `pohunek setup scripts`. They must be siblings: `pohunek-rofi` sources
-    /// `lib.sh` and spawns `pohunek-session-banner` from its own directory.
+    /// `lib.sh`) are materialized into by `pohunek setup scripts`. They must be
+    /// siblings because the shell launchers source `lib.sh` from their own
+    /// directory.
     #[must_use]
     pub(crate) fn launcher_bin_dir(&self) -> PathBuf {
         self.data_dir.join("bin")

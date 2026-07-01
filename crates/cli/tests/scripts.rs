@@ -47,8 +47,8 @@ fn read(path: &Path) -> String {
 
 /// Poll `path` until it contains every needle, or fail after a short deadline.
 ///
-/// The switcher spawns attach/banner terminals in the background, so the mock
-/// terminal may finish writing its arg log slightly after the script returns
+/// The switcher spawns attach terminals in the background, so the mock terminal
+/// may finish writing its arg log slightly after the script returns
 /// (especially under parallel test load). Polling avoids a flaky read race
 /// without changing the script's fire-and-forget behavior.
 fn wait_for_file_contains(path: &Path, needles: &[&str], label: &str) {
@@ -836,7 +836,7 @@ printf 'swaymsg' >>"$POHUNEK_TEST_CALLS"
 for arg in "$@"; do printf ' %s' "$arg" >>"$POHUNEK_TEST_CALLS"; done
 printf '\n' >>"$POHUNEK_TEST_CALLS"
 if [ "$1" = "-t" ] && [ "$2" = "get_tree" ]; then
-  printf '{"nodes":[{"marks":["pohunek:box/s-old","pohunek-banner:box/s-old"],"nodes":[],"floating_nodes":[]}],"floating_nodes":[]}\n'
+  printf '{"nodes":[{"marks":["pohunek:box/s-old"],"nodes":[],"floating_nodes":[]}],"floating_nodes":[]}\n'
 fi
 "#,
     );
@@ -858,8 +858,9 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_TERMINAL_ARGS"; done
             // the per-host `timeout` under parallel test load (which would drop
             // a host to an error row and fail the multi-select assertion).
             ("list_timeout_seconds", "30"),
+            // `banner=true` is now consumed by `pohunek attach` itself. The rofi
+            // switcher must not spawn or arrange a second banner terminal.
             ("banner", "true"),
-            ("banner_height_px", "24"),
             // Keep the mark-retry loop a single fast attempt: the stub swaymsg's
             // get_tree never reflects newly added marks, so verification cannot
             // succeed; one attempt keeps the test fast while still issuing the
@@ -924,80 +925,15 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_TERMINAL_ARGS"; done
         "{calls_text}"
     );
     assert!(
-        calls_text.contains("[con_mark=\"pohunek-banner:box/s-old\"] kill"),
-        "{calls_text}"
-    );
-    assert!(
-        calls_text
-            .contains("[title=\"pohunek-banner:local/s-1\"] mark --add pohunek-banner:local/s-1"),
-        "{calls_text}"
-    );
-    assert!(
-        calls_text.contains("[title=\"pohunek-banner:local/s-1\"] floating disable"),
-        "banner must be forced back into the tiling tree: {calls_text}"
-    );
-    assert!(
-        calls_text.contains(
-            "[title=\"pohunek-banner:local/s-1\"] move container to mark pohunek:local/s-1"
-        ),
-        "banner must be moved to its attach window mark: {calls_text}"
+        !calls_text.contains("pohunek-banner:"),
+        "rofi must not manage separate banner windows anymore: {calls_text}"
     );
     // Both selected sessions get an attach window (terminals are spawned in the
     // background, so wait for the mock terminal's arg log to settle).
-    wait_for_file_contains(
-        &terminal_args,
-        &["local/s-1", "box/s-2", "pohunek-session-banner"],
-        "terminal args",
-    );
-}
-
-#[test]
-fn banner_reflects_agent_state_transition() {
-    // Slice E: the banner re-renders on a state transition fed from the event
-    // stream. A stub `pohunek subscribe` emits working -> blocked for the target
-    // session; the banner line must end up reflecting `activity=blocked`.
-    let root = temp_dir("banner");
-    let bin = root.join("bin");
-    fs::create_dir_all(&bin).expect("create bin dir");
-    let pohunek = bin.join("pohunek");
-
-    write_executable(
-        &pohunek,
-        r#"#!/bin/sh
-if [ "$1" = "session" ] && [ "$2" = "inspect" ]; then
-  printf '{"id":"s-1","agent":"claude","state":"running","activity":"working"}\n'
-  exit 0
-fi
-if [ "$1" = "subscribe" ]; then
-  printf '{"event":"agent_state","session_id":"s-1","activity":"working"}\n'
-  printf '{"event":"agent_state","session_id":"s-1","activity":"blocked"}\n'
-  exit 0
-fi
-exit 1
-"#,
-    );
-
-    let config_dir = write_config(
-        &root,
-        &[("pohunek_bin", pohunek.to_str().expect("utf8 path"))],
-    );
-
-    // The banner never exits while its window is open (it falls back to polling
-    // when the subscribe stream ends), so bound the run with `timeout`. The
-    // blocked transition is rendered during the subscribe phase, before the
-    // fallback, so it is present in the captured output.
-    let out = Command::new("timeout")
-        .arg("2")
-        .arg("sh")
-        .arg(script_path("pohunek-session-banner"))
-        .arg("local/s-1")
-        .env("POHUNEK_CONFIG_DIR", &config_dir)
-        .output()
-        .expect("run banner");
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    wait_for_file_contains(&terminal_args, &["local/s-1", "box/s-2"], "terminal args");
     assert!(
-        stdout.contains("local/s-1  agent=claude  state=running  activity=blocked"),
-        "banner did not reflect the blocked transition: {stdout}"
+        !read(&terminal_args).contains("pohunek-session-banner"),
+        "rofi must only spawn attach terminals now: {}",
+        read(&terminal_args)
     );
 }

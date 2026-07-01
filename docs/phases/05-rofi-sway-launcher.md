@@ -50,8 +50,8 @@ low-risk proof that "the chassis is an API," and it can land **before** Phase 4.
 - **sway orchestration**: open marked attach terminals for the selection and close
   the previously-open attach windows that are no longer selected (detach, not
   stop).
-- **Optional session banner**: a top status line in an attach terminal naming
-  host/session/agent/live-state, for a decoration-less WM.
+- **Optional session banner**: `pohunek attach` can reserve the top row in the
+  attach terminal for host/session/agent/live-state, for decoration-less WMs.
 
 ## Out of Scope
 
@@ -140,9 +140,9 @@ low-risk proof that "the chassis is an API," and it can land **before** Phase 4.
   client treats window close / SIGHUP as detach; cover with the Slice D check
   (session still listed after close).
 - **Banner vs full-screen TUI.** A reserved scroll-region row fights a TUI that
-  resets margins. Mitigation: prefer a WM-level approach (separate 1-row sway pane,
-  or OSC title shown by a tabbed/stacked sway container) over in-band scroll
-  regions; treat the banner as optional.
+  resets margins. Mitigation: make the banner an optional `pohunek attach`
+  overlay, resize the daemon PTY to one fewer row, and repaint the banner after
+  output, resize, event updates, and a short periodic interval.
 - **Cross-host fan-out latency.** Probing/listing many hosts per rofi invocation
   can be slow. Mitigation: query hosts concurrently, honor a short timeout, and
   show partial results with a per-host error marker.
@@ -160,8 +160,9 @@ low-risk proof that "the chassis is an API," and it can land **before** Phase 4.
   the session with the first prompt in one round-trip (no `new` → `input` race).
 - **Linear access.** A **community Linear CLI**, kept behind a thin script seam so
   it can be swapped (GraphQL/MCP) later; GitHub via the official `gh`.
-- **Banner.** A **separate one-row sway pane** above the attach pane, fed from the
-  event stream — robust against the agent's full-screen TUI.
+- **Banner.** An **in-band attach overlay** reserves the first terminal row and is
+  fed from `session.inspect` plus the event stream. The rofi/sway launcher does
+  not spawn a second banner window.
 - **Window marking.** Use the user's **`$TERMINAL`**; tag each attach window with a
   unique **sway mark** (`pohunek:<host>/<id>`) via `swaymsg` so the switcher finds
   and closes it. Terminal-agnostic.
