@@ -27,8 +27,9 @@ session, and action surfaces described in [sessions](../concepts/sessions.md)
 and [projects](../concepts/projects.md).
 
 `launcher.conf` also controls the optional attach banner. When `banner=true`,
-`pohunek attach` reserves the first terminal row for host, project, session name,
-session id, agent state, and live activity, then refreshes it during attach;
-`banner_interval_seconds` controls the periodic repaint interval. The rofi/sway
-switcher only opens marked attach terminals; it does not create a separate
-banner window.
+`pohunek attach` reserves the first terminal row for a `[kill]` action, host,
+project, session name, session id, agent state, and live activity, then refreshes
+it during attach. Clicking `[kill]` sends `session.stop` for the attached
+session and exits the attach client. `banner_interval_seconds` controls the
+periodic repaint interval. The rofi/sway switcher only opens marked attach
+terminals; it does not create a separate banner window.
