@@ -97,7 +97,7 @@ linear_cli=linear
 # Issue picker: which Linear workflow-state types are 'actionable' (space-separated:
 # triage backlog unstarted started completed canceled).
 #linear_issue_states=started unstarted
-# Attach overlay: reserve the first terminal row for host/session/agent state.
+# Attach overlay: reserve the first terminal row for kill shortcut and session state.
 #banner=false
 #banner_interval_seconds=0.5
 # Attach reconnect: after an unexpected daemon stream close, wait for a restarted

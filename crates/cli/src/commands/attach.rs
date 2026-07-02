@@ -34,17 +34,10 @@ const DEFAULT_BANNER_REPAINT_INTERVAL: Duration = Duration::from_millis(500);
 const MIN_ROWS_WITH_BANNER: u16 = 3;
 // Row 1 is reserved for the attach banner; the PTY viewport begins below it.
 const BANNER_VIEWPORT_TOP_ROW: u16 = 2;
-const BANNER_ROW: u16 = 1;
-const BANNER_KILL_LABEL: &str = "[kill]";
-// `[kill]` is six ASCII terminal cells; xterm reports columns as 1-based cells.
-const BANNER_KILL_COLUMNS: u16 = 6;
-// Xterm SGR mouse reporting uses 1-based terminal cell coordinates.
-const SGR_MOUSE_PREFIX: &[u8] = b"\x1b[<";
-// Xterm reports a plain left-button press as button code 0.
-const SGR_LEFT_BUTTON_PRESS: u16 = 0;
-// Mouse reporting is persistent terminal state; reset paths must disable both.
-const BANNER_MOUSE_ENABLE_FRAME: &str = "\x1b[?1000h\x1b[?1006h";
-const BANNER_MOUSE_DISABLE_FRAME: &str = "\x1b[?1000l\x1b[?1006l";
+const BANNER_KILL_LABEL: &str = "[kill:Ctrl-\\]";
+// Ctrl-\ emits ASCII File Separator. Raw mode prevents the terminal driver from
+// turning it into SIGQUIT, and the shortcut stays adjacent to Ctrl-] detach.
+const BANNER_KILL_BYTE: u8 = 0x1c;
 /// Default grace window for reattaching after a daemon restart.
 ///
 /// Long enough for systemd to restart `pohunekd` and for `load_and_resume` to
@@ -170,22 +163,14 @@ struct AttachBannerRuntime {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BannerMouseAction {
+enum BannerInputAction {
     Kill,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BannerMouseMatch {
+struct BannerInputMatch {
     start: usize,
-    action: BannerMouseAction,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SgrMouseEvent {
-    button: u16,
-    col: u16,
-    row: u16,
-    is_press: bool,
+    action: BannerInputAction,
 }
 
 impl AttachBannerSnapshot {
@@ -517,9 +502,9 @@ fn render_banner_viewport_frame(rows: u16) -> String {
     format!("\x1b[?6l\x1b[{BANNER_VIEWPORT_TOP_ROW};{rows}r\x1b[?6h\x1b[1;1H")
 }
 
-fn reset_banner_frame() -> String {
+fn reset_banner_frame() -> &'static str {
     // Reset the scroll region in case an older banner repaint left it active.
-    format!("{BANNER_MOUSE_DISABLE_FRAME}\x1b[s\x1b[?6l\x1b[r\x1b[0m\x1b[1;1H\x1b[2K\x1b[u")
+    "\x1b[s\x1b[?6l\x1b[r\x1b[0m\x1b[1;1H\x1b[2K\x1b[u"
 }
 
 fn truncate_banner_text(text: &str, cols: u16) -> String {
@@ -589,19 +574,6 @@ where
     Ok(())
 }
 
-async fn enable_banner_mouse<W>(writer: &mut W, enabled: bool) -> Result<(), CliError>
-where
-    W: AsyncWrite + Unpin,
-{
-    if enabled {
-        writer
-            .write_all(BANNER_MOUSE_ENABLE_FRAME.as_bytes())
-            .await?;
-        writer.flush().await?;
-    }
-    Ok(())
-}
-
 async fn enter_banner_viewport<W>(
     writer: &mut W,
     banner: &AttachBannerRuntime,
@@ -620,8 +592,7 @@ async fn reset_banner<W>(writer: &mut W) -> Result<(), CliError>
 where
     W: AsyncWrite + Unpin,
 {
-    let frame = reset_banner_frame();
-    writer.write_all(frame.as_bytes()).await?;
+    writer.write_all(reset_banner_frame().as_bytes()).await?;
     writer.flush().await?;
     Ok(())
 }
@@ -757,7 +728,6 @@ where
     let mut socket_buf = [0_u8; IO_BUFFER_BYTES];
     let mut repaint_tick = banner_repaint_tick(banner.as_ref());
 
-    enable_banner_mouse(&mut stdout, banner.is_some()).await?;
     enter_banner_viewport_if_active(&mut stdout, banner.as_ref()).await?;
     repaint_banner_if_active(&mut stdout, banner.as_ref()).await?;
 
@@ -795,7 +765,7 @@ where
                     return Ok(AttachStreamEnd::Detached);
                 }
 
-                if handle_banner_mouse_action(
+                if handle_banner_input_action(
                     &stdin_buf[..bytes_read],
                     &mut socket_write,
                     &mut client,
@@ -950,7 +920,7 @@ async fn send_detach(client: &mut Client, stream_id: &str) -> Result<(), CliErro
     Ok(())
 }
 
-async fn handle_banner_mouse_action<W, O>(
+async fn handle_banner_input_action<W, O>(
     input: &[u8],
     socket_write: &mut W,
     client: &mut Client,
@@ -963,20 +933,20 @@ where
     W: AsyncWrite + Unpin,
     O: AsyncWrite + Unpin,
 {
-    let Some(mouse_match) = banner_enabled
-        .then(|| find_banner_mouse_action(input))
+    let Some(input_match) = banner_enabled
+        .then(|| find_banner_input_action(input))
         .flatten()
     else {
         return Ok(false);
     };
 
-    if mouse_match.start > 0 {
-        socket_write.write_all(&input[..mouse_match.start]).await?;
+    if input_match.start > 0 {
+        socket_write.write_all(&input[..input_match.start]).await?;
         socket_write.flush().await?;
     }
     terminal.take();
-    let stop_result = match mouse_match.action {
-        BannerMouseAction::Kill => send_stop(client, target).await,
+    let stop_result = match input_match.action {
+        BannerInputAction::Kill => send_stop(client, target).await,
     };
     reset_banner_if_active(stdout, banner_enabled).await?;
     stop_result?;
@@ -993,61 +963,16 @@ fn build_stop_request(target: &Target) -> Result<Request, CliError> {
     request_with_params(method::SESSION_STOP, &SessionId(target.session_id.clone()))
 }
 
-fn parse_banner_mouse_action(input: &[u8]) -> Option<BannerMouseAction> {
-    let event = parse_sgr_mouse_event(input)?;
-    (event.is_press
-        && event.button == SGR_LEFT_BUTTON_PRESS
-        && event.row == BANNER_ROW
-        && (1..=BANNER_KILL_COLUMNS).contains(&event.col))
-    .then_some(BannerMouseAction::Kill)
+fn parse_banner_input_action(input: &[u8]) -> Option<BannerInputAction> {
+    input
+        .contains(&BANNER_KILL_BYTE)
+        .then_some(BannerInputAction::Kill)
 }
 
-fn find_banner_mouse_action(input: &[u8]) -> Option<BannerMouseMatch> {
-    let mut offset = 0;
-    while offset < input.len() {
-        let relative_start = input[offset..]
-            .windows(SGR_MOUSE_PREFIX.len())
-            .position(|window| window == SGR_MOUSE_PREFIX)?;
-        let start = offset + relative_start;
-        let candidate = &input[start..];
-        let relative_end = candidate
-            .iter()
-            .position(|byte| *byte == b'M' || *byte == b'm')?;
-        let end = start + relative_end + 1;
-        if let Some(action) = parse_banner_mouse_action(&input[start..end]) {
-            return Some(BannerMouseMatch { start, action });
-        }
-        offset = end;
-    }
-    None
-}
-
-fn parse_sgr_mouse_event(input: &[u8]) -> Option<SgrMouseEvent> {
-    let body = input.strip_prefix(SGR_MOUSE_PREFIX)?;
-    let (&suffix, fields) = body.split_last()?;
-    if suffix != b'M' && suffix != b'm' {
-        return None;
-    }
-
-    let mut parts = fields.split(|byte| *byte == b';');
-    let button = parse_u16(parts.next()?)?;
-    let col = parse_u16(parts.next()?)?;
-    let row = parse_u16(parts.next()?)?;
-    if parts.next().is_some() {
-        return None;
-    }
-
-    Some(SgrMouseEvent {
-        button,
-        col,
-        row,
-        is_press: suffix == b'M',
-    })
-}
-
-fn parse_u16(input: &[u8]) -> Option<u16> {
-    let text = std::str::from_utf8(input).ok()?;
-    text.parse().ok()
+fn find_banner_input_action(input: &[u8]) -> Option<BannerInputMatch> {
+    let start = input.iter().position(|byte| *byte == BANNER_KILL_BYTE)?;
+    let action = parse_banner_input_action(&input[start..=start])?;
+    Some(BannerInputMatch { start, action })
 }
 
 #[derive(Debug)]
@@ -1395,7 +1320,7 @@ mod tests {
         );
         assert!(
             frame.contains(
-                "[kill]  host=local  project=ui  session=review branch  id=s-42  agent=claude  state=running  activity=blocked"
+                "[kill:Ctrl-\\]  host=local  project=ui  session=review branch  id=s-42  agent=claude  state=running  activity=blocked"
             ),
             "banner text should start with kill action and include project, session name, and state: {frame:?}"
         );
@@ -1414,20 +1339,36 @@ mod tests {
     }
 
     #[test]
-    fn attach_banner_mouse_click_on_kill_action_parses_kill() {
-        let input = b"\x1b[<0;3;1M";
+    fn attach_banner_kill_shortcut_does_not_enable_mouse_reporting() {
+        let mut snapshot = AttachBannerSnapshot::unknown("local", "s-42");
+        snapshot.update_from_session_value(&json!({
+            "id": "s-42",
+            "name": "review branch",
+            "agent": "codex",
+            "state": "running",
+            "activity": "working",
+            "project_label": "ui"
+        }));
 
+        let banner = render_banner_frame(120, &snapshot);
+        assert!(
+            banner.contains("[kill:Ctrl-\\]"),
+            "banner should expose the keyboard kill shortcut: {banner:?}"
+        );
+        assert_no_mouse_reporting(&banner);
+        assert_no_mouse_reporting(&render_banner_viewport_frame(40));
+        assert_no_mouse_reporting(reset_banner_frame());
         assert_eq!(
-            parse_banner_mouse_action(input),
-            Some(BannerMouseAction::Kill)
+            parse_banner_input_action(&[BANNER_KILL_BYTE]),
+            Some(BannerInputAction::Kill)
         );
     }
 
     #[test]
-    fn attach_banner_mouse_click_outside_kill_action_is_forwarded() {
-        let input = b"\x1b[<0;7;1M";
+    fn attach_banner_non_kill_input_is_forwarded() {
+        let input = b"\x1b[<64;7;1M";
 
-        assert_eq!(parse_banner_mouse_action(input), None);
+        assert_eq!(parse_banner_input_action(input), None);
     }
 
     #[test]
@@ -1495,6 +1436,13 @@ mod tests {
         assert!(
             frame.contains("host=local  project=p-abc123  session=s-42"),
             "banner frame should fall back to ids when display labels are absent: {frame:?}"
+        );
+    }
+
+    fn assert_no_mouse_reporting(frame: &str) {
+        assert!(
+            !frame.contains("\x1b[?1000") && !frame.contains("\x1b[?1006"),
+            "banner terminal frames must not toggle mouse reporting: {frame:?}"
         );
     }
 }
