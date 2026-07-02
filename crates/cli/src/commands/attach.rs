@@ -502,6 +502,12 @@ fn render_banner_viewport_frame(rows: u16) -> String {
     format!("\x1b[?6l\x1b[{BANNER_VIEWPORT_TOP_ROW};{rows}r\x1b[?6h\x1b[1;1H")
 }
 
+fn render_banner_viewport_repaint_frame(rows: u16) -> String {
+    // SCO save/restore keeps the session cursor stable while the attach overlay
+    // reasserts the scroll margins that a full-screen TUI may have reset.
+    format!("\x1b[s\x1b[?6l\x1b[{BANNER_VIEWPORT_TOP_ROW};{rows}r\x1b[?6h\x1b[u")
+}
+
 fn reset_banner_frame() -> &'static str {
     // Reset the scroll region in case an older banner repaint left it active.
     "\x1b[s\x1b[?6l\x1b[r\x1b[0m\x1b[1;1H\x1b[2K\x1b[u"
@@ -567,6 +573,9 @@ async fn repaint_banner<W>(writer: &mut W, banner: &AttachBannerRuntime) -> Resu
 where
     W: AsyncWrite + Unpin,
 {
+    writer
+        .write_all(render_banner_viewport_repaint_frame(banner.terminal_size.1).as_bytes())
+        .await?;
     writer
         .write_all(render_banner_frame(banner.terminal_size.0, &banner.snapshot).as_bytes())
         .await?;
@@ -1335,6 +1344,35 @@ mod tests {
         assert!(
             !frame.contains("\x1b[?6h"),
             "banner repaint must not force DEC origin mode on the session: {frame:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_banner_repaint_reasserts_viewport_before_drawing_top_row() {
+        let mut snapshot = AttachBannerSnapshot::unknown("local", "s-42");
+        snapshot.update_from_session_value(&json!({
+            "id": "s-42",
+            "name": "review branch",
+            "agent": "codex",
+            "state": "running",
+            "activity": "working",
+            "project_label": "ui"
+        }));
+        let banner = AttachBannerRuntime {
+            snapshot,
+            terminal_size: (120, 40),
+            repaint_interval: DEFAULT_BANNER_REPAINT_INTERVAL,
+        };
+        let mut output = Vec::new();
+
+        repaint_banner(&mut output, &banner)
+            .await
+            .expect("repaint banner");
+        let frame = String::from_utf8(output).expect("banner frame is utf8");
+
+        assert!(
+            frame.starts_with("\x1b[s\x1b[?6l\x1b[2;40r\x1b[?6h\x1b[u\x1b7\x1b[?6l\x1b[1;1H"),
+            "banner repaint must restore the reserved viewport before drawing the banner: {frame:?}"
         );
     }
 

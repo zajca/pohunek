@@ -3907,6 +3907,27 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    fn temp_agent_that_exits_then_resumes(tag: &str, marker: &std::path::Path) -> PathBuf {
+        let runtime = temp_dir(&format!("{tag}-runtime"));
+        let script = runtime.join("resume-agent");
+        write_executable(
+            &script,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\ncase \" $* \" in *\" --resume \"*) sleep 30 ;; *) sleep 0.2; exit 0 ;; esac\n",
+                marker.display()
+            ),
+        );
+        temp_agents_dir_with(
+            tag,
+            "resumable",
+            &format!(
+                "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"sonnet\"]\n",
+                script.display()
+            ),
+        )
+    }
+
     fn resumable_params() -> SessionNewParams {
         SessionNewParams {
             name: None,
@@ -4162,6 +4183,57 @@ mod tests {
                 .is_empty(),
             "stopped session must not leave a resume binding"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_session_can_be_explicitly_resumed_with_same_id() {
+        let store_path = temp_store_path("manual-resume");
+        let marker = temp_dir("manual-resume-marker").join("argv.txt");
+        let agents_dir = temp_agent_that_exits_then_resumes("manual-resume", &marker);
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path),
+            agents_dir: Some(agents_dir),
+            socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
+            ..SessionRegistryConfig::default()
+        });
+
+        let created = registry
+            .create(resumable_params())
+            .await
+            .expect("create session");
+        let recorded = registry
+            .report_native_id(SessionReportNativeIdParams {
+                session_id: created.id.clone(),
+                agent: "claude".to_owned(),
+                native_session_id: "native-manual".to_owned(),
+                transcript_path: None,
+            })
+            .await;
+        assert!(recorded.recorded, "native id captured");
+
+        let done = registry
+            .wait_for_exit(&created.id, Duration::from_secs(2))
+            .await
+            .expect("session exits");
+        assert_eq!(done.state, SessionState::Done);
+
+        let resumed = registry
+            .resume(&created.id)
+            .await
+            .expect("resume terminal session");
+        assert_eq!(resumed.id, created.id);
+        assert_eq!(resumed.state, SessionState::Running);
+        assert_eq!(resumed.native_session_id.as_deref(), Some("native-manual"));
+
+        let argv = wait_for_file_contains(&marker, "native-manual").await;
+        assert!(
+            argv.contains("--resume") && argv.contains("native-manual"),
+            "resume argv must target the captured native id: {argv:?}"
+        );
+
+        let _ = registry.stop(&created.id).await;
     }
 
     #[tokio::test]

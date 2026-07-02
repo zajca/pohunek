@@ -17,7 +17,7 @@ use protocol::{
     ProjectRenameParams, ProjectShowParams, ProtocolError, Request, Response, SessionAttachParams,
     SessionDetachParams, SessionId, SessionInputParams, SessionListParams, SessionNewParams,
     SessionNewResult, SessionRenameParams, SessionReportNativeIdParams, SessionResizeParams,
-    SessionSetMetadataParams, WorktreeRemoveParams, PROTOCOL_VERSION,
+    SessionResumeResult, SessionSetMetadataParams, WorktreeRemoveParams, PROTOCOL_VERSION,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -155,6 +155,7 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::SESSION_LIST => handle_session_list(request, &state.sessions).await,
         method::SESSION_INSPECT => handle_session_inspect(request, &state.sessions).await,
         method::SESSION_STOP => handle_session_stop(request, &state.sessions).await,
+        method::SESSION_RESUME => handle_session_resume(request, &state.sessions).await,
         method::SESSION_REMOVE => handle_session_remove(request, &state.sessions).await,
         method::SESSION_ATTACH => handle_session_attach(request, &state.sessions).await,
         method::SESSION_DETACH => handle_session_detach(request, &state.sessions).await,
@@ -551,6 +552,17 @@ async fn handle_session_stop(request: &Request, sessions: &SessionRegistry) -> R
     };
     match sessions.stop(&id).await {
         Ok(result) => ok_value(request, &result),
+        Err(err) => Response::err(request.id.clone(), err),
+    }
+}
+
+async fn handle_session_resume(request: &Request, sessions: &SessionRegistry) -> Response {
+    let id = match parse_params::<SessionId>(request) {
+        Ok(id) => id,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    match sessions.resume(&id).await {
+        Ok(session) => ok_value(request, &SessionResumeResult { session }),
         Err(err) => Response::err(request.id.clone(), err),
     }
 }

@@ -39,5 +39,13 @@ attached terminal sees that unexpected stream close, `pohunek attach` waits for
 the restarted daemon to resume the same session id and reconnects if it becomes
 running again.
 
+An in-memory terminal session (`stopped`, `done`, or `failed`) that still carries
+captured native resume metadata can be explicitly relaunched with `session.resume`.
+The daemon reuses the same pohunek session id and rebuilds the agent's native
+resume argv from the frozen launch profile. The GUI's "Open in terminal" action
+uses this before attaching, so a finished resumable session opens as a live PTY
+instead of flashing a terminal that immediately exits. A removed session is gone
+and cannot be resumed.
+
 For project-aware work, prefer a registered project or repository target over an
 ad hoc directory. See [projects](projects.md) and [worktrees](worktrees.md).

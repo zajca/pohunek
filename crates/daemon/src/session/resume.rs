@@ -2,9 +2,9 @@
 
 use super::{
     agent_not_resumable, base_resume_template, default_program, info, input_rules_for_agent,
-    is_terminal, resume_pty_command_from_template, runtime_error, warn, LaunchOpts, Ordering,
-    PathBuf, ProtocolError, PtySessionSpec, ResumeBinding, ResumeTemplate, SessionId, SessionInfo,
-    SessionRef, SessionRefKind, SessionRegistry,
+    is_terminal, resume_pty_command_from_template, runtime_error, session_not_found, warn,
+    LaunchOpts, Ordering, PathBuf, ProtocolError, PtySessionSpec, ResumeBinding, ResumeTemplate,
+    SessionEntry, SessionId, SessionInfo, SessionRef, SessionRefKind, SessionRegistry,
 };
 
 /// Frozen structural relaunch snapshot for a session (Part C, C.4).
@@ -59,33 +59,7 @@ impl SessionRegistry {
                 {
                     return None;
                 }
-                Some(ResumeBinding {
-                    session_id: id.0.clone(),
-                    name: entry.info.name.clone(),
-                    agent: entry.info.agent.clone(),
-                    agent_base: entry.info.agent_base,
-                    cwd: entry.info.cwd.clone(),
-                    cols: entry.info.cols,
-                    rows: entry.info.rows,
-                    native_session_id: entry.info.native_session_id.clone(),
-                    native_session_path: entry.info.native_session_path.clone(),
-                    // Capture the project context so resume restores it without
-                    // re-detecting (F5): a restart reads these back verbatim.
-                    project_id: entry.info.project_id.clone(),
-                    is_linked_worktree: entry.info.is_linked_worktree,
-                    metadata: entry.info.metadata.clone(),
-                    // Structural relaunch snapshot (C.4): copied verbatim from the
-                    // frozen entry snapshot on EVERY persist (creation, native-id
-                    // capture, the hot resize path), so a resize re-persist can never
-                    // overwrite the launch-time shape. `env` is intentionally absent —
-                    // it is re-resolved by agent name at resume (no secrets in store).
-                    program: entry.snapshot.program.clone(),
-                    args: entry.snapshot.args.clone(),
-                    input_rules: entry.input_rules.into(),
-                    resume_mode: entry.snapshot.resume.map(|template| template.mode),
-                    ref_kind: entry.snapshot.resume.map(|template| template.ref_kind),
-                    resumable: entry.snapshot.resume.is_some(),
-                })
+                Some(Self::resume_binding_from_entry(id, entry))
             })
         };
         let result = match &desired {
@@ -156,6 +130,69 @@ impl SessionRegistry {
                     }
                 }
             }
+        }
+    }
+
+    /// Relaunch a terminal session from its in-memory resume metadata.
+    ///
+    /// A plain attach requires a live PTY. When a resumable agent exits normally,
+    /// the daemon keeps the terminal session entry visible in memory with its
+    /// captured native reference, so an explicit user action can relaunch it with
+    /// the same pohunek session id. This path intentionally does not auto-resume
+    /// sessions that were removed from memory by a daemon restart; startup resume
+    /// continues to use the persisted binding store.
+    ///
+    /// # Errors
+    ///
+    /// Returns `session_not_found` for an unknown id, `session_not_terminal` for a
+    /// still-live session, `not_resumable` when the terminal entry lacks the
+    /// native reference required by its frozen resume template, or any PTY launch
+    /// error from the relaunch.
+    pub async fn resume(&self, id: &SessionId) -> Result<SessionInfo, ProtocolError> {
+        let binding = {
+            let sessions = self.inner.sessions.lock().await;
+            let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
+            if !is_terminal(entry.info.state) {
+                return Err(runtime_error(
+                    "session_not_terminal",
+                    format!("session is not terminal: {}", id.0),
+                ));
+            }
+            Self::resume_binding_from_entry(id, entry)
+        };
+
+        let info = self.resume_binding(binding).await?;
+        self.persist_resume_binding(&info.id).await;
+        Ok(info)
+    }
+
+    fn resume_binding_from_entry(id: &SessionId, entry: &SessionEntry) -> ResumeBinding {
+        ResumeBinding {
+            session_id: id.0.clone(),
+            name: entry.info.name.clone(),
+            agent: entry.info.agent.clone(),
+            agent_base: entry.info.agent_base,
+            cwd: entry.info.cwd.clone(),
+            cols: entry.info.cols,
+            rows: entry.info.rows,
+            native_session_id: entry.info.native_session_id.clone(),
+            native_session_path: entry.info.native_session_path.clone(),
+            // Capture the project context so resume restores it without
+            // re-detecting (F5): a restart reads these back verbatim.
+            project_id: entry.info.project_id.clone(),
+            is_linked_worktree: entry.info.is_linked_worktree,
+            metadata: entry.info.metadata.clone(),
+            // Structural relaunch snapshot (C.4): copied verbatim from the frozen
+            // entry snapshot on EVERY persist and on explicit resume, so neither a
+            // resize re-persist nor a terminal relaunch can overwrite the
+            // launch-time shape. `env` is intentionally absent — it is re-resolved
+            // by agent name at resume (no secrets in store).
+            program: entry.snapshot.program.clone(),
+            args: entry.snapshot.args.clone(),
+            input_rules: entry.input_rules.into(),
+            resume_mode: entry.snapshot.resume.map(|template| template.mode),
+            ref_kind: entry.snapshot.resume.map(|template| template.ref_kind),
+            resumable: entry.snapshot.resume.is_some(),
         }
     }
 

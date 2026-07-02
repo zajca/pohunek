@@ -11,8 +11,10 @@ intents: [setup, debug, help]
 
 `pohunek-gui` is the native desktop control plane. It lists hosts, sessions,
 projects, worktrees, and agent state through the Rust SDK. It does not embed a
-terminal: opening a session delegates to the user's terminal by spawning the
-configured `attach_command`.
+terminal: opening a live session delegates to the user's terminal by spawning the
+configured `attach_command`. Opening a terminal session first calls
+`session.resume` when native resume metadata is present, then attaches to the
+relaunched PTY.
 
 Use this guide when the user asks to configure or debug the GUI.
 
@@ -97,6 +99,7 @@ The GUI must use existing daemon methods:
 - `project.remove`
 - `session.new`
 - `session.inspect`
+- `session.resume`
 - `session.stop`
 - `session.remove`
 - `session.set_metadata`

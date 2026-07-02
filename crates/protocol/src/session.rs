@@ -470,6 +470,13 @@ pub struct SessionStopResult {
     pub stopped: bool,
 }
 
+/// Result returned by `session.resume`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionResumeResult {
+    /// Relaunched session summary.
+    pub session: SessionInfo,
+}
+
 /// Result returned by `session.remove`.
 ///
 /// Removal is the one operation that makes a session truly disappear from the

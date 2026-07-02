@@ -64,7 +64,7 @@ pub use session::{
     SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
     SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams, SessionNewResult,
     SessionRemoveResult, SessionRenameParams, SessionRenameResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeResult,
     SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
     SessionWarning, SessionWarningKind,
 };
@@ -90,6 +90,8 @@ pub mod method {
     pub const SESSION_LIST: &str = "session.list";
     pub const SESSION_INSPECT: &str = "session.inspect";
     pub const SESSION_STOP: &str = "session.stop";
+    /// Relaunch a terminal session from its captured native resume metadata.
+    pub const SESSION_RESUME: &str = "session.resume";
     /// Evict a session from the registry, stopping it first if still live.
     /// Returns a [`SessionRemoveResult`](crate::SessionRemoveResult).
     pub const SESSION_REMOVE: &str = "session.remove";

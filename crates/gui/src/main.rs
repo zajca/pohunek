@@ -25,13 +25,13 @@ use pohunek_gui_core::{
     launch_provider_item_with_options, list_project_actions_with_options, preview_action_prompt,
     providers, remove_session_with_options, remove_worktree_with_options,
     rename_project_with_options, rename_session_with_options, resolve_project_action_with_options,
-    session_link_metadata, session_metadata_rows, set_session_metadata_with_options,
-    show_project_with_options, spawn_attach_command, stop_session_with_options,
-    AttachCommandSpawner, AttachTemplateValues, ConnState, ConnectionOptions, GitHubProviderScope,
-    GitHubPullRequestStatusKey, HostConfig, HostId, Message as CoreMessage, NotificationIntent,
-    ProviderLaunchItem, ProviderLaunchParams, ProviderOperation, ProviderPanel, ProviderRequestId,
-    Selection, SessionLinkKind, SessionLinkProvider, Toast, TreeNodeId, UiState, WindowSize,
-    Workspace,
+    resume_session_with_options, session_link_metadata, session_metadata_rows,
+    set_session_metadata_with_options, show_project_with_options, spawn_attach_command,
+    stop_session_with_options, AttachCommandSpawner, AttachTemplateValues, ConnState,
+    ConnectionOptions, GitHubProviderScope, GitHubPullRequestStatusKey, HostConfig, HostId,
+    Message as CoreMessage, NotificationIntent, ProviderLaunchItem, ProviderLaunchParams,
+    ProviderOperation, ProviderPanel, ProviderRequestId, Selection, SessionLinkKind,
+    SessionLinkProvider, Toast, TreeNodeId, UiState, WindowSize, Workspace,
 };
 use protocol::{
     AgentActivity, ProjectActionParams, ProjectActionsParams, ProjectAddParams, ProjectInfo,
@@ -837,13 +837,16 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         }
         Message::CoreCommandCompleted(result) => match result {
             Ok(message) => {
-                // A newly created session (manual Start or a provider launch) opens
-                // straight into a terminal, the same as double-clicking it.
-                let new_session = if let CoreMessage::SessionCreated { host_id, session } = &message
-                {
-                    Some((host_id.clone(), session.id.clone()))
-                } else {
-                    None
+                // A newly created or explicitly resumed session opens straight
+                // into a terminal, the same as double-clicking a live session.
+                let opened_session = match &message {
+                    CoreMessage::SessionCreated { host_id, session } => {
+                        Some((host_id.clone(), session.id.clone()))
+                    }
+                    CoreMessage::SessionResumed { host_id, result } => {
+                        Some((host_id.clone(), result.session.id.clone()))
+                    }
+                    _ => None,
                 };
                 // A removed session is gone from the workspace, so clear a
                 // selection still pointing at it to avoid a stale detail pane.
@@ -870,7 +873,7 @@ fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                         app.ui_state.selection = None;
                     }
                 }
-                if let Some((host_id, session_id)) = new_session {
+                if let Some((host_id, session_id)) = opened_session {
                     match attach_task(app, &host_id, &session_id) {
                         Ok(task) => tasks.push(task),
                         Err(err) => app.status = Some(err),
@@ -1146,6 +1149,26 @@ fn remove_selected_session_task(app: &PohunekApp) -> Result<Task<Message>, Strin
                     session_id,
                     result,
                 })
+                .map_err(|err| err.to_string())
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn resume_session_task(
+    app: &PohunekApp,
+    host_id: &HostId,
+    session_id: &SessionId,
+) -> Result<Task<Message>, String> {
+    let host = host_config(app, host_id)?;
+    let host_id = host_id.clone();
+    let session_id = session_id.clone();
+    let options = connection_options(app)?;
+    Ok(Task::perform(
+        runtime::perform(async move {
+            resume_session_with_options(&host, &session_id, options)
+                .await
+                .map(|result| CoreMessage::SessionResumed { host_id, result })
                 .map_err(|err| err.to_string())
         }),
         Message::CoreCommandCompleted,
@@ -3781,19 +3804,37 @@ fn spawn_attach(template: &str, values: &AttachTemplateValues) -> Result<(), Str
     spawn_attach_command(&mut spawner, template, values).map(|_| ())
 }
 
-/// Build the task that opens a session in a terminal via the configured attach
-/// command. Shared by the "Open in terminal" button, the worktree "Open" action
-/// and the session-row double-click.
+/// Build the task that opens a session in a terminal.
+///
+/// Live sessions spawn the configured attach command immediately. Terminal
+/// sessions first ask the daemon to relaunch from native resume metadata; the
+/// command-completion path then calls this again and attaches to the live PTY.
 fn attach_task(
     app: &PohunekApp,
     host_id: &HostId,
     session_id: &SessionId,
 ) -> Result<Task<Message>, String> {
+    if session_requires_resume_before_attach(app, host_id, session_id) {
+        return resume_session_task(app, host_id, session_id);
+    }
+
     let (template, values) = app.attach_values(host_id, session_id)?;
     Ok(Task::perform(
         async move { spawn_attach(&template, &values) },
         Message::AttachSpawned,
     ))
+}
+
+fn session_requires_resume_before_attach(
+    app: &PohunekApp,
+    host_id: &HostId,
+    session_id: &SessionId,
+) -> bool {
+    app.workspace
+        .hosts
+        .get(host_id)
+        .and_then(|host| host.sessions.get(&session_id.0))
+        .is_some_and(|session| session.state.is_terminal())
 }
 
 fn spawn_notification(command: &str, intent: &NotificationIntent) -> Result<(), String> {
@@ -4289,6 +4330,93 @@ fn require_env(key: &'static str) -> Result<String, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_session(id: &str, state: protocol::SessionState) -> SessionInfo {
+        SessionInfo {
+            name: None,
+            id: SessionId(id.to_owned()),
+            agent: "codex".to_owned(),
+            agent_base: protocol::AgentKind::Codex,
+            cwd: PathBuf::from("/tmp/project"),
+            pid: 42,
+            cols: 80,
+            rows: 24,
+            state,
+            state_source: protocol::StateSource::Process,
+            activity: None,
+            native_session_id: Some("native-1".to_owned()),
+            native_session_path: None,
+            project_id: None,
+            project_label: None,
+            metadata: BTreeMap::new(),
+            is_linked_worktree: Some(false),
+            repo: None,
+            branch: None,
+            worktree_path: None,
+            warnings: Vec::new(),
+            created_at: "2026-06-29T00:00:00Z".to_owned(),
+            updated_at: "2026-06-29T00:00:00Z".to_owned(),
+            exit_code: None,
+        }
+    }
+
+    fn app_with_session(host_id: &HostId, session: SessionInfo) -> PohunekApp {
+        let mut host = pohunek_gui_core::HostView {
+            conn: ConnState::Connected,
+            health: None,
+            sessions: BTreeMap::new(),
+            projects: BTreeMap::new(),
+            project_details: BTreeMap::new(),
+            prompt: pohunek_gui_core::PromptState::default(),
+            provider: pohunek_gui_core::ProviderState::default(),
+            last_agent_state: None,
+            last_error: None,
+        };
+        host.sessions.insert(session.id.0.clone(), session);
+
+        let mut app = PohunekApp {
+            workspace: Workspace::default(),
+            config: Err("test config is intentionally absent".to_owned()),
+            hosts: Vec::new(),
+            ui_state: UiState::default(),
+            start: StartForm::default(),
+            assistant: AssistantForm::default(),
+            prompt_editor: text_editor::Content::new(),
+            assistant_editor: text_editor::Content::new(),
+            template_recipe: None,
+            modal: ModalView::None,
+            activity_filter: None,
+            metadata_edit: MetadataEdit::default(),
+            rename_edit: String::new(),
+            project_edit: ProjectEdit::default(),
+            selected_action: None,
+            project_filters: BTreeMap::new(),
+            last_session_click: None,
+            state_dir: None,
+            status: None,
+            notified_intents: 0,
+        };
+        app.workspace.hosts.insert(host_id.clone(), host);
+        app
+    }
+
+    #[test]
+    fn terminal_session_resumes_before_attach() {
+        let host_id = HostId::new("local");
+        let stopped = test_session("s-1", protocol::SessionState::Stopped);
+        let running = test_session("s-2", protocol::SessionState::Running);
+
+        assert!(session_requires_resume_before_attach(
+            &app_with_session(&host_id, stopped.clone()),
+            &host_id,
+            &stopped.id
+        ));
+        assert!(!session_requires_resume_before_attach(
+            &app_with_session(&host_id, running.clone()),
+            &host_id,
+            &running.id
+        ));
+    }
 
     #[test]
     fn selected_project_identity_ignores_manual_project_reference() {

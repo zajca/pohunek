@@ -23,8 +23,8 @@ use protocol::{
     ProjectRemoveResult, ProjectRenameParams, ProjectShowParams, ProjectShowResult,
     ProtocolVersion, ProviderKind, Request, SessionId, SessionInfo, SessionNewParams,
     SessionNewResult, SessionRemoveResult, SessionRenameParams, SessionRenameResult,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
-    StateSource, WorktreeRemoveParams, WorktreeRemoveResult,
+    SessionResumeResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
+    SessionStopResult, StateSource, WorktreeRemoveParams, WorktreeRemoveResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -622,6 +622,10 @@ pub enum Message {
         host_id: HostId,
         session: SessionInfo,
     },
+    SessionResumed {
+        host_id: HostId,
+        result: SessionResumeResult,
+    },
     SessionStopCompleted {
         host_id: HostId,
         session_id: SessionId,
@@ -1210,6 +1214,14 @@ impl Workspace {
                     .hosts
                     .entry(host_id)
                     .or_insert_with(HostView::connecting);
+                host.sessions.insert(session.id.0.clone(), session);
+            }
+            Message::SessionResumed { host_id, result } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                let session = result.session;
                 host.sessions.insert(session.id.0.clone(), session);
             }
             Message::SessionStopCompleted {
@@ -2034,6 +2046,30 @@ pub async fn inspect_session_with_options(
         options,
         "gui-session-inspect",
         method::SESSION_INSPECT,
+        serde_json::to_value(session_id)?,
+    )
+    .await
+}
+
+/// Resume a terminal session on a host through the SDK.
+pub async fn resume_session(
+    config: &HostConfig,
+    session_id: &SessionId,
+) -> Result<SessionResumeResult, CoreError> {
+    resume_session_with_options(config, session_id, ConnectionOptions::default()).await
+}
+
+/// Resume a terminal session with explicit connection options.
+pub async fn resume_session_with_options(
+    config: &HostConfig,
+    session_id: &SessionId,
+    options: ConnectionOptions,
+) -> Result<SessionResumeResult, CoreError> {
+    request_host_json(
+        config,
+        options,
+        "gui-session-resume",
+        method::SESSION_RESUME,
         serde_json::to_value(session_id)?,
     )
     .await
@@ -3170,6 +3206,30 @@ mod tests {
 
         let host = workspace.hosts.get(&HostId::new("local")).expect("host");
         assert!(host.sessions.contains_key("s-1"));
+    }
+
+    #[test]
+    fn session_resumed_replaces_terminal_snapshot() {
+        let mut stopped = session("s-1", None);
+        stopped.state = SessionState::Stopped;
+        let mut resumed = stopped.clone();
+        resumed.state = SessionState::Running;
+        resumed.pid = 99;
+
+        let mut workspace = Workspace::default();
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot("local", vec![stopped]),
+        });
+
+        workspace.apply(Message::SessionResumed {
+            host_id: HostId::new("local"),
+            result: SessionResumeResult { session: resumed },
+        });
+
+        let host = workspace.hosts.get(&HostId::new("local")).expect("host");
+        let session = host.sessions.get("s-1").expect("resumed session");
+        assert_eq!(session.state, SessionState::Running);
+        assert_eq!(session.pid, 99);
     }
 
     #[test]

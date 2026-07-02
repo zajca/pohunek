@@ -1,5 +1,10 @@
 # Knowledge Bundle Log
 
+## 0.7.2
+
+- Documented explicit `session.resume` and the GUI "Open in terminal" behavior
+  for terminal sessions with native resume metadata.
+
 ## 0.7.1
 
 - Documented that release archives include the native `pohunek-gui` binary and

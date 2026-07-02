@@ -124,6 +124,7 @@ All params and result type names below refer to structs exported by
 | `session.list` | `SessionListParams` or `null` | `Vec<SessionInfo>` | Lists sessions; filters use AND semantics. |
 | `session.inspect` | `SessionId` | `SessionInfo` | `SessionId` is a JSON string, e.g. `"s-1"`. |
 | `session.stop` | `SessionId` | `SessionStopResult` | Stops a live session (the entry stays in `list`). |
+| `session.resume` | `SessionId` | `SessionResumeResult` | Relaunches a terminal session from captured native resume metadata, reusing the same session id. Live sessions return `session_not_terminal`; terminal sessions without native metadata return `not_resumable` or `agent_not_resumable`. |
 | `session.remove` | `SessionId` | `SessionRemoveResult` | Evicts a session from the registry, stopping it first if still live. Unknown id is `session_not_found`. |
 | `session.attach` | `SessionAttachParams` | `SessionAttachResult` | Mints a one-shot attach stream id. |
 | `session.detach` | `SessionDetachParams` | `SessionDetachResult` | Cancels an active attach stream. Unknown streams return `detached: false`. |
@@ -224,7 +225,7 @@ Canonical public codes currently emitted include:
 | `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback` |
 | `transport` | `framing`, `host_unreachable` |
 | `discovery` | `netbird_cli_missing`, `netbird_state_unavailable`, `host_unknown`, `remote_discovery_failed` |
-| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_exit_timeout`, `attach_not_found`, `attach_expired`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug` |
+| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_exit_timeout`, `attach_not_found`, `attach_expired`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug` |
 
 Clients must not parse `msg`. Branch on `class` and `code`, then display `msg`
 and `recover` for unknown codes.
@@ -242,7 +243,7 @@ The daemon then writes these events:
 
 | Event | Payload | Meaning |
 |---|---|---|
-| `session_created` | `{session: SessionInfo}` | A session was created. |
+| `session_created` | `{session: SessionInfo}` | A session was created or explicitly resumed into a new live PTY. |
 | `session_updated` | `{session: SessionInfo}` | Session metadata, state, resize, resume binding, or terminal state changed. |
 | `session_stopped` | `{session: SessionInfo}` | A user-requested stop completed. |
 | `session_removed` | `{session: SessionInfo}` | A session was evicted from the registry; clients drop it from their view. |
