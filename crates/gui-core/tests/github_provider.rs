@@ -651,12 +651,14 @@ fn write_fake_gh(path: &Path, body: &str) {
 
     std::fs::create_dir_all(path.parent().expect("fake gh path has parent"))
         .expect("create fake gh dir");
-    std::fs::write(path, body).expect("write fake gh script");
-    let mut permissions = std::fs::metadata(path)
+    let tmp_path = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&tmp_path, body).expect("write temporary fake gh script");
+    let mut permissions = std::fs::metadata(&tmp_path)
         .expect("fake gh metadata")
         .permissions();
     permissions.set_mode(0o755);
-    std::fs::set_permissions(path, permissions).expect("chmod fake gh script");
+    std::fs::set_permissions(&tmp_path, permissions).expect("chmod fake gh script");
+    std::fs::rename(&tmp_path, path).expect("install fake gh script");
 }
 
 #[cfg(unix)]
