@@ -12,7 +12,15 @@ path = "src/main.rs"
 
 [dependencies]
 futures = { workspace = true }
-iced = { workspace = true }
+iced = { workspace = true, default-features = false, features = [
+    "wgpu",
+    "tiny-skia",
+    "crisp",
+    "web-colors",
+    "thread-pool",
+    "linux-theme-detection",
+    "wayland",
+] }
 pohunek-gui-core = { workspace = true }
 pohunek-protocol = { workspace = true }
 serde = { workspace = true }

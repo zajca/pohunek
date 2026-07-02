@@ -6,9 +6,10 @@
 mod runtime;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
 use iced::widget::{
@@ -52,8 +53,24 @@ const ASSISTANT_AUTO_AGENT_LABEL: &str = "Auto";
 // A second click on the same session within this window counts as a double-click
 // and opens the session in a terminal (matching the desktop double-click idiom).
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+// Wayland clients discover their compositor through this standard variable.
+const WAYLAND_DISPLAY_ENV: &str = "WAYLAND_DISPLAY";
+// X11 clients use this standard variable; seeing it without Wayland gives a
+// clearer error than letting the window backend fail later.
+const X11_DISPLAY_ENV: &str = "DISPLAY";
 
-pub fn main() -> iced::Result {
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), StartupError> {
+    validate_wayland_environment()?;
     let boot = BootState::load();
     let initial_window_size = boot.ui_state.window_size;
     iced::application(move || PohunekApp::boot(boot.clone()), update, view)
@@ -63,7 +80,62 @@ pub fn main() -> iced::Result {
             window_dimension_to_f32(initial_window_size.width),
             window_dimension_to_f32(initial_window_size.height),
         ))
-        .run()
+        .run()?;
+    Ok(())
+}
+
+#[derive(Debug, Error)]
+enum StartupError {
+    #[error(transparent)]
+    Display(#[from] DisplayServerError),
+    #[error(transparent)]
+    Iced(#[from] iced::Error),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayServerError {
+    MissingWayland,
+    X11WithoutWayland,
+}
+
+impl std::fmt::Display for DisplayServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingWayland => write!(
+                f,
+                "pohunek-gui is Wayland-only; set `{WAYLAND_DISPLAY_ENV}` to a Wayland display before starting it"
+            ),
+            Self::X11WithoutWayland => write!(
+                f,
+                "pohunek-gui is Wayland-only; {X11_DISPLAY_ENV} is set, but {WAYLAND_DISPLAY_ENV} is missing or empty. X11 is not supported"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DisplayServerError {}
+
+fn validate_wayland_environment() -> Result<(), DisplayServerError> {
+    let wayland_display = std::env::var_os(WAYLAND_DISPLAY_ENV);
+    let x11_display = std::env::var_os(X11_DISPLAY_ENV);
+    validate_wayland_display(wayland_display.as_deref(), x11_display.as_deref())
+}
+
+fn validate_wayland_display(
+    wayland_display: Option<&OsStr>,
+    x11_display: Option<&OsStr>,
+) -> Result<(), DisplayServerError> {
+    if has_display_value(wayland_display) {
+        Ok(())
+    } else if has_display_value(x11_display) {
+        Err(DisplayServerError::X11WithoutWayland)
+    } else {
+        Err(DisplayServerError::MissingWayland)
+    }
+}
+
+fn has_display_value(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
 }
 
 #[derive(Debug, Clone)]
@@ -4593,6 +4665,77 @@ mod tests {
         assert!(err
             .to_string()
             .contains("must start with http:// or https://"));
+    }
+
+    #[test]
+    fn gui_manifest_uses_wayland_only_iced_features() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../Cargo.toml")).expect("gui manifest parses");
+        let iced = manifest
+            .get("dependencies")
+            .and_then(toml::Value::as_table)
+            .and_then(|dependencies| dependencies.get("iced"))
+            .expect("iced dependency");
+        let features = iced
+            .get("features")
+            .and_then(toml::Value::as_array)
+            .expect("explicit iced features");
+
+        assert_eq!(
+            iced.get("default-features").and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert!(features
+            .iter()
+            .any(|feature| feature.as_str() == Some("wayland")));
+        assert!(!features
+            .iter()
+            .any(|feature| feature.as_str() == Some("x11")));
+    }
+
+    #[test]
+    fn workspace_iced_dependency_disables_default_features() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../../Cargo.toml")).expect("workspace manifest parses");
+        let iced = manifest
+            .get("workspace")
+            .and_then(toml::Value::as_table)
+            .and_then(|workspace| workspace.get("dependencies"))
+            .and_then(toml::Value::as_table)
+            .and_then(|dependencies| dependencies.get("iced"))
+            .and_then(toml::Value::as_table)
+            .expect("workspace iced dependency config");
+
+        assert_eq!(
+            iced.get("default-features").and_then(toml::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn wayland_guard_accepts_nonempty_wayland_display() {
+        validate_wayland_display(Some(std::ffi::OsStr::new("wayland-1")), None)
+            .expect("wayland display");
+    }
+
+    #[test]
+    fn wayland_guard_rejects_missing_wayland_display() {
+        let err = validate_wayland_display(None, None).expect_err("missing wayland display");
+
+        assert!(err.to_string().contains("WAYLAND_DISPLAY"));
+        assert!(err.to_string().contains("Wayland-only"));
+    }
+
+    #[test]
+    fn wayland_guard_rejects_empty_wayland_display_with_x11_hint() {
+        let err = validate_wayland_display(
+            Some(std::ffi::OsStr::new("")),
+            Some(std::ffi::OsStr::new(":0")),
+        )
+        .expect_err("empty wayland display");
+
+        assert!(err.to_string().contains("DISPLAY is set"));
+        assert!(err.to_string().contains("X11 is not supported"));
     }
 
     #[test]

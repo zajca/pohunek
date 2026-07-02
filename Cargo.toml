@@ -38,7 +38,7 @@ pohunek-knowledge = { path = "crates/knowledge" }
 pohunek-netbird = { path = "crates/netbird" }
 pohunek-prompt = { path = "crates/prompt" }
 pohunek-protocol = { path = "crates/protocol" }
-iced = "0.14"
+iced = { version = "0.14", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

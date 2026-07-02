@@ -29,9 +29,10 @@ Start with the normal local setup checks:
    capabilities.
 
 The GUI also needs a graphical session. On Linux v1 that means a Wayland session
-with a reachable compositor. If `pohunek-gui` fails with a Wayland
-`NoCompositor` error, the process cannot see the user's compositor socket; run it
-from the user's normal desktop shell instead of a restricted sandbox.
+with a reachable compositor. It is Wayland-only: if `WAYLAND_DISPLAY` is missing
+or empty, `pohunek-gui` exits before starting Iced. If `DISPLAY` is set but
+`WAYLAND_DISPLAY` is not, the user is in an X11-only environment and must start
+the GUI from their normal Wayland desktop shell instead.
 
 ## Configuration File
 

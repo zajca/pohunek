@@ -1,5 +1,10 @@
 # Knowledge Bundle Log
 
+## 0.7.3
+
+- Documented that `pohunek-gui` is Wayland-only and fails fast when
+  `WAYLAND_DISPLAY` is missing or empty.
+
 ## 0.7.2
 
 - Documented explicit `session.resume` and the GUI "Open in terminal" behavior
