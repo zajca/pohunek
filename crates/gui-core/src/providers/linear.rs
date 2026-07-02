@@ -455,8 +455,8 @@ impl GraphqlTransport for HttpGraphqlTransport {
         body: Value,
     ) -> TransportFuture<'a> {
         Box::pin(async move {
-            let authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|source| {
+            let authorization =
+                reqwest::header::HeaderValue::from_str(token).map_err(|source| {
                     GraphqlTransportError::new(format!(
                         "failed to build Linear GraphQL authorization header: {source}"
                     ))

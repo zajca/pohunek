@@ -261,6 +261,8 @@ they are plain query strings and `IssueFilter` objects.
 
 Linear uses `token_key` as a keyring entry reference. The GUI reads the token at
 call time through the keyring boundary and must never offer a token input field.
+Store the raw Linear personal API key in that keyring entry; do not prefix it
+with `Bearer`, which Linear reserves for OAuth access tokens.
 `token_timeout_ms` is required when Linear is configured so a stuck keyring
 backend cannot leave the provider task pending forever.
 

@@ -3,14 +3,18 @@
 // Rust guideline compliant 2026-06-26
 #![forbid(unsafe_code)]
 
+use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pohunek_gui_core::providers::linear::{
-    GraphqlTransport, GraphqlTransportError, LinearClient, LinearConfig, LinearError, LinearQuery,
-    TokenError, TokenFuture, TokenSource, TransportFuture,
+    GraphqlTransport, GraphqlTransportError, HttpGraphqlTransport, LinearClient, LinearConfig,
+    LinearError, LinearQuery, TokenError, TokenFuture, TokenSource, TransportFuture,
 };
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 
 const TOKEN_KEY: &str = "linear-token-ref";
 const SECRET_TOKEN: &str = "lin_api_secret_fixture";
@@ -153,6 +157,78 @@ fn issues_response() -> Value {
 
 fn assert_send<T: Send>(_: T) {}
 
+async fn capture_http_graphql_request(
+    response_body: &'static str,
+) -> (String, oneshot::Receiver<String>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind HTTP capture listener");
+    let endpoint = format!(
+        "http://{}",
+        listener
+            .local_addr()
+            .expect("HTTP capture listener address")
+    );
+    let (request_tx, request_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept HTTP request");
+        let request = read_http_request(&mut stream).await;
+        let _ = request_tx.send(request);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write HTTP response");
+    });
+    (endpoint, request_rx)
+}
+
+async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    let mut content_length = None;
+    loop {
+        let read = stream.read(&mut buffer).await.expect("read HTTP request");
+        assert_ne!(read, 0, "HTTP client closed before sending headers");
+        request.extend_from_slice(&buffer[..read]);
+        if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header_len = header_end + 4;
+            if content_length.is_none() {
+                content_length = parse_content_length(&request[..header_len]);
+            }
+            let expected_len = header_len + content_length.unwrap_or(0);
+            if request.len() >= expected_len {
+                break;
+            }
+        }
+    }
+    String::from_utf8(request).expect("HTTP request is UTF-8")
+}
+
+fn parse_content_length(headers: &[u8]) -> Option<usize> {
+    let headers = std::str::from_utf8(headers).expect("HTTP headers are UTF-8");
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse().expect("valid content length"))
+    })
+}
+
+fn authorization_header_value(request: &str) -> &str {
+    request
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("authorization")
+                .then(|| value.trim())
+        })
+        .expect("authorization header")
+}
+
 #[tokio::test]
 async fn list_issues_reads_token_at_call_time_and_builds_query() {
     let tokens = FakeTokenSource::new(SECRET_TOKEN);
@@ -235,6 +311,26 @@ async fn list_issues_reads_token_at_call_time_and_builds_query() {
     assert!(debug.contains("LinearClient"));
     assert!(!debug.contains(SECRET_TOKEN));
     assert!(!debug.contains("rotated_linear_token_fixture"));
+}
+
+#[tokio::test]
+async fn http_transport_uses_personal_api_key_as_authorization_header() {
+    let (endpoint, request_rx) =
+        capture_http_graphql_request(r#"{"data":{"viewer":{"id":"viewer-id"}}}"#).await;
+    let transport = HttpGraphqlTransport::try_new().expect("HTTP transport");
+
+    let response = transport
+        .post_graphql(
+            &endpoint,
+            SECRET_TOKEN,
+            json!({ "query": "{ viewer { id } }" }),
+        )
+        .await
+        .expect("HTTP GraphQL response");
+
+    assert_eq!(response["data"]["viewer"]["id"], "viewer-id");
+    let request = request_rx.await.expect("captured HTTP request");
+    assert_eq!(authorization_header_value(&request), SECRET_TOKEN);
 }
 
 #[tokio::test]
