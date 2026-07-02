@@ -295,21 +295,23 @@ impl PohunekApp {
     }
 }
 
-/// Agent the operator can launch from the GUI. Backed by the protocol
-/// [`AgentKind`] wire strings; rendered in a `pick_list` instead of being typed.
+/// Runtime the operator can launch from the GUI. Backed by the protocol
+/// base-kind wire strings; rendered in a `pick_list` instead of being typed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentChoice {
+    Shell,
     Codex,
     Claude,
 }
 
 impl AgentChoice {
-    /// Selectable agents, in display order.
-    const ALL: [Self; 2] = [Self::Codex, Self::Claude];
+    /// Selectable runtimes, in display order.
+    const ALL: [Self; 3] = [Self::Shell, Self::Codex, Self::Claude];
 
     /// Wire string passed verbatim to `session new --agent`.
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Shell => "shell",
             Self::Codex => "codex",
             Self::Claude => "claude",
         }
@@ -324,7 +326,7 @@ impl std::fmt::Display for AgentChoice {
 
 /// State for the intent-driven "Start session" panel. The project, repo, cwd and
 /// terminal size are derived from the selected project and config rather than
-/// typed; only the agent, an optional initial input and (under Advanced) branch
+/// typed; only the runtime, an optional initial input and (under Advanced) branch
 /// overrides are operator-supplied.
 #[derive(Debug, Clone)]
 struct StartForm {
@@ -398,6 +400,7 @@ impl AgentChoice {
     /// Maps a wire agent string to a selectable choice, defaulting to Codex.
     fn from_wire(value: &str) -> Self {
         match value {
+            "shell" => Self::Shell,
             "claude" => Self::Claude,
             _ => Self::Codex,
         }
@@ -4402,6 +4405,16 @@ fn require_env(key: &'static str) -> Result<String, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_agent_choices_include_shell_runtime() {
+        assert_eq!(
+            AgentChoice::ALL,
+            [AgentChoice::Shell, AgentChoice::Codex, AgentChoice::Claude]
+        );
+        assert_eq!(AgentChoice::Shell.as_str(), "shell");
+        assert_eq!(AgentChoice::from_wire("shell"), AgentChoice::Shell);
+    }
 
     fn test_session(id: &str, state: protocol::SessionState) -> SessionInfo {
         SessionInfo {

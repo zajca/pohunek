@@ -1,5 +1,10 @@
 # Knowledge Bundle Log
 
+## 0.7.4
+
+- Documented that the native GUI `Start session` runtime picker supports the
+  built-in `shell`, `codex`, and `claude` choices.
+
 ## 0.7.3
 
 - Documented that `pohunek-gui` is Wayland-only and fails fast when

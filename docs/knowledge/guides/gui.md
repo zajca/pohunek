@@ -120,6 +120,14 @@ renames an existing session through `session.rename` (and clears it). The displa
 name leads the row in the workspace tree and the Agents monitor, falling back to
 the session id when unset. The name is cosmetic and never changes targeting.
 
+## Session Launch
+
+The native `Start session` modal creates a session on the selected host and
+project through `session.new`. Its runtime picker sends the selected base-kind
+wire string as `agent`; supported built-in choices are `shell`, `codex`, and
+`claude`. `shell` starts the daemon host's configured default shell and uses the
+same plain-shell runtime path as `pohunek session new` without `--agent`.
+
 ## Assistant Launch
 
 The left workspace rail includes an `Assistant` entry above the workspace tree.
