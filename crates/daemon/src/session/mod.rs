@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -257,6 +257,9 @@ struct SessionRegistryInner {
     active_attaches: Mutex<HashMap<String, ActiveAttach>>,
     next_id: AtomicU64,
     next_stream_id: AtomicU64,
+    /// Set when daemon process shutdown starts. Natural PTY exits observed after
+    /// this point are treated as restart fallout, not terminal session state.
+    daemon_shutdown_started: AtomicBool,
     /// Opaque id unique to this daemon process instance, injected into every
     /// session PTY as `POHUNEK_DAEMON_ID` and compared against the attach origin
     /// so the self-feeding-attach guard fires only for this instance's own PTYs
@@ -357,6 +360,7 @@ impl SessionRegistry {
                 active_attaches: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(1),
                 next_stream_id: AtomicU64::new(1),
+                daemon_shutdown_started: AtomicBool::new(false),
                 daemon_instance_id: generate_daemon_instance_id(),
                 config,
                 profiles,
@@ -402,6 +406,22 @@ impl SessionRegistry {
     #[must_use]
     pub fn daemon_instance_id(&self) -> &str {
         &self.inner.daemon_instance_id
+    }
+
+    /// Mark that the daemon process is shutting down.
+    ///
+    /// After this point, background PTY exit watchers may observe child exits
+    /// caused by the daemon closing its PTY handles or by a service manager
+    /// terminating the process tree. Those exits must not clear resume bindings:
+    /// the next daemon instance needs them for startup resume.
+    pub fn begin_daemon_shutdown(&self) {
+        let already_started = self
+            .inner
+            .daemon_shutdown_started
+            .swap(true, Ordering::Relaxed);
+        if !already_started {
+            info!("daemon shutdown started; preserving restart-resume bindings");
+        }
     }
 
     /// The project manager, when the metadata store is configured. Exposed for
@@ -1308,6 +1328,17 @@ impl SessionRegistry {
                 return;
             };
 
+            if self.inner.daemon_shutdown_started.load(Ordering::Relaxed)
+                && !stopped_by_user
+                && !entry.stopping
+            {
+                debug!(
+                    session_id = %id.0,
+                    "ignoring PTY exit observed after daemon shutdown started"
+                );
+                return;
+            }
+
             if entry.info.state == SessionState::Stopped && stopped_by_user && !entry.stopping {
                 return;
             }
@@ -1567,7 +1598,7 @@ mod tests {
     use crate::integration::{
         ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
     };
-    use crate::pty::PtyCommand;
+    use crate::pty::{PtyCommand, PtyExit};
 
     use super::{SessionRegistry, SessionRegistryConfig, ShellCommand, MAX_SESSION_NAME_BYTES};
 
@@ -1660,6 +1691,14 @@ mod tests {
                 marker.display()
             ),
         );
+    }
+
+    #[cfg(unix)]
+    fn terminate_pid(pid: u32) {
+        let _ = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
     }
 
     async fn wait_for_file_contains(path: &std::path::Path, needle: &str) -> String {
@@ -4258,6 +4297,70 @@ mod tests {
                 .expect("load")
                 .is_empty(),
             "stopped session must not leave a resume binding"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_exit_after_daemon_shutdown_starts_keeps_resume_binding() {
+        let store_path = temp_store_path("shutdown-keeps-binding");
+        let agents_dir = temp_resumable_agents_dir("shutdown-keeps-binding");
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path.clone()),
+            agents_dir: Some(agents_dir),
+            ..SessionRegistryConfig::default()
+        });
+
+        let created = registry
+            .create(resumable_params())
+            .await
+            .expect("create session");
+        let recorded = registry
+            .report_native_id(SessionReportNativeIdParams {
+                session_id: created.id.clone(),
+                agent: "claude".to_owned(),
+                native_session_id: "native-shutdown".to_owned(),
+                transcript_path: None,
+            })
+            .await;
+        assert!(recorded.recorded, "native id captured");
+        assert_eq!(
+            crate::store::Store::new(store_path.clone())
+                .load_resume()
+                .expect("load before shutdown")
+                .len(),
+            1,
+            "precondition: captured session has one resume binding"
+        );
+
+        registry.begin_daemon_shutdown();
+        registry
+            .record_exit(
+                &created.id,
+                PtyExit {
+                    exit_code: None,
+                    success: false,
+                },
+                false,
+            )
+            .await;
+
+        let persisted = crate::store::Store::new(store_path)
+            .load_resume()
+            .expect("load after shutdown exit");
+        let _ = registry.stop(&created.id).await;
+        terminate_pid(created.pid);
+
+        assert_eq!(
+            persisted.len(),
+            1,
+            "a PTY exit observed during daemon shutdown must keep the restart-resume binding"
+        );
+        assert_eq!(persisted[0].session_id, created.id.0);
+        assert_eq!(
+            persisted[0].native_session_id.as_deref(),
+            Some("native-shutdown")
         );
     }
 

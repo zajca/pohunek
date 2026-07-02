@@ -122,8 +122,10 @@ async fn run() -> Result<(), DaemonError> {
     //     stop together.
     let (unix_tx, unix_rx) = oneshot::channel::<()>();
     let (remote_tx, remote_rx) = oneshot::channel::<()>();
+    let shutdown_sessions = sessions.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
+        shutdown_sessions.begin_daemon_shutdown();
         let _ = unix_tx.send(());
         let _ = remote_tx.send(());
     });
