@@ -2911,7 +2911,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "pohunek-cli"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "clap",
  "futures",
@@ -2932,7 +2932,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-client"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "futures",
  "pohunek-netbird",
@@ -2945,7 +2945,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-daemon"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "futures",
  "libc",
@@ -2971,7 +2971,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-gui"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "futures",
  "iced",
@@ -2986,7 +2986,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-gui-core"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "futures",
  "keyring",
@@ -3006,7 +3006,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-hostcheck"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "pohunek-netbird",
  "pohunek-protocol",
@@ -3014,7 +3014,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-knowledge"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "include_dir",
  "pohunek-protocol",
@@ -3026,7 +3026,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-netbird"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3035,7 +3035,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-prompt"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "serde_json",
  "thiserror 2.0.18",
@@ -3043,7 +3043,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-protocol"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5483,7 +5483,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.11.2"
+version = "0.12.0"
 dependencies = [
  "clap",
  "pohunek-cli",
