@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use protocol::{
     event, method, Request, SessionAttachParams, SessionAttachResult, SessionDetachParams,
-    SessionId, SessionResizeParams, ENV_DAEMON_ID, ENV_SESSION_ID,
+    SessionId, SessionInfo, SessionResizeParams, SessionState, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
@@ -45,11 +45,40 @@ const SGR_LEFT_BUTTON_PRESS: u16 = 0;
 // Mouse reporting is persistent terminal state; reset paths must disable both.
 const BANNER_MOUSE_ENABLE_FRAME: &str = "\x1b[?1000h\x1b[?1006h";
 const BANNER_MOUSE_DISABLE_FRAME: &str = "\x1b[?1000l\x1b[?1006l";
+/// Default grace window for reattaching after a daemon restart.
+///
+/// Long enough for systemd to restart `pohunekd` and for `load_and_resume` to
+/// relaunch captured sessions, but short enough that a non-resumable shell does
+/// not leave a dead attach terminal hanging indefinitely. Operators can override
+/// it in `launcher.conf`; zero disables reconnect.
+const DEFAULT_ATTACH_RECONNECT_WINDOW: Duration = Duration::from_secs(20);
+/// Poll interval while waiting for a daemon restart/resume after attach EOF.
+///
+/// A half-second cadence keeps reconnect responsive without turning a restart
+/// outage into a tight socket-dial loop. Operators can override it in
+/// `launcher.conf`.
+const DEFAULT_ATTACH_RECONNECT_INTERVAL: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttachReconnectConfig {
+    window: Duration,
+    interval: Duration,
+}
+
+impl Default for AttachReconnectConfig {
+    fn default() -> Self {
+        Self {
+            window: DEFAULT_ATTACH_RECONNECT_WINDOW,
+            interval: DEFAULT_ATTACH_RECONNECT_INTERVAL,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AttachBannerConfig {
     enabled: bool,
     repaint_interval: Duration,
+    reconnect: AttachReconnectConfig,
 }
 
 impl AttachBannerConfig {
@@ -57,6 +86,7 @@ impl AttachBannerConfig {
         Self {
             enabled: false,
             repaint_interval: DEFAULT_BANNER_REPAINT_INTERVAL,
+            reconnect: AttachReconnectConfig::default(),
         }
     }
 
@@ -83,8 +113,28 @@ impl AttachBannerConfig {
             match key.trim() {
                 "banner" => config.enabled = parse_bool(value.trim(), &path, number + 1)?,
                 "banner_interval_seconds" => {
-                    config.repaint_interval =
-                        parse_duration_seconds(value.trim(), &path, number + 1)?;
+                    config.repaint_interval = parse_positive_duration_seconds(
+                        "banner_interval_seconds",
+                        value.trim(),
+                        &path,
+                        number + 1,
+                    )?;
+                }
+                "attach_reconnect_seconds" => {
+                    config.reconnect.window = parse_nonnegative_duration_seconds(
+                        "attach_reconnect_seconds",
+                        value.trim(),
+                        &path,
+                        number + 1,
+                    )?;
+                }
+                "attach_reconnect_interval_seconds" => {
+                    config.reconnect.interval = parse_positive_duration_seconds(
+                        "attach_reconnect_interval_seconds",
+                        value.trim(),
+                        &path,
+                        number + 1,
+                    )?;
                 }
                 _ => {}
             }
@@ -222,8 +272,36 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
     // attach, and the daemon-id pairing prevents a false positive against a
     // different daemon that reuses the same session-id string.
     let (origin_session_id, origin_daemon_id) = self_feedback_origin();
-    let attach_request = build_attach_request(target, origin_session_id, origin_daemon_id)?;
     let banner_config = AttachBannerConfig::load(paths)?;
+
+    loop {
+        let end = run_attach_once(
+            host,
+            paths,
+            target,
+            origin_session_id.clone(),
+            origin_daemon_id.clone(),
+            banner_config.clone(),
+        )
+        .await?;
+        if end != AttachStreamEnd::StreamClosed || banner_config.reconnect.window.is_zero() {
+            return Ok(());
+        }
+        if !wait_for_attach_reconnect(host, paths, target, &banner_config.reconnect).await? {
+            return Ok(());
+        }
+    }
+}
+
+async fn run_attach_once(
+    host: &str,
+    paths: &Paths,
+    target: &Target,
+    origin_session_id: Option<SessionId>,
+    origin_daemon_id: Option<String>,
+    banner_config: AttachBannerConfig,
+) -> Result<AttachStreamEnd, CliError> {
+    let attach_request = build_attach_request(target, origin_session_id, origin_daemon_id)?;
     let mut client = Client::connect(host, paths).await?;
     let result = client.request(&attach_request).await?;
     let attach: SessionAttachResult = serde_json::from_value(result)?;
@@ -261,6 +339,14 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachStreamEnd {
+    Detached,
+    InputClosed,
+    SessionStopped,
+    StreamClosed,
+}
+
 /// Push an initial resize, then bridge the terminal and the stream until
 /// detach/EOF — generic over the transport.
 ///
@@ -274,7 +360,7 @@ async fn attach_over_stream<S>(
     paths: &Paths,
     target: &Target,
     banner_config: AttachBannerConfig,
-) -> Result<(), CliError>
+) -> Result<AttachStreamEnd, CliError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -377,6 +463,13 @@ fn build_detach_request(stream_id: &str) -> Result<Request, CliError> {
         &SessionDetachParams {
             stream_id: stream_id.to_owned(),
         },
+    )
+}
+
+fn build_inspect_request(target: &Target) -> Result<Request, CliError> {
+    request_with_params(
+        method::SESSION_INSPECT,
+        &SessionId(target.session_id.clone()),
     )
 }
 
@@ -589,7 +682,12 @@ fn parse_bool(value: &str, path: &Path, number: usize) -> Result<bool, CliError>
     }
 }
 
-fn parse_duration_seconds(value: &str, path: &Path, number: usize) -> Result<Duration, CliError> {
+fn parse_positive_duration_seconds(
+    key: &str,
+    value: &str,
+    path: &Path,
+    number: usize,
+) -> Result<Duration, CliError> {
     let seconds = value.parse::<f64>().map_err(|err| {
         config_error(format!(
             "{}:{number}: invalid duration value {value:?}: {err}",
@@ -598,7 +696,28 @@ fn parse_duration_seconds(value: &str, path: &Path, number: usize) -> Result<Dur
     })?;
     if !seconds.is_finite() || seconds <= 0.0 {
         return Err(config_error(format!(
-            "{}:{number}: banner_interval_seconds must be greater than zero",
+            "{}:{number}: {key} must be greater than zero",
+            path.display()
+        )));
+    }
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+fn parse_nonnegative_duration_seconds(
+    key: &str,
+    value: &str,
+    path: &Path,
+    number: usize,
+) -> Result<Duration, CliError> {
+    let seconds = value.parse::<f64>().map_err(|err| {
+        config_error(format!(
+            "{}:{number}: invalid duration value {value:?}: {err}",
+            path.display()
+        ))
+    })?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(config_error(format!(
+            "{}:{number}: {key} must be zero or greater",
             path.display()
         )));
     }
@@ -625,7 +744,7 @@ async fn forward_attached_stream<S>(
     target: &Target,
     mut banner: Option<AttachBannerRuntime>,
     mut banner_updates: Option<mpsc::UnboundedReceiver<AttachBannerSnapshot>>,
-) -> Result<(), CliError>
+) -> Result<AttachStreamEnd, CliError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -648,7 +767,7 @@ where
                 let bytes_read = read?;
                 if bytes_read == 0 {
                     reset_banner_if_active(&mut stdout, banner.is_some()).await?;
-                    return Ok(());
+                    return Ok(AttachStreamEnd::StreamClosed);
                 }
                 stdout.write_all(&socket_buf[..bytes_read]).await?;
                 stdout.flush().await?;
@@ -659,7 +778,7 @@ where
                 if bytes_read == 0 {
                     socket_write.shutdown().await?;
                     reset_banner_if_active(&mut stdout, banner.is_some()).await?;
-                    return Ok(());
+                    return Ok(AttachStreamEnd::InputClosed);
                 }
 
                 if let Some(detach_at) = stdin_buf[..bytes_read]
@@ -673,7 +792,7 @@ where
                     terminal.take();
                     let _ = send_detach(&mut client, &stream_id).await;
                     reset_banner_if_active(&mut stdout, banner.is_some()).await?;
-                    return Ok(());
+                    return Ok(AttachStreamEnd::Detached);
                 }
 
                 if handle_banner_mouse_action(
@@ -687,7 +806,7 @@ where
                 )
                 .await?
                 {
-                    return Ok(());
+                    return Ok(AttachStreamEnd::SessionStopped);
                 }
 
                 socket_write.write_all(&stdin_buf[..bytes_read]).await?;
@@ -729,6 +848,99 @@ where
                 repaint_banner_if_active(&mut stdout, banner.as_ref()).await?;
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachReconnectDecision {
+    Reattach,
+    Retry,
+    Finish,
+    Fail,
+}
+
+async fn wait_for_attach_reconnect(
+    host: &str,
+    paths: &Paths,
+    target: &Target,
+    config: &AttachReconnectConfig,
+) -> Result<bool, CliError> {
+    let deadline = time::Instant::now() + config.window;
+    eprintln!(
+        "[pohunek] attach stream closed; waiting up to {:.1}s for session {} to resume",
+        config.window.as_secs_f64(),
+        target.session_id
+    );
+
+    loop {
+        match probe_attach_reconnect(host, paths, target).await {
+            Ok(AttachReconnectDecision::Reattach) => return Ok(true),
+            Ok(AttachReconnectDecision::Finish | AttachReconnectDecision::Fail) => {
+                return Ok(false);
+            }
+            Ok(AttachReconnectDecision::Retry) => {}
+            Err(err) => match reconnect_decision_from_error(&err) {
+                AttachReconnectDecision::Retry => {}
+                AttachReconnectDecision::Finish => return Ok(false),
+                AttachReconnectDecision::Reattach => return Ok(true),
+                AttachReconnectDecision::Fail => return Err(err),
+            },
+        }
+
+        let now = time::Instant::now();
+        if now >= deadline {
+            eprintln!(
+                "[pohunek] session {} did not resume before reconnect timeout",
+                target.session_id
+            );
+            return Ok(false);
+        }
+        time::sleep(std::cmp::min(config.interval, deadline - now)).await;
+    }
+}
+
+async fn probe_attach_reconnect(
+    host: &str,
+    paths: &Paths,
+    target: &Target,
+) -> Result<AttachReconnectDecision, CliError> {
+    let mut client = Client::connect(host, paths).await?;
+    let request = build_inspect_request(target)?;
+    let result = client.request(&request).await?;
+    let session: SessionInfo = serde_json::from_value(result)?;
+    Ok(reconnect_decision_from_state(session.state))
+}
+
+fn reconnect_decision_from_state(state: SessionState) -> AttachReconnectDecision {
+    match state {
+        SessionState::Running => AttachReconnectDecision::Reattach,
+        SessionState::Starting => AttachReconnectDecision::Retry,
+        SessionState::Stopped | SessionState::Done | SessionState::Failed => {
+            AttachReconnectDecision::Finish
+        }
+    }
+}
+
+fn reconnect_decision_from_error(err: &CliError) -> AttachReconnectDecision {
+    match err {
+        CliError::DaemonUnreachable { .. } => AttachReconnectDecision::Retry,
+        CliError::Protocol(source)
+            if matches!(
+                source.code.as_str(),
+                "session_not_found" | "session_not_running"
+            ) =>
+        {
+            AttachReconnectDecision::Retry
+        }
+        CliError::Client(source)
+            if matches!(
+                source.to_protocol_error().code.as_str(),
+                "daemon_unreachable" | "host_unreachable" | "remote_daemon_unavailable" | "framing"
+            ) =>
+        {
+            AttachReconnectDecision::Retry
+        }
+        _ => AttachReconnectDecision::Fail,
     }
 }
 
@@ -1098,7 +1310,10 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create config dir");
         std::fs::write(
             root.join("launcher.conf"),
-            "banner=true\nbanner_interval_seconds=0.25\n",
+            "banner=true\n\
+             banner_interval_seconds=0.25\n\
+             attach_reconnect_seconds=12\n\
+             attach_reconnect_interval_seconds=0.75\n",
         )
         .expect("write config");
 
@@ -1108,6 +1323,38 @@ mod tests {
         assert_eq!(
             config.repaint_interval,
             std::time::Duration::from_millis(250)
+        );
+        assert_eq!(config.reconnect.window, std::time::Duration::from_secs(12));
+        assert_eq!(
+            config.reconnect.interval,
+            std::time::Duration::from_millis(750)
+        );
+    }
+
+    #[test]
+    fn attach_reconnect_decision_retries_only_live_or_temporarily_missing_sessions() {
+        assert_eq!(
+            reconnect_decision_from_state(protocol::SessionState::Running),
+            AttachReconnectDecision::Reattach
+        );
+        assert_eq!(
+            reconnect_decision_from_state(protocol::SessionState::Starting),
+            AttachReconnectDecision::Retry
+        );
+        assert_eq!(
+            reconnect_decision_from_state(protocol::SessionState::Done),
+            AttachReconnectDecision::Finish
+        );
+
+        let missing = protocol::ProtocolError::new(
+            protocol::ErrorClass::Runtime,
+            "session_not_found",
+            "session vanished during restart",
+            None,
+        );
+        assert_eq!(
+            reconnect_decision_from_error(&CliError::Protocol(missing)),
+            AttachReconnectDecision::Retry
         );
     }
 

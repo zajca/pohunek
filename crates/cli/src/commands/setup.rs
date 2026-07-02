@@ -100,6 +100,10 @@ linear_cli=linear
 # Attach overlay: reserve the first terminal row for host/session/agent state.
 #banner=false
 #banner_interval_seconds=0.5
+# Attach reconnect: after an unexpected daemon stream close, wait for a restarted
+# daemon to resume the session and reattach. Set seconds to 0 to disable.
+#attach_reconnect_seconds=20
+#attach_reconnect_interval_seconds=0.5
 #mark_retry_count=20
 #mark_retry_interval_seconds=0.1
 ";

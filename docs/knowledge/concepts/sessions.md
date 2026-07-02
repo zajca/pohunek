@@ -32,5 +32,12 @@ The assistant feature reuses this session lifecycle. Its opening prompt is just
 initial input to a normal session, so session warnings and applied-input status
 remain the source of truth for whether the agent received that prompt.
 
+Detach and client restarts do not stop a session because the daemon owns the PTY.
+A daemon restart is different: the live PTY and process are gone, and only
+sessions with captured native agent resume metadata can be relaunched. When an
+attached terminal sees that unexpected stream close, `pohunek attach` waits for
+the restarted daemon to resume the same session id and reconnects if it becomes
+running again.
+
 For project-aware work, prefer a registered project or repository target over an
 ad hoc directory. See [projects](projects.md) and [worktrees](worktrees.md).

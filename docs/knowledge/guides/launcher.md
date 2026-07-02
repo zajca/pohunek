@@ -33,3 +33,10 @@ it during attach. Clicking `[kill]` sends `session.stop` for the attached
 session and exits the attach client. `banner_interval_seconds` controls the
 periodic repaint interval. The rofi/sway switcher only opens marked attach
 terminals; it does not create a separate banner window.
+
+Attach terminals automatically retry after an unexpected daemon stream close.
+`attach_reconnect_seconds` controls the retry window, and
+`attach_reconnect_interval_seconds` controls the poll interval. This only helps
+sessions that the restarted daemon can resume from native agent metadata; live
+PTYs and plain shell processes still do not survive a daemon restart. Set
+`attach_reconnect_seconds=0` to disable the retry behavior.
