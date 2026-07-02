@@ -37,7 +37,9 @@ A daemon restart is different: the live PTY and process are gone, and only
 sessions with captured native agent resume metadata can be relaunched. When an
 attached terminal sees that unexpected stream close, `pohunek attach` waits for
 the restarted daemon to resume the same session id and reconnects if it becomes
-running again.
+running again. Native resume metadata is accepted only from the session's own
+agent profile or base kind, so a nested different agent cannot overwrite the
+parent session's resume binding.
 
 An in-memory terminal session (`stopped`, `done`, or `failed`) that still carries
 captured native resume metadata can be explicitly relaunched with `session.resume`.

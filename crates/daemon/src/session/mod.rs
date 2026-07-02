@@ -905,6 +905,17 @@ impl SessionRegistry {
                 );
                 return not_recorded;
             }
+            let expected_base = agent_kind_label(entry.info.agent_base);
+            if params.agent != entry.info.agent && params.agent != expected_base {
+                debug!(
+                    session_id = %params.session_id.0,
+                    report_agent = %params.agent,
+                    session_agent = %entry.info.agent,
+                    session_agent_base = %expected_base,
+                    "native-id report for a different agent; ignoring"
+                );
+                return not_recorded;
+            }
 
             // The native reference KIND is frozen at launch (a profile's `ref_kind`,
             // or `id` for a base kind). The SessionStart hook bakes a base-kind
@@ -1461,6 +1472,14 @@ fn validate_session_metadata(metadata: &BTreeMap<String, String>) -> Result<(), 
 
 fn is_terminal(state: SessionState) -> bool {
     state.is_terminal()
+}
+
+fn agent_kind_label(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::Shell => "shell",
+        AgentKind::Codex => "codex",
+        AgentKind::Claude => "claude",
+    }
 }
 
 fn session_not_found(id: &str) -> ProtocolError {
@@ -3883,6 +3902,63 @@ mod tests {
         assert_eq!(
             persisted[0].native_session_id.as_deref(),
             Some("native-abc")
+        );
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn report_native_id_ignores_reports_from_a_different_agent_base() {
+        let store_path = temp_store_path("report-agent-mismatch");
+        let agents_dir = temp_resumable_agents_dir("report-agent-mismatch");
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path.clone()),
+            agents_dir: Some(agents_dir),
+            ..SessionRegistryConfig::default()
+        });
+
+        let created = registry
+            .create(resumable_params())
+            .await
+            .expect("create claude session");
+
+        let claude_report = registry
+            .report_native_id(SessionReportNativeIdParams {
+                session_id: created.id.clone(),
+                agent: "claude".to_owned(),
+                native_session_id: "claude-native".to_owned(),
+                transcript_path: None,
+            })
+            .await;
+        assert!(claude_report.recorded);
+
+        let codex_report = registry
+            .report_native_id(SessionReportNativeIdParams {
+                session_id: created.id.clone(),
+                agent: "codex".to_owned(),
+                native_session_id: "codex-thread".to_owned(),
+                transcript_path: None,
+            })
+            .await;
+        assert!(
+            !codex_report.recorded,
+            "a codex hook must not overwrite a claude session binding"
+        );
+
+        let inspected = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(
+            inspected.native_session_id.as_deref(),
+            Some("claude-native")
+        );
+
+        let persisted = crate::store::Store::new(store_path.clone())
+            .load_resume()
+            .expect("load store");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(
+            persisted[0].native_session_id.as_deref(),
+            Some("claude-native")
         );
 
         let _ = registry.stop(&created.id).await;
