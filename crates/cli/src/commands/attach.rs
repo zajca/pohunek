@@ -27,8 +27,8 @@ use crate::target::Target;
 
 const DETACH_BYTE: u8 = 0x1d;
 const IO_BUFFER_BYTES: usize = 8192;
-// Disabled by default: transcript-oriented terminals can record each idle
-// repaint in scrollback. Output, resize, and state updates still repaint.
+// Disabled by default: transcript-oriented terminals can record each automatic
+// repaint in scrollback. A positive interval opts into the live overlay.
 const DEFAULT_BANNER_REPAINT_INTERVAL: Duration = Duration::ZERO;
 // Two rows are not enough for a banner plus a usable agent viewport.
 const MIN_ROWS_WITH_BANNER: u16 = 3;
@@ -386,21 +386,21 @@ where
     let (banner, banner_updates) = if let Some(terminal_size) =
         banner_terminal_size.filter(|_| banner_config.enabled)
     {
-        let snapshot = AttachBannerSnapshot::unknown(&banner_host_label(host), &target.session_id);
-        let updates = spawn_banner_updates(
-            host.to_owned(),
-            paths.clone(),
-            target.session_id.clone(),
-            snapshot.clone(),
-        );
-        (
-            Some(AttachBannerRuntime {
+        let snapshot = load_initial_banner_snapshot(&mut client, host, &target.session_id).await;
+        let runtime = AttachBannerRuntime {
+            snapshot: snapshot.clone(),
+            terminal_size,
+            repaint_interval: banner_config.repaint_interval,
+        };
+        let updates = banner_auto_repaint_enabled(Some(&runtime)).then(|| {
+            spawn_banner_updates(
+                host.to_owned(),
+                paths.clone(),
+                target.session_id.clone(),
                 snapshot,
-                terminal_size,
-                repaint_interval: banner_config.repaint_interval,
-            }),
-            Some(updates),
-        )
+            )
+        });
+        (Some(runtime), updates)
     } else {
         (None, None)
     };
@@ -414,6 +414,24 @@ where
         banner_updates,
     )
     .await
+}
+
+async fn load_initial_banner_snapshot(
+    client: &mut Client,
+    host: &str,
+    session_id: &str,
+) -> AttachBannerSnapshot {
+    let mut snapshot = AttachBannerSnapshot::unknown(&banner_host_label(host), session_id);
+    let Ok(request) =
+        request_with_params(method::SESSION_INSPECT, &SessionId(session_id.to_owned()))
+    else {
+        return snapshot;
+    };
+    let Ok(info) = client.request(&request).await else {
+        return snapshot;
+    };
+    snapshot.update_from_session_value(&info);
+    snapshot
 }
 
 // Host routing is the transport's job; the request carries only the session id
@@ -696,6 +714,19 @@ where
     Ok(())
 }
 
+async fn repaint_banner_if_auto<W>(
+    writer: &mut W,
+    banner: Option<&AttachBannerRuntime>,
+) -> Result<(), CliError>
+where
+    W: AsyncWrite + Unpin,
+{
+    if banner_auto_repaint_enabled(banner) {
+        repaint_banner_if_active(writer, banner).await?;
+    }
+    Ok(())
+}
+
 async fn reset_banner_if_active<W>(writer: &mut W, banner_enabled: bool) -> Result<(), CliError>
 where
     W: AsyncWrite + Unpin,
@@ -715,6 +746,10 @@ fn banner_repaint_tick(banner: Option<&AttachBannerRuntime>) -> Option<time::Int
     let mut repaint_tick = time::interval(interval);
     repaint_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     Some(repaint_tick)
+}
+
+fn banner_auto_repaint_enabled(banner: Option<&AttachBannerRuntime>) -> bool {
+    banner.is_some_and(|banner| !banner.repaint_interval.is_zero())
 }
 
 async fn wait_for_banner_repaint_tick(repaint_tick: &mut Option<time::Interval>) {
@@ -825,7 +860,7 @@ where
                 }
                 stdout.write_all(&socket_buf[..bytes_read]).await?;
                 stdout.flush().await?;
-                repaint_banner_if_active(&mut stdout, banner.as_ref()).await?;
+                repaint_banner_if_auto(&mut stdout, banner.as_ref()).await?;
             }
             read = stdin.read(&mut stdin_buf) => {
                 let bytes_read = read?;
@@ -880,7 +915,7 @@ where
                         let _ = client.request(&request).await;
                     }
                     enter_banner_viewport_if_active(&mut stdout, banner.as_ref()).await?;
-                    repaint_banner_if_active(&mut stdout, banner.as_ref()).await?;
+                    repaint_banner_if_auto(&mut stdout, banner.as_ref()).await?;
                 }
             }
             update = async {
@@ -893,7 +928,7 @@ where
                     if let Some(banner) = banner.as_mut() {
                         banner.snapshot = snapshot;
                     }
-                    repaint_banner_if_active(&mut stdout, banner.as_ref()).await?;
+                    repaint_banner_if_auto(&mut stdout, banner.as_ref()).await?;
                 } else {
                     banner_updates = None;
                 }
@@ -1356,7 +1391,7 @@ mod tests {
         assert_eq!(
             config.repaint_interval,
             std::time::Duration::ZERO,
-            "banner should repaint on output and state changes, not on an idle timer by default"
+            "banner should draw initially without automatic repainting by default"
         );
     }
 
@@ -1375,6 +1410,38 @@ mod tests {
         assert!(
             banner_repaint_tick(None).is_none(),
             "inactive banner must not create an idle repaint timer"
+        );
+    }
+
+    #[test]
+    fn attach_banner_zero_interval_disables_automatic_repaint_triggers() {
+        let banner = AttachBannerRuntime {
+            snapshot: AttachBannerSnapshot::unknown("local", "s-42"),
+            terminal_size: (120, 40),
+            repaint_interval: std::time::Duration::ZERO,
+        };
+
+        assert!(
+            !banner_auto_repaint_enabled(Some(&banner)),
+            "zero interval must suppress output and state-change repaint spam"
+        );
+        assert!(
+            !banner_auto_repaint_enabled(None),
+            "inactive banner must not request automatic repaint"
+        );
+    }
+
+    #[test]
+    fn attach_banner_positive_interval_enables_automatic_repaint_triggers() {
+        let banner = AttachBannerRuntime {
+            snapshot: AttachBannerSnapshot::unknown("local", "s-42"),
+            terminal_size: (120, 40),
+            repaint_interval: std::time::Duration::from_millis(250),
+        };
+
+        assert!(
+            banner_auto_repaint_enabled(Some(&banner)),
+            "positive interval keeps the live overlay repaint behavior opt-in"
         );
     }
 
@@ -1510,6 +1577,45 @@ mod tests {
         assert!(
             frame.starts_with("\x1b[s\x1b[?6l\x1b[2;40r\x1b[?6h\x1b[u\x1b7\x1b[?6l\x1b[1;1H"),
             "banner repaint must restore the reserved viewport before drawing the banner: {frame:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_banner_zero_interval_auto_repaint_writes_no_frame() {
+        let banner = AttachBannerRuntime {
+            snapshot: AttachBannerSnapshot::unknown("local", "s-42"),
+            terminal_size: (120, 40),
+            repaint_interval: std::time::Duration::ZERO,
+        };
+        let mut output = Vec::new();
+
+        repaint_banner_if_auto(&mut output, Some(&banner))
+            .await
+            .expect("automatic repaint");
+
+        assert!(
+            output.is_empty(),
+            "zero interval must not write automatic repaint frames into scrollback"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_banner_positive_interval_auto_repaint_writes_frame() {
+        let banner = AttachBannerRuntime {
+            snapshot: AttachBannerSnapshot::unknown("local", "s-42"),
+            terminal_size: (120, 40),
+            repaint_interval: std::time::Duration::from_millis(250),
+        };
+        let mut output = Vec::new();
+
+        repaint_banner_if_auto(&mut output, Some(&banner))
+            .await
+            .expect("automatic repaint");
+        let frame = String::from_utf8(output).expect("banner frame is utf8");
+
+        assert!(
+            frame.contains("[kill:Ctrl-\\]"),
+            "positive interval should keep automatic banner repaint opt-in: {frame:?}"
         );
     }
 
