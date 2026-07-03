@@ -1,3 +1,12 @@
+//! Terminal grid scraping backed by a `vt100` parser.
+//!
+//! [`ScreenTracker`] feeds raw PTY bytes into a `vt100` grid and exposes visible
+//! text, column slices, and agent-oriented prompt/rule heuristics used by the
+//! daemon's activity detection. It models only the visible screen (no
+//! scrollback); dropped PTY output is recovered by [`ScreenTracker::reset`].
+
+// Rust guideline compliant 2026-06-26
+
 const SCROLLBACK_LINES: usize = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

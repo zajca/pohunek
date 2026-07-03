@@ -13,14 +13,15 @@ use protocol::{AgentActivity, AgentKind, StateSource};
 mod machine;
 mod manifest;
 mod osc;
-mod screen;
 
 pub use machine::{ActivityEvidence, ActivityTransition, DetectionConfig, StateMachine};
 pub use manifest::{
     Manifest, ManifestError, ManifestMatch, ManifestRegion, MatchContext, MatcherKind,
 };
 pub use osc::{OscEvidence, OscParser};
-pub use screen::{ScreenRegion, ScreenTracker};
+// The VT screen model lives in `pohunek-terminal` so the daemon and CLI share
+// one implementation instead of drifting copies.
+pub use pohunek_terminal::{ScreenRegion, ScreenTracker};
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;

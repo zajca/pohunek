@@ -97,9 +97,12 @@ linear_cli=linear
 # Issue picker: which Linear workflow-state types are 'actionable' (space-separated:
 # triage backlog unstarted started completed canceled).
 #linear_issue_states=started unstarted
-# Attach overlay: currently disabled at runtime for TUI safety.
+# Attach banner: reserve the top terminal row for the kill shortcut and live
+# session state. The attach client composites the agent screen below it, so the
+# banner works even under full-screen TUI agents (Codex, Claude Code).
 #banner=false
-# Live banner repaint is ignored while the overlay is disabled.
+# Max banner/screen refresh cadence in seconds. 0 uses the built-in ~60fps frame
+# cadence; a positive value throttles repaints to a coarser refresh.
 #banner_interval_seconds=0
 # Attach reconnect: after an unexpected daemon stream close, wait for a restarted
 # daemon to resume the session and reattach. Set seconds to 0 to disable.

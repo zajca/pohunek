@@ -1,0 +1,13 @@
+[package]
+name = "pohunek-terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "pohunek terminal screen model: vt100-backed grid scraping and an attach compositor."
+
+[dependencies]
+vt100 = { workspace = true }
+
+[lints]
+workspace = true

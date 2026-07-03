@@ -10,6 +10,7 @@ use std::os::fd::RawFd;
 use std::path::Path;
 use std::time::Duration;
 
+use pohunek_terminal::Compositor;
 use protocol::{
     event, method, Request, SessionAttachParams, SessionAttachResult, SessionDetachParams,
     SessionId, SessionInfo, SessionResizeParams, SessionState, ENV_DAEMON_ID, ENV_SESSION_ID,
@@ -17,7 +18,7 @@ use protocol::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
-use tokio::time::{self, MissedTickBehavior};
+use tokio::time::{self, Instant};
 
 use crate::client::{attach_raw, Client, RawStream};
 use crate::commands::{request_id, request_with_params};
@@ -27,18 +28,18 @@ use crate::target::Target;
 
 const DETACH_BYTE: u8 = 0x1d;
 const IO_BUFFER_BYTES: usize = 8192;
-// Disabled until attach banners can be rendered outside the attached PTY's
-// terminal state. The scroll-region overlay corrupts full-screen TUIs such as
-// Codex and Claude Code because they own cursor modes, scroll margins, and
-// screen repaint timing.
-const ATTACH_BANNER_OVERLAY_ENABLED: bool = false;
-// Retained for config compatibility while the overlay is disabled. A future
-// out-of-band banner renderer can reuse this as its live refresh cadence.
+// Default frame-coalescing cadence for the attach compositor.
+//
+// Agent output arrives in bursts of PTY chunks; rendering after every chunk
+// wastes work, while too coarse a cadence makes the screen feel laggy. ~60 fps
+// is imperceptible latency yet collapses a burst into a single repaint. Used
+// when `banner_interval_seconds` is zero (the default); a positive config value
+// overrides it to a coarser refresh.
+const DEFAULT_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+// Config default: zero means "use DEFAULT_FRAME_INTERVAL" for the compositor.
 const DEFAULT_BANNER_REPAINT_INTERVAL: Duration = Duration::ZERO;
 // Two rows are not enough for a banner plus a usable agent viewport.
 const MIN_ROWS_WITH_BANNER: u16 = 3;
-// Row 1 is reserved for the attach banner; the PTY viewport begins below it.
-const BANNER_VIEWPORT_TOP_ROW: u16 = 2;
 const BANNER_KILL_LABEL: &str = "[kill:Ctrl-\\]";
 // Two spaces keep dense banner fields readable in monospace terminals.
 const BANNER_FIELD_SEPARATOR: &str = "  ";
@@ -162,11 +163,17 @@ struct AttachBannerSnapshot {
     activity: String,
 }
 
+/// Live attach-banner state driving the [`Compositor`].
+///
+/// Holds the compositor that owns physical-terminal output, the latest session
+/// snapshot rendered into the banner text, the terminal width used to lay that
+/// text out, and the maximum repaint cadence.
 #[derive(Debug)]
-struct AttachBannerRuntime {
+struct BannerState {
+    compositor: Compositor,
     snapshot: AttachBannerSnapshot,
-    terminal_size: (u16, u16),
-    repaint_interval: Duration,
+    cols: u16,
+    frame_interval: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,8 +383,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let terminal_size = terminal_size(libc::STDOUT_FILENO);
-    let banner_enabled = attach_banner_overlay_enabled(&banner_config, terminal_size);
-    let banner_terminal_size = terminal_size.filter(|_| banner_enabled);
+    let banner_terminal_size = banner_terminal_size(&banner_config, terminal_size);
+    let banner_enabled = banner_terminal_size.is_some();
 
     if let Some((cols, rows)) =
         terminal_size.and_then(|size| effective_attach_size(size, banner_enabled))
@@ -387,22 +394,25 @@ where
         }
     }
 
-    let (banner, banner_updates) = if let Some(terminal_size) = banner_terminal_size {
+    let (banner, banner_updates) = if let Some((cols, rows)) = banner_terminal_size {
         let snapshot = load_initial_banner_snapshot(&mut client, host, &target.session_id).await;
-        let runtime = AttachBannerRuntime {
-            snapshot: snapshot.clone(),
-            terminal_size,
-            repaint_interval: banner_config.repaint_interval,
+        // Best-effort live snapshot updates: the banner reflects state/activity
+        // changes while the subscription holds. If the update client cannot
+        // connect or its stream drops, the banner keeps showing the last known
+        // snapshot rather than tearing down the attach.
+        let updates = spawn_banner_updates(
+            host.to_owned(),
+            paths.clone(),
+            target.session_id.clone(),
+            snapshot.clone(),
+        );
+        let state = BannerState {
+            compositor: Compositor::new(cols, rows),
+            snapshot,
+            cols,
+            frame_interval: effective_frame_interval(banner_config.repaint_interval),
         };
-        let updates = banner_auto_repaint_enabled(Some(&runtime)).then(|| {
-            spawn_banner_updates(
-                host.to_owned(),
-                paths.clone(),
-                target.session_id.clone(),
-                snapshot,
-            )
-        });
-        (Some(runtime), updates)
+        (Some(state), Some(updates))
     } else {
         (None, None)
     };
@@ -416,6 +426,32 @@ where
         banner_updates,
     )
     .await
+}
+
+/// Terminal size to render the banner at, or `None` when it should be skipped.
+///
+/// The banner needs an enabled config and a terminal tall enough to keep a
+/// usable agent viewport below the reserved row.
+fn banner_terminal_size(
+    config: &AttachBannerConfig,
+    terminal_size: Option<(u16, u16)>,
+) -> Option<(u16, u16)> {
+    if !config.enabled {
+        return None;
+    }
+    terminal_size.filter(|&(_, rows)| rows >= MIN_ROWS_WITH_BANNER)
+}
+
+/// Resolves the compositor frame cadence from the configured repaint interval.
+///
+/// Zero (the default) selects [`DEFAULT_FRAME_INTERVAL`]; a positive value
+/// throttles repaints to a coarser refresh.
+fn effective_frame_interval(configured: Duration) -> Duration {
+    if configured.is_zero() {
+        DEFAULT_FRAME_INTERVAL
+    } else {
+        configured
+    }
 }
 
 async fn load_initial_banner_snapshot(
@@ -521,21 +557,6 @@ fn effective_attach_size((cols, rows): (u16, u16), banner_enabled: bool) -> Opti
     }
 }
 
-fn attach_banner_overlay_enabled(
-    config: &AttachBannerConfig,
-    terminal_size: Option<(u16, u16)>,
-) -> bool {
-    ATTACH_BANNER_OVERLAY_ENABLED
-        && config.enabled
-        && terminal_size.is_some_and(|size| effective_attach_size(size, true).is_some())
-}
-
-fn render_banner_frame(cols: u16, snapshot: &AttachBannerSnapshot) -> String {
-    let text = render_banner_text(cols, snapshot);
-    // DECSC/DECRC preserve origin mode while the banner targets physical row one.
-    format!("\x1b7\x1b[?6l\x1b[1;1H\x1b[7m\x1b[2K{text}\x1b[0m\x1b8")
-}
-
 fn render_banner_text(cols: u16, snapshot: &AttachBannerSnapshot) -> String {
     let max_cols = usize::from(cols);
     let mut text = truncate_banner_text(BANNER_KILL_LABEL, cols);
@@ -589,21 +610,6 @@ fn push_banner_segment(text: &mut String, segment: &str, max_cols: usize, requir
     }
     let remaining_cols = max_cols.saturating_sub(text.chars().count());
     text.extend(segment.chars().take(remaining_cols));
-}
-
-fn render_banner_viewport_frame(rows: u16) -> String {
-    format!("\x1b[?6l\x1b[{BANNER_VIEWPORT_TOP_ROW};{rows}r\x1b[?6h\x1b[1;1H")
-}
-
-fn render_banner_viewport_repaint_frame(rows: u16) -> String {
-    // SCO save/restore keeps the session cursor stable while the attach overlay
-    // reasserts the scroll margins that a full-screen TUI may have reset.
-    format!("\x1b[s\x1b[?6l\x1b[{BANNER_VIEWPORT_TOP_ROW};{rows}r\x1b[?6h\x1b[u")
-}
-
-fn reset_banner_frame() -> &'static str {
-    // Reset the scroll region in case an older banner repaint left it active.
-    "\x1b[s\x1b[?6l\x1b[r\x1b[0m\x1b[1;1H\x1b[2K\x1b[u"
 }
 
 fn truncate_banner_text(text: &str, cols: u16) -> String {
@@ -662,112 +668,54 @@ fn spawn_banner_updates(
     rx
 }
 
-async fn repaint_banner<W>(writer: &mut W, banner: &AttachBannerRuntime) -> Result<(), CliError>
+/// Renders one compositor frame from the current snapshot to `writer`.
+async fn paint_banner<W>(writer: &mut W, banner: &mut BannerState) -> Result<(), CliError>
 where
     W: AsyncWrite + Unpin,
 {
-    writer
-        .write_all(render_banner_viewport_repaint_frame(banner.terminal_size.1).as_bytes())
-        .await?;
-    writer
-        .write_all(render_banner_frame(banner.terminal_size.0, &banner.snapshot).as_bytes())
-        .await?;
+    let text = render_banner_text(banner.cols, &banner.snapshot);
+    let frame = banner.compositor.render(&text);
+    writer.write_all(&frame).await?;
     writer.flush().await?;
     Ok(())
 }
 
-async fn enter_banner_viewport<W>(
+/// Restores the physical terminal on teardown when a banner is active.
+async fn teardown_banner<W>(
     writer: &mut W,
-    banner: &AttachBannerRuntime,
-) -> Result<(), CliError>
-where
-    W: AsyncWrite + Unpin,
-{
-    writer
-        .write_all(render_banner_viewport_frame(banner.terminal_size.1).as_bytes())
-        .await?;
-    writer.flush().await?;
-    Ok(())
-}
-
-async fn reset_banner<W>(writer: &mut W) -> Result<(), CliError>
-where
-    W: AsyncWrite + Unpin,
-{
-    writer.write_all(reset_banner_frame().as_bytes()).await?;
-    writer.flush().await?;
-    Ok(())
-}
-
-async fn enter_banner_viewport_if_active<W>(
-    writer: &mut W,
-    banner: Option<&AttachBannerRuntime>,
+    banner: Option<&mut BannerState>,
 ) -> Result<(), CliError>
 where
     W: AsyncWrite + Unpin,
 {
     if let Some(banner) = banner {
-        enter_banner_viewport(writer, banner).await?;
+        let frame = banner.compositor.reset();
+        writer.write_all(&frame).await?;
+        writer.flush().await?;
     }
     Ok(())
 }
 
-async fn repaint_banner_if_active<W>(
-    writer: &mut W,
-    banner: Option<&AttachBannerRuntime>,
-) -> Result<(), CliError>
-where
-    W: AsyncWrite + Unpin,
-{
-    if let Some(banner) = banner {
-        repaint_banner(writer, banner).await?;
+/// Awaits the next banner snapshot, or never resolves when updates are absent.
+///
+/// Kept as a named future so the `select!` arm stays a single line and the loop
+/// body fits its line budget.
+async fn recv_banner_update(
+    updates: &mut Option<mpsc::UnboundedReceiver<AttachBannerSnapshot>>,
+) -> Option<AttachBannerSnapshot> {
+    match updates.as_mut() {
+        Some(updates) => updates.recv().await,
+        None => None,
     }
-    Ok(())
 }
 
-async fn repaint_banner_if_auto<W>(
-    writer: &mut W,
-    banner: Option<&AttachBannerRuntime>,
-) -> Result<(), CliError>
-where
-    W: AsyncWrite + Unpin,
-{
-    if banner_auto_repaint_enabled(banner) {
-        repaint_banner_if_active(writer, banner).await?;
-    }
-    Ok(())
-}
-
-async fn reset_banner_if_active<W>(writer: &mut W, banner_enabled: bool) -> Result<(), CliError>
-where
-    W: AsyncWrite + Unpin,
-{
-    if banner_enabled {
-        reset_banner(writer).await?;
-    }
-    Ok(())
-}
-
-fn banner_repaint_tick(banner: Option<&AttachBannerRuntime>) -> Option<time::Interval> {
-    let interval = banner?.repaint_interval;
-    if interval.is_zero() {
-        return None;
-    }
-
-    let mut repaint_tick = time::interval(interval);
-    repaint_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    Some(repaint_tick)
-}
-
-fn banner_auto_repaint_enabled(banner: Option<&AttachBannerRuntime>) -> bool {
-    banner.is_some_and(|banner| !banner.repaint_interval.is_zero())
-}
-
-async fn wait_for_banner_repaint_tick(repaint_tick: &mut Option<time::Interval>) {
-    match repaint_tick {
-        Some(repaint_tick) => {
-            repaint_tick.tick().await;
-        }
+/// Waits until the pending frame deadline, or forever when none is scheduled.
+///
+/// Lets the select loop coalesce a burst of agent output into a single repaint:
+/// the first byte arms a deadline, and this branch fires once it elapses.
+async fn wait_for_frame_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => time::sleep_until(deadline).await,
         None => std::future::pending().await,
     }
 }
@@ -832,6 +780,31 @@ fn config_error(message: String) -> CliError {
     ))
 }
 
+/// Applies a window-size change to the compositor and the daemon PTY.
+///
+/// Reads the current terminal size, resizes the banner compositor (which forces
+/// a full repaint), and sends the daemon the effective agent-grid size. Returns
+/// whether a banner is active, so the caller can schedule an immediate repaint.
+async fn apply_terminal_resize(
+    client: &mut Client,
+    target: &Target,
+    banner: &mut Option<BannerState>,
+) -> bool {
+    let Some((cols, rows)) = terminal_size(libc::STDOUT_FILENO) else {
+        return false;
+    };
+    if let Some(banner) = banner.as_mut() {
+        banner.cols = cols;
+        banner.compositor.resize(cols, rows);
+    }
+    let effective_size =
+        effective_attach_size((cols, rows), banner.is_some()).unwrap_or((cols, rows));
+    if let Ok(request) = build_resize_request(target, effective_size.0, effective_size.1) {
+        let _ = client.request(&request).await;
+    }
+    banner.is_some()
+}
+
 /// Bidirectionally bridge the terminal and the attach byte stream until detach
 /// or EOF, over any transport.
 ///
@@ -843,7 +816,7 @@ async fn forward_attached_stream<S>(
     mut client: Client,
     stream_id: String,
     target: &Target,
-    mut banner: Option<AttachBannerRuntime>,
+    mut banner: Option<BannerState>,
     mut banner_updates: Option<mpsc::UnboundedReceiver<AttachBannerSnapshot>>,
 ) -> Result<AttachStreamEnd, CliError>
 where
@@ -856,99 +829,110 @@ where
     let mut stdout = tokio::io::stdout();
     let mut stdin_buf = [0_u8; IO_BUFFER_BYTES];
     let mut socket_buf = [0_u8; IO_BUFFER_BYTES];
-    let mut repaint_tick = banner_repaint_tick(banner.as_ref());
+    // Coalesces agent-output bursts into one repaint; `None` means idle.
+    let mut frame_deadline: Option<Instant> = None;
 
-    enter_banner_viewport_if_active(&mut stdout, banner.as_ref()).await?;
-    repaint_banner_if_active(&mut stdout, banner.as_ref()).await?;
+    // Run the I/O loop inside a block so terminal restoration happens on *every*
+    // exit — clean detach, EOF, kill, or a mid-attach I/O error propagated by
+    // `?` — instead of only on the explicit success paths. Leaving the reserved
+    // scroll region, origin mode, or hidden cursor active would visibly break
+    // the user's shell after attach ends.
+    let outcome: Result<AttachStreamEnd, CliError> = async {
+        // Paint immediately so the banner and reserved region are up before any
+        // agent output arrives.
+        if let Some(banner) = banner.as_mut() {
+            paint_banner(&mut stdout, banner).await?;
+        }
 
-    loop {
-        tokio::select! {
-            read = socket_read.read(&mut socket_buf) => {
-                let bytes_read = read?;
-                if bytes_read == 0 {
-                    reset_banner_if_active(&mut stdout, banner.is_some()).await?;
-                    return Ok(AttachStreamEnd::StreamClosed);
-                }
-                stdout.write_all(&socket_buf[..bytes_read]).await?;
-                stdout.flush().await?;
-                repaint_banner_if_auto(&mut stdout, banner.as_ref()).await?;
-            }
-            read = stdin.read(&mut stdin_buf) => {
-                let bytes_read = read?;
-                if bytes_read == 0 {
-                    socket_write.shutdown().await?;
-                    reset_banner_if_active(&mut stdout, banner.is_some()).await?;
-                    return Ok(AttachStreamEnd::InputClosed);
-                }
-
-                if let Some(detach_at) = stdin_buf[..bytes_read]
-                    .iter()
-                    .position(|byte| *byte == DETACH_BYTE)
-                {
-                    if detach_at > 0 {
-                        socket_write.write_all(&stdin_buf[..detach_at]).await?;
-                        socket_write.flush().await?;
+        loop {
+            tokio::select! {
+                read = socket_read.read(&mut socket_buf) => {
+                    let bytes_read = read?;
+                    if bytes_read == 0 {
+                        return Ok(AttachStreamEnd::StreamClosed);
                     }
-                    terminal.take();
-                    let _ = send_detach(&mut client, &stream_id).await;
-                    reset_banner_if_active(&mut stdout, banner.is_some()).await?;
-                    return Ok(AttachStreamEnd::Detached);
-                }
-
-                if handle_banner_input_action(
-                    &stdin_buf[..bytes_read],
-                    &mut socket_write,
-                    &mut client,
-                    target,
-                    &mut terminal,
-                    &mut stdout,
-                    banner.is_some(),
-                )
-                .await?
-                {
-                    return Ok(AttachStreamEnd::SessionStopped);
-                }
-
-                socket_write.write_all(&stdin_buf[..bytes_read]).await?;
-                socket_write.flush().await?;
-            }
-            resized = winch.recv() => {
-                if resized.is_none() {
-                    continue;
-                }
-                if let Some((cols, rows)) = terminal_size(libc::STDOUT_FILENO) {
                     if let Some(banner) = banner.as_mut() {
-                        banner.terminal_size = (cols, rows);
+                        banner.compositor.feed(&socket_buf[..bytes_read]);
+                        if frame_deadline.is_none() {
+                            frame_deadline = Some(Instant::now() + banner.frame_interval);
+                        }
+                    } else {
+                        stdout.write_all(&socket_buf[..bytes_read]).await?;
+                        stdout.flush().await?;
                     }
-                    let effective_size = effective_attach_size((cols, rows), banner.is_some())
-                        .unwrap_or((cols, rows));
-                    if let Ok(request) = build_resize_request(target, effective_size.0, effective_size.1) {
-                        let _ = client.request(&request).await;
+                }
+                read = stdin.read(&mut stdin_buf) => {
+                    let bytes_read = read?;
+                    if bytes_read == 0 {
+                        socket_write.shutdown().await?;
+                        return Ok(AttachStreamEnd::InputClosed);
                     }
-                    enter_banner_viewport_if_active(&mut stdout, banner.as_ref()).await?;
-                    repaint_banner_if_auto(&mut stdout, banner.as_ref()).await?;
+
+                    if let Some(detach_at) = stdin_buf[..bytes_read]
+                        .iter()
+                        .position(|byte| *byte == DETACH_BYTE)
+                    {
+                        if detach_at > 0 {
+                            socket_write.write_all(&stdin_buf[..detach_at]).await?;
+                            socket_write.flush().await?;
+                        }
+                        terminal.take();
+                        let _ = send_detach(&mut client, &stream_id).await;
+                        return Ok(AttachStreamEnd::Detached);
+                    }
+
+                    if handle_banner_input_action(
+                        &stdin_buf[..bytes_read],
+                        &mut socket_write,
+                        &mut client,
+                        target,
+                        &mut terminal,
+                        banner.is_some(),
+                    )
+                    .await?
+                    {
+                        return Ok(AttachStreamEnd::SessionStopped);
+                    }
+
+                    socket_write.write_all(&stdin_buf[..bytes_read]).await?;
+                    socket_write.flush().await?;
                 }
-            }
-            update = async {
-                match banner_updates.as_mut() {
-                    Some(updates) => updates.recv().await,
-                    None => None,
+                resized = winch.recv() => {
+                    if resized.is_none() {
+                        continue;
+                    }
+                    // Repaint at once so the resized grid and region are correct.
+                    if apply_terminal_resize(&mut client, target, &mut banner).await {
+                        frame_deadline = Some(Instant::now());
+                    }
                 }
-            }, if banner_updates.is_some() => {
-                if let Some(snapshot) = update {
+                update = recv_banner_update(&mut banner_updates), if banner_updates.is_some() => {
+                    if let Some(snapshot) = update {
+                        if let Some(banner) = banner.as_mut() {
+                            banner.snapshot = snapshot;
+                            if frame_deadline.is_none() {
+                                frame_deadline = Some(Instant::now() + banner.frame_interval);
+                            }
+                        }
+                    } else {
+                        banner_updates = None;
+                    }
+                }
+                () = wait_for_frame_deadline(frame_deadline), if frame_deadline.is_some() => {
+                    frame_deadline = None;
                     if let Some(banner) = banner.as_mut() {
-                        banner.snapshot = snapshot;
+                        paint_banner(&mut stdout, banner).await?;
                     }
-                    repaint_banner_if_auto(&mut stdout, banner.as_ref()).await?;
-                } else {
-                    banner_updates = None;
                 }
-            }
-            () = wait_for_banner_repaint_tick(&mut repaint_tick), if banner.is_some() => {
-                repaint_banner_if_active(&mut stdout, banner.as_ref()).await?;
             }
         }
     }
+    .await;
+
+    // Best-effort restore; do not mask the loop's real outcome with a teardown
+    // write error.
+    let _ = teardown_banner(&mut stdout, banner.as_mut()).await;
+    outcome
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1050,23 +1034,22 @@ async fn send_detach(client: &mut Client, stream_id: &str) -> Result<(), CliErro
     Ok(())
 }
 
-async fn handle_banner_input_action<W, O>(
+async fn handle_banner_input_action<W>(
     input: &[u8],
     socket_write: &mut W,
     client: &mut Client,
     target: &Target,
     terminal: &mut Option<RawTerminal>,
-    stdout: &mut O,
-    banner_enabled: bool,
+    banner_active: bool,
 ) -> Result<bool, CliError>
 where
     W: AsyncWrite + Unpin,
-    O: AsyncWrite + Unpin,
 {
-    let Some(input_match) = banner_enabled
-        .then(|| find_banner_input_action(input))
-        .flatten()
-    else {
+    // The kill shortcut only exists while the banner is shown.
+    if !banner_active {
+        return Ok(false);
+    }
+    let Some(input_match) = find_banner_input_action(input) else {
         return Ok(false);
     };
 
@@ -1074,12 +1057,12 @@ where
         socket_write.write_all(&input[..input_match.start]).await?;
         socket_write.flush().await?;
     }
+    // Restore cooked input before the stop RPC; the caller's centralized
+    // teardown restores the compositor's terminal state on return.
     terminal.take();
-    let stop_result = match input_match.action {
-        BannerInputAction::Kill => send_stop(client, target).await,
-    };
-    reset_banner_if_active(stdout, banner_enabled).await?;
-    stop_result?;
+    match input_match.action {
+        BannerInputAction::Kill => send_stop(client, target).await?,
+    }
     Ok(true)
 }
 
@@ -1407,70 +1390,47 @@ mod tests {
     }
 
     #[test]
-    fn attach_banner_overlay_is_disabled_until_tui_safe() {
-        let config = AttachBannerConfig {
+    fn banner_terminal_size_requires_enabled_config_and_room_for_a_viewport() {
+        let enabled = AttachBannerConfig {
             enabled: true,
-            repaint_interval: std::time::Duration::from_millis(250),
+            repaint_interval: std::time::Duration::ZERO,
             reconnect: AttachReconnectConfig::default(),
         };
+        let disabled = AttachBannerConfig::disabled();
 
-        assert!(
-            !attach_banner_overlay_enabled(&config, Some((120, 40))),
-            "banner overlay must not inject scroll-region/origin-mode sequences into TUI streams"
+        assert_eq!(
+            banner_terminal_size(&enabled, Some((120, 40))),
+            Some((120, 40)),
+            "an enabled banner uses the full terminal size"
         );
-        assert!(
-            !attach_banner_overlay_enabled(&config, None),
-            "missing terminal size must keep banner overlay inactive"
+        assert_eq!(
+            banner_terminal_size(&enabled, Some((120, 2))),
+            None,
+            "a terminal too short for a usable viewport skips the banner"
         );
-    }
-
-    #[test]
-    fn attach_banner_zero_interval_has_no_repaint_tick() {
-        let banner = AttachBannerRuntime {
-            snapshot: AttachBannerSnapshot::unknown("local", "s-42"),
-            terminal_size: (120, 40),
-            repaint_interval: std::time::Duration::ZERO,
-        };
-
-        assert!(
-            banner_repaint_tick(Some(&banner)).is_none(),
-            "zero interval must not create an idle repaint timer"
+        assert_eq!(
+            banner_terminal_size(&enabled, None),
+            None,
+            "a missing terminal size skips the banner"
         );
-        assert!(
-            banner_repaint_tick(None).is_none(),
-            "inactive banner must not create an idle repaint timer"
+        assert_eq!(
+            banner_terminal_size(&disabled, Some((120, 40))),
+            None,
+            "a disabled config never shows the banner"
         );
     }
 
     #[test]
-    fn attach_banner_zero_interval_disables_automatic_repaint_triggers() {
-        let banner = AttachBannerRuntime {
-            snapshot: AttachBannerSnapshot::unknown("local", "s-42"),
-            terminal_size: (120, 40),
-            repaint_interval: std::time::Duration::ZERO,
-        };
-
-        assert!(
-            !banner_auto_repaint_enabled(Some(&banner)),
-            "zero interval must suppress output and state-change repaint spam"
+    fn effective_frame_interval_defaults_zero_to_the_frame_cadence() {
+        assert_eq!(
+            effective_frame_interval(std::time::Duration::ZERO),
+            DEFAULT_FRAME_INTERVAL,
+            "zero selects the built-in frame cadence"
         );
-        assert!(
-            !banner_auto_repaint_enabled(None),
-            "inactive banner must not request automatic repaint"
-        );
-    }
-
-    #[test]
-    fn attach_banner_positive_interval_enables_automatic_repaint_triggers() {
-        let banner = AttachBannerRuntime {
-            snapshot: AttachBannerSnapshot::unknown("local", "s-42"),
-            terminal_size: (120, 40),
-            repaint_interval: std::time::Duration::from_millis(250),
-        };
-
-        assert!(
-            banner_auto_repaint_enabled(Some(&banner)),
-            "positive interval keeps the live overlay repaint behavior opt-in"
+        assert_eq!(
+            effective_frame_interval(std::time::Duration::from_millis(200)),
+            std::time::Duration::from_millis(200),
+            "a positive value throttles repaints to a coarser refresh"
         );
     }
 
@@ -1509,17 +1469,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_banner_viewport_keeps_session_scroll_below_reserved_row() {
-        let frame = render_banner_viewport_frame(40);
-
-        assert_eq!(
-            frame, "\x1b[?6l\x1b[2;40r\x1b[?6h\x1b[1;1H",
-            "banner viewport must constrain session output to rows 2..N"
-        );
-    }
-
-    #[test]
-    fn attach_banner_frame_draws_top_row_without_persistent_terminal_modes() {
+    fn attach_banner_text_prioritizes_live_state_and_kill_shortcut() {
         let mut snapshot = AttachBannerSnapshot::unknown("local", "s-42");
         snapshot.update_from_session_value(&json!({
             "id": "s-42",
@@ -1530,29 +1480,13 @@ mod tests {
             "project_id": "p-abc123",
             "project_label": "ui"
         }));
-        let frame = render_banner_frame(120, &snapshot);
 
-        assert!(
-            frame.starts_with("\x1b7\x1b[?6l\x1b[1;1H\x1b[7m\x1b[2K"),
-            "banner frame must save DEC cursor state and draw on physical row one: {frame:?}"
-        );
-        assert!(
-            frame.contains(
-                "[kill:Ctrl-\\]  agent=claude  state=running  activity=blocked  host=local  id=s-42  session=review branch  project=ui"
-            ),
-            "banner text should start with kill action and prioritize live state: {frame:?}"
-        );
-        assert!(
-            frame.ends_with("\x1b[0m\x1b8"),
-            "banner frame must restore saved DEC cursor state without changing terminal modes: {frame:?}"
-        );
-        assert!(
-            !frame.contains("\x1b[2;24r"),
-            "banner repaint must not leave a scroll region active: {frame:?}"
-        );
-        assert!(
-            !frame.contains("\x1b[?6h"),
-            "banner repaint must not force DEC origin mode on the session: {frame:?}"
+        let text = render_banner_text(120, &snapshot);
+
+        assert_eq!(
+            text,
+            "[kill:Ctrl-\\]  agent=claude  state=running  activity=blocked  host=local  id=s-42  session=review branch  project=ui",
+            "banner text must start with the kill action and prioritize live state: {text:?}"
         );
     }
 
@@ -1567,8 +1501,7 @@ mod tests {
             "activity": "blocked",
             "project_id": "p-8d0114ca"
         }));
-        let frame = render_banner_frame(80, &snapshot);
-        let text = banner_frame_text(&frame);
+        let text = render_banner_text(80, &snapshot);
 
         assert!(
             text.contains("agent=codex  state=running  activity=blocked"),
@@ -1580,97 +1513,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn attach_banner_repaint_reasserts_viewport_before_drawing_top_row() {
-        let mut snapshot = AttachBannerSnapshot::unknown("local", "s-42");
-        snapshot.update_from_session_value(&json!({
-            "id": "s-42",
-            "name": "review branch",
-            "agent": "codex",
-            "state": "running",
-            "activity": "working",
-            "project_label": "ui"
-        }));
-        let banner = AttachBannerRuntime {
-            snapshot,
-            terminal_size: (120, 40),
-            repaint_interval: DEFAULT_BANNER_REPAINT_INTERVAL,
-        };
-        let mut output = Vec::new();
-
-        repaint_banner(&mut output, &banner)
-            .await
-            .expect("repaint banner");
-        let frame = String::from_utf8(output).expect("banner frame is utf8");
-
-        assert!(
-            frame.starts_with("\x1b[s\x1b[?6l\x1b[2;40r\x1b[?6h\x1b[u\x1b7\x1b[?6l\x1b[1;1H"),
-            "banner repaint must restore the reserved viewport before drawing the banner: {frame:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn attach_banner_zero_interval_auto_repaint_writes_no_frame() {
-        let banner = AttachBannerRuntime {
-            snapshot: AttachBannerSnapshot::unknown("local", "s-42"),
-            terminal_size: (120, 40),
-            repaint_interval: std::time::Duration::ZERO,
-        };
-        let mut output = Vec::new();
-
-        repaint_banner_if_auto(&mut output, Some(&banner))
-            .await
-            .expect("automatic repaint");
-
-        assert!(
-            output.is_empty(),
-            "zero interval must not write automatic repaint frames into scrollback"
-        );
-    }
-
-    #[tokio::test]
-    async fn attach_banner_positive_interval_auto_repaint_writes_frame() {
-        let banner = AttachBannerRuntime {
-            snapshot: AttachBannerSnapshot::unknown("local", "s-42"),
-            terminal_size: (120, 40),
-            repaint_interval: std::time::Duration::from_millis(250),
-        };
-        let mut output = Vec::new();
-
-        repaint_banner_if_auto(&mut output, Some(&banner))
-            .await
-            .expect("automatic repaint");
-        let frame = String::from_utf8(output).expect("banner frame is utf8");
-
-        assert!(
-            frame.contains("[kill:Ctrl-\\]"),
-            "positive interval should keep automatic banner repaint opt-in: {frame:?}"
-        );
-    }
-
     #[test]
-    fn attach_banner_kill_shortcut_does_not_enable_mouse_reporting() {
-        let mut snapshot = AttachBannerSnapshot::unknown("local", "s-42");
-        snapshot.update_from_session_value(&json!({
-            "id": "s-42",
-            "name": "review branch",
-            "agent": "codex",
-            "state": "running",
-            "activity": "working",
-            "project_label": "ui"
-        }));
-
-        let banner = render_banner_frame(120, &snapshot);
-        assert!(
-            banner.contains("[kill:Ctrl-\\]"),
-            "banner should expose the keyboard kill shortcut: {banner:?}"
-        );
-        assert_no_mouse_reporting(&banner);
-        assert_no_mouse_reporting(&render_banner_viewport_frame(40));
-        assert_no_mouse_reporting(reset_banner_frame());
+    fn attach_banner_kill_shortcut_is_parsed_from_input() {
         assert_eq!(
             parse_banner_input_action(&[BANNER_KILL_BYTE]),
-            Some(BannerInputAction::Kill)
+            Some(BannerInputAction::Kill),
+            "the Ctrl-\\ byte must map to the kill action"
         );
     }
 
@@ -1696,9 +1544,9 @@ mod tests {
             "project_label": "ui"
         }));
         assert!(
-            render_banner_frame(140, &snapshot)
+            render_banner_text(140, &snapshot)
                 .contains("host=local  id=s-42  session=review branch  project=ui"),
-            "banner frame should include project and session name"
+            "banner text should include project and session name"
         );
         assert_eq!(snapshot.agent, "claude->codex");
         assert_eq!(snapshot.state, "running");
@@ -1744,23 +1592,10 @@ mod tests {
             "project_id": "p-abc123"
         }));
 
-        let frame = render_banner_frame(120, &snapshot);
+        let text = render_banner_text(120, &snapshot);
         assert!(
-            frame.contains("host=local  id=s-42  session=s-42  project=p-abc123"),
-            "banner frame should fall back to ids when display labels are absent: {frame:?}"
+            text.contains("host=local  id=s-42  session=s-42  project=p-abc123"),
+            "banner text should fall back to ids when display labels are absent: {text:?}"
         );
-    }
-
-    fn assert_no_mouse_reporting(frame: &str) {
-        assert!(
-            !frame.contains("\x1b[?1000") && !frame.contains("\x1b[?1006"),
-            "banner terminal frames must not toggle mouse reporting: {frame:?}"
-        );
-    }
-
-    fn banner_frame_text(frame: &str) -> &str {
-        let (_, after_clear) = frame.split_once("\x1b[2K").expect("banner clear");
-        let (text, _) = after_clear.split_once("\x1b[0m").expect("banner reset");
-        text
     }
 }

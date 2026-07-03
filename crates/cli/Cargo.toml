@@ -16,6 +16,7 @@ pohunek-protocol = { workspace = true }
 pohunek-netbird = { workspace = true }
 pohunek-client = { workspace = true }
 pohunek-prompt = { workspace = true }
+pohunek-terminal = { workspace = true }
 pohunek-gui-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

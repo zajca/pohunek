@@ -2934,6 +2934,7 @@ dependencies = [
  "pohunek-netbird",
  "pohunek-prompt",
  "pohunek-protocol",
+ "pohunek-terminal",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2965,6 +2966,7 @@ dependencies = [
  "pohunek-knowledge",
  "pohunek-netbird",
  "pohunek-protocol",
+ "pohunek-terminal",
  "portable-pty",
  "regex",
  "serde",
@@ -2978,7 +2980,6 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "vt100",
 ]
 
 [[package]]
@@ -3060,6 +3061,13 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "pohunek-terminal"
+version = "0.14.4"
+dependencies = [
+ "vt100",
 ]
 
 [[package]]
