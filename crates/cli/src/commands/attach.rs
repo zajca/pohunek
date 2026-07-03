@@ -205,8 +205,9 @@ impl AttachBannerSnapshot {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("-"),
         );
-        if let Some(agent) = value.get("agent").and_then(serde_json::Value::as_str) {
-            replace_string(&mut self.agent, agent);
+        if value.get("agent").is_some() || value.get("active_agent").is_some() {
+            let agent = banner_agent_label(value, &self.agent);
+            replace_string(&mut self.agent, &agent);
         }
         if let Some(state) = value.get("state").and_then(serde_json::Value::as_str) {
             replace_string(&mut self.state, state);
@@ -241,6 +242,24 @@ impl AttachBannerSnapshot {
 fn replace_string(target: &mut String, value: &str) {
     target.clear();
     target.push_str(value);
+}
+
+fn banner_agent_label(value: &serde_json::Value, current: &str) -> String {
+    let launch = value
+        .get("agent")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| {
+            current
+                .split_once("->")
+                .map_or(current, |(launch, _)| launch)
+        });
+    match value
+        .get("active_agent")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(active) if active != launch => format!("{launch}->{active}"),
+        _ => launch.to_owned(),
+    }
 }
 
 /// Run top-level `attach` against the daemon for `host`.
@@ -1417,6 +1436,7 @@ mod tests {
             "id": "s-42",
             "name": "review branch",
             "agent": "claude",
+            "active_agent": "codex",
             "state": "running",
             "activity": "working",
             "project_id": "p-abc123",
@@ -1427,7 +1447,7 @@ mod tests {
                 .contains("host=local  project=ui  session=review branch"),
             "banner frame should include project and session name"
         );
-        assert_eq!(snapshot.agent, "claude");
+        assert_eq!(snapshot.agent, "claude->codex");
         assert_eq!(snapshot.state, "running");
         assert_eq!(snapshot.activity, "working");
 
@@ -1442,11 +1462,12 @@ mod tests {
             "event": "session_updated",
             "session": {
                 "id": "s-42",
-                "agent": "codex",
+                "agent": "shell",
+                "active_agent": "claude",
                 "state": "done"
             }
         }));
-        assert_eq!(snapshot.agent, "codex");
+        assert_eq!(snapshot.agent, "shell->claude");
         assert_eq!(snapshot.state, "done");
         assert_eq!(snapshot.activity, "blocked");
 

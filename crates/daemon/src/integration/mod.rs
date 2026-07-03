@@ -1,11 +1,11 @@
-//! Per-agent `SessionStart` hook installation (session-id capture only).
+//! Per-agent `SessionStart` hook installation.
 //!
 //! Ported from herdr (`src/integration/mod.rs` `install_claude`/`install_codex`
 //! and `assets/{claude,codex}/herdr-agent-state.sh`), rewritten to emit *our*
-//! handshake env names and *our* `session.report_native_id` method. The hook
-//! captures the agent's native session id for resume; it never reports live
-//! state (that stays with the M5 detector — see `docs/plan-phase-1.md`
-//! "Hook Integration (Session-ID Capture Only)").
+//! handshake env names and *our* active-agent/native-id callback methods. The
+//! hook reports nested active-agent identity for the owning session and captures
+//! the launch agent's native session id for direct-session resume; live activity
+//! still comes from the detector unless a hook has reliable activity evidence.
 //!
 //! Install merges into the agent's own config format idempotently and never
 //! clobbers unrelated user hooks: only hooks whose command references our
@@ -778,15 +778,33 @@ mod tests {
     }
 
     #[test]
-    fn assets_fire_our_method_with_our_env_and_exit_zero_on_missing_env() {
+    fn assets_fire_active_agent_then_native_id_with_our_env_and_exit_zero_on_missing_env() {
         for asset in [CLAUDE_HOOK_ASSET, CODEX_HOOK_ASSET] {
             assert!(
                 asset.starts_with("#!/bin/sh"),
                 "hook must be a POSIX sh script"
             );
             assert!(
+                asset.contains(method::SESSION_REPORT_AGENT),
+                "hook must fire our active-agent method"
+            );
+            assert!(
                 asset.contains(method::SESSION_REPORT_NATIVE_ID),
                 "hook must fire our native-id method"
+            );
+            let report_agent_index = asset
+                .find(method::SESSION_REPORT_AGENT)
+                .expect("asset contains active-agent method");
+            let report_native_index = asset
+                .find(method::SESSION_REPORT_NATIVE_ID)
+                .expect("asset contains native-id method");
+            assert!(
+                report_agent_index < report_native_index,
+                "hook must report active agent before native id"
+            );
+            assert!(
+                asset.contains("native_id_params[\"transcript_path\"] = transcript_path"),
+                "hook must forward transcript_path to native-id reports for path-kind resume"
             );
             for env_name in [
                 ENV_FLAG,

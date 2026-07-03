@@ -97,16 +97,7 @@ impl ListFilter {
     /// Whether this filter matches one session exactly.
     #[must_use]
     pub(crate) fn matches(&self, session: &SessionInfo) -> bool {
-        match self {
-            ListFilter::Id(id) => session.id.0 == *id,
-            ListFilter::State(state) => session.state == *state,
-            ListFilter::Activity(activity) => session.activity == Some(*activity),
-            ListFilter::Agent(agent) => session.agent == *agent,
-            ListFilter::Project(reference) => {
-                session.project_id.as_deref() == Some(reference)
-                    || session.project_label.as_deref() == Some(reference)
-            }
-        }
+        self.to_protocol_filter().matches(session)
     }
 
     fn to_protocol_filter(&self) -> SessionListFilter {
@@ -578,7 +569,7 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
         .max("NAME".len());
     let agent_width = sessions
         .iter()
-        .map(|s| agent_label(&s.agent).len())
+        .map(|s| session_agent_label(s).len())
         .max()
         .unwrap_or(0)
         .max("AGENT".len());
@@ -607,7 +598,7 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
             "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {}",
             session.id.0,
             name_label(session),
-            agent_label(&session.agent),
+            session_agent_label(session),
             state_label(session.state),
             activity_label_option(session.activity),
             state_source_label(session.state_source),
@@ -688,7 +679,7 @@ fn warn_count_label(info: &SessionInfo) -> String {
 
 fn render_inspect_human(info: &SessionInfo) -> String {
     let none = || "<none>".to_owned();
-    let rows: Vec<(&str, String)> = vec![
+    let mut rows: Vec<(&str, String)> = vec![
         ("id", info.id.0.clone()),
         ("name", info.name.clone().unwrap_or_else(&none)),
         ("agent", agent_label(&info.agent).to_owned()),
@@ -739,6 +730,18 @@ fn render_inspect_human(info: &SessionInfo) -> String {
             info.exit_code.map_or_else(none, |code| code.to_string()),
         ),
     ];
+    if let Some(active_agent) = &info.active_agent {
+        rows.insert(3, ("active_agent", active_agent.clone()));
+    }
+    if let Some(active_base) = info.active_agent_base {
+        rows.insert(4, ("active_base", agent_kind_label(active_base).to_owned()));
+    }
+    if let Some(active_id) = &info.active_agent_session_id {
+        rows.insert(5, ("active_native_session_id", active_id.clone()));
+    }
+    if let Some(active_path) = &info.active_agent_session_path {
+        rows.insert(6, ("active_native_session_path", active_path.clone()));
+    }
     let width = rows
         .iter()
         .map(|(field, _)| field.len())
@@ -800,6 +803,23 @@ fn agent_label(agent: &str) -> &str {
     agent
 }
 
+fn session_agent_label(info: &SessionInfo) -> String {
+    match info.active_agent.as_deref() {
+        Some(active_agent) if active_agent != info.agent => {
+            format!("{}->{active_agent}", info.agent)
+        }
+        _ => agent_label(&info.agent).to_owned(),
+    }
+}
+
+fn agent_kind_label(agent: protocol::AgentKind) -> &'static str {
+    match agent {
+        protocol::AgentKind::Shell => "shell",
+        protocol::AgentKind::Codex => "codex",
+        protocol::AgentKind::Claude => "claude",
+    }
+}
+
 fn state_label(state: SessionState) -> &'static str {
     match state {
         SessionState::Starting => "starting",
@@ -838,6 +858,7 @@ fn state_source_label(source: StateSource) -> &'static str {
         StateSource::OscProgress => "osc_progress",
         StateSource::Screen => "screen",
         StateSource::Process => "process",
+        StateSource::Report => "report",
     }
 }
 
@@ -873,6 +894,10 @@ mod tests {
             activity: None,
             native_session_id: None,
             native_session_path: None,
+            active_agent: None,
+            active_agent_base: None,
+            active_agent_session_id: None,
+            active_agent_session_path: None,
             project_id: None,
             project_label: None,
             metadata: std::collections::BTreeMap::new(),
@@ -1081,6 +1106,26 @@ mod tests {
         let filter = parse_list_filter("agent=codex").expect("filter");
 
         assert!(!filter.matches(&running_session("s-42")));
+    }
+
+    #[test]
+    fn list_filter_matches_active_agent_identity() {
+        let mut session = running_session("s-42");
+        session.active_agent = Some("codex".to_owned());
+        session.active_agent_base = Some(protocol::AgentKind::Codex);
+
+        assert!(
+            parse_list_filter("agent=codex")
+                .expect("active agent")
+                .matches(&session),
+            "active agent should match the client-side fallback filter"
+        );
+        assert!(
+            parse_list_filter("agent=shell")
+                .expect("launch agent")
+                .matches(&session),
+            "launch agent should remain filterable"
+        );
     }
 
     #[test]
@@ -1514,6 +1559,21 @@ mod tests {
     }
 
     #[test]
+    fn renders_active_agent_in_session_list_table() {
+        let mut session = running_session("s-42");
+        session.active_agent = Some("codex".to_owned());
+        session.active_agent_base = Some(protocol::AgentKind::Codex);
+
+        let output = render_list_human(&[session]);
+
+        assert_eq!(
+            list_row(&output, "s-42")[2],
+            "shell->codex",
+            "AGENT column should show launch and active agent"
+        );
+    }
+
+    #[test]
     fn renders_worktree_branch_and_warning_count_in_list() {
         let mut session = running_session("s-42");
         session.cwd = PathBuf::from("/data/worktrees/s-42-project-feature-login");
@@ -1613,6 +1673,28 @@ mod tests {
         let output = render_inspect_human(&session);
 
         assert!(has_row(&output, "agent", "claude"));
+    }
+
+    #[test]
+    fn renders_active_agent_fields_in_session_inspect_table() {
+        let mut session = running_session("s-42");
+        session.active_agent = Some("codex".to_owned());
+        session.active_agent_base = Some(protocol::AgentKind::Codex);
+        session.active_agent_session_id = Some("codex-native".to_owned());
+        session.active_agent_session_path = Some("/tmp/codex/session.json".to_owned());
+
+        let output = render_inspect_human(&session);
+
+        assert!(has_row(&output, "agent", "shell"));
+        assert!(has_row(&output, "active_agent", "codex"));
+        assert!(has_row(&output, "active_base", "codex"));
+        assert!(has_row(&output, "active_native_session_id", "codex-native"));
+        assert!(has_row(
+            &output,
+            "active_native_session_path",
+            "/tmp/codex/session.json"
+        ));
+        assert!(has_row(&output, "native_session_id", "<none>"));
     }
 
     #[test]

@@ -62,6 +62,8 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/lib.rs`
 - `crates/daemon/src/api/handler.rs`
 - `crates/daemon/src/session/mod.rs`
+- `crates/daemon/src/session/hooks.rs`
+- `crates/daemon/src/session/detector.rs`
 - `crates/daemon/src/project/mod.rs`
 - `crates/daemon/src/project/config.rs`
 - `crates/daemon/src/project/detect.rs`
@@ -69,6 +71,8 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/store/mod.rs`
 - `crates/daemon/src/capabilities.rs`
 - `crates/daemon/src/integration/mod.rs`
+- `crates/daemon/src/integration/assets/codex/pohunek-agent-state.sh`
+- `crates/daemon/src/integration/assets/claude/pohunek-agent-state.sh`
 - `crates/daemon/src/paths.rs`
 - `crates/daemon/src/logging.rs`
 
@@ -79,6 +83,7 @@ Agent runtime and profile resolution:
 - `crates/daemon/src/agent/codex.rs`
 - `crates/daemon/src/agent/claude.rs`
 - `crates/daemon/src/agent/shell.rs`
+- `crates/daemon/src/detect/mod.rs`
 - `crates/daemon/src/detect/manifest/mod.rs`
 - `crates/daemon/src/detect/manifests/codex.toml`
 - `crates/daemon/src/detect/manifests/claude.toml`
@@ -88,6 +93,7 @@ Protocol contracts and transport:
 
 - `crates/client/src/lib.rs`
 - `crates/protocol/src/assistant.rs`
+- `crates/protocol/src/envelope.rs`
 - `crates/protocol/src/lib.rs`
 - `crates/protocol/src/session.rs`
 - `crates/protocol/src/project.rs`

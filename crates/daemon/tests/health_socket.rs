@@ -19,8 +19,8 @@ use protocol::{
     AssistantMaterializeResult, AttachHeader, ErrorClass, Event, Request, Response,
     SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
     SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
-    SessionNewParams, SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult,
-    StateSource, PROTOCOL_VERSION,
+    SessionNewParams, SessionReportAgentParams, SessionReportAgentResult, SessionResizeParams,
+    SessionResizeResult, SessionState, SessionStopResult, StateSource, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1521,6 +1521,64 @@ async fn subscribe_streams_session_created_event() {
         Value::from(created.id.0.as_str()),
         "streamed event should carry the created session id"
     );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn report_agent_api_records_active_agent_and_streams_report_state() {
+    let socket = temp_socket("report-agent-api");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::new("subscribe-report-agent", method::SUBSCRIBE, Value::Null);
+    let ack = exchange(&mut subscriber, &subscribe_req).await;
+    assert!(matches!(ack, Response::Ok { .. }), "subscribe should ack");
+
+    let mut control = connect(&socket).await;
+    let created = create_session(&mut control).await;
+    let report_req = Request::new(
+        "session-report-agent",
+        method::SESSION_REPORT_AGENT,
+        serde_json::to_value(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: "pohunek:codex".to_owned(),
+            agent: "codex".to_owned(),
+            activity: Some(AgentActivity::Blocked),
+            seq: Some(1),
+            agent_session_id: None,
+            agent_session_path: None,
+        })
+        .expect("serialize report-agent params"),
+    );
+    let result: SessionReportAgentResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &report_req).await))
+            .expect("report-agent result");
+    assert!(result.recorded);
+
+    let streamed = wait_for_agent_state_event(
+        &mut subscriber,
+        &created.id,
+        AgentActivity::Blocked,
+        StateSource::Report,
+    )
+    .await;
+    assert_eq!(streamed.payload["source"], Value::from("report"));
+
+    let stop_req = Request::new(
+        "session-stop-report-agent",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
 
     let _ = shutdown.send(());
     let _ = handle.await;

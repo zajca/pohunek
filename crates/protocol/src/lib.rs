@@ -63,10 +63,11 @@ pub use session::{
     AgentActivity, AgentKind, AttachHeader, SessionAttachParams, SessionAttachResult,
     SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
     SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams, SessionNewResult,
-    SessionRemoveResult, SessionRenameParams, SessionRenameResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeResult,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
-    SessionWarning, SessionWarningKind,
+    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams,
+    SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionResumeResult, SessionSetMetadataParams, SessionSetMetadataResult,
+    SessionState, SessionStopResult, SessionWarning, SessionWarningKind,
 };
 #[doc(inline)]
 pub use version::{negotiate, ProtocolVersion, PROTOCOL_VERSION};
@@ -103,6 +104,10 @@ pub mod method {
     pub const SUBSCRIBE: &str = "subscribe";
     /// Fire-and-forget native-session-id capture from the agent hook.
     pub const SESSION_REPORT_NATIVE_ID: &str = "session.report_native_id";
+    /// Fire-and-forget active nested-agent capture from an inherited hook.
+    pub const SESSION_REPORT_AGENT: &str = "session.report_agent";
+    /// Fire-and-forget active nested-agent release from an inherited hook.
+    pub const SESSION_RELEASE_AGENT: &str = "session.release_agent";
     /// Merge owner-controlled metadata for a session.
     pub const SESSION_SET_METADATA: &str = "session.set_metadata";
     /// Set or clear a session's owner-set display name.

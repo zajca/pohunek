@@ -5,10 +5,10 @@ use std::collections::BTreeMap;
 use super::{
     build_pty_command, debug, detect_at, event, launch_adapter_for, plan_initial_input_delivery,
     runtime_error, spawn_error_to_protocol, timestamp_now, warn, watch, AgentKind,
-    CancellationToken, DetectedProject, InputRules, LaunchOpts, Manifest, PathBuf, ProjectRecord,
-    ProtocolError, PtyCommand, PtyHandle, ResolvedAgent, ResumeSnapshot, SessionEntry, SessionId,
-    SessionInfo, SessionNewParams, SessionRegistry, SessionState, SessionWarning, ShellCommand,
-    StateSource, WorktreeRequest,
+    CancellationToken, DetectedProject, DetectorConfig, InputRules, LaunchOpts, Manifest, PathBuf,
+    ProjectRecord, ProtocolError, PtyCommand, PtyHandle, ResolvedAgent, ResumeSnapshot,
+    SessionEntry, SessionId, SessionInfo, SessionNewParams, SessionRegistry, SessionState,
+    SessionWarning, ShellCommand, StateSource, WorktreeRequest,
 };
 
 /// Everything needed to spawn and register one PTY-backed session, shared by
@@ -393,6 +393,8 @@ impl SessionRegistry {
         let detector_output = pty.subscribe_output();
         let detector_cancel = CancellationToken::new();
         let (detector_resize, detector_resize_rx) = watch::channel((rows, cols));
+        let default_detector_config = DetectorConfig::for_profile(agent_base, manifest_override);
+        let (detector_config, detector_config_rx) = watch::channel(default_detector_config.clone());
 
         let now = timestamp_now();
         let info = SessionInfo {
@@ -407,6 +409,10 @@ impl SessionRegistry {
             state: SessionState::Running,
             state_source: StateSource::Process,
             activity: None,
+            active_agent: None,
+            active_agent_base: None,
+            active_agent_session_id: None,
+            active_agent_session_path: None,
             native_session_id,
             native_session_path,
             project_id,
@@ -432,9 +438,13 @@ impl SessionRegistry {
                     pty: pty.clone(),
                     detector_cancel: detector_cancel.clone(),
                     detector_resize,
+                    detector_config,
+                    default_detector_config,
                     stopping: false,
                     input_rules,
                     snapshot,
+                    active_agent: None,
+                    last_agent_report: None,
                 },
             )
         };
@@ -442,12 +452,11 @@ impl SessionRegistry {
         self.emit(event::SESSION_CREATED, &info);
         self.spawn_detector(
             id.clone(),
-            agent_base,
-            manifest_override,
             detector_output,
             (rows, cols),
             detector_cancel,
             detector_resize_rx,
+            detector_config_rx,
         );
         self.spawn_exit_watcher(id, pty);
         Ok(info)
