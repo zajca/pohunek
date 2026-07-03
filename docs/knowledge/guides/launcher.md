@@ -31,10 +31,12 @@ and [projects](../concepts/projects.md).
 host, project, session name, session id, agent state, and activity, then draws
 one initial frame. Pressing Ctrl-\ sends `session.stop` for the attached
 session and exits the attach client. `banner_interval_seconds` controls the
-optional live repaint behavior; `0` disables automatic repainting after PTY
-output, resize events, session state updates, and idle timer ticks. A positive
-value opts into live repainting. The rofi/sway switcher only opens marked attach
-terminals; it does not create a separate banner window.
+optional live repaint behavior for resize events, session state updates, and
+idle timer ticks; `0` disables those live repaints. PTY output always reasserts
+the reserved viewport and redraws the current banner snapshot so the row stays
+visible while attached. A positive value opts into live repainting. The rofi/sway
+switcher only opens marked attach terminals; it does not create a separate banner
+window.
 
 Attach terminals automatically retry after an unexpected daemon stream close.
 `attach_reconnect_seconds` controls the retry window, and
