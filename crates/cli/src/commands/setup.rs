@@ -99,7 +99,8 @@ linear_cli=linear
 #linear_issue_states=started unstarted
 # Attach overlay: reserve the first terminal row for kill shortcut and session state.
 #banner=false
-#banner_interval_seconds=0.5
+# Periodic banner repaint is disabled by default; set a positive value to enable.
+#banner_interval_seconds=0
 # Attach reconnect: after an unexpected daemon stream close, wait for a restarted
 # daemon to resume the session and reattach. Set seconds to 0 to disable.
 #attach_reconnect_seconds=20

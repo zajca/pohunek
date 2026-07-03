@@ -27,14 +27,16 @@ use crate::target::Target;
 
 const DETACH_BYTE: u8 = 0x1d;
 const IO_BUFFER_BYTES: usize = 8192;
-// Frequent enough to redraw over fullscreen TUIs that repaint the first row,
-// while low enough to avoid turning idle attaches into a busy terminal loop.
-const DEFAULT_BANNER_REPAINT_INTERVAL: Duration = Duration::from_millis(500);
+// Disabled by default: transcript-oriented terminals can record each idle
+// repaint in scrollback. Output, resize, and state updates still repaint.
+const DEFAULT_BANNER_REPAINT_INTERVAL: Duration = Duration::ZERO;
 // Two rows are not enough for a banner plus a usable agent viewport.
 const MIN_ROWS_WITH_BANNER: u16 = 3;
 // Row 1 is reserved for the attach banner; the PTY viewport begins below it.
 const BANNER_VIEWPORT_TOP_ROW: u16 = 2;
 const BANNER_KILL_LABEL: &str = "[kill:Ctrl-\\]";
+// Two spaces keep dense banner fields readable in monospace terminals.
+const BANNER_FIELD_SEPARATOR: &str = "  ";
 // Ctrl-\ emits ASCII File Separator. Raw mode prevents the terminal driver from
 // turning it into SIGQUIT, and the shortcut stays adjacent to Ctrl-] detach.
 const BANNER_KILL_BYTE: u8 = 0x1c;
@@ -106,7 +108,7 @@ impl AttachBannerConfig {
             match key.trim() {
                 "banner" => config.enabled = parse_bool(value.trim(), &path, number + 1)?,
                 "banner_interval_seconds" => {
-                    config.repaint_interval = parse_positive_duration_seconds(
+                    config.repaint_interval = parse_nonnegative_duration_seconds(
                         "banner_interval_seconds",
                         value.trim(),
                         &path,
@@ -500,21 +502,64 @@ fn effective_attach_size((cols, rows): (u16, u16), banner_enabled: bool) -> Opti
 }
 
 fn render_banner_frame(cols: u16, snapshot: &AttachBannerSnapshot) -> String {
-    let text = truncate_banner_text(
-        &format!(
-            "{BANNER_KILL_LABEL}  host={}  project={}  session={}  id={}  agent={}  state={}  activity={}",
-            snapshot.host,
-            snapshot.project,
-            snapshot.name,
-            snapshot.id,
-            snapshot.agent,
-            snapshot.state,
-            snapshot.activity
-        ),
-        cols,
-    );
+    let text = render_banner_text(cols, snapshot);
     // DECSC/DECRC preserve origin mode while the banner targets physical row one.
     format!("\x1b7\x1b[?6l\x1b[1;1H\x1b[7m\x1b[2K{text}\x1b[0m\x1b8")
+}
+
+fn render_banner_text(cols: u16, snapshot: &AttachBannerSnapshot) -> String {
+    let max_cols = usize::from(cols);
+    let mut text = truncate_banner_text(BANNER_KILL_LABEL, cols);
+    let priority_segments = [
+        format!("agent={}", snapshot.agent),
+        format!("state={}", snapshot.state),
+        format!("activity={}", snapshot.activity),
+        format!("host={}", snapshot.host),
+        format!("id={}", snapshot.id),
+    ];
+    for segment in priority_segments {
+        push_banner_segment(&mut text, &segment, max_cols, true);
+    }
+
+    let optional_segments = [
+        format!("session={}", snapshot.name),
+        format!("project={}", snapshot.project),
+    ];
+    for segment in optional_segments {
+        push_banner_segment(&mut text, &segment, max_cols, false);
+    }
+    text
+}
+
+fn push_banner_segment(text: &mut String, segment: &str, max_cols: usize, required: bool) {
+    if max_cols == 0 {
+        return;
+    }
+
+    let current_cols = text.chars().count();
+    let separator_cols = if text.is_empty() {
+        0
+    } else {
+        BANNER_FIELD_SEPARATOR.chars().count()
+    };
+    let segment_cols = segment.chars().count();
+    if current_cols + separator_cols + segment_cols <= max_cols {
+        if separator_cols > 0 {
+            text.push_str(BANNER_FIELD_SEPARATOR);
+        }
+        text.push_str(segment);
+        return;
+    }
+
+    if !required || current_cols + separator_cols >= max_cols {
+        return;
+    }
+
+    if separator_cols > 0 {
+        text.push_str(BANNER_FIELD_SEPARATOR);
+    }
+    let remaining_cols = max_cols.saturating_sub(text.chars().count());
+    text.extend(segment.chars().take(remaining_cols));
 }
 
 fn render_banner_viewport_frame(rows: u16) -> String {
@@ -661,13 +706,24 @@ where
     Ok(())
 }
 
-fn banner_repaint_tick(banner: Option<&AttachBannerRuntime>) -> time::Interval {
-    let mut repaint_tick =
-        time::interval(banner.map_or(DEFAULT_BANNER_REPAINT_INTERVAL, |banner| {
-            banner.repaint_interval
-        }));
+fn banner_repaint_tick(banner: Option<&AttachBannerRuntime>) -> Option<time::Interval> {
+    let interval = banner?.repaint_interval;
+    if interval.is_zero() {
+        return None;
+    }
+
+    let mut repaint_tick = time::interval(interval);
     repaint_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    repaint_tick
+    Some(repaint_tick)
+}
+
+async fn wait_for_banner_repaint_tick(repaint_tick: &mut Option<time::Interval>) {
+    match repaint_tick {
+        Some(repaint_tick) => {
+            repaint_tick.tick().await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 fn parse_bool(value: &str, path: &Path, number: usize) -> Result<bool, CliError> {
@@ -842,7 +898,7 @@ where
                     banner_updates = None;
                 }
             }
-            _ = repaint_tick.tick(), if banner.is_some() => {
+            () = wait_for_banner_repaint_tick(&mut repaint_tick), if banner.is_some() => {
                 repaint_banner_if_active(&mut stdout, banner.as_ref()).await?;
             }
         }
@@ -1285,6 +1341,44 @@ mod tests {
     }
 
     #[test]
+    fn attach_banner_config_disables_idle_repaint_by_default() {
+        let root = std::env::temp_dir().join(format!(
+            "pohunek-attach-banner-default-repaint-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create config dir");
+        std::fs::write(root.join("launcher.conf"), "banner=true\n").expect("write config");
+
+        let config = AttachBannerConfig::load_from_config_dir(&root).expect("load config");
+
+        assert!(config.enabled, "banner=true should enable attach overlay");
+        assert_eq!(
+            config.repaint_interval,
+            std::time::Duration::ZERO,
+            "banner should repaint on output and state changes, not on an idle timer by default"
+        );
+    }
+
+    #[test]
+    fn attach_banner_zero_interval_has_no_repaint_tick() {
+        let banner = AttachBannerRuntime {
+            snapshot: AttachBannerSnapshot::unknown("local", "s-42"),
+            terminal_size: (120, 40),
+            repaint_interval: std::time::Duration::ZERO,
+        };
+
+        assert!(
+            banner_repaint_tick(Some(&banner)).is_none(),
+            "zero interval must not create an idle repaint timer"
+        );
+        assert!(
+            banner_repaint_tick(None).is_none(),
+            "inactive banner must not create an idle repaint timer"
+        );
+    }
+
+    #[test]
     fn attach_reconnect_decision_retries_only_live_or_temporarily_missing_sessions() {
         assert_eq!(
             reconnect_decision_from_state(protocol::SessionState::Running),
@@ -1348,9 +1442,9 @@ mod tests {
         );
         assert!(
             frame.contains(
-                "[kill:Ctrl-\\]  host=local  project=ui  session=review branch  id=s-42  agent=claude  state=running  activity=blocked"
+                "[kill:Ctrl-\\]  agent=claude  state=running  activity=blocked  host=local  id=s-42  session=review branch  project=ui"
             ),
-            "banner text should start with kill action and include project, session name, and state: {frame:?}"
+            "banner text should start with kill action and prioritize live state: {frame:?}"
         );
         assert!(
             frame.ends_with("\x1b[0m\x1b8"),
@@ -1363,6 +1457,30 @@ mod tests {
         assert!(
             !frame.contains("\x1b[?6h"),
             "banner repaint must not force DEC origin mode on the session: {frame:?}"
+        );
+    }
+
+    #[test]
+    fn attach_banner_narrow_width_keeps_live_state_visible() {
+        let mut snapshot = AttachBannerSnapshot::unknown("local", "s-37");
+        snapshot.update_from_session_value(&json!({
+            "id": "s-37",
+            "name": "debug s31",
+            "agent": "codex",
+            "state": "running",
+            "activity": "blocked",
+            "project_id": "p-8d0114ca"
+        }));
+        let frame = render_banner_frame(80, &snapshot);
+        let text = banner_frame_text(&frame);
+
+        assert!(
+            text.contains("agent=codex  state=running  activity=blocked"),
+            "narrow banner must preserve the live state before lower-priority labels: {text:?}"
+        );
+        assert!(
+            text.chars().count() <= 80,
+            "banner text must fit the declared terminal width: {text:?}"
         );
     }
 
@@ -1443,8 +1561,8 @@ mod tests {
             "project_label": "ui"
         }));
         assert!(
-            render_banner_frame(120, &snapshot)
-                .contains("host=local  project=ui  session=review branch"),
+            render_banner_frame(140, &snapshot)
+                .contains("host=local  id=s-42  session=review branch  project=ui"),
             "banner frame should include project and session name"
         );
         assert_eq!(snapshot.agent, "claude->codex");
@@ -1493,7 +1611,7 @@ mod tests {
 
         let frame = render_banner_frame(120, &snapshot);
         assert!(
-            frame.contains("host=local  project=p-abc123  session=s-42"),
+            frame.contains("host=local  id=s-42  session=s-42  project=p-abc123"),
             "banner frame should fall back to ids when display labels are absent: {frame:?}"
         );
     }
@@ -1503,5 +1621,11 @@ mod tests {
             !frame.contains("\x1b[?1000") && !frame.contains("\x1b[?1006"),
             "banner terminal frames must not toggle mouse reporting: {frame:?}"
         );
+    }
+
+    fn banner_frame_text(frame: &str) -> &str {
+        let (_, after_clear) = frame.split_once("\x1b[2K").expect("banner clear");
+        let (text, _) = after_clear.split_once("\x1b[0m").expect("banner reset");
+        text
     }
 }
