@@ -11,10 +11,11 @@ use protocol::{
     ProjectSource, ProtocolError, ProtocolVersion, ProviderKind, Request, Response,
     SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
     SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
-    SessionNewParams, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionSetMetadataParams, SessionSetMetadataResult,
-    SessionState, SessionStopResult, SessionWarning, SessionWarningKind, StateSource,
-    PROTOCOL_VERSION,
+    SessionNewParams, SessionReleaseAgentParams, SessionReleaseAgentResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
+    SessionWarning, SessionWarningKind, StateSource, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 
@@ -51,6 +52,10 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         state: SessionState::Running,
         state_source: StateSource::Process,
         activity: None,
+        active_agent: None,
+        active_agent_base: None,
+        active_agent_session_id: None,
+        active_agent_session_path: None,
         native_session_id: None,
         native_session_path: None,
         project_id: None,
@@ -321,6 +326,31 @@ fn session_list_params_roundtrips_with_filters() {
 }
 
 #[test]
+fn session_list_agent_filter_roundtrips_and_matches_launch_or_active_agent_identity() {
+    let session = SessionInfo {
+        agent: "shell-main".to_owned(),
+        agent_base: AgentKind::Shell,
+        active_agent: Some("codex-gpt-5".to_owned()),
+        active_agent_base: Some(AgentKind::Codex),
+        ..running_shell_session(None)
+    };
+
+    for agent in ["shell-main", "shell", "codex-gpt-5", "codex"] {
+        let filter = line_roundtrip(&SessionListFilter::Agent(agent.to_owned()));
+        assert!(
+            filter.matches(&session),
+            "agent filter {agent:?} must match launch or active identity"
+        );
+    }
+
+    let filter = line_roundtrip(&SessionListFilter::Agent("claude".to_owned()));
+    assert!(
+        !filter.matches(&session),
+        "agent filter must reject unrelated identities"
+    );
+}
+
+#[test]
 fn session_list_params_omits_empty_filters() {
     let params = SessionListParams::default();
 
@@ -513,8 +543,89 @@ fn session_report_native_id_method_name_is_stable() {
 }
 
 #[test]
+fn session_report_agent_method_names_are_stable() {
+    assert_eq!(method::SESSION_REPORT_AGENT, "session.report_agent");
+    assert_eq!(method::SESSION_RELEASE_AGENT, "session.release_agent");
+}
+
+#[test]
 fn session_set_metadata_method_name_is_stable() {
     assert_eq!(method::SESSION_SET_METADATA, "session.set_metadata");
+}
+
+#[test]
+fn session_report_agent_params_roundtrip_with_optional_native_refs() {
+    let params = SessionReportAgentParams {
+        session_id: SessionId("s-42".to_owned()),
+        source: "pohunek:codex".to_owned(),
+        agent: "codex".to_owned(),
+        activity: Some(AgentActivity::Working),
+        seq: Some(123),
+        agent_session_id: Some("codex-native".to_owned()),
+        agent_session_path: None,
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize report params");
+    assert_eq!(value["session_id"], json!("s-42"));
+    assert_eq!(value["source"], json!("pohunek:codex"));
+    assert_eq!(value["agent"], json!("codex"));
+    assert_eq!(value["activity"], json!("working"));
+    assert_eq!(value["seq"], json!(123));
+    assert_eq!(value["agent_session_id"], json!("codex-native"));
+    assert!(
+        !value
+            .as_object()
+            .expect("params object")
+            .contains_key("agent_session_path"),
+        "absent agent_session_path must be omitted: {value}"
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn session_release_agent_params_omits_absent_sequence() {
+    let params = SessionReleaseAgentParams {
+        session_id: SessionId("s-42".to_owned()),
+        source: "pohunek:codex".to_owned(),
+        agent: "codex".to_owned(),
+        seq: None,
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize release params");
+    assert_eq!(
+        value,
+        json!({
+            "session_id": "s-42",
+            "source": "pohunek:codex",
+            "agent": "codex"
+        })
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn session_report_and_release_agent_results_roundtrip() {
+    for result in [
+        SessionReportAgentResult { recorded: true },
+        SessionReportAgentResult { recorded: false },
+    ] {
+        let value = serde_json::to_value(&result).expect("serialize report result");
+        assert_eq!(value, json!({ "recorded": result.recorded }));
+        assert_eq!(line_roundtrip(&result), result);
+    }
+
+    for result in [
+        SessionReleaseAgentResult { released: true },
+        SessionReleaseAgentResult { released: false },
+    ] {
+        let value = serde_json::to_value(&result).expect("serialize release result");
+        assert_eq!(value, json!({ "released": result.released }));
+        assert_eq!(line_roundtrip(&result), result);
+    }
 }
 
 #[test]
@@ -598,6 +709,33 @@ fn session_info_roundtrips_with_native_session_id() {
     let back = line_roundtrip(&info);
     assert_eq!(back, info);
     assert_eq!(back.native_session_id.as_deref(), Some("claude-native-abc"));
+}
+
+#[test]
+fn session_info_roundtrips_with_active_agent_fields() {
+    let info = SessionInfo {
+        active_agent: Some("codex".to_owned()),
+        active_agent_base: Some(AgentKind::Codex),
+        active_agent_session_id: Some("codex-native".to_owned()),
+        active_agent_session_path: None,
+        ..running_shell_session(None)
+    };
+
+    let value = serde_json::to_value(&info).expect("serialize session info");
+    assert_eq!(value["agent"], json!("shell"));
+    assert_eq!(value["active_agent"], json!("codex"));
+    assert_eq!(value["active_agent_base"], json!("codex"));
+    assert_eq!(value["active_agent_session_id"], json!("codex-native"));
+    assert!(
+        !value
+            .as_object()
+            .expect("session info object")
+            .contains_key("active_agent_session_path"),
+        "absent active_agent_session_path must be omitted: {value}"
+    );
+
+    let back = line_roundtrip(&info);
+    assert_eq!(back, info);
 }
 
 #[test]
@@ -1081,6 +1219,13 @@ fn err_response_without_recover_omits_field() {
     );
     let back = line_roundtrip(&resp);
     assert_eq!(resp, back);
+}
+
+#[test]
+fn state_source_report_json_shape_roundtrips() {
+    let value = serde_json::to_value(StateSource::Report).expect("serialize state source");
+    assert_eq!(value, json!("report"));
+    assert_eq!(line_roundtrip(&StateSource::Report), StateSource::Report);
 }
 
 #[test]

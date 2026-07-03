@@ -130,7 +130,9 @@ All params and result type names below refer to structs exported by
 | `session.detach` | `SessionDetachParams` | `SessionDetachResult` | Cancels an active attach stream. Unknown streams return `detached: false`. |
 | `session.resize` | `SessionResizeParams` | `SessionResizeResult` | Resizes the PTY on the control connection. |
 | `session.input` | `SessionInputParams` | `SessionInputResult` | Injects text using agent-specific input framing. |
-| `session.report_native_id` | `SessionReportNativeIdParams` | `SessionReportNativeIdResult` | Hook callback for resume metadata. The daemon records only reports whose `agent` matches the session profile name or base kind; ignored reports return `recorded: false`. |
+| `session.report_agent` | `SessionReportAgentParams` | `SessionReportAgentResult` | Hook callback for nested agents running inside an existing session. It records active runtime identity and optional active native metadata without changing launch identity or resume binding; ignored reports return `recorded: false`. |
+| `session.release_agent` | `SessionReleaseAgentParams` | `SessionReleaseAgentResult` | Hook callback that clears a matching active nested-agent report and restores the session's default detector identity. Non-current releases return `released: false`. |
+| `session.report_native_id` | `SessionReportNativeIdParams` | `SessionReportNativeIdResult` | Hook callback for launch-agent resume metadata. The daemon records only reports whose `agent` matches the session profile name or base kind; ignored reports return `recorded: false`. This is not the nested-agent active identity callback. |
 | `session.set_metadata` | `SessionSetMetadataParams` | `SessionSetMetadataResult` | Merges owner-controlled metadata. Values must not contain secrets. |
 | `session.rename` | `SessionRenameParams` | `SessionRenameResult` | Sets or clears a session's owner display name (`name: null` clears). Cosmetic; the daemon trims it and rejects a control character or over-long name. |
 | `subscribe` | `null` | `{subscribed: true}` then event stream | Consumes the connection into a one-way event stream. |
@@ -162,13 +164,24 @@ Important fields:
   its id. Set at `session.new` and changed via `session.rename`.
 - `agent`: profile name.
 - `agent_base`: `shell`, `codex`, or `claude`.
+- `active_agent`: optional runtime agent profile currently active inside the
+  session. Present for nested agents reported through hooks.
+- `active_agent_base`: optional runtime base kind (`shell`, `codex`, or
+  `claude`) for `active_agent`.
+- `active_agent_session_id` / `active_agent_session_path`: optional native
+  metadata for the active nested agent. These fields are display/runtime
+  metadata only and do not make the parent session resumable as that nested
+  agent.
 - `cwd`: host-local working directory.
 - `pid`: root process id.
 - `cols`, `rows`: current PTY size.
 - `state`: `starting`, `running`, `stopped`, `done`, or `failed`.
-- `state_source`: `osc_title`, `osc_progress`, `screen`, or `process`.
+- `state_source`: `osc_title`, `osc_progress`, `screen`, `process`, or
+  `report`.
 - `activity`: optional `working`, `blocked`, or `idle`.
 - `native_session_id` / `native_session_path`: optional agent resume binding.
+  These belong to the immutable launch agent and are written by
+  `session.report_native_id`, not by nested active-agent reports.
 - `project_id`, `project_label`, `repo`, `branch`, `worktree_path`: optional git
   and project context.
 - `warnings`: non-fatal worktree setup warnings.
@@ -179,7 +192,9 @@ Important fields:
 ### Session and Project Filters
 
 `session.list` and `project.list` filters are exact-match predicates combined
-with AND semantics. They are tagged objects, for example:
+with AND semantics. Session `agent` filters match the immutable launch profile
+or base kind, and also match the current `active_agent` profile or base kind
+when a nested agent has reported itself. They are tagged objects, for example:
 
 ```json
 {
@@ -189,6 +204,10 @@ with AND semantics. They are tagged objects, for example:
   ]
 }
 ```
+
+With the example above, a shell session that currently has
+`active_agent: "codex"` also matches `{"key":"agent","value":"codex"}` even
+though its launch `agent` remains `shell`.
 
 ## Error Contract
 
@@ -244,10 +263,10 @@ The daemon then writes these events:
 | Event | Payload | Meaning |
 |---|---|---|
 | `session_created` | `{session: SessionInfo}` | A session was created or explicitly resumed into a new live PTY. |
-| `session_updated` | `{session: SessionInfo}` | Session metadata, state, resize, resume binding, or terminal state changed. |
+| `session_updated` | `{session: SessionInfo}` | Session metadata, active-agent report/release, state, resize, resume binding, or terminal state changed. |
 | `session_stopped` | `{session: SessionInfo}` | A user-requested stop completed. |
 | `session_removed` | `{session: SessionInfo}` | A session was evicted from the registry; clients drop it from their view. |
-| `agent_state` | `{session_id: SessionId, activity: AgentActivity, source: StateSource}` | Agent activity changed. |
+| `agent_state` | `{session_id: SessionId, activity: AgentActivity, source: StateSource}` | Agent activity changed. `source` may be `report` when a hook report supplied explicit active-agent state. |
 | `attach_opened` | `{session_id: SessionId, stream_id: string}` | A pending attach token was redeemed and a raw stream opened. |
 | `attach_closed` | `{session_id: SessionId, stream_id: string}` | A raw attach stream ended or was detached. |
 

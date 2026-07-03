@@ -16,8 +16,9 @@ use protocol::{
     ProjectAddParams, ProjectListParams, ProjectPromptParams, ProjectRemoveParams,
     ProjectRenameParams, ProjectShowParams, ProtocolError, Request, Response, SessionAttachParams,
     SessionDetachParams, SessionId, SessionInputParams, SessionListParams, SessionNewParams,
-    SessionNewResult, SessionRenameParams, SessionReportNativeIdParams, SessionResizeParams,
-    SessionResumeResult, SessionSetMetadataParams, WorktreeRemoveParams, PROTOCOL_VERSION,
+    SessionNewResult, SessionReleaseAgentParams, SessionRenameParams, SessionReportAgentParams,
+    SessionReportNativeIdParams, SessionResizeParams, SessionResumeResult,
+    SessionSetMetadataParams, WorktreeRemoveParams, PROTOCOL_VERSION,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -165,6 +166,10 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::SESSION_INPUT => handle_session_input(request, &state.sessions).await,
         method::SESSION_REPORT_NATIVE_ID => {
             handle_session_report_native_id(request, &state.sessions).await
+        }
+        method::SESSION_REPORT_AGENT => handle_session_report_agent(request, &state.sessions).await,
+        method::SESSION_RELEASE_AGENT => {
+            handle_session_release_agent(request, &state.sessions).await
         }
         method::DAEMON_DOCTOR => handle_daemon_doctor(request).await,
         method::ASSISTANT_MATERIALIZE => handle_assistant_materialize(request).await,
@@ -660,6 +665,24 @@ async fn handle_session_report_native_id(
     ok_value(request, &result)
 }
 
+async fn handle_session_report_agent(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_params::<SessionReportAgentParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    let result = sessions.report_agent(params).await;
+    ok_value(request, &result)
+}
+
+async fn handle_session_release_agent(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_params::<SessionReleaseAgentParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    let result = sessions.release_agent(params).await;
+    ok_value(request, &result)
+}
+
 fn handle_integration_install(request: &Request) -> Response {
     let params = match parse_params::<IntegrationInstallParams>(request) {
         Ok(params) => params,
@@ -839,6 +862,10 @@ mod tests {
             state,
             state_source: StateSource::Process,
             activity: None,
+            active_agent: None,
+            active_agent_base: None,
+            active_agent_session_id: None,
+            active_agent_session_path: None,
             native_session_id: None,
             native_session_path: None,
             project_id: None,

@@ -32,6 +32,14 @@ The assistant feature reuses this session lifecycle. Its opening prompt is just
 initial input to a normal session, so session warnings and applied-input status
 remain the source of truth for whether the agent received that prompt.
 
+Every session has an immutable launch identity: `agent` is the selected profile
+name and `agent_base` is the base kind (`shell`, `codex`, or `claude`). A shell
+session can temporarily host a nested Codex or Claude Code process. When that
+nested agent's hook reports back, the daemon records active runtime metadata in
+`active_agent`, `active_agent_base`, and the optional active native session
+fields. This affects display, filtering, and detector behavior, but it does not
+change the launch `agent` / `agent_base`.
+
 Detach and client restarts do not stop a session because the daemon owns the PTY.
 A daemon restart is different: the live PTY and process are gone, and only
 sessions with captured native agent resume metadata can be relaunched. When an
@@ -39,7 +47,12 @@ attached terminal sees that unexpected stream close, `pohunek attach` waits for
 the restarted daemon to resume the same session id and reconnects if it becomes
 running again. Native resume metadata is accepted only from the session's own
 agent profile or base kind, so a nested different agent cannot overwrite the
-parent session's resume binding.
+parent session's resume binding. Nested active-agent reports are therefore
+runtime evidence only: they can expose the currently active agent and active
+native metadata while the nested process runs, but they never populate or replace
+`native_session_id` / `native_session_path` for the parent session. Releasing the
+active report clears those active fields and restores the parent session's
+default detector identity.
 
 An in-memory terminal session (`stopped`, `done`, or `failed`) that still carries
 captured native resume metadata can be explicitly relaunched with `session.resume`.

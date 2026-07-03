@@ -3132,6 +3132,39 @@ mod tests {
     }
 
     #[test]
+    fn workspace_accepts_report_agent_state_source() {
+        let mut workspace = Workspace::default();
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot("local", vec![session("s-1", None)]),
+        });
+
+        let raw = Event::new(
+            event::AGENT_STATE,
+            serde_json::json!({
+                "session_id": "s-1",
+                "activity": "working",
+                "source": "report"
+            }),
+        );
+        workspace.apply(Message::HostEvent {
+            host_id: HostId::new("local"),
+            event: HostEvent::AgentState(parse_agent_state(raw).expect("agent state")),
+        });
+
+        let host = workspace.hosts.get(&HostId::new("local")).expect("host");
+        assert_eq!(
+            host.last_agent_state.as_ref().map(|event| event.source),
+            Some(StateSource::Report)
+        );
+        assert_eq!(
+            host.sessions
+                .get("s-1")
+                .and_then(|session| session.activity),
+            Some(AgentActivity::Working)
+        );
+    }
+
+    #[test]
     fn session_remove_completed_drops_the_session() {
         let mut workspace = Workspace::default();
         workspace.apply(Message::HostSnapshotLoaded {
@@ -3716,6 +3749,10 @@ mod tests {
             activity,
             native_session_id: None,
             native_session_path: None,
+            active_agent: None,
+            active_agent_base: None,
+            active_agent_session_id: None,
+            active_agent_session_path: None,
             project_id: None,
             project_label: None,
             is_linked_worktree: None,

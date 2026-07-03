@@ -34,7 +34,7 @@ const GENERIC_SHELL_MANIFEST: &str = include_str!("manifests/shell.toml");
 const CODEX_MANIFEST: &str = include_str!("manifests/codex.toml");
 const CLAUDE_MANIFEST: &str = include_str!("manifests/claude.toml");
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DetectorConfig {
     pub detection: DetectionConfig,
     pub manifest: Option<Manifest>,
@@ -126,6 +126,7 @@ pub struct Detector {
     latest_title: Option<String>,
     latest_progress: Option<String>,
     process_activity: ProcessActivityScanner,
+    needs_visible_recheck: bool,
 }
 
 impl Detector {
@@ -139,6 +140,7 @@ impl Detector {
             latest_title: None,
             latest_progress: None,
             process_activity: ProcessActivityScanner::default(),
+            needs_visible_recheck: false,
         }
     }
 
@@ -177,18 +179,30 @@ impl Detector {
         let mut transitions = Vec::new();
 
         // Working evidence is left to the byte/process path; tick only reconfirms
-        // debounced idle/blocked states and refreshes stable visible states.
+        // debounced idle/blocked states and refreshes stable visible states. A
+        // runtime reconfigure asks for one full visible-context recheck so cached
+        // screen/OSC context can publish under the newly active manifest.
         if let Some(item) = self.manifest_evidence(ContextFreshness::all()) {
-            if item.activity != AgentActivity::Working {
+            if item.activity != AgentActivity::Working || self.needs_visible_recheck {
                 push_transition(&mut transitions, self.state.observe_evidence(now, item));
             }
         }
+        self.needs_visible_recheck = false;
         push_transition(&mut transitions, self.state.tick(now));
         transitions
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.screen.resize(rows, cols);
+    }
+
+    /// Switches detector tuning and manifest without clearing terminal context.
+    pub fn reconfigure(&mut self, now: Instant, config: DetectorConfig) {
+        self.state = StateMachine::new(now, config.detection);
+        self.manifest = config.manifest;
+        self.process_activity.reset();
+        self.state.clear_pending();
+        self.needs_visible_recheck = true;
     }
 
     /// Recovers detector state after dropped PTY output.
@@ -204,6 +218,7 @@ impl Detector {
         self.latest_title = None;
         self.latest_progress = None;
         self.screen.reset();
+        self.needs_visible_recheck = false;
     }
 
     #[must_use]
@@ -1052,6 +1067,57 @@ mod tests {
             from_profile.feed(started_at, blocked.as_bytes()),
             from_base.feed(started_at, blocked.as_bytes()),
             "inherited manifest must detect exactly like the base Claude config"
+        );
+    }
+
+    #[test]
+    fn detector_reconfigure_switches_manifest_without_losing_context() {
+        let started_at = instant();
+        let mut detector = Detector::new(3, 80, started_at, config());
+        assert_eq!(
+            detector.feed(
+                started_at,
+                b"\x1b]2;cached nested title\x07\r\nnested-screen-token"
+            ),
+            vec![transition(AgentActivity::Working, StateSource::Process)]
+        );
+
+        let mut detector_config = config();
+        detector_config.manifest = Some(manifest(
+            r#"
+            [[rules]]
+            id = "nested-screen"
+            state = "blocked"
+            priority = 1
+            region = "whole_recent"
+            contains = "nested-screen-token"
+            "#,
+        ));
+        detector.reconfigure(started_at + Duration::from_millis(10), detector_config);
+
+        assert_eq!(detector.latest_title(), Some("cached nested title"));
+        assert_eq!(
+            detector.tick(started_at + Duration::from_millis(20)),
+            vec![transition(AgentActivity::Blocked, StateSource::Screen)]
+        );
+    }
+
+    #[test]
+    fn detector_reconfigure_rechecks_cached_title_with_new_manifest() {
+        let started_at = instant();
+        let mut detector = Detector::new(8, 80, started_at, DetectorConfig::generic_shell());
+        assert!(detector
+            .feed(started_at, "\x1b]2;\u{2800} thinking\x07".as_bytes())
+            .is_empty());
+
+        detector.reconfigure(
+            started_at + Duration::from_millis(10),
+            DetectorConfig::codex(),
+        );
+
+        assert_eq!(
+            detector.tick(started_at + Duration::from_secs(4)),
+            vec![transition(AgentActivity::Working, StateSource::OscTitle)]
         );
     }
 

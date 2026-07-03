@@ -225,9 +225,28 @@ States tracked: at least `working`, `blocked`/`waiting_approval`, `idle`, `done`
 `blocked` signal is the trickiest and is validated per agent and agent-CLI
 version.
 
-**Hooks capture only the native session ID** (for resume), not live state: a
-`SessionStart` hook posts the agent's session ID / transcript path to the daemon
-socket, fire-and-forget. See the resume model below.
+Hooks have two separate roles:
+
+- **Native resume binding.** A launch-agent `SessionStart` hook posts the
+  agent's session ID / transcript path to the daemon socket, fire-and-forget.
+  The daemon accepts this binding only when the reported agent matches the
+  session's immutable launch profile or base kind. This keeps resume tied to the
+  original session identity.
+- **Nested active-agent reporting.** Shell sessions inherit the pohunek hook
+  environment, so Codex or Claude Code started inside a shell PTY can report its
+  active runtime identity back to the parent session. This sets
+  `active_agent`, `active_agent_base`, and optional active native metadata, but
+  it does not change the shell session's launch `agent` / `agent_base` and does
+  not overwrite `native_session_id` / `native_session_path`.
+
+Live state remains detector-first: OSC, screen, PTY activity, and process state
+continue to drive normal activity transitions. A nested active-agent report is
+explicit hook evidence and uses the `report` state source when it supplies
+activity. While such a report is current, the detector can temporarily switch to
+the active agent's manifest so Codex/Claude UI patterns are interpreted
+correctly inside the shell session. Releasing the active report clears the
+active fields and restores the shell/default detector manifest. See the resume
+model below.
 
 ### Agent input injection (TUI quirks)
 

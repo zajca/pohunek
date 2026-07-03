@@ -14,7 +14,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use protocol::{
     event, AgentActivity, AgentKind, ErrorClass, Event, ProjectRemoveResult, ProtocolError,
     SessionAttachParams, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionNewParams, SessionRemoveResult, SessionReportNativeIdParams,
+    SessionNewParams, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
     SessionReportNativeIdResult, SessionSetMetadataResult, SessionState, SessionStopResult,
     SessionWarning, StateSource, WorktreeRemoveResult, PROTOCOL_VERSION,
 };
@@ -185,9 +186,9 @@ pub struct SessionRegistryConfig {
     /// immediately. Prevents the prompt from being delivered to a TUI that has
     /// not yet entered raw/bracketed-paste input mode.
     pub initial_input_startup_grace: Duration,
-    /// Control socket path injected into Codex/Claude agents so their hook can
-    /// call home. `None` disables hook-handshake env injection (e.g. in unit
-    /// tests that do not exercise the hook).
+    /// Control socket path injected into session PTYs so direct or nested agent
+    /// hooks can call home. `None` disables hook-handshake env injection (e.g.
+    /// in unit tests that do not exercise the hook).
     pub socket_path: Option<PathBuf>,
     /// Backing file for the unified metadata store (resume + worktree bindings).
     /// `None` disables persistence (sessions are then not resumable across a
@@ -306,6 +307,8 @@ struct SessionEntry {
     pty: PtyHandle,
     detector_cancel: CancellationToken,
     detector_resize: watch::Sender<(u16, u16)>,
+    detector_config: watch::Sender<DetectorConfig>,
+    default_detector_config: DetectorConfig,
     stopping: bool,
     /// Resolved input-framing rules (base-kind defaults, profile-overridden), used
     /// by `session.input` so a profile's `[input_rules]` is honored on every write.
@@ -314,6 +317,16 @@ struct SessionEntry {
     /// copied verbatim into every persisted [`ResumeBinding`] — so a resize-driven
     /// re-persist can never overwrite the launch-time program/args/resume shape.
     snapshot: ResumeSnapshot,
+    active_agent: Option<ActiveAgentReport>,
+    last_agent_report: Option<ActiveAgentReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveAgentReport {
+    source: String,
+    agent: String,
+    seq: Option<u64>,
+    activity_reported: bool,
 }
 
 impl Default for SessionRegistry {
@@ -996,6 +1009,171 @@ impl SessionRegistry {
         SessionReportNativeIdResult { recorded: true }
     }
 
+    /// Record the active nested agent currently owning a live session.
+    pub async fn report_agent(&self, params: SessionReportAgentParams) -> SessionReportAgentResult {
+        let not_recorded = SessionReportAgentResult { recorded: false };
+        let resolved = match self.inner.profiles.resolve_agent(&params.agent) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                debug!(
+                    session_id = %params.session_id.0,
+                    agent = %params.agent,
+                    error = %err,
+                    "active-agent report for an unknown agent; ignoring"
+                );
+                return not_recorded;
+            }
+        };
+
+        let valid_session_id =
+            validate_agent_session_id(&params.session_id, params.agent_session_id.as_deref());
+        let valid_session_path =
+            validate_agent_session_path(&params.session_id, params.agent_session_path.as_deref());
+        let reported_activity = params.activity;
+        let active_detector_config = detector_config_for_resolved_agent(&resolved);
+        let info = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get_mut(&params.session_id) else {
+                debug!(
+                    session_id = %params.session_id.0,
+                    "active-agent report for an unknown session; ignoring"
+                );
+                return not_recorded;
+            };
+            if is_terminal(entry.info.state) {
+                debug!(
+                    session_id = %params.session_id.0,
+                    "active-agent report for a terminal session; ignoring"
+                );
+                return not_recorded;
+            }
+            if !report_is_current(
+                entry.last_agent_report.as_ref(),
+                &params.source,
+                &resolved.name,
+                params.seq,
+            ) {
+                debug!(
+                    session_id = %params.session_id.0,
+                    source = %params.source,
+                    agent = %resolved.name,
+                    seq = ?params.seq,
+                    "stale active-agent report; ignoring"
+                );
+                return not_recorded;
+            }
+
+            let report = ActiveAgentReport {
+                source: params.source.clone(),
+                agent: resolved.name.clone(),
+                seq: params.seq,
+                activity_reported: reported_activity.is_some(),
+            };
+            entry.active_agent = Some(report.clone());
+            entry.last_agent_report = Some(report);
+            entry.info.active_agent = Some(resolved.name.clone());
+            entry.info.active_agent_base = Some(resolved.base);
+            entry.info.active_agent_session_id = valid_session_id;
+            entry.info.active_agent_session_path = valid_session_path;
+            if let Some(activity) = reported_activity {
+                entry.info.activity = Some(activity);
+                entry.info.state_source = StateSource::Report;
+            }
+            let _ = entry.detector_config.send(active_detector_config);
+            entry.info.updated_at = timestamp_now();
+            entry.info.clone()
+        };
+
+        self.emit(event::SESSION_UPDATED, &info);
+        if let Some(activity) = reported_activity {
+            let event = Event::new(
+                event::AGENT_STATE,
+                json!({
+                    "session_id": params.session_id,
+                    "activity": activity,
+                    "source": StateSource::Report,
+                }),
+            );
+            let _ = self.inner.events.send(event);
+        }
+        SessionReportAgentResult { recorded: true }
+    }
+
+    /// Release the active nested agent currently owning a live session.
+    pub async fn release_agent(
+        &self,
+        params: SessionReleaseAgentParams,
+    ) -> SessionReleaseAgentResult {
+        let not_released = SessionReleaseAgentResult { released: false };
+        let resolved = match self.inner.profiles.resolve_agent(&params.agent) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                debug!(
+                    session_id = %params.session_id.0,
+                    agent = %params.agent,
+                    error = %err,
+                    "active-agent release for an unknown agent; ignoring"
+                );
+                return not_released;
+            }
+        };
+
+        let info = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get_mut(&params.session_id) else {
+                debug!(
+                    session_id = %params.session_id.0,
+                    "active-agent release for an unknown session; ignoring"
+                );
+                return not_released;
+            };
+            if is_terminal(entry.info.state) {
+                debug!(
+                    session_id = %params.session_id.0,
+                    "active-agent release for a terminal session; ignoring"
+                );
+                return not_released;
+            }
+            let Some(active) = entry.active_agent.as_ref() else {
+                return not_released;
+            };
+            if !release_matches(active, &params.source, &resolved.name, params.seq) {
+                debug!(
+                    session_id = %params.session_id.0,
+                    source = %params.source,
+                    agent = %resolved.name,
+                    seq = ?params.seq,
+                    "active-agent release did not match current report; ignoring"
+                );
+                return not_released;
+            }
+            let activity_reported = active.activity_reported;
+
+            entry.last_agent_report = Some(ActiveAgentReport {
+                source: params.source.clone(),
+                agent: resolved.name.clone(),
+                seq: params.seq,
+                activity_reported: false,
+            });
+            entry.active_agent = None;
+            entry.info.active_agent = None;
+            entry.info.active_agent_base = None;
+            entry.info.active_agent_session_id = None;
+            entry.info.active_agent_session_path = None;
+            if activity_reported {
+                entry.info.activity = None;
+                entry.info.state_source = StateSource::Process;
+            }
+            let default_detector_config = entry.default_detector_config.clone();
+            let _ = entry.detector_config.send(default_detector_config);
+            entry.info.updated_at = timestamp_now();
+            entry.info.clone()
+        };
+
+        self.emit(event::SESSION_UPDATED, &info);
+        SessionReleaseAgentResult { released: true }
+    }
+
     /// List all known sessions, with each session's `project_label` enriched from
     /// the project store (so the switcher and `session list` show the project by
     /// name, and `--filter project=<label>` resolves). Enrichment is best-effort:
@@ -1363,6 +1541,12 @@ impl SessionRegistry {
             };
             entry.info.state_source = StateSource::Process;
             entry.info.activity = None;
+            entry.active_agent = None;
+            entry.last_agent_report = None;
+            entry.info.active_agent = None;
+            entry.info.active_agent_base = None;
+            entry.info.active_agent_session_id = None;
+            entry.info.active_agent_session_path = None;
             entry.info.exit_code = exit.exit_code;
             entry.info.updated_at = timestamp_now();
             entry.detector_cancel.cancel();
@@ -1513,6 +1697,76 @@ fn agent_kind_label(agent: AgentKind) -> &'static str {
     }
 }
 
+fn detector_config_for_resolved_agent(resolved: &ResolvedAgent) -> DetectorConfig {
+    DetectorConfig::for_profile(
+        resolved.base,
+        resolved
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.manifest.clone()),
+    )
+}
+
+fn report_is_current(
+    current: Option<&ActiveAgentReport>,
+    source: &str,
+    agent: &str,
+    seq: Option<u64>,
+) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+    if current.source != source || current.agent != agent {
+        return true;
+    }
+    seq_is_current(current.seq, seq)
+}
+
+fn release_matches(
+    current: &ActiveAgentReport,
+    source: &str,
+    agent: &str,
+    seq: Option<u64>,
+) -> bool {
+    current.source == source && current.agent == agent && seq_is_current(current.seq, seq)
+}
+
+fn seq_is_current(current: Option<u64>, incoming: Option<u64>) -> bool {
+    match (current, incoming) {
+        (Some(current), Some(incoming)) => incoming >= current,
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
+fn validate_agent_session_id(session_id: &SessionId, value: Option<&str>) -> Option<String> {
+    value.and_then(|raw| match SessionRef::id(raw) {
+        Ok(session_ref) => Some(session_ref.value().to_owned()),
+        Err(err) => {
+            debug!(
+                session_id = %session_id.0,
+                error = %err,
+                "ignoring active-agent report with an invalid native session id"
+            );
+            None
+        }
+    })
+}
+
+fn validate_agent_session_path(session_id: &SessionId, value: Option<&str>) -> Option<String> {
+    value.and_then(|raw| match SessionRef::path(raw) {
+        Ok(session_ref) => Some(session_ref.value().to_owned()),
+        Err(err) => {
+            debug!(
+                session_id = %session_id.0,
+                error = %err,
+                "ignoring active-agent report with an invalid native session path"
+            );
+            None
+        }
+    })
+}
+
 fn session_not_found(id: &str) -> ProtocolError {
     ProtocolError::new(
         ErrorClass::Runtime,
@@ -1590,11 +1844,12 @@ mod tests {
 
     use protocol::{
         AgentActivity, AgentKind, Event, ProjectSource, SessionAttachParams, SessionId,
-        SessionInfo, SessionNewParams, SessionReportNativeIdParams, SessionState,
+        SessionInfo, SessionNewParams, SessionReleaseAgentParams, SessionReportAgentParams,
+        SessionReportNativeIdParams, SessionState, StateSource,
     };
 
     use crate::agent::{InputRules, ResumeMode, SessionRefKind};
-    use crate::detect::ActivityTransition;
+    use crate::detect::{ActivityTransition, DetectorConfig, ManifestRegion, MatchContext};
     use crate::integration::{
         ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
     };
@@ -1736,6 +1991,16 @@ mod tests {
             activity,
             source: protocol::StateSource::Process,
         }
+    }
+
+    fn title_activity(config: &DetectorConfig, title: &str) -> Option<AgentActivity> {
+        config
+            .manifest
+            .as_ref()?
+            .match_context(
+                &MatchContext::default().with_region_text(ManifestRegion::OscTitle, title),
+            )
+            .map(|matched| matched.activity)
     }
 
     fn pty_command<'a>(program: &str, args: impl IntoIterator<Item = &'a str>) -> PtyCommand {
@@ -3822,17 +4087,14 @@ mod tests {
     }
 
     #[test]
-    fn hook_env_injected_for_agents_with_socket_and_absent_for_shell() {
+    fn hook_env_injected_for_every_agent_kind_with_socket() {
         let registry = SessionRegistry::new(SessionRegistryConfig {
             socket_path: Some(PathBuf::from("/run/pohunek/daemon.sock")),
             ..SessionRegistryConfig::default()
         });
         let id = SessionId("s-7".to_owned());
 
-        // Shell never gets hook env.
-        assert!(registry.hook_env(AgentKind::Shell, &id).is_empty());
-
-        for agent in [AgentKind::Codex, AgentKind::Claude] {
+        for agent in [AgentKind::Shell, AgentKind::Codex, AgentKind::Claude] {
             let env = registry.hook_env(agent, &id);
             let lookup = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
             assert_eq!(lookup(ENV_FLAG).as_deref(), Some("1"));
@@ -3852,6 +4114,7 @@ mod tests {
     fn hook_env_absent_without_configured_socket() {
         let registry = SessionRegistry::default();
         let id = SessionId("s-1".to_owned());
+        assert!(registry.hook_env(AgentKind::Shell, &id).is_empty());
         assert!(registry.hook_env(AgentKind::Claude, &id).is_empty());
         assert!(registry.hook_env(AgentKind::Codex, &id).is_empty());
     }
@@ -3864,11 +4127,13 @@ mod tests {
         });
         let id = SessionId("s-7".to_owned());
 
-        // Every kind — including a plain shell, which gets no hook handshake —
-        // carries POHUNEK_SESSION_ID and POHUNEK_DAEMON_ID so a self-feeding
-        // attach is detectable and pinned to this daemon instance.
+        // Every kind carries the hook handshake plus POHUNEK_DAEMON_ID. The
+        // daemon id keeps self-feeding attach detection scoped to this daemon
+        // instance, and POHUNEK_SESSION_ID must not be duplicated on top of the
+        // hook env that already carries it.
         for agent in [AgentKind::Shell, AgentKind::Codex, AgentKind::Claude] {
             let env = registry.session_pty_env(agent, &id);
+            let lookup = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
             let session_ids: Vec<&str> = env
                 .iter()
                 .filter(|(k, _)| k == ENV_SESSION_ID)
@@ -3891,14 +4156,575 @@ mod tests {
                 vec![registry.daemon_instance_id()],
                 "{agent:?} must carry POHUNEK_DAEMON_ID once, equal to this instance's id"
             );
+            assert_eq!(
+                lookup(ENV_FLAG).as_deref(),
+                Some("1"),
+                "{agent:?} must carry the hook gate flag"
+            );
+            assert_eq!(
+                lookup(ENV_SOCKET_PATH).as_deref(),
+                Some("/run/pohunek/daemon.sock"),
+                "{agent:?} must carry the daemon socket path"
+            );
+            assert_eq!(
+                lookup(ENV_PROTOCOL_VERSION).as_deref(),
+                Some(protocol::PROTOCOL_VERSION.get().to_string().as_str()),
+                "{agent:?} must carry the protocol version"
+            );
         }
+    }
 
-        // The shell carries *only* the session-id marker, not the agent handshake.
-        let shell_env = registry.session_pty_env(AgentKind::Shell, &id);
-        assert!(
-            !shell_env.iter().any(|(k, _)| k == ENV_FLAG),
-            "a shell must not get the agent-hook gate flag: {shell_env:?}"
+    #[tokio::test]
+    async fn report_agent_on_shell_session_sets_active_agent_without_changing_launch_identity() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry
+            .create(params())
+            .await
+            .expect("create shell session");
+
+        let result = registry
+            .report_agent(SessionReportAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                activity: Some(AgentActivity::Working),
+                seq: Some(1),
+                agent_session_id: Some("codex-native".to_owned()),
+                agent_session_path: None,
+            })
+            .await;
+        assert!(result.recorded);
+
+        let inspected = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(inspected.agent, "shell");
+        assert_eq!(inspected.agent_base, AgentKind::Shell);
+        assert_eq!(inspected.active_agent.as_deref(), Some("codex"));
+        assert_eq!(inspected.active_agent_base, Some(AgentKind::Codex));
+        assert_eq!(
+            inspected.active_agent_session_id.as_deref(),
+            Some("codex-native")
         );
+        assert_eq!(inspected.active_agent_session_path, None);
+        assert_eq!(inspected.native_session_id, None);
+        assert_eq!(inspected.native_session_path, None);
+        assert_eq!(inspected.activity, Some(AgentActivity::Working));
+        assert_eq!(inspected.state_source, StateSource::Report);
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn report_agent_reconfigures_detector_and_release_restores_default_config() {
+        let agents_dir = temp_agents_dir_with(
+            "active-detector-config",
+            "nested-codex",
+            "base = \"codex\"\n\
+             program = \"/bin/sh\"\n\
+             args = [\"-c\", \"sleep 30\"]\n\
+             manifest = \"nested-active\"\n",
+        );
+        write_agent_manifest(
+            &agents_dir,
+            "nested-active",
+            r#"
+            [[rules]]
+            id = "profile-title"
+            state = "blocked"
+            priority = 1
+            region = "osc_title"
+            contains = "profile-only-title"
+            "#,
+        );
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            agents_dir: Some(agents_dir),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry
+            .create(params())
+            .await
+            .expect("create shell session");
+        let mut detector_config_rx = {
+            let sessions = registry.inner.sessions.lock().await;
+            sessions
+                .get(&created.id)
+                .expect("session entry")
+                .detector_config
+                .subscribe()
+        };
+
+        let default_config = detector_config_rx.borrow().clone();
+        assert_eq!(title_activity(&default_config, "profile-only-title"), None);
+
+        let report = registry
+            .report_agent(SessionReportAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:nested-codex".to_owned(),
+                agent: "nested-codex".to_owned(),
+                activity: Some(AgentActivity::Working),
+                seq: Some(1),
+                agent_session_id: None,
+                agent_session_path: None,
+            })
+            .await;
+        assert!(report.recorded);
+        detector_config_rx
+            .changed()
+            .await
+            .expect("active detector config");
+        let active_config = detector_config_rx.borrow().clone();
+        assert_eq!(
+            title_activity(&active_config, "profile-only-title"),
+            Some(AgentActivity::Blocked)
+        );
+
+        let release = registry
+            .release_agent(SessionReleaseAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:nested-codex".to_owned(),
+                agent: "nested-codex".to_owned(),
+                seq: Some(1),
+            })
+            .await;
+        assert!(release.released);
+        detector_config_rx
+            .changed()
+            .await
+            .expect("default detector config");
+        let restored_config = detector_config_rx.borrow().clone();
+        assert_eq!(title_activity(&restored_config, "profile-only-title"), None);
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn release_agent_clears_current_active_agent_but_ignores_stale_sequence() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry
+            .create(params())
+            .await
+            .expect("create shell session");
+
+        let newer = registry
+            .report_agent(SessionReportAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                activity: Some(AgentActivity::Working),
+                seq: Some(10),
+                agent_session_id: Some("codex-newer".to_owned()),
+                agent_session_path: None,
+            })
+            .await;
+        assert!(newer.recorded);
+
+        let stale_release = registry
+            .release_agent(SessionReleaseAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                seq: Some(9),
+            })
+            .await;
+        assert!(!stale_release.released);
+        let still_active = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(still_active.active_agent.as_deref(), Some("codex"));
+        assert_eq!(
+            still_active.active_agent_session_id.as_deref(),
+            Some("codex-newer")
+        );
+
+        let current_release = registry
+            .release_agent(SessionReleaseAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                seq: Some(10),
+            })
+            .await;
+        assert!(current_release.released);
+        let cleared = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(cleared.active_agent, None);
+        assert_eq!(cleared.active_agent_base, None);
+        assert_eq!(cleared.active_agent_session_id, None);
+        assert_eq!(cleared.active_agent_session_path, None);
+        assert_eq!(cleared.activity, None);
+        assert_eq!(cleared.state_source, StateSource::Process);
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn report_agent_release_with_no_sequence_does_not_clear_newer_sequenced_report() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry
+            .create(params())
+            .await
+            .expect("create shell session");
+
+        let result = registry
+            .report_agent(SessionReportAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                activity: Some(AgentActivity::Working),
+                seq: Some(10),
+                agent_session_id: Some("codex-newer".to_owned()),
+                agent_session_path: None,
+            })
+            .await;
+        assert!(result.recorded);
+
+        let stale_release = registry
+            .release_agent(SessionReleaseAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                seq: None,
+            })
+            .await;
+        assert!(!stale_release.released);
+
+        let inspected = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(inspected.active_agent.as_deref(), Some("codex"));
+        assert_eq!(
+            inspected.active_agent_session_id.as_deref(),
+            Some("codex-newer")
+        );
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn report_agent_with_no_sequence_does_not_overwrite_newer_sequenced_report() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry
+            .create(params())
+            .await
+            .expect("create shell session");
+
+        let newer = registry
+            .report_agent(SessionReportAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                activity: Some(AgentActivity::Working),
+                seq: Some(10),
+                agent_session_id: Some("codex-newer".to_owned()),
+                agent_session_path: None,
+            })
+            .await;
+        assert!(newer.recorded);
+
+        let stale_report = registry
+            .report_agent(SessionReportAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                activity: Some(AgentActivity::Blocked),
+                seq: None,
+                agent_session_id: Some("codex-stale".to_owned()),
+                agent_session_path: None,
+            })
+            .await;
+        assert!(!stale_report.recorded);
+
+        let inspected = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(
+            inspected.active_agent_session_id.as_deref(),
+            Some("codex-newer")
+        );
+        assert_eq!(inspected.activity, Some(AgentActivity::Working));
+        assert_eq!(inspected.state_source, StateSource::Report);
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn report_agent_release_tombstone_rejects_delayed_lower_sequence() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry
+            .create(params())
+            .await
+            .expect("create shell session");
+
+        let report = registry
+            .report_agent(SessionReportAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                activity: Some(AgentActivity::Blocked),
+                seq: Some(10),
+                agent_session_id: Some("codex-seq-10".to_owned()),
+                agent_session_path: None,
+            })
+            .await;
+        assert!(report.recorded);
+
+        let release = registry
+            .release_agent(SessionReleaseAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                seq: Some(11),
+            })
+            .await;
+        assert!(release.released);
+        let cleared = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(cleared.active_agent, None);
+        assert_eq!(cleared.active_agent_base, None);
+        assert_eq!(cleared.active_agent_session_id, None);
+        assert_eq!(cleared.active_agent_session_path, None);
+        assert_eq!(cleared.activity, None);
+
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Working))
+            .await;
+        let detector_updated = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(detector_updated.activity, Some(AgentActivity::Working));
+        assert_eq!(detector_updated.state_source, StateSource::Process);
+
+        let delayed_report = registry
+            .report_agent(SessionReportAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                activity: Some(AgentActivity::Blocked),
+                seq: Some(10),
+                agent_session_id: Some("codex-stale".to_owned()),
+                agent_session_path: None,
+            })
+            .await;
+        assert!(!delayed_report.recorded);
+        let still_clear = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(still_clear.active_agent, None);
+        assert_eq!(still_clear.active_agent_base, None);
+        assert_eq!(still_clear.active_agent_session_id, None);
+        assert_eq!(still_clear.active_agent_session_path, None);
+        assert_eq!(still_clear.activity, Some(AgentActivity::Working));
+        assert_eq!(still_clear.state_source, StateSource::Process);
+
+        let higher_report = registry
+            .report_agent(SessionReportAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                activity: Some(AgentActivity::Blocked),
+                seq: Some(12),
+                agent_session_id: Some("codex-seq-12".to_owned()),
+                agent_session_path: None,
+            })
+            .await;
+        assert!(higher_report.recorded);
+        let active_again = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(active_again.active_agent.as_deref(), Some("codex"));
+        assert_eq!(
+            active_again.active_agent_session_id.as_deref(),
+            Some("codex-seq-12")
+        );
+        assert_eq!(active_again.activity, Some(AgentActivity::Blocked));
+        assert_eq!(active_again.state_source, StateSource::Report);
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn report_agent_activity_blocks_detector_until_release() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry
+            .create(params())
+            .await
+            .expect("create shell session");
+
+        let report = registry
+            .report_agent(SessionReportAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                activity: Some(AgentActivity::Blocked),
+                seq: Some(1),
+                agent_session_id: None,
+                agent_session_path: None,
+            })
+            .await;
+        assert!(report.recorded);
+
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Working))
+            .await;
+        let blocked = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(blocked.activity, Some(AgentActivity::Blocked));
+        assert_eq!(blocked.state_source, StateSource::Report);
+
+        let release = registry
+            .release_agent(SessionReleaseAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                seq: Some(1),
+            })
+            .await;
+        assert!(release.released);
+
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Working))
+            .await;
+        let working = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(working.activity, Some(AgentActivity::Working));
+        assert_eq!(working.state_source, StateSource::Process);
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn report_agent_without_activity_keeps_detector_activity_enabled() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry
+            .create(params())
+            .await
+            .expect("create shell session");
+
+        let report = registry
+            .report_agent(SessionReportAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                activity: None,
+                seq: Some(1),
+                agent_session_id: Some("codex-native".to_owned()),
+                agent_session_path: None,
+            })
+            .await;
+        assert!(report.recorded);
+
+        registry
+            .record_activity(&created.id, transition(AgentActivity::Working))
+            .await;
+        let inspected = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(inspected.active_agent.as_deref(), Some("codex"));
+        assert_eq!(
+            inspected.active_agent_session_id.as_deref(),
+            Some("codex-native")
+        );
+        assert_eq!(inspected.activity, Some(AgentActivity::Working));
+        assert_eq!(inspected.state_source, StateSource::Process);
+
+        let release = registry
+            .release_agent(SessionReleaseAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                seq: Some(1),
+            })
+            .await;
+        assert!(release.released);
+        let released = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(released.active_agent, None);
+        assert_eq!(released.active_agent_session_id, None);
+        assert_eq!(released.activity, Some(AgentActivity::Working));
+        assert_eq!(released.state_source, StateSource::Process);
+
+        let _ = registry.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn report_agent_active_metadata_is_cleared_on_terminal_session() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry
+            .create(params())
+            .await
+            .expect("create shell session");
+        assert_eq!(created.native_session_id, None);
+        assert_eq!(created.native_session_path, None);
+
+        let report = registry
+            .report_agent(SessionReportAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:codex".to_owned(),
+                agent: "codex".to_owned(),
+                activity: Some(AgentActivity::Blocked),
+                seq: Some(1),
+                agent_session_id: Some("codex-native".to_owned()),
+                agent_session_path: Some("/tmp/codex-session.jsonl".to_owned()),
+            })
+            .await;
+        assert!(report.recorded);
+
+        registry.stop(&created.id).await.expect("stop session");
+
+        let inspected = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(inspected.active_agent, None);
+        assert_eq!(inspected.active_agent_base, None);
+        assert_eq!(inspected.active_agent_session_id, None);
+        assert_eq!(inspected.active_agent_session_path, None);
+        assert_eq!(inspected.activity, None);
+        assert_eq!(inspected.native_session_id, None);
+        assert_eq!(inspected.native_session_path, None);
+    }
+
+    #[tokio::test]
+    async fn report_agent_returns_false_for_unknown_agent() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry
+            .create(params())
+            .await
+            .expect("create shell session");
+
+        let result = registry
+            .report_agent(SessionReportAgentParams {
+                session_id: created.id.clone(),
+                source: "pohunek:unknown".to_owned(),
+                agent: "not-a-real-agent".to_owned(),
+                activity: Some(AgentActivity::Working),
+                seq: Some(1),
+                agent_session_id: None,
+                agent_session_path: None,
+            })
+            .await;
+        assert!(!result.recorded);
+
+        let inspected = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(inspected.active_agent, None);
+        assert_eq!(inspected.activity, None);
+
+        let _ = registry.stop(&created.id).await;
     }
 
     #[tokio::test]
@@ -4012,6 +4838,12 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create agents dir");
         std::fs::write(dir.join(format!("{name}.toml")), body).expect("write profile");
         dir
+    }
+
+    fn write_agent_manifest(dir: &std::path::Path, name: &str, body: &str) {
+        let manifests = dir.join("manifests");
+        std::fs::create_dir_all(&manifests).expect("create manifests dir");
+        std::fs::write(manifests.join(format!("{name}.toml")), body).expect("write manifest");
     }
 
     fn temp_resumable_agents_dir(tag: &str) -> PathBuf {

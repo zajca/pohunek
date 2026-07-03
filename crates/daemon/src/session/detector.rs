@@ -2,35 +2,30 @@
 
 use super::{
     broadcast, debug, event, is_terminal, json, log_lag_warn, timestamp_now, watch,
-    ActivityTransition, AgentKind, CancellationToken, Detector, DetectorConfig, Event, Instant,
-    LagWarnThrottle, Manifest, SessionId, SessionRegistry,
+    ActivityTransition, CancellationToken, Detector, DetectorConfig, Event, Instant,
+    LagWarnThrottle, SessionId, SessionRegistry,
 };
 
+fn detection_interval(config: &DetectorConfig) -> tokio::time::Interval {
+    let mut tick = tokio::time::interval(config.detection.recheck_after);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick
+}
+
 impl SessionRegistry {
-    // The detector spawn carries the session id, base kind, manifest override, the
-    // output stream, the initial size, and its cancel/resize channels — all distinct
-    // runtime inputs with no natural grouping struct.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "distinct detector runtime inputs with no natural grouping struct"
-    )]
     pub(super) fn spawn_detector(
         &self,
         id: SessionId,
-        agent: AgentKind,
-        manifest_override: Option<Manifest>,
         mut output_rx: broadcast::Receiver<Vec<u8>>,
         size: (u16, u16),
         cancel: CancellationToken,
         mut resize_rx: watch::Receiver<(u16, u16)>,
+        mut detector_config_rx: watch::Receiver<DetectorConfig>,
     ) {
         let registry = self.clone();
         tokio::spawn(async move {
-            // A host profile may override the base kind's detection manifest; absent
-            // an override this is exactly `for_agent(agent)` (C.3).
-            let detector_config = DetectorConfig::for_profile(agent, manifest_override);
-            let mut tick = tokio::time::interval(detector_config.detection.recheck_after);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let detector_config = detector_config_rx.borrow().clone();
+            let mut tick = detection_interval(&detector_config);
             tick.tick().await;
             let (rows, cols) = size;
             let mut detector = Detector::new(rows, cols, Instant::now(), detector_config);
@@ -56,6 +51,15 @@ impl SessionRegistry {
                         }
                         let (rows, cols) = *resize_rx.borrow();
                         detector.resize(rows, cols);
+                    }
+                    changed = detector_config_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let detector_config = detector_config_rx.borrow().clone();
+                        tick = detection_interval(&detector_config);
+                        tick.tick().await;
+                        detector.reconfigure(Instant::now(), detector_config);
                     }
                     received = output_rx.recv() => {
                         match received {
@@ -96,6 +100,14 @@ impl SessionRegistry {
             };
 
             if entry.stopping || is_terminal(entry.info.state) {
+                return;
+            }
+
+            if entry
+                .active_agent
+                .as_ref()
+                .is_some_and(|report| report.activity_reported)
+            {
                 return;
             }
 

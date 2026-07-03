@@ -143,6 +143,8 @@ pub enum StateSource {
     Screen,
     /// Derived from process/PTY activity.
     Process,
+    /// Reported by an agent hook running inside the session.
+    Report,
 }
 
 /// An asynchronous event pushed on a subscription connection.

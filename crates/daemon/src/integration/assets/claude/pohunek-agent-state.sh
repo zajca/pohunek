@@ -5,10 +5,10 @@
 # POHUNEK_INTEGRATION_ID=claude
 # POHUNEK_INTEGRATION_VERSION=1
 #
-# SessionStart hook: capture the agent's native session id for resume. This is
-# session-id capture ONLY; it never reports live state. Fire-and-forget: any
-# missing handshake env, missing python3, or socket failure is a silent no-op
-# (exit 0) so the hook can never break the agent.
+# SessionStart hook: report active-agent identity, then capture the agent's
+# native session id for direct-session resume. Fire-and-forget: any missing
+# handshake env, missing python3, or socket failure is a silent no-op (exit 0)
+# so the hook can never break the agent.
 
 set -eu
 
@@ -70,31 +70,49 @@ transcript_path = transcript if isinstance(transcript, str) and transcript else 
 if not native_session_id:
     raise SystemExit(0)
 
-params = {
+timestamp_ms = int(time.time() * 1000)
+
+
+def send_request(method, params, suffix):
+    request = {
+        "v": protocol_version,
+        "id": f"hook:{agent}:{timestamp_ms}:{suffix}",
+        "method": method,
+        "params": params,
+    }
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(0.5)
+        client.connect(socket_path)
+        client.sendall((json.dumps(request) + "\n").encode())
+        try:
+            client.recv(4096)
+        except Exception:
+            pass
+        client.close()
+    except Exception:
+        pass
+
+
+report_agent_params = {
+    "session_id": session_id,
+    "source": f"pohunek:{agent}",
+    "agent": agent,
+    "seq": timestamp_ms,
+    "agent_session_id": native_session_id,
+}
+if transcript_path:
+    report_agent_params["agent_session_path"] = transcript_path
+
+send_request("session.report_agent", report_agent_params, "agent")
+
+native_id_params = {
     "session_id": session_id,
     "agent": agent,
     "native_session_id": native_session_id,
 }
 if transcript_path:
-    params["transcript_path"] = transcript_path
+    native_id_params["transcript_path"] = transcript_path
 
-request = {
-    "v": protocol_version,
-    "id": f"hook:{agent}:{int(time.time() * 1000)}",
-    "method": "session.report_native_id",
-    "params": params,
-}
-
-try:
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    client.settimeout(0.5)
-    client.connect(socket_path)
-    client.sendall((json.dumps(request) + "\n").encode())
-    try:
-        client.recv(4096)
-    except Exception:
-        pass
-    client.close()
-except Exception:
-    pass
+send_request("session.report_native_id", native_id_params, "native")
 PY

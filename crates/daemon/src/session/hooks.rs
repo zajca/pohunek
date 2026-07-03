@@ -123,32 +123,28 @@ impl SessionRegistry {
         })
     }
 
-    /// Build the hook-handshake env injected into a Codex/Claude agent so its
-    /// `SessionStart` hook can report its native session id back to the socket.
-    /// Shell sessions (and registries without a configured socket path) get no
-    /// hook env.
+    /// Build the hook-handshake env injected into a session PTY so nested agent
+    /// `SessionStart` hooks can report active-agent state back to the socket.
+    /// Registries without a configured socket path get no hook env.
     pub(super) fn hook_env(
         &self,
-        agent: AgentKind,
+        _agent: AgentKind,
         session_id: &SessionId,
     ) -> Vec<(String, String)> {
-        match agent {
-            AgentKind::Shell => Vec::new(),
-            AgentKind::Codex | AgentKind::Claude => match &self.inner.config.socket_path {
-                Some(socket_path) => vec![
-                    (ENV_FLAG.to_owned(), "1".to_owned()),
-                    (
-                        ENV_SOCKET_PATH.to_owned(),
-                        socket_path.display().to_string(),
-                    ),
-                    (ENV_SESSION_ID.to_owned(), session_id.0.clone()),
-                    (
-                        ENV_PROTOCOL_VERSION.to_owned(),
-                        PROTOCOL_VERSION.get().to_string(),
-                    ),
-                ],
-                None => Vec::new(),
-            },
+        match &self.inner.config.socket_path {
+            Some(socket_path) => vec![
+                (ENV_FLAG.to_owned(), "1".to_owned()),
+                (
+                    ENV_SOCKET_PATH.to_owned(),
+                    socket_path.display().to_string(),
+                ),
+                (ENV_SESSION_ID.to_owned(), session_id.0.clone()),
+                (
+                    ENV_PROTOCOL_VERSION.to_owned(),
+                    PROTOCOL_VERSION.get().to_string(),
+                ),
+            ],
+            None => Vec::new(),
         }
     }
 
@@ -159,10 +155,11 @@ impl SessionRegistry {
     /// including a plain shell — so a `pohunek attach` launched inside the PTY can
     /// be recognized as a self-feeding loop and rejected (see
     /// [`SessionRegistry::attach`]); the daemon id scopes that decision to this
-    /// instance regardless of which transport delivers the attach. For
-    /// Codex/Claude it additionally carries the hook handshake from
+    /// instance regardless of which transport delivers the attach. When a socket
+    /// is configured it additionally carries the hook handshake from
     /// [`Self::hook_env`] (which already includes the session id, so it is not
-    /// duplicated here).
+    /// duplicated here), including for shell sessions that may launch nested
+    /// agents.
     pub(super) fn session_pty_env(
         &self,
         agent: AgentKind,

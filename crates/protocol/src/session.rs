@@ -112,7 +112,7 @@ pub enum SessionListFilter {
     State(SessionState),
     /// Match [`SessionInfo::activity`].
     Activity(AgentActivity),
-    /// Match [`SessionInfo::agent`] or its snapshotted base kind label.
+    /// Match launch or active agent identity by profile name or base kind label.
     Agent(String),
     /// Match [`SessionInfo::id`].
     Id(String),
@@ -131,7 +131,12 @@ impl SessionListFilter {
             Self::State(state) => session.state == *state,
             Self::Activity(activity) => session.activity == Some(*activity),
             Self::Agent(name) => {
-                session.agent == *name || base_kind_label(session.agent_base) == name
+                session.agent == *name
+                    || base_kind_label(session.agent_base) == name
+                    || session.active_agent.as_deref() == Some(name)
+                    || session
+                        .active_agent_base
+                        .is_some_and(|base| base_kind_label(base) == name)
             }
             Self::Id(id) => session.id.0 == *id,
             Self::Project(reference) => {
@@ -236,6 +241,64 @@ pub struct SessionReportNativeIdParams {
 pub struct SessionReportNativeIdResult {
     /// Whether the daemon recorded the report as a resume binding.
     pub recorded: bool,
+}
+
+/// Parameters for `session.report_agent`.
+///
+/// Fire-and-forget capture sent by an agent launched inside an existing
+/// session. The daemon treats it as active runtime identity only; it does not
+/// replace the parent session's launch agent or native resume binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReportAgentParams {
+    /// The pohunek session id that currently hosts the nested agent.
+    pub session_id: SessionId,
+    /// Hook source identifier, usually `pohunek:<agent>`.
+    pub source: String,
+    /// Agent profile name reporting active ownership of the session.
+    pub agent: String,
+    /// Current activity reported by the hook, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<AgentActivity>,
+    /// Optional monotonic sequence from the reporting hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    /// Native session id for the active nested agent, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
+    /// Native session path for the active nested agent, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_path: Option<String>,
+}
+
+/// Parameters for `session.release_agent`.
+///
+/// Fire-and-forget release sent by a nested agent hook when the active agent no
+/// longer owns the host session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReleaseAgentParams {
+    /// The pohunek session id that currently hosts the nested agent.
+    pub session_id: SessionId,
+    /// Hook source identifier, usually `pohunek:<agent>`.
+    pub source: String,
+    /// Agent profile name releasing active ownership of the session.
+    pub agent: String,
+    /// Optional monotonic sequence from the reporting hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+}
+
+/// Result returned by `session.report_agent`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReportAgentResult {
+    /// Whether the daemon recorded the active-agent report.
+    pub recorded: bool,
+}
+
+/// Result returned by `session.release_agent`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReleaseAgentResult {
+    /// Whether the daemon released the active-agent report.
+    pub released: bool,
 }
 
 /// Parameters for `session.detach`.
@@ -380,6 +443,27 @@ pub struct SessionInfo {
     /// Current detected agent activity, when the detector has published one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<AgentActivity>,
+    /// Active nested agent profile name reported by a session-level hook.
+    ///
+    /// This is runtime metadata only: it does not change the launch identity in
+    /// [`Self::agent`] and is cleared when the nested agent releases the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_agent: Option<String>,
+    /// Resolved base kind for [`Self::active_agent`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_agent_base: Option<AgentKind>,
+    /// Native session id for the active nested agent, when reported.
+    ///
+    /// This metadata is distinct from [`Self::native_session_id`] and never acts
+    /// as the parent session's resume binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_agent_session_id: Option<String>,
+    /// Native session path for the active nested agent, when reported.
+    ///
+    /// This metadata is distinct from [`Self::native_session_path`] and never
+    /// acts as the parent session's resume binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_agent_session_path: Option<String>,
     /// Native agent session id captured via the `SessionStart` hook, when one
     /// has been reported (see `docs/plan-phase-1.md` "Resume Model"). A session
     /// is resumable after a daemon restart only while this is present **and** the
@@ -556,6 +640,10 @@ mod tests {
             state: SessionState::Running,
             state_source: StateSource::Process,
             activity: Some(AgentActivity::Working),
+            active_agent: None,
+            active_agent_base: None,
+            active_agent_session_id: None,
+            active_agent_session_path: None,
             native_session_id: None,
             native_session_path: None,
             project_id: None,
@@ -633,6 +721,20 @@ mod tests {
         assert!(SessionListFilter::Agent("claude-sonnet".to_owned()).matches(&s));
         assert!(SessionListFilter::Agent("claude".to_owned()).matches(&s));
         assert!(!SessionListFilter::Agent("codex".to_owned()).matches(&s));
+    }
+
+    #[test]
+    fn agent_filter_matches_active_profile_name_or_base_kind() {
+        let mut s = session("s-42");
+        s.agent = "shell".to_owned();
+        s.agent_base = AgentKind::Shell;
+        s.active_agent = Some("codex-gpt-5".to_owned());
+        s.active_agent_base = Some(AgentKind::Codex);
+
+        assert!(SessionListFilter::Agent("shell".to_owned()).matches(&s));
+        assert!(SessionListFilter::Agent("codex-gpt-5".to_owned()).matches(&s));
+        assert!(SessionListFilter::Agent("codex".to_owned()).matches(&s));
+        assert!(!SessionListFilter::Agent("claude".to_owned()).matches(&s));
     }
 
     #[test]
