@@ -97,9 +97,9 @@ linear_cli=linear
 # Issue picker: which Linear workflow-state types are 'actionable' (space-separated:
 # triage backlog unstarted started completed canceled).
 #linear_issue_states=started unstarted
-# Attach overlay: reserve the first terminal row for kill shortcut and session state.
+# Attach overlay: currently disabled at runtime for TUI safety.
 #banner=false
-# Live banner repaint is disabled by default; set a positive value to enable.
+# Live banner repaint is ignored while the overlay is disabled.
 #banner_interval_seconds=0
 # Attach reconnect: after an unexpected daemon stream close, wait for a restarted
 # daemon to resume the session and reattach. Set seconds to 0 to disable.

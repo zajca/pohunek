@@ -26,17 +26,14 @@ the launcher UI. The launcher ultimately depends on the same daemon, project,
 session, and action surfaces described in [sessions](../concepts/sessions.md)
 and [projects](../concepts/projects.md).
 
-`launcher.conf` also controls the optional attach banner. When `banner=true`,
-`pohunek attach` reserves the first terminal row for a `kill:Ctrl-\` shortcut,
-host, project, session name, session id, agent state, and activity, then draws
-one initial frame. Pressing Ctrl-\ sends `session.stop` for the attached
-session and exits the attach client. `banner_interval_seconds` controls the
-optional live repaint behavior for resize events, session state updates, and
-idle timer ticks; `0` disables those live repaints. PTY output always reasserts
-the reserved viewport and redraws the current banner snapshot so the row stays
-visible while attached. A positive value opts into live repainting. The rofi/sway
-switcher only opens marked attach terminals; it does not create a separate banner
-window.
+`launcher.conf` includes attach banner keys, but the in-terminal overlay is
+currently disabled at runtime. The previous scroll-region overlay interfered
+with full-screen TUI agents such as Codex and Claude Code because they own the
+same cursor modes, scroll margins, and repaint timing. While the overlay is
+disabled, `banner=true` and `banner_interval_seconds` do not reserve a terminal
+row, draw a banner frame, resize the attached PTY, or enable the Ctrl-\ banner
+kill shortcut. The rofi/sway switcher only opens marked attach terminals; it
+does not create a separate banner window.
 
 Attach terminals automatically retry after an unexpected daemon stream close.
 `attach_reconnect_seconds` controls the retry window, and
