@@ -10,21 +10,23 @@ since: 0.3.3
 
 # Update After Release
 
-Use this runbook after changing the installed Pohunek binary or rebuilding from
-source.
+Use this runbook after replacing an installed Pohunek binary from a component
+release archive or rebuilding it from source.
 
-1. Run `pohunek doctor --json` to confirm the current binary can find required
+1. Download the component archive for the binary being updated: CLI (`pohunek`),
+   daemon (`pohunekd`), or GUI (`pohunek-gui`).
+2. Run `pohunek doctor --json` to confirm the current binary can find required
    paths and state directories.
-2. Run `pohunek health --json` to confirm the daemon responds with the expected
+3. Run `pohunek health --json` to confirm the daemon responds with the expected
    version and protocol compatibility.
-3. Run `pohunek host inspect local --json` to inspect local runtimes and
+4. Run `pohunek host inspect local --json` to inspect local runtimes and
    capabilities.
-4. Refresh launcher scripts with `pohunek setup scripts`.
-5. Review config changes before applying `pohunek setup config --force`; default
+5. Refresh launcher scripts with `pohunek setup scripts`.
+6. Review config changes before applying `pohunek setup config --force`; default
    setup config should not overwrite existing files.
-6. Reprint or refresh sway integration with `pohunek setup sway --print` or
+7. Reprint or refresh sway integration with `pohunek setup sway --print` or
    `pohunek setup sway`.
-7. For important projects, verify `pohunek project show <id-or-label> --json`
+8. For important projects, verify `pohunek project show <id-or-label> --json`
    and resolved actions with `pohunek project actions <id-or-label> --json`.
 
 When the assistant feature is available, its update intent should use bundle

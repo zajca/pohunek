@@ -10,15 +10,15 @@ change before a stable SDK contract is published.
 
 ## Install
 
-Download a release archive for your target, or build the three binaries from a
-checked-out repository:
+Download the component release archive for the binary you want to install, or
+build the three binaries from a checked-out repository:
 
 ```bash
 cargo build --release --locked --bin pohunek --bin pohunekd --bin pohunek-gui
 ```
 
-The release archive includes the CLI, daemon, native GUI, root README, MIT
-license, and the offline documentation bundle.
+Each component archive includes one binary, the root README, MIT license, and
+the offline documentation bundle.
 
 ## Quick Start
 

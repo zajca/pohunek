@@ -3,9 +3,9 @@ name: Release
 # Triggered by pushing a `vX.Y.Z` tag (created by `scripts/release`). First runs
 # the full quality gate (fmt/clippy/test) on the tagged commit, and only if that
 # passes builds the `pohunek` (CLI), `pohunekd` (daemon), and `pohunek-gui`
-# binaries for each target on a native runner, packages them into per-target
-# tarballs with sha256 checksums, and attaches everything to a GitHub Release
-# for that tag.
+# binaries for each target on a native runner, packages them into separate
+# component tarballs with sha256 checksums, and attaches everything to a GitHub
+# Release for that tag.
 #
 # A tag push does NOT run the CI workflow (CI runs on branch pushes and PRs), so
 # the gate is duplicated here: no binary is published from a commit that fails
@@ -67,7 +67,7 @@ jobs:
         run: cargo xtask docs check
 
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.component }} for ${{ matrix.target }}
     needs: [gate, docs-gate]
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -77,10 +77,36 @@ jobs:
           # Dynamically linked glibc build (primary target).
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
+            component: cli
+            archive_prefix: pohunek-cli
+            binary: pohunek
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            component: daemon
+            archive_prefix: pohunek-daemon
+            binary: pohunekd
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            component: gui
+            archive_prefix: pohunek-gui
+            binary: pohunek-gui
           # Fully static musl build: a single self-contained binary that runs on
           # any x86_64 Linux regardless of the host glibc version.
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
+            component: cli
+            archive_prefix: pohunek-cli
+            binary: pohunek
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            component: daemon
+            archive_prefix: pohunek-daemon
+            binary: pohunekd
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            component: gui
+            archive_prefix: pohunek-gui
+            binary: pohunek-gui
     steps:
       - uses: actions/checkout@v4
 
@@ -96,7 +122,7 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}-${{ matrix.component }}
 
       - name: Build release binaries
         run: >
@@ -112,11 +138,11 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          name="pohunek-${version}-${{ matrix.target }}"
+          name="${{ matrix.archive_prefix }}-${version}-${{ matrix.target }}"
           staging="dist/${name}"
           mkdir -p "${staging}"
           bindir="target/${{ matrix.target }}/release"
-          cp "${bindir}/pohunek" "${bindir}/pohunekd" "${bindir}/pohunek-gui" "${staging}/"
+          cp "${bindir}/${{ matrix.binary }}" "${staging}/"
           mkdir -p "${staging}/docs"
           cp -R target/pohunek-docs/offline "${staging}/docs/offline"
           cp target/pohunek-docs/manifest.json "${staging}/docs/manifest.json"
