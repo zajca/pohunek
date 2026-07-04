@@ -12,16 +12,13 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use protocol::{
-    method, ActionSummary, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
-    ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListFilter, ProjectListParams,
-    ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult,
+    method, ActionSummary, ProjectActionParams, ProjectActionsParams, ProjectAddParams,
+    ProjectInfo, ProjectListFilter, ProjectListParams, ProjectPromptParams, ProjectRemoveParams,
     ProjectRenameParams, ProjectShowParams, ProjectShowResult, ProjectSource, ProjectWorktree,
-    PromptLayer, ProviderKind, Request,
+    PromptLayer, ProviderKind,
 };
-use serde_json::Value;
 
 use crate::client::Client;
-use crate::commands::{request_id, request_with_params};
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::is_local_host;
@@ -60,6 +57,12 @@ fn parse_source(value: &str) -> Result<ProjectSource, String> {
     }
 }
 
+fn list_params(filters: &[ProjectListFilter]) -> ProjectListParams {
+    ProjectListParams {
+        filters: filters.to_vec(),
+    }
+}
+
 /// Run `project list` against the daemon for `host`.
 pub(crate) async fn run_list(
     host: &str,
@@ -67,22 +70,10 @@ pub(crate) async fn run_list(
     filters: &[ProjectListFilter],
     json: bool,
 ) -> Result<(), CliError> {
-    let request = if filters.is_empty() {
-        Request::new(
-            request_id(method::PROJECT_LIST),
-            method::PROJECT_LIST,
-            Value::Null,
-        )
-    } else {
-        request_with_params(
-            method::PROJECT_LIST,
-            &ProjectListParams {
-                filters: filters.to_vec(),
-            },
-        )?
-    };
     let mut client = Client::connect(host, paths).await?;
-    let projects: Vec<ProjectInfo> = serde_json::from_value(client.request(&request).await?)?;
+    let projects = client
+        .call::<method::ProjectList>(list_params(filters))
+        .await?;
     if json {
         print!("{}", crate::commands::render_json(&projects)?);
     } else {
@@ -104,16 +95,13 @@ pub(crate) async fn run_add(
     json: bool,
 ) -> Result<(), CliError> {
     let path = resolve_add_path(host, path)?;
-    let request = request_with_params(
-        method::PROJECT_ADD,
-        &ProjectAddParams {
-            path: Some(path),
-            name,
-            base_branch,
-        },
-    )?;
+    let params = ProjectAddParams {
+        path: Some(path),
+        name,
+        base_branch,
+    };
     let mut client = Client::connect(host, paths).await?;
-    let project: ProjectInfo = serde_json::from_value(client.request(&request).await?)?;
+    let project = client.call::<method::ProjectAdd>(params).await?;
     if json {
         print!("{}", crate::commands::render_json(&project)?);
     } else {
@@ -129,14 +117,11 @@ pub(crate) async fn run_show(
     reference: &str,
     json: bool,
 ) -> Result<(), CliError> {
-    let request = request_with_params(
-        method::PROJECT_SHOW,
-        &ProjectShowParams {
-            reference: reference.to_owned(),
-        },
-    )?;
+    let params = ProjectShowParams {
+        reference: reference.to_owned(),
+    };
     let mut client = Client::connect(host, paths).await?;
-    let result: ProjectShowResult = serde_json::from_value(client.request(&request).await?)?;
+    let result = client.call::<method::ProjectShow>(params).await?;
     if json {
         print!("{}", crate::commands::render_json(&result)?);
     } else {
@@ -159,15 +144,12 @@ pub(crate) async fn run_prompt(
     name: &str,
     json: bool,
 ) -> Result<(), CliError> {
-    let request = request_with_params(
-        method::PROJECT_PROMPT,
-        &ProjectPromptParams {
-            reference: reference.to_owned(),
-            name: name.to_owned(),
-        },
-    )?;
+    let params = ProjectPromptParams {
+        reference: reference.to_owned(),
+        name: name.to_owned(),
+    };
     let mut client = Client::connect(host, paths).await?;
-    let result: ProjectPromptResult = serde_json::from_value(client.request(&request).await?)?;
+    let result = client.call::<method::ProjectPrompt>(params).await?;
     if json {
         print!("{}", crate::commands::render_json(&result)?);
     } else {
@@ -203,15 +185,12 @@ pub(crate) async fn run_action(
     name: &str,
     json: bool,
 ) -> Result<(), CliError> {
-    let request = request_with_params(
-        method::PROJECT_ACTION,
-        &ProjectActionParams {
-            reference: reference.to_owned(),
-            name: name.to_owned(),
-        },
-    )?;
+    let params = ProjectActionParams {
+        reference: reference.to_owned(),
+        name: name.to_owned(),
+    };
     let mut client = Client::connect(host, paths).await?;
-    let result: ProjectActionResult = serde_json::from_value(client.request(&request).await?)?;
+    let result = client.call::<method::ProjectAction>(params).await?;
     if json {
         print!("{}", crate::commands::render_json(&result)?);
     } else {
@@ -244,14 +223,11 @@ pub(crate) async fn run_actions(
     reference: &str,
     json: bool,
 ) -> Result<(), CliError> {
-    let request = request_with_params(
-        method::PROJECT_ACTIONS,
-        &ProjectActionsParams {
-            reference: reference.to_owned(),
-        },
-    )?;
+    let params = ProjectActionsParams {
+        reference: reference.to_owned(),
+    };
     let mut client = Client::connect(host, paths).await?;
-    let result: ProjectActionsResult = serde_json::from_value(client.request(&request).await?)?;
+    let result = client.call::<method::ProjectActions>(params).await?;
     if json {
         print!("{}", crate::commands::render_json(&result)?);
     } else {
@@ -290,15 +266,12 @@ pub(crate) async fn run_rename(
     name: &str,
     json: bool,
 ) -> Result<(), CliError> {
-    let request = request_with_params(
-        method::PROJECT_RENAME,
-        &ProjectRenameParams {
-            reference: reference.to_owned(),
-            name: name.to_owned(),
-        },
-    )?;
+    let params = ProjectRenameParams {
+        reference: reference.to_owned(),
+        name: name.to_owned(),
+    };
     let mut client = Client::connect(host, paths).await?;
-    let project: ProjectInfo = serde_json::from_value(client.request(&request).await?)?;
+    let project = client.call::<method::ProjectRename>(params).await?;
     if json {
         print!("{}", crate::commands::render_json(&project)?);
     } else {
@@ -315,15 +288,12 @@ pub(crate) async fn run_rm(
     prune_worktrees: bool,
     json: bool,
 ) -> Result<(), CliError> {
-    let request = request_with_params(
-        method::PROJECT_REMOVE,
-        &ProjectRemoveParams {
-            reference: reference.to_owned(),
-            prune_worktrees,
-        },
-    )?;
+    let params = ProjectRemoveParams {
+        reference: reference.to_owned(),
+        prune_worktrees,
+    };
     let mut client = Client::connect(host, paths).await?;
-    let result: ProjectRemoveResult = serde_json::from_value(client.request(&request).await?)?;
+    let result = client.call::<method::ProjectRemove>(params).await?;
     if json {
         print!("{}", crate::commands::render_json(&result)?);
     } else {
@@ -532,6 +502,22 @@ mod tests {
         assert!(parse_project_filter("source=nope")
             .expect_err("bad source")
             .contains("invalid source filter value"));
+    }
+
+    #[test]
+    fn list_params_preserve_filters_for_typed_sdk_call() {
+        let params = list_params(&[
+            ProjectListFilter::Source(ProjectSource::Manual),
+            ProjectListFilter::Label("ui".to_owned()),
+        ]);
+
+        assert_eq!(
+            params.filters,
+            vec![
+                ProjectListFilter::Source(ProjectSource::Manual),
+                ProjectListFilter::Label("ui".to_owned()),
+            ]
+        );
     }
 
     #[test]

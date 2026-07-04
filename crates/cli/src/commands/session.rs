@@ -10,16 +10,17 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::PathBuf;
 
+#[cfg(test)]
+use protocol::Request;
 use protocol::{
-    method, AgentActivity, Request, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionListFilter, SessionListParams, SessionNewParams, SessionNewResult, SessionRemoveResult,
-    SessionRenameParams, SessionRenameResult, SessionState, SessionStopResult, SessionWarningKind,
-    StateSource,
+    method, AgentActivity, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
+    SessionListFilter, SessionListParams, SessionNewParams, SessionRemoveResult,
+    SessionRenameParams, SessionState, SessionStopResult, SessionWarningKind, StateSource,
 };
-use serde_json::Value;
 
 use crate::client::Client;
-use crate::commands::{request_id, request_with_params};
+#[cfg(test)]
+use crate::commands::request_with_params;
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::{is_local_host, Target};
@@ -231,9 +232,7 @@ pub(crate) async fn run_new(
     }
 
     let mut client = Client::connect(host, paths).await?;
-    let request = build_new_request(&args)?;
-    let result = client.request(&request).await?;
-    let result: SessionNewResult = serde_json::from_value(result)?;
+    let result = client.call::<method::SessionNew>(new_params(&args)).await?;
     let info = &result.session;
 
     // We asked the daemon to inject an initial prompt but it did not confirm
@@ -290,9 +289,9 @@ pub(crate) async fn run_list(
     output_mode: ListOutputMode,
 ) -> Result<(), CliError> {
     let mut client = Client::connect(host, paths).await?;
-    let request = build_list_request(filters)?;
-    let result = client.request(&request).await?;
-    let sessions: Vec<SessionInfo> = serde_json::from_value(result)?;
+    let sessions = client
+        .call::<method::SessionList>(list_params(filters))
+        .await?;
 
     print!("{}", render_list_output(&sessions, filters, output_mode)?);
 
@@ -312,10 +311,10 @@ pub(crate) async fn run_inspect(
     target: &Target,
     json: bool,
 ) -> Result<(), CliError> {
-    let request = build_inspect_request(target)?;
     let mut client = Client::connect(host, paths).await?;
-    let result = client.request(&request).await?;
-    let info: SessionInfo = serde_json::from_value(result)?;
+    let info = client
+        .call::<method::SessionInspect>(SessionId(target.session_id.clone()))
+        .await?;
 
     if json {
         print!("{}", crate::commands::render_json(&info)?);
@@ -339,10 +338,10 @@ pub(crate) async fn run_stop(
     target: &Target,
     json: bool,
 ) -> Result<(), CliError> {
-    let request = build_stop_request(target)?;
     let mut client = Client::connect(host, paths).await?;
-    let result = client.request(&request).await?;
-    let stop: SessionStopResult = serde_json::from_value(result)?;
+    let stop = client
+        .call::<method::SessionStop>(SessionId(target.session_id.clone()))
+        .await?;
 
     if json {
         print!("{}", crate::commands::render_json(&stop)?);
@@ -368,10 +367,10 @@ pub(crate) async fn run_remove(
     target: &Target,
     json: bool,
 ) -> Result<(), CliError> {
-    let request = build_remove_request(target)?;
     let mut client = Client::connect(host, paths).await?;
-    let result = client.request(&request).await?;
-    let removed: SessionRemoveResult = serde_json::from_value(result)?;
+    let removed = client
+        .call::<method::SessionRemove>(SessionId(target.session_id.clone()))
+        .await?;
 
     if json {
         print!("{}", crate::commands::render_json(&removed)?);
@@ -395,10 +394,10 @@ pub(crate) async fn run_input(
     text: &str,
     json: bool,
 ) -> Result<(), CliError> {
-    let request = build_input_request(target, text)?;
     let mut client = Client::connect(host, paths).await?;
-    let result = client.request(&request).await?;
-    let input: SessionInputResult = serde_json::from_value(result)?;
+    let input = client
+        .call::<method::SessionInput>(input_params(target, text))
+        .await?;
 
     if json {
         print!("{}", crate::commands::render_json(&input)?);
@@ -416,10 +415,10 @@ pub(crate) async fn run_rename(
     name: Option<String>,
     json: bool,
 ) -> Result<(), CliError> {
-    let request = build_rename_request(target, name)?;
     let mut client = Client::connect(host, paths).await?;
-    let result = client.request(&request).await?;
-    let renamed: SessionRenameResult = serde_json::from_value(result)?;
+    let renamed = client
+        .call::<method::SessionRename>(rename_params(target, name))
+        .await?;
 
     if json {
         print!("{}", crate::commands::render_json(&renamed)?);
@@ -429,23 +428,25 @@ pub(crate) async fn run_rename(
     Ok(())
 }
 
+fn new_params(args: &NewArgs) -> SessionNewParams {
+    SessionNewParams {
+        agent: args.agent.clone(),
+        name: args.name.clone(),
+        cwd: args.cwd.clone(),
+        cols: args.cols,
+        rows: args.rows,
+        project: args.project.clone(),
+        repo: args.repo.clone(),
+        branch: args.branch.clone(),
+        base_branch: args.base_branch.clone(),
+        input: args.input.clone(),
+        metadata: std::collections::BTreeMap::new(),
+    }
+}
+
+#[cfg(test)]
 fn build_new_request(args: &NewArgs) -> Result<Request, CliError> {
-    request_with_params(
-        method::SESSION_NEW,
-        &SessionNewParams {
-            agent: args.agent.clone(),
-            name: args.name.clone(),
-            cwd: args.cwd.clone(),
-            cols: args.cols,
-            rows: args.rows,
-            project: args.project.clone(),
-            repo: args.repo.clone(),
-            branch: args.branch.clone(),
-            base_branch: args.base_branch.clone(),
-            input: args.input.clone(),
-            metadata: std::collections::BTreeMap::new(),
-        },
-    )
+    request_with_params(method::SESSION_NEW, &new_params(args))
 }
 
 /// Prepare the `session new` args for the target host (design Decision 1).
@@ -472,25 +473,20 @@ fn prepare_new_args(host: &str, args: NewArgs) -> Result<NewArgs, CliError> {
     }
 }
 
-fn build_list_request(filters: &[ListFilter]) -> Result<Request, CliError> {
-    if filters.is_empty() {
-        Ok(Request::new(
-            request_id(method::SESSION_LIST),
-            method::SESSION_LIST,
-            Value::Null,
-        ))
-    } else {
-        request_with_params(
-            method::SESSION_LIST,
-            &SessionListParams {
-                filters: filters.iter().map(ListFilter::to_protocol_filter).collect(),
-            },
-        )
+fn list_params(filters: &[ListFilter]) -> SessionListParams {
+    SessionListParams {
+        filters: filters.iter().map(ListFilter::to_protocol_filter).collect(),
     }
 }
 
 // Host routing is handled by the transport ([`Client`]); these requests carry
 // only the session id (identical on either side), never the host.
+#[cfg(test)]
+fn build_list_request(filters: &[ListFilter]) -> Result<Request, CliError> {
+    request_with_params(method::SESSION_LIST, &list_params(filters))
+}
+
+#[cfg(test)]
 fn build_inspect_request(target: &Target) -> Result<Request, CliError> {
     request_with_params(
         method::SESSION_INSPECT,
@@ -498,10 +494,12 @@ fn build_inspect_request(target: &Target) -> Result<Request, CliError> {
     )
 }
 
+#[cfg(test)]
 fn build_stop_request(target: &Target) -> Result<Request, CliError> {
     request_with_params(method::SESSION_STOP, &SessionId(target.session_id.clone()))
 }
 
+#[cfg(test)]
 fn build_remove_request(target: &Target) -> Result<Request, CliError> {
     request_with_params(
         method::SESSION_REMOVE,
@@ -509,24 +507,28 @@ fn build_remove_request(target: &Target) -> Result<Request, CliError> {
     )
 }
 
-fn build_input_request(target: &Target, text: &str) -> Result<Request, CliError> {
-    request_with_params(
-        method::SESSION_INPUT,
-        &SessionInputParams {
-            session_id: SessionId(target.session_id.clone()),
-            text: text.to_owned(),
-        },
-    )
+fn input_params(target: &Target, text: &str) -> SessionInputParams {
+    SessionInputParams {
+        session_id: SessionId(target.session_id.clone()),
+        text: text.to_owned(),
+    }
 }
 
+#[cfg(test)]
+fn build_input_request(target: &Target, text: &str) -> Result<Request, CliError> {
+    request_with_params(method::SESSION_INPUT, &input_params(target, text))
+}
+
+fn rename_params(target: &Target, name: Option<String>) -> SessionRenameParams {
+    SessionRenameParams {
+        session_id: SessionId(target.session_id.clone()),
+        name,
+    }
+}
+
+#[cfg(test)]
 fn build_rename_request(target: &Target, name: Option<String>) -> Result<Request, CliError> {
-    request_with_params(
-        method::SESSION_RENAME,
-        &SessionRenameParams {
-            session_id: SessionId(target.session_id.clone()),
-            name,
-        },
-    )
+    request_with_params(method::SESSION_RENAME, &rename_params(target, name))
 }
 
 fn render_new_human(info: &SessionInfo) -> String {
@@ -1066,10 +1068,10 @@ mod tests {
     }
 
     #[test]
-    fn list_request_uses_null_params() {
+    fn list_request_uses_empty_typed_params() {
         let request = build_list_request(&[]).expect("request");
 
-        assert_request(&request, method::SESSION_LIST, serde_json::Value::Null);
+        assert_request(&request, method::SESSION_LIST, json!({}));
     }
 
     #[test]
@@ -1144,6 +1146,29 @@ mod tests {
             &running_session("s-shell"),
             &filters
         ));
+    }
+
+    #[test]
+    fn list_params_preserve_filters_for_typed_sdk_call() {
+        let params = list_params(&[
+            ListFilter::State(SessionState::Running),
+            ListFilter::Project("ui".to_owned()),
+        ]);
+
+        assert_eq!(
+            params.filters,
+            vec![
+                SessionListFilter::State(SessionState::Running),
+                SessionListFilter::Project("ui".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_params_without_filters_is_empty_for_typed_sdk_call() {
+        let params = list_params(&[]);
+
+        assert!(params.filters.is_empty());
     }
 
     #[test]

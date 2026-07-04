@@ -15,16 +15,17 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use futures::{stream, StreamExt};
-use pohunek_client::{Client, ClientOptions};
+use pohunek_client::{next_request_id, Client, ClientOptions};
 use protocol::{
-    event, method, AgentActivity, Event, HostClass, HostDiscoverParams, HostRecord,
-    ProjectActionParams, ProjectActionResult, ProjectActionsParams, ProjectActionsResult,
-    ProjectAddParams, ProjectInfo, ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams,
-    ProjectRemoveResult, ProjectRenameParams, ProjectShowParams, ProjectShowResult,
-    ProtocolVersion, ProviderKind, Request, SessionId, SessionInfo, SessionNewParams,
-    SessionNewResult, SessionRemoveResult, SessionRenameParams, SessionRenameResult,
-    SessionResumeResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
-    SessionStopResult, StateSource, WorktreeRemoveParams, WorktreeRemoveResult,
+    event, method, AgentActivity, DaemonHealthResult, Event, HostClass, HostDiscoverParams,
+    HostRecord, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
+    ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams, ProjectPromptParams,
+    ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
+    ProjectShowParams, ProjectShowResult, ProtocolVersion, ProviderKind, Request, SessionId,
+    SessionInfo, SessionListParams, SessionNewParams, SessionNewResult, SessionRemoveResult,
+    SessionRenameParams, SessionRenameResult, SessionResumeResult, SessionSetMetadataParams,
+    SessionSetMetadataResult, SessionState, SessionStopResult, StateSource, WorktreeRemoveParams,
+    WorktreeRemoveResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -177,6 +178,16 @@ pub struct HealthSummary {
     pub status: String,
     pub daemon_version: String,
     pub protocol_version: ProtocolVersion,
+}
+
+impl From<DaemonHealthResult> for HealthSummary {
+    fn from(result: DaemonHealthResult) -> Self {
+        Self {
+            status: result.status,
+            daemon_version: result.daemon_version,
+            protocol_version: result.protocol_version,
+        }
+    }
 }
 
 /// A host snapshot seeded by `daemon.health` and `session.list`.
@@ -2004,14 +2015,7 @@ pub async fn create_session_with_options(
     params: SessionNewParams,
     options: ConnectionOptions,
 ) -> Result<SessionNewResult, CoreError> {
-    request_host_json(
-        config,
-        options,
-        "gui-session-new",
-        method::SESSION_NEW,
-        serde_json::to_value(params)?,
-    )
-    .await
+    call_host::<method::SessionNew>(config, options, params).await
 }
 
 /// Inspect a session on a host through the SDK.
@@ -2028,14 +2032,7 @@ pub async fn inspect_session_with_options(
     session_id: &SessionId,
     options: ConnectionOptions,
 ) -> Result<SessionInfo, CoreError> {
-    request_host_json(
-        config,
-        options,
-        "gui-session-inspect",
-        method::SESSION_INSPECT,
-        serde_json::to_value(session_id)?,
-    )
-    .await
+    call_host::<method::SessionInspect>(config, options, session_id.clone()).await
 }
 
 /// Resume a terminal session on a host through the SDK.
@@ -2052,14 +2049,7 @@ pub async fn resume_session_with_options(
     session_id: &SessionId,
     options: ConnectionOptions,
 ) -> Result<SessionResumeResult, CoreError> {
-    request_host_json(
-        config,
-        options,
-        "gui-session-resume",
-        method::SESSION_RESUME,
-        serde_json::to_value(session_id)?,
-    )
-    .await
+    call_host::<method::SessionResume>(config, options, session_id.clone()).await
 }
 
 /// Stop a session on a host through the SDK.
@@ -2076,14 +2066,7 @@ pub async fn stop_session_with_options(
     session_id: &SessionId,
     options: ConnectionOptions,
 ) -> Result<SessionStopResult, CoreError> {
-    request_host_json(
-        config,
-        options,
-        "gui-session-stop",
-        method::SESSION_STOP,
-        serde_json::to_value(session_id)?,
-    )
-    .await
+    call_host::<method::SessionStop>(config, options, session_id.clone()).await
 }
 
 /// Remove a session from a host through the SDK.
@@ -2103,14 +2086,7 @@ pub async fn remove_session_with_options(
     session_id: &SessionId,
     options: ConnectionOptions,
 ) -> Result<SessionRemoveResult, CoreError> {
-    request_host_json(
-        config,
-        options,
-        "gui-session-remove",
-        method::SESSION_REMOVE,
-        serde_json::to_value(session_id)?,
-    )
-    .await
+    call_host::<method::SessionRemove>(config, options, session_id.clone()).await
 }
 
 /// Merge or clear session metadata on a host.
@@ -2127,14 +2103,7 @@ pub async fn set_session_metadata_with_options(
     params: SessionSetMetadataParams,
     options: ConnectionOptions,
 ) -> Result<SessionSetMetadataResult, CoreError> {
-    request_host_json(
-        config,
-        options,
-        "gui-session-set-metadata",
-        method::SESSION_SET_METADATA,
-        serde_json::to_value(params)?,
-    )
-    .await
+    call_host::<method::SessionSetMetadata>(config, options, params).await
 }
 
 /// Set or clear a session's display name on a host.
@@ -2151,14 +2120,7 @@ pub async fn rename_session_with_options(
     params: SessionRenameParams,
     options: ConnectionOptions,
 ) -> Result<SessionRenameResult, CoreError> {
-    request_host_json(
-        config,
-        options,
-        "gui-session-rename",
-        method::SESSION_RENAME,
-        serde_json::to_value(params)?,
-    )
-    .await
+    call_host::<method::SessionRename>(config, options, params).await
 }
 
 /// List projects on a host through the SDK.
@@ -2171,12 +2133,12 @@ pub async fn list_projects_with_options(
     config: &HostConfig,
     options: ConnectionOptions,
 ) -> Result<Vec<ProjectInfo>, CoreError> {
-    request_host_json(
+    call_host::<method::ProjectList>(
         config,
         options,
-        "gui-project-list",
-        method::PROJECT_LIST,
-        Value::Null,
+        ProjectListParams {
+            filters: Vec::new(),
+        },
     )
     .await
 }
@@ -2195,14 +2157,7 @@ pub async fn add_project_with_options(
     params: ProjectAddParams,
     options: ConnectionOptions,
 ) -> Result<ProjectInfo, CoreError> {
-    request_host_json(
-        config,
-        options,
-        "gui-project-add",
-        method::PROJECT_ADD,
-        serde_json::to_value(params)?,
-    )
-    .await
+    call_host::<method::ProjectAdd>(config, options, params).await
 }
 
 /// Show a project and its live worktrees.
@@ -2219,14 +2174,7 @@ pub async fn show_project_with_options(
     params: ProjectShowParams,
     options: ConnectionOptions,
 ) -> Result<ProjectShowResult, CoreError> {
-    request_host_json(
-        config,
-        options,
-        "gui-project-show",
-        method::PROJECT_SHOW,
-        serde_json::to_value(params)?,
-    )
-    .await
+    call_host::<method::ProjectShow>(config, options, params).await
 }
 
 /// Rename a project on a host through the SDK.
@@ -2243,14 +2191,7 @@ pub async fn rename_project_with_options(
     params: ProjectRenameParams,
     options: ConnectionOptions,
 ) -> Result<ProjectInfo, CoreError> {
-    request_host_json(
-        config,
-        options,
-        "gui-project-rename",
-        method::PROJECT_RENAME,
-        serde_json::to_value(params)?,
-    )
-    .await
+    call_host::<method::ProjectRename>(config, options, params).await
 }
 
 /// Remove a project from a host.
@@ -2267,14 +2208,7 @@ pub async fn remove_project_with_options(
     params: ProjectRemoveParams,
     options: ConnectionOptions,
 ) -> Result<ProjectRemoveResult, CoreError> {
-    request_host_json(
-        config,
-        options,
-        "gui-project-remove",
-        method::PROJECT_REMOVE,
-        serde_json::to_value(params)?,
-    )
-    .await
+    call_host::<method::ProjectRemove>(config, options, params).await
 }
 
 /// Remove a single pohunek-owned worktree from a host.
@@ -2291,14 +2225,7 @@ pub async fn remove_worktree_with_options(
     params: WorktreeRemoveParams,
     options: ConnectionOptions,
 ) -> Result<WorktreeRemoveResult, CoreError> {
-    request_host_json(
-        config,
-        options,
-        "gui-worktree-remove",
-        method::WORKTREE_REMOVE,
-        serde_json::to_value(params)?,
-    )
-    .await
+    call_host::<method::WorktreeRemove>(config, options, params).await
 }
 
 /// List project actions on a host through the SDK.
@@ -2315,14 +2242,7 @@ pub async fn list_project_actions_with_options(
     params: ProjectActionsParams,
     options: ConnectionOptions,
 ) -> Result<ProjectActionsResult, CoreError> {
-    request_host_json(
-        config,
-        options,
-        "gui-project-actions",
-        method::PROJECT_ACTIONS,
-        serde_json::to_value(params)?,
-    )
-    .await
+    call_host::<method::ProjectActions>(config, options, params).await
 }
 
 /// Resolve a project prompt on a host through the SDK.
@@ -2339,14 +2259,7 @@ pub async fn resolve_project_prompt_with_options(
     params: ProjectPromptParams,
     options: ConnectionOptions,
 ) -> Result<ProjectPromptResult, CoreError> {
-    request_host_json(
-        config,
-        options,
-        "gui-project-prompt",
-        method::PROJECT_PROMPT,
-        serde_json::to_value(params)?,
-    )
-    .await
+    call_host::<method::ProjectPrompt>(config, options, params).await
 }
 
 /// Resolve a project action on a host through the SDK.
@@ -2363,14 +2276,7 @@ pub async fn resolve_project_action_with_options(
     params: ProjectActionParams,
     options: ConnectionOptions,
 ) -> Result<ProjectActionResult, CoreError> {
-    request_host_json(
-        config,
-        options,
-        "gui-project-action",
-        method::PROJECT_ACTION,
-        serde_json::to_value(params)?,
-    )
-    .await
+    call_host::<method::ProjectAction>(config, options, params).await
 }
 
 /// Render a resolved prompt template for preview.
@@ -2540,25 +2446,19 @@ async fn load_host_snapshot_with_options(
     options: ConnectionOptions,
 ) -> Result<HostSnapshot, CoreError> {
     let mut client = connect_client(config, options).await?;
-    let health = request_json::<HealthSummary>(
+    let health = HealthSummary::from(call_client::<method::DaemonHealth>(&mut client, ()).await?);
+    let sessions = call_client::<method::SessionList>(
         &mut client,
-        "gui-daemon-health",
-        method::DAEMON_HEALTH,
-        Value::Null,
+        SessionListParams {
+            filters: Vec::new(),
+        },
     )
     .await?;
-    let sessions = request_json::<Vec<SessionInfo>>(
+    let projects = match call_client::<method::ProjectList>(
         &mut client,
-        "gui-session-list",
-        method::SESSION_LIST,
-        Value::Null,
-    )
-    .await?;
-    let projects = match request_json::<Vec<ProjectInfo>>(
-        &mut client,
-        "gui-project-list",
-        method::PROJECT_LIST,
-        Value::Null,
+        ProjectListParams {
+            filters: Vec::new(),
+        },
     )
     .await
     {
@@ -2576,22 +2476,19 @@ async fn load_host_snapshot_with_options(
 
 /// Each GUI command opens a short-lived client so reconnect state is localized
 /// to the operation and does not share failure state with subscriptions.
-async fn request_host_json<T>(
+async fn call_host<M>(
     config: &HostConfig,
     options: ConnectionOptions,
-    id: &'static str,
-    method: &'static str,
-    params: Value,
-) -> Result<T, CoreError>
+    params: M::Params,
+) -> Result<M::Output, CoreError>
 where
-    T: serde::de::DeserializeOwned,
+    M: protocol::Method,
 {
     tracing::event!(
         name: "gui.host_request.client.open",
         tracing::Level::DEBUG,
         host_id = %config.id,
-        request_id = id,
-        method,
+        method = M::NAME,
         "opening per-request GUI host client"
     );
     let mut client = match connect_client(config, options).await {
@@ -2601,22 +2498,20 @@ where
                 name: "gui.host_request.connect.failed",
                 tracing::Level::WARN,
                 host_id = %config.id,
-                request_id = id,
-                method,
+                method = M::NAME,
                 error = %err,
                 "GUI host request connection failed"
             );
             return Err(err);
         }
     };
-    match request_json(&mut client, id, method, params).await {
+    match client.call::<M>(params).await {
         Ok(value) => {
             tracing::event!(
                 name: "gui.host_request.completed",
                 tracing::Level::DEBUG,
                 host_id = %config.id,
-                request_id = id,
-                method,
+                method = M::NAME,
                 "GUI host request completed"
             );
             Ok(value)
@@ -2626,27 +2521,20 @@ where
                 name: "gui.host_request.failed",
                 tracing::Level::WARN,
                 host_id = %config.id,
-                request_id = id,
-                method,
+                method = M::NAME,
                 error = %err,
                 "GUI host request failed"
             );
-            Err(err)
+            Err(err.into())
         }
     }
 }
 
-async fn request_json<T>(
-    client: &mut Client,
-    id: &'static str,
-    method: &'static str,
-    params: Value,
-) -> Result<T, CoreError>
+async fn call_client<M>(client: &mut Client, params: M::Params) -> Result<M::Output, CoreError>
 where
-    T: serde::de::DeserializeOwned,
+    M: protocol::Method,
 {
-    let value = client.request(&Request::new(id, method, params)).await?;
-    Ok(serde_json::from_value(value)?)
+    Ok(client.call::<M>(params).await?)
 }
 
 /// Build a reconnecting stream of messages for one host's event subscription.
@@ -2871,8 +2759,16 @@ async fn subscribe_events(
     options: ConnectionOptions,
 ) -> Result<pohunek_client::Subscription, CoreError> {
     let client = connect_client(config, options).await?;
-    let request = Request::new("gui-subscribe", method::SUBSCRIBE, Value::Null);
+    let request = subscribe_request();
     Ok(client.subscribe(&request).await?)
+}
+
+fn subscribe_request() -> Request {
+    Request::new(
+        next_request_id(method::SUBSCRIBE),
+        method::SUBSCRIBE,
+        Value::Null,
+    )
 }
 
 async fn connect_client(
@@ -2942,13 +2838,9 @@ pub async fn discover_hosts(
     options: ConnectionOptions,
 ) -> Result<Vec<HostConfig>, CoreError> {
     let mut client = connect_client(&local, options).await?;
-    let records = request_json::<Vec<HostRecord>>(
-        &mut client,
-        "gui-host-discover",
-        method::HOST_DISCOVER,
-        serde_json::to_value(HostDiscoverParams { force: false })?,
-    )
-    .await?;
+    let records =
+        call_client::<method::HostDiscover>(&mut client, HostDiscoverParams { force: false })
+            .await?;
     let mut hosts = vec![local.clone()];
     for record in records {
         if matches!(record.class, HostClass::ReachableDaemon { .. }) {
@@ -3705,6 +3597,18 @@ mod tests {
             err,
             CoreError::UnsupportedPromptProvider { provider: "none" }
         ));
+    }
+
+    #[test]
+    fn subscribe_request_uses_sdk_request_id_generator() {
+        let first = subscribe_request();
+        let second = subscribe_request();
+
+        assert_eq!(first.method, method::SUBSCRIBE);
+        assert_eq!(first.params, Value::Null);
+        assert!(first.id.starts_with("sdk-subscribe-"));
+        assert!(second.id.starts_with("sdk-subscribe-"));
+        assert_ne!(first.id, second.id);
     }
 
     fn snapshot(host_id: &str, sessions: Vec<SessionInfo>) -> HostSnapshot {

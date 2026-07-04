@@ -15,17 +15,13 @@ use knowledge::{
 use pohunek_client::Client;
 use protocol::{
     method, AssistantMaterializeParams, AssistantMaterializeResult, ConceptIntent, ConceptMeta,
-    HostCapabilities, ProtocolError, Request, SessionInfo, SessionNewParams, SessionNewResult,
+    HostCapabilities, ProtocolError, SessionInfo, SessionNewParams,
 };
 use serde::Serialize;
 
 use crate::{connect_client, ConnectionOptions, CoreError, HostConfig, HostTransport};
 
 const SNAPSHOT_FILE: &str = "snapshot.json";
-const ASSISTANT_MATERIALIZE_ID: &str = "gui-assistant-materialize";
-const ASSISTANT_HOST_INSPECT_ID: &str = "gui-assistant-host-inspect";
-const ASSISTANT_SESSION_NEW_ID: &str = "gui-assistant-session-new";
-
 /// Assistant launch intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intent {
@@ -318,13 +314,9 @@ pub async fn start_prepared_with_options(
     options: ConnectionOptions,
 ) -> Result<LaunchResult, CoreError> {
     let mut client = connect_client(config, options).await?;
-    let request = Request::new(
-        ASSISTANT_SESSION_NEW_ID,
-        method::SESSION_NEW,
-        serde_json::to_value(&prepared.session_params)?,
-    );
-    let value = client.request(&request).await?;
-    let result: SessionNewResult = serde_json::from_value(value)?;
+    let result = client
+        .call::<method::SessionNew>(prepared.session_params)
+        .await?;
 
     Ok(LaunchResult {
         session: result.session,
@@ -389,14 +381,7 @@ fn host_label(config: &HostConfig) -> String {
 }
 
 async fn fetch_capabilities(client: &mut Client) -> Result<HostCapabilities, CoreError> {
-    let value = client
-        .request(&Request::new(
-            ASSISTANT_HOST_INSPECT_ID,
-            method::HOST_INSPECT,
-            serde_json::Value::Null,
-        ))
-        .await?;
-    Ok(serde_json::from_value(value)?)
+    Ok(client.call::<method::HostInspect>(()).await?)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -499,16 +484,10 @@ async fn materialize_remote(
     let params = AssistantMaterializeParams {
         snapshot: snapshot.to_owned(),
     };
-    let request = Request::new(
-        ASSISTANT_MATERIALIZE_ID,
-        method::ASSISTANT_MATERIALIZE,
-        serde_json::to_value(params)?,
-    );
-    let value = client
-        .request(&request)
+    let result = client
+        .call::<method::AssistantMaterialize>(params)
         .await
         .map_err(map_assistant_method_error)?;
-    let result: AssistantMaterializeResult = serde_json::from_value(value)?;
     assert_bundle_matches(&result)?;
     Ok(result)
 }
