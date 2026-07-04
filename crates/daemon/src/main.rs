@@ -17,6 +17,7 @@ use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo, RemoteServer};
+use pohunek_daemon::discovery::DiscoveryCache;
 use pohunek_daemon::lock::InstanceLock;
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use pohunek_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
@@ -102,7 +103,8 @@ async fn run() -> Result<(), DaemonError> {
 
     // 7. Bind the control socket (stale-socket recovery + 0600).
     let health = HealthInfo::new(DAEMON_VERSION);
-    let state = DaemonState::new(health, sessions.clone());
+    let discovery = DiscoveryCache::default();
+    let state = DaemonState::new_with_discovery(health, sessions.clone(), discovery.clone());
     let server = ControlServer::bind_with_state(&paths.socket, state).await?;
     info!(socket = %server.socket_path().display(), "ready; serving control protocol");
 
@@ -114,7 +116,11 @@ async fn run() -> Result<(), DaemonError> {
 
     // 9. Optionally bind a NetBird TCP control listener alongside the Unix
     //    socket. NetBird absent / not logged in / no self IP => stay local-only.
-    let remote_state = DaemonState::new(HealthInfo::new(DAEMON_VERSION), sessions.clone());
+    let remote_state = DaemonState::new_with_discovery(
+        HealthInfo::new(DAEMON_VERSION),
+        sessions.clone(),
+        discovery,
+    );
     let remote_server = bind_remote_server(remote_state).await;
 
     // 10. Serve both transports under ONE shutdown signal. A small task awaits

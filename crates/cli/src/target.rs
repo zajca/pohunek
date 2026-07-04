@@ -15,19 +15,7 @@
 
 use std::fmt;
 
-/// The reserved host name meaning "this machine".
-pub(crate) const LOCAL_HOST: &str = "local";
-
-/// Whether `host` denotes the local machine.
-///
-/// The reserved [`LOCAL_HOST`] name and an empty string (no host supplied) both
-/// route to the local Unix socket; every other name is remote. This is the one
-/// predicate every command and the transport agree on for "is this local", so
-/// the empty-string-is-local rule is decided in exactly one place.
-#[must_use]
-pub(crate) fn is_local_host(host: &str) -> bool {
-    host.is_empty() || host == LOCAL_HOST
-}
+pub(crate) use pohunek_client::{is_local_host, LOCAL_HOST};
 
 /// A parsed session target.
 #[derive(Debug, Clone, PartialEq, Eq)]

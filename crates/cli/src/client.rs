@@ -1,6 +1,6 @@
 //! CLI compatibility wrapper around the public SDK client.
 
-use protocol::Request;
+use protocol::{Method, Request};
 use serde_json::Value;
 
 use crate::error::CliError;
@@ -26,6 +26,14 @@ impl Client {
     /// Send a request and await its response payload.
     pub(crate) async fn request(&mut self, request: &Request) -> Result<Value, CliError> {
         self.inner.request(request).await.map_err(map_client_error)
+    }
+
+    /// Send one typed SDK method request.
+    pub(crate) async fn call<M>(&mut self, params: M::Params) -> Result<M::Output, CliError>
+    where
+        M: Method,
+    {
+        self.inner.call::<M>(params).await.map_err(map_client_error)
     }
 
     /// Convert this compatibility wrapper into the SDK client.

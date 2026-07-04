@@ -39,6 +39,9 @@ pub enum NetbirdError {
     /// not logged in, or a non-zero exit). Carries a short, bounded detail.
     #[error("NetBird local state is unavailable: {0}")]
     StateUnavailable(String),
+    /// Operator-provided NetBird-related configuration is invalid.
+    #[error("invalid NetBird configuration: {0}")]
+    InvalidConfig(String),
     /// The `netbird status --json` output could not be parsed.
     #[error("failed to parse `netbird status --json`: {0}")]
     Parse(String),

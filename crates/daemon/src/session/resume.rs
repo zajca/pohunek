@@ -7,6 +7,9 @@ use super::{
     SessionEntry, SessionId, SessionInfo, SessionRef, SessionRefKind, SessionRegistry,
 };
 
+use std::io;
+use std::sync::Arc;
+
 /// Frozen structural relaunch snapshot for a session (Part C, C.4).
 ///
 /// Set once at launch from the [`ResolvedAgent`] and persisted verbatim on every
@@ -62,10 +65,14 @@ impl SessionRegistry {
                 Some(Self::resume_binding_from_entry(id, entry))
             })
         };
-        let result = match &desired {
-            Some(binding) => store.record_resume(binding),
-            None => store.remove_resume(&id.0),
-        };
+        let store = Arc::clone(store);
+        let session_id = id.0.clone();
+        let result = tokio::task::spawn_blocking(move || match desired {
+            Some(binding) => store.record_resume(&binding),
+            None => store.remove_resume(&session_id),
+        })
+        .await
+        .unwrap_or_else(join_error_to_io);
         if let Err(err) = result {
             warn!(
                 session_id = %id.0,
@@ -85,7 +92,11 @@ impl SessionRegistry {
         let Some(store) = &self.inner.store else {
             return;
         };
-        let bindings = match store.load_resume() {
+        let store = Arc::clone(store);
+        let bindings = match tokio::task::spawn_blocking(move || store.load_resume())
+            .await
+            .unwrap_or_else(join_error_to_io)
+        {
             Ok(bindings) => bindings,
             Err(err) => {
                 warn!(error = %err, "failed to load resume-binding store; skipping resume");
@@ -314,7 +325,8 @@ impl SessionRegistry {
         // across a daemon restart). With the unified store the session's worktree
         // metadata (repo/branch/worktree_path) is restored too, so inspect/list
         // show it again after a restart.
-        let (repo, branch, worktree_path) = self.restore_worktree_metadata(&binding.session_id);
+        let (repo, branch, worktree_path) =
+            self.restore_worktree_metadata(&binding.session_id).await;
         // The project context was captured on the binding when it was persisted
         // (F5), so restore it directly — no git re-detection on the cwd at startup,
         // and a detection failure can no longer silently drop the metadata. An
@@ -352,14 +364,21 @@ impl SessionRegistry {
     /// its worktree metadata again. Best-effort: a missing store, a read error,
     /// or no binding yields all-`None` — the session still resumes (its cwd is the
     /// worktree path either way); only the display metadata is absent.
-    fn restore_worktree_metadata(
+    async fn restore_worktree_metadata(
         &self,
         session_id: &str,
     ) -> (Option<PathBuf>, Option<String>, Option<PathBuf>) {
         let Some(store) = &self.inner.store else {
             return (None, None, None);
         };
-        match store.find_worktree_for_session(session_id) {
+        let store = Arc::clone(store);
+        let session_id_owned = session_id.to_owned();
+        match tokio::task::spawn_blocking(move || {
+            store.find_worktree_for_session(&session_id_owned)
+        })
+        .await
+        .unwrap_or_else(join_error_to_io)
+        {
             Ok(Some(binding)) => (
                 Some(binding.repository),
                 Some(binding.branch),
@@ -396,4 +415,14 @@ impl SessionRegistry {
             }
         }
     }
+}
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "tokio JoinError is delivered by value from JoinHandle::await"
+)]
+fn join_error_to_io<T>(err: tokio::task::JoinError) -> io::Result<T> {
+    Err(io::Error::other(format!(
+        "blocking store task failed: {err}"
+    )))
 }

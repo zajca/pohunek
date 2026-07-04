@@ -146,6 +146,7 @@ All params and result type names below refer to structs exported by
 | `project.prompt` | `ProjectPromptParams` | `ProjectPromptResult` | Resolves a prompt template without rendering it. |
 | `project.action` | `ProjectActionParams` | `ProjectActionResult` | Resolves one action recipe plus prompt content. |
 | `project.actions` | `ProjectActionsParams` | `ProjectActionsResult` | Lists available project actions after layer shadowing. |
+| `worktree.remove` | `WorktreeRemoveParams` | `WorktreeRemoveResult` | Removes one owned worktree binding, refusing live sessions unless forced by the method contract. |
 
 `status` exists as a method constant in `crates/protocol` but is not a supported
 daemon method in this API version. It returns `daemon/method_not_found`.
@@ -338,6 +339,8 @@ Public exports:
 - `RawStream`: local Unix or remote TCP raw byte stream for attach.
 - `ClientError`: SDK error enum with `to_protocol_error()` for structured
   rendering.
+- `next_request_id(method)`: shared correlation-id generator used by SDK-backed
+  clients.
 - Raw and attach helpers: `connect_raw*` and `attach_raw*`.
 
 Connection APIs:
@@ -351,8 +354,13 @@ Connection APIs:
 
 Request APIs:
 
+- `Client::call::<M: protocol::Method>(params) -> M::Output`: sends one typed
+  method request, pairing the method name, params, and success payload through
+  marker types in `protocol::method`.
+- `Client::handshake() -> ProtocolVersion`: calls `daemon.health` and returns the
+  daemon-reported protocol version.
 - `Client::request(&Request) -> serde_json::Value`: sends one request and returns
-  the `ok` payload.
+  the raw `ok` payload for low-level callers and framing tests.
 - `Client::subscribe(&Request) -> Subscription`: consumes the client connection
   after a subscribe ack.
 - `Subscription::next_line() -> Option<String>`: returns raw event JSON lines.

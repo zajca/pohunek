@@ -15,16 +15,9 @@
 //! - config dir:      `$XDG_CONFIG_HOME` or `~/.config` + `/pohunek`
 //!   (host-default templates/actions/prompts, hooks/, agents/ profiles)
 
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::error::DaemonError;
-
-/// Subdirectory/name constants. Centralized so there are no scattered string
-/// literals for the on-disk layout.
-const APP_DIR: &str = "pohunek";
-const SOCKET_NAME: &str = "daemon.sock";
-const LOCK_NAME: &str = "daemon.lock";
-const LOGS_SUBDIR: &str = "logs";
 
 /// Resolved set of daemon paths.
 #[derive(Debug, Clone)]
@@ -59,114 +52,61 @@ impl Paths {
     /// `XDG_STATE_HOME`/`XDG_DATA_HOME`/`XDG_CONFIG_HOME` nor `HOME` is available to
     /// derive the log/data/config directories.
     pub fn resolve() -> Result<Self, DaemonError> {
-        // XDG_RUNTIME_DIR is mandatory: it is the only correct home for an
-        // owner-private socket, and inventing e.g. /tmp would weaken the
-        // single-user security model. Fail fast instead.
-        let runtime_base = require_env("XDG_RUNTIME_DIR")?;
-        let runtime_dir = PathBuf::from(runtime_base).join(APP_DIR);
-        let socket = runtime_dir.join(SOCKET_NAME);
-        let lock = runtime_dir.join(LOCK_NAME);
-
-        // Logs: prefer XDG_STATE_HOME, else ~/.local/state. One of the two must
-        // resolve; otherwise fail fast.
-        let state_home = xdg_or_home_relative("XDG_STATE_HOME", &[".local", "state"])?;
-        let log_dir = state_home.join(APP_DIR).join(LOGS_SUBDIR);
-
-        // Data dir: prefer XDG_DATA_HOME, else ~/.local/share.
-        let data_home = xdg_or_home_relative("XDG_DATA_HOME", &[".local", "share"])?;
-        let data_dir = data_home.join(APP_DIR);
-
-        // Cache dir: prefer XDG_CACHE_HOME, else ~/.cache.
-        let cache_home = xdg_or_home_relative("XDG_CACHE_HOME", &[".cache"])?;
-        let cache_dir = cache_home.join(APP_DIR);
-
-        // Config dir: prefer XDG_CONFIG_HOME, else ~/.config. One of the two must
-        // resolve; otherwise fail fast (no silent default).
-        let config_home = xdg_or_home_relative("XDG_CONFIG_HOME", &[".config"])?;
-        let config_dir = config_home.join(APP_DIR);
+        let base = pohunek_paths::BasePaths::resolve().map_err(path_error)?;
 
         Ok(Self {
-            runtime_dir,
-            socket,
-            lock,
-            log_dir,
-            data_dir,
-            cache_dir,
-            config_home,
-            config_dir,
+            runtime_dir: base.runtime_dir,
+            socket: base.socket,
+            lock: base.lock,
+            log_dir: base.log_dir,
+            data_dir: base.data_dir,
+            cache_dir: base.cache_dir,
+            config_home: base.config_home,
+            config_dir: base.config_dir,
         })
     }
 
     /// Directory the launcher scripts are materialized into by `pohunek setup scripts`.
     #[must_use]
     pub fn launcher_bin_dir(&self) -> PathBuf {
-        self.data_dir.join("bin")
+        self.data_dir.join(pohunek_paths::BIN_SUBDIR)
     }
 
     /// The user's sway config dir (`<config_home>/sway`).
     #[must_use]
     pub fn sway_config_dir(&self) -> PathBuf {
-        self.config_home.join("sway")
+        self.config_home.join(pohunek_paths::SWAY_CONFIG_DIR)
     }
 
     /// Directory where assistant knowledge bundles are cached.
     #[must_use]
     pub fn assistant_bundle_cache_dir(&self) -> PathBuf {
-        self.cache_dir.join("knowledge")
+        self.cache_dir.join(pohunek_paths::KNOWLEDGE_CACHE_SUBDIR)
     }
 
     /// Runtime directory for assistant material generated for one session or launch.
     #[must_use]
     pub fn assistant_runtime_dir(&self, session_or_launch_id: &str) -> Option<PathBuf> {
-        valid_runtime_id(session_or_launch_id).map(|id| self.runtime_dir.join("assistant").join(id))
+        pohunek_paths::valid_runtime_id(session_or_launch_id).map(|id| {
+            self.runtime_dir
+                .join(pohunek_paths::ASSISTANT_RUNTIME_SUBDIR)
+                .join(id)
+        })
     }
 }
 
-fn valid_runtime_id(id: &str) -> Option<&Path> {
-    let path = Path::new(id);
-    let mut components = path.components();
-    match (components.next(), components.next()) {
-        (Some(Component::Normal(_)), None) => Some(path),
-        _ => None,
+fn path_error(err: pohunek_paths::PathError) -> DaemonError {
+    match err {
+        pohunek_paths::PathError::MissingEnv { var } => DaemonError::MissingEnv { var },
     }
-}
-
-/// Read a required environment variable or fail fast.
-fn require_env(key: &str) -> Result<String, DaemonError> {
-    match std::env::var(key) {
-        Ok(v) if !v.is_empty() => Ok(v),
-        _ => Err(DaemonError::MissingEnv {
-            var: key.to_owned(),
-        }),
-    }
-}
-
-/// Resolve an XDG base dir: use `$key` if set and non-empty, otherwise
-/// `$HOME` joined with `home_relative`. Fails if neither is available.
-fn xdg_or_home_relative(key: &str, home_relative: &[&str]) -> Result<PathBuf, DaemonError> {
-    if let Ok(v) = std::env::var(key) {
-        if !v.is_empty() {
-            return Ok(PathBuf::from(v));
-        }
-    }
-    #[expect(
-        clippy::map_err_ignore,
-        reason = "MissingEnv carries no source; we report a more actionable variable name instead"
-    )]
-    let home = require_env("HOME").map_err(|_| DaemonError::MissingEnv {
-        // Report the more actionable variable: the user needs HOME (or the XDG
-        // var) so the daemon can locate its state directory.
-        var: format!("{key} or HOME"),
-    })?;
-    let mut p = PathBuf::from(home);
-    for seg in home_relative {
-        p.push(seg);
-    }
-    Ok(p)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use pohunek_paths::{APP_DIR, ASSISTANT_RUNTIME_SUBDIR, KNOWLEDGE_CACHE_SUBDIR};
+
     use super::*;
 
     use crate::test_support::XDG_ENV_LOCK;
@@ -275,14 +215,16 @@ mod tests {
         let paths = Paths::resolve().expect("resolve with all base vars set");
         assert_eq!(
             paths.assistant_bundle_cache_dir(),
-            base.join("cache").join(APP_DIR).join("knowledge")
+            base.join("cache")
+                .join(APP_DIR)
+                .join(KNOWLEDGE_CACHE_SUBDIR)
         );
         assert_eq!(
             paths.assistant_runtime_dir("launch-123"),
             Some(
                 base.join("run")
                     .join(APP_DIR)
-                    .join("assistant")
+                    .join(ASSISTANT_RUNTIME_SUBDIR)
                     .join("launch-123")
             )
         );

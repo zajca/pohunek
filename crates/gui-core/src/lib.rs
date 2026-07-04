@@ -1177,10 +1177,10 @@ impl Workspace {
                     });
             }
             Message::HostEvent { host_id, event } => {
-                let host = self
-                    .hosts
-                    .entry(host_id.clone())
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.hosts.get_mut(&host_id) else {
+                    trace_ignored_unknown_host(&host_id, "host event");
+                    return;
+                };
                 host.conn = ConnState::Connected;
                 host.last_error = None;
                 apply_host_event(
@@ -1193,34 +1193,30 @@ impl Workspace {
                 );
             }
             Message::HostDisconnected { host_id, error } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.host_mut_if_known(&host_id, "host disconnected") else {
+                    return;
+                };
                 host.conn = ConnState::Disconnected;
                 host.last_error = Some(error);
             }
             Message::HostUnreachable { host_id, error } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.host_mut_if_known(&host_id, "host unreachable") else {
+                    return;
+                };
                 host.conn = ConnState::Unreachable;
                 host.last_error = Some(error);
             }
             Message::SessionCreated { host_id, session }
             | Message::SessionInspected { host_id, session } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.host_mut_if_known(&host_id, "session result") else {
+                    return;
+                };
                 host.sessions.insert(session.id.0.clone(), session);
             }
             Message::SessionResumed { host_id, result } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.host_mut_if_known(&host_id, "session resume result") else {
+                    return;
+                };
                 let session = result.session;
                 host.sessions.insert(session.id.0.clone(), session);
             }
@@ -1232,10 +1228,9 @@ impl Workspace {
                 if !result.stopped {
                     return;
                 }
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.host_mut_if_known(&host_id, "session stop result") else {
+                    return;
+                };
                 if let Some(session) = host.sessions.get_mut(&session_id.0) {
                     session.state = SessionState::Stopped;
                     session.activity = None;
@@ -1249,33 +1244,29 @@ impl Workspace {
                 if !result.removed {
                     return;
                 }
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.host_mut_if_known(&host_id, "session remove result") else {
+                    return;
+                };
                 host.sessions.remove(&session_id.0);
             }
             Message::SessionMetadataUpdated { host_id, result } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.host_mut_if_known(&host_id, "session metadata result") else {
+                    return;
+                };
                 host.sessions
                     .insert(result.session.id.0.clone(), result.session);
             }
             Message::SessionRenamed { host_id, result } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.host_mut_if_known(&host_id, "session renamed result") else {
+                    return;
+                };
                 host.sessions
                     .insert(result.session.id.0.clone(), result.session);
             }
             Message::ProjectListLoaded { host_id, projects } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.host_mut_if_known(&host_id, "project list result") else {
+                    return;
+                };
                 host.projects = projects
                     .iter()
                     .cloned()
@@ -1286,17 +1277,15 @@ impl Workspace {
             }
             Message::ProjectAdded { host_id, project }
             | Message::ProjectRenamed { host_id, project } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.host_mut_if_known(&host_id, "project change result") else {
+                    return;
+                };
                 host.projects.insert(project.id.clone(), project);
             }
             Message::ProjectShown { host_id, result } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.host_mut_if_known(&host_id, "project shown result") else {
+                    return;
+                };
                 host.projects
                     .insert(result.project.id.clone(), result.project.clone());
                 host.project_details
@@ -1347,59 +1336,46 @@ impl Workspace {
                 reference,
                 result,
             } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.host_mut_if_known(&host_id, "project actions result") else {
+                    return;
+                };
                 host.prompt.actions_by_project.insert(reference, result);
                 host.last_error = None;
             }
             Message::ProjectPromptResolved { host_id, prompt } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.host_mut_if_known(&host_id, "project prompt result") else {
+                    return;
+                };
                 host.prompt.resolved_prompt = Some(prompt);
                 host.prompt.preview = None;
                 host.last_error = None;
             }
             Message::ProjectActionResolved { host_id, action } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.host_mut_if_known(&host_id, "project action result") else {
+                    return;
+                };
                 host.prompt.resolved_action = Some(action);
                 host.prompt.preview = None;
                 host.last_error = None;
             }
             Message::PromptPreviewRendered { host_id, preview } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.host_mut_if_known(&host_id, "prompt preview result") else {
+                    return;
+                };
                 host.prompt.preview = Some(preview);
                 host.last_error = None;
             }
             Message::ProviderPanelSelected { host_id, panel } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let host = self.host_for_ui(host_id);
                 host.provider.active_panel = panel;
             }
             Message::LinearProviderFilterSelected { host_id, name } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let host = self.host_for_ui(host_id);
                 host.provider.linear.selected_filter = Some(name);
                 host.provider.linear.active_request = None;
             }
             Message::LinearProviderSearchChanged { host_id, value } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let host = self.host_for_ui(host_id);
                 host.provider.linear.search = value;
                 host.provider.linear.active_request = None;
             }
@@ -1411,10 +1387,9 @@ impl Workspace {
                 issues,
             } => {
                 let trace_host_id = host_id.clone();
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.host_mut_if_known(&host_id, "linear issues result") else {
+                    return;
+                };
                 if host.provider.linear.active_request != Some(request_id) {
                     trace_ignored_provider_result(
                         &trace_host_id,
@@ -1443,25 +1418,16 @@ impl Workspace {
                 host.provider.linear.last_error = None;
             }
             Message::LinearProviderIssueSelected { host_id, issue_id } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let host = self.host_for_ui(host_id);
                 host.provider.linear.selected_issue_id = Some(issue_id);
             }
             Message::GitHubProviderFilterSelected { host_id, name } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let host = self.host_for_ui(host_id);
                 host.provider.github.selected_filter = Some(name);
                 host.provider.github.pull_requests_request = None;
             }
             Message::GitHubProviderSearchChanged { host_id, value } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let host = self.host_for_ui(host_id);
                 host.provider.github.search = value;
             }
             Message::GitHubProviderPullRequestsLoaded {
@@ -1485,10 +1451,10 @@ impl Workspace {
                     return;
                 }
                 let trace_host_id = host_id.clone();
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.host_mut_if_known(&host_id, "github pull requests result")
+                else {
+                    return;
+                };
                 if host.provider.github.pull_requests_request != Some(request_id) {
                     trace_ignored_provider_result(
                         &trace_host_id,
@@ -1530,10 +1496,9 @@ impl Workspace {
                     return;
                 }
                 let trace_host_id = host_id.clone();
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.host_mut_if_known(&host_id, "github issues result") else {
+                    return;
+                };
                 if host.provider.github.issues_request != Some(request_id) {
                     trace_ignored_provider_result(
                         &trace_host_id,
@@ -1555,17 +1520,11 @@ impl Workspace {
                 host.provider.github.last_error = None;
             }
             Message::GitHubProviderPullRequestSelected { host_id, number } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let host = self.host_for_ui(host_id);
                 host.provider.github.selected_pull_request = Some(number);
             }
             Message::GitHubProviderIssueSelected { host_id, number } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let host = self.host_for_ui(host_id);
                 host.provider.github.selected_issue = Some(number);
             }
             Message::GitHubProviderPullRequestStatusLoaded {
@@ -1589,10 +1548,11 @@ impl Workspace {
                     return;
                 }
                 let trace_host_id = host_id.clone();
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let Some(host) =
+                    self.host_mut_if_known(&host_id, "github pull request status result")
+                else {
+                    return;
+                };
                 if host.provider.github.pull_request_status_request != Some(request_id) {
                     trace_ignored_provider_result(
                         &trace_host_id,
@@ -1617,10 +1577,10 @@ impl Workspace {
                 request_id,
                 error,
             } => {
-                let host = self
-                    .hosts
-                    .entry(host_id.clone())
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.host_mut_if_known(&host_id, "provider operation failure")
+                else {
+                    return;
+                };
                 if !apply_provider_request_failure(&host_id, host, provider, operation, request_id)
                 {
                     return;
@@ -1631,13 +1591,30 @@ impl Workspace {
                 }
             }
             Message::HostOperationFailed { host_id, error } => {
-                let host = self
-                    .hosts
-                    .entry(host_id)
-                    .or_insert_with(HostView::connecting);
+                let Some(host) = self.host_mut_if_known(&host_id, "host operation failure") else {
+                    return;
+                };
                 host.last_error = Some(error);
             }
         }
+    }
+
+    fn host_mut_if_known(
+        &mut self,
+        host_id: &HostId,
+        reason: &'static str,
+    ) -> Option<&mut HostView> {
+        let Some(host) = self.hosts.get_mut(host_id) else {
+            trace_ignored_unknown_host(host_id, reason);
+            return None;
+        };
+        Some(host)
+    }
+
+    fn host_for_ui(&mut self, host_id: HostId) -> &mut HostView {
+        self.hosts
+            .entry(host_id)
+            .or_insert_with(HostView::connecting)
     }
 
     /// Select a session in the detail pane.
@@ -1767,6 +1744,16 @@ fn apply_provider_request_failure(
         (_, ProviderOperation::Launch) => true,
         _ => false,
     }
+}
+
+fn trace_ignored_unknown_host(host_id: &HostId, reason: &'static str) {
+    tracing::event!(
+        name: "gui.host.result.ignored",
+        tracing::Level::DEBUG,
+        host_id = %host_id,
+        reason,
+        "ignoring result for unknown host"
+    );
 }
 
 fn trace_ignored_provider_result(

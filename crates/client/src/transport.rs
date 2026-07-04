@@ -3,10 +3,12 @@
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::{SinkExt, StreamExt};
-use protocol::{AttachHeader, ProtocolError, Request, Response};
+use protocol::{AttachHeader, Method, ProtocolError, ProtocolVersion, Request, Response};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
@@ -14,7 +16,8 @@ use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
 use crate::ClientError;
 
-const LOCAL_HOST: &str = "local";
+/// Reserved host name that routes to this machine's Unix socket.
+pub const LOCAL_HOST: &str = "local";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_LINE_BYTES: usize = 1024 * 1024;
@@ -167,6 +170,30 @@ impl Client {
         }
     }
 
+    /// Send one typed control-method request and decode its success payload.
+    ///
+    /// This is the public SDK path for normal request/response methods. The
+    /// lower-level [`Self::request`] remains available for callers that need raw
+    /// JSON envelopes or are testing framing behavior directly.
+    pub async fn call<M>(&mut self, params: M::Params) -> Result<M::Output, ClientError>
+    where
+        M: Method,
+    {
+        let request = Request::new(
+            next_request_id(M::NAME),
+            M::NAME,
+            serde_json::to_value(params)?,
+        );
+        let value = self.request(&request).await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Probe the daemon and return the negotiated protocol version it reports.
+    pub async fn handshake(&mut self) -> Result<ProtocolVersion, ClientError> {
+        let result = self.call::<protocol::method::DaemonHealth>(()).await?;
+        Ok(result.protocol_version)
+    }
+
     /// Send a subscription request and return a live raw event-line stream.
     ///
     /// The connection is consumed because a successful subscription turns the
@@ -187,6 +214,28 @@ impl Client {
             }
         }
     }
+}
+
+/// Build a unique correlation id for one SDK control request.
+///
+/// Format: `sdk-<method>-<run-token>-<seq>`. The method keeps ids readable in
+/// daemon logs; the run token and sequence keep repeated and concurrent calls
+/// distinct across one process lifetime.
+#[must_use]
+pub fn next_request_id(method: &str) -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("sdk-{method}-{}-{seq}", run_token())
+}
+
+fn run_token() -> &'static str {
+    static TOKEN: OnceLock<String> = OnceLock::new();
+    TOKEN.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        format!("{:x}{:x}", std::process::id(), nanos)
+    })
 }
 
 impl Subscription {
@@ -479,7 +528,9 @@ async fn connect_tcp(
     }
 }
 
-fn is_local_host(host: &str) -> bool {
+/// Return whether `host` denotes the local machine.
+#[must_use]
+pub fn is_local_host(host: &str) -> bool {
     host.is_empty() || host == LOCAL_HOST
 }
 

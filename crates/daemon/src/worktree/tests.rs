@@ -13,8 +13,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use protocol::SessionWarningKind;
 
 use super::{
-    branch_slug, hook_env, is_valid_worktree, HookContext, HookEvent, WorktreeManager,
-    WorktreeRequest,
+    branch_slug, hook_env, is_valid_worktree, run_output_bounded, HookContext, HookEvent,
+    WorktreeManager, WorktreeRequest,
 };
 use crate::store::{Store, WorktreeStatus};
 
@@ -151,6 +151,59 @@ fn git_stdout(dir: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+#[test]
+fn bounded_command_times_out_and_kills_a_slow_child() {
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "sleep 5"]);
+
+    let started = Instant::now();
+    let err =
+        run_output_bounded(cmd, Duration::from_millis(100)).expect_err("slow command times out");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "timeout runner should return promptly"
+    );
+    assert!(
+        err.contains("timed out"),
+        "timeout error should explain the deadline: {err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_command_timeout_kills_process_group_children() {
+    let dir = unique_dir("bounded-command-process-group");
+    let marker = dir.join("child-survived");
+    let script = format!("(sleep 0.4; printf leaked > '{}') & wait", marker.display());
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", &script]);
+
+    let err =
+        run_output_bounded(cmd, Duration::from_millis(100)).expect_err("process group times out");
+
+    assert!(
+        err.contains("timed out"),
+        "timeout error should explain the deadline: {err}"
+    );
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(
+        !marker.exists(),
+        "timeout kill must terminate background children too"
+    );
+}
+
+#[test]
+fn bounded_command_drains_output_larger_than_pipe_buffer() {
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "head -c 200000 /dev/zero | tr '\\0' x"]);
+
+    let output = run_output_bounded(cmd, TEST_SETUP_TIMEOUT).expect("large output drains");
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout.len(), 200_000);
 }
 
 fn request(session: &str, repo: &Path, branch: &str) -> WorktreeRequest {

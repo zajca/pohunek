@@ -92,9 +92,12 @@ Agent runtime and profile resolution:
 Protocol contracts and transport:
 
 - `crates/client/src/lib.rs`
+- `crates/client/src/transport.rs`
+- `crates/paths/src/lib.rs`
 - `crates/protocol/src/assistant.rs`
 - `crates/protocol/src/envelope.rs`
 - `crates/protocol/src/lib.rs`
+- `crates/protocol/src/method.rs`
 - `crates/protocol/src/session.rs`
 - `crates/protocol/src/project.rs`
 - `crates/protocol/src/capabilities.rs`

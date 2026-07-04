@@ -5,6 +5,7 @@
 
 use std::path::Path;
 
+use crate::generators::common::{frontmatter, write_concept_file, ConceptFrontmatter};
 use crate::XtaskError;
 
 struct CommandDescriptor {
@@ -425,24 +426,7 @@ static COMMANDS: &[CommandDescriptor] = &[
     },
 ];
 
-fn write_concept_file(path: &Path, content: &str) -> Result<(), XtaskError> {
-    if let Some(parent) = path.parent() {
-        crate::create_dir_all(parent)?;
-    }
-    std::fs::write(path, content).map_err(|source| XtaskError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
 fn render_command(cmd: &CommandDescriptor, since: &str) -> String {
-    let intents_yaml = cmd
-        .intents
-        .iter()
-        .map(|i| format!("  - {i}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-
     let usage_section = if cmd.usage.is_empty() {
         String::new()
     } else {
@@ -461,30 +445,29 @@ fn render_command(cmd: &CommandDescriptor, since: &str) -> String {
         format!("\n{}\n", cmd.extra_body)
     };
 
+    let yaml = frontmatter(&ConceptFrontmatter {
+        concept_type: "CliCommand",
+        id: &format!("cli/{}", cmd.id),
+        title: cmd.title,
+        description: cmd.description,
+        generated_from: "static CLI descriptor",
+        since: Some(since),
+        tags: &["cli", "reference"],
+        intents: cmd.intents,
+    });
+
     format!(
-        "---\n\
-         type: CliCommand\n\
-         id: cli/{id}\n\
-         title: \"{title}\"\n\
-         description: \"{description}\"\n\
-         source_kind: generated\n\
-         generated_from: \"static CLI descriptor\"\n\
-         since: \"{since}\"\n\
-         tags:\n\
-           - cli\n\
-           - reference\n\
-         intents:\n\
-         {intents}\n\
-         ---\n\
-         \n\
+        "{yaml}\n\
          # {title}\n\
          \n\
          {description}\n\
          {usage_section}{arguments_section}{extra}",
-        id = cmd.id,
+        yaml = yaml,
         title = cmd.title,
         description = cmd.description,
-        intents = intents_yaml,
+        usage_section = usage_section,
+        arguments_section = arguments_section,
+        extra = extra
     )
 }
 

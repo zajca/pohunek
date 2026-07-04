@@ -14,6 +14,7 @@ path = "src/main.rs"
 pohunek-hostcheck = { workspace = true }
 pohunek-protocol = { workspace = true }
 pohunek-netbird = { workspace = true }
+pohunek-paths = { workspace = true }
 pohunek-client = { workspace = true }
 pohunek-prompt = { workspace = true }
 pohunek-terminal = { workspace = true }

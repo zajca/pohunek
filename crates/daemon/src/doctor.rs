@@ -4,47 +4,31 @@
 //! `hostcheck` crate; this module only selects which checks to run on the host
 //! that owns the agent runtime and assembles them into a [`DoctorReport`].
 
-use protocol::{DoctorCheck, DoctorReport, DoctorStatus};
+use hostcheck::StandardCheckInputs;
+use protocol::DoctorReport;
 
 use crate::Paths;
 
 /// Build a daemon-local doctor report on the host that owns the agent runtime.
 #[must_use]
 pub fn report(paths: &Paths) -> DoctorReport {
-    DoctorReport::from_checks(vec![
-        hostcheck::binary("git", true),
-        hostcheck::binary("codex", false),
-        hostcheck::binary("claude", false),
-        hostcheck::dir_writable(
-            "socket_dir_writable",
-            &paths.runtime_dir,
-            "control socket directory",
-        ),
-        hostcheck::dir_writable(
-            "state_dir_writable",
-            &paths.data_dir,
-            "state data directory",
-        ),
-        hostcheck::dir_writable("log_dir_writable", &paths.log_dir, "log directory"),
-        hostcheck::netbird(),
-        DoctorCheck::new(
-            "schema_version",
-            DoctorStatus::Warn,
-            "not available yet (SQLite store is a later milestone)",
-        ),
-        hostcheck::binary("rofi", false),
-        hostcheck::binary("swaymsg", false),
-        hostcheck::binary("python3", false),
-        hostcheck::binary("timeout", false),
-        hostcheck::terminal(),
-        hostcheck::launcher_scripts(&paths.launcher_bin_dir()),
-        hostcheck::sway_include(&paths.sway_config_dir()),
-    ])
+    let launcher_bin_dir = paths.launcher_bin_dir();
+    let sway_config_dir = paths.sway_config_dir();
+
+    DoctorReport::from_checks(hostcheck::standard_checks(StandardCheckInputs {
+        socket_dir: &paths.runtime_dir,
+        state_dir: &paths.data_dir,
+        log_dir: &paths.log_dir,
+        launcher_bin_dir: &launcher_bin_dir,
+        sway_config_dir: &sway_config_dir,
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+
+    use protocol::DoctorStatus;
 
     use super::*;
 

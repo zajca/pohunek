@@ -19,6 +19,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::checks::parse_pohunek_command;
+
 const EVAL_OUTPUT_ROOT: &str = "target/pohunek-eval";
 const TRANSCRIPTS_DIR: &str = "transcripts";
 const FIXTURES_DIR: &str = "fixtures";
@@ -150,8 +152,6 @@ fn check_commands_inner(commands: &[&str], allow_placeholders: bool) -> Vec<Comm
         .iter()
         .map(|cmd_str| {
             let command = cmd_str.to_string();
-
-            // Skip placeholder lines (contain `<...>` tokens).
             if allow_placeholders && command.contains('<') {
                 return CommandCheckResult {
                     command,
@@ -160,47 +160,17 @@ fn check_commands_inner(commands: &[&str], allow_placeholders: bool) -> Vec<Comm
                 };
             }
 
-            let tokens: Vec<String> = command.split_whitespace().map(str::to_string).collect();
-            if tokens.first().map(String::as_str) != Some("pohunek") {
-                return CommandCheckResult {
-                    command,
-                    valid: false,
-                    error: Some("command must start with exact `pohunek` binary".to_owned()),
-                };
-            }
-
-            match cli::command().try_get_matches_from(&tokens) {
-                Ok(_) => CommandCheckResult {
+            match parse_pohunek_command(&command) {
+                Ok(()) => CommandCheckResult {
                     command,
                     valid: true,
                     error: None,
                 },
-                Err(err) => {
-                    use clap::error::ErrorKind;
-                    // DisplayHelp and DisplayVersion are valid outcomes
-                    // (e.g. `pohunek --help`); only real parse errors count
-                    // as hallucinations.
-                    if err.kind() == ErrorKind::DisplayHelp
-                        || err.kind() == ErrorKind::DisplayVersion
-                    {
-                        CommandCheckResult {
-                            command,
-                            valid: true,
-                            error: None,
-                        }
-                    } else {
-                        CommandCheckResult {
-                            command,
-                            valid: false,
-                            error: Some(
-                                err.kind()
-                                    .as_str()
-                                    .unwrap_or("unknown parse error")
-                                    .to_string(),
-                            ),
-                        }
-                    }
-                }
+                Err(error) => CommandCheckResult {
+                    command,
+                    valid: false,
+                    error: Some(error),
+                },
             }
         })
         .collect()

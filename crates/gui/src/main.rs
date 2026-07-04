@@ -4377,28 +4377,18 @@ fn duration_secs(
 }
 
 fn local_socket_path() -> Result<PathBuf, ConfigError> {
-    Ok(PathBuf::from(require_env("XDG_RUNTIME_DIR")?)
-        .join("pohunek")
-        .join("daemon.sock"))
+    pohunek_paths::socket_path().map_err(config_path_error)
 }
 
 fn config_dir() -> Result<PathBuf, ConfigError> {
-    if let Ok(value) = std::env::var("XDG_CONFIG_HOME") {
-        if !value.is_empty() {
-            return Ok(PathBuf::from(value).join("pohunek"));
-        }
-    }
-    Ok(PathBuf::from(require_env("HOME")?)
-        .join(".config")
-        .join("pohunek"))
+    pohunek_paths::config_home()
+        .map(|home| home.join(pohunek_paths::APP_DIR))
+        .map_err(config_path_error)
 }
 
-fn require_env(key: &'static str) -> Result<String, ConfigError> {
-    match std::env::var(key) {
-        Ok(value) if !value.is_empty() => Ok(value),
-        _ => Err(ConfigError::MissingEnv {
-            var: key.to_owned(),
-        }),
+fn config_path_error(err: pohunek_paths::PathError) -> ConfigError {
+    match err {
+        pohunek_paths::PathError::MissingEnv { var } => ConfigError::MissingEnv { var },
     }
 }
 

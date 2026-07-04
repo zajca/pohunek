@@ -2,9 +2,7 @@ use std::time::Duration;
 
 use protocol::ProtocolError;
 
-use super::{
-    launch_command, resume_command, AgentAdapter, AgentCommand, InputRules, LaunchOpts, SessionRef,
-};
+use super::{launch_command, AgentAdapter, InputRules, LaunchOpts};
 use crate::detect::Manifest;
 use crate::pty::PtyCommand;
 
@@ -38,12 +36,5 @@ impl AgentAdapter for CodexAdapter {
 
     fn manifest(&self) -> &Manifest {
         crate::detect::codex_manifest()
-    }
-
-    fn resume(&self, session_ref: &SessionRef) -> Result<AgentCommand, ProtocolError> {
-        Ok(resume_command(
-            "codex",
-            vec!["resume".to_owned(), session_ref.value().to_owned()],
-        ))
     }
 }

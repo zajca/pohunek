@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::version::ProtocolVersion;
+
 /// Outcome of a single doctor check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -70,6 +72,17 @@ impl DoctorReport {
         };
         Self { checks, overall }
     }
+}
+
+/// Result returned by `daemon.health`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonHealthResult {
+    /// Liveness status. Current daemons return `"ok"`.
+    pub status: String,
+    /// Daemon build version.
+    pub daemon_version: String,
+    /// Protocol version spoken by the daemon.
+    pub protocol_version: ProtocolVersion,
 }
 
 /// Result returned by `daemon.doctor`.

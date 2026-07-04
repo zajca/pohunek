@@ -16,12 +16,12 @@ pub const REMOTE_PORT_ENV: &str = "POHUNEK_REMOTE_PORT";
 ///
 /// Returns [`DEFAULT_REMOTE_PORT`] when [`REMOTE_PORT_ENV`] is unset. When the
 /// variable is set it must parse as a non-zero `u16`: a present-but-invalid
-/// value is an error ([`NetbirdError::StateUnavailable`]) rather than a silent
-/// fallback to the default, so a typo in configuration fails loudly.
+/// value is a configuration error rather than a silent fallback to the default,
+/// so a typo in configuration fails loudly.
 pub fn remote_port() -> Result<u16, NetbirdError> {
     match std::env::var(REMOTE_PORT_ENV) {
         Err(std::env::VarError::NotPresent) => Ok(DEFAULT_REMOTE_PORT),
-        Err(std::env::VarError::NotUnicode(_)) => Err(NetbirdError::StateUnavailable(format!(
+        Err(std::env::VarError::NotUnicode(_)) => Err(NetbirdError::InvalidConfig(format!(
             "invalid {REMOTE_PORT_ENV}: value is not valid Unicode"
         ))),
         Ok(raw) => parse_port(&raw),
@@ -35,7 +35,7 @@ pub fn remote_port() -> Result<u16, NetbirdError> {
 fn parse_port(raw: &str) -> Result<u16, NetbirdError> {
     let trimmed = raw.trim();
     let invalid = || {
-        NetbirdError::StateUnavailable(format!(
+        NetbirdError::InvalidConfig(format!(
             "invalid {REMOTE_PORT_ENV}={raw:?}: expected a port number in 1..=65535"
         ))
     };
@@ -78,8 +78,8 @@ mod tests {
         ] {
             let err = parse_port(bad).unwrap_err();
             assert!(
-                matches!(err, NetbirdError::StateUnavailable(_)),
-                "expected StateUnavailable for {bad:?}, got {err:?}"
+                matches!(err, NetbirdError::InvalidConfig(_)),
+                "expected InvalidConfig for {bad:?}, got {err:?}"
             );
         }
     }

@@ -22,6 +22,7 @@ iced = { workspace = true, default-features = false, features = [
     "wayland",
 ] }
 pohunek-gui-core = { workspace = true }
+pohunek-paths = { workspace = true }
 pohunek-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

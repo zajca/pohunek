@@ -9,8 +9,10 @@
 //! reported but their absence is a warning, not a hard failure, because a user
 //! may run only one of the two agents.
 
-use protocol::{DoctorCheck as Check, DoctorReport as Report, DoctorStatus as Status};
+use hostcheck::StandardCheckInputs;
+use protocol::{DoctorReport as Report, DoctorStatus as Status};
 
+use crate::commands::render_json;
 use crate::error::CliError;
 use crate::paths::Paths;
 
@@ -21,54 +23,20 @@ use crate::paths::Paths;
 /// Only returns an error if paths cannot be resolved at all; individual failed
 /// checks are reported in the output, not returned as errors.
 pub(crate) fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
-    let checks = vec![
-        // Required binaries on PATH.
-        hostcheck::binary("git", true),
-        // Agent binaries: reported, but missing is a warning, not fatal (a user
-        // may run only one of the two agents).
-        hostcheck::binary("codex", false),
-        hostcheck::binary("claude", false),
-        // Socket dir writability (where the daemon binds the socket).
-        hostcheck::dir_writable(
-            "socket_dir_writable",
-            &paths.runtime_dir,
-            "control socket directory",
-        ),
-        // State dir writability (state.db / events / worktrees live here).
-        hostcheck::dir_writable(
-            "state_dir_writable",
-            &paths.data_dir,
-            "state data directory",
-        ),
-        // Log dir writability.
-        hostcheck::dir_writable("log_dir_writable", &paths.log_dir, "log directory"),
-        // NetBird: optional. Its absence is a warning (local-only use is valid),
-        // never a hard failure.
-        hostcheck::netbird(),
-        // Schema version: deferred to the SQLite milestone. Reported honestly as
-        // unavailable rather than invented.
-        Check::new(
-            "schema_version",
-            Status::Warn,
-            "not available yet (SQLite store is a later milestone)",
-        ),
-        // Launcher prerequisites: the sway/rofi launcher (materialized by
-        // `pohunek setup`) is OPTIONAL, so every check below is `warn` at worst
-        // and never flips `overall` to fail.
-        hostcheck::binary("rofi", false),
-        hostcheck::binary("swaymsg", false),
-        hostcheck::binary("python3", false),
-        hostcheck::binary("timeout", false),
-        hostcheck::terminal(),
-        hostcheck::launcher_scripts(&paths.launcher_bin_dir()),
-        hostcheck::sway_include(&paths.sway_config_dir()),
-    ];
+    let launcher_bin_dir = paths.launcher_bin_dir();
+    let sway_config_dir = paths.sway_config_dir();
+    let checks = hostcheck::standard_checks(StandardCheckInputs {
+        socket_dir: &paths.runtime_dir,
+        state_dir: &paths.data_dir,
+        log_dir: &paths.log_dir,
+        launcher_bin_dir: &launcher_bin_dir,
+        sway_config_dir: &sway_config_dir,
+    });
 
     let report = Report::from_checks(checks);
 
     if json {
-        let line = serde_json::to_string_pretty(&report)?;
-        println!("{line}");
+        print!("{}", render_json(&report)?);
     } else {
         print_human(&report);
     }

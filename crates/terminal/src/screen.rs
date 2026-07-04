@@ -54,7 +54,7 @@ impl ScreenTracker {
     }
 
     #[must_use]
-    pub fn visible_lines(&self) -> Vec<String> {
+    pub(crate) fn visible_lines(&self) -> Vec<String> {
         let (rows, cols) = self.parser.screen().size();
 
         (0..rows).map(|row| self.trimmed_line(row, cols)).collect()
@@ -90,7 +90,7 @@ impl ScreenTracker {
     /// terminal cells. Clipped wide glyph cells and continuation cells are
     /// represented with spaces so region geometry remains stable.
     #[must_use]
-    pub fn slice_columns(&self, row: u16, start_col: u16, width: u16) -> String {
+    pub(crate) fn slice_columns(&self, row: u16, start_col: u16, width: u16) -> String {
         let screen = self.parser.screen();
         let (rows, cols) = screen.size();
         if row >= rows || start_col >= cols || width == 0 {

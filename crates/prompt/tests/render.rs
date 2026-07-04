@@ -201,6 +201,28 @@ fn rejects_missing_required_fields_like_python() {
 }
 
 #[test]
+fn rejects_missing_branch_with_provider_specific_label() {
+    let github_err = render("${branch}", Provider::GitHubPr, "7", r#"{"title":"Title"}"#)
+        .expect_err("missing GitHub branch rejects");
+    let linear_err = render(
+        "${branch}",
+        Provider::LinearIssue,
+        "LIN-1",
+        r#"{"title":"Title"}"#,
+    )
+    .expect_err("missing Linear branch rejects");
+
+    assert_eq!(
+        github_err.to_string(),
+        "provider JSON missing required field: headRefName/branch/branchName"
+    );
+    assert_eq!(
+        linear_err.to_string(),
+        "provider JSON missing required field: branchName/branch"
+    );
+}
+
+#[test]
 fn provider_values_are_never_reexpanded() {
     for prefix in ["", "plain", "with spaces", "dash.dot_123"] {
         for suffix in ["", "tail", " more text", "_suffix-7"] {

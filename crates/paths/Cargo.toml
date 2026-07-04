@@ -1,0 +1,17 @@
+[package]
+name = "pohunek-paths"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared XDG path contract for pohunek clients and daemon."
+
+[lib]
+name = "pohunek_paths"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

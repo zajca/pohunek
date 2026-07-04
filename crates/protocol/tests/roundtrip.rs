@@ -1893,3 +1893,40 @@ fn action_summary_json_shape_roundtrips() {
     };
     assert_eq!(line_roundtrip(&params), params);
 }
+
+#[test]
+fn typed_method_markers_pair_method_params_and_results() {
+    fn assert_contract<M, Params, Output>(name: &str)
+    where
+        M: protocol::Method<Params = Params, Output = Output>,
+    {
+        assert_eq!(M::NAME, name);
+    }
+
+    assert_contract::<protocol::method::DaemonHealth, (), protocol::DaemonHealthResult>(
+        protocol::method::DAEMON_HEALTH,
+    );
+    assert_contract::<
+        protocol::method::SessionNew,
+        protocol::SessionNewParams,
+        protocol::SessionNewResult,
+    >(protocol::method::SESSION_NEW);
+    assert_contract::<protocol::method::SessionInspect, protocol::SessionId, protocol::SessionInfo>(
+        protocol::method::SESSION_INSPECT,
+    );
+    assert_contract::<
+        protocol::method::HostDiscover,
+        protocol::HostDiscoverParams,
+        Vec<protocol::HostRecord>,
+    >(protocol::method::HOST_DISCOVER);
+    assert_contract::<
+        protocol::method::ProjectAction,
+        protocol::ProjectActionParams,
+        protocol::ProjectActionResult,
+    >(protocol::method::PROJECT_ACTION);
+    assert_contract::<
+        protocol::method::WorktreeRemove,
+        protocol::WorktreeRemoveParams,
+        protocol::WorktreeRemoveResult,
+    >(protocol::method::WORKTREE_REMOVE);
+}

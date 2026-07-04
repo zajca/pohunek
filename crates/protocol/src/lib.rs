@@ -26,6 +26,7 @@ mod doctor;
 mod envelope;
 mod error;
 mod integration;
+pub mod method;
 mod project;
 mod session;
 mod version;
@@ -40,7 +41,7 @@ pub use capabilities::{AgentRuntime, HostCapabilities};
 #[doc(inline)]
 pub use discovery::{HostClass, HostDiscoverParams, HostRecord};
 #[doc(inline)]
-pub use doctor::{DaemonDoctorResult, DoctorCheck, DoctorReport, DoctorStatus};
+pub use doctor::{DaemonDoctorResult, DaemonHealthResult, DoctorCheck, DoctorReport, DoctorStatus};
 #[doc(inline)]
 pub use envelope::{Event, Request, Response, StateSource};
 #[doc(inline)]
@@ -50,6 +51,8 @@ pub use integration::{
     IntegrationInstallParams, IntegrationInstallReport, IntegrationInstallResult, ENV_DAEMON_ID,
     ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
+#[doc(inline)]
+pub use method::Method;
 #[doc(inline)]
 pub use project::{
     ActionSummary, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
@@ -71,94 +74,6 @@ pub use session::{
 };
 #[doc(inline)]
 pub use version::{negotiate, ProtocolVersion, PROTOCOL_VERSION};
-
-/// Control-protocol method names (Phase 1).
-///
-/// These are the `method` values a request may carry. They are kept as
-/// constants rather than an enum because the wire field is an open string: an
-/// older daemon must be able to receive a method it does not know and answer
-/// with a typed `method_not_found` error instead of failing to deserialize.
-///
-/// See `docs/plan-phase-1.md` "Control Protocol" (Methods, Phase 1). Only
-/// `daemon.health` is handled by the daemon in milestone 2; the rest are
-/// declared here so the contract is stable as later milestones land.
-pub mod method {
-    /// Liveness/version probe. Implemented in milestone 2.
-    pub const DAEMON_HEALTH: &str = "daemon.health";
-
-    // --- Declared for later milestones (not yet handled by the daemon). ---
-    pub const SESSION_NEW: &str = "session.new";
-    pub const SESSION_LIST: &str = "session.list";
-    pub const SESSION_INSPECT: &str = "session.inspect";
-    pub const SESSION_STOP: &str = "session.stop";
-    /// Relaunch a terminal session from its captured native resume metadata.
-    pub const SESSION_RESUME: &str = "session.resume";
-    /// Evict a session from the registry, stopping it first if still live.
-    /// Returns a [`SessionRemoveResult`](crate::SessionRemoveResult).
-    pub const SESSION_REMOVE: &str = "session.remove";
-    pub const SESSION_ATTACH: &str = "session.attach";
-    pub const SESSION_DETACH: &str = "session.detach";
-    pub const SESSION_RESIZE: &str = "session.resize";
-    pub const SESSION_INPUT: &str = "session.input";
-    pub const STATUS: &str = "status";
-    pub const SUBSCRIBE: &str = "subscribe";
-    /// Fire-and-forget native-session-id capture from the agent hook.
-    pub const SESSION_REPORT_NATIVE_ID: &str = "session.report_native_id";
-    /// Fire-and-forget active nested-agent capture from an inherited hook.
-    pub const SESSION_REPORT_AGENT: &str = "session.report_agent";
-    /// Fire-and-forget active nested-agent release from an inherited hook.
-    pub const SESSION_RELEASE_AGENT: &str = "session.release_agent";
-    /// Merge owner-controlled metadata for a session.
-    pub const SESSION_SET_METADATA: &str = "session.set_metadata";
-    /// Set or clear a session's owner-set display name.
-    pub const SESSION_RENAME: &str = "session.rename";
-    /// Install the per-agent `SessionStart` hook that captures the native id.
-    pub const INTEGRATION_INSTALL: &str = "integration.install";
-    /// Live host capability probe (Phase 2 / remote hosts over `NetBird`). Returns
-    /// a [`HostCapabilities`](crate::HostCapabilities) snapshot.
-    pub const HOST_INSPECT: &str = "host.inspect";
-    /// Materialize the embedded assistant knowledge bundle on the agent host.
-    pub const ASSISTANT_MATERIALIZE: &str = "assistant.materialize";
-    /// Run daemon-local doctor checks on the host that owns the daemon.
-    pub const DAEMON_DOCTOR: &str = "daemon.doctor";
-    /// Enumerate and classify the local host's `NetBird` peers. Handled by the
-    /// local daemon, which caches the result for a short TTL. Returns a
-    /// `Vec<`[`HostRecord`](crate::HostRecord)`>`.
-    pub const HOST_DISCOVER: &str = "host.discover";
-
-    // --- Projects (git-repo awareness). Resolved per host against its own store.
-    /// List known projects on the target host. Returns
-    /// `Vec<`[`ProjectInfo`](crate::ProjectInfo)`>`.
-    pub const PROJECT_LIST: &str = "project.list";
-    /// Register (or re-add) a project by host-local path. Returns a
-    /// [`ProjectInfo`](crate::ProjectInfo).
-    pub const PROJECT_ADD: &str = "project.add";
-    /// Show a project plus its live worktrees. Returns a
-    /// [`ProjectShowResult`](crate::ProjectShowResult).
-    pub const PROJECT_SHOW: &str = "project.show";
-    /// Set a project's custom display name. Returns a
-    /// [`ProjectInfo`](crate::ProjectInfo).
-    pub const PROJECT_RENAME: &str = "project.rename";
-    /// Forget a project record (optionally pruning owned worktrees). Returns a
-    /// [`ProjectRemoveResult`](crate::ProjectRemoveResult).
-    pub const PROJECT_REMOVE: &str = "project.remove";
-    /// Resolve one prompt by name to its template content, fail-closed
-    /// (`prompt_not_found`). Returns a [`ProjectPromptResult`](crate::ProjectPromptResult).
-    pub const PROJECT_PROMPT: &str = "project.prompt";
-    /// Resolve one action by name to its recipe plus prompt content, fail-closed
-    /// (`action_not_found`/`template_not_found`). Returns a
-    /// [`ProjectActionResult`](crate::ProjectActionResult).
-    pub const PROJECT_ACTION: &str = "project.action";
-    /// List available project actions after in-repo-over-host shadowing. Returns a
-    /// [`ProjectActionsResult`](crate::ProjectActionsResult).
-    pub const PROJECT_ACTIONS: &str = "project.actions";
-
-    // --- Worktrees (single-worktree management within a project). ---
-    /// Remove a single pohunek-owned worktree by path, fail-closed: refuses an
-    /// external (unowned) worktree and a worktree a live session still uses.
-    /// Returns a [`WorktreeRemoveResult`](crate::WorktreeRemoveResult).
-    pub const WORKTREE_REMOVE: &str = "worktree.remove";
-}
 
 /// Control-protocol event names.
 ///

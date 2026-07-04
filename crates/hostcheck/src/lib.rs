@@ -21,6 +21,63 @@ use protocol::{DoctorCheck, DoctorStatus};
 
 const PROBE_FILE: &str = ".pohunek-doctor-probe";
 
+/// Inputs for the standard pohunek host checks.
+///
+/// Callers keep owning path resolution because the CLI and daemon intentionally
+/// resolve paths in their own crates. This type carries only the concrete
+/// directories needed by the shared probe list.
+#[derive(Debug, Clone, Copy)]
+pub struct StandardCheckInputs<'a> {
+    /// Directory where the daemon binds its control socket.
+    pub socket_dir: &'a Path,
+    /// Directory where persistent state is written.
+    pub state_dir: &'a Path,
+    /// Directory where logs are written.
+    pub log_dir: &'a Path,
+    /// Directory where launcher entrypoints are installed.
+    pub launcher_bin_dir: &'a Path,
+    /// Directory containing the user's sway configuration.
+    pub sway_config_dir: &'a Path,
+}
+
+/// Build the standard pohunek host probe list.
+///
+/// The CLI-local doctor command and `daemon.doctor` RPC use this same ordered
+/// list so drift in warnings, required checks, and launcher probes is visible in
+/// one place.
+#[must_use]
+pub fn standard_checks(inputs: StandardCheckInputs<'_>) -> Vec<DoctorCheck> {
+    vec![
+        binary("git", true),
+        binary("codex", false),
+        binary("claude", false),
+        dir_writable(
+            "socket_dir_writable",
+            inputs.socket_dir,
+            "control socket directory",
+        ),
+        dir_writable(
+            "state_dir_writable",
+            inputs.state_dir,
+            "state data directory",
+        ),
+        dir_writable("log_dir_writable", inputs.log_dir, "log directory"),
+        netbird(),
+        DoctorCheck::new(
+            "schema_version",
+            DoctorStatus::Warn,
+            "not available yet (SQLite store is a later milestone)",
+        ),
+        binary("rofi", false),
+        binary("swaymsg", false),
+        binary("python3", false),
+        binary("timeout", false),
+        terminal(),
+        launcher_scripts(inputs.launcher_bin_dir),
+        sway_include(inputs.sway_config_dir),
+    ]
+}
+
 /// Resolve a binary name against the `PATH` environment variable.
 ///
 /// A small dependency-free `which`: splits `PATH`, joins the name, and returns
@@ -273,6 +330,51 @@ mod tests {
         let check = dir_writable("probe_dir", &base, "probe directory");
         assert_eq!(check.status, DoctorStatus::Ok);
         assert!(!base.join(PROBE_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn standard_checks_keeps_single_ordered_probe_contract() {
+        let base = unique_temp_dir();
+        let socket_dir = base.join("runtime");
+        let state_dir = base.join("data");
+        let log_dir = base.join("logs");
+        let launcher_bin_dir = base.join("bin");
+        let sway_config_dir = base.join("sway");
+
+        let checks = standard_checks(StandardCheckInputs {
+            socket_dir: &socket_dir,
+            state_dir: &state_dir,
+            log_dir: &log_dir,
+            launcher_bin_dir: &launcher_bin_dir,
+            sway_config_dir: &sway_config_dir,
+        });
+        let names = checks
+            .iter()
+            .map(|check| check.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            [
+                "bin:git",
+                "bin:codex",
+                "bin:claude",
+                "socket_dir_writable",
+                "state_dir_writable",
+                "log_dir_writable",
+                "netbird_cli",
+                "schema_version",
+                "bin:rofi",
+                "bin:swaymsg",
+                "bin:python3",
+                "bin:timeout",
+                "terminal",
+                "launcher_scripts",
+                "sway_include",
+            ]
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

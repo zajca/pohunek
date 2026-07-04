@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use pohunek_client::protocol::{self, ErrorClass, ProtocolError, Request, Response};
-use pohunek_client::{Client, ClientError, ClientOptions};
+use pohunek_client::{next_request_id, Client, ClientError, ClientOptions};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
@@ -104,6 +104,103 @@ fn request_response_client_options_default_timeout_matches_convenience_apis() {
             .connect_timeout,
         Duration::from_millis(75)
     );
+}
+
+#[test]
+fn request_response_sdk_request_ids_are_method_prefixed_and_unique() {
+    let first = next_request_id(protocol::method::DAEMON_HEALTH);
+    let second = next_request_id(protocol::method::DAEMON_HEALTH);
+
+    assert!(first.starts_with("sdk-daemon.health-"), "id: {first}");
+    assert!(second.starts_with("sdk-daemon.health-"), "id: {second}");
+    assert_ne!(first, second);
+}
+
+#[tokio::test]
+async fn request_response_typed_call_sends_method_params_and_decodes_output() {
+    let daemon = spawn_unix_echo_daemon(json!([
+        {
+            "name": "host-a",
+            "fqdn": "host-a.example.test",
+            "netbird_ip": "100.1.2.3",
+            "classification": "candidate"
+        }
+    ]));
+    let mut client = Client::connect_local(&daemon.socket_path)
+        .await
+        .expect("connect local test daemon");
+
+    let records = client
+        .call::<protocol::method::HostDiscover>(protocol::HostDiscoverParams { force: true })
+        .await
+        .expect("typed call succeeds");
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].name.as_deref(), Some("host-a"));
+    assert_eq!(records[0].class, protocol::HostClass::Candidate);
+    let request_line = daemon
+        .request_line
+        .await
+        .expect("test daemon received a request");
+    daemon.task.await.expect("test daemon task completed");
+    let request: Request = serde_json::from_str(&request_line).expect("parse request");
+    assert_eq!(request.method, protocol::method::HOST_DISCOVER);
+    assert_eq!(request.params, json!({"force": true}));
+    assert!(
+        request.id.starts_with("sdk-host.discover-"),
+        "id: {}",
+        request.id
+    );
+}
+
+#[tokio::test]
+async fn request_response_typed_call_reports_output_deserialization_errors() {
+    let daemon = spawn_unix_echo_daemon(json!({
+        "status": "ok",
+        "daemon_version": "0.15.1",
+        "protocol_version": "not-a-number"
+    }));
+    let mut client = Client::connect_local(&daemon.socket_path)
+        .await
+        .expect("connect local test daemon");
+
+    match client
+        .call::<protocol::method::DaemonHealth>(())
+        .await
+        .expect_err("invalid typed payload is rejected")
+    {
+        ClientError::Json(_) => {}
+        other => panic!("expected typed decode Json error, got {other:?}"),
+    }
+    let _request_line = daemon
+        .request_line
+        .await
+        .expect("test daemon received a request");
+    daemon.task.await.expect("test daemon task completed");
+}
+
+#[tokio::test]
+async fn request_response_handshake_returns_daemon_protocol_version() {
+    let daemon = spawn_unix_echo_daemon(json!({
+        "status": "ok",
+        "daemon_version": "0.15.1",
+        "protocol_version": protocol::PROTOCOL_VERSION
+    }));
+    let mut client = Client::connect_local(&daemon.socket_path)
+        .await
+        .expect("connect local test daemon");
+
+    let version = client.handshake().await.expect("handshake succeeds");
+
+    assert_eq!(version, protocol::PROTOCOL_VERSION);
+    let request_line = daemon
+        .request_line
+        .await
+        .expect("test daemon received a request");
+    daemon.task.await.expect("test daemon task completed");
+    let request: Request = serde_json::from_str(&request_line).expect("parse request");
+    assert_eq!(request.method, protocol::method::DAEMON_HEALTH);
+    assert_eq!(request.params, Value::Null);
 }
 
 #[tokio::test]
@@ -380,6 +477,25 @@ fn spawn_unix_daemon(reply: Reply) -> UnixDaemon {
     }
 }
 
+fn spawn_unix_echo_daemon(ok: Value) -> UnixDaemon {
+    let socket_path = unique_socket_path();
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).expect("bind unix echo test daemon");
+    let (request_tx, request_line) = oneshot::channel();
+
+    let task = tokio::spawn(async move {
+        let (stream, _addr) = listener.accept().await.expect("accept unix client");
+        handle_echo_connection(stream, request_tx, ok).await;
+    });
+
+    UnixDaemon {
+        socket_path: socket_path.clone(),
+        request_line,
+        task,
+        _socket_file: SocketFile(socket_path),
+    }
+}
+
 async fn spawn_tcp_daemon(reply: Reply) -> TcpDaemon {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -452,6 +568,35 @@ fn spawn_reusable_daemon(first_reply_line: String) -> ReusableDaemon {
         task,
         _socket_file: SocketFile(socket_path),
     }
+}
+
+async fn handle_echo_connection<S>(stream: S, request_tx: oneshot::Sender<String>, ok: Value)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut reader = BufReader::new(stream);
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
+        .await
+        .expect("read request line");
+    let request: Request =
+        serde_json::from_str(trim_line_end(&request_line)).expect("parse request line");
+    request_tx
+        .send(trim_line_end(&request_line).to_owned())
+        .expect("send request line to test");
+
+    let line = response_ok_line_for(&request, ok);
+    let mut stream = reader.into_inner();
+    stream
+        .write_all(line.as_bytes())
+        .await
+        .expect("write echo reply line");
+    stream
+        .write_all(b"\n")
+        .await
+        .expect("write echo reply newline");
+    stream.shutdown().await.expect("close echo reply stream");
 }
 
 async fn handle_connection<S>(stream: S, request_tx: oneshot::Sender<String>, reply: Reply)

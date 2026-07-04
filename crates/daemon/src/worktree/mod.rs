@@ -33,17 +33,16 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use protocol::{ErrorClass, ProtocolError, SessionWarning, SessionWarningKind};
-use time::format_description::well_known::Rfc3339;
-use time::OffsetDateTime;
 use tracing::{debug, warn};
 
 use crate::store::{Store, WorktreeBinding, WorktreeStatus};
+use crate::time::now_rfc3339;
 
 /// Relative path of the optional per-repository setup script, run inside a
 /// freshly created worktree. A non-zero exit (or any spawn failure) is recorded
@@ -58,6 +57,18 @@ const SETUP_SCRIPT_INTERPRETER: &str = "sh";
 /// Small enough that a quick script returns promptly, large enough that the busy
 /// loop is negligible against the (much larger) setup-script timeout.
 const SETUP_SCRIPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Maximum runtime for git subprocesses run during worktree setup/removal.
+///
+/// Bounds network-facing operations such as `git fetch` so a dead remote cannot
+/// pin one daemon blocking thread indefinitely. The value is intentionally
+/// shorter than a human-facing command timeout, but long enough for normal local
+/// and NetBird-backed repositories.
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Poll interval for bounded git subprocesses.
+///
+/// Matches the setup-script poll cadence: prompt enough for tests and short
+/// hangs, with negligible CPU overhead on the blocking worktree thread.
+const GIT_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Fallback directory-name component when a repository path has no usable file
 /// name (e.g. the filesystem root) or it sanitizes to empty.
@@ -345,7 +356,7 @@ impl WorktreeManager {
             &mut warnings,
         );
 
-        let now = timestamp_now();
+        let now = now_rfc3339();
         let binding = WorktreeBinding {
             session_id: req.session_id.clone(),
             repository: repository.clone(),
@@ -976,10 +987,9 @@ fn current_branch(repo: &Path) -> Result<String, String> {
 /// `Ok(false)` git ran and the ref is absent, `Err` could not tell.
 fn branch_exists(repo: &Path, branch: &str) -> Result<bool, String> {
     let refname = format!("refs/heads/{branch}");
-    let output = git_command(repo)
-        .args(["rev-parse", "--verify", "--quiet", &refname])
-        .output()
-        .map_err(|err| format!("failed to run git: {err}"))?;
+    let mut cmd = git_command(repo);
+    cmd.args(["rev-parse", "--verify", "--quiet", &refname]);
+    let output = run_output_bounded(cmd, GIT_COMMAND_TIMEOUT)?;
     match output.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
@@ -1250,12 +1260,7 @@ fn run_one_hook(
     for (key, value) in env {
         builder.env(key, value);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // pgid := child pid, so a timeout can signal the whole group at once.
-        builder.process_group(0)
-    };
+    configure_process_group(&mut builder);
 
     let mut child = match builder.spawn() {
         Ok(child) => child,
@@ -1326,7 +1331,7 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> SetupOutcome {
             Ok(Some(status)) => return SetupOutcome::Exited(status),
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    terminate_setup_script(child);
+                    terminate_process_group(child);
                     return SetupOutcome::TimedOut;
                 }
                 thread::sleep(SETUP_SCRIPT_POLL_INTERVAL);
@@ -1336,14 +1341,24 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> SetupOutcome {
     }
 }
 
-/// Kill a timed-out setup script and reap it, leaving no zombie or runaway child.
+/// Configure `cmd` so a timeout can kill the whole process group.
+fn configure_process_group(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // pgid := child pid, so a timeout can signal the whole group at once.
+        cmd.process_group(0);
+    }
+}
+
+/// Kill a timed-out command and reap it, leaving no zombie or runaway child.
 ///
 /// On Unix the whole process group (created via `process_group(0)`) is signalled
 /// so children the script forked die too; the direct child is then reaped. The
 /// child is not yet reaped when this is called, so its pid — and thus the pgid —
 /// cannot have been recycled, making the group-directed kill safe.
 #[expect(unsafe_code, reason = "libc::kill FFI; SAFETY documented below")]
-fn terminate_setup_script(child: &mut Child) {
+fn terminate_process_group(child: &mut Child) {
     #[cfg(unix)]
     {
         // A process id always fits in `pid_t` (bounded by the kernel's PID_MAX,
@@ -1378,14 +1393,86 @@ fn git_command(repo: &Path) -> Command {
 
 /// Run a `git` invocation built with [`git_command`], discarding stdout but
 /// mapping a non-zero exit (or spawn failure) to the herdr-style error message.
-fn run_command(mut cmd: Command) -> Result<String, String> {
-    let output = cmd
-        .output()
-        .map_err(|err| format!("failed to run git: {err}"))?;
+fn run_command(cmd: Command) -> Result<String, String> {
+    let output = run_output_bounded(cmd, GIT_COMMAND_TIMEOUT)?;
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
     }
     Err(output_failure_message(&output))
+}
+
+/// Run a command to completion, killing it when `timeout` elapses.
+fn run_output_bounded(mut cmd: Command, timeout: Duration) -> Result<Output, String> {
+    configure_process_group(&mut cmd);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|err| format!("failed to run git: {err}"))?;
+    let stdout = child.stdout.take().expect("stdout was piped before spawn");
+    let stderr = child.stderr.take().expect("stderr was piped before spawn");
+    let stdout_reader = thread::spawn(move || read_pipe(stdout));
+    let stderr_reader = thread::spawn(move || read_pipe(stderr));
+
+    let status = match wait_child_with_timeout(&mut child, timeout) {
+        GitOutcome::Exited(status) => status,
+        GitOutcome::TimedOut => {
+            return Err(format!("git command timed out after {timeout:?}"));
+        }
+        GitOutcome::WaitError(err) => {
+            return Err(format!("failed to wait for git: {err}"));
+        }
+    };
+
+    let stdout = join_pipe_reader(stdout_reader, "stdout")?;
+    let stderr = join_pipe_reader(stderr_reader, "stderr")?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+enum GitOutcome {
+    Exited(ExitStatus),
+    TimedOut,
+    WaitError(io::Error),
+}
+
+fn wait_child_with_timeout(child: &mut Child, timeout: Duration) -> GitOutcome {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return GitOutcome::Exited(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    terminate_process_group(child);
+                    return GitOutcome::TimedOut;
+                }
+                thread::sleep(GIT_COMMAND_POLL_INTERVAL);
+            }
+            Err(err) => return GitOutcome::WaitError(err),
+        }
+    }
+}
+
+fn read_pipe(mut pipe: impl io::Read) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    pipe.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+fn join_pipe_reader(
+    reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+    stream_name: &str,
+) -> Result<Vec<u8>, String> {
+    let result = match reader.join() {
+        Ok(result) => result,
+        Err(payload) => {
+            drop(payload);
+            return Err(format!("git {stream_name} reader panicked"));
+        }
+    };
+    result.map_err(|err| format!("failed to read git {stream_name}: {err}"))
 }
 
 /// Run `git -C <repo> <args>` capturing trimmed stdout on success.
@@ -1483,13 +1570,6 @@ fn store_error(what: &str, err: &io::Error) -> ProtocolError {
         format!("failed to {what}: {err}"),
         None,
     )
-}
-
-/// Current UTC time as an RFC3339 string (matches the session store).
-fn timestamp_now() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
 }
 
 #[cfg(test)]

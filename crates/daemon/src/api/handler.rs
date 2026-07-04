@@ -11,14 +11,14 @@
 //! methods.
 
 use protocol::{
-    method, negotiate, AssistantMaterializeParams, AssistantMaterializeResult, HostDiscoverParams,
-    IntegrationInstallParams, ProjectActionParams, ProjectActionsParams, ProjectActionsResult,
-    ProjectAddParams, ProjectListParams, ProjectPromptParams, ProjectRemoveParams,
-    ProjectRenameParams, ProjectShowParams, ProtocolError, Request, Response, SessionAttachParams,
-    SessionDetachParams, SessionId, SessionInputParams, SessionListParams, SessionNewParams,
-    SessionNewResult, SessionReleaseAgentParams, SessionRenameParams, SessionReportAgentParams,
-    SessionReportNativeIdParams, SessionResizeParams, SessionResumeResult,
-    SessionSetMetadataParams, WorktreeRemoveParams, PROTOCOL_VERSION,
+    method, negotiate, AssistantMaterializeParams, AssistantMaterializeResult, DaemonHealthResult,
+    HostDiscoverParams, IntegrationInstallParams, ProjectActionParams, ProjectActionsParams,
+    ProjectActionsResult, ProjectAddParams, ProjectListParams, ProjectPromptParams,
+    ProjectRemoveParams, ProjectRenameParams, ProjectShowParams, ProtocolError, Request, Response,
+    SessionAttachParams, SessionDetachParams, SessionId, SessionInputParams, SessionListParams,
+    SessionNewParams, SessionNewResult, SessionReleaseAgentParams, SessionRenameParams,
+    SessionReportAgentParams, SessionReportNativeIdParams, SessionResizeParams,
+    SessionResumeResult, SessionSetMetadataParams, WorktreeRemoveParams, PROTOCOL_VERSION,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -55,10 +55,20 @@ impl DaemonState {
     /// Construct shared daemon state.
     #[must_use]
     pub fn new(health: HealthInfo, sessions: SessionRegistry) -> Self {
+        Self::new_with_discovery(health, sessions, DiscoveryCache::default())
+    }
+
+    /// Construct shared daemon state with an existing discovery cache.
+    #[must_use]
+    pub fn new_with_discovery(
+        health: HealthInfo,
+        sessions: SessionRegistry,
+        discovery: DiscoveryCache,
+    ) -> Self {
         Self {
             health,
             sessions,
-            discovery: DiscoveryCache::default(),
+            discovery,
         }
     }
 }
@@ -120,19 +130,10 @@ pub(crate) async fn dispatch_line(line: &str, state: &DaemonState) -> Dispatch {
         }
     };
 
-    // Version negotiation first, before treating `subscribe` specially: an
-    // incompatible client gets a typed error rather than a long-lived stream.
-    if let Err(err) = negotiate(request.v, PROTOCOL_VERSION) {
-        let resp = Response::err(request.id.clone(), err);
-        return Dispatch::Reply(serialize_response(&resp));
-    }
-
-    if request.method == method::SUBSCRIBE {
-        let ack = Response::ok(request.id.clone(), json!({ "subscribed": true }));
-        return Dispatch::Subscribe(serialize_response(&ack));
-    }
-
     let resp = handle_request(&request, state).await;
+    if request.method == method::SUBSCRIBE && matches!(resp, Response::Ok { .. }) {
+        return Dispatch::Subscribe(serialize_response(&resp));
+    }
     Dispatch::Reply(serialize_response(&resp))
 }
 
@@ -152,6 +153,7 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
 
     match request.method.as_str() {
         method::DAEMON_HEALTH => handle_health(request, &state.health),
+        method::SUBSCRIBE => Response::ok(request.id.clone(), json!({ "subscribed": true })),
         method::SESSION_NEW => handle_session_new(request, &state.sessions).await,
         method::SESSION_LIST => handle_session_list(request, &state.sessions).await,
         method::SESSION_INSPECT => handle_session_inspect(request, &state.sessions).await,
@@ -191,13 +193,13 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
 
 /// `daemon.health`: report daemon version + protocol version.
 fn handle_health(request: &Request, health: &HealthInfo) -> Response {
-    Response::ok(
-        request.id.clone(),
-        json!({
-            "status": "ok",
-            "daemon_version": health.daemon_version,
-            "protocol_version": PROTOCOL_VERSION,
-        }),
+    ok_value(
+        request,
+        &DaemonHealthResult {
+            status: "ok".to_owned(),
+            daemon_version: health.daemon_version.clone(),
+            protocol_version: PROTOCOL_VERSION,
+        },
     )
 }
 

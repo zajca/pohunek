@@ -5,6 +5,7 @@
 
 use std::path::Path;
 
+use crate::generators::common::{frontmatter, write_concept_file, ConceptFrontmatter};
 use crate::XtaskError;
 
 struct AssetDescriptor {
@@ -54,44 +55,29 @@ static ASSETS: &[AssetDescriptor] = &[
     },
 ];
 
-fn write_concept_file(path: &Path, content: &str) -> Result<(), XtaskError> {
-    if let Some(parent) = path.parent() {
-        crate::create_dir_all(parent)?;
-    }
-    std::fs::write(path, content).map_err(|source| XtaskError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
 fn render_asset(asset: &AssetDescriptor) -> String {
+    let yaml = frontmatter(&ConceptFrontmatter {
+        concept_type: "SetupAsset",
+        id: &format!("setup-assets/{}", asset.id),
+        title: &format!("{} — {}", asset.script_name, asset.title_suffix),
+        description: asset.description,
+        generated_from: "static setup asset descriptor",
+        since: None,
+        tags: &["setup", "reference"],
+        intents: &["setup", "help"],
+    });
     format!(
-        "---\n\
-         type: SetupAsset\n\
-         id: setup-assets/{id}\n\
-         title: \"{script_name} — {title_suffix}\"\n\
-         description: \"{description}\"\n\
-         source_kind: generated\n\
-         generated_from: \"static setup asset descriptor\"\n\
-         tags:\n\
-           - setup\n\
-           - reference\n\
-         intents:\n\
-           - setup\n\
-           - help\n\
-         ---\n\
-         \n\
+        "{yaml}\n\
          # {script_name}\n\
          \n\
          {description}\n\
          \n\
          ## Deployment\n\
          \n\
-         Materialized to the pohunek data directory's `bin/` subdirectory by \
+        Materialized to the pohunek data directory's `bin/` subdirectory by \
          `pohunek setup scripts`.\n",
-        id = asset.id,
+        yaml = yaml,
         script_name = asset.script_name,
-        title_suffix = asset.title_suffix,
         description = asset.description,
     )
 }

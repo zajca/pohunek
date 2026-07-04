@@ -5,6 +5,7 @@
 
 use std::path::Path;
 
+use crate::generators::common::{frontmatter, write_concept_file, ConceptFrontmatter};
 use crate::XtaskError;
 
 struct ConfigDescriptor {
@@ -70,40 +71,19 @@ static CONFIGS: &[ConfigDescriptor] = &[
     },
 ];
 
-fn write_concept_file(path: &Path, content: &str) -> Result<(), XtaskError> {
-    if let Some(parent) = path.parent() {
-        crate::create_dir_all(parent)?;
-    }
-    std::fs::write(path, content).map_err(|source| XtaskError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
 fn render_config(cfg: &ConfigDescriptor, since: &str) -> String {
-    let intents_yaml = cfg
-        .intents
-        .iter()
-        .map(|i| format!("  - {i}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-
+    let yaml = frontmatter(&ConceptFrontmatter {
+        concept_type: "ConfigReference",
+        id: &format!("config/{}", cfg.id),
+        title: &format!("{} — {}", cfg.file_name, cfg.title_suffix),
+        description: cfg.description,
+        generated_from: "static config descriptor",
+        since: Some(since),
+        tags: &["config", "reference"],
+        intents: cfg.intents,
+    });
     format!(
-        "---\n\
-         type: ConfigReference\n\
-         id: config/{id}\n\
-         title: \"{file_name} — {title_suffix}\"\n\
-         description: \"{description}\"\n\
-         source_kind: generated\n\
-         generated_from: \"static config descriptor\"\n\
-         since: \"{since}\"\n\
-         tags:\n\
-           - config\n\
-           - reference\n\
-         intents:\n\
-         {intents}\n\
-         ---\n\
-         \n\
+        "{yaml}\n\
          # {file_name}\n\
          \n\
          {description}\n\
@@ -115,13 +95,10 @@ fn render_config(cfg: &ConfigDescriptor, since: &str) -> String {
          ## Format\n\
          \n\
          {format}\n",
-        id = cfg.id,
         file_name = cfg.file_name,
-        title_suffix = cfg.title_suffix,
         description = cfg.description,
         location = cfg.location,
         format = cfg.format,
-        intents = intents_yaml,
     )
 }
 

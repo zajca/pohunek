@@ -161,24 +161,6 @@ impl SessionRef {
     }
 }
 
-/// Command argv produced by a resume builder.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentCommand {
-    /// Program name.
-    pub program: String,
-    /// Program arguments excluding argv[0].
-    pub args: Vec<String>,
-}
-
-impl AgentCommand {
-    fn new(program: impl Into<String>, args: impl IntoIterator<Item = String>) -> Self {
-        Self {
-            program: program.into(),
-            args: args.into_iter().collect(),
-        }
-    }
-}
-
 /// How an agent's resume invocation is shaped on the command line.
 ///
 /// The two built-in kinds differ only in this: Claude resumes via a `--resume`
@@ -235,7 +217,7 @@ pub(crate) fn base_resume_template(base: protocol::AgentKind) -> Option<ResumeTe
     }
 }
 
-/// Thin per-agent adapter for launch, input, and resume behavior.
+/// Thin per-agent adapter for launch, input, and activity behavior.
 pub trait AgentAdapter: std::fmt::Debug + Send + Sync {
     /// Stable adapter id.
     fn id(&self) -> &str;
@@ -245,8 +227,6 @@ pub trait AgentAdapter: std::fmt::Debug + Send + Sync {
     fn input_rules(&self) -> InputRules;
     /// Agent-specific activity manifest.
     fn manifest(&self) -> &Manifest;
-    /// Build a native resume command argv. M6 only builds this; M7 wires resume.
-    fn resume(&self, session_ref: &SessionRef) -> Result<AgentCommand, ProtocolError>;
 }
 
 fn launch_command(
@@ -298,34 +278,14 @@ pub fn build_pty_command(
     })
 }
 
-/// Build the PTY command that resumes an existing agent session.
-///
-/// Combines the M6 resume-argv builder (`claude --resume <id>` /
-/// `codex resume <id>`) with `PATH` resolution and the launch env in `opts`, so
-/// the daemon can relaunch-and-resume a session after a restart.
-///
-/// # Errors
-///
-/// Returns a typed error for `AgentKind::Shell` (shells have no resume argv) or
-/// when the agent binary is not on `PATH`.
-pub fn resume_pty_command(
-    agent: protocol::AgentKind,
-    session_ref: &SessionRef,
-    opts: &LaunchOpts,
-) -> Result<PtyCommand, ProtocolError> {
-    let command = adapter_for(agent).resume(session_ref)?;
-    build_pty_command(&command.program, command.args, opts)
-}
-
 /// Build the PTY command that resumes a session from its frozen structural
 /// snapshot (Part C: C.4).
 ///
-/// Unlike [`resume_pty_command`], this never consults the base adapter: the
-/// `program` and the resume `template` come from the session's launch-time
+/// The `program` and the resume `template` come from the session's launch-time
 /// snapshot, so a host profile that overrode the launch program or the resume
-/// mode resumes with exactly those values — not the base kind's defaults. The
-/// `session_ref` must already be the kind named by `template.ref_kind` (its
-/// constructor enforced the matching guard).
+/// mode resumes with exactly those values. The `session_ref` must already be
+/// the kind named by `template.ref_kind` (its constructor enforced the matching
+/// guard).
 pub(crate) fn resume_pty_command_from_template(
     program: &str,
     frozen_args: Vec<String>,
@@ -336,10 +296,6 @@ pub(crate) fn resume_pty_command_from_template(
     let mut args = frozen_args;
     args.extend(template.mode.argv(session_ref.value()));
     build_pty_command(program, args, opts)
-}
-
-fn resume_command(program: &'static str, args: Vec<String>) -> AgentCommand {
-    AgentCommand::new(program, args)
 }
 
 pub(crate) fn agent_not_resumable(agent: &str) -> ProtocolError {
@@ -582,21 +538,6 @@ mod tests {
     }
 
     #[test]
-    fn resume_builders_match_native_agent_argv() {
-        let session = SessionRef::new("native-123").expect("session ref");
-
-        let codex = CodexAdapter.resume(&session).expect("codex resume command");
-        assert_eq!(codex.program, "codex");
-        assert_eq!(codex.args, vec!["resume", "native-123"]);
-
-        let claude = ClaudeAdapter
-            .resume(&session)
-            .expect("claude resume command");
-        assert_eq!(claude.program, "claude");
-        assert_eq!(claude.args, vec!["--resume", "native-123"]);
-    }
-
-    #[test]
     fn session_ref_id_accepts_valid_value_and_reports_kind() {
         let session = SessionRef::id("native-123").expect("id session ref");
         assert_eq!(session.kind(), SessionRefKind::Id);
@@ -682,60 +623,9 @@ mod tests {
     }
 
     #[test]
-    fn resume_argv_carries_path_kind_value() {
-        let session = SessionRef::path("/abs/session.jsonl").expect("path session ref");
-        let claude = ClaudeAdapter
-            .resume(&session)
-            .expect("claude resume command");
-        assert_eq!(claude.args, vec!["--resume", "/abs/session.jsonl"]);
-        let codex = CodexAdapter.resume(&session).expect("codex resume command");
-        assert_eq!(codex.args, vec!["resume", "/abs/session.jsonl"]);
-    }
-
-    #[test]
-    fn resume_pty_command_resolves_binary_and_builds_resume_argv() {
-        let bin_dir = temp_dir("resume-claude-bin");
-        write_executable(&bin_dir, "claude");
-        let cwd = temp_dir("resume-claude-cwd");
-        let session = SessionRef::id("native-123").expect("session ref");
-
-        let command = with_path(&bin_dir, || {
-            super::resume_pty_command(
-                protocol::AgentKind::Claude,
-                &session,
-                &launch_opts(cwd.clone()),
-            )
-            .expect("resume pty command")
-        });
-
-        assert!(command.program.ends_with("claude"));
-        assert_eq!(command.args, vec!["--resume", "native-123"]);
-        assert_eq!(command.cwd, cwd);
-        assert_eq!(
-            command.env,
-            vec![("POHUNEK_SESSION_ID".to_owned(), "s-42".to_owned())]
-        );
-    }
-
-    #[test]
-    fn resume_pty_command_rejects_shell_agent() {
-        let cwd = temp_dir("resume-shell-cwd");
-        let session = SessionRef::id("native-123").expect("session ref");
-        let adapter_err = ShellAdapter
-            .resume(&session)
-            .expect_err("shell adapter is not resumable");
-        assert_eq!(adapter_err.code, "agent_not_resumable");
-
-        let err =
-            super::resume_pty_command(protocol::AgentKind::Shell, &session, &launch_opts(cwd))
-                .expect_err("shell is not resumable");
-        assert_eq!(err.code, "agent_not_resumable");
-    }
-
-    #[test]
-    fn base_resume_template_matches_native_adapter_modes() {
-        // The base-kind templates must agree with the hard-coded adapter argv:
+    fn base_resume_template_defines_native_resume_modes() {
         // Claude → `--resume` flag, Codex → `resume` subcommand, both id-kind.
+        // This is the single source of resume argv shape for built-in base kinds.
         let claude = base_resume_template(protocol::AgentKind::Claude).expect("claude resumable");
         assert_eq!(claude.mode, ResumeMode::Flag);
         assert_eq!(claude.ref_kind, SessionRefKind::Id);

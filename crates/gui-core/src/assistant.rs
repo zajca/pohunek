@@ -6,7 +6,7 @@
 // Rust guideline compliant 2026-07-01
 
 use std::fmt::Write as _;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use knowledge::{
     assistant_launch_id, bundle_content_hash, bundle_index, materialize as materialize_bundle,
@@ -21,7 +21,6 @@ use serde::Serialize;
 
 use crate::{connect_client, ConnectionOptions, CoreError, HostConfig, HostTransport};
 
-const APP_DIR: &str = "pohunek";
 const SNAPSHOT_FILE: &str = "snapshot.json";
 const ASSISTANT_MATERIALIZE_ID: &str = "gui-assistant-materialize";
 const ASSISTANT_HOST_INSPECT_ID: &str = "gui-assistant-host-inspect";
@@ -85,32 +84,29 @@ impl AssistantPaths {
     /// Returns [`CoreError::MissingEnv`] when the required XDG or `HOME`
     /// environment variables are absent.
     pub fn resolve() -> Result<Self, CoreError> {
-        let runtime_base = require_env("XDG_RUNTIME_DIR")?;
-        let runtime_dir = PathBuf::from(runtime_base).join(APP_DIR);
-        let data_dir = xdg_or_home_relative("XDG_DATA_HOME", &[".local", "share"])?.join(APP_DIR);
-        let log_dir = xdg_or_home_relative("XDG_STATE_HOME", &[".local", "state"])?
-            .join(APP_DIR)
-            .join("logs");
-        let cache_dir = xdg_or_home_relative("XDG_CACHE_HOME", &[".cache"])?.join(APP_DIR);
-        let config_dir = xdg_or_home_relative("XDG_CONFIG_HOME", &[".config"])?.join(APP_DIR);
+        let paths = pohunek_paths::BasePaths::resolve().map_err(path_error)?;
 
         Ok(Self {
-            runtime_dir,
-            data_dir,
-            log_dir,
-            cache_dir,
-            config_dir,
+            runtime_dir: paths.runtime_dir,
+            data_dir: paths.data_dir,
+            log_dir: paths.log_dir,
+            cache_dir: paths.cache_dir,
+            config_dir: paths.config_dir,
         })
     }
 
     /// Return the local knowledge bundle cache directory.
     #[must_use]
     pub fn assistant_bundle_cache_dir(&self) -> PathBuf {
-        self.cache_dir.join("knowledge")
+        self.cache_dir.join(pohunek_paths::KNOWLEDGE_CACHE_SUBDIR)
     }
 
     fn assistant_runtime_dir(&self, launch_id: &str) -> Option<PathBuf> {
-        valid_runtime_id(launch_id).map(|id| self.runtime_dir.join("assistant").join(id))
+        pohunek_paths::valid_runtime_id(launch_id).map(|id| {
+            self.runtime_dir
+                .join(pohunek_paths::ASSISTANT_RUNTIME_SUBDIR)
+                .join(id)
+        })
     }
 }
 
@@ -824,41 +820,8 @@ fn write_toc(prompt: &mut String, intent: Intent, concepts: &[ConceptMeta]) {
     }
 }
 
-fn require_env(key: &str) -> Result<String, CoreError> {
-    match std::env::var(key) {
-        Ok(value) if !value.is_empty() => Ok(value),
-        _ => Err(CoreError::MissingEnv {
-            var: key.to_owned(),
-        }),
-    }
-}
-
-fn xdg_or_home_relative(key: &str, home_relative: &[&str]) -> Result<PathBuf, CoreError> {
-    if let Ok(value) = std::env::var(key) {
-        if !value.is_empty() {
-            return Ok(PathBuf::from(value));
-        }
-    }
-    let home = std::env::var("HOME").map_err(|_err| CoreError::MissingEnv {
-        var: format!("{key} or HOME"),
-    })?;
-    if home.is_empty() {
-        return Err(CoreError::MissingEnv {
-            var: format!("{key} or HOME"),
-        });
-    }
-    let mut path = PathBuf::from(home);
-    for segment in home_relative {
-        path.push(segment);
-    }
-    Ok(path)
-}
-
-fn valid_runtime_id(id: &str) -> Option<&Path> {
-    let path = Path::new(id);
-    let mut components = path.components();
-    match (components.next(), components.next()) {
-        (Some(Component::Normal(_)), None) => Some(path),
-        _ => None,
+fn path_error(err: pohunek_paths::PathError) -> CoreError {
+    match err {
+        pohunek_paths::PathError::MissingEnv { var } => CoreError::MissingEnv { var },
     }
 }

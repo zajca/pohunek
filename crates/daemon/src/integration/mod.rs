@@ -23,6 +23,7 @@ use protocol::{
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use toml_edit::{value, DocumentMut, Item, Table};
 
 // The agent-handshake env var names are defined once in `protocol` (the shared
 // contract crate) so the daemon (which injects them), the installed hook (which
@@ -221,11 +222,7 @@ pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
     };
     let trust_key = codex_hook_trust_key(&hooks_path, group_index, handler_index);
     let trusted_hash = codex_command_hook_trusted_hash(&command, HOOK_TIMEOUT_SECS, None)?;
-    let updated = ensure_codex_hook_trust_state(
-        &enable_codex_hooks_feature(&existing),
-        &trust_key,
-        &trusted_hash,
-    );
+    let updated = update_codex_config_toml(&existing, &trust_key, &trusted_hash, &config_path)?;
     if updated != existing {
         write_file(&config_path, &updated)?;
     }
@@ -477,92 +474,42 @@ fn command_references(hook: &Value, needle: &str) -> bool {
             .is_some_and(|command| command.contains(needle))
 }
 
-/// Ensure `[features] hooks = true` in a Codex `config.toml`, preserving the
-/// rest. Ported from herdr `build_codex_config_with_hooks`.
-fn enable_codex_hooks_feature(content: &str) -> String {
-    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
-    let trailing_newline = content.ends_with('\n');
-    let mut in_features = false;
-    let mut features_header_index = None;
-    let mut hooks_index = None;
+/// Update Codex `config.toml` through a TOML parser, preserving unrelated data.
+fn update_codex_config_toml(
+    content: &str,
+    trust_key: &str,
+    trusted_hash: &str,
+    path: &Path,
+) -> Result<String, ProtocolError> {
+    let mut doc = content.parse::<DocumentMut>().map_err(|err| {
+        settings_invalid(path, &format!("invalid TOML in Codex config.toml: {err}"))
+    })?;
 
-    for (index, line) in lines.iter().enumerate() {
-        if let Some(header) = toml_table_header(line) {
-            in_features = header == "[features]";
-            if in_features && features_header_index.is_none() {
-                features_header_index = Some(index);
-            }
-            continue;
-        }
-        if in_features && is_toml_key(line, "hooks") {
-            hooks_index = Some(index);
-        }
-    }
+    ensure_table(doc.as_table_mut(), "features", path)?.insert("hooks", value(true));
+    let hooks = ensure_table(doc.as_table_mut(), "hooks", path)?;
+    let state = ensure_table(hooks, "state", path)?;
+    ensure_table(state, trust_key, path)?.insert("trusted_hash", value(trusted_hash));
 
-    if let Some(index) = hooks_index {
-        lines[index] = "hooks = true".to_string();
-        return join_toml_lines(&lines, trailing_newline);
-    }
-
-    if let Some(index) = features_header_index {
-        lines.insert(index + 1, "hooks = true".to_string());
-        return join_toml_lines(&lines, trailing_newline);
-    }
-
-    let mut result = content.trim_end_matches('\n').to_string();
-    if !result.is_empty() {
-        result.push_str("\n\n");
-    }
-    result.push_str("[features]\nhooks = true\n");
-    result
+    Ok(doc.to_string())
 }
 
-fn ensure_codex_hook_trust_state(content: &str, trust_key: &str, trusted_hash: &str) -> String {
-    let state_header = format!("[hooks.state.{}]", toml_basic_string(trust_key));
-    let trusted_hash_line = format!("trusted_hash = {}", toml_basic_string(trusted_hash));
-    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
-    let trailing_newline = content.ends_with('\n');
-
-    if let Some(header_index) = lines
-        .iter()
-        .position(|line| toml_table_header(line) == Some(state_header.as_str()))
-    {
-        let table_end = lines
-            .iter()
-            .enumerate()
-            .skip(header_index + 1)
-            .find_map(|(index, line)| toml_table_header(line).map(|_| index))
-            .unwrap_or(lines.len());
-        if let Some(trusted_hash_index) =
-            (header_index + 1..table_end).find(|index| is_toml_key(&lines[*index], "trusted_hash"))
-        {
-            lines[trusted_hash_index] = trusted_hash_line;
-        } else {
-            lines.insert(header_index + 1, trusted_hash_line);
-        }
-        return join_toml_lines(&lines, trailing_newline);
-    }
-
-    let mut result = content.trim_end_matches('\n').to_string();
-    if !result.is_empty() {
-        result.push_str("\n\n");
-    }
-    if !has_toml_table(content, "[hooks.state]") {
-        result.push_str("[hooks.state]\n\n");
-    }
-    result.push_str(&state_header);
-    result.push('\n');
-    result.push_str(&trusted_hash_line);
-    result.push('\n');
-    result
+fn ensure_table<'a>(
+    parent: &'a mut Table,
+    key: &str,
+    path: &Path,
+) -> Result<&'a mut Table, ProtocolError> {
+    let item = parent
+        .entry(key)
+        .or_insert_with(|| Item::Table(Table::new()));
+    item.as_table_mut().ok_or_else(|| {
+        settings_invalid(
+            path,
+            &format!("cannot update Codex config.toml: `{key}` is not a TOML table"),
+        )
+    })
 }
 
-fn has_toml_table(content: &str, header: &str) -> bool {
-    content
-        .lines()
-        .any(|line| toml_table_header(line) == Some(header))
-}
-
+#[cfg(test)]
 fn toml_basic_string(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len() + 2);
     escaped.push('"');
@@ -578,40 +525,6 @@ fn toml_basic_string(value: &str) -> String {
     }
     escaped.push('"');
     escaped
-}
-
-fn join_toml_lines(lines: &[String], trailing_newline: bool) -> String {
-    let mut result = lines.join("\n");
-    if trailing_newline || result.is_empty() {
-        result.push('\n');
-    }
-    result
-}
-
-fn toml_table_header(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with('#') || !trimmed.starts_with('[') {
-        return None;
-    }
-    let header_end = if trimmed.starts_with("[[") {
-        trimmed.find("]]").map(|index| index + 2)?
-    } else {
-        trimmed.find(']').map(|index| index + 1)?
-    };
-    let header = &trimmed[..header_end];
-    let rest = trimmed[header_end..].trim_start();
-    if !rest.is_empty() && !rest.starts_with('#') {
-        return None;
-    }
-    Some(header)
-}
-
-fn is_toml_key(line: &str, key: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.starts_with('#') || !trimmed.starts_with(key) {
-        return false;
-    }
-    trimmed[key.len()..].trim_start().starts_with('=')
 }
 
 fn config_dir(env_var: &str, home_relative: &str) -> Result<PathBuf, ProtocolError> {
@@ -965,6 +878,44 @@ mod tests {
             after_second.matches("hooks = true").count(),
             1,
             "exactly one hooks=true: {after_second}"
+        );
+    }
+
+    #[test]
+    fn install_codex_updates_dotted_feature_config_toml() {
+        let codex_dir = temp_dir("codex-dotted");
+        fs::write(
+            codex_dir.join("config.toml"),
+            "model = \"gpt-5\"\nfeatures.hooks = false\n",
+        )
+        .unwrap();
+
+        install_codex(&codex_dir).expect("install codex");
+        let updated = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
+
+        assert!(updated.contains("model = \"gpt-5\""), "{updated}");
+        assert!(
+            updated.contains("hooks = true") || updated.contains("features.hooks = true"),
+            "{updated}"
+        );
+        assert!(updated.contains("trusted_hash"), "{updated}");
+    }
+
+    #[test]
+    fn install_codex_fails_closed_on_inline_feature_table() {
+        let codex_dir = temp_dir("codex-inline");
+        fs::write(
+            codex_dir.join("config.toml"),
+            "features = { hooks = false }\n",
+        )
+        .unwrap();
+
+        let err = install_codex(&codex_dir).expect_err("inline features table is refused");
+
+        assert_eq!(err.code, "integration_settings_invalid");
+        assert!(
+            err.msg.contains("features") && err.msg.contains("not a TOML table"),
+            "{err:?}"
         );
     }
 

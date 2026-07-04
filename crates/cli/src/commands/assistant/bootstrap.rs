@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::client::Client;
 use crate::error::CliError;
 use crate::paths::Paths;
-use crate::target::LOCAL_HOST;
+use crate::target::is_local_host;
 
 /// How long to wait for a freshly started daemon to begin answering, and how
 /// often to re-probe the socket while waiting.
@@ -34,7 +34,7 @@ pub(crate) async fn ensure_daemon(
     no_start_daemon: bool,
 ) -> Result<bool, CliError> {
     // Remote targets are never auto-started.
-    if !is_local(host) {
+    if !is_local_host(host) {
         return Ok(false);
     }
 
@@ -46,10 +46,6 @@ pub(crate) async fn ensure_daemon(
         }
         Err(err) => Err(err),
     }
-}
-
-fn is_local(host: &str) -> bool {
-    host.is_empty() || host == LOCAL_HOST
 }
 
 /// Start the local daemon in the background and poll the socket until it answers

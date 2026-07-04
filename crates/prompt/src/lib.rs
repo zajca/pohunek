@@ -10,6 +10,49 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
+#[derive(Debug, Clone, Copy)]
+struct Field {
+    names: &'static [&'static str],
+    label: &'static str,
+    required: bool,
+}
+
+const TITLE_FIELD: Field = Field {
+    names: &["title"],
+    label: "title",
+    required: true,
+};
+const GITHUB_BODY_FIELD: Field = Field {
+    names: &["body", "description"],
+    label: "body/description",
+    required: false,
+};
+const GITHUB_BRANCH_FIELD: Field = Field {
+    names: &["headRefName", "branch", "branchName"],
+    label: "headRefName/branch/branchName",
+    required: true,
+};
+const LINEAR_ID_FIELD: Field = Field {
+    names: &["identifier", "id"],
+    label: "identifier/id",
+    required: false,
+};
+const LINEAR_BODY_FIELD: Field = Field {
+    names: &["description", "body"],
+    label: "description/body",
+    required: false,
+};
+const LINEAR_BRANCH_FIELD: Field = Field {
+    names: &["branchName", "branch"],
+    label: "branchName/branch",
+    required: true,
+};
+const URL_FIELD: Field = Field {
+    names: &["url"],
+    label: "url",
+    required: false,
+};
+
 /// Provider context supported by the shared prompt renderer.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum Provider {
@@ -113,17 +156,14 @@ fn build_context(
             context.insert("provider", "github".to_owned());
             context.insert("number", item_id.to_owned());
             context.insert("id", item_id.to_owned());
-            context.insert("title", pick(data, &["title"], true)?);
-            context.insert("body", pick(data, &["body", "description"], false)?);
-            context.insert(
-                "branch",
-                pick(data, &["headRefName", "branch", "branchName"], true)?,
-            );
-            context.insert("url", pick(data, &["url"], false)?);
+            context.insert("title", pick(data, TITLE_FIELD)?);
+            context.insert("body", pick(data, GITHUB_BODY_FIELD)?);
+            context.insert("branch", pick(data, GITHUB_BRANCH_FIELD)?);
+            context.insert("url", pick(data, URL_FIELD)?);
         }
         Provider::LinearIssue => {
             context.insert("provider", "linear".to_owned());
-            let id = pick(data, &["identifier", "id"], false)?;
+            let id = pick(data, LINEAR_ID_FIELD)?;
             let id = if id.is_empty() {
                 item_id.to_owned()
             } else {
@@ -131,22 +171,18 @@ fn build_context(
             };
             context.insert("id", id.clone());
             context.insert("number", id);
-            context.insert("title", pick(data, &["title"], true)?);
-            context.insert("body", pick(data, &["description", "body"], false)?);
-            context.insert("branch", pick(data, &["branchName", "branch"], true)?);
-            context.insert("url", pick(data, &["url"], false)?);
+            context.insert("title", pick(data, TITLE_FIELD)?);
+            context.insert("body", pick(data, LINEAR_BODY_FIELD)?);
+            context.insert("branch", pick(data, LINEAR_BRANCH_FIELD)?);
+            context.insert("url", pick(data, URL_FIELD)?);
         }
     }
 
     Ok(context)
 }
 
-fn pick(
-    data: &serde_json::Value,
-    names: &'static [&'static str],
-    required: bool,
-) -> Result<String, Error> {
-    for name in names {
+fn pick(data: &serde_json::Value, field: Field) -> Result<String, Error> {
+    for name in field.names {
         if let Some(value) = data.get(*name).and_then(serde_json::Value::as_str) {
             if !value.is_empty() {
                 return Ok(value.to_owned());
@@ -154,19 +190,10 @@ fn pick(
         }
     }
 
-    if required {
-        Err(Error::MissingRequiredField(joined_field_name(names)))
+    if field.required {
+        Err(Error::MissingRequiredField(field.label))
     } else {
         Ok(String::new())
-    }
-}
-
-fn joined_field_name(names: &'static [&'static str]) -> &'static str {
-    match names {
-        ["title"] => "title",
-        ["headRefName", "branch", "branchName"] => "headRefName/branch/branchName",
-        ["branchName", "branch"] => "branchName/branch",
-        _ => "unknown",
     }
 }
 

@@ -11,6 +11,7 @@ futures = { workspace = true }
 keyring = { workspace = true }
 pohunek-client = { workspace = true }
 pohunek-knowledge = { workspace = true, features = ["protocol"] }
+pohunek-paths = { workspace = true }
 pohunek-prompt = { workspace = true }
 pohunek-protocol = { workspace = true }
 reqwest = { workspace = true }

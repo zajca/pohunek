@@ -2932,6 +2932,7 @@ dependencies = [
  "pohunek-gui-core",
  "pohunek-hostcheck",
  "pohunek-netbird",
+ "pohunek-paths",
  "pohunek-prompt",
  "pohunek-protocol",
  "pohunek-terminal",
@@ -2965,6 +2966,7 @@ dependencies = [
  "pohunek-hostcheck",
  "pohunek-knowledge",
  "pohunek-netbird",
+ "pohunek-paths",
  "pohunek-protocol",
  "pohunek-terminal",
  "portable-pty",
@@ -2977,6 +2979,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "toml_edit 0.22.27",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -2989,6 +2992,7 @@ dependencies = [
  "futures",
  "iced",
  "pohunek-gui-core",
+ "pohunek-paths",
  "pohunek-protocol",
  "serde",
  "serde_json",
@@ -3006,6 +3010,7 @@ dependencies = [
  "pohunek-client",
  "pohunek-daemon",
  "pohunek-knowledge",
+ "pohunek-paths",
  "pohunek-prompt",
  "pohunek-protocol",
  "reqwest",
@@ -3043,6 +3048,13 @@ version = "0.15.1"
 dependencies = [
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "pohunek-paths"
+version = "0.15.1"
+dependencies = [
  "thiserror 2.0.18",
 ]
 

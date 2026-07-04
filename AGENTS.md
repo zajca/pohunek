@@ -44,7 +44,9 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | `crates/cli`      | CLI (`pohunek`): commands over the local protocol. |
 | `crates/prompt`   | Shared prompt rendering for provider launch flows. |
 | `crates/knowledge`| Knowledge-bundle primitives for the assistant and offline docs. |
+| `crates/terminal` | Shared VT screen tracking and attach compositing primitives. |
 | `crates/netbird`  | NetBird status parsing, host resolution, bind-address validation. |
+| `crates/paths`    | Shared XDG path and local socket contract for daemon, CLI, and GUI clients. |
 | `crates/hostcheck`| Host environment probes shared by `doctor` and the daemon's `doctor` RPC. |
 | `crates/gui-core` | Pure, headless state + SDK bridge for the GUI (no Iced dependency; fully unit-testable). |
 | `crates/gui`      | Native Iced shell that wraps `gui-core` in `Task`/`Subscription`. |

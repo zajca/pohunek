@@ -935,10 +935,10 @@ mod tests {
         assert_eq!(request.v.get(), 1, "envelope version");
         assert_eq!(request.method, method_name, "method");
         assert_eq!(request.params, params, "params");
-        // The id is now a unique per-call correlation id, not a fixed string;
-        // assert only its stable, log-greppable `cli-<method>-` prefix.
+        // The id is now a unique per-call SDK correlation id, not a fixed string;
+        // assert only its stable, log-greppable `sdk-<method>-` prefix.
         assert!(
-            request.id.starts_with(&format!("cli-{method_name}-")),
+            request.id.starts_with(&format!("sdk-{method_name}-")),
             "id {:?} must be prefixed by the method",
             request.id
         );

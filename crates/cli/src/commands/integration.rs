@@ -9,10 +9,9 @@
 use std::fmt::Write as _;
 
 use clap::ValueEnum;
-use protocol::{method, AgentKind, IntegrationInstallParams, IntegrationInstallResult, Request};
+use protocol::{method, AgentKind, IntegrationInstallParams, IntegrationInstallResult};
 
 use crate::client::Client;
-use crate::commands::request_id;
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::LOCAL_HOST;
@@ -49,17 +48,12 @@ pub(crate) async fn run_install(
     let params = IntegrationInstallParams {
         agent: agent.map(Into::into),
     };
-    let request = Request::new(
-        request_id(method::INTEGRATION_INSTALL),
-        method::INTEGRATION_INSTALL,
-        serde_json::to_value(params)?,
-    );
     // Installing hooks is inherently a *local* daemon operation: it writes into
     // this machine's agent config dirs. Always use the local transport regardless
     // of any `--host` flag.
     let mut client = Client::connect(LOCAL_HOST, paths).await?;
-    let result = client.request(&request).await?;
-    let result: IntegrationInstallResult = serde_json::from_value(result)?;
+    let result: IntegrationInstallResult =
+        client.call::<method::IntegrationInstall>(params).await?;
 
     if json {
         print!("{}", crate::commands::render_json(&result)?);

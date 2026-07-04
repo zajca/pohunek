@@ -1,9 +1,6 @@
 use protocol::ProtocolError;
 
-use super::{
-    launch_command, resume_command, AgentAdapter, AgentCommand, InputRules, LaunchOpts, SessionRef,
-    DEFAULT_CLAUDE_SUBMIT_DELAY,
-};
+use super::{launch_command, AgentAdapter, InputRules, LaunchOpts, DEFAULT_CLAUDE_SUBMIT_DELAY};
 use crate::detect::Manifest;
 use crate::pty::PtyCommand;
 
@@ -29,12 +26,5 @@ impl AgentAdapter for ClaudeAdapter {
 
     fn manifest(&self) -> &Manifest {
         crate::detect::claude_manifest()
-    }
-
-    fn resume(&self, session_ref: &SessionRef) -> Result<AgentCommand, ProtocolError> {
-        Ok(resume_command(
-            "claude",
-            vec!["--resume".to_owned(), session_ref.value().to_owned()],
-        ))
     }
 }

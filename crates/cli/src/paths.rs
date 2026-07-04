@@ -9,9 +9,6 @@ use std::path::PathBuf;
 
 use crate::error::CliError;
 
-const APP_DIR: &str = "pohunek";
-const SOCKET_NAME: &str = "daemon.sock";
-
 /// Resolved CLI paths.
 #[derive(Debug, Clone)]
 pub(crate) struct Paths {
@@ -42,30 +39,16 @@ impl Paths {
     /// Returns [`CliError::MissingEnv`] when `XDG_RUNTIME_DIR` is unset, or when
     /// neither the relevant XDG var nor `HOME` is available.
     pub(crate) fn resolve() -> Result<Self, CliError> {
-        let runtime_base = require_env("XDG_RUNTIME_DIR")?;
-        let runtime_dir = PathBuf::from(runtime_base).join(APP_DIR);
-        let socket = runtime_dir.join(SOCKET_NAME);
-
-        let data_home = xdg_or_home_relative("XDG_DATA_HOME", &[".local", "share"])?;
-        let data_dir = data_home.join(APP_DIR);
-
-        let state_home = xdg_or_home_relative("XDG_STATE_HOME", &[".local", "state"])?;
-        let log_dir = state_home.join(APP_DIR).join("logs");
-
-        let cache_home = xdg_or_home_relative("XDG_CACHE_HOME", &[".cache"])?;
-        let cache_dir = cache_home.join(APP_DIR);
-
-        let config_home = xdg_or_home_relative("XDG_CONFIG_HOME", &[".config"])?;
-        let config_dir = config_home.join(APP_DIR);
+        let base = pohunek_paths::BasePaths::resolve().map_err(path_error)?;
 
         Ok(Self {
-            runtime_dir,
-            socket,
-            data_dir,
-            log_dir,
-            cache_dir,
-            config_home,
-            config_dir,
+            runtime_dir: base.runtime_dir,
+            socket: base.socket,
+            data_dir: base.data_dir,
+            log_dir: base.log_dir,
+            cache_dir: base.cache_dir,
+            config_home: base.config_home,
+            config_dir: base.config_dir,
         })
     }
 
@@ -75,7 +58,7 @@ impl Paths {
     /// directory.
     #[must_use]
     pub(crate) fn launcher_bin_dir(&self) -> PathBuf {
-        self.data_dir.join("bin")
+        self.data_dir.join(pohunek_paths::BIN_SUBDIR)
     }
 
     /// The user's sway config dir (`<config_home>/sway`). `pohunek setup sway`
@@ -83,44 +66,22 @@ impl Paths {
     /// main sway config.
     #[must_use]
     pub(crate) fn sway_config_dir(&self) -> PathBuf {
-        self.config_home.join("sway")
+        self.config_home.join(pohunek_paths::SWAY_CONFIG_DIR)
     }
 }
 
-fn require_env(key: &str) -> Result<String, CliError> {
-    match std::env::var(key) {
-        Ok(v) if !v.is_empty() => Ok(v),
-        _ => Err(CliError::MissingEnv {
-            var: key.to_owned(),
-        }),
+fn path_error(err: pohunek_paths::PathError) -> CliError {
+    match err {
+        pohunek_paths::PathError::MissingEnv { var } => CliError::MissingEnv { var },
     }
-}
-
-fn xdg_or_home_relative(key: &str, home_relative: &[&str]) -> Result<PathBuf, CliError> {
-    if let Ok(v) = std::env::var(key) {
-        if !v.is_empty() {
-            return Ok(PathBuf::from(v));
-        }
-    }
-    let home = std::env::var("HOME").map_err(|_err| CliError::MissingEnv {
-        var: format!("{key} or HOME"),
-    })?;
-    if home.is_empty() {
-        return Err(CliError::MissingEnv {
-            var: format!("{key} or HOME"),
-        });
-    }
-    let mut p = PathBuf::from(home);
-    for seg in home_relative {
-        p.push(seg);
-    }
-    Ok(p)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    use pohunek_paths::APP_DIR;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

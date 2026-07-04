@@ -5,6 +5,7 @@
 
 use std::path::Path;
 
+use crate::generators::common::{frontmatter, write_concept_file, ConceptFrontmatter};
 use crate::XtaskError;
 
 struct MethodDescriptor {
@@ -157,16 +158,6 @@ static EVENTS: &[EventDescriptor] = &[
     },
 ];
 
-fn write_concept_file(path: &Path, content: &str) -> Result<(), XtaskError> {
-    if let Some(parent) = path.parent() {
-        crate::create_dir_all(parent)?;
-    }
-    std::fs::write(path, content).map_err(|source| XtaskError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
 /// Convert a method wire name to a file-system slug.
 ///
 /// `daemon.health` → `daemon-health`
@@ -183,22 +174,18 @@ fn event_slug(wire_name: &str) -> String {
 
 fn render_method(method: &MethodDescriptor, since: &str) -> String {
     let slug = method_slug(method.wire_name);
+    let yaml = frontmatter(&ConceptFrontmatter {
+        concept_type: "ProtocolMethod",
+        id: &format!("protocol/{slug}"),
+        title: &format!("{} — {}", method.wire_name, method.description),
+        description: method.description,
+        generated_from: "static protocol descriptor",
+        since: Some(since),
+        tags: &["protocol", "reference"],
+        intents: &["debug"],
+    });
     format!(
-        "---\n\
-         type: ProtocolMethod\n\
-         id: protocol/{slug}\n\
-         title: \"{wire_name} — {description}\"\n\
-         description: \"{description}\"\n\
-         source_kind: generated\n\
-         generated_from: \"static protocol descriptor\"\n\
-         since: \"{since}\"\n\
-         tags:\n\
-           - protocol\n\
-           - reference\n\
-         intents:\n\
-           - debug\n\
-         ---\n\
-         \n\
+        "{yaml}\n\
          # {wire_name}\n\
          \n\
          {description}\n\
@@ -210,6 +197,7 @@ fn render_method(method: &MethodDescriptor, since: &str) -> String {
          ## Transport\n\
          \n\
          Sent over the local Unix control socket as a newline-delimited JSON request envelope.\n",
+        yaml = yaml,
         wire_name = method.wire_name,
         description = method.description,
     )
@@ -217,22 +205,18 @@ fn render_method(method: &MethodDescriptor, since: &str) -> String {
 
 fn render_event(event: &EventDescriptor, since: &str) -> String {
     let slug = event_slug(event.wire_name);
+    let yaml = frontmatter(&ConceptFrontmatter {
+        concept_type: "ProtocolEvent",
+        id: &format!("protocol/{slug}"),
+        title: &format!("{} — {}", event.wire_name, event.description),
+        description: event.description,
+        generated_from: "static protocol descriptor",
+        since: Some(since),
+        tags: &["protocol", "reference"],
+        intents: &["debug"],
+    });
     format!(
-        "---\n\
-         type: ProtocolEvent\n\
-         id: protocol/{slug}\n\
-         title: \"{wire_name} — {description}\"\n\
-         description: \"{description}\"\n\
-         source_kind: generated\n\
-         generated_from: \"static protocol descriptor\"\n\
-         since: \"{since}\"\n\
-         tags:\n\
-           - protocol\n\
-           - reference\n\
-         intents:\n\
-           - debug\n\
-         ---\n\
-         \n\
+        "{yaml}\n\
          # {wire_name}\n\
          \n\
          {description}\n\
@@ -244,6 +228,7 @@ fn render_event(event: &EventDescriptor, since: &str) -> String {
          ## Transport\n\
          \n\
          Published on subscription connections as newline-delimited JSON event envelopes.\n",
+        yaml = yaml,
         wire_name = event.wire_name,
         description = event.description,
     )

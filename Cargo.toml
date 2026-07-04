@@ -3,16 +3,15 @@
 # Single-user, CLI-first tool: a daemon owns PTYs running coding agents; a CLI
 # controls it over a local Unix socket using newline-delimited JSON.
 #
-# Layout and crate choices follow docs/plan-phase-1.md ("Tech Stack and Crates",
-# "Cargo Workspace Layout"). Build-Order milestones 1-3 are implemented in this
-# revision (socket + health, then PTY ownership and the session registry); later
-# modules are stubs.
+# Layout and crate choices are summarized in AGENTS.md and the architecture
+# documents under docs/.
 [workspace]
 resolver = "2"
 members = [
     "crates/protocol",
     "crates/knowledge",
     "crates/hostcheck",
+    "crates/paths",
     "crates/xtask",
     "crates/netbird",
     "crates/prompt",
@@ -37,6 +36,7 @@ pohunek-gui-core = { path = "crates/gui-core" }
 pohunek-hostcheck = { path = "crates/hostcheck" }
 pohunek-knowledge = { path = "crates/knowledge" }
 pohunek-netbird = { path = "crates/netbird" }
+pohunek-paths = { path = "crates/paths" }
 pohunek-prompt = { path = "crates/prompt" }
 pohunek-protocol = { path = "crates/protocol" }
 pohunek-terminal = { path = "crates/terminal" }
@@ -48,6 +48,7 @@ include_dir = "0.7"
 sha2 = "0.10"
 thiserror = "2"
 toml = "0.8"
+toml_edit = "0.22"
 regex = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "fs", "time", "process"] }
 tokio-util = { version = "0.7", features = ["codec"] }

@@ -143,6 +143,12 @@ fn netbird_error_to_protocol_error(err: &netbird::NetbirdError) -> ProtocolError
         netbird::NetbirdError::StateUnavailable(detail) | netbird::NetbirdError::Parse(detail) => {
             ProtocolError::netbird_state_unavailable(detail.clone())
         }
+        netbird::NetbirdError::InvalidConfig(detail) => ProtocolError::new(
+            ErrorClass::Configuration,
+            "netbird_invalid_config",
+            detail.clone(),
+            Some("fix the invalid NetBird-related configuration and retry".to_owned()),
+        ),
         netbird::NetbirdError::HostUnknown(host) => ProtocolError::host_unknown(host),
     }
 }
@@ -208,6 +214,20 @@ mod tests {
         assert!(
             structured.msg.contains("bad json"),
             "msg includes parse detail: {}",
+            structured.msg
+        );
+    }
+
+    #[test]
+    fn netbird_invalid_config_maps_to_configuration_error() {
+        let structured = ClientError::from(NetbirdError::InvalidConfig("bad port".to_owned()))
+            .to_protocol_error();
+
+        assert_eq!(structured.class, ErrorClass::Configuration);
+        assert_eq!(structured.code, "netbird_invalid_config");
+        assert!(
+            structured.msg.contains("bad port"),
+            "msg includes config detail: {}",
             structured.msg
         );
     }

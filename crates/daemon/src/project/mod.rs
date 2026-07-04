@@ -26,22 +26,12 @@ use protocol::{
     ErrorClass, ProjectInfo, ProjectListFilter, ProjectShowResult, ProjectSource, ProjectWorktree,
     ProtocolError,
 };
-use time::format_description::well_known::Rfc3339;
-use time::OffsetDateTime;
 
 use crate::store::{ProjectRecord, ProjectResolution, Store, WorktreeStatus};
+use crate::time::now_rfc3339;
 use crate::worktree::canonical_or_original;
 
 use detect::DetectedProject;
-
-/// Current UTC time as an RFC3339 string for project record timestamps (matches
-/// the session/worktree stores). Formatting a valid `OffsetDateTime` cannot fail
-/// in practice; the fallback only guards a future API change.
-fn now_rfc3339() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
-}
 
 /// Project store glue: resolve `<id|label>` references and upsert detected/added
 /// projects into the unified [`Store`].

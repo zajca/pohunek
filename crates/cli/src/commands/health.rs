@@ -5,11 +5,10 @@
 //! protocol versions as a table or, with `--json`, the raw payload (see
 //! `docs/plan-phase-1.md` "CLI Grammar": `--json` on `status`).
 
-use protocol::{method, Request};
-use serde_json::Value;
+use protocol::method;
 
 use crate::client::Client;
-use crate::commands::request_id;
+use crate::commands::render_json;
 use crate::error::CliError;
 use crate::paths::Paths;
 
@@ -21,44 +20,17 @@ use crate::paths::Paths;
 /// resolved, or the daemon returns an error.
 pub(crate) async fn run(host: &str, paths: &Paths, json: bool) -> Result<(), CliError> {
     let mut client = Client::connect(host, paths).await?;
-
-    let request = Request::new(
-        request_id(method::DAEMON_HEALTH),
-        method::DAEMON_HEALTH,
-        Value::Null,
-    );
-    let result = client.request(&request).await?;
+    let result = client.call::<method::DaemonHealth>(()).await?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        print!("{}", render_json(&result)?);
         return Ok(());
     }
 
-    // Human table. Pull known fields defensively; unknown shapes still print.
-    let daemon_version = result
-        .get("daemon_version")
-        .and_then(Value::as_str)
-        .unwrap_or("<unknown>");
-    let protocol_version = result
-        .get("protocol_version")
-        .map_or_else(|| "<unknown>".to_owned(), value_to_string);
-    let status = result
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("<unknown>");
-
     println!("FIELD             VALUE");
-    println!("status            {status}");
-    println!("daemon_version    {daemon_version}");
-    println!("protocol_version  {protocol_version}");
+    println!("status            {}", result.status);
+    println!("daemon_version    {}", result.daemon_version);
+    println!("protocol_version  {}", result.protocol_version);
 
     Ok(())
-}
-
-/// Stringify a JSON scalar without surrounding quotes for table display.
-fn value_to_string(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
 }
