@@ -11,14 +11,22 @@
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo, RemoteServer};
 use pohunek_daemon::discovery::DiscoveryCache;
+use pohunek_daemon::events::{spawn_drain, EventLog};
 use pohunek_daemon::lock::InstanceLock;
+use pohunek_daemon::notifications::{
+    AttentionCoordinator, NotificationProjector, NotificationService, NOTIFICATIONS_SUBDIR,
+};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use pohunek_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
 
@@ -31,6 +39,14 @@ const WORKTREES_SUBDIR: &str = "worktrees";
 
 /// Subdirectory under the data dir holding the append-only event log.
 const EVENTS_SUBDIR: &str = "events";
+
+/// Maximum time to let event-log drains flush on daemon shutdown.
+///
+/// Event log writes are local owner-private JSONL appends and should finish
+/// quickly. Bounding shutdown prevents a wedged filesystem from hanging the
+/// daemon indefinitely while still giving buffered audit/debug events a chance
+/// to reach disk.
+const EVENT_LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -89,22 +105,40 @@ async fn run() -> Result<(), DaemonError> {
         ..SessionRegistryConfig::default()
     };
     let sessions = SessionRegistry::new(config);
+    let notifications =
+        NotificationService::open(&paths.data_dir).map_err(|source| DaemonError::Directory {
+            path: paths.data_dir.join(NOTIFICATIONS_SUBDIR),
+            source: std::io::Error::other(source),
+        })?;
 
     // 6. Start the append-only event log before anything emits, so the resume
-    //    events from `load_and_resume` below are captured too. Fail fast if the
-    //    log location is unusable.
-    sessions
-        .spawn_event_log()
-        .map_err(|source| DaemonError::Directory {
-            path: paths.data_dir.join(EVENTS_SUBDIR),
-            source,
-        })?;
+    //    events from `load_and_resume` below are captured too. The log drains
+    //    both session and notification control-plane events into one file.
+    let event_logs = spawn_event_logs(
+        &paths.data_dir.join(EVENTS_SUBDIR),
+        &sessions,
+        &notifications,
+    )?;
+    // Spawn the attention debounce coordinator: it owns the lifecycle of
+    // agent_blocked/approval_required notifications, holding them for the policy
+    // debounce window so transient attention states never surface. Both producers
+    // (the notification.create handler and the projector) route attention through
+    // its clonable command handle.
+    let (attention_coordinator, attention_task) =
+        AttentionCoordinator::spawn(notifications.clone());
+    let notification_projector = NotificationProjector::spawn(
+        &sessions,
+        notifications.clone(),
+        attention_coordinator.clone(),
+    );
     sessions.spawn_agent_state_hooks();
 
     // 7. Bind the control socket (stale-socket recovery + 0600).
     let health = HealthInfo::new(DAEMON_VERSION);
     let discovery = DiscoveryCache::default();
-    let state = DaemonState::new_with_discovery(health, sessions.clone(), discovery.clone());
+    let state = DaemonState::new_with_discovery(health, sessions.clone(), discovery.clone())
+        .with_notifications(notifications.clone())
+        .with_attention_coordinator(attention_coordinator.clone());
     let server = ControlServer::bind_with_state(&paths.socket, state).await?;
     info!(socket = %server.socket_path().display(), "ready; serving control protocol");
 
@@ -120,7 +154,9 @@ async fn run() -> Result<(), DaemonError> {
         HealthInfo::new(DAEMON_VERSION),
         sessions.clone(),
         discovery,
-    );
+    )
+    .with_notifications(notifications.clone())
+    .with_attention_coordinator(attention_coordinator.clone());
     let remote_server = bind_remote_server(remote_state).await;
 
     // 10. Serve both transports under ONE shutdown signal. A small task awaits
@@ -152,11 +188,53 @@ async fn run() -> Result<(), DaemonError> {
 
     // 11. Flush the append-only event log before exit so events buffered at
     //     shutdown are not lost (bounded so a wedged write cannot hang exit).
+    //     Stop the projector before the coordinator so any last defers/resolves
+    //     it drains are still accepted, then drop the coordinator's pending
+    //     (in-memory, deliberately not persisted).
+    notification_projector.shutdown().await;
+    attention_task.shutdown().await;
     sessions.shutdown_agent_state_hooks().await;
-    sessions.shutdown_event_log().await;
+    shutdown_event_logs(event_logs).await;
 
     info!("pohunekd stopped");
     Ok(())
+}
+
+#[derive(Debug)]
+struct EventLogDrains {
+    shutdown: CancellationToken,
+    handles: Vec<JoinHandle<()>>,
+}
+
+fn spawn_event_logs(
+    events_dir: &std::path::Path,
+    sessions: &SessionRegistry,
+    notifications: &NotificationService,
+) -> Result<EventLogDrains, DaemonError> {
+    let log = Arc::new(
+        EventLog::open(events_dir).map_err(|source| DaemonError::Directory {
+            path: events_dir.to_path_buf(),
+            source,
+        })?,
+    );
+    let shutdown = CancellationToken::new();
+    let handles = vec![
+        spawn_drain(Arc::clone(&log), sessions.subscribe(), shutdown.clone()),
+        spawn_drain(log, notifications.subscribe(), shutdown.clone()),
+    ];
+    Ok(EventLogDrains { shutdown, handles })
+}
+
+async fn shutdown_event_logs(drains: EventLogDrains) {
+    drains.shutdown.cancel();
+    for handle in drains.handles {
+        if tokio::time::timeout(EVENT_LOG_FLUSH_TIMEOUT, handle)
+            .await
+            .is_err()
+        {
+            warn!("event-log drain did not finish flushing within the shutdown timeout");
+        }
+    }
 }
 
 /// Bind the optional `NetBird` TCP control listener.

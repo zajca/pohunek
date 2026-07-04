@@ -32,6 +32,48 @@ The assistant feature reuses this session lifecycle. Its opening prompt is just
 initial input to a normal session, so session warnings and applied-input status
 remain the source of truth for whether the agent received that prompt.
 
+Notifications can be linked to a session through `session_id`. Provider hook
+adapters attach the id when `POHUNEK_SESSION_ID` is present and shape-valid;
+invalid values are dropped so the notification is still created without session
+linkage. The daemon also enriches `notification.create` with current session
+context when the referenced session still exists, but a notification may outlive
+the session it references.
+
+Session attention notifications use the source-independent dedupe key
+`attention:<session_id>`. That lets a daemon projector `agent_blocked` record
+and a provider-hook approval record refer to the same waiting-for-input moment
+without sharing a producer-specific source id. Within the policy's attention
+dedupe window, Codex and Claude provider records outrank daemon projector
+records for the same session attention key.
+
+Attention notifications self-resolve. When the daemon observes a session's
+activity return to `working`, the projector acknowledges any `unread` or `read`
+`agent_blocked` and `approval_required` records for that session's
+`attention:<session_id>` key, covering both hook- and projector-produced
+records. This keeps a transient waiting-for-input signal from lingering as
+unread after the agent has resumed; other kinds such as `error` and
+`session_finished` are never auto-resolved and wait for explicit owner action.
+
+Attention notifications are also debounced before they ever become visible. An
+`agent_blocked` or `approval_required` create carrying an
+`attention:<session_id>` dedupe key is held pending in memory by the daemon for
+the policy's `attention_debounce_secs` window (5 seconds by default) instead of
+being persisted immediately; `notification.create` still reports `created:
+true` with a minted id, but the record does not appear in `notification.list`
+and no `notification_created` event fires while it is pending. If the session's
+activity returns to `working` inside that window, the pending record is
+dropped entirely and nothing is ever created — the same self-resolve edge
+described above, applied before the record surfaces rather than after. Only a
+genuinely outstanding attention state, still unresolved once the window
+elapses, is committed and broadcast. This is distinct from
+`attention_dedupe_window_secs`, which merges duplicate reports of the same
+attention moment across producers rather than delaying when it surfaces.
+
+The GUI opens the notification detail when a notification is selected. If the
+record links to a session still known on the same host, the detail offers a
+separate Open linked session action; if the linked session is gone, the detail
+remains available so the record is not a dead end.
+
 Every session has an immutable launch identity: `agent` is the selected profile
 name and `agent_base` is the base kind (`shell`, `codex`, or `claude`). A shell
 session can temporarily host a nested Codex or Claude Code process. When that

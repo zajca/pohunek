@@ -11,7 +11,11 @@ use serde::Serialize;
 use crate::{
     AssistantMaterializeParams, AssistantMaterializeResult, DaemonDoctorResult, DaemonHealthResult,
     HostCapabilities, HostDiscoverParams, HostRecord, IntegrationInstallParams,
-    IntegrationInstallResult, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
+    IntegrationInstallResult, NotificationCreateParams, NotificationCreateResult,
+    NotificationDeleteParams, NotificationDeleteResult, NotificationListParams,
+    NotificationListResult, NotificationPolicyParams, NotificationPolicyResult,
+    NotificationRetentionParams, NotificationRetentionResult, NotificationUpdateParams,
+    NotificationUpdateResult, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
     ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams, ProjectPromptParams,
     ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
     ProjectShowParams, ProjectShowResult, SessionAttachParams, SessionAttachResult,
@@ -259,6 +263,69 @@ method_marker!(
     "host.discover",
     HostDiscoverParams,
     Vec<HostRecord>
+);
+
+method_marker!(
+    /// Create a durable notification record.
+    NotificationCreate,
+    NOTIFICATION_CREATE,
+    "notification.create",
+    NotificationCreateParams,
+    NotificationCreateResult
+);
+
+method_marker!(
+    /// List durable notification records.
+    NotificationList,
+    NOTIFICATION_LIST,
+    "notification.list",
+    NotificationListParams,
+    NotificationListResult
+);
+
+method_marker!(
+    /// Update a notification lifecycle status.
+    NotificationUpdate,
+    NOTIFICATION_UPDATE,
+    "notification.update",
+    NotificationUpdateParams,
+    NotificationUpdateResult
+);
+
+method_marker!(
+    /// Delete a notification record.
+    NotificationDelete,
+    NOTIFICATION_DELETE,
+    "notification.delete",
+    NotificationDeleteParams,
+    NotificationDeleteResult
+);
+
+method_marker!(
+    /// Read the notification policy.
+    NotificationPolicyGet,
+    NOTIFICATION_POLICY_GET,
+    "notification.policy.get",
+    (),
+    NotificationPolicyResult
+);
+
+method_marker!(
+    /// Replace the notification policy.
+    NotificationPolicySet,
+    NOTIFICATION_POLICY_SET,
+    "notification.policy.set",
+    NotificationPolicyParams,
+    NotificationPolicyResult
+);
+
+method_marker!(
+    /// Prune notifications through the retention policy.
+    NotificationRetentionPrune,
+    NOTIFICATION_RETENTION_PRUNE,
+    "notification.retention.prune",
+    NotificationRetentionParams,
+    NotificationRetentionResult
 );
 
 method_marker!(

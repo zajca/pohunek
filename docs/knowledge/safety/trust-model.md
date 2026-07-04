@@ -24,6 +24,12 @@ The assistant must:
 - Treat hooks as executable code requiring explicit review.
 - Avoid weakening owner-only profile checks, name guards, path containment, or
   remote safety gates.
+- Treat `notification.create` like every other control method: it is guarded by
+  the owner-only daemon socket, not by per-session authentication. Any same-user
+  process that can reach the socket can create notifications and influence
+  attention dedupe within the single-operator trust boundary. A supplied
+  `session_id` is shape-validated so it is bounded and contains no control
+  characters, but it is not cryptographically authenticated to a session.
 
 The assistant may write host or repo configuration when that is the requested
 task, but it must stay inside the user's requested scope and respect the

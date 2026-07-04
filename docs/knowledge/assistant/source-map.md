@@ -24,6 +24,8 @@ Current CLI and command surface:
 - `crates/cli/src/commands/health.rs`
 - `crates/cli/src/commands/session.rs`
 - `crates/cli/src/commands/project.rs`
+- `crates/cli/src/commands/notifications.rs`
+- `crates/cli/src/commands/host_fanout.rs`
 - `crates/cli/src/commands/setup.rs`
 - `crates/cli/src/commands/host.rs`
 - `crates/cli/src/commands/integration.rs`
@@ -31,6 +33,7 @@ Current CLI and command surface:
 - `crates/cli/src/target.rs`
 - `crates/cli/src/paths.rs`
 - `crates/cli/src/error.rs`
+- `crates/cli/tests/notifications_clap.rs`
 
 Native GUI client:
 
@@ -72,7 +75,13 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/capabilities.rs`
 - `crates/daemon/src/integration/mod.rs`
 - `crates/daemon/src/integration/assets/codex/pohunek-agent-state.sh`
+- `crates/daemon/src/integration/assets/codex/pohunek-agent-notify.sh`
 - `crates/daemon/src/integration/assets/claude/pohunek-agent-state.sh`
+- `crates/daemon/src/integration/assets/claude/pohunek-agent-notify.sh`
+- `crates/daemon/src/notifications/mod.rs`
+- `crates/daemon/src/notifications/store.rs`
+- `crates/daemon/src/notifications/policy.rs`
+- `crates/daemon/src/notifications/projector.rs`
 - `crates/daemon/src/paths.rs`
 - `crates/daemon/src/logging.rs`
 
@@ -92,12 +101,14 @@ Agent runtime and profile resolution:
 Protocol contracts and transport:
 
 - `crates/client/src/lib.rs`
+- `crates/client/src/notifications.rs`
 - `crates/client/src/transport.rs`
 - `crates/paths/src/lib.rs`
 - `crates/protocol/src/assistant.rs`
 - `crates/protocol/src/envelope.rs`
 - `crates/protocol/src/lib.rs`
 - `crates/protocol/src/method.rs`
+- `crates/protocol/src/notification.rs`
 - `crates/protocol/src/session.rs`
 - `crates/protocol/src/project.rs`
 - `crates/protocol/src/capabilities.rs`

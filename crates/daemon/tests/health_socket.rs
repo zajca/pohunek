@@ -7,20 +7,26 @@
 //! response carries the daemon and protocol versions. It also covers
 //! stale-socket recovery and the `method_not_found` path.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use protocol::{
     event, method, AgentActivity, AgentKind, AssistantMaterializeParams,
-    AssistantMaterializeResult, AttachHeader, ErrorClass, Event, Request, Response,
-    SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
-    SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
-    SessionNewParams, SessionReportAgentParams, SessionReportAgentResult, SessionResizeParams,
-    SessionResizeResult, SessionState, SessionStopResult, StateSource, PROTOCOL_VERSION,
+    AssistantMaterializeResult, AttachHeader, ErrorClass, Event, NotificationCreateParams,
+    NotificationCreateResult, NotificationDeleteParams, NotificationDeleteResult, NotificationKind,
+    NotificationKindPolicy, NotificationListParams, NotificationListResult, NotificationPolicy,
+    NotificationPolicyParams, NotificationPolicyResult, NotificationRetentionParams,
+    NotificationRetentionResult, NotificationSeverity, NotificationSource, NotificationStatus,
+    NotificationUpdateParams, NotificationUpdateResult, Request, Response, SessionAttachParams,
+    SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId, SessionInfo,
+    SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
+    SessionReportAgentParams, SessionReportAgentResult, SessionResizeParams, SessionResizeResult,
+    SessionState, SessionStopResult, StateSource, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,6 +35,8 @@ use tokio::sync::{oneshot, Mutex, MutexGuard};
 use tokio_util::codec::{Framed, LinesCodec};
 
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo};
+use pohunek_daemon::events::{spawn_drain, EventLog};
+use pohunek_daemon::notifications::NotificationService;
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use pohunek_daemon::store::Store;
 
@@ -236,7 +244,25 @@ async fn spawn_server_with_config(
     version: &str,
     config: SessionRegistryConfig,
 ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
-    let state = DaemonState::new(HealthInfo::new(version), SessionRegistry::new(config));
+    let event_log_dir = config.event_log_dir.clone();
+    let registry = SessionRegistry::new(config);
+    let notifications = NotificationService::open(&notification_data_dir(socket))
+        .expect("notification service opens");
+    if let Some(event_log_dir) = event_log_dir {
+        let log = Arc::new(EventLog::open(&event_log_dir).expect("event log opens"));
+        let _session_log = spawn_drain(
+            Arc::clone(&log),
+            registry.subscribe(),
+            tokio_util::sync::CancellationToken::default(),
+        );
+        let _notification_log = spawn_drain(
+            log,
+            notifications.subscribe(),
+            tokio_util::sync::CancellationToken::default(),
+        );
+    }
+    let state =
+        DaemonState::new(HealthInfo::new(version), registry).with_notifications(notifications);
     let server = ControlServer::bind_with_state(socket, state)
         .await
         .expect("server binds");
@@ -249,6 +275,13 @@ async fn spawn_server_with_config(
             .await;
     });
     (tx, handle)
+}
+
+fn notification_data_dir(socket: &std::path::Path) -> PathBuf {
+    socket
+        .parent()
+        .expect("test socket has a parent")
+        .join("notification-data")
 }
 
 /// Connect a raw line-framed client to `socket`.
@@ -412,6 +445,13 @@ fn ok_payload(response: Response) -> Value {
     }
 }
 
+fn err_payload(response: Response) -> protocol::ProtocolError {
+    match response {
+        Response::Ok { ok, .. } => panic!("expected error, got ok: {ok}"),
+        Response::Err { err, .. } => err,
+    }
+}
+
 async fn create_session(framed: &mut Framed<UnixStream, LinesCodec>) -> SessionInfo {
     let req = Request::new(
         "session-new",
@@ -512,6 +552,123 @@ async fn input_session(
         .expect("serialize input params"),
     );
     serde_json::from_value(ok_payload(exchange(framed, &req).await)).expect("input result")
+}
+
+fn notification_params(session_id: Option<SessionId>) -> NotificationCreateParams {
+    NotificationCreateParams {
+        source: NotificationSource {
+            provider: "codex".to_owned(),
+            provider_event: "PermissionRequest".to_owned(),
+            host_local_source_id: "codex-hook-1".to_owned(),
+        },
+        kind: NotificationKind::ApprovalRequired,
+        severity: NotificationSeverity::ActionRequired,
+        title: "Approval required".to_owned(),
+        body: "Codex is waiting for owner approval.".to_owned(),
+        metadata: BTreeMap::from([
+            ("provider".to_owned(), "codex".to_owned()),
+            ("provider_event".to_owned(), "PermissionRequest".to_owned()),
+        ]),
+        session_id,
+        agent_kind: None,
+        source_id: Some("permission-request-1".to_owned()),
+        dedupe_key: Some("session:s-1:attention".to_owned()),
+        project_id: None,
+    }
+}
+
+async fn create_notification(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    params: NotificationCreateParams,
+) -> NotificationCreateResult {
+    let req = Request::new(
+        "notification-create",
+        method::NOTIFICATION_CREATE,
+        serde_json::to_value(params).expect("serialize notification params"),
+    );
+    serde_json::from_value(ok_payload(exchange(framed, &req).await))
+        .expect("notification.create result")
+}
+
+async fn update_notification(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    params: NotificationUpdateParams,
+) -> NotificationUpdateResult {
+    let req = Request::new(
+        "notification-update",
+        method::NOTIFICATION_UPDATE,
+        serde_json::to_value(params).expect("serialize notification update"),
+    );
+    serde_json::from_value(ok_payload(exchange(framed, &req).await))
+        .expect("notification.update result")
+}
+
+async fn delete_notification(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    params: NotificationDeleteParams,
+) -> NotificationDeleteResult {
+    let req = Request::new(
+        "notification-delete",
+        method::NOTIFICATION_DELETE,
+        serde_json::to_value(params).expect("serialize notification delete"),
+    );
+    serde_json::from_value(ok_payload(exchange(framed, &req).await))
+        .expect("notification.delete result")
+}
+
+async fn list_notifications(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    params: NotificationListParams,
+) -> NotificationListResult {
+    let req = Request::new(
+        "notification-list",
+        method::NOTIFICATION_LIST,
+        serde_json::to_value(params).expect("serialize list params"),
+    );
+    serde_json::from_value(ok_payload(exchange(framed, &req).await))
+        .expect("notification.list result")
+}
+
+async fn get_notification_policy(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+) -> NotificationPolicyResult {
+    let req = Request::new(
+        "notification-policy-get",
+        method::NOTIFICATION_POLICY_GET,
+        Value::Null,
+    );
+    serde_json::from_value(ok_payload(exchange(framed, &req).await))
+        .expect("notification.policy.get result")
+}
+
+async fn set_notification_policy(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    policy: NotificationPolicy,
+) -> NotificationPolicyResult {
+    let req = Request::new(
+        "notification-policy-set",
+        method::NOTIFICATION_POLICY_SET,
+        serde_json::to_value(NotificationPolicyParams { policy }).expect("serialize policy params"),
+    );
+    serde_json::from_value(ok_payload(exchange(framed, &req).await))
+        .expect("notification.policy.set result")
+}
+
+fn all_enabled_notification_policy() -> NotificationPolicy {
+    NotificationPolicy {
+        attention_dedupe_window_secs: 42,
+        attention_debounce_secs: 5,
+        enabled: NotificationKindPolicy {
+            agent_blocked: true,
+            approval_required: true,
+            turn_completed: true,
+            session_finished: true,
+            error: true,
+            system: true,
+        },
+        codex: None,
+        claude: None,
+    }
 }
 
 async fn read_file_until(path: &Path, marker: &[u8]) -> Vec<u8> {
@@ -640,6 +797,61 @@ async fn wait_for_agent_state_event(
                 return streamed;
             }
         }
+    }
+}
+
+async fn wait_for_notification_event(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    expected_event: &str,
+    id: &protocol::NotificationId,
+    expected_status: Option<NotificationStatus>,
+) -> Event {
+    let expected_status = expected_status
+        .map(serde_json::to_value)
+        .transpose()
+        .expect("serialize status");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut seen = Vec::new();
+    loop {
+        let now = tokio::time::Instant::now();
+        assert!(
+            now < deadline,
+            "notification event did not arrive before timeout; expected event={expected_event} id={}; seen={seen:?}",
+            id.0
+        );
+
+        let line = tokio::time::timeout(deadline - now, framed.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "notification event did not arrive before timeout; expected event={expected_event} id={}; seen={seen:?}",
+                    id.0
+                )
+            })
+            .expect("a streamed event line")
+            .expect("event framing ok");
+        let streamed: Event = serde_json::from_str(&line).expect("parse event");
+        if streamed.event != expected_event {
+            continue;
+        }
+        seen.push(streamed.payload.clone());
+        if expected_event == event::NOTIFICATION_DELETED {
+            if streamed.payload["notification_id"].as_str() == Some(id.0.as_str()) {
+                return streamed;
+            }
+            continue;
+        }
+        let record = &streamed.payload["record"];
+        if record["id"].as_str() != Some(id.0.as_str()) {
+            continue;
+        }
+        if expected_status
+            .as_ref()
+            .is_some_and(|status| record["status"] != *status)
+        {
+            continue;
+        }
+        return streamed;
     }
 }
 
@@ -1527,6 +1739,416 @@ async fn subscribe_streams_session_created_event() {
 }
 
 #[tokio::test]
+async fn notification_api_crud_policy_methods_work() {
+    let socket = temp_socket("notification-api");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+
+    let created = create_notification(&mut control, notification_params(None)).await;
+    assert!(created.created);
+    assert_eq!(created.record.status, NotificationStatus::Unread);
+
+    let listed = list_notifications(&mut control, NotificationListParams::default()).await;
+    assert_eq!(listed.notifications.len(), 1);
+    assert_eq!(listed.notifications[0].id, created.record.id);
+
+    let read = update_notification(
+        &mut control,
+        NotificationUpdateParams {
+            id: created.record.id.clone(),
+            status: NotificationStatus::Read,
+        },
+    )
+    .await;
+    assert_eq!(read.record.status, NotificationStatus::Read);
+    assert!(read.record.read_at.is_some());
+
+    let got_policy = get_notification_policy(&mut control).await;
+    assert!(got_policy.policy.enabled.agent_blocked);
+
+    let replacement_policy = all_enabled_notification_policy();
+    let set_policy = set_notification_policy(&mut control, replacement_policy.clone()).await;
+    assert_eq!(set_policy.policy, replacement_policy);
+
+    let deleted = delete_notification(
+        &mut control,
+        NotificationDeleteParams {
+            id: created.record.id.clone(),
+        },
+    )
+    .await;
+    assert!(deleted.deleted);
+    assert_eq!(deleted.id, created.record.id);
+    let deleted_again = delete_notification(
+        &mut control,
+        NotificationDeleteParams {
+            id: created.record.id.clone(),
+        },
+    )
+    .await;
+    assert!(
+        !deleted_again.deleted,
+        "notification.delete is idempotent for already-deleted records"
+    );
+
+    let default_list = list_notifications(&mut control, NotificationListParams::default()).await;
+    assert!(
+        default_list.notifications.is_empty(),
+        "default list excludes deleted records"
+    );
+    let deleted_list = list_notifications(
+        &mut control,
+        NotificationListParams {
+            status: Some(NotificationStatus::Deleted),
+            ..NotificationListParams::default()
+        },
+    )
+    .await;
+    assert_eq!(deleted_list.notifications.len(), 1);
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn notification_retention_prune_dry_run_and_apply_methods_work() {
+    let socket = temp_socket("notification-retention");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+
+    let read_record = create_notification(&mut control, notification_params(None)).await;
+    let _ = update_notification(
+        &mut control,
+        NotificationUpdateParams {
+            id: read_record.record.id.clone(),
+            status: NotificationStatus::Read,
+        },
+    )
+    .await;
+    let retention_dry_run_req = Request::new(
+        "notification-retention-dry-run",
+        method::NOTIFICATION_RETENTION_PRUNE,
+        serde_json::to_value(NotificationRetentionParams {
+            dry_run: true,
+            status: Some(NotificationStatus::Read),
+            before: Some("2999-01-01T00:00:00Z".to_owned()),
+            limit: None,
+        })
+        .expect("serialize retention params"),
+    );
+    let dry_run: NotificationRetentionResult = serde_json::from_value(ok_payload(
+        exchange(&mut control, &retention_dry_run_req).await,
+    ))
+    .expect("notification.retention.prune dry-run result");
+    assert!(dry_run.dry_run);
+    assert_eq!(dry_run.pruned, vec![read_record.record.id.clone()]);
+
+    let mut archived_params = notification_params(None);
+    archived_params.source.host_local_source_id = "codex-hook-2".to_owned();
+    archived_params.source_id = Some("permission-request-2".to_owned());
+    archived_params.dedupe_key = Some("session:s-2:attention".to_owned());
+    let archived_record = create_notification(&mut control, archived_params).await;
+    let archived = update_notification(
+        &mut control,
+        NotificationUpdateParams {
+            id: archived_record.record.id.clone(),
+            status: NotificationStatus::Archived,
+        },
+    )
+    .await;
+    assert_eq!(archived.record.status, NotificationStatus::Archived);
+
+    let retention_apply_req = Request::new(
+        "notification-retention-apply",
+        method::NOTIFICATION_RETENTION_PRUNE,
+        serde_json::to_value(NotificationRetentionParams {
+            dry_run: false,
+            status: Some(NotificationStatus::Archived),
+            before: Some("2999-01-01T00:00:00Z".to_owned()),
+            limit: None,
+        })
+        .expect("serialize retention apply params"),
+    );
+    let applied: NotificationRetentionResult = serde_json::from_value(ok_payload(
+        exchange(&mut control, &retention_apply_req).await,
+    ))
+    .expect("notification.retention.prune apply result");
+    assert!(!applied.dry_run);
+    assert_eq!(applied.pruned, vec![archived_record.record.id.clone()]);
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn notification_update_returns_typed_errors_for_missing_invalid_and_malformed_requests() {
+    let socket = temp_socket("notification-errors");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+
+    let missing_req = Request::new(
+        "notification-update-missing",
+        method::NOTIFICATION_UPDATE,
+        serde_json::to_value(NotificationUpdateParams {
+            id: protocol::NotificationId("n-missing".to_owned()),
+            status: NotificationStatus::Read,
+        })
+        .expect("serialize missing update"),
+    );
+    let missing = err_payload(exchange(&mut control, &missing_req).await);
+    assert_eq!(missing.class, ErrorClass::Runtime);
+    assert_eq!(missing.code, "notification_not_found");
+
+    let created = create_notification(&mut control, notification_params(None)).await;
+    let _ = update_notification(
+        &mut control,
+        NotificationUpdateParams {
+            id: created.record.id.clone(),
+            status: NotificationStatus::Read,
+        },
+    )
+    .await;
+    let invalid_req = Request::new(
+        "notification-update-invalid-transition",
+        method::NOTIFICATION_UPDATE,
+        serde_json::to_value(NotificationUpdateParams {
+            id: created.record.id.clone(),
+            status: NotificationStatus::Unread,
+        })
+        .expect("serialize invalid transition"),
+    );
+    let invalid = err_payload(exchange(&mut control, &invalid_req).await);
+    assert_eq!(invalid.class, ErrorClass::Runtime);
+    assert_eq!(invalid.code, "invalid_notification_transition");
+
+    let _ = delete_notification(
+        &mut control,
+        NotificationDeleteParams {
+            id: created.record.id.clone(),
+        },
+    )
+    .await;
+    let update_deleted_req = Request::new(
+        "notification-update-deleted",
+        method::NOTIFICATION_UPDATE,
+        serde_json::to_value(NotificationUpdateParams {
+            id: created.record.id.clone(),
+            status: NotificationStatus::Archived,
+        })
+        .expect("serialize deleted update"),
+    );
+    let update_deleted = err_payload(exchange(&mut control, &update_deleted_req).await);
+    assert_eq!(update_deleted.code, "invalid_notification_transition");
+
+    let malformed_list_req = Request::new(
+        "notification-list-malformed",
+        method::NOTIFICATION_LIST,
+        serde_json::json!({ "created_after": "not-rfc3339" }),
+    );
+    let malformed = err_payload(exchange(&mut control, &malformed_list_req).await);
+    assert_eq!(malformed.class, ErrorClass::Runtime);
+    assert_eq!(malformed.code, "invalid_notification_timestamp");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn notification_create_enriches_live_session_context() {
+    let socket = temp_socket("notification-session-context");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+    let session = create_session(&mut control).await;
+
+    let created =
+        create_notification(&mut control, notification_params(Some(session.id.clone()))).await;
+
+    assert_eq!(created.record.session_id, Some(session.id));
+    assert_eq!(created.record.agent_kind, Some(AgentKind::Shell));
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn notification_create_keeps_missing_session_reference() {
+    let socket = temp_socket("notification-missing-session");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+    let missing = SessionId("s-missing".to_owned());
+
+    let created =
+        create_notification(&mut control, notification_params(Some(missing.clone()))).await;
+
+    assert_eq!(created.record.session_id, Some(missing));
+    assert_eq!(created.record.agent_kind, None);
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn subscribe_streams_notification_created_event() {
+    let socket = temp_socket("notification-created-event");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::new(
+        "subscribe-notification-created",
+        method::SUBSCRIBE,
+        Value::Null,
+    );
+    let ack = exchange(&mut subscriber, &subscribe_req).await;
+    assert!(matches!(ack, Response::Ok { .. }), "subscribe should ack");
+
+    let mut control = connect(&socket).await;
+    let created = create_notification(&mut control, notification_params(None)).await;
+    let streamed = wait_for_notification_event(
+        &mut subscriber,
+        event::NOTIFICATION_CREATED,
+        &created.record.id,
+        Some(NotificationStatus::Unread),
+    )
+    .await;
+
+    assert_eq!(
+        streamed.payload["record"]["title"],
+        Value::from("Approval required")
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn subscribe_streams_notification_updated_events_for_read_ack_and_archive() {
+    let socket = temp_socket("notification-updated-events");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+    let created = create_notification(&mut control, notification_params(None)).await;
+
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::new(
+        "subscribe-notification-updated",
+        method::SUBSCRIBE,
+        Value::Null,
+    );
+    let ack = exchange(&mut subscriber, &subscribe_req).await;
+    assert!(matches!(ack, Response::Ok { .. }), "subscribe should ack");
+
+    for status in [
+        NotificationStatus::Read,
+        NotificationStatus::Acknowledged,
+        NotificationStatus::Archived,
+    ] {
+        let updated = update_notification(
+            &mut control,
+            NotificationUpdateParams {
+                id: created.record.id.clone(),
+                status,
+            },
+        )
+        .await;
+        assert_eq!(updated.record.status, status);
+        let streamed = wait_for_notification_event(
+            &mut subscriber,
+            event::NOTIFICATION_UPDATED,
+            &created.record.id,
+            Some(status),
+        )
+        .await;
+        assert_eq!(
+            streamed.payload["record"]["id"],
+            Value::from(created.record.id.0.as_str())
+        );
+    }
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn subscribe_streams_notification_deleted_event() {
+    let socket = temp_socket("notification-deleted-event");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+    let created = create_notification(&mut control, notification_params(None)).await;
+
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::new(
+        "subscribe-notification-deleted",
+        method::SUBSCRIBE,
+        Value::Null,
+    );
+    let ack = exchange(&mut subscriber, &subscribe_req).await;
+    assert!(matches!(ack, Response::Ok { .. }), "subscribe should ack");
+
+    let deleted = delete_notification(
+        &mut control,
+        NotificationDeleteParams {
+            id: created.record.id.clone(),
+        },
+    )
+    .await;
+    assert!(deleted.deleted);
+    let streamed = wait_for_notification_event(
+        &mut subscriber,
+        event::NOTIFICATION_DELETED,
+        &created.record.id,
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        streamed.payload["notification_id"],
+        Value::from(created.record.id.0.as_str())
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
 async fn report_agent_api_records_active_agent_and_streams_report_state() {
     let socket = temp_socket("report-agent-api");
     let config = SessionRegistryConfig {
@@ -2158,6 +2780,46 @@ async fn event_log_records_lifecycle_and_never_terminal_bytes() {
     assert!(
         !text.contains(SENTINEL),
         "event log must never contain raw terminal output: {text}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Notification events are structured control-plane events, so the append-only
+/// event log records them just like session lifecycle events.
+#[tokio::test]
+async fn event_log_records_notification_control_events() {
+    let events_dir = temp_dir("notification-eventlog-data").join("events");
+    let socket = temp_socket("notification-eventlog");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        event_log_dir: Some(events_dir.clone()),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut control = connect(&socket).await;
+    let created = create_notification(&mut control, notification_params(None)).await;
+
+    let log_path = events_dir.join("events.jsonl");
+    let bytes = read_file_until(&log_path, event::NOTIFICATION_CREATED.as_bytes()).await;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut saw_created = false;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let parsed: Value = serde_json::from_str(line)
+            .unwrap_or_else(|err| panic!("invalid event line {line:?}: {err}"));
+        if parsed["event"].as_str() == Some(event::NOTIFICATION_CREATED)
+            && parsed["record"]["id"].as_str() == Some(created.record.id.0.as_str())
+        {
+            saw_created = true;
+        }
+    }
+    assert!(
+        saw_created,
+        "event log must record notification_created for {}: {text}",
+        created.record.id.0
     );
 
     let _ = shutdown.send(());

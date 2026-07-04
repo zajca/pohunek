@@ -18,11 +18,15 @@ use futures::{stream, StreamExt};
 use pohunek_client::{next_request_id, Client, ClientOptions};
 use protocol::{
     event, method, AgentActivity, DaemonHealthResult, Event, HostClass, HostDiscoverParams,
-    HostRecord, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
-    ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams, ProjectPromptParams,
-    ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
-    ProjectShowParams, ProjectShowResult, ProtocolVersion, ProviderKind, Request, SessionId,
-    SessionInfo, SessionListParams, SessionNewParams, SessionNewResult, SessionRemoveResult,
+    HostRecord, NotificationCreatedEvent, NotificationDeleteParams, NotificationDeleteResult,
+    NotificationDeletedEvent, NotificationId, NotificationKind, NotificationListParams,
+    NotificationListResult, NotificationRecord, NotificationSeverity, NotificationStatus,
+    NotificationUpdateParams, NotificationUpdateResult, NotificationUpdatedEvent,
+    ProjectActionParams, ProjectActionResult, ProjectActionsParams, ProjectActionsResult,
+    ProjectAddParams, ProjectInfo, ProjectListParams, ProjectPromptParams, ProjectPromptResult,
+    ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams, ProjectShowParams,
+    ProjectShowResult, ProtocolVersion, ProviderKind, Request, SessionId, SessionInfo,
+    SessionListParams, SessionNewParams, SessionNewResult, SessionRemoveResult,
     SessionRenameParams, SessionRenameResult, SessionResumeResult, SessionSetMetadataParams,
     SessionSetMetadataResult, SessionState, SessionStopResult, StateSource, WorktreeRemoveParams,
     WorktreeRemoveResult,
@@ -42,6 +46,8 @@ const DEFAULT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const DEFAULT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const UI_STATE_FILE: &str = "ui-state.toml";
 const DEFAULT_LEFT_PANE_WIDTH: u16 = 280;
+/// Stable protocol code older daemons return for unknown optional methods.
+const METHOD_NOT_FOUND_CODE: &str = "method_not_found";
 /// Minimum height for the Agents monitor.
 ///
 /// This leaves room for about five compact two-line session rows in the
@@ -50,6 +56,15 @@ const MIN_AGENTS_PANE_HEIGHT: u16 = 360;
 const DEFAULT_AGENTS_PANE_HEIGHT: u16 = MIN_AGENTS_PANE_HEIGHT;
 const DEFAULT_WINDOW_WIDTH: u32 = 960;
 const DEFAULT_WINDOW_HEIGHT: u32 = 640;
+/// Per-query page size used to seed the inbox from `notification.list` on
+/// connect and reconcile.
+///
+/// The seed runs bounded queries for unread, live-default, and deleted
+/// tombstone records (see [`notification_seed_queries`]), so recent unread
+/// records and recent deletes are never crowded out by a long read/archive
+/// history. It bounds reconcile cost while keeping realistic per-host inboxes
+/// accurate.
+const GUI_NOTIFICATION_SEED_LIMIT: u32 = 200;
 
 /// Connection and reconciliation timing for host workers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -190,7 +205,8 @@ impl From<DaemonHealthResult> for HealthSummary {
     }
 }
 
-/// A host snapshot seeded by `daemon.health` and `session.list`.
+/// A host snapshot seeded by `daemon.health`, `session.list`, `project.list`,
+/// and `notification.list`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostSnapshot {
     pub host_id: HostId,
@@ -198,6 +214,11 @@ pub struct HostSnapshot {
     pub sessions: Vec<SessionInfo>,
     pub projects: Vec<ProjectInfo>,
     pub project_error: Option<String>,
+    /// Recent notification records seeded from `notification.list`.
+    ///
+    /// Empty when the host daemon does not implement notifications; seeding is
+    /// non-fatal so a host without the notification surface still connects.
+    pub notifications: Vec<NotificationRecord>,
 }
 
 /// Provider context used to render a prompt preview.
@@ -598,6 +619,12 @@ pub enum HostEvent {
     SessionUpdated(SessionInfo),
     SessionStopped(SessionInfo),
     SessionRemoved(SessionInfo),
+    /// A durable notification record was created on the host.
+    NotificationCreated(NotificationRecord),
+    /// A durable notification record changed lifecycle status or content.
+    NotificationUpdated(NotificationRecord),
+    /// A durable notification record was hard-deleted on the host.
+    NotificationDeleted(NotificationId),
     Other(Event),
 }
 
@@ -767,6 +794,14 @@ pub enum Message {
         host_id: HostId,
         error: String,
     },
+    NotificationUpdateCompleted {
+        host_id: HostId,
+        result: NotificationUpdateResult,
+    },
+    NotificationDeleteCompleted {
+        host_id: HostId,
+        result: NotificationDeleteResult,
+    },
 }
 
 /// Per-host connection state for the headless workspace model.
@@ -792,6 +827,10 @@ pub enum Selection {
     Session {
         host_id: HostId,
         session_id: SessionId,
+    },
+    Notification {
+        host_id: HostId,
+        notification_id: NotificationId,
     },
 }
 
@@ -953,11 +992,19 @@ pub fn default_state_dir() -> Result<PathBuf, UiStateError> {
 }
 
 /// OS notification requested by core state transitions.
+///
+/// Raised from durable `notification_created` events whose severity warrants an
+/// immediate desktop notification (see [`notification_raises_intent`]). The
+/// monotonic `id` lets the shell consume new intents with a cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotificationIntent {
     pub id: u64,
     pub host_id: HostId,
-    pub session_id: SessionId,
+    /// Durable notification that raised this intent, so the shell can open its
+    /// inbox detail on click.
+    pub notification_id: Option<NotificationId>,
+    /// Linked session, when the source notification is bound to one.
+    pub session_id: Option<SessionId>,
     pub title: String,
     pub body: String,
 }
@@ -971,6 +1018,54 @@ pub struct Toast {
     pub message: String,
 }
 
+/// Filter for the inbox notification-list selectors.
+///
+/// Every `Some` field must match; `None` fields do not constrain the result.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NotificationFilter {
+    pub host_id: Option<HostId>,
+    pub status: Option<NotificationStatus>,
+    pub severity: Option<NotificationSeverity>,
+    pub kind: Option<NotificationKind>,
+    pub provider: Option<String>,
+}
+
+impl NotificationFilter {
+    /// Whether `record` passes the non-host constraints of this filter.
+    ///
+    /// The host constraint is applied by the caller, which already iterates
+    /// hosts and can skip whole hosts without inspecting their records.
+    fn matches(&self, record: &NotificationRecord) -> bool {
+        if self.status.is_some_and(|status| status != record.status) {
+            return false;
+        }
+        if self
+            .severity
+            .is_some_and(|severity| severity != record.severity)
+        {
+            return false;
+        }
+        if self.kind.is_some_and(|kind| kind != record.kind) {
+            return false;
+        }
+        if self
+            .provider
+            .as_ref()
+            .is_some_and(|provider| provider != &record.source.provider)
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// One notification row for the inbox list, tagged with its owning host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationRow {
+    pub host_id: HostId,
+    pub record: NotificationRecord,
+}
+
 /// GUI-facing state for one daemon host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostView {
@@ -981,6 +1076,8 @@ pub struct HostView {
     pub project_details: BTreeMap<String, ProjectShowResult>,
     pub prompt: PromptState,
     pub provider: ProviderState,
+    /// Durable notification records for this host, keyed by notification id.
+    pub notifications: BTreeMap<String, NotificationRecord>,
     pub last_agent_state: Option<AgentStateEvent>,
     pub last_error: Option<String>,
 }
@@ -995,6 +1092,7 @@ impl HostView {
             project_details: BTreeMap::new(),
             prompt: PromptState::default(),
             provider: ProviderState::default(),
+            notifications: BTreeMap::new(),
             last_agent_state: None,
             last_error: None,
         }
@@ -1121,21 +1219,6 @@ impl Workspace {
             }
             Message::HostSnapshotLoaded { snapshot } => {
                 let host_id = snapshot.host_id.clone();
-                let previous_sessions = self.hosts.get(&host_id).map(|host| host.sessions.clone());
-                if let Some(previous_sessions) = &previous_sessions {
-                    for session in &snapshot.sessions {
-                        if let Some(previous_session) = previous_sessions.get(&session.id.0) {
-                            push_blocked_effects(
-                                previous_session.activity,
-                                session,
-                                &host_id,
-                                &mut self.notification_intents,
-                                &mut self.toasts,
-                                &mut self.next_intent_id,
-                            );
-                        }
-                    }
-                }
                 let sessions = snapshot
                     .sessions
                     .iter()
@@ -1160,6 +1243,17 @@ impl Workspace {
                     .hosts
                     .get(&host_id)
                     .map_or_else(ProviderState::default, |host| host.provider.clone());
+                // Notifications reconcile by merge, not wholesale replacement: the
+                // seed query returns a bounded recent window, so previously
+                // received records are preserved and missed records are folded in
+                // (deduped by id). Seeding never raises OS intents.
+                let mut notifications = self
+                    .hosts
+                    .get(&host_id)
+                    .map_or_else(BTreeMap::new, |host| host.notifications.clone());
+                for record in snapshot.notifications {
+                    upsert_notification(&mut notifications, record);
+                }
                 self.hosts.insert(
                     snapshot.host_id,
                     HostView {
@@ -1170,6 +1264,7 @@ impl Workspace {
                         project_details: previous_details,
                         prompt: previous_prompt,
                         provider: previous_provider,
+                        notifications,
                         last_agent_state: None,
                         last_error: snapshot.project_error,
                     },
@@ -1607,6 +1702,23 @@ impl Workspace {
                 };
                 host.last_error = Some(error);
             }
+            Message::NotificationUpdateCompleted { host_id, result } => {
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                upsert_notification(&mut host.notifications, result.record);
+            }
+            Message::NotificationDeleteCompleted { host_id, result } => {
+                if !result.deleted {
+                    return;
+                }
+                let host = self
+                    .hosts
+                    .entry(host_id)
+                    .or_insert_with(HostView::connecting);
+                remove_notification(&mut host.notifications, &result.id);
+            }
         }
     }
 
@@ -1644,6 +1756,104 @@ impl Workspace {
             host_id,
             project_id,
         });
+    }
+
+    /// Select a notification, following its linked session when that session is
+    /// still live.
+    ///
+    /// A notification bound to a session the host still knows selects that
+    /// session so the operator lands on the live work. When the session no
+    /// longer exists (or the notification is not session-bound), notification
+    /// detail opens instead so the record is never a dead end.
+    pub fn select_notification(&mut self, host_id: HostId, notification_id: NotificationId) {
+        self.invalidate_github_provider_requests(&host_id);
+        let linked_session = self.hosts.get(&host_id).and_then(|host| {
+            let record = host.notifications.get(&notification_id.0)?;
+            let session_id = record.session_id.as_ref()?;
+            host.sessions
+                .contains_key(&session_id.0)
+                .then(|| session_id.clone())
+        });
+        self.selection = Some(match linked_session {
+            Some(session_id) => Selection::Session {
+                host_id,
+                session_id,
+            },
+            None => Selection::Notification {
+                host_id,
+                notification_id,
+            },
+        });
+    }
+
+    /// Total unread notifications across all hosts.
+    #[must_use]
+    pub fn unread_notification_count(&self) -> usize {
+        self.hosts.values().map(host_unread_count).sum()
+    }
+
+    /// Unread notifications for a single host.
+    #[must_use]
+    pub fn host_unread_notification_count(&self, host_id: &HostId) -> usize {
+        self.hosts.get(host_id).map_or(0, host_unread_count)
+    }
+
+    /// Notifications matching `filter`, newest first.
+    ///
+    /// Ordering is by the stable `(created_at desc, id)` identity, never by the
+    /// volatile lifecycle status, so marking a record read does not reshuffle
+    /// rows under the operator's cursor.
+    #[must_use]
+    pub fn notifications(&self, filter: &NotificationFilter) -> Vec<NotificationRow> {
+        let mut rows = Vec::new();
+        for (host_id, host) in &self.hosts {
+            if filter
+                .host_id
+                .as_ref()
+                .is_some_and(|wanted| wanted != host_id)
+            {
+                continue;
+            }
+            for record in host.notifications.values() {
+                if filter.matches(record) {
+                    rows.push(NotificationRow {
+                        host_id: host_id.clone(),
+                        record: record.clone(),
+                    });
+                }
+            }
+        }
+        rows.sort_by(|left, right| {
+            right
+                .record
+                .created_at
+                .cmp(&left.record.created_at)
+                .then_with(|| left.record.id.0.cmp(&right.record.id.0))
+        });
+        rows
+    }
+
+    /// Look up one notification record by host and id.
+    #[must_use]
+    pub fn notification(
+        &self,
+        host_id: &HostId,
+        id: &NotificationId,
+    ) -> Option<&NotificationRecord> {
+        self.hosts.get(host_id)?.notifications.get(&id.0)
+    }
+
+    /// The currently selected notification record, when a notification is
+    /// selected and still present.
+    #[must_use]
+    pub fn selected_notification(&self) -> Option<&NotificationRecord> {
+        match self.selection.as_ref()? {
+            Selection::Notification {
+                host_id,
+                notification_id,
+            } => self.notification(host_id, notification_id),
+            _ => None,
+        }
     }
 
     /// Build the agents monitor model from current host state.
@@ -1874,77 +2084,105 @@ fn apply_host_event(
     match event {
         HostEvent::AgentState(state) => {
             if let Some(session) = host.sessions.get_mut(&state.session_id.0) {
-                let previous = session.activity;
                 session.activity = Some(state.activity);
                 session.state_source = state.source;
-                push_blocked_effects(
-                    previous,
-                    session,
-                    host_id,
-                    notifications,
-                    toasts,
-                    next_intent_id,
-                );
             }
             host.last_agent_state = Some(state);
         }
         HostEvent::SessionCreated(session)
         | HostEvent::SessionUpdated(session)
         | HostEvent::SessionStopped(session) => {
-            let previous = host
-                .sessions
-                .get(&session.id.0)
-                .and_then(|existing| existing.activity);
-            push_blocked_effects(
-                previous,
-                &session,
-                host_id,
-                notifications,
-                toasts,
-                next_intent_id,
-            );
             host.sessions.insert(session.id.0.clone(), session);
         }
         HostEvent::SessionRemoved(session) => {
             host.sessions.remove(&session.id.0);
         }
+        HostEvent::NotificationCreated(record) => {
+            // A freshly created durable notification is the single source of OS
+            // notifications: the daemon projector emits a durable `agent_blocked`
+            // for a blocked session, which replaces the removed transient path.
+            push_notification_effects(&record, host_id, notifications, toasts, next_intent_id);
+            upsert_notification(&mut host.notifications, record);
+        }
+        HostEvent::NotificationUpdated(record) => {
+            // Lifecycle/content changes (read, ack, archive, supersede) update the
+            // stored record but never re-raise an OS intent.
+            upsert_notification(&mut host.notifications, record);
+        }
+        HostEvent::NotificationDeleted(id) => {
+            remove_notification(&mut host.notifications, &id);
+        }
         HostEvent::Other(_) => {}
     }
 }
 
-fn push_blocked_effects(
-    previous: Option<AgentActivity>,
-    session: &SessionInfo,
+/// Store or replace a notification record, dropping it when the daemon reports a
+/// deleted lifecycle status so a hard-removed record cannot linger in the inbox.
+fn upsert_notification(
+    store: &mut BTreeMap<String, NotificationRecord>,
+    record: NotificationRecord,
+) {
+    if record.status == NotificationStatus::Deleted {
+        store.remove(&record.id.0);
+    } else {
+        store.insert(record.id.0.clone(), record);
+    }
+}
+
+/// Remove a notification record by id.
+fn remove_notification(store: &mut BTreeMap<String, NotificationRecord>, id: &NotificationId) {
+    store.remove(&id.0);
+}
+
+/// Count unread notifications held by one host.
+fn host_unread_count(host: &HostView) -> usize {
+    host.notifications
+        .values()
+        .filter(|record| record.status == NotificationStatus::Unread)
+        .count()
+}
+
+/// Whether a freshly created notification warrants a desktop OS notification.
+///
+/// Only durable action-required and error notifications interrupt the operator;
+/// informational, success, and warning records land in the inbox silently.
+fn notification_raises_intent(record: &NotificationRecord) -> bool {
+    matches!(
+        record.severity,
+        NotificationSeverity::ActionRequired | NotificationSeverity::Error
+    )
+}
+
+/// Append the OS intent (and, when session-linked, the in-app toast) for a newly
+/// created notification that warrants an interrupt.
+fn push_notification_effects(
+    record: &NotificationRecord,
     host_id: &HostId,
     notifications: &mut Vec<NotificationIntent>,
     toasts: &mut Vec<Toast>,
     next_intent_id: &mut u64,
 ) {
-    if previous == Some(AgentActivity::Blocked) || session.activity != Some(AgentActivity::Blocked)
-    {
+    if !notification_raises_intent(record) {
         return;
     }
     let id = *next_intent_id;
     *next_intent_id += 1;
-    let title = "Agent blocked".to_owned();
-    let body = format!(
-        "{} on {} is waiting for input",
-        session.agent,
-        host_id.as_str()
-    );
     notifications.push(NotificationIntent {
         id,
         host_id: host_id.clone(),
-        session_id: session.id.clone(),
-        title,
-        body: body.clone(),
+        notification_id: Some(record.id.clone()),
+        session_id: record.session_id.clone(),
+        title: record.title.clone(),
+        body: record.body.clone(),
     });
-    toasts.push(Toast {
-        id,
-        host_id: host_id.clone(),
-        session_id: session.id.clone(),
-        message: body,
-    });
+    if let Some(session_id) = record.session_id.clone() {
+        toasts.push(Toast {
+            id,
+            host_id: host_id.clone(),
+            session_id,
+            message: record.body.clone(),
+        });
+    }
 }
 
 /// Errors raised by the GUI core bridge.
@@ -2121,6 +2359,57 @@ pub async fn rename_session_with_options(
     options: ConnectionOptions,
 ) -> Result<SessionRenameResult, CoreError> {
     call_host::<method::SessionRename>(config, options, params).await
+}
+
+/// List notification records on a host through the SDK.
+pub async fn list_notifications(
+    config: &HostConfig,
+    params: NotificationListParams,
+) -> Result<NotificationListResult, CoreError> {
+    list_notifications_with_options(config, params, ConnectionOptions::default()).await
+}
+
+/// List notification records with explicit connection options.
+pub async fn list_notifications_with_options(
+    config: &HostConfig,
+    params: NotificationListParams,
+    options: ConnectionOptions,
+) -> Result<NotificationListResult, CoreError> {
+    call_host::<method::NotificationList>(config, options, params).await
+}
+
+/// Update a notification's lifecycle status on a host.
+pub async fn update_notification(
+    config: &HostConfig,
+    params: NotificationUpdateParams,
+) -> Result<NotificationUpdateResult, CoreError> {
+    update_notification_with_options(config, params, ConnectionOptions::default()).await
+}
+
+/// Update a notification with explicit connection options.
+pub async fn update_notification_with_options(
+    config: &HostConfig,
+    params: NotificationUpdateParams,
+    options: ConnectionOptions,
+) -> Result<NotificationUpdateResult, CoreError> {
+    call_host::<method::NotificationUpdate>(config, options, params).await
+}
+
+/// Delete a notification record on a host.
+pub async fn delete_notification(
+    config: &HostConfig,
+    params: NotificationDeleteParams,
+) -> Result<NotificationDeleteResult, CoreError> {
+    delete_notification_with_options(config, params, ConnectionOptions::default()).await
+}
+
+/// Delete a notification with explicit connection options.
+pub async fn delete_notification_with_options(
+    config: &HostConfig,
+    params: NotificationDeleteParams,
+    options: ConnectionOptions,
+) -> Result<NotificationDeleteResult, CoreError> {
+    call_host::<method::NotificationDelete>(config, options, params).await
 }
 
 /// List projects on a host through the SDK.
@@ -2465,13 +2754,109 @@ async fn load_host_snapshot_with_options(
         Ok(projects) => (projects, None),
         Err(err) => (Vec::new(), Some(format!("project.list failed: {err}"))),
     };
+    let notifications = load_host_notifications(&mut client, &config.id).await;
     Ok(HostSnapshot {
         host_id: config.id.clone(),
         health,
         sessions,
         projects: projects.0,
-        project_error: projects.1,
+        project_error: combine_seed_errors(projects.1, notifications.1),
+        notifications: notifications.0,
     })
+}
+
+/// Seed recent notifications for one host, deduped across the seed queries.
+///
+/// Seeding is non-fatal: a host daemon without the notification surface answers
+/// `method_not_found`, which is logged and treated as an empty inbox so the host
+/// still connects. Runtime failures are surfaced through the snapshot's existing
+/// degraded-status error channel. The daemon does not poison the connection on
+/// a handled error, so this reuses the snapshot client after
+/// `session.list`/`project.list`.
+async fn load_host_notifications(
+    client: &mut Client,
+    host_id: &HostId,
+) -> (Vec<NotificationRecord>, Option<String>) {
+    let mut records: BTreeMap<String, NotificationRecord> = BTreeMap::new();
+    let mut first_error = None;
+    for params in notification_seed_queries() {
+        match call_client::<method::NotificationList>(client, params).await {
+            Ok(result) => {
+                for record in result.notifications {
+                    records.insert(record.id.0.clone(), record);
+                }
+            }
+            Err(err) => {
+                if notification_seed_unsupported(&err) {
+                    tracing::event!(
+                        name: "gui.notification_seed.unsupported",
+                        tracing::Level::DEBUG,
+                        host_id = %host_id,
+                        error = %err,
+                        "notification seed unsupported; treating as empty inbox"
+                    );
+                    return (Vec::new(), None);
+                }
+                tracing::event!(
+                    name: "gui.notification_seed.query.failed",
+                    tracing::Level::WARN,
+                    host_id = %host_id,
+                    error = %err,
+                    "notification seed query failed; marking inbox degraded"
+                );
+                first_error.get_or_insert_with(|| format!("notification.list failed: {err}"));
+            }
+        }
+    }
+    (records.into_values().collect(), first_error)
+}
+
+fn combine_seed_errors(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
+        (Some(error), None) | (None, Some(error)) => Some(error),
+        (None, None) => None,
+    }
+}
+
+fn notification_seed_unsupported(err: &CoreError) -> bool {
+    match err {
+        CoreError::Client(
+            pohunek_client::ClientError::Protocol(err)
+            | pohunek_client::ClientError::RemoteProtocol { source: err, .. },
+        )
+        | CoreError::Protocol(err) => {
+            err.class == protocol::ErrorClass::Daemon && err.code == METHOD_NOT_FOUND_CODE
+        }
+        _ => false,
+    }
+}
+
+/// Seed queries run on connect and reconcile: recent unread first so an unread
+/// backlog is never crowded out, then recent records of default live statuses
+/// for read/archived context, then a bounded deleted tombstone window.
+///
+/// The tombstone query is intentionally limited to [`GUI_NOTIFICATION_SEED_LIMIT`]:
+/// reconnect only reconciles deletes still covered by the daemon's recent
+/// deleted window. Live delete events remain the authoritative path while the
+/// GUI is connected, and seed reconciliation never raises OS intents.
+fn notification_seed_queries() -> [NotificationListParams; 3] {
+    [
+        NotificationListParams {
+            status: Some(NotificationStatus::Unread),
+            limit: Some(GUI_NOTIFICATION_SEED_LIMIT),
+            ..NotificationListParams::default()
+        },
+        NotificationListParams {
+            limit: Some(GUI_NOTIFICATION_SEED_LIMIT),
+            ..NotificationListParams::default()
+        },
+        NotificationListParams {
+            status: Some(NotificationStatus::Deleted),
+            limit: Some(GUI_NOTIFICATION_SEED_LIMIT),
+            ..NotificationListParams::default()
+        },
+    ]
 }
 
 /// Each GUI command opens a short-lived client so reconnect state is localized
@@ -2797,12 +3182,36 @@ fn parse_event_message(host_id: &HostId, line: &str) -> Result<Message, CoreErro
         event::SESSION_UPDATED => HostEvent::SessionUpdated(parse_session_event(&raw)?),
         event::SESSION_STOPPED => HostEvent::SessionStopped(parse_session_event(&raw)?),
         event::SESSION_REMOVED => HostEvent::SessionRemoved(parse_session_event(&raw)?),
+        event::NOTIFICATION_CREATED => {
+            HostEvent::NotificationCreated(parse_notification_created(&raw)?)
+        }
+        event::NOTIFICATION_UPDATED => {
+            HostEvent::NotificationUpdated(parse_notification_updated(&raw)?)
+        }
+        event::NOTIFICATION_DELETED => {
+            HostEvent::NotificationDeleted(parse_notification_deleted(&raw)?)
+        }
         _ => HostEvent::Other(raw),
     };
     Ok(Message::HostEvent {
         host_id: host_id.clone(),
         event,
     })
+}
+
+fn parse_notification_created(raw: &Event) -> Result<NotificationRecord, CoreError> {
+    let event: NotificationCreatedEvent = serde_json::from_value(raw.payload.clone())?;
+    Ok(event.record)
+}
+
+fn parse_notification_updated(raw: &Event) -> Result<NotificationRecord, CoreError> {
+    let event: NotificationUpdatedEvent = serde_json::from_value(raw.payload.clone())?;
+    Ok(event.record)
+}
+
+fn parse_notification_deleted(raw: &Event) -> Result<NotificationId, CoreError> {
+    let event: NotificationDeletedEvent = serde_json::from_value(raw.payload.clone())?;
+    Ok(event.notification_id)
 }
 
 fn parse_agent_state(raw: Event) -> Result<AgentStateEvent, CoreError> {
@@ -2972,6 +3381,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use protocol::NotificationSource;
+
     use super::*;
 
     #[test]
@@ -3396,6 +3807,7 @@ mod tests {
                 sessions: Vec::new(),
                 projects: vec![project("project-a", "/repo/current")],
                 project_error: None,
+                notifications: Vec::new(),
             },
         });
         workspace.selection = Some(Selection::Project {
@@ -3514,19 +3926,598 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_relist_notifies_known_session_transition_to_blocked() {
+    fn blocked_session_agent_state_no_longer_emits_transient_intent() {
         let mut workspace = Workspace::default();
         workspace.apply(Message::HostSnapshotLoaded {
             snapshot: snapshot("local", vec![session("s-1", Some(AgentActivity::Working))]),
         });
 
-        workspace.apply(Message::HostSnapshotLoaded {
-            snapshot: snapshot("local", vec![session("s-1", Some(AgentActivity::Blocked))]),
+        let raw = Event::new(
+            event::AGENT_STATE,
+            serde_json::json!({
+                "session_id": "s-1",
+                "activity": "blocked",
+                "source": "osc_title"
+            }),
+        );
+        workspace.apply(Message::HostEvent {
+            host_id: HostId::new("local"),
+            event: HostEvent::AgentState(parse_agent_state(raw).expect("agent state")),
         });
 
+        // The transient blocked-session OS notification path was removed; OS
+        // intents now originate from durable `notification_created` events that
+        // the daemon projector produces for a blocked session.
+        assert!(workspace.notification_intents.is_empty());
+        assert!(workspace.toasts.is_empty());
+    }
+
+    #[test]
+    fn host_snapshot_carries_notification_records() {
+        let mut workspace = Workspace::default();
+        let snapshot = snapshot_with_notifications(
+            "local",
+            vec![session("s-1", None)],
+            vec![notification_record(
+                "n-1",
+                NotificationStatus::Unread,
+                NotificationSeverity::ActionRequired,
+            )],
+        );
+        workspace.apply(Message::HostSnapshotLoaded { snapshot });
+
+        let host = workspace.hosts.get(&HostId::new("local")).expect("host");
+        assert!(host.notifications.contains_key("n-1"));
+    }
+
+    #[test]
+    fn notification_created_event_parses_from_subscription_line() {
+        let record = notification_record(
+            "n-1",
+            NotificationStatus::Unread,
+            NotificationSeverity::ActionRequired,
+        );
+        let event = Event::new(
+            event::NOTIFICATION_CREATED,
+            serde_json::to_value(NotificationCreatedEvent {
+                record: record.clone(),
+            })
+            .expect("payload"),
+        );
+        let line = serde_json::to_string(&event).expect("line");
+
+        let message = parse_event_message(&HostId::new("local"), &line).expect("parse");
+        match message {
+            Message::HostEvent {
+                event: HostEvent::NotificationCreated(parsed),
+                ..
+            } => assert_eq!(parsed, record),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notification_updated_event_parses_from_subscription_line() {
+        let record = notification_record(
+            "n-1",
+            NotificationStatus::Read,
+            NotificationSeverity::ActionRequired,
+        );
+        let event = Event::new(
+            event::NOTIFICATION_UPDATED,
+            serde_json::to_value(NotificationUpdatedEvent {
+                record: record.clone(),
+            })
+            .expect("payload"),
+        );
+        let line = serde_json::to_string(&event).expect("line");
+
+        let message = parse_event_message(&HostId::new("local"), &line).expect("parse");
+        match message {
+            Message::HostEvent {
+                event: HostEvent::NotificationUpdated(parsed),
+                ..
+            } => assert_eq!(parsed, record),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notification_deleted_event_parses_from_subscription_line() {
+        let event = Event::new(
+            event::NOTIFICATION_DELETED,
+            serde_json::to_value(NotificationDeletedEvent {
+                notification_id: NotificationId("n-9".to_owned()),
+            })
+            .expect("payload"),
+        );
+        let line = serde_json::to_string(&event).expect("line");
+
+        let message = parse_event_message(&HostId::new("local"), &line).expect("parse");
+        match message {
+            Message::HostEvent {
+                event: HostEvent::NotificationDeleted(id),
+                ..
+            } => assert_eq!(id, NotificationId("n-9".to_owned())),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_stores_notifications_per_host() {
+        let mut workspace = Workspace::default();
+        // Events only apply to hosts already known through the connect path; a
+        // snapshot seeds each host before its notification events arrive.
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot("host-a", vec![]),
+        });
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot("host-b", vec![]),
+        });
+        workspace.apply(notification_created(
+            "host-a",
+            notification_record(
+                "n-1",
+                NotificationStatus::Unread,
+                NotificationSeverity::ActionRequired,
+            ),
+        ));
+        workspace.apply(notification_created(
+            "host-b",
+            notification_record(
+                "n-2",
+                NotificationStatus::Unread,
+                NotificationSeverity::Error,
+            ),
+        ));
+
+        let host_a = workspace.hosts.get(&HostId::new("host-a")).expect("host-a");
+        let host_b = workspace.hosts.get(&HostId::new("host-b")).expect("host-b");
+        assert!(host_a.notifications.contains_key("n-1"));
+        assert!(!host_a.notifications.contains_key("n-2"));
+        assert!(host_b.notifications.contains_key("n-2"));
+    }
+
+    #[test]
+    fn unread_counts_track_lifecycle_transitions() {
+        let mut workspace = Workspace::default();
+        let host = HostId::new("local");
+        // Seed the host through the connect path so its events are not dropped.
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot("local", vec![]),
+        });
+        workspace.apply(notification_created(
+            "local",
+            notification_record(
+                "n-1",
+                NotificationStatus::Unread,
+                NotificationSeverity::ActionRequired,
+            ),
+        ));
+        workspace.apply(notification_created(
+            "local",
+            notification_record(
+                "n-2",
+                NotificationStatus::Unread,
+                NotificationSeverity::Error,
+            ),
+        ));
+        assert_eq!(workspace.unread_notification_count(), 2);
+        assert_eq!(workspace.host_unread_notification_count(&host), 2);
+
+        workspace.apply(notification_updated(
+            "local",
+            notification_record(
+                "n-1",
+                NotificationStatus::Read,
+                NotificationSeverity::ActionRequired,
+            ),
+        ));
+        assert_eq!(workspace.unread_notification_count(), 1);
+
+        workspace.apply(notification_updated(
+            "local",
+            notification_record(
+                "n-2",
+                NotificationStatus::Acknowledged,
+                NotificationSeverity::Error,
+            ),
+        ));
+        assert_eq!(workspace.unread_notification_count(), 0);
+
+        workspace.apply(notification_updated(
+            "local",
+            notification_record(
+                "n-1",
+                NotificationStatus::Archived,
+                NotificationSeverity::ActionRequired,
+            ),
+        ));
+        assert_eq!(workspace.unread_notification_count(), 0);
+
+        workspace.apply(Message::HostEvent {
+            host_id: HostId::new("local"),
+            event: HostEvent::NotificationDeleted(NotificationId("n-2".to_owned())),
+        });
+        assert!(!workspace
+            .hosts
+            .get(&host)
+            .expect("host")
+            .notifications
+            .contains_key("n-2"));
+    }
+
+    #[test]
+    fn reconnect_reconciliation_merges_missed_notifications_without_duplicates() {
+        let mut workspace = Workspace::default();
+        workspace.apply(notification_created(
+            "local",
+            notification_record(
+                "n-1",
+                NotificationStatus::Unread,
+                NotificationSeverity::ActionRequired,
+            ),
+        ));
+        let intents_after_live = workspace.notification_intents.len();
+
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot_with_notifications(
+                "local",
+                vec![],
+                vec![
+                    notification_record(
+                        "n-1",
+                        NotificationStatus::Unread,
+                        NotificationSeverity::ActionRequired,
+                    ),
+                    notification_record(
+                        "n-2",
+                        NotificationStatus::Unread,
+                        NotificationSeverity::ActionRequired,
+                    ),
+                ],
+            ),
+        });
+
+        let host = workspace.hosts.get(&HostId::new("local")).expect("host");
+        assert_eq!(host.notifications.len(), 2);
+        assert!(host.notifications.contains_key("n-1"));
+        assert!(host.notifications.contains_key("n-2"));
+        // Seeding never emits OS intents; otherwise the periodic reconcile tick
+        // would re-notify every still-unread record on every reload.
+        assert_eq!(workspace.notification_intents.len(), intents_after_live);
+    }
+
+    #[test]
+    fn reconnect_reconciliation_removes_seeded_deleted_notifications() {
+        let mut workspace = Workspace::default();
+        workspace.apply(notification_created(
+            "local",
+            notification_record(
+                "n-deleted",
+                NotificationStatus::Unread,
+                NotificationSeverity::ActionRequired,
+            ),
+        ));
+        workspace.apply(notification_created(
+            "local",
+            notification_record(
+                "n-live",
+                NotificationStatus::Unread,
+                NotificationSeverity::ActionRequired,
+            ),
+        ));
+        let intents_after_live = workspace.notification_intents.len();
+
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot_with_notifications(
+                "local",
+                vec![],
+                vec![
+                    notification_record(
+                        "n-live",
+                        NotificationStatus::Unread,
+                        NotificationSeverity::ActionRequired,
+                    ),
+                    notification_record(
+                        "n-deleted",
+                        NotificationStatus::Deleted,
+                        NotificationSeverity::ActionRequired,
+                    ),
+                ],
+            ),
+        });
+
+        let host = workspace.hosts.get(&HostId::new("local")).expect("host");
+        assert!(host.notifications.contains_key("n-live"));
+        assert!(!host.notifications.contains_key("n-deleted"));
+        assert_eq!(workspace.notification_intents.len(), intents_after_live);
+    }
+
+    #[test]
+    fn notification_seed_queries_include_deleted_tombstone_window() {
+        let queries = notification_seed_queries();
+
+        assert!(
+            queries
+                .iter()
+                .any(|params| params.status == Some(NotificationStatus::Deleted)),
+            "reconnect seed must include deleted tombstones"
+        );
+    }
+
+    #[test]
+    fn selecting_linked_notification_selects_existing_session() {
+        let mut workspace = Workspace::default();
+        let mut record = notification_record(
+            "n-1",
+            NotificationStatus::Unread,
+            NotificationSeverity::ActionRequired,
+        );
+        record.session_id = Some(SessionId("s-1".to_owned()));
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot_with_notifications(
+                "local",
+                vec![session("s-1", Some(AgentActivity::Blocked))],
+                vec![record],
+            ),
+        });
+
+        workspace.select_notification(HostId::new("local"), NotificationId("n-1".to_owned()));
+
+        assert_eq!(
+            workspace.selection,
+            Some(Selection::Session {
+                host_id: HostId::new("local"),
+                session_id: SessionId("s-1".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn selecting_notification_without_live_session_opens_notification_detail() {
+        let mut workspace = Workspace::default();
+        let mut record = notification_record(
+            "n-1",
+            NotificationStatus::Unread,
+            NotificationSeverity::ActionRequired,
+        );
+        record.session_id = Some(SessionId("s-gone".to_owned()));
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot_with_notifications("local", vec![], vec![record]),
+        });
+
+        workspace.select_notification(HostId::new("local"), NotificationId("n-1".to_owned()));
+
+        assert_eq!(
+            workspace.selection,
+            Some(Selection::Notification {
+                host_id: HostId::new("local"),
+                notification_id: NotificationId("n-1".to_owned()),
+            })
+        );
+        assert!(workspace.selected_notification().is_some());
+    }
+
+    #[test]
+    fn action_required_notification_created_emits_single_os_intent() {
+        let mut workspace = Workspace::default();
+        // Seed the host through the connect path so its events are not dropped.
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot("local", vec![]),
+        });
+        let mut record = notification_record(
+            "n-1",
+            NotificationStatus::Unread,
+            NotificationSeverity::ActionRequired,
+        );
+        record.session_id = Some(SessionId("s-1".to_owned()));
+        workspace.apply(notification_created("local", record));
+
         assert_eq!(workspace.notification_intents.len(), 1);
-        assert_eq!(workspace.notification_intents[0].session_id.0, "s-1");
+        let intent = &workspace.notification_intents[0];
+        assert_eq!(
+            intent.notification_id,
+            Some(NotificationId("n-1".to_owned()))
+        );
+        assert_eq!(intent.session_id, Some(SessionId("s-1".to_owned())));
+        // A session-linked notification also surfaces an in-app toast.
         assert_eq!(workspace.toasts.len(), 1);
+    }
+
+    #[test]
+    fn informational_notification_created_does_not_emit_os_intent() {
+        let mut workspace = Workspace::default();
+        workspace.apply(notification_created(
+            "local",
+            notification_record(
+                "n-1",
+                NotificationStatus::Unread,
+                NotificationSeverity::Info,
+            ),
+        ));
+
+        assert!(workspace.notification_intents.is_empty());
+        assert!(workspace.toasts.is_empty());
+    }
+
+    #[test]
+    fn snapshot_seed_does_not_emit_notification_intents() {
+        let mut workspace = Workspace::default();
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot_with_notifications(
+                "local",
+                vec![],
+                vec![notification_record(
+                    "n-1",
+                    NotificationStatus::Unread,
+                    NotificationSeverity::ActionRequired,
+                )],
+            ),
+        });
+
+        assert!(workspace.notification_intents.is_empty());
+        assert!(workspace
+            .hosts
+            .get(&HostId::new("local"))
+            .expect("host")
+            .notifications
+            .contains_key("n-1"));
+    }
+
+    #[test]
+    fn notification_update_completed_message_updates_store() {
+        let mut workspace = Workspace::default();
+        workspace.apply(notification_created(
+            "local",
+            notification_record(
+                "n-1",
+                NotificationStatus::Unread,
+                NotificationSeverity::ActionRequired,
+            ),
+        ));
+        workspace.apply(Message::NotificationUpdateCompleted {
+            host_id: HostId::new("local"),
+            result: NotificationUpdateResult {
+                record: notification_record(
+                    "n-1",
+                    NotificationStatus::Read,
+                    NotificationSeverity::ActionRequired,
+                ),
+            },
+        });
+
+        assert_eq!(workspace.unread_notification_count(), 0);
+        assert_eq!(
+            workspace
+                .hosts
+                .get(&HostId::new("local"))
+                .expect("host")
+                .notifications
+                .get("n-1")
+                .expect("n-1")
+                .status,
+            NotificationStatus::Read
+        );
+    }
+
+    #[test]
+    fn notification_delete_completed_message_removes_record() {
+        let mut workspace = Workspace::default();
+        workspace.apply(notification_created(
+            "local",
+            notification_record(
+                "n-1",
+                NotificationStatus::Unread,
+                NotificationSeverity::ActionRequired,
+            ),
+        ));
+        workspace.apply(Message::NotificationDeleteCompleted {
+            host_id: HostId::new("local"),
+            result: NotificationDeleteResult {
+                id: NotificationId("n-1".to_owned()),
+                deleted: true,
+            },
+        });
+
+        assert!(!workspace
+            .hosts
+            .get(&HostId::new("local"))
+            .expect("host")
+            .notifications
+            .contains_key("n-1"));
+    }
+
+    #[test]
+    fn notifications_selector_filters_and_orders_newest_first() {
+        let mut workspace = Workspace::default();
+        // Seed the host through the connect path so its events are not dropped.
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot("local", vec![]),
+        });
+        let mut older = notification_record(
+            "n-old",
+            NotificationStatus::Unread,
+            NotificationSeverity::ActionRequired,
+        );
+        older.created_at = "2026-07-01T00:00:00Z".to_owned();
+        let mut newer = notification_record(
+            "n-new",
+            NotificationStatus::Read,
+            NotificationSeverity::Error,
+        );
+        newer.created_at = "2026-07-03T00:00:00Z".to_owned();
+        newer.kind = NotificationKind::Error;
+        newer.source.provider = "claude".to_owned();
+        workspace.apply(notification_created("local", older));
+        workspace.apply(notification_created("local", newer));
+
+        let rows = workspace.notifications(&NotificationFilter::default());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].record.id, NotificationId("n-new".to_owned()));
+        assert_eq!(rows[1].record.id, NotificationId("n-old".to_owned()));
+
+        let unread = workspace.notifications(&NotificationFilter {
+            status: Some(NotificationStatus::Unread),
+            ..NotificationFilter::default()
+        });
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].record.id, NotificationId("n-old".to_owned()));
+
+        let errors = workspace.notifications(&NotificationFilter {
+            severity: Some(NotificationSeverity::Error),
+            ..NotificationFilter::default()
+        });
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].record.id, NotificationId("n-new".to_owned()));
+
+        let claude = workspace.notifications(&NotificationFilter {
+            provider: Some("claude".to_owned()),
+            ..NotificationFilter::default()
+        });
+        assert_eq!(claude.len(), 1);
+
+        let error_kind = workspace.notifications(&NotificationFilter {
+            kind: Some(NotificationKind::Error),
+            ..NotificationFilter::default()
+        });
+        assert_eq!(error_kind.len(), 1);
+    }
+
+    #[test]
+    fn notifications_selector_filters_by_host() {
+        let mut workspace = Workspace::default();
+        // Seed both hosts through the connect path so their events are not dropped.
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot("host-a", vec![]),
+        });
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot("host-b", vec![]),
+        });
+        workspace.apply(notification_created(
+            "host-a",
+            notification_record(
+                "n-1",
+                NotificationStatus::Unread,
+                NotificationSeverity::ActionRequired,
+            ),
+        ));
+        workspace.apply(notification_created(
+            "host-b",
+            notification_record(
+                "n-2",
+                NotificationStatus::Unread,
+                NotificationSeverity::Error,
+            ),
+        ));
+
+        let rows = workspace.notifications(&NotificationFilter {
+            host_id: Some(HostId::new("host-b")),
+            ..NotificationFilter::default()
+        });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].host_id, HostId::new("host-b"));
+        assert_eq!(rows[0].record.id, NotificationId("n-2".to_owned()));
     }
 
     #[test]
@@ -3622,6 +4613,7 @@ mod tests {
             sessions,
             projects: Vec::new(),
             project_error: None,
+            notifications: Vec::new(),
         }
     }
 
@@ -3670,6 +4662,63 @@ mod tests {
             is_bare: false,
             added_at: "2026-01-01T00:00:00Z".to_owned(),
             last_used_at: "2026-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn snapshot_with_notifications(
+        host_id: &str,
+        sessions: Vec<SessionInfo>,
+        notifications: Vec<NotificationRecord>,
+    ) -> HostSnapshot {
+        HostSnapshot {
+            notifications,
+            ..snapshot(host_id, sessions)
+        }
+    }
+
+    fn notification_record(
+        id: &str,
+        status: NotificationStatus,
+        severity: NotificationSeverity,
+    ) -> NotificationRecord {
+        NotificationRecord {
+            id: NotificationId(id.to_owned()),
+            source: NotificationSource {
+                provider: "codex".to_owned(),
+                provider_event: "agent_blocked".to_owned(),
+                host_local_source_id: format!("src-{id}"),
+            },
+            kind: NotificationKind::AgentBlocked,
+            severity,
+            status,
+            title: format!("Notification {id}"),
+            body: "Agent is waiting for input".to_owned(),
+            metadata: BTreeMap::new(),
+            created_at: "2026-07-03T00:00:00Z".to_owned(),
+            session_id: None,
+            agent_kind: None,
+            source_id: None,
+            dedupe_key: None,
+            project_id: None,
+            read_at: None,
+            acked_at: None,
+            archived_at: None,
+            deleted_at: None,
+            superseded_by: None,
+        }
+    }
+
+    fn notification_created(host: &str, record: NotificationRecord) -> Message {
+        Message::HostEvent {
+            host_id: HostId::new(host),
+            event: HostEvent::NotificationCreated(record),
+        }
+    }
+
+    fn notification_updated(host: &str, record: NotificationRecord) -> Message {
+        Message::HostEvent {
+            host_id: HostId::new(host),
+            event: HostEvent::NotificationUpdated(record),
         }
     }
 }

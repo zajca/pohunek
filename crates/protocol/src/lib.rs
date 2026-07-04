@@ -27,6 +27,7 @@ mod envelope;
 mod error;
 mod integration;
 pub mod method;
+mod notification;
 mod project;
 mod session;
 mod version;
@@ -53,6 +54,16 @@ pub use integration::{
 };
 #[doc(inline)]
 pub use method::Method;
+#[doc(inline)]
+pub use notification::{
+    NotificationCreateParams, NotificationCreateResult, NotificationCreatedEvent,
+    NotificationDeleteParams, NotificationDeleteResult, NotificationDeletedEvent, NotificationId,
+    NotificationKind, NotificationKindPolicy, NotificationListParams, NotificationListResult,
+    NotificationPolicy, NotificationPolicyParams, NotificationPolicyResult, NotificationRecord,
+    NotificationRetentionParams, NotificationRetentionResult, NotificationSeverity,
+    NotificationSource, NotificationStatus, NotificationUpdateParams, NotificationUpdateResult,
+    NotificationUpdatedEvent,
+};
 #[doc(inline)]
 pub use project::{
     ActionSummary, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
@@ -83,6 +94,9 @@ pub mod event {
     pub const AGENT_STATE: &str = "agent_state";
     pub const ATTACH_OPENED: &str = "attach_opened";
     pub const ATTACH_CLOSED: &str = "attach_closed";
+    pub const NOTIFICATION_CREATED: &str = "notification_created";
+    pub const NOTIFICATION_UPDATED: &str = "notification_updated";
+    pub const NOTIFICATION_DELETED: &str = "notification_deleted";
     pub const SESSION_CREATED: &str = "session_created";
     pub const SESSION_UPDATED: &str = "session_updated";
     pub const SESSION_STOPPED: &str = "session_stopped";

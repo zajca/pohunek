@@ -25,7 +25,9 @@ toml = { workspace = true }
 toml_edit = { workspace = true }
 regex = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }
+# `time` adds DelayQueue for the attention debounce coordinator; `codec` comes
+# from the workspace default and drives the control-socket line framing.
+tokio-util = { workspace = true, features = ["time"] }
 futures = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -33,6 +35,11 @@ tracing-appender = { workspace = true }
 libc = { workspace = true }
 time = { workspace = true }
 portable-pty = { workspace = true }
+
+[dev-dependencies]
+# `test-util` enables tokio's paused clock (`start_paused`) so the attention
+# debounce coordinator tests advance time deterministically instead of sleeping.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

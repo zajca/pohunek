@@ -105,6 +105,10 @@ The GUI must use existing daemon methods:
 - `session.remove`
 - `session.set_metadata`
 - `session.rename`
+- `notification.list`
+- `notification.update`
+- `notification.delete`
+- `subscribe`
 - `assistant.materialize`
 
 Worktree creation is represented by `session.new` with a project or repo and a
@@ -162,6 +166,35 @@ ordering on it would reshuffle rows under the operator's cursor. Each row shows
 the name (or id), agent, project, branch, and activity word. The left-rail
 monitor is at least 360px tall so roughly five session rows are visible; older
 persisted UI state below that height is raised when the GUI loads.
+
+## Inbox
+
+The native GUI Inbox is a durable notification view across all configured hosts.
+Each host snapshot seeds recent records through `notification.list`, and the
+subscription stream keeps the Inbox current with `notification_created`,
+`notification_updated`, and `notification_deleted` events. A host whose daemon
+does not support notifications may still connect; notification seeding is
+non-fatal for the GUI.
+
+The Inbox shows one unread total across hosts and can filter by host, lifecycle
+status, severity, notification kind, and provider. Rows are ordered by
+`created_at` descending and then notification id, not by lifecycle status, so
+marking a record read or acknowledged does not move rows under the cursor.
+Deleted records are removed from the Inbox when the daemon reports deleted
+status or a delete event.
+
+Selecting a notification opens the notification detail pane. When the record has
+a `session_id` and that session is still present on the same host, the detail
+view offers a separate Open linked session action; if the linked session is gone,
+the detail remains available so the record is not a dead end. Detail actions
+call `notification.update` to mark read, acknowledge, or archive, and
+`notification.delete` to delete.
+
+Fresh durable notifications are the single source for desktop OS notification
+intents. The GUI raises an OS notification only for newly created records whose
+severity is `action_required` or `error`; informational, success, and warning
+records land in the Inbox silently. Updates do not re-raise desktop
+notifications.
 
 ## Prompt Management
 
@@ -320,11 +353,12 @@ tokens to make the GUI start.
 When behavior must be checked against implementation, inspect:
 
 - `crates/gui/src/main.rs` for config loading, attach spawning, and Iced shell
-  behavior, provider task spawning, prompt management controls, and provider
-  panels.
+  behavior, provider task spawning, prompt management controls, provider panels,
+  and Inbox rendering/actions.
 - `crates/gui-core/src/lib.rs` for headless state transitions, SDK requests,
   prompt/action state, prompt preview rendering, provider request state, linked
-  metadata helpers, and attach command rendering.
+  metadata helpers, Inbox notification state, OS notification intents, and
+  attach command rendering.
 - `crates/gui-core/src/providers/linear.rs` for Linear GraphQL requests,
   keyring-token lookup boundaries, and token lookup timeouts.
 - `crates/gui-core/src/providers/github.rs` for `gh` command execution, timeout
@@ -333,8 +367,8 @@ When behavior must be checked against implementation, inspect:
   built-in defaults, and the host/project layer merge (in-repo-over-host
   shadowing) used by both provider pickers.
 - `crates/gui-core/tests/loopback.rs` for loopback coverage of host-resolved
-  prompt/action browse, preview, provider launch, and linked metadata
-  persistence behavior.
+  prompt/action browse, preview, provider launch, linked metadata persistence,
+  and notification Inbox behavior.
 - `crates/gui-core/tests/linear_provider.rs` and
   `crates/gui-core/tests/github_provider.rs` for provider fixtures, fake token
   sources, fake `gh` scripts, parsing coverage, timeout behavior, and error

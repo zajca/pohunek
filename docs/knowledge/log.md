@@ -1,5 +1,20 @@
 # Knowledge Bundle Log
 
+## 0.15.2
+
+- Documented the attention notification debounce window
+  (`attention_debounce_secs`), the deferred-create behavior for
+  `agent_blocked`/`approval_required` (`created: true` with a minted id, held
+  pending until it flushes or is suppressed by an in-window resolve), and its
+  relationship to `attention_dedupe_window_secs` in the sessions concept, the
+  debug-daemon runbook, and the public API reference.
+
+## 0.14.5
+
+- Documented the durable cross-host notification Inbox, CLI/API surface,
+  provider hook requirements, source-priority dedupe, retention, and trust-model
+  boundary.
+
 ## 0.7.4
 
 - Documented that the native GUI `Start session` runtime picker supports the

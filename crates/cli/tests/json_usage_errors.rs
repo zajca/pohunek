@@ -128,6 +128,35 @@ fn session_list_json_and_quiet_conflict_under_json_is_structured() {
 }
 
 #[test]
+fn notifications_all_hosts_conflicts_with_host_under_json() {
+    let out = pohunek()
+        .args([
+            "--host",
+            "host-b",
+            "notifications",
+            "list",
+            "--all-hosts",
+            "--json",
+        ])
+        .output()
+        .expect("spawn pohunek");
+
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stderr.is_empty());
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    let doc: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be JSON ({e}): {stdout:?}"));
+    assert_eq!(doc["code"], "cli_usage");
+    assert_eq!(doc["class"], "configuration");
+    assert!(
+        doc["msg"]
+            .as_str()
+            .is_some_and(|msg| { msg.contains("--host") && msg.contains("--all-hosts") }),
+        "usage message should name the conflicting arguments: {doc:?}"
+    );
+}
+
+#[test]
 fn usage_error_without_json_stays_human_on_stderr() {
     // No `--json`: behavior must be identical to a plain `Cli::parse()` — human
     // error on stderr, nothing on stdout, exit 2.

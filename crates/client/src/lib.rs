@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod error;
+mod notifications;
 mod transport;
 
 pub use error::ClientError;
