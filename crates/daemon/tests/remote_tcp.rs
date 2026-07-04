@@ -35,6 +35,12 @@ use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellComma
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Stop grace for remote TCP integration tests.
+///
+/// Loaded CI runners can need more than 50 ms to reap a PTY-backed shell, and
+/// these tests assert remote protocol behavior rather than minimum stop timing.
+const REMOTE_TEST_STOP_GRACE: Duration = Duration::from_millis(500);
+
 /// A unique temp directory inside the test temp root.
 ///
 /// The Unix server enforces its directory's mode on bind, so the socket must
@@ -56,11 +62,11 @@ fn temp_socket(tag: &str) -> PathBuf {
     temp_dir(tag).join("daemon.sock")
 }
 
-/// Build a shell session config with a short stop grace, like the Unix tests.
+/// Build a shell session config with bounded test stop grace.
 fn shell_config() -> SessionRegistryConfig {
     SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
-        stop_grace: Duration::from_millis(50),
+        stop_grace: REMOTE_TEST_STOP_GRACE,
         ..SessionRegistryConfig::default()
     }
 }
@@ -410,7 +416,7 @@ async fn session_new_with_input_over_tcp_writes_text_to_shell_pty() {
                 "IFS= read -r line; printf 'got:%s\\n' \"$line\"; sleep 30",
             ],
         ),
-        stop_grace: Duration::from_millis(50),
+        stop_grace: REMOTE_TEST_STOP_GRACE,
         ..SessionRegistryConfig::default()
     };
     let (addr, _socket, shutdown, handle) =
