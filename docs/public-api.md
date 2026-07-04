@@ -138,7 +138,7 @@ All params and result type names below refer to structs exported by
 | `subscribe` | `null` | `{subscribed: true}` then event stream | Consumes the connection into a one-way event stream. |
 | `integration.install` | `IntegrationInstallParams` or `null` | `IntegrationInstallResult` | Installs agent hooks for native session id capture. |
 | `assistant.materialize` | `AssistantMaterializeParams` | `AssistantMaterializeResult` | Materializes the assistant knowledge bundle on the daemon host. |
-| `notification.create` | `NotificationCreateParams` | `NotificationCreateResult` | Creates a durable host-local notification. Daemon policy is enforced for every producer, including provider hooks and daemon projectors. Dedupe may return `created: false` with an existing or upgraded record. |
+| `notification.create` | `NotificationCreateParams` | `NotificationCreateResult` | Creates a durable host-local notification. Daemon policy is enforced for every producer, including provider hooks and daemon projectors. Dedupe may return `created: false` with an existing or upgraded record. Attention kinds carrying an `attention:<session_id>` dedupe key are deferred: the result still reports `created: true` with a minted id, but the record is held pending until `attention_debounce_secs` elapses; see `NotificationPolicy`. |
 | `notification.list` | `NotificationListParams` or `null` | `NotificationListResult` | Lists notification records with exact-match filters and cursor pagination. Deleted records are excluded unless `status: deleted` is requested. |
 | `notification.update` | `NotificationUpdateParams` | `NotificationUpdateResult` | Updates one record's lifecycle status. Allowed transitions are `unread -> read`, `read -> acknowledged`, `unread -> acknowledged`, `unread/read/acknowledged -> archived`, and any non-deleted status to deleted. |
 | `notification.delete` | `NotificationDeleteParams` | `NotificationDeleteResult` | Logically deletes one record. Unknown or already-deleted ids return `deleted: false`. |
@@ -260,6 +260,9 @@ Important fields:
 
 - `attention_dedupe_window_secs`: window for source-independent attention
   dedupe. The default is 120 seconds.
+- `attention_debounce_secs`: window a deferred attention notification is held
+  pending before it is allowed to surface. The default is 5 seconds. Additive:
+  a policy JSON written before this field existed loads the default.
 - `enabled`: default per-kind flags.
 - `codex` / `claude`: optional provider-specific per-kind overrides.
 
@@ -279,6 +282,36 @@ an existing provider-backed attention record is suppressed and returns
 `created: false` with the existing record. Producers other than Codex, Claude,
 `pohunek`, or `daemon` are treated as user/external sources and do not
 automatically supersede provider records.
+
+#### Attention debounce
+
+`agent_blocked` and `approval_required` are held pending rather than persisted
+immediately. When a producer creates one of these kinds with an
+`attention:<session_id>` dedupe key, the daemon mints the notification id and
+returns `notification.create` result `created: true` with the full record, but
+the record is not written to the store and does not appear in
+`notification.list` until it flushes. No `notification_created` event is
+emitted for a pending record.
+
+The daemon holds the pending record for `attention_debounce_secs`. If the
+session's activity resolves back to `working` within that window (the same
+edge that acknowledges an already-visible attention record), the pending
+record is dropped entirely: nothing is ever persisted, and no event fires.
+Only if the window elapses with the attention state still outstanding does the
+daemon commit the record through the store and emit `notification_created`,
+exactly as an immediate create would. Debounce applies only to
+`agent_blocked` and `approval_required`; `turn_completed`, `session_finished`,
+`error`, and `system` are always created immediately.
+
+`attention_dedupe_window_secs` and `attention_debounce_secs` are independent
+and answer different questions:
+
+- `attention_dedupe_window_secs` controls whether two producers reporting the
+  *same* attention moment (a provider hook and the daemon projector) collapse
+  into one record instead of two.
+- `attention_debounce_secs` controls *whether and when* a pending attention
+  notification is allowed to surface at all, regardless of how many producers
+  reported it.
 
 ### Provider Notification Hooks
 

@@ -12,13 +12,13 @@
 
 use protocol::{
     method, negotiate, AssistantMaterializeParams, AssistantMaterializeResult, HostDiscoverParams,
-    IntegrationInstallParams, NotificationCreateParams, NotificationDeleteParams,
-    NotificationListParams, NotificationPolicyParams, NotificationPolicyResult,
-    NotificationRetentionParams, NotificationUpdateParams, ProjectActionParams,
-    ProjectActionsParams, ProjectActionsResult, ProjectAddParams, ProjectListParams,
-    ProjectPromptParams, ProjectRemoveParams, ProjectRenameParams, ProjectShowParams,
-    ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams, SessionId,
-    SessionInputParams, SessionListParams, SessionNewParams, SessionNewResult,
+    IntegrationInstallParams, NotificationCreateParams, NotificationCreateResult,
+    NotificationDeleteParams, NotificationListParams, NotificationPolicyParams,
+    NotificationPolicyResult, NotificationRetentionParams, NotificationUpdateParams,
+    ProjectActionParams, ProjectActionsParams, ProjectActionsResult, ProjectAddParams,
+    ProjectListParams, ProjectPromptParams, ProjectRemoveParams, ProjectRenameParams,
+    ProjectShowParams, ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams,
+    SessionId, SessionInputParams, SessionListParams, SessionNewParams, SessionNewResult,
     SessionReleaseAgentParams, SessionRenameParams, SessionReportAgentParams,
     SessionReportNativeIdParams, SessionResizeParams, SessionResumeResult,
     SessionSetMetadataParams, WorktreeRemoveParams, PROTOCOL_VERSION,
@@ -31,7 +31,7 @@ use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 use crate::discovery::DiscoveryCache;
-use crate::notifications::NotificationService;
+use crate::notifications::{is_attention_create, AttentionCoordinator, NotificationService};
 use crate::project::{LiveSession, ProjectConfigResolver, ProjectManager};
 use crate::session::SessionRegistry;
 
@@ -53,6 +53,8 @@ pub struct DaemonState {
     pub sessions: SessionRegistry,
     /// Durable notification inbox, when configured by the daemon binary.
     pub notifications: Option<NotificationService>,
+    /// Attention debounce coordinator, when notifications are configured.
+    pub attention: Option<AttentionCoordinator>,
     /// TTL-cached `NetBird` host discovery, shared across connections.
     pub discovery: DiscoveryCache,
 }
@@ -65,6 +67,7 @@ impl DaemonState {
             health,
             sessions,
             notifications: None,
+            attention: None,
             discovery: DiscoveryCache::default(),
         }
     }
@@ -73,6 +76,13 @@ impl DaemonState {
     #[must_use]
     pub fn with_notifications(mut self, notifications: NotificationService) -> Self {
         self.notifications = Some(notifications);
+        self
+    }
+
+    /// Attach the attention debounce coordinator to shared daemon state.
+    #[must_use]
+    pub fn with_attention_coordinator(mut self, attention: AttentionCoordinator) -> Self {
+        self.attention = Some(attention);
         self
     }
 }
@@ -191,7 +201,13 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::HOST_INSPECT => handle_host_inspect(request, &state.health, &state.sessions),
         method::HOST_DISCOVER => handle_host_discover(request, &state.discovery).await,
         method::NOTIFICATION_CREATE => {
-            handle_notification_create(request, state.notifications.as_ref(), &state.sessions).await
+            handle_notification_create(
+                request,
+                state.notifications.as_ref(),
+                state.attention.as_ref(),
+                &state.sessions,
+            )
+            .await
         }
         method::NOTIFICATION_LIST => {
             handle_notification_list(request, state.notifications.as_ref()).await
@@ -312,6 +328,25 @@ fn require_notifications(
     })
 }
 
+/// Resolve the attention debounce coordinator, or a typed error response when this
+/// daemon state was built with notifications but no coordinator.
+fn require_attention(
+    request: &Request,
+    attention: Option<&AttentionCoordinator>,
+) -> Result<AttentionCoordinator, Response> {
+    attention.cloned().ok_or_else(|| {
+        Response::err(
+            request.id.clone(),
+            ProtocolError::new(
+                protocol::ErrorClass::Daemon,
+                "notifications_not_configured",
+                "the daemon is not configured for attention debounce".to_owned(),
+                None,
+            ),
+        )
+    })
+}
+
 /// Run a fallible blocking operation off the async runtime and map its result to
 /// a [`Response`]: a serialized value on success, the operation's typed error on
 /// failure, and a daemon-class error built from `panic_code`/`panic_msg`/
@@ -375,9 +410,16 @@ where
 }
 
 /// `notification.create`: create or dedupe a durable notification record.
+///
+/// Attention creates (`agent_blocked`/`approval_required` carrying a session
+/// attention dedupe key) are routed to the debounce coordinator: the id is minted
+/// and `created: true` is returned, but the record is held pending and only
+/// becomes visible in `notification.list` after the debounce window (or never, if
+/// the session resumes first). Every other create persists immediately.
 async fn handle_notification_create(
     request: &Request,
     notifications: Option<&NotificationService>,
+    attention: Option<&AttentionCoordinator>,
     sessions: &SessionRegistry,
 ) -> Response {
     let params = match parse_params::<NotificationCreateParams>(request) {
@@ -389,6 +431,28 @@ async fn handle_notification_create(
         Err(resp) => return resp,
     };
     let params = enrich_notification_session_context(params, sessions).await;
+
+    if is_attention_create(params.kind, params.dedupe_key.as_deref()) {
+        let attention = match require_attention(request, attention) {
+            Ok(attention) => attention,
+            Err(resp) => return resp,
+        };
+        return run_notification_blocking(request, move || {
+            // Preparing the record does no store I/O; the coordinator commits it
+            // after the debounce window. The response still returns the minted
+            // record with `created: true`.
+            let record = notifications
+                .prepare_deferred(params)
+                .map_err(|err| err.to_protocol_error())?;
+            attention.defer(record.clone());
+            Ok(NotificationCreateResult {
+                created: true,
+                record,
+            })
+        })
+        .await;
+    }
+
     run_notification_blocking(request, move || {
         notifications
             .create(params)
@@ -1194,6 +1258,153 @@ mod tests {
         );
 
         let _ = sessions.stop(&created.id).await;
+    }
+
+    fn notification_temp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "pohunek-handler-notifications-{tag}-{}-{nanos}-{counter}",
+            std::process::id()
+        ))
+    }
+
+    fn attention_create_request(id: &str) -> Request {
+        let params = protocol::NotificationCreateParams {
+            source: protocol::NotificationSource {
+                provider: "codex".to_owned(),
+                provider_event: "PermissionRequest".to_owned(),
+                host_local_source_id: "codex-hook-s-1".to_owned(),
+            },
+            kind: protocol::NotificationKind::ApprovalRequired,
+            severity: protocol::NotificationSeverity::ActionRequired,
+            title: "Approval required".to_owned(),
+            body: "Codex is waiting for a tool approval.".to_owned(),
+            metadata: BTreeMap::new(),
+            session_id: Some(SessionId("s-1".to_owned())),
+            agent_kind: Some(AgentKind::Codex),
+            source_id: Some("codex:s-1:permission:1".to_owned()),
+            dedupe_key: Some("attention:s-1".to_owned()),
+            project_id: Some("p-1".to_owned()),
+        };
+        Request::new(
+            id,
+            method::NOTIFICATION_CREATE,
+            serde_json::to_value(params).expect("params serialize"),
+        )
+    }
+
+    fn error_create_request(id: &str) -> Request {
+        let params = protocol::NotificationCreateParams {
+            source: protocol::NotificationSource {
+                provider: "codex".to_owned(),
+                provider_event: "Error".to_owned(),
+                host_local_source_id: "codex-error-s-1".to_owned(),
+            },
+            kind: protocol::NotificationKind::Error,
+            severity: protocol::NotificationSeverity::Error,
+            title: "Agent error".to_owned(),
+            body: "Codex reported an error.".to_owned(),
+            metadata: BTreeMap::new(),
+            session_id: Some(SessionId("s-1".to_owned())),
+            agent_kind: Some(AgentKind::Codex),
+            source_id: Some("codex:s-1:error:1".to_owned()),
+            dedupe_key: None,
+            project_id: Some("p-1".to_owned()),
+        };
+        Request::new(
+            id,
+            method::NOTIFICATION_CREATE,
+            serde_json::to_value(params).expect("params serialize"),
+        )
+    }
+
+    async fn create_result(
+        state: &DaemonState,
+        request: &Request,
+    ) -> protocol::NotificationCreateResult {
+        let response = handle_request(request, state).await;
+        let protocol::Response::Ok { ok, .. } = response else {
+            panic!("expected notification.create ok response: {response:?}");
+        };
+        serde_json::from_value(ok).expect("create result deserializes")
+    }
+
+    async fn list_records(state: &DaemonState) -> Vec<protocol::NotificationRecord> {
+        let request = Request::new(
+            "notification-list",
+            method::NOTIFICATION_LIST,
+            serde_json::to_value(protocol::NotificationListParams::default())
+                .expect("list params serialize"),
+        );
+        let response = handle_request(&request, state).await;
+        let protocol::Response::Ok { ok, .. } = response else {
+            panic!("expected notification.list ok response: {response:?}");
+        };
+        let result: protocol::NotificationListResult =
+            serde_json::from_value(ok).expect("list result");
+        result.notifications
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notification_create_defers_attention_but_lists_non_attention_immediately() {
+        use crate::notifications::{AttentionCoordinator, NotificationService};
+        use protocol::NotificationKind;
+
+        let notifications = NotificationService::open(&notification_temp_dir("defer"))
+            .expect("notification service opens");
+        let (attention, _task) = AttentionCoordinator::spawn(notifications.clone());
+        let state = DaemonState::new(
+            HealthInfo::new("test"),
+            SessionRegistry::new(SessionRegistryConfig::default()),
+        )
+        .with_notifications(notifications)
+        .with_attention_coordinator(attention);
+
+        // Attention create: the handler mints and returns the record, but holds it
+        // pending, so it is not yet listable.
+        let created = create_result(&state, &attention_create_request("attention-create")).await;
+        assert!(created.created);
+        assert_eq!(created.record.kind, NotificationKind::ApprovalRequired);
+        assert!(
+            list_records(&state).await.is_empty(),
+            "an attention create must be debounced, not immediately listable"
+        );
+
+        // A non-attention create persists and is listable immediately.
+        let error = create_result(&state, &error_create_request("error-create")).await;
+        assert!(error.created);
+        let listed = list_records(&state).await;
+        assert_eq!(
+            listed.len(),
+            1,
+            "the non-attention create is listable while the attention one stays pending"
+        );
+        assert_eq!(listed[0].kind, NotificationKind::Error);
+        assert_eq!(listed[0].id, error.record.id);
+
+        // After the debounce window the held attention record surfaces too.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(
+            crate::notifications::DEFAULT_ATTENTION_DEBOUNCE_SECS + 1,
+        ))
+        .await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+
+        let flushed = list_records(&state).await;
+        assert_eq!(flushed.len(), 2, "the debounced attention record flushes");
+        assert!(flushed.iter().any(|record| record.id == created.record.id
+            && record.kind == NotificationKind::ApprovalRequired));
     }
 
     #[tokio::test]

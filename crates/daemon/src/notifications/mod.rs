@@ -1,5 +1,6 @@
 //! Durable daemon notification service.
 
+mod coordinator;
 mod policy;
 mod projector;
 mod store;
@@ -23,7 +24,12 @@ use time::OffsetDateTime;
 use tokio::sync::broadcast;
 
 #[doc(inline)]
-pub use policy::{default_policy, policy_enables_kind, DEFAULT_ATTENTION_DEDUPE_WINDOW_SECS};
+pub use coordinator::{AttentionCoordinator, AttentionCoordinatorTask};
+#[doc(inline)]
+pub use policy::{
+    default_policy, policy_enables_kind, DEFAULT_ATTENTION_DEBOUNCE_SECS,
+    DEFAULT_ATTENTION_DEDUPE_WINDOW_SECS,
+};
 #[doc(inline)]
 pub use projector::{attention_dedupe_key, NotificationProjector};
 #[doc(inline)]
@@ -86,6 +92,12 @@ const MAX_PROJECT_ID_CHARS: usize = 128;
 /// Matches the session event channel scale so short subscriber stalls do not
 /// drop ordinary notification bursts, while keeping per-daemon memory bounded.
 const NOTIFICATION_EVENT_CAPACITY: usize = 128;
+
+/// Prefix of the shared session attention dedupe key (`attention:<session_id>`).
+///
+/// Kept in sync with [`projector::attention_dedupe_key`], which builds keys with
+/// this prefix. Routing a create to the debounce coordinator matches on it.
+pub(crate) const ATTENTION_DEDUPE_KEY_PREFIX: &str = "attention";
 
 /// Secret-like metadata keys rejected before notification storage.
 const SECRET_METADATA_KEYS: &[&str] = &[
@@ -554,11 +566,54 @@ impl NotificationService {
         self.create_with_metadata_at(params, created_at.to_owned())
     }
 
+    /// Build a normalized, validated notification record without persisting it.
+    ///
+    /// Mints the id now so the `notification.create` response can return it, but
+    /// the caller (the attention debounce coordinator) holds the record pending
+    /// and commits it later via [`Self::commit_deferred`]. Performs no store I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`NotificationError`] when validation or the policy kind check
+    /// fails, exactly as an immediate create would.
+    pub(crate) fn prepare_deferred(
+        &self,
+        params: NotificationCreateParams,
+    ) -> Result<NotificationRecord, NotificationError> {
+        self.build_record(params, timestamp_now())
+    }
+
+    /// Commit a previously prepared deferred record and broadcast its event.
+    ///
+    /// This is the debounce coordinator's flush path: the record is run through
+    /// the store's `create_or_dedupe` (the final dedupe authority) and, when it
+    /// becomes visible, a `notification_created`/`notification_updated` event is
+    /// emitted exactly as an immediate create would.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`NotificationError`] when the store append fails.
+    pub(crate) fn commit_deferred(
+        &self,
+        record: NotificationRecord,
+    ) -> Result<NotificationCreateResult, NotificationError> {
+        self.commit_record(record)
+    }
+
     fn create_with_metadata_at(
         &self,
         params: NotificationCreateParams,
         created_at: String,
     ) -> Result<NotificationCreateResult, NotificationError> {
+        let record = self.build_record(params, created_at)?;
+        self.commit_record(record)
+    }
+
+    fn build_record(
+        &self,
+        params: NotificationCreateParams,
+        created_at: String,
+    ) -> Result<NotificationRecord, NotificationError> {
         let mut params = normalize_params(params);
         validate_session_id(params.session_id.as_ref())?;
         let policy = self.policy();
@@ -570,7 +625,7 @@ impl NotificationService {
         }
         params.metadata = validate_metadata(&params.metadata)?;
 
-        let record = NotificationRecord {
+        Ok(NotificationRecord {
             id: self.next_id(),
             source: params.source,
             kind: params.kind,
@@ -590,12 +645,15 @@ impl NotificationService {
             archived_at: None,
             deleted_at: None,
             superseded_by: None,
-        };
-        match self
-            .inner
-            .store
-            .create_or_dedupe(record, policy.attention_dedupe_window_secs)?
-        {
+        })
+    }
+
+    fn commit_record(
+        &self,
+        record: NotificationRecord,
+    ) -> Result<NotificationCreateResult, NotificationError> {
+        let window = self.policy().attention_dedupe_window_secs;
+        match self.inner.store.create_or_dedupe(record, window)? {
             store::CreateOutcome::Created(record) => {
                 self.emit_created(&record);
                 Ok(NotificationCreateResult {
@@ -800,6 +858,34 @@ fn is_valid_status_transition(from: NotificationStatus, to: NotificationStatus) 
 
 fn same_source_namespace(left: &NotificationSource, right: &NotificationSource) -> bool {
     left.provider == right.provider && left.provider_event == right.provider_event
+}
+
+/// Whether `kind` is an attention notification that self-resolves on resume.
+///
+/// Only `agent_blocked` and `approval_required` represent a transient
+/// waiting-for-owner condition. Other kinds (for example `error` or
+/// `session_finished`) stay until the owner handles them explicitly, so they are
+/// never debounced or auto-resolved.
+pub(crate) fn is_attention_kind(kind: NotificationKind) -> bool {
+    matches!(
+        kind,
+        NotificationKind::AgentBlocked | NotificationKind::ApprovalRequired
+    )
+}
+
+/// Whether a create should be deferred through the attention debounce coordinator.
+///
+/// Only `agent_blocked`/`approval_required` creates carrying a session attention
+/// dedupe key are debounced; every other create persists immediately.
+pub(crate) fn is_attention_create(kind: NotificationKind, dedupe_key: Option<&str>) -> bool {
+    is_attention_kind(kind) && dedupe_key.is_some_and(is_attention_dedupe_key)
+}
+
+/// Whether `dedupe_key` is a session attention dedupe key (`attention:<id>`).
+fn is_attention_dedupe_key(dedupe_key: &str) -> bool {
+    dedupe_key
+        .strip_prefix(ATTENTION_DEDUPE_KEY_PREFIX)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1682,6 +1768,7 @@ mod tests {
         let service = NotificationService::open(&data_dir).expect("open service");
         let policy = protocol::NotificationPolicy {
             attention_dedupe_window_secs: 42,
+            attention_debounce_secs: 3,
             enabled: NotificationKindPolicy {
                 agent_blocked: true,
                 approval_required: true,

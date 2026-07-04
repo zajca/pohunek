@@ -929,6 +929,7 @@ fn sample_notification_record() -> protocol::NotificationRecord {
 fn sample_policy() -> protocol::NotificationPolicy {
     protocol::NotificationPolicy {
         attention_dedupe_window_secs: 30,
+        attention_debounce_secs: 5,
         enabled: protocol::NotificationKindPolicy {
             agent_blocked: true,
             approval_required: true,

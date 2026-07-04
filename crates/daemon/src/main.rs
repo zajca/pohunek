@@ -24,7 +24,7 @@ use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo, RemoteServer};
 use pohunek_daemon::events::{spawn_drain, EventLog};
 use pohunek_daemon::lock::InstanceLock;
 use pohunek_daemon::notifications::{
-    NotificationProjector, NotificationService, NOTIFICATIONS_SUBDIR,
+    AttentionCoordinator, NotificationProjector, NotificationService, NOTIFICATIONS_SUBDIR,
 };
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use pohunek_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
@@ -118,13 +118,25 @@ async fn run() -> Result<(), DaemonError> {
         &sessions,
         &notifications,
     )?;
-    let notification_projector = NotificationProjector::spawn(&sessions, notifications.clone());
+    // Spawn the attention debounce coordinator: it owns the lifecycle of
+    // agent_blocked/approval_required notifications, holding them for the policy
+    // debounce window so transient attention states never surface. Both producers
+    // (the notification.create handler and the projector) route attention through
+    // its clonable command handle.
+    let (attention_coordinator, attention_task) =
+        AttentionCoordinator::spawn(notifications.clone());
+    let notification_projector = NotificationProjector::spawn(
+        &sessions,
+        notifications.clone(),
+        attention_coordinator.clone(),
+    );
     sessions.spawn_agent_state_hooks();
 
     // 7. Bind the control socket (stale-socket recovery + 0600).
     let health = HealthInfo::new(DAEMON_VERSION);
-    let state =
-        DaemonState::new(health, sessions.clone()).with_notifications(notifications.clone());
+    let state = DaemonState::new(health, sessions.clone())
+        .with_notifications(notifications.clone())
+        .with_attention_coordinator(attention_coordinator.clone());
     let server = ControlServer::bind_with_state(&paths.socket, state).await?;
     info!(socket = %server.socket_path().display(), "ready; serving control protocol");
 
@@ -137,7 +149,8 @@ async fn run() -> Result<(), DaemonError> {
     // 9. Optionally bind a NetBird TCP control listener alongside the Unix
     //    socket. NetBird absent / not logged in / no self IP => stay local-only.
     let remote_state = DaemonState::new(HealthInfo::new(DAEMON_VERSION), sessions.clone())
-        .with_notifications(notifications.clone());
+        .with_notifications(notifications.clone())
+        .with_attention_coordinator(attention_coordinator.clone());
     let remote_server = bind_remote_server(remote_state).await;
 
     // 10. Serve both transports under ONE shutdown signal. A small task awaits
@@ -169,7 +182,11 @@ async fn run() -> Result<(), DaemonError> {
 
     // 11. Flush the append-only event log before exit so events buffered at
     //     shutdown are not lost (bounded so a wedged write cannot hang exit).
+    //     Stop the projector before the coordinator so any last defers/resolves
+    //     it drains are still accepted, then drop the coordinator's pending
+    //     (in-memory, deliberately not persisted).
     notification_projector.shutdown().await;
+    attention_task.shutdown().await;
     sessions.shutdown_agent_state_hooks().await;
     shutdown_event_logs(event_logs).await;
 

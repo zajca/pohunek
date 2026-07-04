@@ -124,6 +124,7 @@ fn notification_kind_policy() -> NotificationKindPolicy {
 fn notification_policy() -> NotificationPolicy {
     NotificationPolicy {
         attention_dedupe_window_secs: 90,
+        attention_debounce_secs: 7,
         enabled: notification_kind_policy(),
         codex: Some(NotificationKindPolicy {
             agent_blocked: true,
@@ -540,6 +541,7 @@ fn notification_policy_params_json_shape_roundtrips() {
         json!({
             "policy": {
                 "attention_dedupe_window_secs": 90,
+                "attention_debounce_secs": 7,
                 "enabled": {
                     "agent_blocked": true,
                     "approval_required": true,
@@ -581,6 +583,41 @@ fn notification_policy_carries_attention_dedupe_window_secs() {
 
     let back = line_roundtrip(&policy);
     assert_eq!(back.attention_dedupe_window_secs, 90);
+}
+
+#[test]
+fn notification_policy_carries_attention_debounce_secs() {
+    let policy = notification_policy();
+
+    let value = serde_json::to_value(&policy).expect("serialize notification policy");
+    assert_eq!(value["attention_debounce_secs"], json!(7));
+
+    let back = line_roundtrip(&policy);
+    assert_eq!(back.attention_debounce_secs, 7);
+}
+
+#[test]
+fn notification_policy_defaults_attention_debounce_secs_when_field_absent() {
+    // A policy JSON persisted before the debounce field existed must still load,
+    // backfilling the default rather than failing to deserialize.
+    let value = json!({
+        "attention_dedupe_window_secs": 120,
+        "enabled": {
+            "agent_blocked": true,
+            "approval_required": true,
+            "turn_completed": false,
+            "session_finished": false,
+            "error": true,
+            "system": false
+        }
+    });
+
+    let policy: NotificationPolicy =
+        serde_json::from_value(value).expect("legacy policy without debounce field loads");
+
+    // 5 is the documented default backfilled by `default_attention_debounce_secs`.
+    assert_eq!(policy.attention_debounce_secs, 5);
+    assert_eq!(policy.attention_dedupe_window_secs, 120);
 }
 
 #[test]

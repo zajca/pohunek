@@ -65,6 +65,19 @@ For durable notification issues:
     both hook- and projector-produced records are cleared together. A record
     that never self-resolves usually means no `working` activity edge reached
     the projector (for example a session whose activity is not being reported).
+12. If an expected `agent_blocked` or `approval_required` notification does not
+    (yet) show up in `pohunek notifications list --json` or
+    `pohunek notifications watch --json`, it may simply be debounced: the
+    daemon holds attention creates pending in memory for
+    `attention_debounce_secs` (5 seconds by default, see
+    `pohunek notifications policy get --json`) before committing and emitting
+    `notification_created`. Wait past the configured window and re-check; if
+    the session resolved back to `working` inside the window, the pending
+    record was dropped and will never appear — that is the intended debounce
+    behavior, not a bug. Pending debounced entries are in-memory only and are
+    not persisted, so a daemon restart while an entry is pending drops that
+    transient signal; this is expected for a sub-10s window and is not a data
+    loss bug worth chasing.
 
 The durable store is under the daemon data directory in `notifications/`.
 `notifications.jsonl` is append-only record history, while `policy.json` is the

@@ -657,6 +657,7 @@ async fn set_notification_policy(
 fn all_enabled_notification_policy() -> NotificationPolicy {
     NotificationPolicy {
         attention_dedupe_window_secs: 42,
+        attention_debounce_secs: 5,
         enabled: NotificationKindPolicy {
             agent_blocked: true,
             approval_required: true,

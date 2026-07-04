@@ -18,16 +18,16 @@ use tracing::warn;
 
 use crate::session::SessionRegistry;
 
-use super::{policy_enables_kind, NotificationService};
+use super::{
+    is_attention_create, policy_enables_kind, AttentionCoordinator, NotificationService,
+    ATTENTION_DEDUPE_KEY_PREFIX,
+};
 
 /// Provider namespace used for daemon-derived notification records.
 const PROJECTOR_PROVIDER: &str = "pohunek";
 
 /// Source-id prefix for daemon-derived notification records.
 const PROJECTOR_SOURCE_ID_PREFIX: &str = "projector";
-
-/// Dedupe-key prefix shared by projectors and provider hooks.
-const ATTENTION_DEDUPE_KEY_PREFIX: &str = "attention";
 
 /// Maximum time to wait for the projector task to flush buffered events.
 ///
@@ -45,12 +45,21 @@ pub struct NotificationProjector {
 
 impl NotificationProjector {
     /// Spawn a projector task on the session event broadcast.
+    ///
+    /// Derived attention notifications are routed through `attention` (the
+    /// debounce coordinator) rather than persisted directly, and the resume edge
+    /// resolves attention through it too.
     #[must_use]
-    pub fn spawn(sessions: &SessionRegistry, notifications: NotificationService) -> Self {
+    pub fn spawn(
+        sessions: &SessionRegistry,
+        notifications: NotificationService,
+        attention: AttentionCoordinator,
+    ) -> Self {
         let shutdown = CancellationToken::new();
         let handle = spawn_projector_task(
             sessions.clone(),
             notifications,
+            attention,
             sessions.subscribe(),
             shutdown.clone(),
         );
@@ -75,6 +84,7 @@ impl NotificationProjector {
 fn spawn_projector_task(
     sessions: SessionRegistry,
     notifications: NotificationService,
+    attention: AttentionCoordinator,
     mut events: broadcast::Receiver<Event>,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
@@ -84,17 +94,17 @@ fn spawn_projector_task(
             tokio::select! {
                 biased;
                 () = shutdown.cancelled() => {
-                    drain_buffered_events(&sessions, &notifications, &mut events, &mut state).await;
+                    drain_buffered_events(&sessions, &notifications, &attention, &mut events, &mut state).await;
                     break;
                 }
                 received = events.recv() => match received {
-                    Ok(event) => state.handle_event_blocking(&notifications, &event).await,
+                    Ok(event) => state.handle_event_blocking(&notifications, &attention, &event).await,
                     Err(broadcast::error::RecvError::Lagged(dropped)) => {
                         warn!(
                             dropped,
                             "notification projector lagged; re-reading current session state"
                         );
-                        resync_from_registry(&sessions, &notifications, &mut state).await;
+                        resync_from_registry(&sessions, &notifications, &attention, &mut state).await;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
@@ -106,18 +116,23 @@ fn spawn_projector_task(
 async fn drain_buffered_events(
     sessions: &SessionRegistry,
     notifications: &NotificationService,
+    attention: &AttentionCoordinator,
     events: &mut broadcast::Receiver<Event>,
     state: &mut ProjectorState,
 ) {
     loop {
         match events.try_recv() {
-            Ok(event) => state.handle_event_blocking(notifications, &event).await,
+            Ok(event) => {
+                state
+                    .handle_event_blocking(notifications, attention, &event)
+                    .await;
+            }
             Err(broadcast::error::TryRecvError::Lagged(dropped)) => {
                 warn!(
                     dropped,
                     "notification projector lagged during shutdown; re-reading current session state"
                 );
-                resync_from_registry(sessions, notifications, state).await;
+                resync_from_registry(sessions, notifications, attention, state).await;
             }
             Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
                 break;
@@ -129,11 +144,12 @@ async fn drain_buffered_events(
 async fn resync_from_registry(
     sessions: &SessionRegistry,
     notifications: &NotificationService,
+    attention: &AttentionCoordinator,
     state: &mut ProjectorState,
 ) {
     for session in sessions.list().await {
         state
-            .handle_session_snapshot_blocking(notifications, &session)
+            .handle_session_snapshot_blocking(notifications, attention, &session)
             .await;
     }
 }
@@ -148,29 +164,13 @@ pub fn attention_dedupe_key(session_id: &SessionId) -> String {
     format!("{ATTENTION_DEDUPE_KEY_PREFIX}:{}", session_id.0)
 }
 
-/// Acknowledge lingering attention notifications for a resumed session.
+/// Resolve attention notifications for a resumed session via the coordinator.
 ///
-/// Best-effort: a store failure is logged and swallowed so the projector event
-/// loop keeps consuming session events instead of terminating on I/O errors.
-fn resolve_session_attention(notifications: &NotificationService, session_id: &SessionId) {
-    let dedupe_key = attention_dedupe_key(session_id);
-    match notifications.resolve_attention(&dedupe_key) {
-        Ok(resolved) if !resolved.is_empty() => {
-            tracing::debug!(
-                session = %session_id.0,
-                resolved = resolved.len(),
-                "acknowledged attention notifications after session resumed"
-            );
-        }
-        Ok(_) => {}
-        Err(error) => {
-            warn!(
-                session = %session_id.0,
-                error = %error,
-                "failed to resolve attention notifications after session resumed"
-            );
-        }
-    }
+/// The coordinator unifies both paths: it cancels any still-pending (debounced)
+/// attention notification for this session so it never surfaces, and acknowledges
+/// any already-visible attention record sharing the session's dedupe key.
+fn resolve_session_attention(attention: &AttentionCoordinator, session_id: &SessionId) {
+    attention.resolve(attention_dedupe_key(session_id));
 }
 
 /// Return a deterministic projector source id.
@@ -200,38 +200,55 @@ struct ProjectorState {
 
 impl ProjectorState {
     #[cfg(test)]
-    fn handle_event(&mut self, notifications: &NotificationService, event: &Event) {
-        for pending in self.pending_event(notifications, event) {
-            create_pending_notification(notifications, pending);
+    fn handle_event(
+        &mut self,
+        notifications: &NotificationService,
+        attention: &AttentionCoordinator,
+        event: &Event,
+    ) {
+        for pending in self.pending_event(notifications, attention, event) {
+            create_pending_notification(notifications, attention, pending);
         }
     }
 
-    async fn handle_event_blocking(&mut self, notifications: &NotificationService, event: &Event) {
-        for pending in self.pending_event(notifications, event) {
-            create_pending_notification_blocking(notifications.clone(), pending).await;
+    async fn handle_event_blocking(
+        &mut self,
+        notifications: &NotificationService,
+        attention: &AttentionCoordinator,
+        event: &Event,
+    ) {
+        for pending in self.pending_event(notifications, attention, event) {
+            create_pending_notification_blocking(notifications.clone(), attention, pending).await;
         }
     }
 
     async fn handle_session_snapshot_blocking(
         &mut self,
         notifications: &NotificationService,
+        attention: &AttentionCoordinator,
         session: &SessionInfo,
     ) {
-        for pending in self.pending_session_snapshot(notifications, session) {
-            create_pending_notification_blocking(notifications.clone(), pending).await;
+        for pending in self.pending_session_snapshot(notifications, attention, session) {
+            create_pending_notification_blocking(notifications.clone(), attention, pending).await;
         }
     }
 
     fn pending_event(
         &mut self,
         notifications: &NotificationService,
+        attention: &AttentionCoordinator,
         event: &Event,
     ) -> Vec<PendingNotification> {
         match event.event.as_str() {
             event::AGENT_STATE => {
                 if let Some(payload) = parse_projector_payload::<AgentStatePayload>(event) {
                     return self
-                        .pending_activity(notifications, &payload.session_id, payload.activity)
+                        .pending_activity(
+                            notifications,
+                            attention,
+                            &payload.session_id,
+                            payload.activity,
+                        )
                         .into_iter()
                         .collect();
                 }
@@ -257,11 +274,12 @@ impl ProjectorState {
     fn pending_session_snapshot(
         &mut self,
         notifications: &NotificationService,
+        attention: &AttentionCoordinator,
         session: &SessionInfo,
     ) -> Vec<PendingNotification> {
         let mut pending = Vec::new();
         if let Some(activity) = session.activity {
-            pending.extend(self.pending_activity(notifications, &session.id, activity));
+            pending.extend(self.pending_activity(notifications, attention, &session.id, activity));
         } else {
             self.activity_by_session.remove(&session.id);
         }
@@ -276,6 +294,7 @@ impl ProjectorState {
     fn pending_activity(
         &mut self,
         notifications: &NotificationService,
+        attention: &AttentionCoordinator,
         session_id: &SessionId,
         activity: AgentActivity,
     ) -> Option<PendingNotification> {
@@ -283,13 +302,14 @@ impl ProjectorState {
             .activity_by_session
             .insert(session_id.clone(), activity);
         // A session that resumes active work no longer needs owner attention, so
-        // acknowledge any lingering attention notifications sharing its dedupe
-        // key. Only the transition edge into `Working` triggers the resolve so
-        // repeated working events do not rescan the store. Do not gate on the
-        // previous state being `Blocked`: provider hooks create attention
-        // notifications without the daemon observing a blocked activity edge.
+        // resolve any attention notification sharing its dedupe key through the
+        // coordinator (cancelling a still-pending debounced one and acknowledging
+        // any already-visible one). Only the transition edge into `Working`
+        // triggers the resolve so repeated working events do not rescan the store.
+        // Do not gate on the previous state being `Blocked`: provider hooks create
+        // attention notifications without the daemon observing a blocked edge.
         if activity == AgentActivity::Working && previous != Some(AgentActivity::Working) {
-            resolve_session_attention(notifications, session_id);
+            resolve_session_attention(attention, session_id);
         }
         if activity != AgentActivity::Blocked || previous == Some(AgentActivity::Blocked) {
             return None;
@@ -455,7 +475,15 @@ struct PendingNotification {
 }
 
 #[cfg(test)]
-fn create_pending_notification(notifications: &NotificationService, pending: PendingNotification) {
+fn create_pending_notification(
+    notifications: &NotificationService,
+    attention: &AttentionCoordinator,
+    pending: PendingNotification,
+) {
+    if is_attention_create(pending.kind, pending.params.dedupe_key.as_deref()) {
+        defer_pending_attention(notifications, attention, pending);
+        return;
+    }
     if let Err(err) = notifications.create(pending.params) {
         warn!(
             error = %err,
@@ -468,8 +496,16 @@ fn create_pending_notification(notifications: &NotificationService, pending: Pen
 
 async fn create_pending_notification_blocking(
     notifications: NotificationService,
+    attention: &AttentionCoordinator,
     pending: PendingNotification,
 ) {
+    if is_attention_create(pending.kind, pending.params.dedupe_key.as_deref()) {
+        // Preparing a deferred record does no store I/O and deferring is a
+        // channel send, so this stays on the runtime worker; the coordinator
+        // commits after the debounce window.
+        defer_pending_attention(&notifications, attention, pending);
+        return;
+    }
     let session_id = pending.session_id;
     let kind = pending.kind;
     let params = pending.params;
@@ -492,6 +528,28 @@ async fn create_pending_notification_blocking(
                 session_id = %session_id.0,
                 kind = kind.as_str(),
                 "notification projector blocking create task failed"
+            );
+        }
+    }
+}
+
+/// Route a derived attention notification through the debounce coordinator.
+///
+/// Best-effort: a preparation failure is logged and swallowed so the projector
+/// event loop keeps consuming session events.
+fn defer_pending_attention(
+    notifications: &NotificationService,
+    attention: &AttentionCoordinator,
+    pending: PendingNotification,
+) {
+    match notifications.prepare_deferred(pending.params) {
+        Ok(record) => attention.defer(record),
+        Err(err) => {
+            warn!(
+                error = %err,
+                session_id = %pending.session_id.0,
+                kind = pending.kind.as_str(),
+                "failed to prepare derived attention notification for debounce"
             );
         }
     }
@@ -565,9 +623,28 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        attention_dedupe_key, projector_source_id, run_projector_blocking, ProjectorState,
+        attention_dedupe_key, projector_source_id, run_projector_blocking, AttentionCoordinator,
+        ProjectorState,
     };
-    use crate::notifications::{default_policy, NotificationService};
+    use crate::notifications::{
+        default_policy, NotificationService, DEFAULT_ATTENTION_DEBOUNCE_SECS,
+    };
+
+    /// Yield repeatedly so the spawned coordinator task drains its command channel
+    /// and (re)arms its timer before the test advances the paused clock.
+    async fn settle() {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Advance the paused clock past the default debounce window to force a flush.
+    async fn advance_past_debounce() {
+        tokio::time::advance(std::time::Duration::from_secs(
+            DEFAULT_ATTENTION_DEBOUNCE_SECS + 1,
+        ))
+        .await;
+    }
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -695,12 +772,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn blocked_transition_creates_agent_blocked_notification() {
+    #[tokio::test(start_paused = true)]
+    async fn blocked_transition_defers_then_flushes_agent_blocked_notification() {
         let service = service("blocked");
+        let (attention, _task) = AttentionCoordinator::spawn(service.clone());
         let mut projector = ProjectorState::default();
 
-        projector.handle_event(&service, &agent_state_event("s-1", AgentActivity::Blocked));
+        projector.handle_event(
+            &service,
+            &attention,
+            &agent_state_event("s-1", AgentActivity::Blocked),
+        );
+        settle().await;
+        assert!(
+            list(&service).is_empty(),
+            "a derived agent_blocked notification is debounced, not immediately visible"
+        );
+
+        advance_past_debounce().await;
+        settle().await;
 
         let notifications = list(&service);
         assert_eq!(notifications.len(), 1);
@@ -718,32 +808,46 @@ mod tests {
         assert_eq!(record.dedupe_key.as_deref(), Some("attention:s-1"));
     }
 
-    #[test]
-    fn working_after_blocked_acknowledges_projector_notification() {
+    #[tokio::test(start_paused = true)]
+    async fn blocked_then_working_within_window_suppresses_notification() {
         let service = service("resolve-projector");
+        let (attention, _task) = AttentionCoordinator::spawn(service.clone());
         let mut projector = ProjectorState::default();
 
-        projector.handle_event(&service, &agent_state_event("s-1", AgentActivity::Blocked));
-        let created = list(&service);
-        assert_eq!(created.len(), 1);
-        assert_eq!(created[0].kind, NotificationKind::AgentBlocked);
-        assert_eq!(created[0].status, NotificationStatus::Unread);
+        projector.handle_event(
+            &service,
+            &attention,
+            &agent_state_event("s-1", AgentActivity::Blocked),
+        );
+        settle().await;
+        assert!(
+            list(&service).is_empty(),
+            "the derived agent_blocked notification is still pending"
+        );
 
-        projector.handle_event(&service, &agent_state_event("s-1", AgentActivity::Working));
+        projector.handle_event(
+            &service,
+            &attention,
+            &agent_state_event("s-1", AgentActivity::Working),
+        );
+        settle().await;
+        advance_past_debounce().await;
+        settle().await;
 
-        let resolved = list(&service);
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].status, NotificationStatus::Acknowledged);
-        assert!(resolved[0].acked_at.is_some());
+        assert!(
+            list(&service).is_empty(),
+            "a debounced agent_blocked must be suppressed when the session resumes in-window"
+        );
     }
 
-    #[test]
-    fn working_acknowledges_provider_hook_attention_notification() {
+    #[tokio::test(start_paused = true)]
+    async fn working_acknowledges_provider_hook_attention_notification() {
         let service = service("resolve-hook");
+        let (attention, _task) = AttentionCoordinator::spawn(service.clone());
         let mut projector = ProjectorState::default();
 
-        // A provider hook creates the attention notification directly, so the
-        // projector never observes a blocked activity edge for this session.
+        // A provider hook creates the attention notification directly (visible),
+        // so the projector never observes a blocked activity edge for this session.
         service
             .create(provider_approval_params("s-1"))
             .expect("create provider approval notification");
@@ -752,34 +856,63 @@ mod tests {
         assert_eq!(created[0].kind, NotificationKind::ApprovalRequired);
         assert_eq!(created[0].status, NotificationStatus::Unread);
 
-        projector.handle_event(&service, &agent_state_event("s-1", AgentActivity::Working));
+        projector.handle_event(
+            &service,
+            &attention,
+            &agent_state_event("s-1", AgentActivity::Working),
+        );
+        settle().await;
 
         let resolved = list(&service);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].status, NotificationStatus::Acknowledged);
     }
 
-    #[test]
-    fn repeated_blocked_events_during_one_period_do_not_duplicate() {
+    #[tokio::test(start_paused = true)]
+    async fn repeated_blocked_events_during_one_period_do_not_duplicate() {
         let service = service("blocked-dedupe");
+        let (attention, _task) = AttentionCoordinator::spawn(service.clone());
         let mut projector = ProjectorState::default();
 
-        projector.handle_event(&service, &agent_state_event("s-1", AgentActivity::Blocked));
-        projector.handle_event(&service, &agent_state_event("s-1", AgentActivity::Blocked));
-        projector.handle_event(&service, &agent_state_event("s-1", AgentActivity::Blocked));
+        projector.handle_event(
+            &service,
+            &attention,
+            &agent_state_event("s-1", AgentActivity::Blocked),
+        );
+        projector.handle_event(
+            &service,
+            &attention,
+            &agent_state_event("s-1", AgentActivity::Blocked),
+        );
+        projector.handle_event(
+            &service,
+            &attention,
+            &agent_state_event("s-1", AgentActivity::Blocked),
+        );
+        settle().await;
+        advance_past_debounce().await;
+        settle().await;
 
         assert_eq!(list(&service).len(), 1);
     }
 
-    #[test]
-    fn provider_approval_suppresses_projector_blocked_for_same_attention_key() {
+    #[tokio::test(start_paused = true)]
+    async fn provider_approval_suppresses_projector_blocked_for_same_attention_key() {
         let service = service("provider-suppresses-projector");
+        let (attention, _task) = AttentionCoordinator::spawn(service.clone());
         let provider = service
             .create(provider_approval_params("s-1"))
             .expect("provider create");
         let mut projector = ProjectorState::default();
 
-        projector.handle_event(&service, &agent_state_event("s-1", AgentActivity::Blocked));
+        projector.handle_event(
+            &service,
+            &attention,
+            &agent_state_event("s-1", AgentActivity::Blocked),
+        );
+        settle().await;
+        advance_past_debounce().await;
+        settle().await;
 
         let notifications = list(&service);
         assert_eq!(notifications.len(), 1);
@@ -791,10 +924,12 @@ mod tests {
     #[test]
     fn failed_session_update_creates_error_with_exit_code() {
         let service = service("failed");
+        let attention = AttentionCoordinator::disconnected();
         let mut projector = ProjectorState::default();
 
         projector.handle_event(
             &service,
+            &attention,
             &session_event(
                 event::SESSION_UPDATED,
                 &session_info("s-1", SessionState::Failed, Some(42)),
@@ -822,10 +957,12 @@ mod tests {
     fn done_session_update_creates_session_finished_when_policy_enabled() {
         let service = service("done-enabled");
         enable_session_finished(&service);
+        let attention = AttentionCoordinator::disconnected();
         let mut projector = ProjectorState::default();
 
         projector.handle_event(
             &service,
+            &attention,
             &session_event(
                 event::SESSION_UPDATED,
                 &session_info("s-1", SessionState::Done, Some(0)),
@@ -845,10 +982,12 @@ mod tests {
     #[test]
     fn stopped_session_events_do_not_create_error_notifications() {
         let service = service("stopped");
+        let attention = AttentionCoordinator::disconnected();
         let mut projector = ProjectorState::default();
 
         projector.handle_event(
             &service,
+            &attention,
             &session_event(
                 event::SESSION_STOPPED,
                 &session_info("s-1", SessionState::Stopped, None),
@@ -856,6 +995,7 @@ mod tests {
         );
         projector.handle_event(
             &service,
+            &attention,
             &session_event(
                 event::SESSION_UPDATED,
                 &session_info("s-2", SessionState::Stopped, None),
@@ -868,10 +1008,12 @@ mod tests {
     #[test]
     fn disabled_policy_kinds_do_not_create_records() {
         let service = service("done-disabled");
+        let attention = AttentionCoordinator::disconnected();
         let mut projector = ProjectorState::default();
 
         projector.handle_event(
             &service,
+            &attention,
             &session_event(
                 event::SESSION_UPDATED,
                 &session_info("s-1", SessionState::Done, Some(0)),
@@ -881,12 +1023,20 @@ mod tests {
         assert!(list(&service).is_empty());
     }
 
-    #[test]
-    fn source_ids_are_deterministic_per_kind_transition_epoch() {
+    #[tokio::test(start_paused = true)]
+    async fn source_ids_are_deterministic_per_kind_transition_epoch() {
         let service = service("source-id");
+        let (attention, _task) = AttentionCoordinator::spawn(service.clone());
         let mut projector = ProjectorState::default();
 
-        projector.handle_event(&service, &agent_state_event("s-1", AgentActivity::Blocked));
+        projector.handle_event(
+            &service,
+            &attention,
+            &agent_state_event("s-1", AgentActivity::Blocked),
+        );
+        settle().await;
+        advance_past_debounce().await;
+        settle().await;
 
         let source_ids = list(&service)
             .into_iter()

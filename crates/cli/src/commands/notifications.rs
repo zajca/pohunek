@@ -952,6 +952,11 @@ fn render_policy_human(host: &str, policy: &NotificationPolicy) -> String {
         "  attention_dedupe_window_secs: {}",
         policy.attention_dedupe_window_secs
     );
+    let _ = writeln!(
+        output,
+        "  attention_debounce_secs: {}",
+        policy.attention_debounce_secs
+    );
     render_kind_policy(&mut output, "default", &policy.enabled);
     if let Some(codex) = &policy.codex {
         render_kind_policy(&mut output, "codex", codex);
@@ -1076,6 +1081,7 @@ mod tests {
         };
         NotificationPolicy {
             attention_dedupe_window_secs: 120,
+            attention_debounce_secs: 5,
             enabled: enabled.clone(),
             codex: Some(enabled.clone()),
             claude: Some(enabled),
@@ -1206,6 +1212,24 @@ mod tests {
         assert_eq!(doc["host_id"], "host-b");
         assert_eq!(doc["event"], "notification_deleted");
         assert_eq!(doc["notification_id"], "n-1");
+    }
+
+    #[test]
+    fn policy_get_json_render_includes_attention_debounce_secs() {
+        let result = NotificationPolicyResult { policy: policy() };
+
+        let output = crate::commands::render_json(&result).expect("render");
+        let doc: serde_json::Value = serde_json::from_str(&output).expect("json");
+
+        assert_eq!(doc["policy"]["attention_debounce_secs"], 5);
+        assert_eq!(doc["policy"]["attention_dedupe_window_secs"], 120);
+    }
+
+    #[test]
+    fn policy_human_render_includes_attention_debounce_secs() {
+        let output = render_policy_human("host-b", &policy());
+
+        assert!(output.contains("attention_debounce_secs: 5"));
     }
 
     #[test]

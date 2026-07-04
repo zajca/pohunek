@@ -54,6 +54,21 @@ records. This keeps a transient waiting-for-input signal from lingering as
 unread after the agent has resumed; other kinds such as `error` and
 `session_finished` are never auto-resolved and wait for explicit owner action.
 
+Attention notifications are also debounced before they ever become visible. An
+`agent_blocked` or `approval_required` create carrying an
+`attention:<session_id>` dedupe key is held pending in memory by the daemon for
+the policy's `attention_debounce_secs` window (5 seconds by default) instead of
+being persisted immediately; `notification.create` still reports `created:
+true` with a minted id, but the record does not appear in `notification.list`
+and no `notification_created` event fires while it is pending. If the session's
+activity returns to `working` inside that window, the pending record is
+dropped entirely and nothing is ever created — the same self-resolve edge
+described above, applied before the record surfaces rather than after. Only a
+genuinely outstanding attention state, still unresolved once the window
+elapses, is committed and broadcast. This is distinct from
+`attention_dedupe_window_secs`, which merges duplicate reports of the same
+attention moment across producers rather than delaying when it surfaces.
+
 The GUI opens the notification detail when a notification is selected. If the
 record links to a session still known on the same host, the detail offers a
 separate Open linked session action; if the linked session is gone, the detail

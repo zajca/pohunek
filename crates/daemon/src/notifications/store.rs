@@ -7,15 +7,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use protocol::{
-    NotificationId, NotificationKind, NotificationListParams, NotificationListResult,
-    NotificationPolicy, NotificationRecord, NotificationStatus,
+    NotificationId, NotificationListParams, NotificationListResult, NotificationPolicy,
+    NotificationRecord, NotificationStatus,
 };
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::{
-    apply_status, inside_attention_window, is_valid_status_transition, parse_timestamp,
-    same_source_namespace, source_priority, NotificationError, SourcePriority,
+    apply_status, inside_attention_window, is_attention_kind, is_valid_status_transition,
+    parse_timestamp, same_source_namespace, source_priority, NotificationError, SourcePriority,
 };
 
 /// Directory under the daemon data dir holding notification state.
@@ -517,18 +517,6 @@ fn append_action_locked(
         .map_err(|source| NotificationError::io(path, source))?;
     apply_action(&mut state.records, action);
     Ok(())
-}
-
-/// Whether `kind` is an attention notification that self-resolves on resume.
-///
-/// Only `agent_blocked` and `approval_required` represent a transient
-/// waiting-for-owner condition. Other kinds (for example `error` or
-/// `session_finished`) stay until the owner handles them explicitly.
-fn is_attention_kind(kind: NotificationKind) -> bool {
-    matches!(
-        kind,
-        NotificationKind::AgentBlocked | NotificationKind::ApprovalRequired
-    )
 }
 
 fn find_existing_source(

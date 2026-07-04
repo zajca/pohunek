@@ -346,11 +346,30 @@ pub struct NotificationKindPolicy {
     pub system: bool,
 }
 
+/// Default for [`NotificationPolicy::attention_debounce_secs`] when a persisted
+/// or wire policy omits it.
+///
+/// Backfills policy JSON written before the field existed so an older stored
+/// policy keeps loading. The daemon owns the authoritative default
+/// (`DEFAULT_ATTENTION_DEBOUNCE_SECS`); this mirror only exists because the
+/// protocol crate cannot depend on the daemon, and the two must stay in sync.
+const fn default_attention_debounce_secs() -> u64 {
+    5
+}
+
 /// Durable notification policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotificationPolicy {
     /// Dedupe window for equivalent attention events.
     pub attention_dedupe_window_secs: u64,
+    /// Debounce window before a pending attention notification may surface.
+    ///
+    /// Additive: an older client omits it, and a policy JSON without it loads the
+    /// default so a pre-debounce persisted policy keeps working. Distinct from
+    /// [`Self::attention_dedupe_window_secs`], which merges duplicate reports of
+    /// one attention moment rather than delaying when it surfaces.
+    #[serde(default = "default_attention_debounce_secs")]
+    pub attention_debounce_secs: u64,
     /// Default per-kind enable flags.
     pub enabled: NotificationKindPolicy,
     /// Codex-specific per-kind override, when configured.
