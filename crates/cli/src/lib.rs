@@ -121,6 +121,12 @@ enum Commands {
         action: HostAction,
     },
 
+    /// List, watch, update, and configure durable agent notifications.
+    Notifications {
+        #[command(subcommand)]
+        action: NotificationsAction,
+    },
+
     /// Render provider prompt templates locally.
     Prompt {
         #[command(subcommand)]
@@ -363,6 +369,177 @@ enum HostAction {
 }
 
 #[derive(Debug, Subcommand)]
+enum NotificationsAction {
+    /// List durable notifications on one host or across reachable hosts.
+    List {
+        /// Include local plus all reachable hosts discovered by the local daemon.
+        #[arg(long, conflicts_with = "host")]
+        all_hosts: bool,
+        /// Alias for `--status unread`.
+        #[arg(long, conflicts_with = "status")]
+        unread: bool,
+        /// Filter by lifecycle status.
+        #[arg(long, value_parser = commands::notifications::parse_notification_status)]
+        status: Option<protocol::NotificationStatus>,
+        /// Filter by notification kind.
+        #[arg(long, value_parser = commands::notifications::parse_notification_kind)]
+        kind: Option<protocol::NotificationKind>,
+        /// Filter by severity.
+        #[arg(long, value_parser = commands::notifications::parse_notification_severity)]
+        severity: Option<protocol::NotificationSeverity>,
+        /// Filter by agent kind. Applied client-side.
+        #[arg(long, value_parser = commands::notifications::parse_agent_kind)]
+        agent: Option<protocol::AgentKind>,
+        /// Filter by notification producer provider.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Filter by linked session id.
+        #[arg(long)]
+        session: Option<String>,
+        /// Maximum number of records to return.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Pagination cursor returned by a previous list call.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Emit machine-readable JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Watch notification create/update/delete events.
+    Watch {
+        /// Include local plus all reachable hosts discovered by the local daemon.
+        #[arg(long, conflicts_with = "host")]
+        all_hosts: bool,
+        /// Emit machine-readable JSON event lines instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Mark one notification as read.
+    Read {
+        /// Notification target: `id` or `host/id`.
+        target: commands::notifications::NotificationTarget,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Acknowledge one notification.
+    Ack {
+        /// Notification target: `id` or `host/id`.
+        target: commands::notifications::NotificationTarget,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Archive one notification.
+    Archive {
+        /// Notification target: `id` or `host/id`.
+        target: commands::notifications::NotificationTarget,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Delete one notification record.
+    Delete {
+        /// Notification target: `id` or `host/id`.
+        target: commands::notifications::NotificationTarget,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Read or update notification policy.
+    Policy {
+        #[command(subcommand)]
+        action: NotificationPolicyAction,
+    },
+
+    /// Run notification retention maintenance.
+    Retention {
+        #[command(subcommand)]
+        action: NotificationRetentionAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum NotificationPolicyAction {
+    /// Show notification policy.
+    Get {
+        /// Include local plus all reachable hosts discovered by the local daemon.
+        #[arg(long, conflicts_with = "host")]
+        all_hosts: bool,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Enable or disable one provider/kind policy flag.
+    #[command(group(
+        clap::ArgGroup::new("policy_value")
+            .required(true)
+            .args(["enabled", "disabled"])
+    ))]
+    Set {
+        /// Provider policy namespace to update.
+        #[arg(long, value_parser = commands::notifications::parse_policy_provider)]
+        provider: commands::notifications::PolicyProvider,
+        /// Notification kind to update.
+        #[arg(long, value_parser = commands::notifications::parse_notification_kind)]
+        kind: protocol::NotificationKind,
+        /// Enable the selected provider/kind flag.
+        #[arg(long, group = "policy_value")]
+        enabled: bool,
+        /// Disable the selected provider/kind flag.
+        #[arg(long, group = "policy_value")]
+        disabled: bool,
+        /// Include local plus all reachable hosts discovered by the local daemon.
+        #[arg(long, conflicts_with = "host")]
+        all_hosts: bool,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum NotificationRetentionAction {
+    /// Prune notification records selected by retention filters.
+    #[command(group(
+        clap::ArgGroup::new("retention_mode")
+            .required(true)
+            .args(["dry_run", "apply"])
+    ))]
+    Prune {
+        /// Report matching records without deleting them.
+        #[arg(long, group = "retention_mode")]
+        dry_run: bool,
+        /// Delete matching records.
+        #[arg(long, group = "retention_mode")]
+        apply: bool,
+        /// Include local plus all reachable hosts discovered by the local daemon.
+        #[arg(long, conflicts_with = "host")]
+        all_hosts: bool,
+        /// Restrict pruning to this lifecycle status.
+        #[arg(long, value_parser = commands::notifications::parse_notification_status)]
+        status: Option<protocol::NotificationStatus>,
+        /// Prune records created before this RFC3339 timestamp.
+        #[arg(long)]
+        before: Option<String>,
+        /// Maximum number of records to prune.
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum PromptAction {
     /// Render a provider prompt template using context JSON from stdin.
     Render {
@@ -580,12 +757,32 @@ impl Commands {
                 action.as_ref().map_or(*json, SetupAction::wants_json)
             }
             Commands::Host { action } => action.wants_json(),
+            Commands::Notifications { action } => action.wants_json(),
             Commands::Project { action } => action.wants_json(),
             Commands::Assistant { action, args, .. } => {
                 action.as_ref().map_or(args.json, |a| a.parts().1.json)
             }
             Commands::Subscribe { json } => *json,
             Commands::Attach { .. } | Commands::Daemon { .. } | Commands::Prompt { .. } => false,
+        }
+    }
+
+    fn uses_all_hosts(&self) -> bool {
+        match self {
+            Commands::Notifications { action } => action.uses_all_hosts(),
+            Commands::Attach { .. }
+            | Commands::Doctor { .. }
+            | Commands::Daemon { .. }
+            | Commands::Health { .. }
+            | Commands::Status { .. }
+            | Commands::Session { .. }
+            | Commands::Subscribe { .. }
+            | Commands::Integration { .. }
+            | Commands::Setup { .. }
+            | Commands::Host { .. }
+            | Commands::Prompt { .. }
+            | Commands::Project { .. }
+            | Commands::Assistant { .. } => false,
         }
     }
 }
@@ -625,6 +822,64 @@ impl HostAction {
     }
 }
 
+impl NotificationsAction {
+    fn wants_json(&self) -> bool {
+        match self {
+            NotificationsAction::List { json, .. }
+            | NotificationsAction::Watch { json, .. }
+            | NotificationsAction::Read { json, .. }
+            | NotificationsAction::Ack { json, .. }
+            | NotificationsAction::Archive { json, .. }
+            | NotificationsAction::Delete { json, .. } => *json,
+            NotificationsAction::Policy { action } => action.wants_json(),
+            NotificationsAction::Retention { action } => action.wants_json(),
+        }
+    }
+
+    fn uses_all_hosts(&self) -> bool {
+        match self {
+            NotificationsAction::List { all_hosts, .. }
+            | NotificationsAction::Watch { all_hosts, .. } => *all_hosts,
+            NotificationsAction::Policy { action } => action.uses_all_hosts(),
+            NotificationsAction::Retention { action } => action.uses_all_hosts(),
+            NotificationsAction::Read { .. }
+            | NotificationsAction::Ack { .. }
+            | NotificationsAction::Archive { .. }
+            | NotificationsAction::Delete { .. } => false,
+        }
+    }
+}
+
+impl NotificationPolicyAction {
+    fn wants_json(&self) -> bool {
+        match self {
+            NotificationPolicyAction::Get { json, .. }
+            | NotificationPolicyAction::Set { json, .. } => *json,
+        }
+    }
+
+    fn uses_all_hosts(&self) -> bool {
+        match self {
+            NotificationPolicyAction::Get { all_hosts, .. }
+            | NotificationPolicyAction::Set { all_hosts, .. } => *all_hosts,
+        }
+    }
+}
+
+impl NotificationRetentionAction {
+    fn wants_json(&self) -> bool {
+        match self {
+            NotificationRetentionAction::Prune { json, .. } => *json,
+        }
+    }
+
+    fn uses_all_hosts(&self) -> bool {
+        match self {
+            NotificationRetentionAction::Prune { all_hosts, .. } => *all_hosts,
+        }
+    }
+}
+
 impl SessionAction {
     fn wants_json(&self) -> bool {
         match self {
@@ -657,6 +912,13 @@ pub async fn run_cli() -> ExitCode {
         Ok(cli) => cli,
         Err(err) => return error::render_clap_error(&err, error::args_request_json(&args)),
     };
+    if cli.command.uses_all_hosts() && args_request_host(&args) {
+        let err = clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--host cannot be used together with --all-hosts",
+        );
+        return error::render_clap_error(&err, error::args_request_json(&args));
+    }
     // Capture whether the active command requested `--json` before `run` consumes
     // `cli`, so a failure is rendered in the same mode a success would have been.
     let json = cli.command.wants_json();
@@ -863,6 +1125,109 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 Ok(ExitCode::SUCCESS)
             }
         },
+        Commands::Notifications { action } => {
+            let paths = Paths::resolve()?;
+            let host = effective_host(&global_host, None);
+            match action {
+                NotificationsAction::List {
+                    all_hosts,
+                    unread,
+                    status,
+                    kind,
+                    severity,
+                    agent,
+                    provider,
+                    session,
+                    limit,
+                    cursor,
+                    json,
+                } => {
+                    commands::notifications::run_list(
+                        &host,
+                        &paths,
+                        commands::notifications::ListFilters {
+                            unread,
+                            status,
+                            kind,
+                            severity,
+                            provider,
+                            agent,
+                            session,
+                            limit,
+                            cursor,
+                        },
+                        all_hosts,
+                        json,
+                    )
+                    .await?;
+                }
+                NotificationsAction::Watch { all_hosts, json } => {
+                    commands::notifications::run_watch(&host, &paths, all_hosts, json).await?;
+                }
+                NotificationsAction::Read { target, json } => {
+                    let host = effective_notification_host(&host, &target);
+                    commands::notifications::run_read(&host, &paths, &target, json).await?;
+                }
+                NotificationsAction::Ack { target, json } => {
+                    let host = effective_notification_host(&host, &target);
+                    commands::notifications::run_ack(&host, &paths, &target, json).await?;
+                }
+                NotificationsAction::Archive { target, json } => {
+                    let host = effective_notification_host(&host, &target);
+                    commands::notifications::run_archive(&host, &paths, &target, json).await?;
+                }
+                NotificationsAction::Delete { target, json } => {
+                    let host = effective_notification_host(&host, &target);
+                    commands::notifications::run_delete(&host, &paths, &target, json).await?;
+                }
+                NotificationsAction::Policy { action } => match action {
+                    NotificationPolicyAction::Get { all_hosts, json } => {
+                        commands::notifications::run_policy_get(&host, &paths, all_hosts, json)
+                            .await?;
+                    }
+                    NotificationPolicyAction::Set {
+                        provider,
+                        kind,
+                        enabled,
+                        all_hosts,
+                        json,
+                        ..
+                    } => {
+                        commands::notifications::run_policy_set(
+                            &host, &paths, provider, kind, enabled, all_hosts, json,
+                        )
+                        .await?;
+                    }
+                },
+                NotificationsAction::Retention { action } => match action {
+                    NotificationRetentionAction::Prune {
+                        dry_run,
+                        apply,
+                        all_hosts,
+                        status,
+                        before,
+                        limit,
+                        json,
+                    } => {
+                        commands::notifications::run_retention_prune(
+                            &host,
+                            &paths,
+                            commands::notifications::RetentionArgs {
+                                dry_run,
+                                apply,
+                                status,
+                                before,
+                                limit,
+                            },
+                            all_hosts,
+                            json,
+                        )
+                        .await?;
+                    }
+                },
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Commands::Prompt { action } => {
             match action {
                 PromptAction::Render {
@@ -1003,10 +1368,26 @@ fn effective_host(global: &str, target: Option<&Target>) -> String {
     }
 }
 
+fn effective_notification_host(
+    global: &str,
+    target: &commands::notifications::NotificationTarget,
+) -> String {
+    target.host.as_deref().unwrap_or(global).to_owned()
+}
+
 fn parse_prompt_provider(value: &str) -> Result<pohunek_prompt::Provider, String> {
     value
         .parse()
         .map_err(|err: pohunek_prompt::Error| err.to_string())
+}
+
+fn args_request_host(args: &[std::ffi::OsString]) -> bool {
+    let host_flag = std::ffi::OsStr::new("--host");
+    let end_of_opts = std::ffi::OsStr::new("--");
+    args.iter()
+        .skip(1)
+        .take_while(|arg| arg.as_os_str() != end_of_opts)
+        .any(|arg| arg.as_os_str() == host_flag || arg.to_string_lossy().starts_with("--host="))
 }
 
 #[cfg(test)]
@@ -1052,6 +1433,7 @@ mod tests {
             "integration",
             "setup",
             "host",
+            "notifications",
             "prompt",
             "project",
             "assistant",

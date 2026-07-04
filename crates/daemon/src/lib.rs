@@ -37,6 +37,7 @@ pub mod agent;
 pub mod detect;
 pub mod events;
 pub mod integration;
+pub mod notifications;
 pub mod project;
 pub mod store;
 pub mod worktree;

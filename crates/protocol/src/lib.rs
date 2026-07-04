@@ -26,6 +26,7 @@ mod doctor;
 mod envelope;
 mod error;
 mod integration;
+mod notification;
 mod project;
 mod session;
 mod version;
@@ -49,6 +50,16 @@ pub use error::{ErrorClass, ProtocolError};
 pub use integration::{
     IntegrationInstallParams, IntegrationInstallReport, IntegrationInstallResult, ENV_DAEMON_ID,
     ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
+};
+#[doc(inline)]
+pub use notification::{
+    NotificationCreateParams, NotificationCreateResult, NotificationCreatedEvent,
+    NotificationDeleteParams, NotificationDeleteResult, NotificationDeletedEvent, NotificationId,
+    NotificationKind, NotificationKindPolicy, NotificationListParams, NotificationListResult,
+    NotificationPolicy, NotificationPolicyParams, NotificationPolicyResult, NotificationRecord,
+    NotificationRetentionParams, NotificationRetentionResult, NotificationSeverity,
+    NotificationSource, NotificationStatus, NotificationUpdateParams, NotificationUpdateResult,
+    NotificationUpdatedEvent,
 };
 #[doc(inline)]
 pub use project::{
@@ -126,6 +137,29 @@ pub mod method {
     /// `Vec<`[`HostRecord`](crate::HostRecord)`>`.
     pub const HOST_DISCOVER: &str = "host.discover";
 
+    // --- Notifications (durable local inbox records, aggregated client-side). ---
+    /// Create a durable notification record. Returns a
+    /// [`NotificationCreateResult`](crate::NotificationCreateResult).
+    pub const NOTIFICATION_CREATE: &str = "notification.create";
+    /// List durable notification records. Returns a
+    /// [`NotificationListResult`](crate::NotificationListResult).
+    pub const NOTIFICATION_LIST: &str = "notification.list";
+    /// Update a notification lifecycle status. Returns a
+    /// [`NotificationUpdateResult`](crate::NotificationUpdateResult).
+    pub const NOTIFICATION_UPDATE: &str = "notification.update";
+    /// Delete a notification record. Returns a
+    /// [`NotificationDeleteResult`](crate::NotificationDeleteResult).
+    pub const NOTIFICATION_DELETE: &str = "notification.delete";
+    /// Read the notification policy. Returns a
+    /// [`NotificationPolicyResult`](crate::NotificationPolicyResult).
+    pub const NOTIFICATION_POLICY_GET: &str = "notification.policy.get";
+    /// Replace the notification policy. Returns a
+    /// [`NotificationPolicyResult`](crate::NotificationPolicyResult).
+    pub const NOTIFICATION_POLICY_SET: &str = "notification.policy.set";
+    /// Prune notifications through retention policy. Returns a
+    /// [`NotificationRetentionResult`](crate::NotificationRetentionResult).
+    pub const NOTIFICATION_RETENTION_PRUNE: &str = "notification.retention.prune";
+
     // --- Projects (git-repo awareness). Resolved per host against its own store.
     /// List known projects on the target host. Returns
     /// `Vec<`[`ProjectInfo`](crate::ProjectInfo)`>`.
@@ -168,6 +202,9 @@ pub mod event {
     pub const AGENT_STATE: &str = "agent_state";
     pub const ATTACH_OPENED: &str = "attach_opened";
     pub const ATTACH_CLOSED: &str = "attach_closed";
+    pub const NOTIFICATION_CREATED: &str = "notification_created";
+    pub const NOTIFICATION_UPDATED: &str = "notification_updated";
+    pub const NOTIFICATION_DELETED: &str = "notification_deleted";
     pub const SESSION_CREATED: &str = "session_created";
     pub const SESSION_UPDATED: &str = "session_updated";
     pub const SESSION_STOPPED: &str = "session_stopped";

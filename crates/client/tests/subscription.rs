@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process;
@@ -206,6 +207,94 @@ async fn subscription_ack_response_id_mismatch_is_rejected() {
         .expect("subscription daemon task completed");
 }
 
+#[tokio::test]
+async fn subscription_next_event_decodes_notification_created() {
+    let request = subscribe_request("subscribe-notification-created");
+    let record = sample_notification_record();
+    let event = protocol::Event::new(
+        protocol::event::NOTIFICATION_CREATED,
+        json!({ "record": serde_json::to_value(&record).expect("serialize record") }),
+    );
+    let event_line = serde_json::to_string(&event).expect("serialize event");
+    let daemon = spawn_unix_subscription_daemon(
+        response_ok_line_for(&request, json!({"subscribed": true})),
+        vec![event_line],
+    );
+
+    let client = Client::connect_local(&daemon.socket_path)
+        .await
+        .expect("connect local subscription test daemon");
+    let mut subscription = client
+        .subscribe(&request)
+        .await
+        .expect("subscribe succeeds");
+    assert_sent_request(
+        &daemon
+            .request_line
+            .await
+            .expect("daemon received subscription request"),
+        &request,
+    );
+
+    let decoded = subscription
+        .next_event()
+        .await
+        .expect("event decodes")
+        .expect("event is present");
+    assert_eq!(decoded, event);
+    assert_eq!(decoded.event, protocol::event::NOTIFICATION_CREATED);
+    let payload: protocol::NotificationCreatedEvent =
+        serde_json::from_value(decoded.payload).expect("decode notification_created payload");
+    assert_eq!(payload.record, record);
+
+    assert!(subscription
+        .next_event()
+        .await
+        .expect("closed stream yields Ok(None)")
+        .is_none());
+    daemon
+        .task
+        .await
+        .expect("subscription daemon task completed");
+}
+
+#[tokio::test]
+async fn subscription_next_event_malformed_json_returns_typed_error() {
+    let request = subscribe_request("subscribe-notification-malformed");
+    let daemon = spawn_unix_subscription_daemon(
+        response_ok_line_for(&request, json!({"subscribed": true})),
+        vec!["definitely not json".to_owned()],
+    );
+
+    let client = Client::connect_local(&daemon.socket_path)
+        .await
+        .expect("connect local subscription test daemon");
+    let mut subscription = client
+        .subscribe(&request)
+        .await
+        .expect("subscribe succeeds");
+    assert_sent_request(
+        &daemon
+            .request_line
+            .await
+            .expect("daemon received subscription request"),
+        &request,
+    );
+
+    match subscription
+        .next_event()
+        .await
+        .expect_err("malformed event line surfaces a typed error")
+    {
+        ClientError::Json(_) => {}
+        other => panic!("expected local Json error, got {other:?}"),
+    }
+    daemon
+        .task
+        .await
+        .expect("subscription daemon task completed");
+}
+
 fn spawn_unix_subscription_daemon(
     ack_line: String,
     event_lines: Vec<String>,
@@ -308,6 +397,34 @@ fn response_error_line_for(request: &Request, err: ProtocolError) -> String {
 fn assert_sent_request(request_line: &str, expected: &Request) {
     let request: Request = serde_json::from_str(request_line).expect("parse request line");
     assert_eq!(&request, expected);
+}
+
+fn sample_notification_record() -> protocol::NotificationRecord {
+    protocol::NotificationRecord {
+        id: protocol::NotificationId("n-1".to_owned()),
+        source: protocol::NotificationSource {
+            provider: "codex".to_owned(),
+            provider_event: "permission_request".to_owned(),
+            host_local_source_id: "src-1".to_owned(),
+        },
+        kind: protocol::NotificationKind::ApprovalRequired,
+        severity: protocol::NotificationSeverity::ActionRequired,
+        status: protocol::NotificationStatus::Unread,
+        title: "Approval required".to_owned(),
+        body: "Codex is waiting for approval".to_owned(),
+        metadata: BTreeMap::new(),
+        created_at: "2026-07-03T00:00:00Z".to_owned(),
+        session_id: None,
+        agent_kind: None,
+        source_id: None,
+        dedupe_key: Some("dedupe-1".to_owned()),
+        project_id: None,
+        read_at: None,
+        acked_at: None,
+        archived_at: None,
+        deleted_at: None,
+        superseded_by: None,
+    }
 }
 
 fn trim_line_end(line: &str) -> &str {

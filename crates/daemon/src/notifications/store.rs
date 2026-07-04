@@ -1,0 +1,956 @@
+//! Append-only notification store.
+
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use protocol::{
+    NotificationId, NotificationListParams, NotificationListResult, NotificationPolicy,
+    NotificationRecord, NotificationStatus,
+};
+use serde::{Deserialize, Serialize};
+use tracing::warn;
+
+use super::{
+    apply_status, inside_attention_window, is_valid_status_transition, parse_timestamp,
+    same_source_namespace, source_priority, NotificationError, SourcePriority,
+};
+
+/// Directory under the daemon data dir holding notification state.
+pub const NOTIFICATIONS_SUBDIR: &str = "notifications";
+
+/// File name of the append-only notification action log.
+const NOTIFICATIONS_LOG_NAME: &str = "notifications.jsonl";
+
+/// File name of the durable notification policy.
+///
+/// Policy is singleton configuration state, not notification audit history, so
+/// it is atomically replaced beside the append-only action log instead of being
+/// replayed from notification actions.
+const POLICY_FILE_NAME: &str = "policy.json";
+
+#[cfg(unix)]
+const OWNER_PRIVATE_DIR_MODE: u32 = 0o700;
+
+#[cfg(unix)]
+const OWNER_PRIVATE_FILE_MODE: u32 = 0o600;
+
+/// Separator used by stable notification list cursors.
+///
+/// RFC3339 timestamps and daemon notification ids do not contain this byte, so
+/// the cursor can stay compact without JSON/base64 encoding.
+const CURSOR_SEPARATOR: char = '|';
+
+/// Whether replay may ignore one unterminated EOF parse error at the log tail.
+///
+/// A daemon crash can interrupt an append after bytes are written but before the
+/// newline-delimited JSON action is complete. Earlier parse failures or
+/// newline-terminated failures may hide durable lifecycle actions and must stop
+/// replay instead of reconstructing false state.
+const TOLERATE_TRAILING_EOF_ACTION: bool = true;
+
+/// Append-only notification store.
+#[derive(Debug)]
+pub(crate) struct NotificationStore {
+    dir: PathBuf,
+    path: PathBuf,
+    state: Mutex<StoreState>,
+}
+
+#[derive(Debug)]
+struct StoreState {
+    file: File,
+    records: BTreeMap<String, NotificationRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum StoreAction {
+    Created { record: NotificationRecord },
+    Updated { record: NotificationRecord },
+    Deleted { record: NotificationRecord },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CreateOutcome {
+    Created(NotificationRecord),
+    Existing(NotificationRecord),
+    Updated(NotificationRecord),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UpdateOutcome {
+    Updated(NotificationRecord),
+    Deleted(NotificationRecord),
+}
+
+impl NotificationStore {
+    /// Open the notification store under `data_dir`.
+    ///
+    /// Creates `<data_dir>/notifications` owner-private and opens
+    /// `notifications.jsonl` owner-private in append mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationError`] when directory, file, or replay I/O fails.
+    pub(crate) fn open(data_dir: &Path) -> Result<Self, NotificationError> {
+        let dir = data_dir.join(NOTIFICATIONS_SUBDIR);
+        create_private_dir(&dir)?;
+        let path = dir.join(NOTIFICATIONS_LOG_NAME);
+        let file = owner_private_append_options()
+            .open(&path)
+            .map_err(|source| NotificationError::io(&path, source))?;
+        set_owner_private_file_permissions(&path)?;
+        let records = replay(&path)?;
+        Ok(Self {
+            dir,
+            path,
+            state: Mutex::new(StoreState { file, records }),
+        })
+    }
+
+    /// The backing JSONL file path.
+    #[must_use]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Return all reconstructed notification records.
+    pub(crate) fn all(&self) -> Vec<NotificationRecord> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.records.values().cloned().collect()
+    }
+
+    /// Create a record or return/update a deduped visible record atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationError`] when timestamp parsing, serialization, or
+    /// writing fails.
+    pub(crate) fn create_or_dedupe(
+        &self,
+        candidate: NotificationRecord,
+        attention_window_secs: u64,
+    ) -> Result<CreateOutcome, NotificationError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if let Some(existing) = find_existing_source(&state.records, &candidate) {
+            return Ok(CreateOutcome::Existing(existing));
+        }
+
+        if let Some(dedupe_key) = candidate.dedupe_key.as_deref() {
+            let incoming_created_at = parse_timestamp(&candidate.created_at)?;
+            let incoming_priority = source_priority(&candidate.source);
+            for existing in state.records.values().cloned() {
+                if existing.status == NotificationStatus::Deleted {
+                    continue;
+                }
+                if existing.dedupe_key.as_deref() != Some(dedupe_key) {
+                    continue;
+                }
+                if !inside_attention_window(&existing, incoming_created_at, attention_window_secs)?
+                {
+                    continue;
+                }
+                let existing_priority = source_priority(&existing.source);
+                match (incoming_priority, existing_priority) {
+                    (SourcePriority::Provider, SourcePriority::Projector) => {
+                        let updated = upgrade_projector(existing, &candidate);
+                        append_action_locked(
+                            &self.path,
+                            &mut state,
+                            StoreAction::Updated {
+                                record: updated.clone(),
+                            },
+                        )?;
+                        return Ok(CreateOutcome::Updated(updated));
+                    }
+                    (
+                        SourcePriority::Projector | SourcePriority::Provider,
+                        SourcePriority::Provider,
+                    )
+                    | (SourcePriority::Projector, SourcePriority::Projector) => {
+                        return Ok(CreateOutcome::Existing(existing));
+                    }
+                    (SourcePriority::User, _)
+                    | (
+                        SourcePriority::Provider | SourcePriority::Projector,
+                        SourcePriority::User,
+                    ) => {}
+                }
+            }
+        }
+
+        append_action_locked(
+            &self.path,
+            &mut state,
+            StoreAction::Created {
+                record: candidate.clone(),
+            },
+        )?;
+        Ok(CreateOutcome::Created(candidate))
+    }
+
+    /// Load the persisted notification policy or return `fallback`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationError`] when the policy file cannot be read or
+    /// parsed.
+    pub(crate) fn load_policy(
+        &self,
+        fallback: NotificationPolicy,
+    ) -> Result<NotificationPolicy, NotificationError> {
+        let path = self.policy_path();
+        match fs::read_to_string(&path) {
+            Ok(content) => serde_json::from_str(&content)
+                .map_err(|source| NotificationError::policy_parse(path, source)),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(fallback),
+            Err(source) => Err(NotificationError::io(path, source)),
+        }
+    }
+
+    /// Atomically persist the notification policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationError`] when serialization or writing fails.
+    pub(crate) fn write_policy(
+        &self,
+        policy: &NotificationPolicy,
+    ) -> Result<(), NotificationError> {
+        let path = self.policy_path();
+        let temp_path = self.dir.join("policy.json.tmp");
+        let mut file = owner_private_write_options()
+            .open(&temp_path)
+            .map_err(|source| NotificationError::io(&temp_path, source))?;
+        serde_json::to_writer_pretty(&mut file, policy).map_err(NotificationError::serialize)?;
+        file.write_all(b"\n")
+            .map_err(|source| NotificationError::io(&temp_path, source))?;
+        file.flush()
+            .map_err(|source| NotificationError::io(&temp_path, source))?;
+        set_owner_private_file_permissions(&temp_path)?;
+        fs::rename(&temp_path, &path).map_err(|source| NotificationError::io(&path, source))?;
+        set_owner_private_file_permissions(&path)?;
+        Ok(())
+    }
+
+    /// Append a created action.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationError`] when serialization or writing fails.
+    #[cfg(test)]
+    pub(crate) fn append_created(
+        &self,
+        record: NotificationRecord,
+    ) -> Result<(), NotificationError> {
+        self.append_action(StoreAction::Created { record })
+    }
+
+    /// Append an updated action.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationError`] when serialization or writing fails.
+    #[cfg(test)]
+    pub(crate) fn append_updated(
+        &self,
+        record: NotificationRecord,
+    ) -> Result<(), NotificationError> {
+        self.append_action(StoreAction::Updated { record })
+    }
+
+    /// Append a deleted action.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationError`] when serialization or writing fails.
+    #[cfg(test)]
+    pub(crate) fn append_deleted(
+        &self,
+        record: NotificationRecord,
+    ) -> Result<(), NotificationError> {
+        self.append_action(StoreAction::Deleted { record })
+    }
+
+    /// Atomically validate, apply, and append an update transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationError`] when the id is unknown, the transition is
+    /// invalid, or the append fails.
+    pub(crate) fn update_transition(
+        &self,
+        id: NotificationId,
+        status: NotificationStatus,
+        now: &str,
+    ) -> Result<UpdateOutcome, NotificationError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(mut record) = state.records.get(&id.0).cloned() else {
+            return Err(NotificationError::NotFound { id });
+        };
+        if !is_valid_status_transition(record.status, status) {
+            return Err(NotificationError::InvalidTransition {
+                id,
+                from: record.status,
+                to: status,
+            });
+        }
+
+        apply_status(&mut record, status, now);
+        if record.status == NotificationStatus::Deleted {
+            append_action_locked(
+                &self.path,
+                &mut state,
+                StoreAction::Deleted {
+                    record: record.clone(),
+                },
+            )?;
+            Ok(UpdateOutcome::Deleted(record))
+        } else {
+            append_action_locked(
+                &self.path,
+                &mut state,
+                StoreAction::Updated {
+                    record: record.clone(),
+                },
+            )?;
+            Ok(UpdateOutcome::Updated(record))
+        }
+    }
+
+    /// Atomically apply and append a delete transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationError`] when the append fails.
+    pub(crate) fn delete_transition(
+        &self,
+        id: &NotificationId,
+        now: &str,
+    ) -> Result<Option<NotificationRecord>, NotificationError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(mut record) = state.records.get(&id.0).cloned() else {
+            return Ok(None);
+        };
+        if record.status == NotificationStatus::Deleted {
+            return Ok(None);
+        }
+
+        apply_status(&mut record, NotificationStatus::Deleted, now);
+        append_action_locked(
+            &self.path,
+            &mut state,
+            StoreAction::Deleted {
+                record: record.clone(),
+            },
+        )?;
+        Ok(Some(record))
+    }
+
+    /// List records using protocol filters and a stable cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationError`] when timestamp filters or the cursor are
+    /// invalid.
+    pub(crate) fn list(
+        &self,
+        params: NotificationListParams,
+    ) -> Result<NotificationListResult, NotificationError> {
+        let NotificationListParams {
+            status,
+            kind,
+            severity,
+            provider,
+            session_id,
+            created_after,
+            created_before,
+            limit,
+            cursor,
+        } = params;
+        let created_after = parse_optional_timestamp(created_after.as_deref())?;
+        let created_before = parse_optional_timestamp(created_before.as_deref())?;
+        let cursor = cursor.as_deref().map(parse_cursor).transpose()?;
+
+        let mut records: Vec<NotificationRecord> = self
+            .all()
+            .into_iter()
+            .filter(|record| {
+                status.map_or(record.status != NotificationStatus::Deleted, |status| {
+                    record.status == status
+                }) && kind.is_none_or(|kind| record.kind == kind)
+                    && severity.is_none_or(|severity| record.severity == severity)
+                    && provider
+                        .as_ref()
+                        .is_none_or(|provider| record.source.provider == *provider)
+                    && session_id
+                        .as_ref()
+                        .is_none_or(|session_id| record.session_id.as_ref() == Some(session_id))
+            })
+            .filter(|record| {
+                record_in_time_range(record, created_after, created_before).unwrap_or(false)
+            })
+            .collect();
+
+        sort_records_for_list(&mut records);
+        if let Some(cursor) = cursor {
+            records.retain(|record| record_after_cursor(record, &cursor));
+        }
+
+        let limit = limit.and_then(|value| usize::try_from(value).ok());
+        let next_cursor = limit.and_then(|limit| {
+            if records.len() > limit && limit > 0 {
+                records.get(limit - 1).map(encode_cursor)
+            } else {
+                None
+            }
+        });
+        if let Some(limit) = limit {
+            records.truncate(limit);
+        }
+
+        Ok(NotificationListResult {
+            notifications: records,
+            next_cursor,
+        })
+    }
+
+    #[cfg(test)]
+    fn append_action(&self, action: StoreAction) -> Result<(), NotificationError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        append_action_locked(&self.path, &mut state, action)
+    }
+
+    fn policy_path(&self) -> PathBuf {
+        self.dir.join(POLICY_FILE_NAME)
+    }
+}
+
+fn append_action_locked(
+    path: &Path,
+    state: &mut StoreState,
+    action: StoreAction,
+) -> Result<(), NotificationError> {
+    let mut line = serde_json::to_string(&action).map_err(NotificationError::serialize)?;
+    line.push('\n');
+    state
+        .file
+        .write_all(line.as_bytes())
+        .map_err(|source| NotificationError::io(path, source))?;
+    state
+        .file
+        .flush()
+        .map_err(|source| NotificationError::io(path, source))?;
+    apply_action(&mut state.records, action);
+    Ok(())
+}
+
+fn find_existing_source(
+    records: &BTreeMap<String, NotificationRecord>,
+    candidate: &NotificationRecord,
+) -> Option<NotificationRecord> {
+    let source_id = candidate.source_id.as_deref()?;
+    records.values().find_map(|record| {
+        (record.status != NotificationStatus::Deleted
+            && record.source_id.as_deref() == Some(source_id)
+            && same_source_namespace(&record.source, &candidate.source))
+        .then(|| record.clone())
+    })
+}
+
+fn upgrade_projector(
+    mut existing: NotificationRecord,
+    replacement: &NotificationRecord,
+) -> NotificationRecord {
+    existing.source.clone_from(&replacement.source);
+    existing.kind = replacement.kind;
+    existing.severity = replacement.severity;
+    existing.title.clone_from(&replacement.title);
+    existing.body.clone_from(&replacement.body);
+    existing.metadata.clone_from(&replacement.metadata);
+    existing.session_id.clone_from(&replacement.session_id);
+    existing.agent_kind = replacement.agent_kind;
+    existing.source_id.clone_from(&replacement.source_id);
+    existing.dedupe_key.clone_from(&replacement.dedupe_key);
+    existing.project_id.clone_from(&replacement.project_id);
+    existing.superseded_by = None;
+    existing
+}
+
+fn replay(path: &Path) -> Result<BTreeMap<String, NotificationRecord>, NotificationError> {
+    let content = fs::read_to_string(path).map_err(|source| NotificationError::io(path, source))?;
+    let mut records = BTreeMap::new();
+    for (index, raw_line) in content.split_inclusive('\n').enumerate() {
+        let line_number = index + 1;
+        let terminated = raw_line.ends_with('\n');
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<StoreAction>(line) {
+            Ok(action) => apply_action(&mut records, action),
+            Err(err) if is_tolerated_trailing_partial(terminated, &err) => {
+                warn!(
+                    error = %err,
+                    file.path = %path.display(),
+                    line.number = line_number,
+                    "ignoring truncated trailing notification-store action"
+                );
+            }
+            Err(err) => return Err(NotificationError::store_parse(path, line_number, err)),
+        }
+    }
+    Ok(records)
+}
+
+fn is_tolerated_trailing_partial(terminated: bool, err: &serde_json::Error) -> bool {
+    TOLERATE_TRAILING_EOF_ACTION
+        && !terminated
+        && err.classify() == serde_json::error::Category::Eof
+}
+
+fn apply_action(records: &mut BTreeMap<String, NotificationRecord>, action: StoreAction) {
+    let record = match action {
+        StoreAction::Created { record }
+        | StoreAction::Updated { record }
+        | StoreAction::Deleted { record } => record,
+    };
+    records.insert(record.id.0.clone(), record);
+}
+
+fn sort_records_for_list(records: &mut [NotificationRecord]) {
+    records.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| left.id.0.cmp(&right.id.0))
+    });
+}
+
+fn parse_optional_timestamp(
+    value: Option<&str>,
+) -> Result<Option<time::OffsetDateTime>, NotificationError> {
+    value.map(parse_timestamp).transpose()
+}
+
+fn record_in_time_range(
+    record: &NotificationRecord,
+    created_after: Option<time::OffsetDateTime>,
+    created_before: Option<time::OffsetDateTime>,
+) -> Result<bool, NotificationError> {
+    let created_at = parse_timestamp(&record.created_at)?;
+    Ok(created_after.is_none_or(|after| created_at >= after)
+        && created_before.is_none_or(|before| created_at < before))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Cursor {
+    created_at: String,
+    id: String,
+}
+
+fn encode_cursor(record: &NotificationRecord) -> String {
+    format!("{}{CURSOR_SEPARATOR}{}", record.created_at, record.id.0)
+}
+
+fn parse_cursor(cursor: &str) -> Result<Cursor, NotificationError> {
+    let Some((created_at, id)) = cursor.split_once(CURSOR_SEPARATOR) else {
+        return Err(NotificationError::InvalidCursor {
+            cursor: cursor.to_owned(),
+        });
+    };
+    parse_timestamp(created_at)?;
+    if id.is_empty() {
+        return Err(NotificationError::InvalidCursor {
+            cursor: cursor.to_owned(),
+        });
+    }
+    Ok(Cursor {
+        created_at: created_at.to_owned(),
+        id: id.to_owned(),
+    })
+}
+
+fn record_after_cursor(record: &NotificationRecord, cursor: &Cursor) -> bool {
+    record.created_at < cursor.created_at
+        || (record.created_at == cursor.created_at && record.id.0 > cursor.id)
+}
+
+fn owner_private_append_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(OWNER_PRIVATE_FILE_MODE)
+    };
+    options
+}
+
+fn owner_private_write_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(OWNER_PRIVATE_FILE_MODE)
+    };
+    options
+}
+
+fn create_private_dir(dir: &Path) -> Result<(), NotificationError> {
+    fs::create_dir_all(dir).map_err(|source| NotificationError::io(dir, source))?;
+    set_owner_private_dir_permissions(dir)
+}
+
+#[cfg(unix)]
+fn set_owner_private_dir_permissions(dir: &Path) -> Result<(), NotificationError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(dir, fs::Permissions::from_mode(OWNER_PRIVATE_DIR_MODE))
+        .map_err(|source| NotificationError::io(dir, source))
+}
+
+#[cfg(not(unix))]
+fn set_owner_private_dir_permissions(_dir: &Path) -> Result<(), NotificationError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_owner_private_file_permissions(path: &Path) -> Result<(), NotificationError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(OWNER_PRIVATE_FILE_MODE))
+        .map_err(|source| NotificationError::io(path, source))
+}
+
+#[cfg(not(unix))]
+fn set_owner_private_file_permissions(_path: &Path) -> Result<(), NotificationError> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use protocol::{
+        NotificationId, NotificationKind, NotificationSeverity, NotificationSource,
+        NotificationStatus,
+    };
+
+    use super::NotificationStore;
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_data_dir(tag: &str) -> std::path::PathBuf {
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "pohunek-notifications-store-{tag}-{}-{nanos}-{counter}",
+            std::process::id()
+        ))
+    }
+
+    fn record(id: &str, created_at: &str) -> protocol::NotificationRecord {
+        protocol::NotificationRecord {
+            id: NotificationId(id.to_owned()),
+            source: NotificationSource {
+                provider: "codex".to_owned(),
+                provider_event: "PermissionRequest".to_owned(),
+                host_local_source_id: format!("source-{id}"),
+            },
+            kind: NotificationKind::ApprovalRequired,
+            severity: NotificationSeverity::ActionRequired,
+            status: NotificationStatus::Unread,
+            title: format!("Title {id}"),
+            body: format!("Body {id}"),
+            metadata: BTreeMap::new(),
+            created_at: created_at.to_owned(),
+            session_id: None,
+            agent_kind: None,
+            source_id: Some(format!("source-id-{id}")),
+            dedupe_key: None,
+            project_id: None,
+            read_at: None,
+            acked_at: None,
+            archived_at: None,
+            deleted_at: None,
+            superseded_by: None,
+        }
+    }
+
+    #[test]
+    fn open_creates_notifications_directory_and_file_owner_private() {
+        let data_dir = temp_data_dir("permissions");
+        let store = NotificationStore::open(&data_dir).expect("open store");
+
+        assert!(data_dir.join("notifications").is_dir());
+        assert!(store.path().is_file());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir_mode = std::fs::metadata(data_dir.join("notifications"))
+                .expect("dir metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            let file_mode = std::fs::metadata(store.path())
+                .expect("file metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700);
+            assert_eq!(file_mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn append_create_update_archive_delete_replays_after_reopen() {
+        let data_dir = temp_data_dir("replay");
+        let store = NotificationStore::open(&data_dir).expect("open store");
+        let mut first = record("n-1", "2026-07-03T10:00:00Z");
+        store.append_created(first.clone()).expect("append created");
+
+        first.status = NotificationStatus::Read;
+        first.read_at = Some("2026-07-03T10:05:00Z".to_owned());
+        store.append_updated(first.clone()).expect("append updated");
+
+        first.status = NotificationStatus::Archived;
+        first.archived_at = Some("2026-07-03T10:10:00Z".to_owned());
+        store
+            .append_updated(first.clone())
+            .expect("append archived");
+
+        first.status = NotificationStatus::Deleted;
+        first.deleted_at = Some("2026-07-03T10:15:00Z".to_owned());
+        store.append_deleted(first.clone()).expect("append deleted");
+
+        let reopened = NotificationStore::open(&data_dir).expect("reopen store");
+        let records = reopened.all();
+
+        assert_eq!(records, vec![first]);
+        let lines = std::fs::read_to_string(reopened.path())
+            .expect("read log")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        assert_eq!(lines, 4);
+    }
+
+    #[test]
+    fn replay_tolerates_truncated_trailing_action_and_keeps_prior_records() {
+        let data_dir = temp_data_dir("trailing-partial");
+        let store = NotificationStore::open(&data_dir).expect("open store");
+        let first = record("n-1", "2026-07-03T10:00:00Z");
+        store
+            .append_created(first.clone())
+            .expect("append created record");
+        let path = store.path().to_path_buf();
+        drop(store);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open log for trailing partial")
+            .write_all(br#"{"action":"updated""#)
+            .expect("write trailing partial");
+
+        let reopened = NotificationStore::open(&data_dir).expect("reopen with trailing partial");
+
+        assert_eq!(reopened.all(), vec![first]);
+    }
+
+    #[test]
+    fn replay_rejects_corrupt_mid_file_action() {
+        let data_dir = temp_data_dir("mid-file-corrupt");
+        let store = NotificationStore::open(&data_dir).expect("open store");
+        let first = record("n-1", "2026-07-03T10:00:00Z");
+        let second = record("n-2", "2026-07-03T10:05:00Z");
+        store
+            .append_created(first)
+            .expect("append first created record");
+        store
+            .append_created(second)
+            .expect("append second created record");
+        let path = store.path().to_path_buf();
+        drop(store);
+        let content = std::fs::read_to_string(&path).expect("read original log");
+        let mut lines = content.lines();
+        let first_line = lines.next().expect("first log line");
+        let second_line = lines.next().expect("second log line");
+        std::fs::write(
+            &path,
+            format!("{first_line}\n{{not-json}}\n{second_line}\n"),
+        )
+        .expect("write corrupt mid-file log");
+
+        let err = NotificationStore::open(&data_dir)
+            .expect_err("mid-file corrupt action must fail store open");
+
+        assert_eq!(err.to_protocol_error().code, "notification_store_error");
+        match err {
+            super::super::NotificationError::StoreParse { line, .. } => assert_eq!(line, 2),
+            other => panic!("expected StoreParse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_keeps_deleted_action_before_trailing_partial() {
+        let data_dir = temp_data_dir("deleted-before-partial");
+        let store = NotificationStore::open(&data_dir).expect("open store");
+        let mut deleted = record("n-1", "2026-07-03T10:00:00Z");
+        store
+            .append_created(deleted.clone())
+            .expect("append created record");
+        deleted.status = NotificationStatus::Deleted;
+        deleted.deleted_at = Some("2026-07-03T10:05:00Z".to_owned());
+        store
+            .append_deleted(deleted.clone())
+            .expect("append deleted record");
+        let path = store.path().to_path_buf();
+        drop(store);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open log for trailing partial")
+            .write_all(br#"{"action":"updated""#)
+            .expect("write trailing partial");
+
+        let reopened = NotificationStore::open(&data_dir).expect("reopen with trailing partial");
+
+        assert_eq!(reopened.all(), vec![deleted]);
+    }
+
+    #[test]
+    fn list_filters_by_status_kind_severity_provider_session_and_time_range() {
+        let data_dir = temp_data_dir("filters");
+        let store = NotificationStore::open(&data_dir).expect("open store");
+        let mut first = record("n-1", "2026-07-03T10:00:00Z");
+        first.session_id = Some(protocol::SessionId("s-1".to_owned()));
+        store.append_created(first.clone()).expect("append first");
+        let mut second = record("n-2", "2026-07-03T11:00:00Z");
+        second.status = NotificationStatus::Archived;
+        second.kind = NotificationKind::Error;
+        second.severity = NotificationSeverity::Error;
+        second.source.provider = "claude".to_owned();
+        second.session_id = Some(protocol::SessionId("s-2".to_owned()));
+        store.append_created(second).expect("append second");
+
+        let listed = store
+            .list(protocol::NotificationListParams {
+                status: Some(NotificationStatus::Unread),
+                kind: Some(NotificationKind::ApprovalRequired),
+                severity: Some(NotificationSeverity::ActionRequired),
+                provider: Some("codex".to_owned()),
+                session_id: Some(protocol::SessionId("s-1".to_owned())),
+                created_after: Some("2026-07-03T09:00:00Z".to_owned()),
+                created_before: Some("2026-07-03T10:30:00Z".to_owned()),
+                limit: None,
+                cursor: None,
+            })
+            .expect("list");
+
+        assert_eq!(listed.notifications, vec![first]);
+        assert_eq!(listed.next_cursor, None);
+    }
+
+    #[test]
+    fn list_cursor_orders_by_created_at_desc_then_id() {
+        let data_dir = temp_data_dir("cursor");
+        let store = NotificationStore::open(&data_dir).expect("open store");
+        for id in ["n-2", "n-1", "n-3"] {
+            store
+                .append_created(record(id, "2026-07-03T10:00:00Z"))
+                .expect("append");
+        }
+        store
+            .append_created(record("n-4", "2026-07-03T11:00:00Z"))
+            .expect("append newer");
+
+        let first_page = store
+            .list(protocol::NotificationListParams {
+                limit: Some(2),
+                ..protocol::NotificationListParams::default()
+            })
+            .expect("first page");
+        let second_page = store
+            .list(protocol::NotificationListParams {
+                limit: Some(10),
+                cursor: first_page.next_cursor.clone(),
+                ..protocol::NotificationListParams::default()
+            })
+            .expect("second page");
+
+        let first_ids: Vec<_> = first_page
+            .notifications
+            .iter()
+            .map(|record| record.id.0.as_str())
+            .collect();
+        let second_ids: Vec<_> = second_page
+            .notifications
+            .iter()
+            .map(|record| record.id.0.as_str())
+            .collect();
+        assert_eq!(first_ids, vec!["n-4", "n-1"]);
+        assert_eq!(second_ids, vec!["n-2", "n-3"]);
+    }
+
+    #[test]
+    fn list_default_excludes_deleted_unless_status_filter_requests_deleted() {
+        let data_dir = temp_data_dir("list-deleted");
+        let store = NotificationStore::open(&data_dir).expect("open store");
+        let mut deleted = record("n-1", "2026-07-03T10:00:00Z");
+        store
+            .append_created(deleted.clone())
+            .expect("append deleted record");
+        deleted.status = NotificationStatus::Deleted;
+        deleted.deleted_at = Some("2026-07-03T10:05:00Z".to_owned());
+        store
+            .append_deleted(deleted.clone())
+            .expect("append delete action");
+        let visible = record("n-2", "2026-07-03T11:00:00Z");
+        store
+            .append_created(visible.clone())
+            .expect("append visible record");
+
+        let default_list = store
+            .list(protocol::NotificationListParams::default())
+            .expect("default list");
+        let deleted_list = store
+            .list(protocol::NotificationListParams {
+                status: Some(NotificationStatus::Deleted),
+                ..protocol::NotificationListParams::default()
+            })
+            .expect("deleted list");
+
+        assert_eq!(default_list.notifications, vec![visible]);
+        assert_eq!(deleted_list.notifications, vec![deleted]);
+    }
+}

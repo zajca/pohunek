@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process;
@@ -53,6 +54,14 @@ struct ReusableDaemon {
     socket_path: PathBuf,
     first_request_line: oneshot::Receiver<String>,
     second_request_line: oneshot::Receiver<Option<String>>,
+    task: JoinHandle<()>,
+    _socket_file: SocketFile,
+}
+
+#[derive(Debug)]
+struct EchoDaemon {
+    socket_path: PathBuf,
+    request_line: oneshot::Receiver<String>,
     task: JoinHandle<()>,
     _socket_file: SocketFile,
 }
@@ -333,6 +342,203 @@ async fn request_response_id_mismatch_poisons_connection_before_it_can_be_reused
     daemon.task.await.expect("reusable daemon completed");
 }
 
+#[tokio::test]
+async fn request_response_create_notification_sends_method_and_returns_typed_result() {
+    let params = sample_create_params();
+    let expected = protocol::NotificationCreateResult {
+        created: true,
+        record: sample_notification_record(),
+    };
+    let daemon = spawn_echo_ok_daemon(serde_json::to_value(&expected).expect("serialize result"));
+    let mut client = Client::connect_local(&daemon.socket_path)
+        .await
+        .expect("connect local echo daemon");
+
+    let result = client
+        .create_notification(params.clone())
+        .await
+        .expect("create_notification succeeds");
+
+    assert_eq!(result, expected);
+    let sent = parse_sent_request(&daemon.request_line.await.expect("daemon saw request"));
+    assert_eq!(sent.method, protocol::method::NOTIFICATION_CREATE);
+    assert_eq!(
+        sent.params,
+        serde_json::to_value(&params).expect("serialize params")
+    );
+    daemon.task.await.expect("echo daemon completed");
+}
+
+#[tokio::test]
+async fn request_response_list_notifications_sends_method_and_returns_typed_result() {
+    let params = protocol::NotificationListParams {
+        status: Some(protocol::NotificationStatus::Unread),
+        ..protocol::NotificationListParams::default()
+    };
+    let expected = protocol::NotificationListResult {
+        notifications: vec![sample_notification_record()],
+        next_cursor: Some("cursor-1".to_owned()),
+    };
+    let daemon = spawn_echo_ok_daemon(serde_json::to_value(&expected).expect("serialize result"));
+    let mut client = Client::connect_local(&daemon.socket_path)
+        .await
+        .expect("connect local echo daemon");
+
+    let result = client
+        .list_notifications(params.clone())
+        .await
+        .expect("list_notifications succeeds");
+
+    assert_eq!(result, expected);
+    let sent = parse_sent_request(&daemon.request_line.await.expect("daemon saw request"));
+    assert_eq!(sent.method, protocol::method::NOTIFICATION_LIST);
+    assert_eq!(
+        sent.params,
+        serde_json::to_value(&params).expect("serialize params")
+    );
+    daemon.task.await.expect("echo daemon completed");
+}
+
+#[tokio::test]
+async fn request_response_update_notification_sends_method_and_returns_typed_result() {
+    let params = protocol::NotificationUpdateParams {
+        id: protocol::NotificationId("n-1".to_owned()),
+        status: protocol::NotificationStatus::Read,
+    };
+    let expected = protocol::NotificationUpdateResult {
+        record: sample_notification_record(),
+    };
+    let daemon = spawn_echo_ok_daemon(serde_json::to_value(&expected).expect("serialize result"));
+    let mut client = Client::connect_local(&daemon.socket_path)
+        .await
+        .expect("connect local echo daemon");
+
+    let result = client
+        .update_notification(params.clone())
+        .await
+        .expect("update_notification succeeds");
+
+    assert_eq!(result, expected);
+    let sent = parse_sent_request(&daemon.request_line.await.expect("daemon saw request"));
+    assert_eq!(sent.method, protocol::method::NOTIFICATION_UPDATE);
+    assert_eq!(
+        sent.params,
+        serde_json::to_value(&params).expect("serialize params")
+    );
+    daemon.task.await.expect("echo daemon completed");
+}
+
+#[tokio::test]
+async fn request_response_delete_notification_sends_method_and_returns_typed_result() {
+    let params = protocol::NotificationDeleteParams {
+        id: protocol::NotificationId("n-1".to_owned()),
+    };
+    let expected = protocol::NotificationDeleteResult {
+        id: protocol::NotificationId("n-1".to_owned()),
+        deleted: true,
+    };
+    let daemon = spawn_echo_ok_daemon(serde_json::to_value(&expected).expect("serialize result"));
+    let mut client = Client::connect_local(&daemon.socket_path)
+        .await
+        .expect("connect local echo daemon");
+
+    let result = client
+        .delete_notification(params.clone())
+        .await
+        .expect("delete_notification succeeds");
+
+    assert_eq!(result, expected);
+    let sent = parse_sent_request(&daemon.request_line.await.expect("daemon saw request"));
+    assert_eq!(sent.method, protocol::method::NOTIFICATION_DELETE);
+    assert_eq!(
+        sent.params,
+        serde_json::to_value(&params).expect("serialize params")
+    );
+    daemon.task.await.expect("echo daemon completed");
+}
+
+#[tokio::test]
+async fn request_response_get_notification_policy_sends_null_params_and_returns_policy() {
+    let expected = protocol::NotificationPolicyResult {
+        policy: sample_policy(),
+    };
+    let daemon = spawn_echo_ok_daemon(serde_json::to_value(&expected).expect("serialize result"));
+    let mut client = Client::connect_local(&daemon.socket_path)
+        .await
+        .expect("connect local echo daemon");
+
+    let result = client
+        .get_notification_policy()
+        .await
+        .expect("get_notification_policy succeeds");
+
+    assert_eq!(result, expected);
+    let sent = parse_sent_request(&daemon.request_line.await.expect("daemon saw request"));
+    assert_eq!(sent.method, protocol::method::NOTIFICATION_POLICY_GET);
+    assert_eq!(sent.params, Value::Null);
+    daemon.task.await.expect("echo daemon completed");
+}
+
+#[tokio::test]
+async fn request_response_set_notification_policy_sends_method_and_returns_policy() {
+    let params = protocol::NotificationPolicyParams {
+        policy: sample_policy(),
+    };
+    let expected = protocol::NotificationPolicyResult {
+        policy: sample_policy(),
+    };
+    let daemon = spawn_echo_ok_daemon(serde_json::to_value(&expected).expect("serialize result"));
+    let mut client = Client::connect_local(&daemon.socket_path)
+        .await
+        .expect("connect local echo daemon");
+
+    let result = client
+        .set_notification_policy(params.clone())
+        .await
+        .expect("set_notification_policy succeeds");
+
+    assert_eq!(result, expected);
+    let sent = parse_sent_request(&daemon.request_line.await.expect("daemon saw request"));
+    assert_eq!(sent.method, protocol::method::NOTIFICATION_POLICY_SET);
+    assert_eq!(
+        sent.params,
+        serde_json::to_value(&params).expect("serialize params")
+    );
+    daemon.task.await.expect("echo daemon completed");
+}
+
+#[tokio::test]
+async fn request_response_prune_notifications_sends_method_and_returns_typed_result() {
+    let params = protocol::NotificationRetentionParams {
+        dry_run: true,
+        status: Some(protocol::NotificationStatus::Archived),
+        before: Some("2026-01-01T00:00:00Z".to_owned()),
+        limit: Some(10),
+    };
+    let expected = protocol::NotificationRetentionResult {
+        dry_run: true,
+        pruned: vec![protocol::NotificationId("n-1".to_owned())],
+    };
+    let daemon = spawn_echo_ok_daemon(serde_json::to_value(&expected).expect("serialize result"));
+    let mut client = Client::connect_local(&daemon.socket_path)
+        .await
+        .expect("connect local echo daemon");
+
+    let result = client
+        .prune_notifications(params.clone())
+        .await
+        .expect("prune_notifications succeeds");
+
+    assert_eq!(result, expected);
+    let sent = parse_sent_request(&daemon.request_line.await.expect("daemon saw request"));
+    assert_eq!(sent.method, protocol::method::NOTIFICATION_RETENTION_PRUNE);
+    assert_eq!(
+        sent.params,
+        serde_json::to_value(&params).expect("serialize params")
+    );
+    daemon.task.await.expect("echo daemon completed");
+}
+
 async fn run_local(reply: Reply) -> (Result<Value, ClientError>, String) {
     let daemon = spawn_unix_daemon(reply);
     let mut client = Client::connect_local(&daemon.socket_path)
@@ -452,6 +658,56 @@ fn spawn_reusable_daemon(first_reply_line: String) -> ReusableDaemon {
         task,
         _socket_file: SocketFile(socket_path),
     }
+}
+
+fn spawn_echo_ok_daemon(ok_payload: Value) -> EchoDaemon {
+    let socket_path = unique_socket_path();
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).expect("bind unix echo test daemon");
+    let (request_tx, request_line) = oneshot::channel();
+
+    let task = tokio::spawn(async move {
+        let (stream, _addr) = listener.accept().await.expect("accept unix client");
+        handle_echo_connection(stream, request_tx, ok_payload).await;
+    });
+
+    EchoDaemon {
+        socket_path: socket_path.clone(),
+        request_line,
+        task,
+        _socket_file: SocketFile(socket_path),
+    }
+}
+
+async fn handle_echo_connection<S>(
+    stream: S,
+    request_tx: oneshot::Sender<String>,
+    ok_payload: Value,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut reader = BufReader::new(stream);
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
+        .await
+        .expect("read request line");
+    let trimmed = trim_line_end(&request_line).to_owned();
+    let request: Request = serde_json::from_str(&trimmed).expect("parse echo request");
+    request_tx.send(trimmed).expect("send request line to test");
+
+    let reply =
+        serde_json::to_string(&Response::ok(request.id, ok_payload)).expect("serialize ok reply");
+    let mut stream = reader.into_inner();
+    stream
+        .write_all(reply.as_bytes())
+        .await
+        .expect("write echo reply line");
+    stream
+        .write_all(b"\n")
+        .await
+        .expect("write echo reply newline");
+    stream.shutdown().await.expect("close echo reply stream");
 }
 
 async fn handle_connection<S>(stream: S, request_tx: oneshot::Sender<String>, reply: Reply)
@@ -616,6 +872,74 @@ fn assert_sent_request(request_line: &str) {
 fn assert_sent_specific_request(request_line: &str, expected: &Request) {
     let request: Request = serde_json::from_str(request_line).expect("parse request line");
     assert_eq!(&request, expected);
+}
+
+fn parse_sent_request(request_line: &str) -> Request {
+    serde_json::from_str(request_line).expect("parse request line")
+}
+
+fn sample_notification_source() -> protocol::NotificationSource {
+    protocol::NotificationSource {
+        provider: "codex".to_owned(),
+        provider_event: "permission_request".to_owned(),
+        host_local_source_id: "src-1".to_owned(),
+    }
+}
+
+fn sample_create_params() -> protocol::NotificationCreateParams {
+    protocol::NotificationCreateParams {
+        source: sample_notification_source(),
+        kind: protocol::NotificationKind::ApprovalRequired,
+        severity: protocol::NotificationSeverity::ActionRequired,
+        title: "Approval required".to_owned(),
+        body: "Codex is waiting for approval".to_owned(),
+        session_id: None,
+        agent_kind: None,
+        source_id: None,
+        dedupe_key: Some("dedupe-1".to_owned()),
+        project_id: None,
+        metadata: BTreeMap::new(),
+    }
+}
+
+fn sample_notification_record() -> protocol::NotificationRecord {
+    protocol::NotificationRecord {
+        id: protocol::NotificationId("n-1".to_owned()),
+        source: sample_notification_source(),
+        kind: protocol::NotificationKind::ApprovalRequired,
+        severity: protocol::NotificationSeverity::ActionRequired,
+        status: protocol::NotificationStatus::Unread,
+        title: "Approval required".to_owned(),
+        body: "Codex is waiting for approval".to_owned(),
+        metadata: BTreeMap::new(),
+        created_at: "2026-07-03T00:00:00Z".to_owned(),
+        session_id: None,
+        agent_kind: None,
+        source_id: None,
+        dedupe_key: Some("dedupe-1".to_owned()),
+        project_id: None,
+        read_at: None,
+        acked_at: None,
+        archived_at: None,
+        deleted_at: None,
+        superseded_by: None,
+    }
+}
+
+fn sample_policy() -> protocol::NotificationPolicy {
+    protocol::NotificationPolicy {
+        attention_dedupe_window_secs: 30,
+        enabled: protocol::NotificationKindPolicy {
+            agent_blocked: true,
+            approval_required: true,
+            turn_completed: false,
+            session_finished: false,
+            error: true,
+            system: false,
+        },
+        codex: None,
+        claude: None,
+    }
 }
 
 fn trim_line_end(line: &str) -> &str {
