@@ -38,7 +38,7 @@ use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo};
 use pohunek_daemon::events::{spawn_drain, EventLog};
 use pohunek_daemon::notifications::NotificationService;
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
-use pohunek_daemon::store::Store;
+use pohunek_daemon::store::{ResumeBinding, Store, WorktreeBinding};
 
 static PATH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static XDG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -930,6 +930,35 @@ async fn wait_for_native_id(
     }
     panic!(
         "native id {native_id} was not captured for session {}",
+        id.0
+    );
+}
+
+async fn wait_for_persisted_resume_and_worktree(
+    store: &Store,
+    id: &SessionId,
+) -> (Vec<ResumeBinding>, Vec<WorktreeBinding>) {
+    for _ in 0..100 {
+        let resume = store.load_resume().expect("load resume");
+        let worktrees = store.load_worktrees().expect("load worktrees");
+        if resume
+            .iter()
+            .any(|binding| binding.session_id == id.0.as_str())
+            && worktrees
+                .iter()
+                .any(|binding| binding.session_id == id.0.as_str())
+        {
+            return (resume, worktrees);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let resume = store.load_resume().expect("load resume after timeout");
+    let worktrees = store
+        .load_worktrees()
+        .expect("load worktrees after timeout");
+    panic!(
+        "resume and worktree bindings did not persist for {}: resume={resume:?}, worktrees={worktrees:?}",
         id.0
     );
 }
@@ -2883,8 +2912,8 @@ async fn worktree_session_resumes_with_metadata_after_restart() {
 
     // --- Both records survived the kill in ONE unified metadata file. ---
     let store = Store::new(store_path.clone());
-    let resume_before = store.load_resume().expect("load resume");
-    let worktrees_before = store.load_worktrees().expect("load worktrees");
+    let (resume_before, worktrees_before) =
+        wait_for_persisted_resume_and_worktree(&store, &created.id).await;
     assert_eq!(
         resume_before.len(),
         1,
