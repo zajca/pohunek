@@ -46,6 +46,14 @@ without sharing a producer-specific source id. Within the policy's attention
 dedupe window, Codex and Claude provider records outrank daemon projector
 records for the same session attention key.
 
+Attention notifications self-resolve. When the daemon observes a session's
+activity return to `working`, the projector acknowledges any `unread` or `read`
+`agent_blocked` and `approval_required` records for that session's
+`attention:<session_id>` key, covering both hook- and projector-produced
+records. This keeps a transient waiting-for-input signal from lingering as
+unread after the agent has resumed; other kinds such as `error` and
+`session_finished` are never auto-resolved and wait for explicit owner action.
+
 The GUI opens the notification detail when a notification is selected. If the
 record links to a session still known on the same host, the detail offers a
 separate Open linked session action; if the linked session is gone, the detail

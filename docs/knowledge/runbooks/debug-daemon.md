@@ -57,6 +57,14 @@ For durable notification issues:
     `dedupe_key`, `source.provider`, `source.provider_event`, and `created_at`.
     Session attention dedupe uses `attention:<session_id>` and only applies
     inside the policy's `attention_dedupe_window_secs`.
+11. If a stale `agent_blocked` or `approval_required` record stays `unread`
+    after the agent already resumed, check that the daemon still observes the
+    session returning to `working` activity. Attention notifications
+    auto-resolve to `acknowledged` when the projector sees the session's
+    activity transition into `working`, keyed by `attention:<session_id>`, so
+    both hook- and projector-produced records are cleared together. A record
+    that never self-resolves usually means no `working` activity edge reached
+    the projector (for example a session whose activity is not being reported).
 
 The durable store is under the daemon data directory in `notifications/`.
 `notifications.jsonl` is append-only record history, while `policy.json` is the

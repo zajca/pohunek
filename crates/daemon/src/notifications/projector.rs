@@ -148,6 +148,31 @@ pub fn attention_dedupe_key(session_id: &SessionId) -> String {
     format!("{ATTENTION_DEDUPE_KEY_PREFIX}:{}", session_id.0)
 }
 
+/// Acknowledge lingering attention notifications for a resumed session.
+///
+/// Best-effort: a store failure is logged and swallowed so the projector event
+/// loop keeps consuming session events instead of terminating on I/O errors.
+fn resolve_session_attention(notifications: &NotificationService, session_id: &SessionId) {
+    let dedupe_key = attention_dedupe_key(session_id);
+    match notifications.resolve_attention(&dedupe_key) {
+        Ok(resolved) if !resolved.is_empty() => {
+            tracing::debug!(
+                session = %session_id.0,
+                resolved = resolved.len(),
+                "acknowledged attention notifications after session resumed"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warn!(
+                session = %session_id.0,
+                error = %error,
+                "failed to resolve attention notifications after session resumed"
+            );
+        }
+    }
+}
+
 /// Return a deterministic projector source id.
 ///
 /// Scheme: `projector:<session_id>:<kind>:<transition_epoch>`. The transition
@@ -257,6 +282,15 @@ impl ProjectorState {
         let previous = self
             .activity_by_session
             .insert(session_id.clone(), activity);
+        // A session that resumes active work no longer needs owner attention, so
+        // acknowledge any lingering attention notifications sharing its dedupe
+        // key. Only the transition edge into `Working` triggers the resolve so
+        // repeated working events do not rescan the store. Do not gate on the
+        // previous state being `Blocked`: provider hooks create attention
+        // notifications without the daemon observing a blocked activity edge.
+        if activity == AgentActivity::Working && previous != Some(AgentActivity::Working) {
+            resolve_session_attention(notifications, session_id);
+        }
         if activity != AgentActivity::Blocked || previous == Some(AgentActivity::Blocked) {
             return None;
         }
@@ -682,6 +716,47 @@ mod tests {
             Some("projector:s-1:agent_blocked:1")
         );
         assert_eq!(record.dedupe_key.as_deref(), Some("attention:s-1"));
+    }
+
+    #[test]
+    fn working_after_blocked_acknowledges_projector_notification() {
+        let service = service("resolve-projector");
+        let mut projector = ProjectorState::default();
+
+        projector.handle_event(&service, &agent_state_event("s-1", AgentActivity::Blocked));
+        let created = list(&service);
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].kind, NotificationKind::AgentBlocked);
+        assert_eq!(created[0].status, NotificationStatus::Unread);
+
+        projector.handle_event(&service, &agent_state_event("s-1", AgentActivity::Working));
+
+        let resolved = list(&service);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].status, NotificationStatus::Acknowledged);
+        assert!(resolved[0].acked_at.is_some());
+    }
+
+    #[test]
+    fn working_acknowledges_provider_hook_attention_notification() {
+        let service = service("resolve-hook");
+        let mut projector = ProjectorState::default();
+
+        // A provider hook creates the attention notification directly, so the
+        // projector never observes a blocked activity edge for this session.
+        service
+            .create(provider_approval_params("s-1"))
+            .expect("create provider approval notification");
+        let created = list(&service);
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].kind, NotificationKind::ApprovalRequired);
+        assert_eq!(created[0].status, NotificationStatus::Unread);
+
+        projector.handle_event(&service, &agent_state_event("s-1", AgentActivity::Working));
+
+        let resolved = list(&service);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].status, NotificationStatus::Acknowledged);
     }
 
     #[test]

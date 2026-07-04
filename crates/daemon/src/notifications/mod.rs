@@ -473,6 +473,29 @@ impl NotificationService {
         })
     }
 
+    /// Acknowledge active attention notifications for `dedupe_key`.
+    ///
+    /// Called when a session resumes active work so `agent_blocked` and
+    /// `approval_required` notifications sharing that session's attention dedupe
+    /// key stop lingering as unread. Emits `notification_updated` for each
+    /// acknowledged record and returns them; a dedupe key with no active
+    /// attention notification is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`NotificationError`] when the store append fails.
+    pub fn resolve_attention(
+        &self,
+        dedupe_key: &str,
+    ) -> Result<Vec<NotificationRecord>, NotificationError> {
+        let now = timestamp_now();
+        let resolved = self.inner.store.resolve_attention(dedupe_key, &now)?;
+        for record in &resolved {
+            self.emit_updated(record);
+        }
+        Ok(resolved)
+    }
+
     /// Return the current notification policy.
     #[must_use]
     pub fn policy(&self) -> NotificationPolicy {

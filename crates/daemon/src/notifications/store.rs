@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use protocol::{
-    NotificationId, NotificationListParams, NotificationListResult, NotificationPolicy,
-    NotificationRecord, NotificationStatus,
+    NotificationId, NotificationKind, NotificationListParams, NotificationListResult,
+    NotificationPolicy, NotificationRecord, NotificationStatus,
 };
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -363,6 +363,61 @@ impl NotificationStore {
         Ok(Some(record))
     }
 
+    /// Acknowledge active attention notifications sharing `dedupe_key`.
+    ///
+    /// Marks `unread` and `read` `agent_blocked`/`approval_required` records that
+    /// carry the given dedupe key as `acknowledged`, appends one update action
+    /// per record, and returns the acknowledged records. Records already
+    /// acknowledged, archived, or deleted, and non-attention kinds, are left
+    /// untouched, so repeated calls are idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationError`] when appending an update action fails.
+    pub(crate) fn resolve_attention(
+        &self,
+        dedupe_key: &str,
+        now: &str,
+    ) -> Result<Vec<NotificationRecord>, NotificationError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Collect matching ids first so the records map is not mutated while it
+        // is being iterated below.
+        let matching_ids: Vec<String> = state
+            .records
+            .values()
+            .filter(|record| {
+                record.dedupe_key.as_deref() == Some(dedupe_key)
+                    && is_attention_kind(record.kind)
+                    && matches!(
+                        record.status,
+                        NotificationStatus::Unread | NotificationStatus::Read
+                    )
+            })
+            .map(|record| record.id.0.clone())
+            .collect();
+
+        let mut resolved = Vec::with_capacity(matching_ids.len());
+        for id in matching_ids {
+            let Some(mut record) = state.records.get(&id).cloned() else {
+                continue;
+            };
+            apply_status(&mut record, NotificationStatus::Acknowledged, now);
+            append_action_locked(
+                &self.path,
+                &mut state,
+                StoreAction::Updated {
+                    record: record.clone(),
+                },
+            )?;
+            resolved.push(record);
+        }
+        Ok(resolved)
+    }
+
     /// List records using protocol filters and a stable cursor.
     ///
     /// # Errors
@@ -462,6 +517,18 @@ fn append_action_locked(
         .map_err(|source| NotificationError::io(path, source))?;
     apply_action(&mut state.records, action);
     Ok(())
+}
+
+/// Whether `kind` is an attention notification that self-resolves on resume.
+///
+/// Only `agent_blocked` and `approval_required` represent a transient
+/// waiting-for-owner condition. Other kinds (for example `error` or
+/// `session_finished`) stay until the owner handles them explicitly.
+fn is_attention_kind(kind: NotificationKind) -> bool {
+    matches!(
+        kind,
+        NotificationKind::AgentBlocked | NotificationKind::ApprovalRequired
+    )
 }
 
 fn find_existing_source(
@@ -703,6 +770,83 @@ mod tests {
             deleted_at: None,
             superseded_by: None,
         }
+    }
+
+    #[test]
+    fn resolve_attention_acknowledges_matching_attention_records() {
+        let data_dir = temp_data_dir("resolve-attention");
+        let store = NotificationStore::open(&data_dir).expect("open store");
+
+        let mut blocked = record("n-1", "2026-07-03T10:00:00Z");
+        blocked.kind = NotificationKind::AgentBlocked;
+        blocked.dedupe_key = Some("attention:s-1".to_owned());
+        store.append_created(blocked).expect("append blocked");
+
+        let mut approval = record("n-2", "2026-07-03T10:00:01Z");
+        approval.kind = NotificationKind::ApprovalRequired;
+        approval.dedupe_key = Some("attention:s-1".to_owned());
+        store.append_created(approval).expect("append approval");
+
+        // A different session must not be acknowledged.
+        let mut other = record("n-3", "2026-07-03T10:00:02Z");
+        other.kind = NotificationKind::AgentBlocked;
+        other.dedupe_key = Some("attention:s-2".to_owned());
+        store.append_created(other).expect("append other session");
+
+        let resolved = store
+            .resolve_attention("attention:s-1", "2026-07-03T10:05:00Z")
+            .expect("resolve attention");
+
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.iter().all(|record| {
+            record.status == NotificationStatus::Acknowledged
+                && record.acked_at.as_deref() == Some("2026-07-03T10:05:00Z")
+        }));
+
+        let statuses: BTreeMap<String, NotificationStatus> = store
+            .all()
+            .into_iter()
+            .map(|record| (record.id.0, record.status))
+            .collect();
+        assert_eq!(statuses["n-1"], NotificationStatus::Acknowledged);
+        assert_eq!(statuses["n-2"], NotificationStatus::Acknowledged);
+        assert_eq!(statuses["n-3"], NotificationStatus::Unread);
+    }
+
+    #[test]
+    fn resolve_attention_skips_non_attention_kinds_and_is_idempotent() {
+        let data_dir = temp_data_dir("resolve-attention-idempotent");
+        let store = NotificationStore::open(&data_dir).expect("open store");
+
+        let mut blocked = record("n-1", "2026-07-03T10:00:00Z");
+        blocked.kind = NotificationKind::AgentBlocked;
+        blocked.dedupe_key = Some("attention:s-1".to_owned());
+        store.append_created(blocked).expect("append blocked");
+
+        // An error notification shares the dedupe key but must not auto-resolve.
+        let mut errored = record("n-2", "2026-07-03T10:00:01Z");
+        errored.kind = NotificationKind::Error;
+        errored.dedupe_key = Some("attention:s-1".to_owned());
+        store.append_created(errored).expect("append error");
+
+        let first = store
+            .resolve_attention("attention:s-1", "2026-07-03T10:05:00Z")
+            .expect("first resolve");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].id.0, "n-1");
+
+        let second = store
+            .resolve_attention("attention:s-1", "2026-07-03T10:06:00Z")
+            .expect("second resolve");
+        assert!(second.is_empty());
+
+        let statuses: BTreeMap<String, NotificationStatus> = store
+            .all()
+            .into_iter()
+            .map(|record| (record.id.0, record.status))
+            .collect();
+        assert_eq!(statuses["n-1"], NotificationStatus::Acknowledged);
+        assert_eq!(statuses["n-2"], NotificationStatus::Unread);
     }
 
     #[test]
