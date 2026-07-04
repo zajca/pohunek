@@ -1,4 +1,4 @@
-//! Per-agent `SessionStart` hook installation.
+//! Per-agent hook installation.
 //!
 //! Ported from herdr (`src/integration/mod.rs` `install_claude`/`install_codex`
 //! and `assets/{claude,codex}/herdr-agent-state.sh`), rewritten to emit *our*
@@ -8,9 +8,8 @@
 //! still comes from the detector unless a hook has reliable activity evidence.
 //!
 //! Install merges into the agent's own config format idempotently and never
-//! clobbers unrelated user hooks: only hooks whose command references our
-//! installed script path are stripped before the `SessionStart` hook is
-//! (re-)added.
+//! clobbers unrelated user hooks: only exact command strings written by this
+//! installer are stripped before managed hooks are (re-)added.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -33,18 +32,57 @@ pub use protocol::{
     ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
 
-/// Installed hook script file name (shared by both agents).
-const HOOK_INSTALL_NAME: &str = "pohunek-agent-state.sh";
+/// Installed active-agent state hook script file name (shared by both agents).
+const STATE_HOOK_INSTALL_NAME: &str = "pohunek-agent-state.sh";
+/// Installed notification hook script file name (shared by both agents).
+const NOTIFY_HOOK_INSTALL_NAME: &str = "pohunek-agent-notify.sh";
 /// The Claude hook script, embedded at compile time.
 const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/pohunek-agent-state.sh");
+/// The Claude notification hook script, embedded at compile time.
+const CLAUDE_NOTIFY_HOOK_ASSET: &str = include_str!("assets/claude/pohunek-agent-notify.sh");
 /// The Codex hook script, embedded at compile time.
 const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/pohunek-agent-state.sh");
+/// The Codex notification hook script, embedded at compile time.
+const CODEX_NOTIFY_HOOK_ASSET: &str = include_str!("assets/codex/pohunek-agent-notify.sh");
 /// Per-hook timeout (seconds) recorded in the agent's hook config.
 const HOOK_TIMEOUT_SECS: u64 = 10;
 /// Action argument passed to the hook script for the `SessionStart` event.
 const HOOK_ACTION: &str = "session";
 /// `SessionStart` event name in the agents' hook config.
 const SESSION_START_EVENT: &str = "SessionStart";
+/// Codex lifecycle event fired before provider approval prompts.
+const CODEX_PERMISSION_REQUEST_EVENT: &str = "PermissionRequest";
+/// Codex lifecycle event fired when a turn completes.
+const CODEX_STOP_EVENT: &str = "Stop";
+/// Claude event family for interactive notifications.
+const CLAUDE_NOTIFICATION_EVENT: &str = "Notification";
+/// Claude event fired when a turn completes.
+const CLAUDE_STOP_EVENT: &str = "Stop";
+/// Claude event fired when a stop hook reports failure.
+const CLAUDE_STOP_FAILURE_EVENT: &str = "StopFailure";
+/// Codex trust identity name for `SessionStart`.
+const CODEX_SESSION_START_TRUST_EVENT: &str = "session_start";
+/// Codex trust identity name for `PermissionRequest`.
+const CODEX_PERMISSION_REQUEST_TRUST_EVENT: &str = "permission_request";
+/// Codex trust identity name for `Stop`.
+const CODEX_STOP_TRUST_EVENT: &str = "stop";
+/// Action argument passed to notification hook scripts for approval prompts.
+const PERMISSION_REQUEST_ACTION: &str = "permission_request";
+/// Action argument passed to notification hook scripts for notifications.
+const NOTIFICATION_ACTION: &str = "notification";
+/// Action argument passed to notification hook scripts for turn completion.
+const STOP_ACTION: &str = "stop";
+/// Action argument passed to notification hook scripts for stop failures.
+const STOP_FAILURE_ACTION: &str = "stop_failure";
+/// Claude `Notification` matchers that map to durable notifications.
+const CLAUDE_NOTIFICATION_MATCHERS: &[&str] = &[
+    "permission_prompt",
+    "elicitation_dialog",
+    "idle_prompt",
+    "auth_success",
+    "elicitation_complete",
+    "elicitation_response",
+];
 
 /// Env var overriding Claude's config dir (else `~/.claude`).
 const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
@@ -146,11 +184,11 @@ pub fn codex_config_dir() -> Result<PathBuf, ProtocolError> {
     config_dir(CODEX_HOME_ENV, ".codex")
 }
 
-/// Install the Claude `SessionStart` hook into `claude_dir`.
+/// Install the Claude hooks into `claude_dir`.
 ///
-/// Writes `hooks/pohunek-agent-state.sh` and merges a `SessionStart` hook
-/// (matcher `*`) into `settings.json`, stripping any hooks this installer owns
-/// first so reinstall is idempotent.
+/// Writes managed scripts under `hooks/` and merges `SessionStart`,
+/// `Notification`, `Stop`, and `StopFailure` hooks into `settings.json`,
+/// stripping any hooks this installer owns first so reinstall is idempotent.
 ///
 /// # Errors
 ///
@@ -163,15 +201,44 @@ pub fn install_claude(claude_dir: &Path) -> Result<InstallPaths, ProtocolError> 
 
     let hooks_dir = claude_dir.join("hooks");
     create_dir_all(&hooks_dir)?;
-    let hook_path = hooks_dir.join(HOOK_INSTALL_NAME);
+    let hook_path = hooks_dir.join(STATE_HOOK_INSTALL_NAME);
     write_file(&hook_path, CLAUDE_HOOK_ASSET)?;
     make_executable(&hook_path)?;
+    let notify_hook_path = hooks_dir.join(NOTIFY_HOOK_INSTALL_NAME);
+    write_file(&notify_hook_path, CLAUDE_NOTIFY_HOOK_ASSET)?;
+    make_executable(&notify_hook_path)?;
 
     let settings_path = claude_dir.join("settings.json");
     let mut settings = read_json_object_or_empty(&settings_path)?;
     let hooks = ensure_hooks_object(&mut settings, &settings_path)?;
-    remove_owned_command_hooks(hooks, &hook_path);
-    ensure_command_hook(hooks, &hook_command(&hook_path), Some("*"))?;
+    remove_owned_command_hooks(hooks, &[hook_command(&hook_path, HOOK_ACTION)]);
+    remove_owned_command_hooks(hooks, &claude_notify_hook_commands(&notify_hook_path));
+    ensure_command_hook(
+        hooks,
+        SESSION_START_EVENT,
+        &hook_command(&hook_path, HOOK_ACTION),
+        Some("*"),
+    )?;
+    for matcher in CLAUDE_NOTIFICATION_MATCHERS {
+        ensure_command_hook(
+            hooks,
+            CLAUDE_NOTIFICATION_EVENT,
+            &hook_command_with_args(&notify_hook_path, &[NOTIFICATION_ACTION, matcher]),
+            Some(matcher),
+        )?;
+    }
+    ensure_command_hook(
+        hooks,
+        CLAUDE_STOP_EVENT,
+        &hook_command(&notify_hook_path, STOP_ACTION),
+        Some("*"),
+    )?;
+    ensure_command_hook(
+        hooks,
+        CLAUDE_STOP_FAILURE_EVENT,
+        &hook_command(&notify_hook_path, STOP_FAILURE_ACTION),
+        Some("*"),
+    )?;
     write_json_pretty(&settings_path, &settings)?;
 
     Ok(InstallPaths {
@@ -180,11 +247,11 @@ pub fn install_claude(claude_dir: &Path) -> Result<InstallPaths, ProtocolError> 
     })
 }
 
-/// Install the Codex `SessionStart` hook into `codex_dir`.
+/// Install the Codex hooks into `codex_dir`.
 ///
-/// Writes `pohunek-agent-state.sh`, merges a `SessionStart` hook into
-/// `hooks.json`, and enables `[features] hooks = true` in `config.toml`,
-/// idempotently.
+/// Writes managed scripts, merges `SessionStart`, `PermissionRequest`, and
+/// `Stop` hooks into `hooks.json`, and enables `[features] hooks = true` in
+/// `config.toml`, idempotently.
 ///
 /// # Errors
 ///
@@ -195,22 +262,57 @@ pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
         return Err(config_dir_missing(AgentKind::Codex, codex_dir));
     }
 
-    let hook_path = codex_dir.join(HOOK_INSTALL_NAME);
+    let hook_path = codex_dir.join(STATE_HOOK_INSTALL_NAME);
     write_file(&hook_path, CODEX_HOOK_ASSET)?;
     make_executable(&hook_path)?;
+    let notify_hook_path = codex_dir.join(NOTIFY_HOOK_INSTALL_NAME);
+    write_file(&notify_hook_path, CODEX_NOTIFY_HOOK_ASSET)?;
+    make_executable(&notify_hook_path)?;
 
     let hooks_path = codex_dir.join("hooks.json");
     let mut hooks_file = read_json_object_or_empty(&hooks_path)?;
     let hooks = ensure_hooks_object(&mut hooks_file, &hooks_path)?;
-    remove_owned_command_hooks(hooks, &hook_path);
-    let command = hook_command(&hook_path);
-    ensure_command_hook(hooks, &command, None)?;
-    let (group_index, handler_index) = command_hook_position(hooks, &command).ok_or_else(|| {
-        settings_invalid(
-            &hooks_path,
-            "installed Codex SessionStart hook was not found after merge",
-        )
-    })?;
+    remove_owned_command_hooks(hooks, &[hook_command(&hook_path, HOOK_ACTION)]);
+    remove_owned_command_hooks(hooks, &codex_notify_hook_commands(&notify_hook_path));
+    let codex_hooks = [
+        CodexManagedHook {
+            event: SESSION_START_EVENT,
+            trust_event: CODEX_SESSION_START_TRUST_EVENT,
+            command: hook_command(&hook_path, HOOK_ACTION),
+        },
+        CodexManagedHook {
+            event: CODEX_PERMISSION_REQUEST_EVENT,
+            trust_event: CODEX_PERMISSION_REQUEST_TRUST_EVENT,
+            command: hook_command(&notify_hook_path, PERMISSION_REQUEST_ACTION),
+        },
+        CodexManagedHook {
+            event: CODEX_STOP_EVENT,
+            trust_event: CODEX_STOP_TRUST_EVENT,
+            command: hook_command(&notify_hook_path, STOP_ACTION),
+        },
+    ];
+    for managed in &codex_hooks {
+        ensure_command_hook(hooks, managed.event, &managed.command, None)?;
+    }
+    let mut trust_entries = Vec::with_capacity(codex_hooks.len());
+    for managed in &codex_hooks {
+        let (group_index, handler_index) =
+            command_hook_position(hooks, managed.event, &managed.command).ok_or_else(|| {
+                settings_invalid(
+                    &hooks_path,
+                    &format!(
+                        "installed Codex {} hook was not found after merge",
+                        managed.event
+                    ),
+                )
+            })?;
+        trust_entries.push((
+            managed.trust_event,
+            managed.command.clone(),
+            group_index,
+            handler_index,
+        ));
+    }
     write_json_pretty(&hooks_path, &hooks_file)?;
 
     let config_path = codex_dir.join("config.toml");
@@ -219,13 +321,13 @@ pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(io_error("read", &config_path, &err)),
     };
-    let trust_key = codex_hook_trust_key(&hooks_path, group_index, handler_index);
-    let trusted_hash = codex_command_hook_trusted_hash(&command, HOOK_TIMEOUT_SECS, None)?;
-    let updated = ensure_codex_hook_trust_state(
-        &enable_codex_hooks_feature(&existing),
-        &trust_key,
-        &trusted_hash,
-    );
+    let mut updated = enable_codex_hooks_feature(&existing);
+    for (trust_event, command, group_index, handler_index) in trust_entries {
+        let trust_key = codex_hook_trust_key(&hooks_path, trust_event, group_index, handler_index);
+        let trusted_hash =
+            codex_command_hook_trusted_hash(trust_event, &command, HOOK_TIMEOUT_SECS, None)?;
+        updated = ensure_codex_hook_trust_state(&updated, &trust_key, &trusted_hash);
+    }
     if updated != existing {
         write_file(&config_path, &updated)?;
     }
@@ -236,9 +338,19 @@ pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
     })
 }
 
-fn command_hook_position(hooks: &Map<String, Value>, command: &str) -> Option<(usize, usize)> {
+struct CodexManagedHook {
+    event: &'static str,
+    trust_event: &'static str,
+    command: String,
+}
+
+fn command_hook_position(
+    hooks: &Map<String, Value>,
+    event: &str,
+    command: &str,
+) -> Option<(usize, usize)> {
     hooks
-        .get(SESSION_START_EVENT)?
+        .get(event)?
         .as_array()?
         .iter()
         .enumerate()
@@ -256,16 +368,21 @@ fn command_hook_position(hooks: &Map<String, Value>, command: &str) -> Option<(u
         })
 }
 
-fn codex_hook_trust_key(hooks_path: &Path, group_index: usize, handler_index: usize) -> String {
+fn codex_hook_trust_key(
+    hooks_path: &Path,
+    event_name: &str,
+    group_index: usize,
+    handler_index: usize,
+) -> String {
     format!(
-        "{}:session_start:{group_index}:{handler_index}",
+        "{}:{event_name}:{group_index}:{handler_index}",
         hooks_path.display()
     )
 }
 
 #[derive(Serialize)]
-struct CodexNormalizedHookIdentity {
-    event_name: &'static str,
+struct CodexNormalizedHookIdentity<'a> {
+    event_name: &'a str,
     #[serde(flatten)]
     group: CodexMatcherGroup,
 }
@@ -296,12 +413,13 @@ enum CodexHookHandlerConfig {
 }
 
 fn codex_command_hook_trusted_hash(
+    event_name: &str,
     command: &str,
     timeout_sec: u64,
     matcher: Option<&str>,
 ) -> Result<String, ProtocolError> {
     let identity = CodexNormalizedHookIdentity {
-        event_name: "session_start",
+        event_name,
         group: CodexMatcherGroup {
             matcher: matcher.map(ToOwned::to_owned),
             hooks: vec![CodexHookHandlerConfig::Command {
@@ -356,14 +474,42 @@ fn canonical_json(value: &Value) -> Value {
     }
 }
 
-/// Build the shell command string that runs our hook for the `SessionStart`
-/// event. `sh '<path>' session`.
-fn hook_command(hook_path: &Path) -> String {
-    format!(
-        "sh {} {}",
-        shell_single_quote(&hook_path.display().to_string()),
-        HOOK_ACTION
-    )
+/// Build the shell command string that runs our hook for one action.
+fn hook_command(hook_path: &Path, action: &str) -> String {
+    hook_command_with_args(hook_path, &[action])
+}
+
+/// Build the shell command string that runs our hook with fixed arguments.
+fn hook_command_with_args(hook_path: &Path, args: &[&str]) -> String {
+    let mut command = format!(
+        "sh {}",
+        shell_single_quote(&hook_path.display().to_string())
+    );
+    for arg in args {
+        command.push(' ');
+        command.push_str(arg);
+    }
+    command
+}
+
+fn claude_notify_hook_commands(notify_hook_path: &Path) -> Vec<String> {
+    let mut commands = Vec::with_capacity(CLAUDE_NOTIFICATION_MATCHERS.len() + 2);
+    for matcher in CLAUDE_NOTIFICATION_MATCHERS {
+        commands.push(hook_command_with_args(
+            notify_hook_path,
+            &[NOTIFICATION_ACTION, matcher],
+        ));
+    }
+    commands.push(hook_command(notify_hook_path, STOP_ACTION));
+    commands.push(hook_command(notify_hook_path, STOP_FAILURE_ACTION));
+    commands
+}
+
+fn codex_notify_hook_commands(notify_hook_path: &Path) -> Vec<String> {
+    vec![
+        hook_command(notify_hook_path, PERMISSION_REQUEST_ACTION),
+        hook_command(notify_hook_path, STOP_ACTION),
+    ]
 }
 
 /// Single-quote a value for a POSIX shell command line.
@@ -385,24 +531,25 @@ fn ensure_hooks_object<'a>(
         .ok_or_else(|| settings_invalid(settings_path, "`hooks` must be a JSON object"))
 }
 
-/// Add a `SessionStart` command hook in the nested agent format, deduped.
+/// Add a command hook in the nested agent format, deduped.
 ///
 /// Nested shape (Claude/Codex):
 /// `{ "matcher": "...", "hooks": [{ "type": "command", "command": "...", "timeout": N }] }`.
 fn ensure_command_hook(
     hooks: &mut Map<String, Value>,
+    event: &str,
     command: &str,
     matcher: Option<&str>,
 ) -> Result<(), ProtocolError> {
     let entries = hooks
-        .entry(SESSION_START_EVENT.to_string())
+        .entry(event.to_string())
         .or_insert_with(|| Value::Array(Vec::new()))
         .as_array_mut()
         .ok_or_else(|| {
             ProtocolError::new(
                 ErrorClass::Runtime,
                 "integration_settings_invalid",
-                format!("hook entries for {SESSION_START_EVENT} must be an array"),
+                format!("hook entries for {event} must be an array"),
                 None,
             )
         })?;
@@ -434,14 +581,11 @@ fn ensure_command_hook(
     Ok(())
 }
 
-/// Strip every command hook this installer owns (command references
-/// `hook_path`), across all events, removing now-empty entries and events.
+/// Strip every exact command hook this installer owns.
 ///
-/// Ownership is keyed on the installed script path, which is unique to us, so
-/// unrelated user hooks are never touched. This makes reinstall idempotent and
-/// clears any stale lifecycle hook a prior version may have installed.
-fn remove_owned_command_hooks(hooks: &mut Map<String, Value>, hook_path: &Path) {
-    let needle = hook_path.display().to_string();
+/// Ownership is keyed on the precise command strings written by the installer,
+/// so user hooks that merely mention the managed script path are preserved.
+fn remove_owned_command_hooks(hooks: &mut Map<String, Value>, owned_commands: &[String]) {
     let events: Vec<String> = hooks.keys().cloned().collect();
     for event in events {
         let Some(entries) = hooks.get_mut(&event).and_then(Value::as_array_mut) else {
@@ -455,7 +599,7 @@ fn remove_owned_command_hooks(hooks: &mut Map<String, Value>, hook_path: &Path) 
             else {
                 return true;
             };
-            hook_entries.retain(|hook| !command_references(hook, &needle));
+            hook_entries.retain(|hook| !is_owned_command(hook, owned_commands));
             !hook_entries.is_empty()
         });
         if hooks
@@ -468,13 +612,13 @@ fn remove_owned_command_hooks(hooks: &mut Map<String, Value>, hook_path: &Path) 
     }
 }
 
-/// Whether a hook entry is a command hook whose command references `needle`.
-fn command_references(hook: &Value, needle: &str) -> bool {
+/// Whether a hook entry is one of this installer's exact command hooks.
+fn is_owned_command(hook: &Value, owned_commands: &[String]) -> bool {
     hook.get("type").and_then(Value::as_str) == Some("command")
         && hook
             .get("command")
             .and_then(Value::as_str)
-            .is_some_and(|command| command.contains(needle))
+            .is_some_and(|command| owned_commands.iter().any(|owned| owned == command))
 }
 
 /// Ensure `[features] hooks = true` in a Codex `config.toml`, preserving the
@@ -721,17 +865,28 @@ fn io_error(action: &str, path: &Path, source: &io::Error) -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{ErrorKind, Read, Write};
+    use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use protocol::method;
     use serde_json::{json, Value};
 
     use super::{
-        codex_command_hook_trusted_hash, codex_hook_trust_key, install_claude, install_codex,
-        toml_basic_string, CLAUDE_HOOK_ASSET, CODEX_HOOK_ASSET, ENV_FLAG, ENV_PROTOCOL_VERSION,
-        ENV_SESSION_ID, ENV_SOCKET_PATH, HOOK_TIMEOUT_SECS,
+        codex_command_hook_trusted_hash, codex_hook_trust_key, hook_command, install_claude,
+        install_codex, shell_single_quote, toml_basic_string, CLAUDE_HOOK_ASSET, CODEX_HOOK_ASSET,
+        CODEX_SESSION_START_TRUST_EVENT, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID,
+        ENV_SOCKET_PATH, HOOK_TIMEOUT_SECS,
     };
+
+    /// Large enough to expose unbounded hook stdin reads through pipe backpressure.
+    const LARGE_HOOK_INPUT_BYTES: usize = 1024 * 1024;
+    /// Minimal successful JSON-RPC response expected by notification hook scripts.
+    const HOOK_RESPONSE: &[u8] = b"{\"v\":1,\"id\":\"test\",\"result\":{}}\n";
 
     fn temp_dir(tag: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -751,7 +906,11 @@ mod tests {
     }
 
     fn session_start_command_hooks(settings: &Value) -> Vec<String> {
-        settings["hooks"]["SessionStart"]
+        command_hooks(settings, "SessionStart")
+    }
+
+    fn command_hooks(settings: &Value, event: &str) -> Vec<String> {
+        settings["hooks"][event]
             .as_array()
             .map(|entries| {
                 entries
@@ -765,11 +924,391 @@ mod tests {
             .unwrap_or_default()
     }
 
+    fn matcher_commands(settings: &Value, event: &str, matcher: &str) -> Vec<String> {
+        settings["hooks"][event]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| entry.get("matcher").and_then(Value::as_str) == Some(matcher))
+                    .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+                    .flatten()
+                    .filter_map(|hook| hook.get("command").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn daemon_manifest_asset(agent: &str, script: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/integration/assets")
+            .join(agent)
+            .join(script)
+    }
+
+    fn notification_asset(agent: &str) -> PathBuf {
+        daemon_manifest_asset(agent, "pohunek-agent-notify.sh")
+    }
+
+    fn run_notification_asset(
+        agent: &str,
+        args: &[&str],
+        input: &Value,
+        socket_available: bool,
+    ) -> (std::process::ExitStatus, String, String, Vec<Value>) {
+        let (status, stdout, stderr, requests, _bytes_written) = run_notification_asset_custom(
+            agent,
+            args,
+            input.to_string().as_bytes(),
+            socket_available,
+            Some("session-123"),
+            None,
+            false,
+        );
+        (status, stdout, stderr, requests)
+    }
+
+    fn run_notification_asset_custom(
+        agent: &str,
+        args: &[&str],
+        input: &[u8],
+        socket_available: bool,
+        session_id: Option<&str>,
+        tmpdir_override: Option<&Path>,
+        allow_broken_pipe: bool,
+    ) -> (std::process::ExitStatus, String, String, Vec<Value>, usize) {
+        let asset_path = notification_asset(agent);
+        assert!(
+            asset_path.is_file(),
+            "missing notification hook asset at {}",
+            asset_path.display()
+        );
+
+        let temp = temp_dir(&format!("{agent}-notify-run"));
+        let socket_path = temp.join("daemon.sock");
+        let tmpdir = tmpdir_override.unwrap_or(&temp);
+        let handle = socket_available.then(|| {
+            let listener = UnixListener::bind(&socket_path).expect("bind hook socket");
+            listener
+                .set_nonblocking(true)
+                .expect("make hook socket nonblocking");
+            thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                let mut requests = Vec::new();
+                while std::time::Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut stream, _addr)) => {
+                            let mut raw = Vec::new();
+                            let mut byte = [0_u8; 1];
+                            while stream.read(&mut byte).expect("read hook request") == 1 {
+                                raw.push(byte[0]);
+                                if byte[0] == b'\n' {
+                                    break;
+                                }
+                            }
+                            let request = serde_json::from_slice::<Value>(&raw)
+                                .expect("hook request is JSON");
+                            requests.push(request);
+                            write_hook_response(&mut stream);
+                            break;
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(err) => panic!("accept hook request: {err}"),
+                    }
+                }
+                requests
+            })
+        });
+
+        let mut command = Command::new("sh");
+        command
+            .arg(&asset_path)
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("TMPDIR", tmpdir)
+            .env(ENV_FLAG, "1")
+            .env(ENV_SOCKET_PATH, &socket_path)
+            .env(ENV_PROTOCOL_VERSION, "1")
+            .env("POHUNEK_SECRET_SENTINEL", "DROP_ME_ENV")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(session_id) = session_id {
+            command.env(ENV_SESSION_ID, session_id);
+        }
+        let mut child = command.spawn().expect("spawn notification hook");
+        let mut bytes_written = 0;
+        if let Some(mut stdin) = child.stdin.take() {
+            while bytes_written < input.len() {
+                match stdin.write(&input[bytes_written..]) {
+                    Ok(0) => break,
+                    Ok(written) => bytes_written += written,
+                    Err(err) if allow_broken_pipe && err.kind() == ErrorKind::BrokenPipe => break,
+                    Err(err) => panic!("write hook stdin: {err}"),
+                }
+            }
+        }
+        let output = child
+            .wait_with_output()
+            .expect("wait for notification hook");
+        let requests = handle
+            .map(|handle| handle.join().expect("hook socket thread"))
+            .unwrap_or_default();
+        (
+            output.status,
+            String::from_utf8(output.stdout).expect("hook stdout utf8"),
+            String::from_utf8(output.stderr).expect("hook stderr utf8"),
+            requests,
+            bytes_written,
+        )
+    }
+
+    fn captured_notification_request(
+        agent: &str,
+        args: &[&str],
+        input: &Value,
+    ) -> (String, String, Value) {
+        let (status, stdout, stderr, requests) = run_notification_asset(agent, args, input, true);
+        assert!(status.success(), "hook exited with {status}: {stderr}");
+        assert_eq!(stdout, "", "hook must not print stdout");
+        assert_eq!(stderr, "", "hook must not print stderr");
+        assert_eq!(requests.len(), 1, "expected one request: {requests:?}");
+        (stdout, stderr, requests.into_iter().next().unwrap())
+    }
+
+    fn large_json_input() -> Vec<u8> {
+        let mut input = br#"{"hook_event_id":"large"}"#.to_vec();
+        input.resize(LARGE_HOOK_INPUT_BYTES, b' ');
+        input
+    }
+
+    fn write_hook_response(stream: &mut impl Write) {
+        if let Err(err) = stream.write_all(HOOK_RESPONSE) {
+            // Notification hooks are fire-and-forget; after the request line is
+            // captured, the hook may close without reading the daemon response.
+            assert!(
+                matches!(
+                    err.kind(),
+                    ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+                ),
+                "write hook response: {err}"
+            );
+        }
+    }
+
+    struct DisconnectingWriter {
+        kind: ErrorKind,
+    }
+
+    impl Write for DisconnectingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(self.kind))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn hook_response_write_includes_newline() {
+        let mut response = Vec::new();
+
+        write_hook_response(&mut response);
+
+        assert_eq!(response.as_slice(), HOOK_RESPONSE);
+    }
+
+    #[test]
+    fn hook_response_write_tolerates_client_disconnect() {
+        for kind in [ErrorKind::BrokenPipe, ErrorKind::ConnectionReset] {
+            let mut writer = DisconnectingWriter { kind };
+
+            write_hook_response(&mut writer);
+        }
+    }
+
+    fn assert_notification_payload(
+        request: &Value,
+        agent: &str,
+        provider_event: &str,
+        kind: &str,
+        severity: &str,
+        matcher: Option<&str>,
+        attention_dedupe: bool,
+    ) {
+        assert_eq!(request["method"], json!(method::NOTIFICATION_CREATE));
+        let params = &request["params"];
+        assert_eq!(params["kind"], json!(kind));
+        assert_eq!(params["severity"], json!(severity));
+        assert_eq!(params["status"], json!("unread"));
+        assert_eq!(params["session_id"], json!("session-123"));
+        assert_eq!(params["agent_kind"], json!(agent));
+        assert_eq!(params["source"]["provider"], json!(agent));
+        assert_eq!(params["source"]["provider_event"], json!(provider_event));
+        assert_eq!(params["metadata"]["provider"], json!(agent));
+        assert_eq!(params["metadata"]["provider_event"], json!(provider_event));
+        if let Some(matcher) = matcher {
+            assert_eq!(params["metadata"]["matcher"], json!(matcher));
+        } else {
+            assert!(params["metadata"].get("matcher").is_none());
+        }
+        if attention_dedupe {
+            assert_eq!(params["dedupe_key"], json!("attention:session-123"));
+        } else {
+            assert!(params.get("dedupe_key").is_none());
+        }
+
+        let source_id = params["source_id"].as_str().expect("source_id is a string");
+        assert!(
+            source_id.starts_with(&format!("hook:{agent}:{provider_event}:")),
+            "unexpected source_id: {source_id}"
+        );
+        assert_eq!(params["source"]["host_local_source_id"], json!(source_id));
+    }
+
+    #[test]
+    fn notification_hooks_drop_hostile_session_id_before_wire() {
+        for (agent, args) in [
+            ("codex", vec!["permission_request"]),
+            ("claude", vec!["notification", "permission_prompt"]),
+        ] {
+            let (status, stdout, stderr, requests, _bytes_written) = run_notification_asset_custom(
+                agent,
+                &args,
+                br#"{"hook_event_id":"hostile-session"}"#,
+                true,
+                Some("session-123\nhostile"),
+                None,
+                false,
+            );
+
+            assert!(
+                status.success(),
+                "{agent} hook exited with {status}: {stderr}"
+            );
+            assert_eq!(stdout, "", "{agent} hook must not print stdout");
+            assert_eq!(stderr, "", "{agent} hook must not print stderr");
+            assert_eq!(
+                requests.len(),
+                1,
+                "{agent} hook must still send notification"
+            );
+            let params = &requests[0]["params"];
+            assert!(
+                params.get("session_id").is_none(),
+                "{agent} hook must drop hostile session_id: {params}"
+            );
+            assert!(
+                params.get("dedupe_key").is_none(),
+                "{agent} hook must not derive dedupe_key from hostile session_id: {params}"
+            );
+        }
+    }
+
+    #[test]
+    fn notification_hooks_ignore_unknown_action_without_consuming_large_stdin() {
+        let input = vec![b'x'; LARGE_HOOK_INPUT_BYTES];
+        for (agent, args) in [
+            ("codex", vec!["ignored_action"]),
+            ("claude", vec!["ignored_action"]),
+        ] {
+            let (status, stdout, stderr, requests, bytes_written) = run_notification_asset_custom(
+                agent,
+                &args,
+                &input,
+                false,
+                Some("session-123"),
+                None,
+                true,
+            );
+
+            assert!(
+                status.success(),
+                "{agent} hook exited with {status}: {stderr}"
+            );
+            assert_eq!(stdout, "", "{agent} hook must not print stdout");
+            assert_eq!(stderr, "", "{agent} hook must not print stderr");
+            assert!(requests.is_empty(), "{agent} ignored action must not send");
+            assert!(
+                bytes_written < LARGE_HOOK_INPUT_BYTES,
+                "{agent} ignored action consumed the full oversized stdin"
+            );
+        }
+    }
+
+    #[test]
+    fn notification_hooks_cap_large_valid_stdin() {
+        let input = large_json_input();
+        for (agent, args) in [
+            ("codex", vec!["permission_request"]),
+            ("claude", vec!["notification", "permission_prompt"]),
+        ] {
+            let (status, stdout, stderr, requests, bytes_written) = run_notification_asset_custom(
+                agent,
+                &args,
+                &input,
+                true,
+                Some("session-123"),
+                None,
+                true,
+            );
+
+            assert!(
+                status.success(),
+                "{agent} hook exited with {status}: {stderr}"
+            );
+            assert_eq!(stdout, "", "{agent} hook must not print stdout");
+            assert_eq!(stderr, "", "{agent} hook must not print stderr");
+            assert_eq!(requests.len(), 1, "{agent} hook must send one request");
+            assert!(
+                bytes_written < LARGE_HOOK_INPUT_BYTES,
+                "{agent} hook consumed the full oversized stdin"
+            );
+        }
+    }
+
+    #[test]
+    fn notification_hooks_silence_mktemp_failure() {
+        for (agent, args) in [
+            ("codex", vec!["permission_request"]),
+            ("claude", vec!["notification", "permission_prompt"]),
+        ] {
+            let temp = temp_dir(&format!("{agent}-broken-tmpdir"));
+            let missing_tmpdir = temp.join("missing");
+            let (status, stdout, stderr, requests, _bytes_written) = run_notification_asset_custom(
+                agent,
+                &args,
+                br#"{"hook_event_id":"broken-tmpdir"}"#,
+                false,
+                Some("session-123"),
+                Some(&missing_tmpdir),
+                false,
+            );
+
+            assert!(
+                status.success(),
+                "{agent} hook exited with {status}: {stderr}"
+            );
+            assert_eq!(stdout, "", "{agent} hook must not print stdout");
+            assert_eq!(stderr, "", "{agent} hook must not print stderr");
+            assert!(requests.is_empty(), "{agent} hook must fail closed");
+        }
+    }
+
     #[test]
     fn codex_hook_trust_hash_matches_codex_normalized_identity() {
-        let hash =
-            codex_command_hook_trusted_hash("sh '/tmp/pohunek-agent-state.sh' session", 10, None)
-                .expect("hash Codex hook identity");
+        let hash = codex_command_hook_trusted_hash(
+            CODEX_SESSION_START_TRUST_EVENT,
+            "sh '/tmp/pohunek-agent-state.sh' session",
+            10,
+            None,
+        )
+        .expect("hash Codex hook identity");
 
         assert_eq!(
             hash,
@@ -927,9 +1466,19 @@ mod tests {
         assert!(config.contains("[features]"), "config: {config}");
         assert!(config.contains("hooks = true"), "config: {config}");
 
-        let trust_key = codex_hook_trust_key(&codex_dir.join("hooks.json"), 0, 0);
-        let trusted_hash = codex_command_hook_trusted_hash(&commands[0], HOOK_TIMEOUT_SECS, None)
-            .expect("hash installed Codex hook");
+        let trust_key = codex_hook_trust_key(
+            &codex_dir.join("hooks.json"),
+            CODEX_SESSION_START_TRUST_EVENT,
+            0,
+            0,
+        );
+        let trusted_hash = codex_command_hook_trusted_hash(
+            CODEX_SESSION_START_TRUST_EVENT,
+            &commands[0],
+            HOOK_TIMEOUT_SECS,
+            None,
+        )
+        .expect("hash installed Codex hook");
         assert!(
             config.contains(&format!("[hooks.state.{}]", toml_basic_string(&trust_key))),
             "config: {config}"
@@ -966,6 +1515,409 @@ mod tests {
             1,
             "exactly one hooks=true: {after_second}"
         );
+    }
+
+    #[test]
+    fn install_claude_preserves_user_hook_that_mentions_managed_notify_path() {
+        let claude_dir = temp_dir("claude-substring-owned");
+        let notify_path = claude_dir.join("hooks/pohunek-agent-notify.sh");
+        let user_command = format!(
+            "test -x {} && echo ok",
+            shell_single_quote(&notify_path.display().to_string())
+        );
+        let settings_path = claude_dir.join("settings.json");
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&json!({
+                "hooks": {
+                    "Notification": [
+                        { "matcher": "permission_prompt", "hooks": [
+                            { "type": "command", "command": user_command }
+                        ]}
+                    ]
+                }
+            }))
+            .expect("serialize settings"),
+        )
+        .expect("write settings");
+
+        install_claude(&claude_dir).expect("install claude");
+        install_claude(&claude_dir).expect("reinstall claude");
+
+        let settings = read_json(&settings_path);
+        let commands = matcher_commands(&settings, "Notification", "permission_prompt");
+        assert!(
+            commands.contains(&user_command),
+            "user hook mentioning the managed path must survive reinstall: {commands:?}"
+        );
+        let managed_command = format!(
+            "sh {} notification permission_prompt",
+            shell_single_quote(&notify_path.display().to_string())
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| *command == &managed_command)
+                .count(),
+            1,
+            "genuine managed hook must remain idempotent: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn install_codex_preserves_user_hook_that_mentions_managed_notify_path() {
+        let codex_dir = temp_dir("codex-substring-owned");
+        let notify_path = codex_dir.join("pohunek-agent-notify.sh");
+        let user_command = format!(
+            "test -x {} && echo ok",
+            shell_single_quote(&notify_path.display().to_string())
+        );
+        let hooks_path = codex_dir.join("hooks.json");
+        fs::write(
+            &hooks_path,
+            serde_json::to_string_pretty(&json!({
+                "hooks": {
+                    "PermissionRequest": [
+                        { "hooks": [
+                            { "type": "command", "command": user_command }
+                        ]}
+                    ]
+                }
+            }))
+            .expect("serialize hooks"),
+        )
+        .expect("write hooks");
+
+        install_codex(&codex_dir).expect("install codex");
+        install_codex(&codex_dir).expect("reinstall codex");
+
+        let hooks = read_json(&hooks_path);
+        let commands = command_hooks(&hooks, "PermissionRequest");
+        assert!(
+            commands.contains(&user_command),
+            "user hook mentioning the managed path must survive reinstall: {commands:?}"
+        );
+        let managed_command = hook_command(&notify_path, "permission_request");
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| *command == &managed_command)
+                .count(),
+            1,
+            "genuine managed hook must remain idempotent: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn install_claude_writes_notification_hook_and_modern_events() {
+        let claude_dir = temp_dir("claude-notify-install");
+        let settings_path = claude_dir.join("settings.json");
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&json!({
+                "hooks": {
+                    "Notification": [
+                        { "matcher": "permission_prompt", "hooks": [
+                            { "type": "command", "command": "echo user-notification" }
+                        ]}
+                    ],
+                    "Stop": [
+                        { "matcher": "*", "hooks": [
+                            { "type": "command", "command": "echo user-stop" }
+                        ]}
+                    ],
+                    "StopFailure": [
+                        { "matcher": "*", "hooks": [
+                            { "type": "command", "command": "echo user-stop-failure" }
+                        ]}
+                    ]
+                }
+            }))
+            .expect("serialize settings"),
+        )
+        .expect("write settings");
+        let paths = install_claude(&claude_dir).expect("install claude");
+        install_claude(&claude_dir).expect("reinstall claude");
+        let notify_path = claude_dir.join("hooks/pohunek-agent-notify.sh");
+
+        assert!(paths.hook_path.ends_with("pohunek-agent-state.sh"));
+        assert!(notify_path.is_file(), "notification hook must be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&notify_path)
+                .expect("notify hook metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "notify hook must be executable");
+        };
+
+        let settings = read_json(&settings_path);
+        assert!(
+            command_hooks(&settings, "Notification").contains(&"echo user-notification".to_owned())
+        );
+        assert!(command_hooks(&settings, "Stop").contains(&"echo user-stop".to_owned()));
+        assert!(
+            command_hooks(&settings, "StopFailure").contains(&"echo user-stop-failure".to_owned())
+        );
+        assert_eq!(
+            command_hooks(&settings, "Notification")
+                .iter()
+                .filter(|command| command.contains("pohunek-agent-notify.sh"))
+                .count(),
+            6,
+            "reinstall must keep one notification hook per matcher"
+        );
+        for matcher in [
+            "permission_prompt",
+            "elicitation_dialog",
+            "idle_prompt",
+            "auth_success",
+            "elicitation_complete",
+            "elicitation_response",
+        ] {
+            let commands = matcher_commands(&settings, "Notification", matcher);
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter(|command| command.contains("pohunek-agent-notify.sh"))
+                    .count(),
+                1,
+                "one Pohunek Notification hook for {matcher}"
+            );
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| command.contains("pohunek-agent-notify.sh")),
+                "Notification command for {matcher}: {commands:?}"
+            );
+        }
+        for event in ["Stop", "StopFailure"] {
+            let commands = command_hooks(&settings, event);
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter(|command| command.contains("pohunek-agent-notify.sh"))
+                    .count(),
+                1,
+                "one Pohunek {event} hook"
+            );
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| command.contains("pohunek-agent-notify.sh")),
+                "{event} command: {commands:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_codex_writes_notification_hook_modern_events_and_trust_without_notify() {
+        let codex_dir = temp_dir("codex-notify-install");
+        let hooks_path = codex_dir.join("hooks.json");
+        fs::write(
+            &hooks_path,
+            serde_json::to_string_pretty(&json!({
+                "hooks": {
+                    "PermissionRequest": [
+                        { "hooks": [
+                            { "type": "command", "command": "echo user-permission" }
+                        ]}
+                    ],
+                    "Stop": [
+                        { "hooks": [
+                            { "type": "command", "command": "echo user-stop" }
+                        ]}
+                    ]
+                }
+            }))
+            .expect("serialize hooks"),
+        )
+        .expect("write hooks");
+        let paths = install_codex(&codex_dir).expect("install codex");
+        install_codex(&codex_dir).expect("reinstall codex");
+        let notify_path = codex_dir.join("pohunek-agent-notify.sh");
+
+        assert!(paths.hook_path.ends_with("pohunek-agent-state.sh"));
+        assert!(notify_path.is_file(), "notification hook must be written");
+        let hooks = read_json(&hooks_path);
+        assert!(
+            hooks.get("notify").is_none(),
+            "Codex approval notifications must not use legacy notify: {hooks}"
+        );
+        assert!(
+            command_hooks(&hooks, "PermissionRequest").contains(&"echo user-permission".to_owned())
+        );
+        assert!(command_hooks(&hooks, "Stop").contains(&"echo user-stop".to_owned()));
+        for event in ["PermissionRequest", "Stop"] {
+            let commands = command_hooks(&hooks, event);
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter(|command| command.contains("pohunek-agent-notify.sh"))
+                    .count(),
+                1,
+                "one Pohunek {event} hook after reinstall"
+            );
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| command.contains("pohunek-agent-notify.sh")),
+                "{event} command: {commands:?}"
+            );
+        }
+
+        let config = fs::read_to_string(codex_dir.join("config.toml")).expect("config.toml");
+        for event in ["session_start", "permission_request", "stop"] {
+            assert!(
+                config.contains(&format!(
+                    "{}:{event}:",
+                    codex_dir.join("hooks.json").display()
+                )),
+                "missing trust metadata for {event}: {config}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_notification_hook_maps_matchers() {
+        for (matcher, kind, severity, dedupe) in [
+            (
+                "permission_prompt",
+                "approval_required",
+                "action_required",
+                true,
+            ),
+            (
+                "elicitation_dialog",
+                "approval_required",
+                "action_required",
+                true,
+            ),
+            ("idle_prompt", "agent_blocked", "warning", true),
+            ("auth_success", "system", "success", false),
+            ("elicitation_complete", "system", "info", false),
+            ("elicitation_response", "system", "info", false),
+        ] {
+            let (_stdout, _stderr, request) = captured_notification_request(
+                "claude",
+                &["notification", matcher],
+                &json!({"hook_event_id": format!("evt-{matcher}")}),
+            );
+            assert_notification_payload(
+                &request,
+                "claude",
+                &format!("Notification.{matcher}"),
+                kind,
+                severity,
+                Some(matcher),
+                dedupe,
+            );
+        }
+    }
+
+    #[test]
+    fn claude_notification_hook_maps_stop_events() {
+        for (action, provider_event, kind, severity) in [
+            ("stop", "Stop", "turn_completed", "info"),
+            ("stop_failure", "StopFailure", "error", "error"),
+        ] {
+            let (_stdout, _stderr, request) = captured_notification_request(
+                "claude",
+                &[action],
+                &json!({"hook_event_id": format!("evt-{action}")}),
+            );
+            assert_notification_payload(
+                &request,
+                "claude",
+                provider_event,
+                kind,
+                severity,
+                None,
+                false,
+            );
+        }
+    }
+
+    #[test]
+    fn codex_notification_hook_maps_lifecycle_events() {
+        for (action, provider_event, kind, severity, dedupe) in [
+            (
+                "permission_request",
+                "PermissionRequest",
+                "approval_required",
+                "action_required",
+                true,
+            ),
+            ("stop", "Stop", "turn_completed", "info", false),
+        ] {
+            let (_stdout, _stderr, request) = captured_notification_request(
+                "codex",
+                &[action],
+                &json!({"hook_event_id": format!("evt-{action}")}),
+            );
+            assert_notification_payload(
+                &request,
+                "codex",
+                provider_event,
+                kind,
+                severity,
+                None,
+                dedupe,
+            );
+        }
+    }
+
+    #[test]
+    fn notification_hooks_omit_raw_payload_and_environment() {
+        let sentinels = [
+            "DROP_ME_PROMPT",
+            "DROP_ME_OUTPUT",
+            "DROP_ME_ENV",
+            "DROP_ME_TOOL",
+            "DROP_ME_CWD",
+        ];
+        let input = json!({
+            "hook_event_id": "evt-safe-1",
+            "prompt": "DROP_ME_PROMPT",
+            "terminal_output": "DROP_ME_OUTPUT",
+            "env": {"TOKEN": "DROP_ME_ENV"},
+            "tool_result": "DROP_ME_TOOL",
+            "cwd": "DROP_ME_CWD"
+        });
+        let (stdout, stderr, request) =
+            captured_notification_request("codex", &["permission_request"], &input);
+
+        let request_text = request.to_string();
+        for sentinel in sentinels {
+            assert!(
+                !request_text.contains(sentinel),
+                "raw payload leaked into notification request: {request_text}"
+            );
+            assert!(!stdout.contains(sentinel), "raw payload leaked to stdout");
+            assert!(!stderr.contains(sentinel), "raw payload leaked to stderr");
+        }
+    }
+
+    #[test]
+    fn notification_hooks_exit_zero_when_socket_unavailable() {
+        for (agent, args) in [
+            ("codex", vec!["permission_request"]),
+            ("claude", vec!["notification", "permission_prompt"]),
+        ] {
+            let (status, stdout, stderr, requests) =
+                run_notification_asset(agent, &args, &json!({}), false);
+            assert!(
+                status.success(),
+                "{agent} hook exited with {status}: {stderr}"
+            );
+            assert_eq!(stdout, "", "{agent} hook must not print stdout");
+            assert_eq!(stderr, "", "{agent} hook must not print stderr");
+            assert!(
+                requests.is_empty(),
+                "socket unavailable captured no requests"
+            );
+        }
     }
 
     #[test]

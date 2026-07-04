@@ -335,9 +335,17 @@ where
             Dispatch::Subscribe(ack_line) => {
                 // Subscribe BEFORE sending the ack so no event emitted between
                 // the ack and the recv loop is missed.
-                let mut events = state.sessions.subscribe();
+                let mut session_events = state.sessions.subscribe();
+                let (_notification_sender, mut notification_events) =
+                    if let Some(notifications) = &state.notifications {
+                        (None, notifications.subscribe())
+                    } else {
+                        let (sender, receiver) = broadcast::channel(1);
+                        (Some(sender), receiver)
+                    };
                 framed.send(ack_line).await.map_err(codec_to_io)?;
-                run_event_subscription(&mut framed, &mut events).await?;
+                run_event_subscription(&mut framed, &mut session_events, &mut notification_events)
+                    .await?;
                 // The connection is consumed by the subscription stream.
                 return Ok(());
             }
@@ -476,7 +484,7 @@ where
     Ok(())
 }
 
-/// Stream session lifecycle events to a subscribed client until it disconnects.
+/// Stream control-plane events to a subscribed client until it disconnects.
 ///
 /// Each received [`Event`] is written as one JSON line. Further input from the
 /// client is ignored (a subscription is one-way in this milestone); a closed or
@@ -484,7 +492,8 @@ where
 /// the oldest events with a warning rather than tearing down the connection.
 async fn run_event_subscription<S>(
     framed: &mut Framed<S, LinesCodec>,
-    events: &mut broadcast::Receiver<Event>,
+    session_events: &mut broadcast::Receiver<Event>,
+    notification_events: &mut broadcast::Receiver<Event>,
 ) -> Result<(), io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -497,11 +506,18 @@ where
                 // Ignore any further input on a one-way subscription in M3.
                 Some(Ok(_)) => {}
             },
-            evt = events.recv() => match evt {
+            evt = session_events.recv() => match evt {
                 Ok(event) => {
-                    let line = serde_json::to_string(&event)
-                        .expect("Event serialization is infallible");
-                    framed.send(line).await.map_err(codec_to_io)?;
+                    send_event_line(framed, &event).await?;
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "event subscriber lagged; some events were dropped");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            evt = notification_events.recv() => match evt {
+                Ok(event) => {
+                    send_event_line(framed, &event).await?;
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(skipped, "event subscriber lagged; some events were dropped");
@@ -511,6 +527,17 @@ where
         }
     }
     Ok(())
+}
+
+async fn send_event_line<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    event: &Event,
+) -> Result<(), io::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let line = serde_json::to_string(event).expect("Event serialization is infallible");
+    framed.send(line).await.map_err(codec_to_io)
 }
 
 /// Map a line-codec send error to an [`io::Error`] for connection-level handling.

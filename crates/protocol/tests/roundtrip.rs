@@ -8,10 +8,16 @@ use protocol::{
     AssistantMaterializeResult, AttachHeader, ConceptDeprecation, ConceptIntent, ConceptMeta,
     ConceptType, DaemonDoctorResult, DoctorCheck, DoctorReport, DoctorStatus, ErrorClass, Event,
     HostCapabilities, IntegrationInstallParams, IntegrationInstallReport, IntegrationInstallResult,
-    ProjectSource, ProtocolError, ProtocolVersion, ProviderKind, Request, Response,
-    SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
-    SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
-    SessionNewParams, SessionReleaseAgentParams, SessionReleaseAgentResult,
+    NotificationCreateParams, NotificationCreateResult, NotificationCreatedEvent,
+    NotificationDeleteParams, NotificationDeleteResult, NotificationDeletedEvent, NotificationId,
+    NotificationKind, NotificationKindPolicy, NotificationListParams, NotificationListResult,
+    NotificationPolicy, NotificationPolicyParams, NotificationPolicyResult, NotificationRecord,
+    NotificationRetentionParams, NotificationRetentionResult, NotificationSeverity,
+    NotificationSource, NotificationStatus, NotificationUpdateParams, NotificationUpdateResult,
+    NotificationUpdatedEvent, ProjectSource, ProtocolError, ProtocolVersion, ProviderKind, Request,
+    Response, SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult,
+    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter,
+    SessionListParams, SessionNewParams, SessionReleaseAgentParams, SessionReleaseAgentResult,
     SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
     SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult,
     SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
@@ -69,6 +75,72 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         created_at: "2026-06-17T10:00:00Z".to_owned(),
         updated_at: "2026-06-17T10:01:00Z".to_owned(),
         exit_code,
+    }
+}
+
+fn notification_source() -> NotificationSource {
+    NotificationSource {
+        provider: "codex".to_owned(),
+        provider_event: "PermissionRequest".to_owned(),
+        host_local_source_id: "hook-42".to_owned(),
+    }
+}
+
+fn notification_record() -> NotificationRecord {
+    NotificationRecord {
+        id: NotificationId("n-42".to_owned()),
+        source: notification_source(),
+        kind: NotificationKind::ApprovalRequired,
+        severity: NotificationSeverity::ActionRequired,
+        status: NotificationStatus::Unread,
+        title: "Approval required".to_owned(),
+        body: "Codex is waiting for a tool approval.".to_owned(),
+        metadata: BTreeMap::new(),
+        created_at: "2026-07-03T09:00:00Z".to_owned(),
+        session_id: None,
+        agent_kind: None,
+        source_id: None,
+        dedupe_key: None,
+        project_id: None,
+        read_at: None,
+        acked_at: None,
+        archived_at: None,
+        deleted_at: None,
+        superseded_by: None,
+    }
+}
+
+fn notification_kind_policy() -> NotificationKindPolicy {
+    NotificationKindPolicy {
+        agent_blocked: true,
+        approval_required: true,
+        turn_completed: false,
+        session_finished: false,
+        error: true,
+        system: false,
+    }
+}
+
+fn notification_policy() -> NotificationPolicy {
+    NotificationPolicy {
+        attention_dedupe_window_secs: 90,
+        enabled: notification_kind_policy(),
+        codex: Some(NotificationKindPolicy {
+            agent_blocked: true,
+            approval_required: true,
+            turn_completed: false,
+            session_finished: false,
+            error: true,
+            system: true,
+        }),
+        claude: Some(NotificationKindPolicy {
+            agent_blocked: true,
+            approval_required: true,
+            turn_completed: true,
+            session_finished: false,
+            error: true,
+            system: false,
+        }),
     }
 }
 
@@ -135,6 +207,532 @@ fn public_enum_string_helpers_match_wire_shapes() {
     assert_wire_label!(ProviderKind::LinearIssue, "linear_issue");
     assert_wire_label!(ProviderKind::GithubPr, "github_pr");
     assert_wire_label!(ProviderKind::None, "none");
+}
+
+#[test]
+fn notification_kind_json_shape_roundtrips() {
+    let cases = [
+        (NotificationKind::AgentBlocked, json!("agent_blocked")),
+        (
+            NotificationKind::ApprovalRequired,
+            json!("approval_required"),
+        ),
+        (NotificationKind::TurnCompleted, json!("turn_completed")),
+        (NotificationKind::SessionFinished, json!("session_finished")),
+        (NotificationKind::Error, json!("error")),
+        (NotificationKind::System, json!("system")),
+    ];
+
+    for (kind, expected) in cases {
+        let value = serde_json::to_value(kind).expect("serialize notification kind");
+        assert_eq!(value, expected);
+
+        let back = line_roundtrip(&kind);
+        assert_eq!(back, kind);
+        assert_eq!(kind.as_str(), expected.as_str().expect("string label"));
+    }
+}
+
+#[test]
+fn notification_severity_json_shape_roundtrips() {
+    let cases = [
+        (NotificationSeverity::Info, json!("info")),
+        (NotificationSeverity::Success, json!("success")),
+        (NotificationSeverity::Warning, json!("warning")),
+        (NotificationSeverity::Error, json!("error")),
+        (
+            NotificationSeverity::ActionRequired,
+            json!("action_required"),
+        ),
+    ];
+
+    for (severity, expected) in cases {
+        let value = serde_json::to_value(severity).expect("serialize notification severity");
+        assert_eq!(value, expected);
+
+        let back = line_roundtrip(&severity);
+        assert_eq!(back, severity);
+        assert_eq!(severity.as_str(), expected.as_str().expect("string label"));
+    }
+}
+
+#[test]
+fn notification_status_json_shape_roundtrips() {
+    let cases = [
+        (NotificationStatus::Unread, json!("unread")),
+        (NotificationStatus::Read, json!("read")),
+        (NotificationStatus::Acknowledged, json!("acknowledged")),
+        (NotificationStatus::Archived, json!("archived")),
+        (NotificationStatus::Deleted, json!("deleted")),
+    ];
+
+    for (status, expected) in cases {
+        let value = serde_json::to_value(status).expect("serialize notification status");
+        assert_eq!(value, expected);
+
+        let back = line_roundtrip(&status);
+        assert_eq!(back, status);
+        assert_eq!(status.as_str(), expected.as_str().expect("string label"));
+    }
+}
+
+#[test]
+fn notification_record_json_shape_roundtrips() {
+    let record = notification_record();
+
+    let value = serde_json::to_value(&record).expect("serialize notification record");
+    assert_eq!(
+        value,
+        json!({
+            "id": "n-42",
+            "source": {
+                "provider": "codex",
+                "provider_event": "PermissionRequest",
+                "host_local_source_id": "hook-42"
+            },
+            "kind": "approval_required",
+            "severity": "action_required",
+            "status": "unread",
+            "title": "Approval required",
+            "body": "Codex is waiting for a tool approval.",
+            "created_at": "2026-07-03T09:00:00Z"
+        })
+    );
+
+    let back = line_roundtrip(&record);
+    assert_eq!(back, record);
+}
+
+#[test]
+fn notification_record_omits_absent_optional_fields() {
+    let record = notification_record();
+
+    let value = serde_json::to_value(&record).expect("serialize notification record");
+    for field in [
+        "session_id",
+        "agent_kind",
+        "source_id",
+        "dedupe_key",
+        "project_id",
+        "read_at",
+        "acked_at",
+        "archived_at",
+        "deleted_at",
+        "superseded_by",
+        "metadata",
+    ] {
+        assert!(
+            !value
+                .as_object()
+                .expect("notification record object")
+                .contains_key(field),
+            "absent optional notification field must not appear on the wire: {field}"
+        );
+    }
+}
+
+#[test]
+fn notification_record_metadata_roundtrips_when_present() {
+    let mut record = notification_record();
+    record.metadata = metadata(&[("provider", "codex"), ("reason", "approval")]);
+
+    let value = serde_json::to_value(&record).expect("serialize notification record");
+    assert_eq!(
+        value["metadata"],
+        json!({
+            "provider": "codex",
+            "reason": "approval"
+        })
+    );
+
+    let back = line_roundtrip(&record);
+    assert_eq!(back, record);
+}
+
+#[test]
+fn notification_create_params_json_shape_roundtrips() {
+    let params = NotificationCreateParams {
+        source: notification_source(),
+        kind: NotificationKind::ApprovalRequired,
+        severity: NotificationSeverity::ActionRequired,
+        title: "Approval required".to_owned(),
+        body: "Codex is waiting for a tool approval.".to_owned(),
+        session_id: Some(SessionId("s-42".to_owned())),
+        agent_kind: Some(AgentKind::Codex),
+        source_id: Some("provider-event-7".to_owned()),
+        dedupe_key: None,
+        project_id: Some("p-42".to_owned()),
+        metadata: BTreeMap::new(),
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize notification create params");
+    assert_eq!(
+        value,
+        json!({
+            "source": {
+                "provider": "codex",
+                "provider_event": "PermissionRequest",
+                "host_local_source_id": "hook-42"
+            },
+            "kind": "approval_required",
+            "severity": "action_required",
+            "title": "Approval required",
+            "body": "Codex is waiting for a tool approval.",
+            "session_id": "s-42",
+            "agent_kind": "codex",
+            "source_id": "provider-event-7",
+            "project_id": "p-42"
+        })
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn notification_create_params_metadata_roundtrips_when_present() {
+    let params = NotificationCreateParams {
+        source: notification_source(),
+        kind: NotificationKind::ApprovalRequired,
+        severity: NotificationSeverity::ActionRequired,
+        title: "Approval required".to_owned(),
+        body: "Codex is waiting for a tool approval.".to_owned(),
+        session_id: Some(SessionId("s-42".to_owned())),
+        agent_kind: Some(AgentKind::Codex),
+        source_id: Some("provider-event-7".to_owned()),
+        dedupe_key: None,
+        project_id: Some("p-42".to_owned()),
+        metadata: metadata(&[("provider", "codex"), ("reason", "approval")]),
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize notification create params");
+    assert_eq!(
+        value["metadata"],
+        json!({
+            "provider": "codex",
+            "reason": "approval"
+        })
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn notification_create_params_carries_source_independent_dedupe_key() {
+    let params = NotificationCreateParams {
+        source: notification_source(),
+        kind: NotificationKind::AgentBlocked,
+        severity: NotificationSeverity::Warning,
+        title: "Agent blocked".to_owned(),
+        body: "The agent is waiting for input.".to_owned(),
+        session_id: Some(SessionId("s-42".to_owned())),
+        agent_kind: Some(AgentKind::Codex),
+        source_id: Some("provider-event-7".to_owned()),
+        dedupe_key: Some("attention:s-42:approval".to_owned()),
+        project_id: Some("p-42".to_owned()),
+        metadata: BTreeMap::new(),
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize notification create params");
+    assert_eq!(value["dedupe_key"], json!("attention:s-42:approval"));
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back.dedupe_key.as_deref(), Some("attention:s-42:approval"));
+}
+
+#[test]
+fn notification_create_result_can_return_existing_record() {
+    let result = NotificationCreateResult {
+        created: false,
+        record: notification_record(),
+    };
+
+    let value = serde_json::to_value(&result).expect("serialize notification create result");
+    assert_eq!(value["created"], json!(false));
+    assert_eq!(value["record"]["id"], json!("n-42"));
+
+    let back = line_roundtrip(&result);
+    assert_eq!(back, result);
+}
+
+#[test]
+fn notification_list_params_json_shape_roundtrips() {
+    let params = NotificationListParams {
+        status: Some(NotificationStatus::Unread),
+        kind: Some(NotificationKind::ApprovalRequired),
+        severity: Some(NotificationSeverity::ActionRequired),
+        provider: Some("codex".to_owned()),
+        session_id: Some(SessionId("s-42".to_owned())),
+        created_after: Some("2026-07-03T08:00:00Z".to_owned()),
+        created_before: Some("2026-07-03T10:00:00Z".to_owned()),
+        limit: Some(50),
+        cursor: Some("page-2".to_owned()),
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize notification list params");
+    assert_eq!(
+        value,
+        json!({
+            "status": "unread",
+            "kind": "approval_required",
+            "severity": "action_required",
+            "provider": "codex",
+            "session_id": "s-42",
+            "created_after": "2026-07-03T08:00:00Z",
+            "created_before": "2026-07-03T10:00:00Z",
+            "limit": 50,
+            "cursor": "page-2"
+        })
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn notification_update_params_json_shape_roundtrips() {
+    let params = NotificationUpdateParams {
+        id: NotificationId("n-42".to_owned()),
+        status: NotificationStatus::Acknowledged,
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize notification update params");
+    assert_eq!(
+        value,
+        json!({
+            "id": "n-42",
+            "status": "acknowledged"
+        })
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn notification_delete_params_json_shape_roundtrips() {
+    let params = NotificationDeleteParams {
+        id: NotificationId("n-42".to_owned()),
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize notification delete params");
+    assert_eq!(
+        value,
+        json!({
+            "id": "n-42"
+        })
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn notification_policy_params_json_shape_roundtrips() {
+    let params = NotificationPolicyParams {
+        policy: notification_policy(),
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize notification policy params");
+    assert_eq!(
+        value,
+        json!({
+            "policy": {
+                "attention_dedupe_window_secs": 90,
+                "enabled": {
+                    "agent_blocked": true,
+                    "approval_required": true,
+                    "turn_completed": false,
+                    "session_finished": false,
+                    "error": true,
+                    "system": false
+                },
+                "codex": {
+                    "agent_blocked": true,
+                    "approval_required": true,
+                    "turn_completed": false,
+                    "session_finished": false,
+                    "error": true,
+                    "system": true
+                },
+                "claude": {
+                    "agent_blocked": true,
+                    "approval_required": true,
+                    "turn_completed": true,
+                    "session_finished": false,
+                    "error": true,
+                    "system": false
+                }
+            }
+        })
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn notification_policy_carries_attention_dedupe_window_secs() {
+    let policy = notification_policy();
+
+    let value = serde_json::to_value(&policy).expect("serialize notification policy");
+    assert_eq!(value["attention_dedupe_window_secs"], json!(90));
+
+    let back = line_roundtrip(&policy);
+    assert_eq!(back.attention_dedupe_window_secs, 90);
+}
+
+#[test]
+fn notification_retention_params_json_shape_roundtrips() {
+    let params = NotificationRetentionParams {
+        dry_run: true,
+        status: Some(NotificationStatus::Archived),
+        before: Some("2026-08-01T00:00:00Z".to_owned()),
+        limit: Some(100),
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize notification retention params");
+    assert_eq!(
+        value,
+        json!({
+            "dry_run": true,
+            "status": "archived",
+            "before": "2026-08-01T00:00:00Z",
+            "limit": 100
+        })
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn notification_result_types_json_shape_roundtrip() {
+    let list = NotificationListResult {
+        notifications: vec![notification_record()],
+        next_cursor: Some("page-2".to_owned()),
+    };
+    let update = NotificationUpdateResult {
+        record: notification_record(),
+    };
+    let delete = NotificationDeleteResult {
+        id: NotificationId("n-42".to_owned()),
+        deleted: true,
+    };
+    let policy = NotificationPolicyResult {
+        policy: notification_policy(),
+    };
+    let retention = NotificationRetentionResult {
+        dry_run: true,
+        pruned: vec![NotificationId("n-42".to_owned())],
+    };
+
+    assert_eq!(line_roundtrip(&list), list);
+    assert_eq!(line_roundtrip(&update), update);
+    assert_eq!(line_roundtrip(&delete), delete);
+    assert_eq!(line_roundtrip(&policy), policy);
+    assert_eq!(line_roundtrip(&retention), retention);
+}
+
+#[test]
+fn notification_method_names_are_stable() {
+    assert_eq!(method::NOTIFICATION_CREATE, "notification.create");
+    assert_eq!(method::NOTIFICATION_LIST, "notification.list");
+    assert_eq!(method::NOTIFICATION_UPDATE, "notification.update");
+    assert_eq!(method::NOTIFICATION_DELETE, "notification.delete");
+    assert_eq!(method::NOTIFICATION_POLICY_GET, "notification.policy.get");
+    assert_eq!(method::NOTIFICATION_POLICY_SET, "notification.policy.set");
+    assert_eq!(
+        method::NOTIFICATION_RETENTION_PRUNE,
+        "notification.retention.prune"
+    );
+}
+
+#[test]
+fn notification_created_event_carries_record_in_flattened_payload() {
+    let event = Event::new(
+        event::NOTIFICATION_CREATED,
+        serde_json::to_value(NotificationCreatedEvent {
+            record: notification_record(),
+        })
+        .expect("serialize notification created event"),
+    );
+
+    let back = line_roundtrip(&event);
+    assert_eq!(event, back);
+    assert_eq!(back.event, event::NOTIFICATION_CREATED);
+
+    let value = serde_json::to_value(&event).expect("serialize event");
+    assert_eq!(value["event"], json!("notification_created"));
+    assert_eq!(value["record"]["id"], json!("n-42"));
+    assert!(
+        !value
+            .as_object()
+            .expect("event object")
+            .contains_key("payload"),
+        "event payload fields must be flattened: {value}"
+    );
+}
+
+#[test]
+fn notification_updated_event_carries_record_in_flattened_payload() {
+    let mut record = notification_record();
+    record.status = NotificationStatus::Acknowledged;
+    record.acked_at = Some("2026-07-03T09:05:00Z".to_owned());
+
+    let event = Event::new(
+        event::NOTIFICATION_UPDATED,
+        serde_json::to_value(NotificationUpdatedEvent { record })
+            .expect("serialize notification updated event"),
+    );
+
+    let back = line_roundtrip(&event);
+    assert_eq!(event, back);
+    assert_eq!(back.event, event::NOTIFICATION_UPDATED);
+
+    let value = serde_json::to_value(&event).expect("serialize event");
+    assert_eq!(value["event"], json!("notification_updated"));
+    assert_eq!(value["record"]["status"], json!("acknowledged"));
+    assert!(
+        !value
+            .as_object()
+            .expect("event object")
+            .contains_key("payload"),
+        "event payload fields must be flattened: {value}"
+    );
+}
+
+#[test]
+fn notification_deleted_event_carries_id_in_flattened_payload() {
+    let event = Event::new(
+        event::NOTIFICATION_DELETED,
+        serde_json::to_value(NotificationDeletedEvent {
+            notification_id: NotificationId("n-42".to_owned()),
+        })
+        .expect("serialize notification deleted event"),
+    );
+
+    let back = line_roundtrip(&event);
+    assert_eq!(event, back);
+    assert_eq!(back.event, event::NOTIFICATION_DELETED);
+
+    let value = serde_json::to_value(&event).expect("serialize event");
+    assert_eq!(
+        value,
+        json!({
+            "v": PROTOCOL_VERSION,
+            "event": "notification_deleted",
+            "notification_id": "n-42"
+        })
+    );
+    assert!(
+        !value
+            .as_object()
+            .expect("event object")
+            .contains_key("payload"),
+        "event payload fields must be flattened: {value}"
+    );
 }
 
 #[test]

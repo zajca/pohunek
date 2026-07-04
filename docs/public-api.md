@@ -138,6 +138,13 @@ All params and result type names below refer to structs exported by
 | `subscribe` | `null` | `{subscribed: true}` then event stream | Consumes the connection into a one-way event stream. |
 | `integration.install` | `IntegrationInstallParams` or `null` | `IntegrationInstallResult` | Installs agent hooks for native session id capture. |
 | `assistant.materialize` | `AssistantMaterializeParams` | `AssistantMaterializeResult` | Materializes the assistant knowledge bundle on the daemon host. |
+| `notification.create` | `NotificationCreateParams` | `NotificationCreateResult` | Creates a durable host-local notification. Daemon policy is enforced for every producer, including provider hooks and daemon projectors. Dedupe may return `created: false` with an existing or upgraded record. |
+| `notification.list` | `NotificationListParams` or `null` | `NotificationListResult` | Lists notification records with exact-match filters and cursor pagination. Deleted records are excluded unless `status: deleted` is requested. |
+| `notification.update` | `NotificationUpdateParams` | `NotificationUpdateResult` | Updates one record's lifecycle status. Allowed transitions are `unread -> read`, `read -> acknowledged`, `unread -> acknowledged`, `unread/read/acknowledged -> archived`, and any non-deleted status to deleted. |
+| `notification.delete` | `NotificationDeleteParams` | `NotificationDeleteResult` | Logically deletes one record. Unknown or already-deleted ids return `deleted: false`. |
+| `notification.policy.get` | `null` | `NotificationPolicyResult` | Reads the daemon's notification policy. Non-null params are `daemon/bad_request`. |
+| `notification.policy.set` | `NotificationPolicyParams` | `NotificationPolicyResult` | Replaces and persists the daemon notification policy at `<data_dir>/notifications/policy.json`. |
+| `notification.retention.prune` | `NotificationRetentionParams` or `null` | `NotificationRetentionResult` | Explicitly deletes records selected by retention filters, or reports matches when `dry_run` is true. |
 | `project.list` | `ProjectListParams` or `null` | `Vec<ProjectInfo>` | Lists known projects on the target host. |
 | `project.add` | `ProjectAddParams` | `ProjectInfo` | Registers a host-local git project path. |
 | `project.show` | `ProjectShowParams` | `ProjectShowResult` | Shows a project plus live worktree state. |
@@ -209,6 +216,93 @@ With the example above, a shell session that currently has
 `active_agent: "codex"` also matches `{"key":"agent","value":"codex"}` even
 though its launch `agent` remains `shell`.
 
+### `NotificationRecord`
+
+Important fields:
+
+- `id`: stable host-local notification id.
+- `source`: sanitized producer identity with `provider`, `provider_event`, and
+  `host_local_source_id`. Provider hooks use `codex` or `claude`; daemon
+  projectors use `pohunek`.
+- `kind`: `agent_blocked`, `approval_required`, `turn_completed`,
+  `session_finished`, `error`, or `system`.
+- `severity`: `info`, `success`, `warning`, `error`, or `action_required`.
+- `status`: `unread`, `read`, `acknowledged`, `archived`, or `deleted`.
+- `title` / `body`: bounded, sanitized user-facing text. Notification payloads
+  must not contain raw terminal output, prompts, secrets, environment dumps, or
+  full tool results.
+- `metadata`: safe producer tags. The daemon accepts at most eight entries, with
+  values at most 512 characters, and only allowlisted keys: `action_url`,
+  `detail_url`, `provider`, `provider_event`, `reason`, `summary`,
+  `hook_event_id`, `matcher`, and `tool_name`. Secret-shaped keys such as
+  `token`, `secret`, `password`, `api_key`, `authorization`, and `cookie` are
+  rejected.
+- `session_id`: optional linked session id. It is shape-validated when supplied
+  by `notification.create` and may point to a session that no longer exists.
+- `agent_kind`, `project_id`: optional display and filtering context.
+- `source_id`: optional producer-specific id used for idempotence within one
+  source namespace.
+- `dedupe_key`: optional source-independent id for one logical event. Session
+  attention notifications use `attention:<session_id>`.
+- `read_at`, `acked_at`, `archived_at`, `deleted_at`: lifecycle timestamps set
+  by status transitions.
+- `superseded_by`: optional replacement link for implementations that preserve
+  superseded records.
+
+`notification.list` sorts by `created_at` descending, then `id`, and omits
+deleted records by default. `NotificationListParams` can filter by status, kind,
+severity, provider, session id, and creation time range, plus `limit` and
+`cursor`.
+
+### `NotificationPolicy`
+
+Important fields:
+
+- `attention_dedupe_window_secs`: window for source-independent attention
+  dedupe. The default is 120 seconds.
+- `enabled`: default per-kind flags.
+- `codex` / `claude`: optional provider-specific per-kind overrides.
+
+Default policy enables `agent_blocked`, `approval_required`, and `error`.
+`turn_completed`, `session_finished`, and `system` are implemented but disabled
+by default.
+
+Policy is enforced daemon-side for all notification producers. If a producer
+creates a disabled kind, `notification.create` returns
+`runtime/notification_kind_disabled`.
+
+Provider hooks have higher source priority than daemon projectors for the same
+`dedupe_key` inside `attention_dedupe_window_secs`. A Codex or Claude hook can
+upgrade an existing projector record in place; the daemon returns
+`created: false` and emits `notification_updated`. A later projector create for
+an existing provider-backed attention record is suppressed and returns
+`created: false` with the existing record. Producers other than Codex, Claude,
+`pohunek`, or `daemon` are treated as user/external sources and do not
+automatically supersede provider records.
+
+### Provider Notification Hooks
+
+`integration.install` installs durable notification hook adapters for current
+Codex and Claude builds only. There is no fallback for older provider hook APIs.
+
+Codex notification support requires modern lifecycle hooks for
+`PermissionRequest` and `Stop`. The installer writes managed command hooks to
+`hooks.json` and records trust metadata in `config.toml`; the legacy Codex
+`notify` key is not used and is not sufficient for approval notifications.
+
+Claude notification support requires hook events for `Notification`, `Stop`,
+and `StopFailure`. `Notification` matcher values map as follows:
+`permission_prompt` and `elicitation_dialog` create `approval_required`,
+`idle_prompt` creates `agent_blocked`, and `auth_success`,
+`elicitation_complete`, and `elicitation_response` create `system`. `Stop`
+creates `turn_completed`; `StopFailure` creates `error`.
+
+Hook adapters read at most 64 KiB from provider stdin, validate action and
+environment before reading input, silently drop an invalid `POHUNEK_SESSION_ID`,
+and exit successfully without output on local failures so agent sessions are not
+disrupted. Reinstalling hooks removes only exact command shapes managed by
+Pohunek; user hooks that merely reference the managed script path are preserved.
+
 ## Error Contract
 
 Every error body has this shape:
@@ -244,7 +338,7 @@ Canonical public codes currently emitted include:
 | `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback` |
 | `transport` | `framing`, `host_unreachable` |
 | `discovery` | `netbird_cli_missing`, `netbird_state_unavailable`, `host_unknown`, `remote_discovery_failed` |
-| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_exit_timeout`, `attach_not_found`, `attach_expired`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug` |
+| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_exit_timeout`, `attach_not_found`, `attach_expired`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor` |
 
 Clients must not parse `msg`. Branch on `class` and `code`, then display `msg`
 and `recover` for unknown codes.
@@ -269,10 +363,37 @@ The daemon then writes these events:
 | `agent_state` | `{session_id: SessionId, activity: AgentActivity, source: StateSource}` | Agent activity changed. `source` may be `report` when a hook report supplied explicit active-agent state. |
 | `attach_opened` | `{session_id: SessionId, stream_id: string}` | A pending attach token was redeemed and a raw stream opened. |
 | `attach_closed` | `{session_id: SessionId, stream_id: string}` | A raw attach stream ended or was detached. |
+| `notification_created` | `{record: NotificationRecord}` | A durable notification record was created. |
+| `notification_updated` | `{record: NotificationRecord}` | A notification record changed lifecycle status or was upgraded by higher-priority source dedupe. |
+| `notification_deleted` | `{notification_id: NotificationId}` | A notification record was logically deleted. |
 
 Subscription connections ignore further client input after the ack. A slow
 subscriber may miss older events if the daemon's internal event channel lags; it
-should reconcile by calling `session.list` or `session.inspect`.
+should reconcile by calling `session.list`, `session.inspect`, or
+`notification.list`.
+
+## CLI Notification Surface
+
+The CLI exposes durable notifications through `pohunek notifications`:
+
+- `pohunek notifications list`: list records on one host; `--all-hosts` includes
+  local plus all reachable daemon hosts discovered by the local daemon.
+- `pohunek notifications watch`: stream `notification_created`,
+  `notification_updated`, and `notification_deleted`; `--all-hosts` opens one
+  subscription per reachable host.
+- `pohunek notifications read|ack|archive|delete <target>`: update one record.
+  Targets accept bare `id` or `host/id`; an explicit target host overrides
+  `--host`.
+- `pohunek notifications policy get|set`: read policy or toggle one
+  provider/kind flag. `set` accepts `--provider default|codex|claude`,
+  `--kind <kind>`, and exactly one of `--enabled` or `--disabled`.
+- `pohunek notifications retention prune`: explicitly prune records selected by
+  `--status`, `--before`, and `--limit`, with exactly one of `--dry-run` or
+  `--apply`.
+
+Commands that support `--all-hosts` render per-host successes and structured
+per-host errors. Cross-host notification aggregation is client-side; no central
+notification server is introduced.
 
 ## Attach Stream
 
@@ -356,6 +477,21 @@ Request APIs:
 - `Client::subscribe(&Request) -> Subscription`: consumes the client connection
   after a subscribe ack.
 - `Subscription::next_line() -> Option<String>`: returns raw event JSON lines.
+- `Subscription::next_event() -> Option<Event>`: decodes one event JSON line into
+  the protocol event envelope.
+- `Client::create_notification(NotificationCreateParams)`: calls
+  `notification.create`.
+- `Client::list_notifications(NotificationListParams)`: calls
+  `notification.list`.
+- `Client::update_notification(NotificationUpdateParams)`: calls
+  `notification.update`.
+- `Client::delete_notification(NotificationDeleteParams)`: calls
+  `notification.delete`.
+- `Client::get_notification_policy()`: calls `notification.policy.get`.
+- `Client::set_notification_policy(NotificationPolicyParams)`: calls
+  `notification.policy.set`.
+- `Client::prune_notifications(NotificationRetentionParams)`: calls
+  `notification.retention.prune`.
 
 SDK error mapping preserves daemon protocol errors and adds host/transport
 context for local and remote failures. Use `ClientError::to_protocol_error()` to

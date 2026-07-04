@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
-use protocol::{AttachHeader, ProtocolError, Request, Response};
+use protocol::{AttachHeader, Event, ProtocolError, Request, Response};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
@@ -197,6 +197,18 @@ impl Subscription {
             SubscriptionInner::Remote(conn) => conn.next_line().await,
         }
     }
+
+    /// Return the next decoded [`Event`], or `None` when the daemon closes.
+    ///
+    /// This is the typed counterpart to [`Self::next_line`]: it reads one line
+    /// and decodes it into a protocol [`Event`]. A malformed line surfaces as a
+    /// typed error, mapped by transport exactly like an unparseable reply.
+    pub async fn next_event(&mut self) -> Result<Option<Event>, ClientError> {
+        match &mut self.inner {
+            SubscriptionInner::Local(conn) => conn.next_event().await,
+            SubscriptionInner::Remote(conn) => conn.next_event().await,
+        }
+    }
 }
 
 impl<S> Conn<S>
@@ -294,6 +306,17 @@ where
         match self.framed.next().await {
             Some(line) => line.map(Some).map_err(|err| map_codec_err_for(host, err)),
             None => Ok(None),
+        }
+    }
+
+    async fn next_event(&mut self) -> Result<Option<Event>, ClientError> {
+        let Some(line) = self.next_line().await? else {
+            return Ok(None);
+        };
+        let host = self.remote_host.as_deref();
+        match serde_json::from_str::<Event>(&line) {
+            Ok(event) => Ok(Some(event)),
+            Err(err) => Err(unparseable_reply_error(host, err)),
         }
     }
 }

@@ -1,5 +1,11 @@
 # Knowledge Bundle Log
 
+## 0.14.5
+
+- Documented the durable cross-host notification Inbox, CLI/API surface,
+  provider hook requirements, source-priority dedupe, retention, and trust-model
+  boundary.
+
 ## 0.7.4
 
 - Documented that the native GUI `Start session` runtime picker supports the

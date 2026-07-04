@@ -33,6 +33,8 @@ pohunek session attach <session-id>
 
 Use `pohunek project add`, `pohunek project list`, and `pohunek project actions`
 to drive repository-aware launcher flows.
+Use `pohunek notifications list` and `pohunek notifications watch` to inspect
+the durable agent inbox.
 
 ## Trust Boundary
 

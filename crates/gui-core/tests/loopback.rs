@@ -27,13 +27,16 @@ use pohunek_gui_core::{
     TreeNodeId, UiState, WindowSize, Workspace,
 };
 use protocol::{
-    method, AgentActivity, AgentKind, ProjectActionParams, ProjectActionResult,
+    method, AgentActivity, AgentKind, ErrorClass, ProjectActionParams, ProjectActionResult,
     ProjectActionsParams, ProjectAddParams, ProjectPromptParams, ProjectRemoveParams,
-    ProjectRenameParams, ProjectShowParams, ProviderKind, Request, SessionId, SessionInfo,
-    SessionNewParams, SessionReportNativeIdParams, SessionSetMetadataParams, StateSource,
+    ProjectRenameParams, ProjectShowParams, ProtocolError, ProviderKind, Request, Response,
+    SessionId, SessionInfo, SessionNewParams, SessionReportNativeIdParams,
+    SessionSetMetadataParams, StateSource,
 };
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -130,7 +133,7 @@ async fn workspace_connects_to_multiple_loopback_daemons_and_lists_sessions() {
 }
 
 #[tokio::test]
-async fn live_agent_state_updates_are_reflected_and_emit_blocked_intent() {
+async fn live_agent_state_updates_are_reflected() {
     let _path_lock = PATH_LOCK.lock().await;
     let bin_dir = temp_dir("gui-core-m1-blocked-bin");
     write_executable(
@@ -165,13 +168,72 @@ async fn live_agent_state_updates_are_reflected_and_emit_blocked_intent() {
             .and_then(|session| session.activity),
         Some(AgentActivity::Blocked)
     );
-    assert_eq!(workspace.notification_intents.len(), 1);
-    assert_eq!(workspace.toasts.len(), 1);
-    assert_eq!(workspace.notification_intents[0].host_id, host.id);
-    assert_eq!(workspace.notification_intents[0].session_id, session.id);
+    // The transient blocked-session OS notification path was removed. OS intents
+    // now originate from durable `notification_created` events produced by the
+    // daemon projector, so a bare `agent_state` transition raises no intent.
+    assert!(workspace.notification_intents.is_empty());
+    assert!(workspace.toasts.is_empty());
 
     stop_session(&host, &session.id).await;
     daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn notification_seed_degrades_gracefully_without_daemon_support() {
+    let _path_lock = PATH_LOCK.lock().await;
+    let bin_dir = temp_dir("gui-core-notif-seed-bin");
+    write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
+    let _path = PathGuard::prepend(&bin_dir);
+
+    // This daemon build does not serve `notification.list`, so seeding must be
+    // non-fatal: the host still connects and streams sessions with an empty
+    // inbox rather than failing the whole snapshot load.
+    let daemon = LoopbackDaemon::spawn("notif-seed", "0.1.0-notif").await;
+    let host = HostConfig::tcp("host-notif", daemon.addr);
+    let mut workspace = Workspace::default();
+    let mut stream = Box::pin(workspace_connection_stream(
+        vec![host.clone()],
+        test_connection_options(),
+    ));
+    wait_for_host_connected(&mut workspace, &mut stream, &host).await;
+
+    let session =
+        create_agent_session(&host, AgentKind::Codex, temp_dir("gui-core-notif-cwd")).await;
+    wait_for_hosts_with_sessions(&mut workspace, &mut stream, &[(&host, &session.id)]).await;
+
+    let view = workspace.hosts.get(&host.id).expect("host view");
+    assert_eq!(view.conn, ConnState::Connected);
+    assert!(view.notifications.is_empty());
+    assert_eq!(workspace.unread_notification_count(), 0);
+
+    stop_session(&host, &session.id).await;
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn notification_seed_runtime_error_surfaces_on_snapshot() {
+    let daemon = NotificationListErrorDaemon::spawn().await;
+    let host = HostConfig::tcp("host-notif-error", daemon.addr);
+
+    let snapshot = load_host_snapshot(&host)
+        .await
+        .expect("runtime notification error is non-fatal to host seed");
+
+    assert!(snapshot.notifications.is_empty());
+    let error = snapshot
+        .project_error
+        .as_deref()
+        .expect("notification.list runtime error is surfaced");
+    assert!(
+        error.contains("notification.list failed"),
+        "seed error is attributed to notification.list: {error}"
+    );
+    assert!(
+        error.contains("notification_store_unavailable"),
+        "seed error keeps daemon code: {error}"
+    );
+
+    daemon.join().await;
 }
 
 #[tokio::test]
@@ -684,6 +746,7 @@ fn preview_state_updates_without_launching_session() {
             sessions: Vec::new(),
             projects: Vec::new(),
             project_error: None,
+            notifications: Vec::new(),
         },
     });
     let preview = PromptPreview {
@@ -1382,6 +1445,85 @@ impl LoopbackDaemon {
     async fn shutdown(self) {
         let _ = self.shutdown.send(());
         let _ = self.handle.await;
+    }
+}
+
+struct NotificationListErrorDaemon {
+    addr: SocketAddr,
+    handle: JoinHandle<()>,
+}
+
+impl NotificationListErrorDaemon {
+    async fn spawn() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("notification error daemon bind");
+        let addr = listener
+            .local_addr()
+            .expect("notification error daemon addr");
+        let handle = tokio::spawn(async move {
+            let (stream, _addr) = listener
+                .accept()
+                .await
+                .expect("notification error daemon accept");
+            let mut reader = BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                let bytes = reader
+                    .read_line(&mut line)
+                    .await
+                    .expect("notification error daemon read request");
+                if bytes == 0 {
+                    break;
+                }
+                let request: Request =
+                    serde_json::from_str(line.trim_end()).expect("parse request");
+                let response = notification_error_response(&request);
+                let reply = serde_json::to_string(&response).expect("serialize response");
+                reader
+                    .get_mut()
+                    .write_all(reply.as_bytes())
+                    .await
+                    .expect("write response");
+                reader
+                    .get_mut()
+                    .write_all(b"\n")
+                    .await
+                    .expect("write response newline");
+            }
+        });
+        Self { addr, handle }
+    }
+
+    async fn join(self) {
+        self.handle.await.expect("notification error daemon task");
+    }
+}
+
+fn notification_error_response(request: &Request) -> Response {
+    match request.method.as_str() {
+        method::DAEMON_HEALTH => Response::ok(
+            request.id.clone(),
+            serde_json::to_value(HealthSummary {
+                status: "ok".to_owned(),
+                daemon_version: "0.1.0-notif-error".to_owned(),
+                protocol_version: protocol::PROTOCOL_VERSION,
+            })
+            .expect("serialize health"),
+        ),
+        method::SESSION_LIST | method::PROJECT_LIST => {
+            Response::ok(request.id.clone(), serde_json::json!([]))
+        }
+        method::NOTIFICATION_LIST => Response::err(
+            request.id.clone(),
+            ProtocolError::new(
+                ErrorClass::Runtime,
+                "notification_store_unavailable",
+                "notification store unavailable",
+                None,
+            ),
+        ),
+        method => Response::err(request.id.clone(), ProtocolError::method_not_found(method)),
     }
 }
 

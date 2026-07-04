@@ -2,15 +2,15 @@
 //!
 //! A local, owner-private JSON-lines audit/debug trail under `<data_dir>/events/`
 //! (see `docs/architecture.md` "Configuration, State, and Log Storage"). It is
-//! fed from [`crate::session::SessionRegistry::subscribe`] and writes **exactly
-//! one JSON line per lifecycle [`Event`]** (session created/updated/stopped,
-//! attach opened/closed, `agent_state`).
+//! fed from daemon control-plane broadcast channels and writes **exactly one JSON
+//! line per structured [`Event`]** (session created/updated/stopped, attach
+//! opened/closed, `agent_state`, notification lifecycle events).
 //!
 //! The log **never contains secrets and never contains raw terminal bytes**: it
-//! records only the structured control-plane events, whose payloads carry session
-//! metadata (ids, cwd, size, state). PTY output flows on a *separate* broadcast
-//! channel (`PtyHandle::subscribe_output`) that this log never taps, so terminal
-//! bytes are out of reach by construction.
+//! records only the structured control-plane events, whose payloads carry bounded
+//! daemon metadata. PTY output flows on a *separate* broadcast channel
+//! (`PtyHandle::subscribe_output`) that this log never taps, so terminal bytes
+//! are out of reach by construction.
 //!
 //! Unlike the (deferred) `state.db`, this log is **not rebuildable**, so it is
 //! append-only: each event is appended and flushed, never rewritten.

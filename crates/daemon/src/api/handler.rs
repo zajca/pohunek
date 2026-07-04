@@ -12,11 +12,14 @@
 
 use protocol::{
     method, negotiate, AssistantMaterializeParams, AssistantMaterializeResult, HostDiscoverParams,
-    IntegrationInstallParams, ProjectActionParams, ProjectActionsParams, ProjectActionsResult,
-    ProjectAddParams, ProjectListParams, ProjectPromptParams, ProjectRemoveParams,
-    ProjectRenameParams, ProjectShowParams, ProtocolError, Request, Response, SessionAttachParams,
-    SessionDetachParams, SessionId, SessionInputParams, SessionListParams, SessionNewParams,
-    SessionNewResult, SessionReleaseAgentParams, SessionRenameParams, SessionReportAgentParams,
+    IntegrationInstallParams, NotificationCreateParams, NotificationDeleteParams,
+    NotificationListParams, NotificationPolicyParams, NotificationPolicyResult,
+    NotificationRetentionParams, NotificationUpdateParams, ProjectActionParams,
+    ProjectActionsParams, ProjectActionsResult, ProjectAddParams, ProjectListParams,
+    ProjectPromptParams, ProjectRemoveParams, ProjectRenameParams, ProjectShowParams,
+    ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams, SessionId,
+    SessionInputParams, SessionListParams, SessionNewParams, SessionNewResult,
+    SessionReleaseAgentParams, SessionRenameParams, SessionReportAgentParams,
     SessionReportNativeIdParams, SessionResizeParams, SessionResumeResult,
     SessionSetMetadataParams, WorktreeRemoveParams, PROTOCOL_VERSION,
 };
@@ -28,6 +31,7 @@ use serde_json::{json, Value};
 use tracing::{debug, warn};
 
 use crate::discovery::DiscoveryCache;
+use crate::notifications::NotificationService;
 use crate::project::{LiveSession, ProjectConfigResolver, ProjectManager};
 use crate::session::SessionRegistry;
 
@@ -47,6 +51,8 @@ pub struct DaemonState {
     pub health: HealthInfo,
     /// In-memory session registry.
     pub sessions: SessionRegistry,
+    /// Durable notification inbox, when configured by the daemon binary.
+    pub notifications: Option<NotificationService>,
     /// TTL-cached `NetBird` host discovery, shared across connections.
     pub discovery: DiscoveryCache,
 }
@@ -58,8 +64,16 @@ impl DaemonState {
         Self {
             health,
             sessions,
+            notifications: None,
             discovery: DiscoveryCache::default(),
         }
+    }
+
+    /// Attach the durable notification service to shared daemon state.
+    #[must_use]
+    pub fn with_notifications(mut self, notifications: NotificationService) -> Self {
+        self.notifications = Some(notifications);
+        self
     }
 }
 
@@ -176,6 +190,27 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::INTEGRATION_INSTALL => handle_integration_install(request),
         method::HOST_INSPECT => handle_host_inspect(request, &state.health, &state.sessions),
         method::HOST_DISCOVER => handle_host_discover(request, &state.discovery).await,
+        method::NOTIFICATION_CREATE => {
+            handle_notification_create(request, state.notifications.as_ref(), &state.sessions).await
+        }
+        method::NOTIFICATION_LIST => {
+            handle_notification_list(request, state.notifications.as_ref()).await
+        }
+        method::NOTIFICATION_UPDATE => {
+            handle_notification_update(request, state.notifications.as_ref()).await
+        }
+        method::NOTIFICATION_DELETE => {
+            handle_notification_delete(request, state.notifications.as_ref()).await
+        }
+        method::NOTIFICATION_POLICY_GET => {
+            handle_notification_policy_get(request, state.notifications.as_ref())
+        }
+        method::NOTIFICATION_POLICY_SET => {
+            handle_notification_policy_set(request, state.notifications.as_ref()).await
+        }
+        method::NOTIFICATION_RETENTION_PRUNE => {
+            handle_notification_retention_prune(request, state.notifications.as_ref()).await
+        }
         method::PROJECT_LIST => handle_project_list(request, &state.sessions).await,
         method::PROJECT_ADD => handle_project_add(request, &state.sessions).await,
         method::PROJECT_SHOW => handle_project_show(request, &state.sessions).await,
@@ -258,6 +293,25 @@ fn require_projects(
     })
 }
 
+/// Resolve the notification service, or a typed error response when this daemon
+/// state was built without durable notification storage.
+fn require_notifications(
+    request: &Request,
+    notifications: Option<&NotificationService>,
+) -> Result<NotificationService, Response> {
+    notifications.cloned().ok_or_else(|| {
+        Response::err(
+            request.id.clone(),
+            ProtocolError::new(
+                protocol::ErrorClass::Daemon,
+                "notifications_not_configured",
+                "the daemon is not configured for notifications".to_owned(),
+                None,
+            ),
+        )
+    })
+}
+
 /// Run a fallible blocking operation off the async runtime and map its result to
 /// a [`Response`]: a serialized value on success, the operation's typed error on
 /// failure, and a daemon-class error built from `panic_code`/`panic_msg`/
@@ -301,6 +355,199 @@ where
         "project operation task panicked",
         None,
     )
+    .await
+}
+
+/// Run a blocking notification operation off the async runtime.
+async fn run_notification_blocking<T, F>(request: &Request, op: F) -> Response
+where
+    T: Serialize + Send + 'static,
+    F: FnOnce() -> Result<T, ProtocolError> + Send + 'static,
+{
+    run_blocking(
+        request,
+        op,
+        "notification_task_panicked",
+        "notification operation task panicked",
+        None,
+    )
+    .await
+}
+
+/// `notification.create`: create or dedupe a durable notification record.
+async fn handle_notification_create(
+    request: &Request,
+    notifications: Option<&NotificationService>,
+    sessions: &SessionRegistry,
+) -> Response {
+    let params = match parse_params::<NotificationCreateParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    let notifications = match require_notifications(request, notifications) {
+        Ok(notifications) => notifications,
+        Err(resp) => return resp,
+    };
+    let params = enrich_notification_session_context(params, sessions).await;
+    run_notification_blocking(request, move || {
+        notifications
+            .create(params)
+            .map_err(|err| err.to_protocol_error())
+    })
+    .await
+}
+
+/// Enrich producer params with live session context without making a missing
+/// session reference fatal.
+async fn enrich_notification_session_context(
+    mut params: NotificationCreateParams,
+    sessions: &SessionRegistry,
+) -> NotificationCreateParams {
+    let Some(session_id) = params.session_id.as_ref() else {
+        return params;
+    };
+    let Ok(session) = sessions.inspect(session_id).await else {
+        return params;
+    };
+    if session.state.is_terminal() {
+        return params;
+    }
+    if params.agent_kind.is_none() {
+        params.agent_kind = session.active_agent_base.or(Some(session.agent_base));
+    }
+    if params.project_id.is_none() {
+        params.project_id = session.project_id;
+    }
+    params
+}
+
+/// `notification.list`: list durable notification records.
+async fn handle_notification_list(
+    request: &Request,
+    notifications: Option<&NotificationService>,
+) -> Response {
+    let params = match parse_optional_params::<NotificationListParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    let notifications = match require_notifications(request, notifications) {
+        Ok(notifications) => notifications,
+        Err(resp) => return resp,
+    };
+    run_notification_blocking(request, move || {
+        notifications
+            .list(params)
+            .map_err(|err| err.to_protocol_error())
+    })
+    .await
+}
+
+/// `notification.update`: update notification lifecycle status.
+async fn handle_notification_update(
+    request: &Request,
+    notifications: Option<&NotificationService>,
+) -> Response {
+    let params = match parse_params::<NotificationUpdateParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    let notifications = match require_notifications(request, notifications) {
+        Ok(notifications) => notifications,
+        Err(resp) => return resp,
+    };
+    run_notification_blocking(request, move || {
+        notifications
+            .update(params)
+            .map_err(|err| err.to_protocol_error())
+    })
+    .await
+}
+
+/// `notification.delete`: logically delete a notification.
+async fn handle_notification_delete(
+    request: &Request,
+    notifications: Option<&NotificationService>,
+) -> Response {
+    let params = match parse_params::<NotificationDeleteParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    let notifications = match require_notifications(request, notifications) {
+        Ok(notifications) => notifications,
+        Err(resp) => return resp,
+    };
+    run_notification_blocking(request, move || {
+        notifications
+            .delete(params)
+            .map_err(|err| err.to_protocol_error())
+    })
+    .await
+}
+
+/// `notification.policy.get`: return the current notification policy.
+fn handle_notification_policy_get(
+    request: &Request,
+    notifications: Option<&NotificationService>,
+) -> Response {
+    if !request.params.is_null() {
+        return Response::err(
+            request.id.clone(),
+            ProtocolError::bad_request("notification.policy.get does not accept params"),
+        );
+    }
+    let notifications = match require_notifications(request, notifications) {
+        Ok(notifications) => notifications,
+        Err(resp) => return resp,
+    };
+    ok_value(
+        request,
+        &NotificationPolicyResult {
+            policy: notifications.policy(),
+        },
+    )
+}
+
+/// `notification.policy.set`: persist a replacement notification policy.
+async fn handle_notification_policy_set(
+    request: &Request,
+    notifications: Option<&NotificationService>,
+) -> Response {
+    let params = match parse_params::<NotificationPolicyParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    let notifications = match require_notifications(request, notifications) {
+        Ok(notifications) => notifications,
+        Err(resp) => return resp,
+    };
+    let policy = params.policy;
+    run_notification_blocking(request, move || {
+        notifications
+            .set_policy(policy.clone())
+            .map_err(|err| err.to_protocol_error())?;
+        Ok(NotificationPolicyResult { policy })
+    })
+    .await
+}
+
+/// `notification.retention.prune`: delete records selected by retention params.
+async fn handle_notification_retention_prune(
+    request: &Request,
+    notifications: Option<&NotificationService>,
+) -> Response {
+    let params = match parse_optional_params::<NotificationRetentionParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    let notifications = match require_notifications(request, notifications) {
+        Ok(notifications) => notifications,
+        Err(resp) => return resp,
+    };
+    run_notification_blocking(request, move || {
+        notifications
+            .prune_retention(&params)
+            .map_err(|err| err.to_protocol_error())
+    })
     .await
 }
 

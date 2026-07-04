@@ -48,6 +48,34 @@ static METHODS: &[MethodDescriptor] = &[
         description: "Install the per-agent SessionStart hook that captures the native id.",
     },
     MethodDescriptor {
+        wire_name: "notification.create",
+        description: "Create or dedupe a durable host-local notification record.",
+    },
+    MethodDescriptor {
+        wire_name: "notification.delete",
+        description: "Logically delete one durable notification record.",
+    },
+    MethodDescriptor {
+        wire_name: "notification.list",
+        description: "List durable notification records with filters and cursor pagination.",
+    },
+    MethodDescriptor {
+        wire_name: "notification.policy.get",
+        description: "Read the daemon notification policy.",
+    },
+    MethodDescriptor {
+        wire_name: "notification.policy.set",
+        description: "Replace and persist the daemon notification policy.",
+    },
+    MethodDescriptor {
+        wire_name: "notification.retention.prune",
+        description: "Prune notification records selected by retention filters.",
+    },
+    MethodDescriptor {
+        wire_name: "notification.update",
+        description: "Update one notification's lifecycle status.",
+    },
+    MethodDescriptor {
         wire_name: "project.action",
         description: "Resolve one action by name to its recipe plus prompt content.",
     },
@@ -142,6 +170,18 @@ static EVENTS: &[EventDescriptor] = &[
     EventDescriptor {
         wire_name: "attach_opened",
         description: "A client attached to a session's PTY stream.",
+    },
+    EventDescriptor {
+        wire_name: "notification_created",
+        description: "A durable notification record was created.",
+    },
+    EventDescriptor {
+        wire_name: "notification_deleted",
+        description: "A durable notification record was deleted.",
+    },
+    EventDescriptor {
+        wire_name: "notification_updated",
+        description: "A durable notification record changed.",
     },
     EventDescriptor {
         wire_name: "session_created",

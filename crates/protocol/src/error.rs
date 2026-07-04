@@ -115,6 +115,21 @@ impl ProtocolError {
         Self::new(ErrorClass::Daemon, "bad_request", msg, None)
     }
 
+    /// The canonical `runtime/notification_kind_disabled` error.
+    ///
+    /// Raised when daemon notification policy disables a create request's
+    /// notification kind for the producer provider. Code is stable:
+    /// `notification_kind_disabled`.
+    #[must_use]
+    pub fn notification_kind_disabled(provider: &str, kind: &str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "notification_kind_disabled",
+            format!("notification kind `{kind}` is disabled for provider `{provider}`"),
+            Some("enable the notification kind in policy before creating this record".to_owned()),
+        )
+    }
+
     /// The canonical `runtime/agent_binary_missing` error.
     ///
     /// Names the missing binary so the operator (or an operator agent) sees
