@@ -71,7 +71,7 @@ pulldown-cmark = "0.12"
 # Single source of truth for the released version. Every crate opts in via
 # `version.workspace = true`, so `scripts/release` only bumps it here.
 [workspace.package]
-version = "0.15.1"
+version = "0.16.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.96"
