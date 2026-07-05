@@ -1,18 +1,20 @@
-//! Inbox pane and notification detail: filters, list rows, actions, and age/date formatting.
+//! Inbox modal: notification list and message-detail layers, plus the
+//! age/date formatting they share.
 
-use std::collections::BTreeSet;
-
-use iced::widget::{button, column, row, text};
+use iced::widget::{button, column, container, pick_list, row, scrollable, text};
 use iced::{Center, Element, Fill, Theme};
-use pohunek_gui_core::{HostId, NotificationFilter, Selection};
+use pohunek_gui_core::{HostId, NotificationScope};
 use protocol::{
     NotificationId, NotificationKind, NotificationRecord, NotificationSeverity, NotificationStatus,
+    SessionId,
 };
 
-use crate::message::{Message, NotificationAction};
+use crate::attach::window_dimension_to_f32;
+use crate::message::{InboxView, Message, NotificationAction};
+use crate::view::provider::{status_pill, PillTone};
 use crate::PohunekApp;
 
-use super::{card, list_button, muted_style, push_meta, section_title, STATUS_DOT};
+use super::{card, list_button, muted_style, push_meta, STATUS_DOT};
 
 // Calendar conversion offset from the civil-date algorithm's day zero to Unix
 // epoch; changing it would make notification age labels wrong for every row.
@@ -40,356 +42,266 @@ pub(crate) const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
 
 const SECONDS_PER_WEEK: u64 = 7 * SECONDS_PER_DAY;
 
-pub(crate) fn inbox_pane(app: &PohunekApp) -> Element<'_, Message> {
+// Wide enough to read a notification body comfortably; the other modals use
+// `dialog_card`'s fixed 640px, which felt cramped for triage + full text.
+const INBOX_MODAL_WIDTH: f32 = 760.0;
+
+// Leaves headroom above/below the dialog for the dimmed backdrop; the body
+// scrolls internally beyond this so a long notification list or body never
+// grows the dialog past the operator's window.
+const INBOX_MODAL_HEIGHT_RATIO: f32 = 0.8;
+
+// Sentinel `pick_list` option meaning "no host filter"; it can never collide
+// with a real host id, which comes from config-defined host slugs.
+const INBOX_ALL_HOSTS_LABEL: &str = "All hosts";
+
+/// Routes the inbox modal to its current layer: the notification list, or one
+/// message's detail (auto-marked read by `Message::SelectNotification`).
+pub(crate) fn inbox_modal_content(app: &PohunekApp) -> Element<'_, Message> {
+    match &app.inbox_view {
+        InboxView::List => inbox_list_content(app),
+        InboxView::Message {
+            host_id,
+            notification_id,
+        } => inbox_message_content(app, host_id, notification_id),
+    }
+}
+
+/// Layer 1: header with unread count, the scope/host controls, and the
+/// notification list. Rows are pre-sorted for triage by `Workspace::inbox_rows`.
+fn inbox_list_content(app: &PohunekApp) -> Element<'_, Message> {
     let unread = app.workspace.unread_notification_count();
-    let rows = app.workspace.notifications(&app.notification_filter);
     let header = row![
-        text("Inbox").size(22),
-        text(format!("{unread} unread")).size(13).style(muted_style),
+        text(format!("Inbox · {unread} unread")).size(20),
         iced::widget::space().width(Fill),
-        button("Clear filters")
-            .on_press(Message::ClearNotificationFilters)
+        button("Close")
+            .on_press(Message::CloseModal)
             .style(iced::widget::button::secondary),
     ]
-    .spacing(10)
     .align_y(Center);
-    let mut list = column![].spacing(5);
-    let mut shown = 0_usize;
-    for row in rows {
-        shown += 1;
-        list = list.push(notification_row(app, row.host_id, row.record));
+
+    let rows = app
+        .workspace
+        .inbox_rows(app.inbox_scope, &app.notification_filter);
+    let mut list = column![].spacing(6);
+    if rows.is_empty() {
+        list = list.push(text(inbox_empty_label(app.inbox_scope)).size(13));
+    } else {
+        for row in rows {
+            list = list.push(notification_row(app, row.host_id, row.record));
+        }
     }
-    if shown == 0 {
-        list = list.push(text("No notifications match the filters").size(13));
-    }
-    column![header, notification_filters(app), card(list),]
-        .spacing(12)
-        .into()
+
+    inbox_dialog(
+        app,
+        column![header, inbox_controls(app), card(list)].spacing(12),
+    )
 }
 
-fn notification_filters(app: &PohunekApp) -> Element<'_, Message> {
-    column![
-        notification_status_filters(app),
-        notification_severity_filters(app),
-        notification_kind_filters(app),
-        notification_provider_filters(app),
-        notification_host_filters(app),
-    ]
-    .spacing(4)
-    .into()
-}
-
-fn notification_status_filters(app: &PohunekApp) -> Element<'static, Message> {
-    let statuses = [
-        NotificationStatus::Unread,
-        NotificationStatus::Read,
-        NotificationStatus::Acknowledged,
-        NotificationStatus::Archived,
-    ];
-    let mut row = row![
-        text("Status").size(13).style(muted_style),
-        notification_chip(
-            "all",
-            notification_count_with(app, |filter| filter.status = None),
-            app.notification_filter.status.is_none(),
-            Message::FilterNotificationStatus(None),
+/// The scope segmented control, plus (when 2+ hosts have notifications) the
+/// host `pick_list` that replaces the old per-axis filter-chip rows.
+fn inbox_controls(app: &PohunekApp) -> Element<'_, Message> {
+    let mut controls = row![
+        inbox_scope_button(
+            "Needs action",
+            NotificationScope::NeedsAction,
+            app.inbox_scope
         ),
+        inbox_scope_button("All", NotificationScope::All, app.inbox_scope),
+        inbox_scope_button("Archived", NotificationScope::Archived, app.inbox_scope),
     ]
     .spacing(6)
     .align_y(Center);
-    for status in statuses {
-        let active = app.notification_filter.status == Some(status);
-        row = row.push(notification_chip(
-            notification_status_label(status),
-            notification_count_with(app, |filter| filter.status = Some(status)),
-            active,
-            Message::FilterNotificationStatus((!active).then_some(status)),
-        ));
+    if let Some(picker) = inbox_host_picker(app) {
+        controls = controls
+            .push(iced::widget::space().width(Fill))
+            .push(picker);
     }
-    row.into()
+    controls.into()
 }
 
-fn notification_severity_filters(app: &PohunekApp) -> Element<'static, Message> {
-    let severities = [
-        NotificationSeverity::ActionRequired,
-        NotificationSeverity::Error,
-        NotificationSeverity::Warning,
-        NotificationSeverity::Info,
-        NotificationSeverity::Success,
-    ];
-    let mut row = row![
-        text("Severity").size(13).style(muted_style),
-        notification_chip(
-            "all",
-            notification_count_with(app, |filter| filter.severity = None),
-            app.notification_filter.severity.is_none(),
-            Message::FilterNotificationSeverity(None),
-        ),
-    ]
-    .spacing(6)
-    .align_y(Center);
-    for severity in severities {
-        let active = app.notification_filter.severity == Some(severity);
-        row = row.push(notification_chip(
-            notification_severity_label(severity),
-            notification_count_with(app, |filter| filter.severity = Some(severity)),
-            active,
-            Message::FilterNotificationSeverity((!active).then_some(severity)),
-        ));
-    }
-    row.into()
-}
-
-fn notification_kind_filters(app: &PohunekApp) -> Element<'static, Message> {
-    let kinds = [
-        NotificationKind::AgentBlocked,
-        NotificationKind::ApprovalRequired,
-        NotificationKind::Error,
-        NotificationKind::TurnCompleted,
-        NotificationKind::SessionFinished,
-        NotificationKind::System,
-    ];
-    let mut row = row![
-        text("Kind").size(13).style(muted_style),
-        notification_chip(
-            "all",
-            notification_count_with(app, |filter| filter.kind = None),
-            app.notification_filter.kind.is_none(),
-            Message::FilterNotificationKind(None),
-        ),
-    ]
-    .spacing(6)
-    .align_y(Center);
-    for kind in kinds {
-        let active = app.notification_filter.kind == Some(kind);
-        row = row.push(notification_chip(
-            notification_kind_label(kind),
-            notification_count_with(app, |filter| filter.kind = Some(kind)),
-            active,
-            Message::FilterNotificationKind((!active).then_some(kind)),
-        ));
-    }
-    row.into()
-}
-
-fn notification_provider_filters(app: &PohunekApp) -> Element<'static, Message> {
-    let providers = notification_providers(app);
-    let mut row = row![
-        text("Provider").size(13).style(muted_style),
-        notification_chip(
-            "all",
-            notification_count_with(app, |filter| filter.provider = None),
-            app.notification_filter.provider.is_none(),
-            Message::FilterNotificationProvider(None),
-        ),
-    ]
-    .spacing(6)
-    .align_y(Center);
-    for provider in providers {
-        let active = app.notification_filter.provider.as_ref() == Some(&provider);
-        row = row.push(notification_chip(
-            provider.clone(),
-            notification_count_with(app, |filter| filter.provider = Some(provider.clone())),
-            active,
-            Message::FilterNotificationProvider((!active).then_some(provider)),
-        ));
-    }
-    row.into()
-}
-
-fn notification_host_filters(app: &PohunekApp) -> Element<'static, Message> {
-    let mut row = row![
-        text("Host").size(13).style(muted_style),
-        notification_chip(
-            "all",
-            notification_count_with(app, |filter| filter.host_id = None),
-            app.notification_filter.host_id.is_none(),
-            Message::FilterNotificationHost(None),
-        ),
-    ]
-    .spacing(6)
-    .align_y(Center);
-    for host_id in app.workspace.hosts.keys() {
-        let active = app.notification_filter.host_id.as_ref() == Some(host_id);
-        row = row.push(notification_chip(
-            host_id.to_string(),
-            notification_count_with(app, |filter| filter.host_id = Some(host_id.clone())),
-            active,
-            Message::FilterNotificationHost((!active).then(|| host_id.clone())),
-        ));
-    }
-    row.into()
-}
-
-fn notification_chip(
-    label: impl Into<String>,
-    count: usize,
-    active: bool,
-    message: Message,
+fn inbox_scope_button(
+    label: &'static str,
+    scope: NotificationScope,
+    active: NotificationScope,
 ) -> Element<'static, Message> {
-    let chip = button(text(format!("{} {count}", label.into())).size(13)).on_press(message);
-    if active {
+    let chip = button(text(label).size(13)).on_press(Message::SetInboxScope(scope));
+    if scope == active {
         chip.style(iced::widget::button::primary).into()
     } else {
         chip.style(iced::widget::button::text).into()
     }
 }
 
-fn notification_count_with(
-    app: &PohunekApp,
-    update: impl FnOnce(&mut NotificationFilter),
-) -> usize {
-    let mut filter = app.notification_filter.clone();
-    update(&mut filter);
-    app.workspace.notifications(&filter).len()
-}
-
-fn notification_providers(app: &PohunekApp) -> Vec<String> {
-    let mut providers = BTreeSet::new();
-    for host in app.workspace.hosts.values() {
-        for record in host.notifications.values() {
-            providers.insert(record.source.provider.clone());
-        }
+/// Host filter picker; hidden entirely below two hosts, since a single-host
+/// workspace has nothing to narrow.
+fn inbox_host_picker(app: &PohunekApp) -> Option<Element<'_, Message>> {
+    let hosts_with_notifications: Vec<HostId> = app
+        .workspace
+        .hosts
+        .iter()
+        .filter(|(_, host)| !host.notifications.is_empty())
+        .map(|(host_id, _)| host_id.clone())
+        .collect();
+    if hosts_with_notifications.len() < 2 {
+        return None;
     }
-    providers.into_iter().collect()
+    let mut options = vec![INBOX_ALL_HOSTS_LABEL.to_owned()];
+    options.extend(hosts_with_notifications.iter().map(HostId::to_string));
+    let selected = app
+        .notification_filter
+        .host_id
+        .as_ref()
+        .map_or_else(|| INBOX_ALL_HOSTS_LABEL.to_owned(), HostId::to_string);
+    Some(
+        pick_list(options, Some(selected), |value| {
+            Message::FilterNotificationHost(
+                (value != INBOX_ALL_HOSTS_LABEL).then(|| HostId::new(value)),
+            )
+        })
+        .into(),
+    )
 }
 
+fn inbox_empty_label(scope: NotificationScope) -> &'static str {
+    match scope {
+        NotificationScope::NeedsAction => "All clear.",
+        NotificationScope::All => "No notifications",
+        NotificationScope::Archived => "No archived notifications",
+    }
+}
+
+/// One inbox row: severity dot (+ an `action` pill for agent-blocked/approval
+/// prompts) and title on the first line, age right-aligned; host, linked
+/// session, and kind on a muted second line. Clicking opens the message layer.
 fn notification_row(
     app: &PohunekApp,
     host_id: HostId,
     record: NotificationRecord,
 ) -> Element<'static, Message> {
-    let selected = matches!(
-        app.ui_state.selection.as_ref(),
-        Some(Selection::Notification { host_id: h, notification_id })
-            if h == &host_id && notification_id == &record.id
+    let unread = record.status == NotificationStatus::Unread;
+    let needs_action = matches!(
+        record.kind,
+        NotificationKind::AgentBlocked | NotificationKind::ApprovalRequired
     );
-    let notification_id = record.id.clone();
+    let session_label = record
+        .session_id
+        .as_ref()
+        .map(|session_id| session_display_label(app, &host_id, session_id));
+
     let mut meta = String::new();
-    push_meta(&mut meta, notification_status_label(record.status));
-    push_meta(&mut meta, notification_severity_label(record.severity));
     push_meta(&mut meta, &host_id.to_string());
-    push_meta(
-        &mut meta,
-        record
-            .session_id
-            .as_ref()
-            .map_or("no session", |session_id| session_id.0.as_str()),
-    );
+    push_meta(&mut meta, session_label.as_deref().unwrap_or("no session"));
+    push_meta(&mut meta, notification_kind_label(record.kind));
+
+    let mut title = text(record.title)
+        .size(14)
+        .wrapping(iced::widget::text::Wrapping::WordOrGlyph);
+    if unread {
+        title = title.font(iced::Font {
+            weight: iced::font::Weight::Bold,
+            ..iced::Font::DEFAULT
+        });
+    }
+
+    let mut title_row = row![notification_dot(record.severity)]
+        .spacing(6)
+        .align_y(Center);
+    if needs_action {
+        title_row = title_row.push(status_pill("action", PillTone::Danger));
+    }
+    title_row = title_row
+        .push(title)
+        .push(iced::widget::space().width(Fill))
+        .push(
+            text(notification_age_label(&record.created_at))
+                .size(11)
+                .style(muted_style),
+        );
+
+    let notification_id = record.id.clone();
+    list_button(
+        column![title_row, text(meta).size(11).style(muted_style)].spacing(2),
+        Message::SelectNotification {
+            host_id,
+            notification_id,
+        },
+        false,
+    )
+}
+
+/// Layer 2: back/title/severity header, meta line, scrollable body, primary
+/// actions, and a collapsible `> Details` expander.
+fn inbox_message_content<'a>(
+    app: &'a PohunekApp,
+    host_id: &'a HostId,
+    notification_id: &'a NotificationId,
+) -> Element<'a, Message> {
+    let Some(record) = app.workspace.notification(host_id, notification_id) else {
+        // The record vanished from under the operator (e.g. deleted from
+        // another client); fall back to the list instead of a dead end.
+        return inbox_list_content(app);
+    };
+    let header = row![
+        button("‹ Back")
+            .on_press(Message::InboxBack)
+            .style(iced::widget::button::text),
+        text(record.title.as_str())
+            .size(18)
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+        notification_severity_pill(record.severity),
+        iced::widget::space().width(Fill),
+        button("Close")
+            .on_press(Message::CloseModal)
+            .style(iced::widget::button::secondary),
+    ]
+    .spacing(10)
+    .align_y(Center);
+
+    let session_label = record
+        .session_id
+        .as_ref()
+        .map(|session_id| session_display_label(app, host_id, session_id));
+    let mut meta = String::new();
+    push_meta(&mut meta, &host_id.to_string());
+    push_meta(&mut meta, session_label.as_deref().unwrap_or("no session"));
     push_meta(&mut meta, notification_kind_label(record.kind));
     push_meta(&mut meta, &notification_age_label(&record.created_at));
-    row![
-        notification_dot(record.severity),
-        list_button(
-            column![
-                text(record.title)
-                    .size(14)
-                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
-                text(meta).size(11).style(muted_style),
-            ]
-            .spacing(1),
-            Message::SelectNotification {
-                host_id,
-                notification_id,
-            },
-            selected,
-        ),
-    ]
-    .spacing(6)
-    .align_y(Center)
-    .into()
-}
 
-pub(crate) fn notification_pane(app: &PohunekApp) -> Element<'_, Message> {
-    let Some((host_id, record)) = selected_notification(app) else {
-        return card(column![
-            section_title("Notification"),
-            text("Notification not found").size(13)
-        ]);
-    };
-    let mut detail = column![
-        section_title("Notification"),
-        text(record.title.as_str())
-            .size(16)
-            .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
-        text(record.body.as_str())
-            .size(14)
-            .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
-        notification_summary(record, host_id),
-        notification_actions(host_id, record),
+    let body = container(
+        scrollable(
+            text(record.body.as_str())
+                .size(14)
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+        )
+        .width(Fill),
+    )
+    .height(220);
+
+    let mut content = column![
+        header,
+        text(meta).size(12).style(muted_style),
+        body,
+        inbox_message_actions(app, host_id, record),
+        inbox_details_toggle(app),
     ]
-    .spacing(8);
-    if let Some(link) = notification_link_action(app, host_id, record) {
-        detail = detail.push(link);
+    .spacing(10);
+    if app.inbox_details_expanded {
+        content = content.push(notification_details(host_id, record));
     }
-    detail = detail.push(notification_metadata(record));
-    card(detail)
+    inbox_dialog(app, content)
 }
 
-fn notification_summary<'a>(
-    record: &'a NotificationRecord,
+/// Primary `[Open session]` action plus lifecycle buttons; there is no
+/// separate "Mark read" button since opening a message marks it read.
+fn inbox_message_actions<'a>(
+    app: &'a PohunekApp,
     host_id: &'a HostId,
+    record: &'a NotificationRecord,
 ) -> Element<'a, Message> {
-    let mut rows = column![text("Summary").size(15)].spacing(4);
-    rows = rows
-        .push(text(format!("host: {host_id}")).size(13))
-        .push(
-            text(format!(
-                "status: {}",
-                notification_status_label(record.status)
-            ))
-            .size(13),
-        )
-        .push(
-            text(format!(
-                "severity: {}",
-                notification_severity_label(record.severity)
-            ))
-            .size(13),
-        )
-        .push(text(format!("kind: {}", notification_kind_label(record.kind))).size(13))
-        .push(text(format!("created: {}", record.created_at)).size(13))
-        .push(
-            text(format!(
-                "age: {}",
-                notification_age_label(&record.created_at)
-            ))
-            .size(13),
-        )
-        .push(
-            text(format!(
-                "source: {} / {} / {}",
-                record.source.provider,
-                record.source.provider_event,
-                record.source.host_local_source_id
-            ))
-            .size(13),
-        );
-    if let Some(session_id) = &record.session_id {
-        rows = rows.push(text(format!("session: {}", session_id.0)).size(13));
-    }
-    if let Some(agent_kind) = record.agent_kind {
-        rows = rows.push(text(format!("agent: {}", agent_kind_label(agent_kind))).size(13));
-    }
-    if let Some(project_id) = &record.project_id {
-        rows = rows.push(text(format!("project: {project_id}")).size(13));
-    }
-    rows.into()
-}
-
-fn notification_actions(
-    host_id: &HostId,
-    record: &NotificationRecord,
-) -> Element<'static, Message> {
     let mut actions = row![].spacing(8);
-    if record.status == NotificationStatus::Unread {
-        actions = actions.push(notification_action_button(
-            "Mark read",
-            host_id,
-            &record.id,
-            NotificationAction::Read,
-            iced::widget::button::secondary,
-        ));
+    if let Some(link) = notification_link_action(app, host_id, record) {
+        actions = actions.push(link);
     }
     if record.status != NotificationStatus::Acknowledged {
         actions = actions.push(notification_action_button(
@@ -437,30 +349,8 @@ fn notification_action_button(
         .into()
 }
 
-fn notification_metadata(record: &NotificationRecord) -> Element<'_, Message> {
-    let mut metadata = column![text("Metadata").size(15)].spacing(4);
-    if record.metadata.is_empty()
-        && record.source_id.is_none()
-        && record.dedupe_key.is_none()
-        && record.superseded_by.is_none()
-    {
-        return metadata.push(text("No metadata").size(13)).into();
-    }
-    for (key, value) in &record.metadata {
-        metadata = metadata.push(text(format!("{key}: {value}")).size(13));
-    }
-    if let Some(source_id) = &record.source_id {
-        metadata = metadata.push(text(format!("source_id: {source_id}")).size(13));
-    }
-    if let Some(dedupe_key) = &record.dedupe_key {
-        metadata = metadata.push(text(format!("dedupe_key: {dedupe_key}")).size(13));
-    }
-    if let Some(superseded_by) = &record.superseded_by {
-        metadata = metadata.push(text(format!("superseded_by: {}", superseded_by.0)).size(13));
-    }
-    metadata.into()
-}
-
+/// `[Open session]`, gated on the linked session still being live; renders
+/// explanatory text instead of a dead button when it is not.
 fn notification_link_action<'a>(
     app: &'a PohunekApp,
     host_id: &'a HostId,
@@ -473,7 +363,7 @@ fn notification_link_action<'a>(
         .get(host_id)
         .is_some_and(|host| host.sessions.contains_key(&session_id.0));
     let content: Element<'a, Message> = if live {
-        button("Open linked session")
+        button("Open session")
             .on_press(Message::OpenNotificationLink {
                 host_id: host_id.clone(),
                 notification_id: record.id.clone(),
@@ -489,17 +379,88 @@ fn notification_link_action<'a>(
     Some(content)
 }
 
-fn selected_notification(app: &PohunekApp) -> Option<(&HostId, &NotificationRecord)> {
-    let Some(Selection::Notification {
-        host_id,
-        notification_id,
-    }) = app.ui_state.selection.as_ref()
-    else {
-        return None;
+/// The message layer's collapsible `> Details`: source triplet, created
+/// timestamp, linked project/agent, safe metadata, and dedupe/source ids.
+fn notification_details<'a>(
+    host_id: &'a HostId,
+    record: &'a NotificationRecord,
+) -> Element<'a, Message> {
+    let mut rows = column![
+        text(format!(
+            "status: {}",
+            notification_status_label(record.status)
+        ))
+        .size(12),
+        text(format!("host: {host_id}")).size(12),
+        text(format!(
+            "source: {} / {} / {}",
+            record.source.provider,
+            record.source.provider_event,
+            record.source.host_local_source_id
+        ))
+        .size(12),
+        text(format!("created: {}", record.created_at)).size(12),
+    ]
+    .spacing(4);
+    if let Some(project_id) = &record.project_id {
+        rows = rows.push(text(format!("project: {project_id}")).size(12));
+    }
+    if let Some(agent_kind) = record.agent_kind {
+        rows = rows.push(text(format!("agent: {}", agent_kind_label(agent_kind))).size(12));
+    }
+    for (key, value) in &record.metadata {
+        rows = rows.push(text(format!("{key}: {value}")).size(12));
+    }
+    if let Some(source_id) = &record.source_id {
+        rows = rows.push(text(format!("source_id: {source_id}")).size(12));
+    }
+    if let Some(dedupe_key) = &record.dedupe_key {
+        rows = rows.push(text(format!("dedupe_key: {dedupe_key}")).size(12));
+    }
+    if let Some(superseded_by) = &record.superseded_by {
+        rows = rows.push(text(format!("superseded_by: {}", superseded_by.0)).size(12));
+    }
+    card(rows)
+}
+
+fn inbox_details_toggle(app: &PohunekApp) -> Element<'_, Message> {
+    let label = if app.inbox_details_expanded {
+        "v Details"
+    } else {
+        "> Details"
     };
+    button(text(label).size(13))
+        .on_press(Message::ToggleInboxDetails)
+        .style(iced::widget::button::text)
+        .into()
+}
+
+/// Session display label for row/detail meta lines: the session's name when
+/// set, else its id.
+fn session_display_label(app: &PohunekApp, host_id: &HostId, session_id: &SessionId) -> String {
     app.workspace
-        .notification(host_id, notification_id)
-        .map(|record| (host_id, record))
+        .hosts
+        .get(host_id)
+        .and_then(|host| host.sessions.get(&session_id.0))
+        .and_then(|session| session.name.clone())
+        .unwrap_or_else(|| session_id.0.clone())
+}
+
+/// A fixed-width, height-capped dialog body for the inbox modal, wider than
+/// the standard `dialog_card` and scrolling internally past
+/// [`INBOX_MODAL_HEIGHT_RATIO`] of the window height.
+fn inbox_dialog<'a>(
+    app: &'a PohunekApp,
+    body: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let max_height =
+        window_dimension_to_f32(app.ui_state.window_size.height) * INBOX_MODAL_HEIGHT_RATIO;
+    container(scrollable(body).width(Fill))
+        .padding(20)
+        .width(INBOX_MODAL_WIDTH)
+        .max_height(max_height)
+        .style(iced::widget::container::rounded_box)
+        .into()
 }
 
 fn notification_status_label(status: NotificationStatus) -> &'static str {
@@ -548,6 +509,16 @@ fn notification_dot(severity: NotificationSeverity) -> Element<'static, Message>
             color: Some(notification_color(theme, severity)),
         })
         .into()
+}
+
+fn notification_severity_pill(severity: NotificationSeverity) -> Element<'static, Message> {
+    let tone = match severity {
+        NotificationSeverity::ActionRequired | NotificationSeverity::Error => PillTone::Danger,
+        NotificationSeverity::Warning => PillTone::Warning,
+        NotificationSeverity::Success => PillTone::Success,
+        NotificationSeverity::Info => PillTone::Neutral,
+    };
+    status_pill(notification_severity_label(severity), tone)
 }
 
 fn notification_color(theme: &Theme, severity: NotificationSeverity) -> iced::Color {

@@ -21,7 +21,7 @@ use iced::widget::text_editor;
 use iced::{window, Subscription, Task, Theme};
 use pohunek_gui_core::{
     default_state_dir, providers, AttachTemplateValues, HostConfig, HostId, NotificationFilter,
-    UiState, Workspace,
+    NotificationScope, UiState, Workspace,
 };
 use protocol::{AgentActivity, SessionId};
 use thiserror::Error;
@@ -30,7 +30,8 @@ use attach::window_dimension_to_f32;
 use command::{discover_hosts_task, update};
 use config::AppConfig;
 use message::{
-    AssistantForm, Message, MetadataEdit, ModalView, ProjectEdit, StartForm, TemplateRecipe,
+    AssistantForm, InboxView, Message, MetadataEdit, ModalView, ProjectEdit, StartForm,
+    TemplateRecipe,
 };
 use view::view;
 
@@ -172,10 +173,14 @@ struct PohunekApp {
     modal: ModalView,
     /// Active activity filter for the agents monitor; `None` shows all agents.
     activity_filter: Option<AgentActivity>,
-    /// Active inbox filters; `None` fields do not constrain the notification list.
+    /// Active inbox host filter; `None` fields do not constrain the notification list.
     notification_filter: NotificationFilter,
-    /// Whether the detail pane is showing the inbox list instead of start work.
-    inbox_open: bool,
+    /// `Needs action | All | Archived` scope picked in the inbox modal.
+    inbox_scope: NotificationScope,
+    /// Which layer of the inbox modal is showing.
+    inbox_view: InboxView,
+    /// Whether the inbox message layer's `> Details` section is expanded.
+    inbox_details_expanded: bool,
     metadata_edit: MetadataEdit,
     /// Edit buffer for renaming the selected session's display name.
     rename_edit: String,
@@ -218,7 +223,9 @@ impl PohunekApp {
                 modal: ModalView::None,
                 activity_filter: None,
                 notification_filter: NotificationFilter::default(),
-                inbox_open: false,
+                inbox_scope: NotificationScope::default(),
+                inbox_view: InboxView::default(),
+                inbox_details_expanded: false,
                 metadata_edit: MetadataEdit::default(),
                 rename_edit: String::new(),
                 project_edit: ProjectEdit::default(),
@@ -378,7 +385,9 @@ mod tests {
             modal: ModalView::None,
             activity_filter: None,
             notification_filter: NotificationFilter::default(),
-            inbox_open: false,
+            inbox_scope: NotificationScope::default(),
+            inbox_view: InboxView::default(),
+            inbox_details_expanded: false,
             metadata_edit: MetadataEdit::default(),
             rename_edit: String::new(),
             project_edit: ProjectEdit::default(),
@@ -453,7 +462,9 @@ mod tests {
             modal: ModalView::None,
             activity_filter: None,
             notification_filter: NotificationFilter::default(),
-            inbox_open: false,
+            inbox_scope: NotificationScope::default(),
+            inbox_view: InboxView::default(),
+            inbox_details_expanded: false,
             metadata_edit: MetadataEdit::default(),
             rename_edit: String::new(),
             project_edit: ProjectEdit {
@@ -557,7 +568,9 @@ mod tests {
             modal: ModalView::None,
             activity_filter: None,
             notification_filter: NotificationFilter::default(),
-            inbox_open: false,
+            inbox_scope: NotificationScope::default(),
+            inbox_view: InboxView::default(),
+            inbox_details_expanded: false,
             metadata_edit: MetadataEdit::default(),
             rename_edit: String::new(),
             project_edit: ProjectEdit::default(),

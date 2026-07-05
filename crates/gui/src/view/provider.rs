@@ -340,7 +340,7 @@ fn review_label(decision: &providers::github::ReviewDecision) -> &str {
 
 /// Semantic background tone for a status pill.
 #[derive(Debug, Clone, Copy)]
-enum PillTone {
+pub(crate) enum PillTone {
     Success,
     Danger,
     Warning,
@@ -348,7 +348,7 @@ enum PillTone {
 }
 
 /// A small rounded status pill backed by a themed semantic color.
-fn status_pill(label: impl Into<String>, tone: PillTone) -> Element<'static, Message> {
+pub(crate) fn status_pill(label: impl Into<String>, tone: PillTone) -> Element<'static, Message> {
     let label = label.into();
     container(text(label).size(11))
         .padding([1, 6])

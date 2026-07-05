@@ -64,8 +64,8 @@ pub use sdk::{
 pub use state::{
     AgentMonitor, AgentRow, AgentStateEvent, ConnState, GitHubProviderScope, GitHubProviderState,
     GitHubPullRequestStatusKey, HostEvent, HostView, LinearProviderState, NotificationFilter,
-    NotificationIntent, NotificationRow, PromptState, ProviderOperation, ProviderPanel,
-    ProviderRequestId, ProviderState, Toast, Workspace,
+    NotificationIntent, NotificationRow, NotificationScope, PromptState, ProviderOperation,
+    ProviderPanel, ProviderRequestId, ProviderState, Toast, Workspace,
 };
 #[doc(inline)]
 pub use ui_state::{

@@ -6,7 +6,6 @@ use pohunek_gui_core::{HostId, Selection};
 
 use crate::message::Message;
 use crate::selection::project_is_selected;
-use crate::view::inbox::{inbox_pane, notification_pane};
 use crate::view::modals::toast_view;
 use crate::view::project::project_pane;
 use crate::view::session::session_pane;
@@ -19,13 +18,13 @@ use super::{card, list_button, section_title};
 /// instead of stacking every form unconditionally. Sessions show a session
 /// card; projects show the project plus its start/provider/action surfaces;
 /// hosts show project management; nothing selected shows a start-work landing.
+/// Notifications have no selection route: the inbox modal (`ModalView::Inbox`)
+/// is their only surface.
 pub(crate) fn detail_view(app: &PohunekApp) -> Element<'_, Message> {
     let body = match app.ui_state.selection.as_ref() {
         Some(Selection::Session { .. }) => session_pane(app),
         Some(Selection::Project { .. }) => project_pane(app),
         Some(Selection::Host { host_id }) => host_pane(app, host_id),
-        Some(Selection::Notification { .. }) => notification_pane(app),
-        None if app.inbox_open => inbox_pane(app),
         None => start_work_pane(app),
     };
     let mut detail = column![body].spacing(12);

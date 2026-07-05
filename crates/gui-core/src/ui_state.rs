@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use protocol::{NotificationId, SessionId};
+use protocol::SessionId;
 
 use crate::{
     HostId, DEFAULT_AGENTS_PANE_HEIGHT, DEFAULT_LEFT_PANE_WIDTH, DEFAULT_WINDOW_HEIGHT,
@@ -27,10 +27,6 @@ pub enum Selection {
     Session {
         host_id: HostId,
         session_id: SessionId,
-    },
-    Notification {
-        host_id: HostId,
-        notification_id: NotificationId,
     },
 }
 

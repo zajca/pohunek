@@ -69,10 +69,11 @@ elapses, is committed and broadcast. This is distinct from
 `attention_dedupe_window_secs`, which merges duplicate reports of the same
 attention moment across producers rather than delaying when it surfaces.
 
-The GUI opens the notification detail when a notification is selected. If the
-record links to a session still known on the same host, the detail offers a
-separate Open linked session action; if the linked session is gone, the detail
-remains available so the record is not a dead end.
+The GUI's Inbox modal opens a notification's message detail when it is
+selected from the list, auto-marking it read. If the record links to a session
+still known on the same host, the detail offers a primary Open session action
+that closes the modal and selects that session; if the linked session is gone,
+explanatory text replaces the button so the record is not a dead end.
 
 Every session has an immutable launch identity: `agent` is the selected profile
 name and `agent_base` is the base kind (`shell`, `codex`, or `claude`). A shell

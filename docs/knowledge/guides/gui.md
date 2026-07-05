@@ -176,19 +176,30 @@ subscription stream keeps the Inbox current with `notification_created`,
 does not support notifications may still connect; notification seeding is
 non-fatal for the GUI.
 
-The Inbox shows one unread total across hosts and can filter by host, lifecycle
-status, severity, notification kind, and provider. Rows are ordered by
-`created_at` descending and then notification id, not by lifecycle status, so
-marking a record read or acknowledged does not move rows under the cursor.
-Deleted records are removed from the Inbox when the daemon reports deleted
-status or a delete event.
+The Inbox is a modal, not a pane: the left-rail Inbox button and each host's
+`inbox N` tree row open it over the workspace rather than replacing the detail
+pane. It has two layers — a notification list, and one message's detail —
+and the Back button (or closing the modal) always returns to the list.
 
-Selecting a notification opens the notification detail pane. When the record has
-a `session_id` and that session is still present on the same host, the detail
-view offers a separate Open linked session action; if the linked session is gone,
-the detail remains available so the record is not a dead end. Detail actions
-call `notification.update` to mark read, acknowledge, or archive, and
-`notification.delete` to delete.
+The list layer narrows by two controls instead of five filter axes: a
+`Needs action | All | Archived` scope (`Needs action`, the default, is unread
+OR severity `action_required`/`error`, excluding anything archived) and a host
+picker shown only when 2+ hosts have notifications. Rows are sorted for
+triage — unresolved agent-blocked/approval-required records pinned first,
+then unread by recency, then read — not by raw `created_at`, so marking a
+record read or acknowledged does not reshuffle rows under the cursor. Deleted
+records are removed from the Inbox when the daemon reports deleted status or a
+delete event; if the record currently open in the message layer is deleted,
+the modal steps back to the list instead of showing a dead end.
+
+Opening a message auto-marks it read (there is no separate "Mark read"
+action) and shows its body, metadata, and actions. When the record has a
+`session_id` and that session is still present on the same host, the message
+layer offers a primary Open session action that closes the modal and selects
+the session; if the linked session is gone, explanatory text replaces the
+button so the record is never a dead end. Remaining actions call
+`notification.update` to acknowledge or archive, and `notification.delete` to
+delete.
 
 Fresh durable notifications are the single source for desktop OS notification
 intents. The GUI raises an OS notification only for newly created records whose

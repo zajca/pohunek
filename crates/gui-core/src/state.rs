@@ -250,6 +250,62 @@ pub struct NotificationRow {
     pub record: NotificationRecord,
 }
 
+/// Coarse inbox modal scope, replacing the five per-axis filter-chip rows.
+///
+/// Unlike [`NotificationFilter`] (an AND of independent axes), `NeedsAction`
+/// is an OR over status and severity, so it is modeled as its own selector
+/// rather than as another `NotificationFilter` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NotificationScope {
+    /// Unread notifications, plus read ones severe enough to still demand
+    /// attention (`ActionRequired`/`Error`). The inbox modal's default view.
+    #[default]
+    NeedsAction,
+    /// Every non-deleted notification, regardless of lifecycle status.
+    All,
+    /// Only archived notifications.
+    Archived,
+}
+
+impl NotificationScope {
+    /// Whether `record` is visible under this scope.
+    #[must_use]
+    pub fn matches(self, record: &NotificationRecord) -> bool {
+        match self {
+            Self::NeedsAction => notification_needs_action(record),
+            Self::All => true,
+            Self::Archived => record.status == NotificationStatus::Archived,
+        }
+    }
+}
+
+/// Whether `record` belongs in the inbox modal's default "Needs action" scope.
+///
+/// True for anything still unread, or anything severe enough
+/// (`ActionRequired`/`Error`) to keep demanding attention even once read.
+/// Archiving a record always drops it out of scope, since the operator has
+/// already dealt with it.
+#[must_use]
+fn notification_needs_action(record: &NotificationRecord) -> bool {
+    record.status != NotificationStatus::Archived
+        && (record.status == NotificationStatus::Unread || notification_raises_intent(record))
+}
+
+/// Sort tier for the inbox modal: unresolved agent/approval prompts pinned to
+/// the top, then unread, then read; recency breaks ties within a tier.
+fn inbox_row_tier(record: &NotificationRecord) -> u8 {
+    if matches!(
+        record.kind,
+        NotificationKind::AgentBlocked | NotificationKind::ApprovalRequired
+    ) {
+        0
+    } else if record.status == NotificationStatus::Unread {
+        1
+    } else {
+        2
+    }
+}
+
 /// GUI-facing state for one daemon host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostView {
@@ -942,32 +998,36 @@ impl Workspace {
         });
     }
 
-    /// Select a notification, following its linked session when that session is
+    /// Selects the session linked to a notification, when that session is
     /// still live.
     ///
-    /// A notification bound to a session the host still knows selects that
-    /// session so the operator lands on the live work. When the session no
-    /// longer exists (or the notification is not session-bound), notification
-    /// detail opens instead so the record is never a dead end.
-    pub fn select_notification(&mut self, host_id: HostId, notification_id: NotificationId) {
-        self.invalidate_github_provider_requests(&host_id);
-        let linked_session = self.hosts.get(&host_id).and_then(|host| {
+    /// Returns `true` and updates [`Workspace::selection`] when a live linked
+    /// session was found; returns `false` and leaves the selection untouched
+    /// otherwise. The inbox modal is the only route to notification detail, so
+    /// there is no selection-based fallback to fall back to here — callers
+    /// (the modal's "Open session" action) only invoke this once the session
+    /// is known live from the same [`HostView`] data.
+    pub fn select_notification_session(
+        &mut self,
+        host_id: &HostId,
+        notification_id: &NotificationId,
+    ) -> bool {
+        let linked_session = self.hosts.get(host_id).and_then(|host| {
             let record = host.notifications.get(&notification_id.0)?;
             let session_id = record.session_id.as_ref()?;
             host.sessions
                 .contains_key(&session_id.0)
                 .then(|| session_id.clone())
         });
-        self.selection = Some(match linked_session {
-            Some(session_id) => Selection::Session {
-                host_id,
-                session_id,
-            },
-            None => Selection::Notification {
-                host_id,
-                notification_id,
-            },
+        let Some(session_id) = linked_session else {
+            return false;
+        };
+        self.invalidate_github_provider_requests(host_id);
+        self.selection = Some(Selection::Session {
+            host_id: host_id.clone(),
+            session_id,
         });
+        true
     }
 
     /// Total unread notifications across all hosts.
@@ -1017,6 +1077,31 @@ impl Workspace {
         rows
     }
 
+    /// Notification rows for the inbox modal: `scope` narrows by
+    /// lifecycle/severity, `filter` narrows by host as with
+    /// [`Workspace::notifications`], and rows are sorted for triage —
+    /// unresolved agent/approval prompts first, then unread by recency, then
+    /// read.
+    #[must_use]
+    pub fn inbox_rows(
+        &self,
+        scope: NotificationScope,
+        filter: &NotificationFilter,
+    ) -> Vec<NotificationRow> {
+        let mut rows: Vec<NotificationRow> = self
+            .notifications(filter)
+            .into_iter()
+            .filter(|row| scope.matches(&row.record))
+            .collect();
+        rows.sort_by(|left, right| {
+            inbox_row_tier(&left.record)
+                .cmp(&inbox_row_tier(&right.record))
+                .then_with(|| right.record.created_at.cmp(&left.record.created_at))
+                .then_with(|| left.record.id.0.cmp(&right.record.id.0))
+        });
+        rows
+    }
+
     /// Look up one notification record by host and id.
     #[must_use]
     pub fn notification(
@@ -1025,19 +1110,6 @@ impl Workspace {
         id: &NotificationId,
     ) -> Option<&NotificationRecord> {
         self.hosts.get(host_id)?.notifications.get(&id.0)
-    }
-
-    /// The currently selected notification record, when a notification is
-    /// selected and still present.
-    #[must_use]
-    pub fn selected_notification(&self) -> Option<&NotificationRecord> {
-        match self.selection.as_ref()? {
-            Selection::Notification {
-                host_id,
-                notification_id,
-            } => self.notification(host_id, notification_id),
-            _ => None,
-        }
     }
 
     /// Build the agents monitor model from current host state.
@@ -2231,6 +2303,121 @@ mod tests {
     }
 
     #[test]
+    fn needs_action_scope_excludes_archived_and_untroubled_read_records() {
+        let mut workspace = Workspace::default();
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot("local", vec![]),
+        });
+        let unread = notification_record(
+            "n-unread",
+            NotificationStatus::Unread,
+            NotificationSeverity::Info,
+        );
+        let mut read_error = notification_record(
+            "n-read-error",
+            NotificationStatus::Read,
+            NotificationSeverity::Error,
+        );
+        read_error.kind = NotificationKind::System;
+        let mut archived_error = notification_record(
+            "n-archived-error",
+            NotificationStatus::Archived,
+            NotificationSeverity::Error,
+        );
+        archived_error.kind = NotificationKind::System;
+        let mut read_info = notification_record(
+            "n-read-info",
+            NotificationStatus::Read,
+            NotificationSeverity::Info,
+        );
+        read_info.kind = NotificationKind::System;
+        for record in [unread, read_error, archived_error, read_info] {
+            workspace.apply(notification_created("local", record));
+        }
+
+        let rows = workspace.inbox_rows(
+            NotificationScope::NeedsAction,
+            &NotificationFilter::default(),
+        );
+        let ids: Vec<&str> = rows.iter().map(|row| row.record.id.0.as_str()).collect();
+
+        assert!(ids.contains(&"n-unread"));
+        assert!(ids.contains(&"n-read-error"));
+        assert!(!ids.contains(&"n-archived-error"));
+        assert!(!ids.contains(&"n-read-info"));
+    }
+
+    #[test]
+    fn inbox_rows_pin_action_kinds_above_unread_above_read() {
+        let mut workspace = Workspace::default();
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot("local", vec![]),
+        });
+        let mut blocked_but_read = notification_record(
+            "n-blocked",
+            NotificationStatus::Read,
+            NotificationSeverity::Info,
+        );
+        blocked_but_read.kind = NotificationKind::AgentBlocked;
+        let mut unread_system = notification_record(
+            "n-unread",
+            NotificationStatus::Unread,
+            NotificationSeverity::Info,
+        );
+        unread_system.kind = NotificationKind::System;
+        let mut read_system = notification_record(
+            "n-read",
+            NotificationStatus::Read,
+            NotificationSeverity::Info,
+        );
+        read_system.kind = NotificationKind::System;
+        for record in [read_system, unread_system, blocked_but_read] {
+            workspace.apply(notification_created("local", record));
+        }
+
+        let rows = workspace.inbox_rows(NotificationScope::All, &NotificationFilter::default());
+        let ids: Vec<&str> = rows.iter().map(|row| row.record.id.0.as_str()).collect();
+
+        assert_eq!(ids, vec!["n-blocked", "n-unread", "n-read"]);
+    }
+
+    #[test]
+    fn inbox_rows_apply_host_filter() {
+        let mut workspace = Workspace::default();
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot("host-a", vec![]),
+        });
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot("host-b", vec![]),
+        });
+        workspace.apply(notification_created(
+            "host-a",
+            notification_record(
+                "n-a",
+                NotificationStatus::Unread,
+                NotificationSeverity::Info,
+            ),
+        ));
+        workspace.apply(notification_created(
+            "host-b",
+            notification_record(
+                "n-b",
+                NotificationStatus::Unread,
+                NotificationSeverity::Info,
+            ),
+        ));
+
+        let filter = NotificationFilter {
+            host_id: Some(HostId::new("host-a")),
+            ..NotificationFilter::default()
+        };
+        let rows = workspace.inbox_rows(NotificationScope::All, &filter);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record.id.0, "n-a");
+    }
+
+    #[test]
     fn selecting_linked_notification_selects_existing_session() {
         let mut workspace = Workspace::default();
         let mut record = notification_record(
@@ -2247,8 +2434,10 @@ mod tests {
             ),
         });
 
-        workspace.select_notification(HostId::new("local"), NotificationId("n-1".to_owned()));
+        let selected = workspace
+            .select_notification_session(&HostId::new("local"), &NotificationId("n-1".to_owned()));
 
+        assert!(selected);
         assert_eq!(
             workspace.selection,
             Some(Selection::Session {
@@ -2259,7 +2448,7 @@ mod tests {
     }
 
     #[test]
-    fn selecting_notification_without_live_session_opens_notification_detail() {
+    fn selecting_notification_without_live_session_leaves_selection_untouched() {
         let mut workspace = Workspace::default();
         let mut record = notification_record(
             "n-1",
@@ -2271,16 +2460,11 @@ mod tests {
             snapshot: snapshot_with_notifications("local", vec![], vec![record]),
         });
 
-        workspace.select_notification(HostId::new("local"), NotificationId("n-1".to_owned()));
+        let selected = workspace
+            .select_notification_session(&HostId::new("local"), &NotificationId("n-1".to_owned()));
 
-        assert_eq!(
-            workspace.selection,
-            Some(Selection::Notification {
-                host_id: HostId::new("local"),
-                notification_id: NotificationId("n-1".to_owned()),
-            })
-        );
-        assert!(workspace.selected_notification().is_some());
+        assert!(!selected);
+        assert_eq!(workspace.selection, None);
     }
 
     #[test]

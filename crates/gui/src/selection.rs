@@ -52,8 +52,7 @@ pub(crate) fn selected_host_id(app: &PohunekApp) -> Result<HostId, String> {
         Some(
             Selection::Host { host_id }
             | Selection::Project { host_id, .. }
-            | Selection::Session { host_id, .. }
-            | Selection::Notification { host_id, .. },
+            | Selection::Session { host_id, .. },
         ) => Some(host_id.clone()),
         None => app.hosts.first().map(|host| host.id.clone()),
     }

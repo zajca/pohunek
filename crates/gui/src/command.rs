@@ -15,9 +15,8 @@ use pohunek_gui_core::{
     rename_project_with_options, rename_session_with_options, resolve_project_action_with_options,
     resume_session_with_options, set_session_metadata_with_options, show_project_with_options,
     stop_session_with_options, update_notification_with_options, ConnectionOptions, HostConfig,
-    HostId, Message as CoreMessage, NotificationFilter, ProviderLaunchItem, ProviderLaunchParams,
-    ProviderOperation, ProviderPanel, ProviderRequestId, Selection, SessionLinkProvider,
-    WindowSize,
+    HostId, Message as CoreMessage, ProviderLaunchItem, ProviderLaunchParams, ProviderOperation,
+    ProviderPanel, ProviderRequestId, Selection, SessionLinkProvider, WindowSize,
 };
 use protocol::{
     NotificationDeleteParams, NotificationId, NotificationStatus, NotificationUpdateParams,
@@ -29,7 +28,7 @@ use protocol::{
 use crate::attach::{attach_task, spawn_notification, window_dimension_to_u32};
 use crate::config::AppConfig;
 use crate::message::{
-    AgentChoice, AssistantForm, DiscoveryResult, Message, ModalView, NotificationAction,
+    AgentChoice, AssistantForm, DiscoveryResult, InboxView, Message, ModalView, NotificationAction,
     ResolvedTemplate, StartForm, TemplateRecipe, ASSISTANT_AUTO_AGENT_LABEL, BLANK_TEMPLATE_LABEL,
 };
 use crate::runtime;
@@ -73,70 +72,65 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         }
         Message::FilterActivity(activity) => app.activity_filter = activity,
         Message::OpenInbox => {
-            app.inbox_open = true;
+            app.modal = ModalView::Inbox;
+            app.inbox_view = InboxView::List;
             app.notification_filter.host_id = None;
-            app.workspace.selection = None;
-            app.ui_state.selection = None;
-            app.last_session_click = None;
-            tasks.push(save_ui_state_task(app));
         }
         Message::OpenHostInbox(host_id) => {
-            app.inbox_open = true;
+            app.modal = ModalView::Inbox;
+            app.inbox_view = InboxView::List;
             app.notification_filter.host_id = Some(host_id);
-            app.workspace.selection = None;
-            app.ui_state.selection = None;
-            app.last_session_click = None;
-            tasks.push(save_ui_state_task(app));
         }
-        Message::FilterNotificationStatus(status) => {
-            app.inbox_open = true;
-            app.notification_filter.status = status;
-        }
-        Message::FilterNotificationSeverity(severity) => {
-            app.inbox_open = true;
-            app.notification_filter.severity = severity;
-        }
-        Message::FilterNotificationKind(kind) => {
-            app.inbox_open = true;
-            app.notification_filter.kind = kind;
-        }
-        Message::FilterNotificationProvider(provider) => {
-            app.inbox_open = true;
-            app.notification_filter.provider = provider;
-        }
-        Message::FilterNotificationHost(host_id) => {
-            app.inbox_open = true;
-            app.notification_filter.host_id = host_id;
-        }
-        Message::ClearNotificationFilters => {
-            app.inbox_open = true;
-            app.notification_filter = NotificationFilter::default();
-        }
+        Message::SetInboxScope(scope) => app.inbox_scope = scope,
+        Message::FilterNotificationHost(host_id) => app.notification_filter.host_id = host_id,
         Message::SelectNotification {
             host_id,
             notification_id,
         } => {
-            app.inbox_open = true;
-            app.workspace
-                .select_notification(host_id.clone(), notification_id.clone());
-            app.workspace.selection = Some(Selection::Notification {
-                host_id: host_id.clone(),
-                notification_id: notification_id.clone(),
-            });
-            app.ui_state.selection = app.workspace.selection.clone();
-            app.last_session_click = None;
-            tasks.push(save_ui_state_task(app));
+            app.inbox_details_expanded = false;
+            // Auto-mark-read on open: there is no separate "Mark read" action.
+            let unread = app
+                .workspace
+                .notification(&host_id, &notification_id)
+                .is_some_and(|record| record.status == NotificationStatus::Unread);
+            if unread {
+                match notification_action_task(
+                    app,
+                    host_id.clone(),
+                    notification_id.clone(),
+                    NotificationAction::Read,
+                ) {
+                    Ok(task) => tasks.push(task),
+                    Err(err) => app.status = Some(err),
+                }
+            }
+            app.inbox_view = InboxView::Message {
+                host_id,
+                notification_id,
+            };
+        }
+        Message::InboxBack => app.inbox_view = InboxView::List,
+        Message::ToggleInboxDetails => {
+            app.inbox_details_expanded = !app.inbox_details_expanded;
         }
         Message::OpenNotificationLink {
             host_id,
             notification_id,
         } => {
-            app.workspace.select_notification(host_id, notification_id);
-            app.ui_state.selection = app.workspace.selection.clone();
-            app.inbox_open = false;
-            sync_rename_edit_for_selection(app);
+            if app
+                .workspace
+                .select_notification_session(&host_id, &notification_id)
+            {
+                app.ui_state.selection = app.workspace.selection.clone();
+                app.modal = ModalView::None;
+                app.inbox_view = InboxView::List;
+                // TODO(B2): force Detail tab
+                sync_rename_edit_for_selection(app);
+                tasks.push(save_ui_state_task(app));
+            } else {
+                app.status = Some("linked session is no longer live".to_owned());
+            }
             app.last_session_click = None;
-            tasks.push(save_ui_state_task(app));
         }
         Message::ActOnNotification {
             host_id,
@@ -150,7 +144,6 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             host_id,
             session_id,
         } => {
-            app.inbox_open = false;
             // A second click on the already-clicked session within the window is
             // a double-click: select as usual, then open it in a terminal.
             let now = Instant::now();
@@ -193,7 +186,6 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             host_id,
             project_id,
         } => {
-            app.inbox_open = false;
             app.workspace
                 .select_project(host_id.clone(), project_id.clone());
             app.ui_state.selection = app.workspace.selection.clone();
@@ -568,15 +560,15 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                     }
                 }
                 if let Some((host_id, notification_id)) = deleted_notification {
-                    if app.ui_state.selection
-                        == Some(Selection::Notification {
+                    // The deleted record's message layer is now a dead end;
+                    // step back to the list instead of leaving it stranded.
+                    if app.inbox_view
+                        == (InboxView::Message {
                             host_id,
                             notification_id,
                         })
                     {
-                        app.workspace.selection = None;
-                        app.ui_state.selection = None;
-                        app.inbox_open = true;
+                        app.inbox_view = InboxView::List;
                     }
                 }
                 if let Some((host_id, session_id)) = opened_session {

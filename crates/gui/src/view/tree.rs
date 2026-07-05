@@ -8,7 +8,7 @@ use iced::{Center, Element, Fill, Theme};
 use pohunek_gui_core::{ConnState, HostId, TreeNodeId};
 use protocol::{AgentActivity, ProjectInfo, SessionInfo};
 
-use crate::message::Message;
+use crate::message::{Message, ModalView};
 use crate::selection::{project_is_selected, session_is_selected};
 use crate::view::provider::linked_pr_status_label;
 use crate::PohunekApp;
@@ -26,7 +26,7 @@ pub(crate) fn inbox_entry_button(app: &PohunekApp) -> Element<'_, Message> {
         .width(Fill)
         .padding([8, 10])
         .on_press(Message::OpenInbox);
-    if app.inbox_open {
+    if app.modal == ModalView::Inbox {
         button.style(iced::widget::button::primary).into()
     } else {
         button.style(iced::widget::button::secondary).into()

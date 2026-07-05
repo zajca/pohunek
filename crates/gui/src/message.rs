@@ -5,11 +5,10 @@ use std::path::PathBuf;
 use iced::widget::text_editor;
 use iced::Size;
 use pohunek_gui_core::assistant::Intent as AssistantIntent;
-use pohunek_gui_core::{HostConfig, HostId, Message as CoreMessage, ProviderPanel, TreeNodeId};
-use protocol::{
-    AgentActivity, NotificationId, NotificationKind, NotificationSeverity, NotificationStatus,
-    SessionId,
+use pohunek_gui_core::{
+    HostConfig, HostId, Message as CoreMessage, NotificationScope, ProviderPanel, TreeNodeId,
 };
+use protocol::{AgentActivity, NotificationId, SessionId};
 
 // Sentinel option in the Start template picker meaning "no template, blank session".
 pub(crate) const BLANK_TEMPLATE_LABEL: &str = "— blank —";
@@ -27,6 +26,21 @@ pub(crate) enum ModalView {
     Assistant,
     /// The selected provider item (PR/issue) detail and launch dialog.
     ProviderItem,
+    /// The inbox: notification list, or one message's detail.
+    Inbox,
+}
+
+/// Which layer of the inbox modal is showing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum InboxView {
+    /// The notification list, optionally scoped and host-filtered.
+    #[default]
+    List,
+    /// One notification's detail, auto-marked read on entry.
+    Message {
+        host_id: HostId,
+        notification_id: NotificationId,
+    },
 }
 
 /// Launch recipe resolved from a selected template (a `None`-provider action).
@@ -172,16 +186,18 @@ pub(crate) enum Message {
     FilterActivity(Option<AgentActivity>),
     OpenInbox,
     OpenHostInbox(HostId),
-    FilterNotificationStatus(Option<NotificationStatus>),
-    FilterNotificationSeverity(Option<NotificationSeverity>),
-    FilterNotificationKind(Option<NotificationKind>),
-    FilterNotificationProvider(Option<String>),
+    /// Pick the inbox modal's `Needs action | All | Archived` scope.
+    SetInboxScope(NotificationScope),
     FilterNotificationHost(Option<HostId>),
-    ClearNotificationFilters,
+    /// Open a notification's message-detail layer; auto-marks it read.
     SelectNotification {
         host_id: HostId,
         notification_id: NotificationId,
     },
+    /// Step the inbox modal's message-detail layer back to the list.
+    InboxBack,
+    /// Expand or collapse the message-detail layer's `> Details` section.
+    ToggleInboxDetails,
     OpenNotificationLink {
         host_id: HostId,
         notification_id: NotificationId,
