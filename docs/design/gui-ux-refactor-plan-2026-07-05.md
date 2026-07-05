@@ -1,5 +1,10 @@
 # GUI code + UX refactor plan (2026-07-05)
 
+> **Status (2026-07-05):** A1, A2, B1, B2, B3, B3a, B4, and G1 all landed on
+> `main` and shipped in **v0.18.0**. The remaining work is tracked in the
+> "Remaining work" section at the end of this document (B5 list-navigation plus a
+> new **keyboard-configurability** track requested by the operator).
+
 Combines the architecture-review GUI refactors (G1 message split, G2 module
 decomposition) with a UX redesign. UX spec authored by a UX pass (Fable 5),
 grounded in `docs/design/track-d-ui-brief.md` and the current
@@ -208,3 +213,90 @@ keys behind the focus guard.
 
 Prereq: gui-review H1 (splitting view fns out of the 5.7k main.rs) should land
 before/with phase 2 — the tab refactor touches every `*_pane`.
+
+---
+
+## Remaining work (planned 2026-07-05, after v0.18.0)
+
+Everything above shipped in v0.18.0. What is left is one deferred UX piece (B5)
+and a new **keyboard-configurability** track the operator asked for. Design goal:
+the keyboard layer becomes *data-driven* — a keymap the operator can override in
+`gui.toml` — instead of the hardcoded key→Message match that B4 shipped.
+
+### Track K — configurable keyboard controls (new)
+
+Today `crates/gui/src/keyboard.rs::route_key_press` hardcodes the bindings in a
+`match` over physical keys. Make it a lookup over a configurable keymap.
+
+**K1 — keymap refactor (behavior-preserving).**
+- Introduce a `KeyAction` enum naming every semantic action the router can fire,
+  each tagged with the context it applies in (`Global` vs `Modal`): `TabDetail`,
+  `TabLinear`, `TabGitHub`, `TabWorktrees`, `OpenInbox`, `CycleBlocked`,
+  `OpenSelectedSession`, `NewSession`, `OpenAssistant`, `RefreshTab`, `ModalBack`,
+  `ModalPrimary`, `ModalPrimaryWithTerminal` (Shift+Enter). Reserve
+  `ListUp`/`ListDown`/`FocusSearch` for B5.
+- `KeyChord { key: iced::keyboard::Key, mods: Modifiers }` + `KeyMap` = ordered
+  `(KeyChord, KeyAction)` set. A `KeyMap::default()` encodes exactly the current
+  B4 bindings (so K1 changes nothing observable).
+- `route_key_press` becomes: resolve context (modal/focus gate unchanged) → look
+  up the chord in the keymap → map `KeyAction` to the existing `Message`(s) via a
+  small pure `action_to_messages(app, action)`. Keep the "typed input captures its
+  own keys" focus model — the keymap only ever sees un-consumed keys.
+- Unit-test: default keymap round-trips the B4 table; `action_to_messages` matches
+  the pre-refactor behavior for every action.
+
+**K2 — `gui.toml` overrides + validation.**
+- New optional `[keybindings]` table mapping action name → key string, e.g.
+  `open_inbox = "i"`, `tab_linear = "2"`, `refresh = "r"`,
+  `modal_primary_with_terminal = "shift+enter"`, `cycle_blocked = "b"`.
+- A key-string parser: `"i"`, `"1"`, `"escape"`, `"enter"`, `"shift+enter"`,
+  `"ctrl+r"`, … → `KeyChord`. Fail-fast (typed `ConfigError`, per the repo's
+  no-silent-defaults rule) on an unknown action name or an unparseable key.
+- **Partial override**: only listed actions are remapped; unlisted actions keep
+  their documented default. Document this in the key table.
+- **Conflict detection at load**: two chords bound to different actions *in the
+  same context* is a fail-fast `ConfigError` (a global `i` shadowing another
+  global action), so a broken keymap never silently eats input. Modal vs global
+  may reuse a chord (contexts don't overlap).
+- Wire the loaded keymap onto `PohunekApp` (built from `AppConfig`, following the
+  existing `notification_command`/`open_url_command` config precedent). Fall back
+  to `KeyMap::default()` when the table is absent.
+- Tests: parse table, override-merge, unknown-action rejection, bad-key rejection,
+  same-context conflict rejection, modal/global reuse allowed.
+- Docs: rewrite the `docs/knowledge/guides/gui.md` Keyboard Shortcuts section to
+  document the default table AND the `[keybindings]` override syntax + rules.
+
+**K3 — in-app cheat-sheet (optional, nice-to-have).**
+- A `?` binding opens a modal listing the *effective* keymap (action + chord),
+  grouped by context. Makes a customized keymap discoverable. Skip if it competes
+  for time; the docs cover the need.
+
+### Track B5 — list navigation (deferred from B4)
+
+- A per-list highlight cursor for the inbox list and the Linear/GitHub provider
+  lists (new selection-index state on those view regions, with wrap-around).
+- Bind `ListUp`/`ListDown` (`k`/`j` + arrows) to move the cursor and `Enter`/`o`
+  to activate the highlighted row (inbox: open message / open session; provider:
+  open item modal). `/` = `FocusSearch` focuses the active provider search input
+  (`iced::widget::text_input::focus` with a known input id).
+- These actions flow through the Track-K keymap, so they are configurable from
+  day one. Do K1 first (or alongside) so B5's keys are not a second hardcoded set.
+- Replaces the current `TODO(B5)` no-ops in `view/inbox.rs::inbox_enter` and
+  `keyboard.rs`.
+
+### Suggested order
+
+1. **K1** keymap refactor (unblocks configurable everything; behavior-preserving).
+2. **B5** list navigation (adds its actions into the keymap).
+3. **K2** `gui.toml` overrides + validation + docs + tests.
+4. **K3** cheat-sheet overlay (optional).
+
+### Smaller follow-ups (opportunistic, not blocking)
+
+- **gui-review H2** — confirm/close the "dual source of truth for selection"
+  (`ui_state.selection` vs `workspace.selection`); the A1/A2/B1 work reshaped this
+  area, so re-verify whether one owner now holds it and remove any remaining
+  hand-sync.
+- **Diff review (UI brief §3.9, v1.1)** — files→hunks→lines, inline comments, and
+  "dispatch review as a new session." A large future feature, out of this track's
+  scope; noted so it stays on the roadmap.
