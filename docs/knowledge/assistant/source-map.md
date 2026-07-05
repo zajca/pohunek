@@ -63,7 +63,7 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/assistant.rs`
 - `crates/daemon/src/main.rs`
 - `crates/daemon/src/lib.rs`
-- `crates/daemon/src/api/handler.rs`
+- `crates/daemon/src/api/handler/mod.rs`
 - `crates/daemon/src/session/mod.rs`
 - `crates/daemon/src/session/hooks.rs`
 - `crates/daemon/src/session/detector.rs`
