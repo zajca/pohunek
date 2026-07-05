@@ -1211,7 +1211,7 @@ mod tests {
                 false,
                 Some("session-123"),
                 Some(&missing_tmpdir),
-                false,
+                true,
             );
 
             assert!(
