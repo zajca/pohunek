@@ -50,18 +50,15 @@ Acceptance criteria:
 - Preserve existing session behavior with targeted unit tests for lifecycle,
   attach, subscription, and resume-binding paths.
 
-`api/handler.rs` also still mixes unrelated method families. Typed protocol
-methods make a cleaner split possible, but the handler has not yet been divided
-by domain.
-
-Acceptance criteria:
-
-- Split daemon request handling into domain modules such as daemon/health,
-  host, session, project, integration, assistant, and worktree.
-- Keep shared request parsing, response construction, and error mapping in common
-  helpers.
-- Migrate tests to assert behavior at the domain boundary instead of relying on
-  one very large handler module.
+The `api/handler.rs` domain split is **done** (D5): the former 1 620-line file is
+now `api/handler/` — a router `mod.rs` (transport glue + `dispatch_line`/
+`handle_request`) plus per-domain modules `daemon`, `host`, `session`, `project`,
+`worktree`, `notification`, `assistant`, and `integration`, with the shared
+parse/serialize/blocking helpers in `handler/util.rs`. Pure code motion: no wire
+or behavior change, all existing dispatch tests preserved. The follow-up here is
+now only to route future handlers through the typed protocol method layer as
+callsites migrate (see "Protocol And SDK Callsite Migration"), not the split
+itself.
 
 Remaining large methods and localized lint suppressions should be revisited only
 after these decompositions. The goal is to remove real complexity, not to shuffle
@@ -166,8 +163,10 @@ Acceptance criteria:
 
 1. Finish the GUI message split before extracting more GUI modules.
 2. Decompose `SessionRegistryInner` around concrete state ownership.
-3. Split daemon API handler domains using the typed protocol method layer.
-4. Migrate remaining SDK callsites from raw requests to typed methods.
+3. ~~Split daemon API handler domains~~ **done** — see the handler decomposition
+   note above; typed-method routing tracked under step 4.
+4. Migrate remaining SDK callsites from raw requests to typed methods (and route
+   the daemon handler modules through the typed method layer as this lands).
 5. Apply naming/module cleanup where it falls out of the structural work.
 6. Add targeted xtask and documentation-invariant tests when those files change.
 
