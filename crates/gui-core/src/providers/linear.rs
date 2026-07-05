@@ -3,7 +3,7 @@
 //! The client keeps secrets outside persistent state by reading the configured
 //! token reference through [`TokenSource`] immediately before each GraphQL call.
 
-// Rust guideline compliant 2026-06-26
+// Rust guideline compliant 2026-07-05
 
 use std::future::Future;
 use std::pin::Pin;
@@ -28,10 +28,21 @@ query PohunekIssues($first: Int!, $filter: IssueFilter) {
       description
       branchName
       url
+      state {
+        name
+        type
+      }
+      assignee {
+        displayName
+        name
+      }
+      updatedAt
     }
   }
 }
 ";
+/// Assignee fields queried in priority order to resolve a display name.
+const ISSUE_ASSIGNEE_NAME_FIELDS: &[&str] = &["displayName", "name"];
 /// Primary Linear issue branch field emitted by Linear and prompt JSON.
 pub const ISSUE_PRIMARY_BRANCH_FIELD: &str = "branchName";
 /// Branch fields accepted for Linear issue prompt contexts.
@@ -92,6 +103,14 @@ pub struct LinearIssue {
     pub branch: String,
     /// Browser URL for the issue.
     pub url: String,
+    /// Workflow state display name, `None` if Linear omitted `state.name`.
+    pub state: Option<String>,
+    /// Workflow state category, `None` if Linear omitted `state.type`.
+    pub state_type: Option<String>,
+    /// Assignee display name, `None` when the issue is unassigned.
+    pub assignee: Option<String>,
+    /// ISO-8601 timestamp of the issue's last update, if Linear returned one.
+    pub updated_at: Option<String>,
 }
 
 impl LinearIssue {
@@ -540,6 +559,10 @@ fn issue_from_value(index: usize, value: &Value) -> Result<LinearIssue, LinearEr
         body: optional_str(value, &["description", "body"]),
         branch: required_any_str(index, value, ISSUE_BRANCH_FIELDS)?,
         url: required_str(index, value, "url")?,
+        state: optional_nested_str(value, "state", "name"),
+        state_type: optional_nested_str(value, "state", "type"),
+        assignee: optional_nested_any_str(value, "assignee", ISSUE_ASSIGNEE_NAME_FIELDS),
+        updated_at: optional_field_str(value, "updatedAt"),
     })
 }
 
@@ -602,6 +625,35 @@ fn optional_str(value: &Value, fields: &[&str]) -> String {
                 .map(ToOwned::to_owned)
         })
         .unwrap_or_default()
+}
+
+fn optional_field_str(value: &Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn optional_nested_str(value: &Value, parent: &str, field: &str) -> Option<String> {
+    value
+        .get(parent)?
+        .get(field)?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
+fn optional_nested_any_str(
+    value: &Value,
+    parent: &str,
+    fields: &'static [&'static str],
+) -> Option<String> {
+    let parent_value = value.get(parent)?;
+    fields.iter().find_map(|field| {
+        parent_value
+            .get(*field)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    })
 }
 
 fn joined_field_name(fields: &'static [&'static str]) -> &'static str {

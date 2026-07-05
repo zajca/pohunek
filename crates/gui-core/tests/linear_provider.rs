@@ -1,6 +1,6 @@
 //! Linear provider client tests.
 
-// Rust guideline compliant 2026-06-26
+// Rust guideline compliant 2026-07-05
 #![forbid(unsafe_code)]
 
 use std::net::Ipv4Addr;
@@ -147,7 +147,16 @@ fn issues_response() -> Value {
                         "title": "Fix launcher",
                         "description": "Issue body",
                         "branchName": "lin-123-fix-launcher",
-                        "url": "https://linear.example/LIN-123"
+                        "url": "https://linear.example/LIN-123",
+                        "state": {
+                            "name": "In Progress",
+                            "type": "started"
+                        },
+                        "assignee": {
+                            "displayName": "Ada Lovelace",
+                            "name": "ada"
+                        },
+                        "updatedAt": "2026-07-04T12:34:56.000Z"
                     }
                 ]
             }
@@ -254,6 +263,13 @@ async fn list_issues_reads_token_at_call_time_and_builds_query() {
     assert_eq!(issue.body, "Issue body");
     assert_eq!(issue.branch, "lin-123-fix-launcher");
     assert_eq!(issue.url, "https://linear.example/LIN-123");
+    assert_eq!(issue.state.as_deref(), Some("In Progress"));
+    assert_eq!(issue.state_type.as_deref(), Some("started"));
+    assert_eq!(issue.assignee.as_deref(), Some("Ada Lovelace"));
+    assert_eq!(
+        issue.updated_at.as_deref(),
+        Some("2026-07-04T12:34:56.000Z")
+    );
     assert_eq!(issue.prompt_item_id(), "LIN-123");
     assert_eq!(
         issue.to_prompt_json(),
@@ -293,6 +309,10 @@ async fn list_issues_reads_token_at_call_time_and_builds_query() {
     assert!(query.contains("description"));
     assert!(query.contains("branchName"));
     assert!(query.contains("url"));
+    assert!(query.contains("state"));
+    assert!(query.contains("assignee"));
+    assert!(query.contains("displayName"));
+    assert!(query.contains("updatedAt"));
     assert!(query.contains("IssueFilter"));
 
     assert_eq!(request["variables"]["first"], 25);
@@ -545,6 +565,44 @@ async fn invalid_response_shape_is_typed() {
         LinearError::InvalidResponse { path }
             if path == "data.issues.nodes"
     ));
+}
+
+#[tokio::test]
+async fn absent_state_assignee_and_updated_at_are_none() {
+    let transport = FakeTransport::new(json!({
+        "data": {
+            "issues": {
+                "nodes": [
+                    {
+                        "id": "opaque-linear-id",
+                        "identifier": "LIN-124",
+                        "title": "Unassigned issue",
+                        "description": "Issue body",
+                        "branchName": "lin-124-unassigned",
+                        "url": "https://linear.example/LIN-124",
+                        "assignee": null
+                    }
+                ]
+            }
+        }
+    }));
+    let client = LinearClient::new(
+        config(TOKEN_KEY),
+        FakeTokenSource::new(SECRET_TOKEN),
+        transport,
+    );
+
+    let issues = client
+        .list_issues(LinearQuery::default())
+        .await
+        .expect("issues without state, assignee, or updatedAt");
+
+    assert_eq!(issues.len(), 1);
+    let issue = &issues[0];
+    assert_eq!(issue.state, None);
+    assert_eq!(issue.state_type, None);
+    assert_eq!(issue.assignee, None);
+    assert_eq!(issue.updated_at, None);
 }
 
 #[tokio::test]

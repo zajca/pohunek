@@ -1604,6 +1604,10 @@ mod tests {
                 body: "Issue body".to_owned(),
                 branch: "lin-123-fix-launcher".to_owned(),
                 url: "https://linear.test/LIN-123".to_owned(),
+                state: None,
+                state_type: None,
+                assignee: None,
+                updated_at: None,
             }],
         });
         workspace.apply(Message::LinearProviderIssueSelected {
@@ -1681,6 +1685,10 @@ mod tests {
                 body: String::new(),
                 branch: "lin-123".to_owned(),
                 url: "https://linear.test/LIN-123".to_owned(),
+                state: None,
+                state_type: None,
+                assignee: None,
+                updated_at: None,
             }],
         });
 
