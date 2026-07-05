@@ -17,16 +17,16 @@ use protocol::{
 
 use crate::connection::connect_client;
 use crate::{
-    preview_action_prompt, ConnectionOptions, CoreError, HealthSummary, HostConfig, HostId,
-    HostSnapshot, Message, PromptLaunchParams, ProviderLaunchParams, GUI_NOTIFICATION_SEED_LIMIT,
+    preview_action_prompt, ConnectionOptions, CoreError, DomainEvent, HealthSummary, HostConfig,
+    HostId, HostSnapshot, PromptLaunchParams, ProviderLaunchParams, GUI_NOTIFICATION_SEED_LIMIT,
     METHOD_NOT_FOUND_CODE,
 };
 
 /// Load one host snapshot with `daemon.health` and `session.list`.
-pub async fn load_host(config: HostConfig) -> Message {
+pub async fn load_host(config: HostConfig) -> DomainEvent {
     match load_host_snapshot(&config).await {
-        Ok(snapshot) => Message::HostSnapshotLoaded { snapshot },
-        Err(err) => Message::HostDisconnected {
+        Ok(snapshot) => DomainEvent::HostSnapshotLoaded { snapshot },
+        Err(err) => DomainEvent::HostDisconnected {
             host_id: config.id,
             error: err.to_string(),
         },

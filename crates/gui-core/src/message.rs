@@ -1,4 +1,4 @@
-//! The [`Message`] enum emitted by async host workers and applied to the workspace.
+//! The [`DomainEvent`] enum emitted by async host/provider I/O and reduced by the workspace.
 
 use std::path::PathBuf;
 
@@ -12,12 +12,21 @@ use protocol::{
 use crate::providers;
 use crate::{
     GitHubProviderScope, GitHubPullRequestStatusKey, HostEvent, HostId, HostSnapshot,
-    PromptPreview, ProviderOperation, ProviderPanel, ProviderRequestId, SessionLinkProvider,
+    PromptPreview, ProviderOperation, ProviderRequestId, SessionLinkProvider,
 };
 
-/// Message emitted by async host workers and applied to [`Workspace`].
+/// Result of async daemon/provider I/O, reduced by [`Workspace::apply`].
+///
+/// This enum holds only outcomes of off-thread work — host/session/project
+/// results and provider fetches, several guarded by a [`ProviderRequestId`]
+/// staleness check. Pure UI pokes (active panel, filter, search, selection)
+/// are not events; they are typed methods on [`Workspace`] the shell calls
+/// directly instead of routing through here.
+///
+/// [`Workspace::apply`]: crate::Workspace::apply
+/// [`Workspace`]: crate::Workspace
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Message {
+pub enum DomainEvent {
     HostConnecting {
         host_id: HostId,
     },
@@ -113,36 +122,12 @@ pub enum Message {
         host_id: HostId,
         preview: PromptPreview,
     },
-    ProviderPanelSelected {
-        host_id: HostId,
-        panel: ProviderPanel,
-    },
-    LinearProviderFilterSelected {
-        host_id: HostId,
-        name: String,
-    },
-    LinearProviderSearchChanged {
-        host_id: HostId,
-        value: String,
-    },
     LinearProviderIssuesLoaded {
         host_id: HostId,
         request_id: ProviderRequestId,
         filter_name: Option<String>,
         search: String,
         issues: Vec<providers::linear::LinearIssue>,
-    },
-    LinearProviderIssueSelected {
-        host_id: HostId,
-        issue_id: String,
-    },
-    GitHubProviderFilterSelected {
-        host_id: HostId,
-        name: String,
-    },
-    GitHubProviderSearchChanged {
-        host_id: HostId,
-        value: String,
     },
     GitHubProviderPullRequestsLoaded {
         host_id: HostId,
@@ -155,14 +140,6 @@ pub enum Message {
         request_id: ProviderRequestId,
         scope: GitHubProviderScope,
         issues: Vec<providers::github::GitHubIssue>,
-    },
-    GitHubProviderPullRequestSelected {
-        host_id: HostId,
-        number: u64,
-    },
-    GitHubProviderIssueSelected {
-        host_id: HostId,
-        number: u64,
     },
     GitHubProviderPullRequestStatusLoaded {
         host_id: HostId,

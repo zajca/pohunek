@@ -21,8 +21,8 @@ use pohunek_gui_core::{
     resolve_project_action, resolve_project_prompt, session_link_metadata, session_metadata_rows,
     set_session_metadata, show_project, spawn_attach_command, stop_session as stop_gui_session,
     workspace_connection_stream, AgentStateEvent, AttachCommandSpawner, AttachSpawnIntent,
-    AttachTemplateValues, ConnState, ConnectionOptions, HealthSummary, HostConfig, HostEvent,
-    HostId, HostSnapshot, Message, PromptContext, PromptLaunchParams, PromptPreview,
+    AttachTemplateValues, ConnState, ConnectionOptions, DomainEvent, HealthSummary, HostConfig,
+    HostEvent, HostId, HostSnapshot, PromptContext, PromptLaunchParams, PromptPreview,
     ProviderLaunchItem, ProviderLaunchParams, RightTab, Selection, SessionLinkKind,
     SessionLinkProvider, TreeNodeId, UiState, WindowSize, Workspace,
 };
@@ -66,11 +66,11 @@ async fn loopback_hosts_seed_and_stream_agent_state() {
     let mut events = Box::pin(host_subscription_stream(host_a.clone()));
     assert!(matches!(
         events.next().await.expect("connecting message"),
-        Message::HostConnecting { .. }
+        DomainEvent::HostConnecting { .. }
     ));
     assert!(matches!(
         events.next().await.expect("subscribed message"),
-        Message::HostSubscribed { .. }
+        DomainEvent::HostSubscribed { .. }
     ));
 
     let created = create_agent_session(&host_a, AgentKind::Codex, temp_dir("gui-core-cwd")).await;
@@ -306,7 +306,7 @@ async fn session_lifecycle_create_inspect_and_stop_reconciles_workspace_state() 
     )
     .await
     .expect("session.new through gui-core");
-    workspace.apply(Message::SessionCreated {
+    workspace.apply(DomainEvent::SessionCreated {
         host_id: host.id.clone(),
         session: created.session.clone(),
     });
@@ -320,7 +320,7 @@ async fn session_lifecycle_create_inspect_and_stop_reconciles_workspace_state() 
     let inspected = inspect_session(&host, &created.session.id)
         .await
         .expect("session.inspect through gui-core");
-    workspace.apply(Message::SessionInspected {
+    workspace.apply(DomainEvent::SessionInspected {
         host_id: host.id.clone(),
         session: inspected.clone(),
     });
@@ -331,7 +331,7 @@ async fn session_lifecycle_create_inspect_and_stop_reconciles_workspace_state() 
         .await
         .expect("session.stop through gui-core");
     assert!(stopped.stopped);
-    workspace.apply(Message::SessionStopCompleted {
+    workspace.apply(DomainEvent::SessionStopCompleted {
         host_id: host.id.clone(),
         session_id: created.session.id.clone(),
         result: stopped,
@@ -735,7 +735,7 @@ fn rendered_gui_prompt_matches_shared_prompt_render_for_same_context() {
 fn preview_state_updates_without_launching_session() {
     let host_id = HostId::new("preview-host");
     let mut workspace = Workspace::default();
-    workspace.apply(Message::HostSnapshotLoaded {
+    workspace.apply(DomainEvent::HostSnapshotLoaded {
         snapshot: HostSnapshot {
             host_id: host_id.clone(),
             health: HealthSummary {
@@ -755,7 +755,7 @@ fn preview_state_updates_without_launching_session() {
         branch: Some("lin-123".to_owned()),
     };
 
-    workspace.apply(Message::PromptPreviewRendered {
+    workspace.apply(DomainEvent::PromptPreviewRendered {
         host_id: host_id.clone(),
         preview: preview.clone(),
     });
@@ -1189,7 +1189,7 @@ async fn prompt_errors_surface_without_corrupting_workspace_state() {
     let existing =
         create_agent_session(&host, AgentKind::Codex, temp_dir("gui-core-m3-existing")).await;
     let mut workspace = Workspace::default();
-    workspace.apply(Message::HostSnapshotLoaded {
+    workspace.apply(DomainEvent::HostSnapshotLoaded {
         snapshot: load_host_snapshot(&host).await.expect("seed workspace"),
     });
     let before_sessions = workspace
@@ -1257,7 +1257,7 @@ async fn apply_prompt_error_cases(
     )
     .await
     .expect_err("missing prompt should fail");
-    workspace.apply(Message::HostOperationFailed {
+    workspace.apply(DomainEvent::HostOperationFailed {
         host_id: host.id.clone(),
         error: missing_prompt.to_string(),
     });
@@ -1271,7 +1271,7 @@ async fn apply_prompt_error_cases(
     )
     .await
     .expect_err("missing action should fail");
-    workspace.apply(Message::HostOperationFailed {
+    workspace.apply(DomainEvent::HostOperationFailed {
         host_id: host.id.clone(),
         error: missing_action.to_string(),
     });
@@ -1291,7 +1291,7 @@ async fn apply_prompt_error_cases(
         r#"{"identifier":"LIN-123","title":"Fix launcher","description":"Issue body","branchName":"lin-123-fix-launcher"}"#,
     )
     .expect_err("unknown variable should fail");
-    workspace.apply(Message::HostOperationFailed {
+    workspace.apply(DomainEvent::HostOperationFailed {
         host_id: host.id.clone(),
         error: render_error.to_string(),
     });
@@ -1541,7 +1541,7 @@ async fn wait_for_hosts_with_sessions<S>(
     events: &mut S,
     expected: &[(&HostConfig, &SessionId)],
 ) where
-    S: futures::Stream<Item = Message> + Unpin,
+    S: futures::Stream<Item = DomainEvent> + Unpin,
 {
     wait_for_workspace(events, workspace, |workspace| {
         expected.iter().all(|(host, session_id)| {
@@ -1556,7 +1556,7 @@ async fn wait_for_hosts_with_sessions<S>(
 
 async fn wait_for_host_connected<S>(workspace: &mut Workspace, events: &mut S, host: &HostConfig)
 where
-    S: futures::Stream<Item = Message> + Unpin,
+    S: futures::Stream<Item = DomainEvent> + Unpin,
 {
     wait_for_workspace(events, workspace, |workspace| {
         workspace
@@ -1569,7 +1569,7 @@ where
 
 async fn wait_for_host_error<S>(workspace: &mut Workspace, events: &mut S, host: &HostConfig)
 where
-    S: futures::Stream<Item = Message> + Unpin,
+    S: futures::Stream<Item = DomainEvent> + Unpin,
 {
     wait_for_workspace(events, workspace, |workspace| {
         workspace
@@ -1587,7 +1587,7 @@ async fn wait_for_session_activity<S>(
     session_id: &SessionId,
     activity: AgentActivity,
 ) where
-    S: futures::Stream<Item = Message> + Unpin,
+    S: futures::Stream<Item = DomainEvent> + Unpin,
 {
     wait_for_workspace(events, workspace, |workspace| {
         workspace
@@ -1607,7 +1607,7 @@ async fn wait_for_session_state<S>(
     session_id: &SessionId,
     state: protocol::SessionState,
 ) where
-    S: futures::Stream<Item = Message> + Unpin,
+    S: futures::Stream<Item = DomainEvent> + Unpin,
 {
     wait_for_workspace(events, workspace, |workspace| {
         workspace
@@ -1622,7 +1622,7 @@ async fn wait_for_session_state<S>(
 
 async fn wait_for_workspace<S, F>(events: &mut S, workspace: &mut Workspace, mut done: F)
 where
-    S: futures::Stream<Item = Message> + Unpin,
+    S: futures::Stream<Item = DomainEvent> + Unpin,
     F: FnMut(&Workspace) -> bool,
 {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1874,7 +1874,7 @@ async fn client(host: &HostConfig) -> Client {
 
 async fn wait_for_agent_state<S>(events: &mut S, id: &SessionId) -> AgentStateEvent
 where
-    S: futures::Stream<Item = Message> + Unpin,
+    S: futures::Stream<Item = DomainEvent> + Unpin,
 {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -1884,7 +1884,7 @@ where
             .await
             .expect("event before deadline")
             .expect("subscription message");
-        if let Message::HostEvent {
+        if let DomainEvent::HostEvent {
             event: HostEvent::AgentState(state),
             ..
         } = message

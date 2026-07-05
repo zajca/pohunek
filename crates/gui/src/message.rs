@@ -7,7 +7,7 @@ use iced::widget::text_editor;
 use iced::Size;
 use pohunek_gui_core::assistant::Intent as AssistantIntent;
 use pohunek_gui_core::{
-    HostConfig, HostId, Message as CoreMessage, NotificationScope, RightTab, TreeNodeId,
+    DomainEvent as CoreEvent, HostConfig, HostId, NotificationScope, RightTab, TreeNodeId,
 };
 use protocol::{AgentActivity, NotificationId, SessionId};
 
@@ -181,7 +181,7 @@ pub(crate) enum NotificationAction {
 
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
-    Core(CoreMessage),
+    Core(CoreEvent),
     HostsDiscovered(DiscoveryResult),
     ToggleNode(TreeNodeId),
     /// Switch the right pane's persistent tab. Only dispatched for a tab the
@@ -284,13 +284,23 @@ pub(crate) enum Message {
     SelectLinearFilter(String),
     /// Pick a GitHub pull request filter and immediately fetch.
     SelectGitHubFilter(String),
+    /// Edit the Linear provider search box.
+    LinearSearchChanged {
+        host_id: HostId,
+        value: String,
+    },
+    /// Edit the GitHub provider search box.
+    GitHubSearchChanged {
+        host_id: HostId,
+        value: String,
+    },
     FetchLinearIssues,
     FetchGitHubPullRequests,
     FetchGitHubIssues,
     FetchGitHubPullRequestStatus,
     LaunchLinearIssue,
     LaunchGitHubPullRequest,
-    CoreCommandCompleted(Result<CoreMessage, String>),
+    CoreCommandCompleted(Result<CoreEvent, String>),
     AttachSpawned(Result<(), String>),
     NotificationSent(Result<(), String>),
     UrlOpened(Result<(), String>),

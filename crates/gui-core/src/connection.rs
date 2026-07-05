@@ -14,12 +14,12 @@ use serde_json::Value;
 
 use crate::sdk::{call_client, load_host_snapshot_with_options};
 use crate::{
-    AgentStateEvent, ConnectionOptions, CoreError, HostConfig, HostEvent, HostId, HostTransport,
-    Message, DEFAULT_BACKOFF_MAX,
+    AgentStateEvent, ConnectionOptions, CoreError, DomainEvent, HostConfig, HostEvent, HostId,
+    HostTransport, DEFAULT_BACKOFF_MAX,
 };
 
 /// Build a reconnecting stream of messages for one host's event subscription.
-pub fn host_subscription_stream(config: HostConfig) -> impl futures::Stream<Item = Message> {
+pub fn host_subscription_stream(config: HostConfig) -> impl futures::Stream<Item = DomainEvent> {
     host_connection_stream(config, ConnectionOptions::default())
 }
 
@@ -27,7 +27,7 @@ pub fn host_subscription_stream(config: HostConfig) -> impl futures::Stream<Item
 pub fn workspace_connection_stream(
     hosts: Vec<HostConfig>,
     options: ConnectionOptions,
-) -> impl futures::Stream<Item = Message> {
+) -> impl futures::Stream<Item = DomainEvent> {
     stream::select_all(
         hosts
             .into_iter()
@@ -43,7 +43,7 @@ pub fn workspace_connection_stream(
 fn host_connection_stream(
     config: HostConfig,
     options: ConnectionOptions,
-) -> impl futures::Stream<Item = Message> {
+) -> impl futures::Stream<Item = DomainEvent> {
     stream::unfold(
         StreamState::Connecting {
             config,
@@ -57,7 +57,7 @@ fn host_connection_stream(
                         backoff,
                     };
                     Some((
-                        Message::HostConnecting {
+                        DomainEvent::HostConnecting {
                             host_id: config.id.clone(),
                         },
                         next,
@@ -66,7 +66,7 @@ fn host_connection_stream(
                 StreamState::Subscribing { config, backoff } => {
                     match subscribe_events(&config, options).await {
                         Ok(subscription) => Some((
-                            Message::HostSubscribed {
+                            DomainEvent::HostSubscribed {
                                 host_id: config.id.clone(),
                             },
                             StreamState::LoadingSnapshot {
@@ -75,7 +75,7 @@ fn host_connection_stream(
                             },
                         )),
                         Err(err) => Some((
-                            Message::HostUnreachable {
+                            DomainEvent::HostUnreachable {
                                 host_id: config.id.clone(),
                                 error: err.to_string(),
                             },
@@ -88,7 +88,7 @@ fn host_connection_stream(
                     subscription,
                 } => match load_host_snapshot_with_options(&config, options).await {
                     Ok(snapshot) => Some((
-                        Message::HostSnapshotLoaded { snapshot },
+                        DomainEvent::HostSnapshotLoaded { snapshot },
                         StreamState::Reading {
                             config,
                             subscription,
@@ -97,7 +97,7 @@ fn host_connection_stream(
                         },
                     )),
                     Err(err) => Some((
-                        Message::HostDisconnected {
+                        DomainEvent::HostDisconnected {
                             host_id: config.id.clone(),
                             error: err.to_string(),
                         },
@@ -119,7 +119,7 @@ fn host_connection_stream(
                                 Ok(Some(line)) => {
                                     let message = parse_event_message(&config.id, &line);
                                     Some((
-                                        message.unwrap_or_else(|err| Message::HostDisconnected {
+                                        message.unwrap_or_else(|err| DomainEvent::HostDisconnected {
                                             host_id: config.id.clone(),
                                             error: err.to_string(),
                                         }),
@@ -132,14 +132,14 @@ fn host_connection_stream(
                                     ))
                                 }
                                 Ok(None) => Some((
-                                    Message::HostDisconnected {
+                                    DomainEvent::HostDisconnected {
                                         host_id: config.id.clone(),
                                         error: "event subscription closed".to_owned(),
                                     },
                                     StreamState::Waiting { config, backoff },
                                 )),
                                 Err(err) => Some((
-                                    Message::HostDisconnected {
+                                    DomainEvent::HostDisconnected {
                                         host_id: config.id.clone(),
                                         error: err.to_string(),
                                     },
@@ -149,8 +149,8 @@ fn host_connection_stream(
                         }
                         _ = interval.tick() => {
                             let message = match load_host_snapshot_with_options(&config, options).await {
-                                Ok(snapshot) => Message::HostSnapshotLoaded { snapshot },
-                                Err(err) => Message::HostDisconnected {
+                                Ok(snapshot) => DomainEvent::HostSnapshotLoaded { snapshot },
+                                Err(err) => DomainEvent::HostDisconnected {
                                     host_id: config.id.clone(),
                                     error: err.to_string(),
                                 },
@@ -174,7 +174,7 @@ fn host_connection_stream(
                     tokio::time::sleep(backoff.current).await;
                     backoff.advance();
                     Some((
-                        Message::HostConnecting {
+                        DomainEvent::HostConnecting {
                             host_id: config.id.clone(),
                         },
                         StreamState::Subscribing { config, backoff },
@@ -270,7 +270,7 @@ pub(crate) async fn connect_client(
     }
 }
 
-pub(crate) fn parse_event_message(host_id: &HostId, line: &str) -> Result<Message, CoreError> {
+pub(crate) fn parse_event_message(host_id: &HostId, line: &str) -> Result<DomainEvent, CoreError> {
     let raw: Event = serde_json::from_str(line)?;
     let event = match raw.event.as_str() {
         event::AGENT_STATE => HostEvent::AgentState(parse_agent_state(raw)?),
@@ -289,7 +289,7 @@ pub(crate) fn parse_event_message(host_id: &HostId, line: &str) -> Result<Messag
         }
         _ => HostEvent::Other(raw),
     };
-    Ok(Message::HostEvent {
+    Ok(DomainEvent::HostEvent {
         host_id: host_id.clone(),
         event,
     })

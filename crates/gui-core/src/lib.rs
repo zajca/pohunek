@@ -43,7 +43,7 @@ pub use link::{
     ProviderLaunchParams, SessionLinkKind, SessionLinkMetadata, SessionLinkProvider,
 };
 #[doc(inline)]
-pub use message::Message;
+pub use message::DomainEvent;
 #[doc(inline)]
 pub use sdk::{
     add_project, add_project_with_options, create_session, create_session_with_options,

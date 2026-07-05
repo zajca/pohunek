@@ -9,7 +9,7 @@ use iced::widget::{button, column, container, pick_list, row, text, text_input};
 use iced::{Background, Center, Color, Element, Theme};
 use pohunek_gui_core::{
     providers, session_link_metadata, GitHubProviderScope, GitHubPullRequestStatusKey, HostId,
-    Message as CoreMessage, SessionLinkKind, SessionLinkProvider,
+    SessionLinkKind, SessionLinkProvider,
 };
 use protocol::SessionInfo;
 
@@ -91,11 +91,9 @@ pub(crate) fn linear_provider_view(
         row![
             text_input("search", &state.search).on_input({
                 let host_id = host_id.clone();
-                move |value| {
-                    Message::Core(CoreMessage::LinearProviderSearchChanged {
-                        host_id: host_id.clone(),
-                        value,
-                    })
+                move |value| Message::LinearSearchChanged {
+                    host_id: host_id.clone(),
+                    value,
                 }
             }),
             button("Fetch")
@@ -148,11 +146,9 @@ pub(crate) fn github_provider_view(
         row![
             text_input("search", &state.search).on_input({
                 let host_id = host_id.clone();
-                move |value| {
-                    Message::Core(CoreMessage::GitHubProviderSearchChanged {
-                        host_id: host_id.clone(),
-                        value,
-                    })
+                move |value| Message::GitHubSearchChanged {
+                    host_id: host_id.clone(),
+                    value,
                 }
             }),
             button("Fetch issues")

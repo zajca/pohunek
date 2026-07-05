@@ -14,9 +14,10 @@ use pohunek_gui_core::{
     providers, remove_session_with_options, remove_worktree_with_options,
     rename_project_with_options, rename_session_with_options, resolve_project_action_with_options,
     resume_session_with_options, set_session_metadata_with_options, show_project_with_options,
-    stop_session_with_options, update_notification_with_options, ConnectionOptions, HostConfig,
-    HostId, Message as CoreMessage, ProviderLaunchItem, ProviderLaunchParams, ProviderOperation,
-    ProviderPanel, ProviderRequestId, RightTab, Selection, SessionLinkProvider, WindowSize,
+    stop_session_with_options, update_notification_with_options, ConnectionOptions,
+    DomainEvent as CoreEvent, HostConfig, HostId, ProviderLaunchItem, ProviderLaunchParams,
+    ProviderOperation, ProviderPanel, ProviderRequestId, RightTab, Selection, SessionLinkProvider,
+    WindowSize,
 };
 use protocol::{
     NotificationDeleteParams, NotificationId, NotificationStatus, NotificationUpdateParams,
@@ -55,8 +56,8 @@ const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
     let mut tasks = Vec::new();
     match message {
-        Message::Core(message) => {
-            app.workspace.apply(message);
+        Message::Core(event) => {
+            app.workspace.apply(event);
             tasks.push(notification_tasks(app));
         }
         Message::HostsDiscovered(result) => {
@@ -338,34 +339,25 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                 // disambiguates Linear vs. GitHub by that field) shows the
                 // right item; the standalone Linear|GitHub toggle that used to
                 // drive it is retired in favor of the top-level tab bar.
-                app.workspace.apply(CoreMessage::ProviderPanelSelected {
-                    host_id: host_id.clone(),
-                    panel: ProviderPanel::Linear,
-                });
                 app.workspace
-                    .apply(CoreMessage::LinearProviderIssueSelected { host_id, issue_id });
+                    .set_active_panel(host_id.clone(), ProviderPanel::Linear);
+                app.workspace.select_linear_issue(host_id, issue_id);
                 app.modal = ModalView::ProviderItem;
             }
         }
         Message::OpenGitHubPullRequest(number) => {
             if let Ok(host_id) = selected_host_id(app) {
-                app.workspace.apply(CoreMessage::ProviderPanelSelected {
-                    host_id: host_id.clone(),
-                    panel: ProviderPanel::GitHub,
-                });
                 app.workspace
-                    .apply(CoreMessage::GitHubProviderPullRequestSelected { host_id, number });
+                    .set_active_panel(host_id.clone(), ProviderPanel::GitHub);
+                app.workspace.select_github_pull_request(host_id, number);
                 app.modal = ModalView::ProviderItem;
             }
         }
         Message::OpenGitHubIssue(number) => {
             if let Ok(host_id) = selected_host_id(app) {
-                app.workspace.apply(CoreMessage::ProviderPanelSelected {
-                    host_id: host_id.clone(),
-                    panel: ProviderPanel::GitHub,
-                });
                 app.workspace
-                    .apply(CoreMessage::GitHubProviderIssueSelected { host_id, number });
+                    .set_active_panel(host_id.clone(), ProviderPanel::GitHub);
+                app.workspace.select_github_issue(host_id, number);
                 app.modal = ModalView::ProviderItem;
             }
         }
@@ -427,8 +419,7 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         Message::SelectAction(name) => app.selected_action = Some(name),
         Message::SelectLinearFilter(name) => {
             if let Ok(host_id) = selected_host_id(app) {
-                app.workspace
-                    .apply(CoreMessage::LinearProviderFilterSelected { host_id, name });
+                app.workspace.select_linear_filter(host_id, name);
             }
             // Picking a filter both selects it and fetches with it in one click.
             match begin_linear_issues_request(app) {
@@ -448,8 +439,7 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         }
         Message::SelectGitHubFilter(name) => {
             if let Ok(host_id) = selected_host_id(app) {
-                app.workspace
-                    .apply(CoreMessage::GitHubProviderFilterSelected { host_id, name });
+                app.workspace.select_github_filter(host_id, name);
             }
             // Picking a filter both selects it and fetches PRs in one click.
             match begin_github_pull_requests_request(app) {
@@ -466,6 +456,12 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                 }
                 Err(err) => app.status = Some(err),
             }
+        }
+        Message::LinearSearchChanged { host_id, value } => {
+            app.workspace.set_linear_search(host_id, value);
+        }
+        Message::GitHubSearchChanged { host_id, value } => {
+            app.workspace.set_github_search(host_id, value);
         }
         Message::FetchLinearIssues => match begin_linear_issues_request(app) {
             Ok(request_id) => {
@@ -546,17 +542,17 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                 // A newly created or explicitly resumed session opens straight
                 // into a terminal, the same as double-clicking a live session.
                 let opened_session = match &message {
-                    CoreMessage::SessionCreated { host_id, session } => {
+                    CoreEvent::SessionCreated { host_id, session } => {
                         Some((host_id.clone(), session.id.clone()))
                     }
-                    CoreMessage::SessionResumed { host_id, result } => {
+                    CoreEvent::SessionResumed { host_id, result } => {
                         Some((host_id.clone(), result.session.id.clone()))
                     }
                     _ => None,
                 };
                 // A removed session is gone from the workspace, so clear a
                 // selection still pointing at it to avoid a stale detail pane.
-                let removed_session = if let CoreMessage::SessionRemoveCompleted {
+                let removed_session = if let CoreEvent::SessionRemoveCompleted {
                     host_id,
                     session_id,
                     result,
@@ -568,15 +564,12 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                 } else {
                     None
                 };
-                let deleted_notification = if let CoreMessage::NotificationDeleteCompleted {
-                    host_id,
-                    result,
-                } = &message
-                {
-                    result.deleted.then(|| (host_id.clone(), result.id.clone()))
-                } else {
-                    None
-                };
+                let deleted_notification =
+                    if let CoreEvent::NotificationDeleteCompleted { host_id, result } = &message {
+                        result.deleted.then(|| (host_id.clone(), result.id.clone()))
+                    } else {
+                        None
+                    };
                 app.workspace.apply(message);
                 if let Some((host_id, session_id)) = removed_session {
                     if app.ui_state.selection
@@ -676,7 +669,7 @@ fn push_provider_task_result(
     match result {
         Ok(task) => tasks.push(task),
         Err(error) => match selected_host_id(app) {
-            Ok(host_id) => app.workspace.apply(CoreMessage::ProviderOperationFailed {
+            Ok(host_id) => app.workspace.apply(CoreEvent::ProviderOperationFailed {
                 host_id,
                 provider,
                 operation,
@@ -805,7 +798,7 @@ fn create_session_task(app: &PohunekApp) -> Result<Task<Message>, String> {
         runtime::perform(async move {
             create_session_with_options(&host, params, options)
                 .await
-                .map(|result| CoreMessage::SessionCreated {
+                .map(|result| CoreEvent::SessionCreated {
                     host_id,
                     session: result.session,
                 })
@@ -840,7 +833,7 @@ fn launch_assistant_task(app: &PohunekApp) -> Result<Task<Message>, String> {
         runtime::perform(async move {
             assistant_core::launch_with_options(&target.host, &paths, params, options)
                 .await
-                .map(|result| CoreMessage::SessionCreated {
+                .map(|result| CoreEvent::SessionCreated {
                     host_id,
                     session: result.session,
                 })
@@ -858,7 +851,7 @@ fn inspect_selected_session_task(app: &PohunekApp) -> Result<Task<Message>, Stri
         runtime::perform(async move {
             inspect_session_with_options(&host, &session_id, options)
                 .await
-                .map(|session| CoreMessage::SessionInspected { host_id, session })
+                .map(|session| CoreEvent::SessionInspected { host_id, session })
                 .map_err(|err| err.to_string())
         }),
         Message::CoreCommandCompleted,
@@ -907,7 +900,7 @@ fn stop_selected_session_task(app: &PohunekApp) -> Result<Task<Message>, String>
         runtime::perform(async move {
             stop_session_with_options(&host, &session_id, options)
                 .await
-                .map(|result| CoreMessage::SessionStopCompleted {
+                .map(|result| CoreEvent::SessionStopCompleted {
                     host_id,
                     session_id,
                     result,
@@ -926,7 +919,7 @@ fn remove_selected_session_task(app: &PohunekApp) -> Result<Task<Message>, Strin
         runtime::perform(async move {
             remove_session_with_options(&host, &session_id, options)
                 .await
-                .map(|result| CoreMessage::SessionRemoveCompleted {
+                .map(|result| CoreEvent::SessionRemoveCompleted {
                     host_id,
                     session_id,
                     result,
@@ -988,7 +981,7 @@ fn notification_update_task(
         runtime::perform(async move {
             update_notification_with_options(&host, params, options)
                 .await
-                .map(|result| CoreMessage::NotificationUpdateCompleted { host_id, result })
+                .map(|result| CoreEvent::NotificationUpdateCompleted { host_id, result })
                 .map_err(|err| err.to_string())
         }),
         Message::CoreCommandCompleted,
@@ -1008,7 +1001,7 @@ fn notification_delete_task(
         runtime::perform(async move {
             delete_notification_with_options(&host, params, options)
                 .await
-                .map(|result| CoreMessage::NotificationDeleteCompleted { host_id, result })
+                .map(|result| CoreEvent::NotificationDeleteCompleted { host_id, result })
                 .map_err(|err| err.to_string())
         }),
         Message::CoreCommandCompleted,
@@ -1028,7 +1021,7 @@ pub(crate) fn resume_session_task(
         runtime::perform(async move {
             resume_session_with_options(&host, &session_id, options)
                 .await
-                .map(|result| CoreMessage::SessionResumed { host_id, result })
+                .map(|result| CoreEvent::SessionResumed { host_id, result })
                 .map_err(|err| err.to_string())
         }),
         Message::CoreCommandCompleted,
@@ -1058,7 +1051,7 @@ fn metadata_task(app: &PohunekApp, action: MetadataAction) -> Result<Task<Messag
         runtime::perform(async move {
             set_session_metadata_with_options(&host, params, options)
                 .await
-                .map(|result| CoreMessage::SessionMetadataUpdated { host_id, result })
+                .map(|result| CoreEvent::SessionMetadataUpdated { host_id, result })
                 .map_err(|err| err.to_string())
         }),
         Message::CoreCommandCompleted,
@@ -1081,7 +1074,7 @@ fn rename_selected_session_task(app: &PohunekApp, clear: bool) -> Result<Task<Me
         runtime::perform(async move {
             rename_session_with_options(&host, params, options)
                 .await
-                .map(|result| CoreMessage::SessionRenamed { host_id, result })
+                .map(|result| CoreEvent::SessionRenamed { host_id, result })
                 .map_err(|err| err.to_string())
         }),
         Message::CoreCommandCompleted,
@@ -1104,7 +1097,7 @@ fn add_project_task(app: &PohunekApp) -> Result<Task<Message>, String> {
         runtime::perform(async move {
             add_project_with_options(&host, params, options)
                 .await
-                .map(|project| CoreMessage::ProjectAdded { host_id, project })
+                .map(|project| CoreEvent::ProjectAdded { host_id, project })
                 .map_err(|err| err.to_string())
         }),
         Message::CoreCommandCompleted,
@@ -1122,7 +1115,7 @@ fn show_project_task(app: &PohunekApp) -> Result<Task<Message>, String> {
         runtime::perform(async move {
             show_project_with_options(&host, params, options)
                 .await
-                .map(|result| CoreMessage::ProjectShown { host_id, result })
+                .map(|result| CoreEvent::ProjectShown { host_id, result })
                 .map_err(|err| err.to_string())
         }),
         Message::CoreCommandCompleted,
@@ -1141,7 +1134,7 @@ fn rename_project_task(app: &PohunekApp) -> Result<Task<Message>, String> {
         runtime::perform(async move {
             rename_project_with_options(&host, params, options)
                 .await
-                .map(|project| CoreMessage::ProjectRenamed { host_id, project })
+                .map(|project| CoreEvent::ProjectRenamed { host_id, project })
                 .map_err(|err| err.to_string())
         }),
         Message::CoreCommandCompleted,
@@ -1160,7 +1153,7 @@ fn remove_worktree_task(app: &PohunekApp, path: PathBuf) -> Result<Task<Message>
         runtime::perform(async move {
             remove_worktree_with_options(&host, params, options)
                 .await
-                .map(|result| CoreMessage::WorktreeRemoved {
+                .map(|result| CoreEvent::WorktreeRemoved {
                     host_id,
                     project_id,
                     path,
@@ -1183,12 +1176,12 @@ fn list_project_actions_task(app: &PohunekApp) -> Result<Task<Message>, String> 
     Ok(Task::perform(
         runtime::perform(async move {
             match list_project_actions_with_options(&host, params, options).await {
-                Ok(result) => Ok(CoreMessage::ProjectActionsLoaded {
+                Ok(result) => Ok(CoreEvent::ProjectActionsLoaded {
                     host_id,
                     reference,
                     result,
                 }),
-                Err(err) => Ok(CoreMessage::HostOperationFailed {
+                Err(err) => Ok(CoreEvent::HostOperationFailed {
                     host_id,
                     error: err.to_string(),
                 }),
@@ -1238,7 +1231,7 @@ fn fetch_linear_issues_task(
                     transport,
                 ),
                 Err(err) => {
-                    return Ok(CoreMessage::ProviderOperationFailed {
+                    return Ok(CoreEvent::ProviderOperationFailed {
                         host_id,
                         provider: SessionLinkProvider::Linear,
                         operation: ProviderOperation::LinearIssues,
@@ -1248,14 +1241,14 @@ fn fetch_linear_issues_task(
                 }
             };
             match client.list_issues(query).await {
-                Ok(issues) => Ok(CoreMessage::LinearProviderIssuesLoaded {
+                Ok(issues) => Ok(CoreEvent::LinearProviderIssuesLoaded {
                     host_id,
                     request_id,
                     filter_name,
                     search,
                     issues,
                 }),
-                Err(err) => Ok(CoreMessage::ProviderOperationFailed {
+                Err(err) => Ok(CoreEvent::ProviderOperationFailed {
                     host_id,
                     provider: SessionLinkProvider::Linear,
                     operation: ProviderOperation::LinearIssues,
@@ -1279,13 +1272,13 @@ fn fetch_github_pull_requests_task(
     Ok(Task::perform(
         runtime::perform(async move {
             match client.list_pull_requests(&filter_args).await {
-                Ok(pull_requests) => Ok(CoreMessage::GitHubProviderPullRequestsLoaded {
+                Ok(pull_requests) => Ok(CoreEvent::GitHubProviderPullRequestsLoaded {
                     host_id,
                     request_id,
                     scope,
                     pull_requests,
                 }),
-                Err(err) => Ok(CoreMessage::ProviderOperationFailed {
+                Err(err) => Ok(CoreEvent::ProviderOperationFailed {
                     host_id,
                     provider: SessionLinkProvider::GitHub,
                     operation: ProviderOperation::GitHubPullRequests,
@@ -1306,13 +1299,13 @@ fn fetch_github_issues_task(
     Ok(Task::perform(
         runtime::perform(async move {
             match client.list_issues().await {
-                Ok(issues) => Ok(CoreMessage::GitHubProviderIssuesLoaded {
+                Ok(issues) => Ok(CoreEvent::GitHubProviderIssuesLoaded {
                     host_id,
                     request_id,
                     scope,
                     issues,
                 }),
-                Err(err) => Ok(CoreMessage::ProviderOperationFailed {
+                Err(err) => Ok(CoreEvent::ProviderOperationFailed {
                     host_id,
                     provider: SessionLinkProvider::GitHub,
                     operation: ProviderOperation::GitHubIssues,
@@ -1334,13 +1327,13 @@ fn fetch_github_pr_status_task(
     Ok(Task::perform(
         runtime::perform(async move {
             match client.pull_request_status(target.number).await {
-                Ok(status) => Ok(CoreMessage::GitHubProviderPullRequestStatusLoaded {
+                Ok(status) => Ok(CoreEvent::GitHubProviderPullRequestStatusLoaded {
                     host_id,
                     request_id,
                     status_key: target.status_key,
                     status,
                 }),
-                Err(err) => Ok(CoreMessage::ProviderOperationFailed {
+                Err(err) => Ok(CoreEvent::ProviderOperationFailed {
                     host_id,
                     provider: SessionLinkProvider::GitHub,
                     operation: ProviderOperation::GitHubPullRequestStatus,
@@ -1382,11 +1375,11 @@ fn launch_linear_issue_task(app: &PohunekApp) -> Result<Task<Message>, String> {
             )
             .await
             {
-                Ok(result) => Ok(CoreMessage::SessionCreated {
+                Ok(result) => Ok(CoreEvent::SessionCreated {
                     host_id,
                     session: result.session,
                 }),
-                Err(err) => Ok(CoreMessage::HostOperationFailed {
+                Err(err) => Ok(CoreEvent::HostOperationFailed {
                     host_id,
                     error: err.to_string(),
                 }),
@@ -1428,11 +1421,11 @@ fn launch_github_pull_request_task(app: &PohunekApp) -> Result<Task<Message>, St
             )
             .await
             {
-                Ok(result) => Ok(CoreMessage::SessionCreated {
+                Ok(result) => Ok(CoreEvent::SessionCreated {
                     host_id,
                     session: result.session,
                 }),
-                Err(err) => Ok(CoreMessage::HostOperationFailed {
+                Err(err) => Ok(CoreEvent::HostOperationFailed {
                     host_id,
                     error: err.to_string(),
                 }),

@@ -11,7 +11,7 @@ use protocol::{
 };
 
 use crate::providers;
-use crate::{HealthSummary, HostId, Message, PromptPreview, Selection, SessionLinkProvider};
+use crate::{DomainEvent, HealthSummary, HostId, PromptPreview, Selection, SessionLinkProvider};
 
 /// Prompt/action browse and preview state for one host.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -441,14 +441,14 @@ impl Workspace {
         }
     }
 
-    /// Apply one async message to the workspace state.
+    /// Reduce one domain event (async daemon/provider I/O result) into state.
     #[expect(
         clippy::too_many_lines,
         reason = "workspace updates are centralized so GUI transitions stay deterministic and testable"
     )]
-    pub fn apply(&mut self, message: Message) {
-        match message {
-            Message::HostConnecting { host_id } => {
+    pub fn apply(&mut self, event: DomainEvent) {
+        match event {
+            DomainEvent::HostConnecting { host_id } => {
                 self.hosts
                     .entry(host_id)
                     .and_modify(|host| {
@@ -457,7 +457,7 @@ impl Workspace {
                     })
                     .or_insert_with(HostView::connecting);
             }
-            Message::HostSnapshotLoaded { snapshot } => {
+            DomainEvent::HostSnapshotLoaded { snapshot } => {
                 let host_id = snapshot.host_id.clone();
                 let sessions = snapshot
                     .sessions
@@ -510,7 +510,7 @@ impl Workspace {
                     },
                 );
             }
-            Message::HostSubscribed { host_id } => {
+            DomainEvent::HostSubscribed { host_id } => {
                 self.hosts
                     .entry(host_id)
                     .and_modify(|host| {
@@ -522,7 +522,7 @@ impl Workspace {
                         ..HostView::connecting()
                     });
             }
-            Message::HostEvent { host_id, event } => {
+            DomainEvent::HostEvent { host_id, event } => {
                 let Some(host) = self.hosts.get_mut(&host_id) else {
                     trace_ignored_unknown_host(&host_id, "host event");
                     return;
@@ -538,35 +538,35 @@ impl Workspace {
                     &mut self.next_intent_id,
                 );
             }
-            Message::HostDisconnected { host_id, error } => {
+            DomainEvent::HostDisconnected { host_id, error } => {
                 let Some(host) = self.host_mut_if_known(&host_id, "host disconnected") else {
                     return;
                 };
                 host.conn = ConnState::Disconnected;
                 host.last_error = Some(error);
             }
-            Message::HostUnreachable { host_id, error } => {
+            DomainEvent::HostUnreachable { host_id, error } => {
                 let Some(host) = self.host_mut_if_known(&host_id, "host unreachable") else {
                     return;
                 };
                 host.conn = ConnState::Unreachable;
                 host.last_error = Some(error);
             }
-            Message::SessionCreated { host_id, session }
-            | Message::SessionInspected { host_id, session } => {
+            DomainEvent::SessionCreated { host_id, session }
+            | DomainEvent::SessionInspected { host_id, session } => {
                 let Some(host) = self.host_mut_if_known(&host_id, "session result") else {
                     return;
                 };
                 host.sessions.insert(session.id.0.clone(), session);
             }
-            Message::SessionResumed { host_id, result } => {
+            DomainEvent::SessionResumed { host_id, result } => {
                 let Some(host) = self.host_mut_if_known(&host_id, "session resume result") else {
                     return;
                 };
                 let session = result.session;
                 host.sessions.insert(session.id.0.clone(), session);
             }
-            Message::SessionStopCompleted {
+            DomainEvent::SessionStopCompleted {
                 host_id,
                 session_id,
                 result,
@@ -582,7 +582,7 @@ impl Workspace {
                     session.activity = None;
                 }
             }
-            Message::SessionRemoveCompleted {
+            DomainEvent::SessionRemoveCompleted {
                 host_id,
                 session_id,
                 result,
@@ -595,21 +595,21 @@ impl Workspace {
                 };
                 host.sessions.remove(&session_id.0);
             }
-            Message::SessionMetadataUpdated { host_id, result } => {
+            DomainEvent::SessionMetadataUpdated { host_id, result } => {
                 let Some(host) = self.host_mut_if_known(&host_id, "session metadata result") else {
                     return;
                 };
                 host.sessions
                     .insert(result.session.id.0.clone(), result.session);
             }
-            Message::SessionRenamed { host_id, result } => {
+            DomainEvent::SessionRenamed { host_id, result } => {
                 let Some(host) = self.host_mut_if_known(&host_id, "session renamed result") else {
                     return;
                 };
                 host.sessions
                     .insert(result.session.id.0.clone(), result.session);
             }
-            Message::ProjectListLoaded { host_id, projects } => {
+            DomainEvent::ProjectListLoaded { host_id, projects } => {
                 let Some(host) = self.host_mut_if_known(&host_id, "project list result") else {
                     return;
                 };
@@ -621,14 +621,14 @@ impl Workspace {
                 host.project_details
                     .retain(|id, _details| host.projects.contains_key(id));
             }
-            Message::ProjectAdded { host_id, project }
-            | Message::ProjectRenamed { host_id, project } => {
+            DomainEvent::ProjectAdded { host_id, project }
+            | DomainEvent::ProjectRenamed { host_id, project } => {
                 let Some(host) = self.host_mut_if_known(&host_id, "project change result") else {
                     return;
                 };
                 host.projects.insert(project.id.clone(), project);
             }
-            Message::ProjectShown { host_id, result } => {
+            DomainEvent::ProjectShown { host_id, result } => {
                 let Some(host) = self.host_mut_if_known(&host_id, "project shown result") else {
                     return;
                 };
@@ -637,7 +637,7 @@ impl Workspace {
                 host.project_details
                     .insert(result.project.id.clone(), result);
             }
-            Message::ProjectRemoved {
+            DomainEvent::ProjectRemoved {
                 host_id,
                 reference,
                 result,
@@ -658,7 +658,7 @@ impl Workspace {
                     }
                 }
             }
-            Message::WorktreeRemoved {
+            DomainEvent::WorktreeRemoved {
                 host_id,
                 project_id,
                 path,
@@ -677,7 +677,7 @@ impl Workspace {
                     details.worktrees.retain(|worktree| worktree.path != path);
                 }
             }
-            Message::ProjectActionsLoaded {
+            DomainEvent::ProjectActionsLoaded {
                 host_id,
                 reference,
                 result,
@@ -688,7 +688,7 @@ impl Workspace {
                 host.prompt.actions_by_project.insert(reference, result);
                 host.last_error = None;
             }
-            Message::ProjectPromptResolved { host_id, prompt } => {
+            DomainEvent::ProjectPromptResolved { host_id, prompt } => {
                 let Some(host) = self.host_mut_if_known(&host_id, "project prompt result") else {
                     return;
                 };
@@ -696,7 +696,7 @@ impl Workspace {
                 host.prompt.preview = None;
                 host.last_error = None;
             }
-            Message::ProjectActionResolved { host_id, action } => {
+            DomainEvent::ProjectActionResolved { host_id, action } => {
                 let Some(host) = self.host_mut_if_known(&host_id, "project action result") else {
                     return;
                 };
@@ -704,28 +704,14 @@ impl Workspace {
                 host.prompt.preview = None;
                 host.last_error = None;
             }
-            Message::PromptPreviewRendered { host_id, preview } => {
+            DomainEvent::PromptPreviewRendered { host_id, preview } => {
                 let Some(host) = self.host_mut_if_known(&host_id, "prompt preview result") else {
                     return;
                 };
                 host.prompt.preview = Some(preview);
                 host.last_error = None;
             }
-            Message::ProviderPanelSelected { host_id, panel } => {
-                let host = self.host_for_ui(host_id);
-                host.provider.active_panel = panel;
-            }
-            Message::LinearProviderFilterSelected { host_id, name } => {
-                let host = self.host_for_ui(host_id);
-                host.provider.linear.selected_filter = Some(name);
-                host.provider.linear.active_request = None;
-            }
-            Message::LinearProviderSearchChanged { host_id, value } => {
-                let host = self.host_for_ui(host_id);
-                host.provider.linear.search = value;
-                host.provider.linear.active_request = None;
-            }
-            Message::LinearProviderIssuesLoaded {
+            DomainEvent::LinearProviderIssuesLoaded {
                 host_id,
                 request_id,
                 filter_name,
@@ -763,20 +749,7 @@ impl Workspace {
                 host.provider.linear.selected_issue_id = None;
                 host.provider.linear.last_error = None;
             }
-            Message::LinearProviderIssueSelected { host_id, issue_id } => {
-                let host = self.host_for_ui(host_id);
-                host.provider.linear.selected_issue_id = Some(issue_id);
-            }
-            Message::GitHubProviderFilterSelected { host_id, name } => {
-                let host = self.host_for_ui(host_id);
-                host.provider.github.selected_filter = Some(name);
-                host.provider.github.pull_requests_request = None;
-            }
-            Message::GitHubProviderSearchChanged { host_id, value } => {
-                let host = self.host_for_ui(host_id);
-                host.provider.github.search = value;
-            }
-            Message::GitHubProviderPullRequestsLoaded {
+            DomainEvent::GitHubProviderPullRequestsLoaded {
                 host_id,
                 request_id,
                 scope,
@@ -821,7 +794,7 @@ impl Workspace {
                 host.provider.github.selected_pull_request = None;
                 host.provider.github.last_error = None;
             }
-            Message::GitHubProviderIssuesLoaded {
+            DomainEvent::GitHubProviderIssuesLoaded {
                 host_id,
                 request_id,
                 scope,
@@ -865,15 +838,7 @@ impl Workspace {
                 host.provider.github.selected_issue = None;
                 host.provider.github.last_error = None;
             }
-            Message::GitHubProviderPullRequestSelected { host_id, number } => {
-                let host = self.host_for_ui(host_id);
-                host.provider.github.selected_pull_request = Some(number);
-            }
-            Message::GitHubProviderIssueSelected { host_id, number } => {
-                let host = self.host_for_ui(host_id);
-                host.provider.github.selected_issue = Some(number);
-            }
-            Message::GitHubProviderPullRequestStatusLoaded {
+            DomainEvent::GitHubProviderPullRequestStatusLoaded {
                 host_id,
                 request_id,
                 status_key,
@@ -916,7 +881,7 @@ impl Workspace {
                     .insert(status_key, status);
                 host.provider.github.last_error = None;
             }
-            Message::ProviderOperationFailed {
+            DomainEvent::ProviderOperationFailed {
                 host_id,
                 provider,
                 operation,
@@ -936,20 +901,20 @@ impl Workspace {
                     SessionLinkProvider::GitHub => host.provider.github.last_error = Some(error),
                 }
             }
-            Message::HostOperationFailed { host_id, error } => {
+            DomainEvent::HostOperationFailed { host_id, error } => {
                 let Some(host) = self.host_mut_if_known(&host_id, "host operation failure") else {
                     return;
                 };
                 host.last_error = Some(error);
             }
-            Message::NotificationUpdateCompleted { host_id, result } => {
+            DomainEvent::NotificationUpdateCompleted { host_id, result } => {
                 let host = self
                     .hosts
                     .entry(host_id)
                     .or_insert_with(HostView::connecting);
                 upsert_notification(&mut host.notifications, result.record);
             }
-            Message::NotificationDeleteCompleted { host_id, result } => {
+            DomainEvent::NotificationDeleteCompleted { host_id, result } => {
                 if !result.deleted {
                     return;
                 }
@@ -978,6 +943,62 @@ impl Workspace {
         self.hosts
             .entry(host_id)
             .or_insert_with(HostView::connecting)
+    }
+
+    /// Switch the active provider browser panel for `host_id`.
+    pub fn set_active_panel(&mut self, host_id: HostId, panel: ProviderPanel) {
+        let host = self.host_for_ui(host_id);
+        host.provider.active_panel = panel;
+    }
+
+    /// Pick the named Linear filter for `host_id`, dropping any in-flight
+    /// issues request so a stale response cannot land under the new filter.
+    pub fn select_linear_filter(&mut self, host_id: HostId, name: String) {
+        let host = self.host_for_ui(host_id);
+        host.provider.linear.selected_filter = Some(name);
+        host.provider.linear.active_request = None;
+    }
+
+    /// Update the Linear search box text for `host_id`, dropping any
+    /// in-flight issues request so a stale response cannot land under the new
+    /// search.
+    pub fn set_linear_search(&mut self, host_id: HostId, value: String) {
+        let host = self.host_for_ui(host_id);
+        host.provider.linear.search = value;
+        host.provider.linear.active_request = None;
+    }
+
+    /// Select a Linear issue in the provider browser for `host_id`.
+    pub fn select_linear_issue(&mut self, host_id: HostId, issue_id: String) {
+        let host = self.host_for_ui(host_id);
+        host.provider.linear.selected_issue_id = Some(issue_id);
+    }
+
+    /// Pick the named GitHub pull request filter for `host_id`, dropping any
+    /// in-flight pull requests request so a stale response cannot land under
+    /// the new filter.
+    pub fn select_github_filter(&mut self, host_id: HostId, name: String) {
+        let host = self.host_for_ui(host_id);
+        host.provider.github.selected_filter = Some(name);
+        host.provider.github.pull_requests_request = None;
+    }
+
+    /// Update the GitHub search box text for `host_id`.
+    pub fn set_github_search(&mut self, host_id: HostId, value: String) {
+        let host = self.host_for_ui(host_id);
+        host.provider.github.search = value;
+    }
+
+    /// Select a GitHub pull request in the provider browser for `host_id`.
+    pub fn select_github_pull_request(&mut self, host_id: HostId, number: u64) {
+        let host = self.host_for_ui(host_id);
+        host.provider.github.selected_pull_request = Some(number);
+    }
+
+    /// Select a GitHub issue in the provider browser for `host_id`.
+    pub fn select_github_issue(&mut self, host_id: HostId, number: u64) {
+        let host = self.host_for_ui(host_id);
+        host.provider.github.selected_issue = Some(number);
     }
 
     /// Select a session in the detail pane.
@@ -1456,7 +1477,7 @@ mod tests {
     fn workspace_applies_agent_state_to_known_session() {
         let mut workspace = Workspace::default();
         let session = session("s-1", None);
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("local", vec![session]),
         });
 
@@ -1468,7 +1489,7 @@ mod tests {
                 "source": "osc_title"
             }),
         );
-        workspace.apply(Message::HostEvent {
+        workspace.apply(DomainEvent::HostEvent {
             host_id: HostId::new("local"),
             event: HostEvent::AgentState(parse_agent_state(raw).expect("agent state")),
         });
@@ -1491,7 +1512,7 @@ mod tests {
     #[test]
     fn workspace_accepts_report_agent_state_source() {
         let mut workspace = Workspace::default();
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("local", vec![session("s-1", None)]),
         });
 
@@ -1503,7 +1524,7 @@ mod tests {
                 "source": "report"
             }),
         );
-        workspace.apply(Message::HostEvent {
+        workspace.apply(DomainEvent::HostEvent {
             host_id: HostId::new("local"),
             event: HostEvent::AgentState(parse_agent_state(raw).expect("agent state")),
         });
@@ -1524,11 +1545,11 @@ mod tests {
     #[test]
     fn session_remove_completed_drops_the_session() {
         let mut workspace = Workspace::default();
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("local", vec![session("s-1", None), session("s-2", None)]),
         });
 
-        workspace.apply(Message::SessionRemoveCompleted {
+        workspace.apply(DomainEvent::SessionRemoveCompleted {
             host_id: HostId::new("local"),
             session_id: SessionId("s-1".to_owned()),
             result: SessionRemoveResult {
@@ -1550,7 +1571,7 @@ mod tests {
         let mut named = session("s-2", Some(AgentActivity::Working));
         named.name = Some("triage build".to_owned());
         let mut workspace = Workspace::default();
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot(
                 "local",
                 vec![
@@ -1579,7 +1600,7 @@ mod tests {
     #[test]
     fn blocked_at_cycles_through_blocked_sessions_only() {
         let mut workspace = Workspace::default();
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot(
                 "local",
                 vec![
@@ -1610,7 +1631,7 @@ mod tests {
     #[test]
     fn blocked_at_is_none_without_any_blocked_session() {
         let mut workspace = Workspace::default();
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("local", vec![session("s-1", Some(AgentActivity::Working))]),
         });
 
@@ -1620,13 +1641,13 @@ mod tests {
     #[test]
     fn session_remove_completed_keeps_session_when_not_removed() {
         let mut workspace = Workspace::default();
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("local", vec![session("s-1", None)]),
         });
 
         // A `removed: false` result (a concurrent remove won the race) must not
         // touch the local view.
-        workspace.apply(Message::SessionRemoveCompleted {
+        workspace.apply(DomainEvent::SessionRemoveCompleted {
             host_id: HostId::new("local"),
             session_id: SessionId("s-1".to_owned()),
             result: SessionRemoveResult {
@@ -1648,11 +1669,11 @@ mod tests {
         resumed.pid = 99;
 
         let mut workspace = Workspace::default();
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("local", vec![stopped]),
         });
 
-        workspace.apply(Message::SessionResumed {
+        workspace.apply(DomainEvent::SessionResumed {
             host_id: HostId::new("local"),
             result: SessionResumeResult { session: resumed },
         });
@@ -1666,11 +1687,11 @@ mod tests {
     #[test]
     fn session_removed_event_drops_the_session() {
         let mut workspace = Workspace::default();
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("local", vec![session("s-1", None), session("s-2", None)]),
         });
 
-        workspace.apply(Message::HostEvent {
+        workspace.apply(DomainEvent::HostEvent {
             host_id: HostId::new("local"),
             event: HostEvent::SessionRemoved(session("s-1", None)),
         });
@@ -1695,7 +1716,7 @@ mod tests {
             parse_event_message(&HostId::new("local"), &line).expect("parse session_removed");
 
         match message {
-            Message::HostEvent {
+            DomainEvent::HostEvent {
                 event: HostEvent::SessionRemoved(info),
                 ..
             } => assert_eq!(info.id, SessionId("s-1".to_owned())),
@@ -1707,24 +1728,12 @@ mod tests {
     fn workspace_applies_provider_browser_state() {
         let host_id = HostId::new("local");
         let mut workspace = Workspace::default();
-        workspace.apply(Message::ProviderPanelSelected {
-            host_id: host_id.clone(),
-            panel: ProviderPanel::GitHub,
-        });
-        workspace.apply(Message::LinearProviderFilterSelected {
-            host_id: host_id.clone(),
-            name: "Assigned to me".to_owned(),
-        });
-        workspace.apply(Message::GitHubProviderFilterSelected {
-            host_id: host_id.clone(),
-            name: "My PRs".to_owned(),
-        });
-        workspace.apply(Message::LinearProviderSearchChanged {
-            host_id: host_id.clone(),
-            value: "launcher".to_owned(),
-        });
+        workspace.set_active_panel(host_id.clone(), ProviderPanel::GitHub);
+        workspace.select_linear_filter(host_id.clone(), "Assigned to me".to_owned());
+        workspace.select_github_filter(host_id.clone(), "My PRs".to_owned());
+        workspace.set_linear_search(host_id.clone(), "launcher".to_owned());
         let request_id = workspace.begin_linear_issues_request(host_id.clone());
-        workspace.apply(Message::LinearProviderIssuesLoaded {
+        workspace.apply(DomainEvent::LinearProviderIssuesLoaded {
             host_id: host_id.clone(),
             request_id,
             filter_name: Some("Assigned to me".to_owned()),
@@ -1742,10 +1751,7 @@ mod tests {
                 updated_at: None,
             }],
         });
-        workspace.apply(Message::LinearProviderIssueSelected {
-            host_id: host_id.clone(),
-            issue_id: "LIN-123".to_owned(),
-        });
+        workspace.select_linear_issue(host_id.clone(), "LIN-123".to_owned());
 
         let host = workspace.hosts.get(&host_id).expect("host");
         assert_eq!(host.provider.active_panel, ProviderPanel::GitHub);
@@ -1772,7 +1778,7 @@ mod tests {
             GitHubPullRequestStatusKey::new(scope, "https://github.example/repo/pull/7");
         let mut workspace = Workspace::default();
         let request_id = workspace.begin_github_pull_request_status_request(host_id.clone());
-        workspace.apply(Message::GitHubProviderPullRequestStatusLoaded {
+        workspace.apply(DomainEvent::GitHubProviderPullRequestStatusLoaded {
             host_id: host_id.clone(),
             request_id,
             status_key: status_key.clone(),
@@ -1801,11 +1807,8 @@ mod tests {
         let host_id = HostId::new("local");
         let mut workspace = Workspace::default();
         let request_id = workspace.begin_linear_issues_request(host_id.clone());
-        workspace.apply(Message::LinearProviderSearchChanged {
-            host_id: host_id.clone(),
-            value: "new".to_owned(),
-        });
-        workspace.apply(Message::LinearProviderIssuesLoaded {
+        workspace.set_linear_search(host_id.clone(), "new".to_owned());
+        workspace.apply(DomainEvent::LinearProviderIssuesLoaded {
             host_id: host_id.clone(),
             request_id,
             filter_name: None,
@@ -1833,7 +1836,7 @@ mod tests {
         let host_id = HostId::new("local");
         let mut workspace = Workspace::default();
         let pull_requests_request = workspace.begin_github_pull_requests_request(host_id.clone());
-        workspace.apply(Message::GitHubProviderPullRequestsLoaded {
+        workspace.apply(DomainEvent::GitHubProviderPullRequestsLoaded {
             host_id: host_id.clone(),
             request_id: pull_requests_request,
             scope: GitHubProviderScope::new("project-a", "/repo/a"),
@@ -1846,7 +1849,7 @@ mod tests {
             )],
         });
         let issues_request = workspace.begin_github_issues_request(host_id.clone());
-        workspace.apply(Message::GitHubProviderIssuesLoaded {
+        workspace.apply(DomainEvent::GitHubProviderIssuesLoaded {
             host_id: host_id.clone(),
             request_id: issues_request,
             scope: GitHubProviderScope::new("project-b", "/repo/b"),
@@ -1873,7 +1876,7 @@ mod tests {
         let host_id = HostId::new("local");
         let mut workspace = Workspace::default();
         let pull_requests_request = workspace.begin_github_pull_requests_request(host_id.clone());
-        workspace.apply(Message::GitHubProviderPullRequestsLoaded {
+        workspace.apply(DomainEvent::GitHubProviderPullRequestsLoaded {
             host_id: host_id.clone(),
             request_id: pull_requests_request,
             scope: GitHubProviderScope::new("project-a", "/repo/a"),
@@ -1886,7 +1889,7 @@ mod tests {
             )],
         });
         let issues_request = workspace.begin_github_issues_request(host_id.clone());
-        workspace.apply(Message::GitHubProviderIssuesLoaded {
+        workspace.apply(DomainEvent::GitHubProviderIssuesLoaded {
             host_id: host_id.clone(),
             request_id: issues_request,
             scope: GitHubProviderScope::new("project-a", "/repo/b"),
@@ -1912,7 +1915,7 @@ mod tests {
     fn github_provider_ignores_stale_repo_scope_response() {
         let host_id = HostId::new("local");
         let mut workspace = Workspace::default();
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: HostSnapshot {
                 host_id: host_id.clone(),
                 health: HealthSummary {
@@ -1931,7 +1934,7 @@ mod tests {
             project_id: "project-a".to_owned(),
         });
         let request_id = workspace.begin_github_pull_requests_request(host_id.clone());
-        workspace.apply(Message::GitHubProviderPullRequestsLoaded {
+        workspace.apply(DomainEvent::GitHubProviderPullRequestsLoaded {
             host_id: host_id.clone(),
             request_id,
             scope: GitHubProviderScope::new("project-a", "/repo/stale"),
@@ -1956,7 +1959,7 @@ mod tests {
         let mut workspace = Workspace::default();
         let stale_request = workspace.begin_github_pull_requests_request(host_id.clone());
         let current_request = workspace.begin_github_pull_requests_request(host_id.clone());
-        workspace.apply(Message::GitHubProviderPullRequestsLoaded {
+        workspace.apply(DomainEvent::GitHubProviderPullRequestsLoaded {
             host_id: host_id.clone(),
             request_id: current_request,
             scope: scope.clone(),
@@ -1968,7 +1971,7 @@ mod tests {
                 "https://github.example/current/pull/9",
             )],
         });
-        workspace.apply(Message::GitHubProviderPullRequestsLoaded {
+        workspace.apply(DomainEvent::GitHubProviderPullRequestsLoaded {
             host_id: host_id.clone(),
             request_id: stale_request,
             scope,
@@ -1992,7 +1995,7 @@ mod tests {
         let mut workspace = Workspace::default();
         let stale_request = workspace.begin_linear_issues_request(host_id.clone());
         let _current_request = workspace.begin_linear_issues_request(host_id.clone());
-        workspace.apply(Message::ProviderOperationFailed {
+        workspace.apply(DomainEvent::ProviderOperationFailed {
             host_id: host_id.clone(),
             provider: SessionLinkProvider::Linear,
             operation: ProviderOperation::LinearIssues,
@@ -2010,7 +2013,7 @@ mod tests {
         let mut workspace = Workspace::default();
         let stale_request = workspace.begin_github_pull_requests_request(host_id.clone());
         workspace.select_project(host_id.clone(), "project-a".to_owned());
-        workspace.apply(Message::ProviderOperationFailed {
+        workspace.apply(DomainEvent::ProviderOperationFailed {
             host_id: host_id.clone(),
             provider: SessionLinkProvider::GitHub,
             operation: ProviderOperation::GitHubPullRequests,
@@ -2026,14 +2029,14 @@ mod tests {
     fn snapshot_seed_does_not_notify_existing_blocked_session() {
         let mut workspace = Workspace::default();
         let host_id = HostId::new("local");
-        workspace.apply(Message::HostConnecting {
+        workspace.apply(DomainEvent::HostConnecting {
             host_id: host_id.clone(),
         });
-        workspace.apply(Message::HostSubscribed {
+        workspace.apply(DomainEvent::HostSubscribed {
             host_id: host_id.clone(),
         });
 
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("local", vec![session("s-1", Some(AgentActivity::Blocked))]),
         });
 
@@ -2044,7 +2047,7 @@ mod tests {
     #[test]
     fn blocked_session_agent_state_no_longer_emits_transient_intent() {
         let mut workspace = Workspace::default();
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("local", vec![session("s-1", Some(AgentActivity::Working))]),
         });
 
@@ -2056,7 +2059,7 @@ mod tests {
                 "source": "osc_title"
             }),
         );
-        workspace.apply(Message::HostEvent {
+        workspace.apply(DomainEvent::HostEvent {
             host_id: HostId::new("local"),
             event: HostEvent::AgentState(parse_agent_state(raw).expect("agent state")),
         });
@@ -2080,7 +2083,7 @@ mod tests {
                 NotificationSeverity::ActionRequired,
             )],
         );
-        workspace.apply(Message::HostSnapshotLoaded { snapshot });
+        workspace.apply(DomainEvent::HostSnapshotLoaded { snapshot });
 
         let host = workspace.hosts.get(&HostId::new("local")).expect("host");
         assert!(host.notifications.contains_key("n-1"));
@@ -2104,7 +2107,7 @@ mod tests {
 
         let message = parse_event_message(&HostId::new("local"), &line).expect("parse");
         match message {
-            Message::HostEvent {
+            DomainEvent::HostEvent {
                 event: HostEvent::NotificationCreated(parsed),
                 ..
             } => assert_eq!(parsed, record),
@@ -2130,7 +2133,7 @@ mod tests {
 
         let message = parse_event_message(&HostId::new("local"), &line).expect("parse");
         match message {
-            Message::HostEvent {
+            DomainEvent::HostEvent {
                 event: HostEvent::NotificationUpdated(parsed),
                 ..
             } => assert_eq!(parsed, record),
@@ -2151,7 +2154,7 @@ mod tests {
 
         let message = parse_event_message(&HostId::new("local"), &line).expect("parse");
         match message {
-            Message::HostEvent {
+            DomainEvent::HostEvent {
                 event: HostEvent::NotificationDeleted(id),
                 ..
             } => assert_eq!(id, NotificationId("n-9".to_owned())),
@@ -2164,10 +2167,10 @@ mod tests {
         let mut workspace = Workspace::default();
         // Events only apply to hosts already known through the connect path; a
         // snapshot seeds each host before its notification events arrive.
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("host-a", vec![]),
         });
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("host-b", vec![]),
         });
         workspace.apply(notification_created(
@@ -2199,7 +2202,7 @@ mod tests {
         let mut workspace = Workspace::default();
         let host = HostId::new("local");
         // Seed the host through the connect path so its events are not dropped.
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("local", vec![]),
         });
         workspace.apply(notification_created(
@@ -2251,7 +2254,7 @@ mod tests {
         ));
         assert_eq!(workspace.unread_notification_count(), 0);
 
-        workspace.apply(Message::HostEvent {
+        workspace.apply(DomainEvent::HostEvent {
             host_id: HostId::new("local"),
             event: HostEvent::NotificationDeleted(NotificationId("n-2".to_owned())),
         });
@@ -2276,7 +2279,7 @@ mod tests {
         ));
         let intents_after_live = workspace.notification_intents.len();
 
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot_with_notifications(
                 "local",
                 vec![],
@@ -2325,7 +2328,7 @@ mod tests {
         ));
         let intents_after_live = workspace.notification_intents.len();
 
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot_with_notifications(
                 "local",
                 vec![],
@@ -2365,7 +2368,7 @@ mod tests {
     #[test]
     fn needs_action_scope_excludes_archived_and_untroubled_read_records() {
         let mut workspace = Workspace::default();
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("local", vec![]),
         });
         let unread = notification_record(
@@ -2410,7 +2413,7 @@ mod tests {
     #[test]
     fn inbox_rows_pin_action_kinds_above_unread_above_read() {
         let mut workspace = Workspace::default();
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("local", vec![]),
         });
         let mut blocked_but_read = notification_record(
@@ -2444,10 +2447,10 @@ mod tests {
     #[test]
     fn inbox_rows_apply_host_filter() {
         let mut workspace = Workspace::default();
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("host-a", vec![]),
         });
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("host-b", vec![]),
         });
         workspace.apply(notification_created(
@@ -2486,7 +2489,7 @@ mod tests {
             NotificationSeverity::ActionRequired,
         );
         record.session_id = Some(SessionId("s-1".to_owned()));
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot_with_notifications(
                 "local",
                 vec![session("s-1", Some(AgentActivity::Blocked))],
@@ -2516,7 +2519,7 @@ mod tests {
             NotificationSeverity::ActionRequired,
         );
         record.session_id = Some(SessionId("s-gone".to_owned()));
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot_with_notifications("local", vec![], vec![record]),
         });
 
@@ -2531,7 +2534,7 @@ mod tests {
     fn action_required_notification_created_emits_single_os_intent() {
         let mut workspace = Workspace::default();
         // Seed the host through the connect path so its events are not dropped.
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("local", vec![]),
         });
         let mut record = notification_record(
@@ -2572,7 +2575,7 @@ mod tests {
     #[test]
     fn snapshot_seed_does_not_emit_notification_intents() {
         let mut workspace = Workspace::default();
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot_with_notifications(
                 "local",
                 vec![],
@@ -2604,7 +2607,7 @@ mod tests {
                 NotificationSeverity::ActionRequired,
             ),
         ));
-        workspace.apply(Message::NotificationUpdateCompleted {
+        workspace.apply(DomainEvent::NotificationUpdateCompleted {
             host_id: HostId::new("local"),
             result: NotificationUpdateResult {
                 record: notification_record(
@@ -2640,7 +2643,7 @@ mod tests {
                 NotificationSeverity::ActionRequired,
             ),
         ));
-        workspace.apply(Message::NotificationDeleteCompleted {
+        workspace.apply(DomainEvent::NotificationDeleteCompleted {
             host_id: HostId::new("local"),
             result: NotificationDeleteResult {
                 id: NotificationId("n-1".to_owned()),
@@ -2660,7 +2663,7 @@ mod tests {
     fn notifications_selector_filters_and_orders_newest_first() {
         let mut workspace = Workspace::default();
         // Seed the host through the connect path so its events are not dropped.
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("local", vec![]),
         });
         let mut older = notification_record(
@@ -2716,10 +2719,10 @@ mod tests {
     fn notifications_selector_filters_by_host() {
         let mut workspace = Workspace::default();
         // Seed both hosts through the connect path so their events are not dropped.
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("host-a", vec![]),
         });
-        workspace.apply(Message::HostSnapshotLoaded {
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("host-b", vec![]),
         });
         workspace.apply(notification_created(
@@ -2936,15 +2939,15 @@ mod tests {
         }
     }
 
-    fn notification_created(host: &str, record: NotificationRecord) -> Message {
-        Message::HostEvent {
+    fn notification_created(host: &str, record: NotificationRecord) -> DomainEvent {
+        DomainEvent::HostEvent {
             host_id: HostId::new(host),
             event: HostEvent::NotificationCreated(record),
         }
     }
 
-    fn notification_updated(host: &str, record: NotificationRecord) -> Message {
-        Message::HostEvent {
+    fn notification_updated(host: &str, record: NotificationRecord) -> DomainEvent {
+        DomainEvent::HostEvent {
             host_id: HostId::new(host),
             event: HostEvent::NotificationUpdated(record),
         }

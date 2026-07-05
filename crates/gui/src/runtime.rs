@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 use futures::channel::{mpsc, oneshot};
 use futures::{SinkExt, Stream, StreamExt};
 use pohunek_gui_core::{
-    workspace_connection_stream, ConnectionOptions, HostConfig, Message as CoreMessage,
+    workspace_connection_stream, ConnectionOptions, DomainEvent as CoreEvent, HostConfig,
 };
 use tokio::runtime::{Builder, Runtime};
 
@@ -36,7 +36,7 @@ where
 
 pub(crate) fn host_subscription(
     input: &(HostConfig, ConnectionOptions),
-) -> impl Stream<Item = CoreMessage> {
+) -> impl Stream<Item = CoreEvent> {
     let (mut sender, receiver) = mpsc::channel(128);
     let (config, options) = input.clone();
     TOKIO.spawn(async move {
