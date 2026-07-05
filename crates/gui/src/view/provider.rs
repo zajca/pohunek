@@ -109,12 +109,8 @@ pub(crate) fn linear_provider_view(
         view = view.push(text("Pick an issue, choose an action, then Launch.").size(12));
     }
     for issue in &state.issues {
-        let issue_id = issue.prompt_item_id().to_owned();
-        view = view.push(list_button(
-            text(format!("{}  {}", issue.prompt_item_id(), issue.title)).size(13),
-            Message::OpenLinearIssue(issue_id),
-            false,
-        ));
+        let selected = state.selected_issue_id.as_deref() == Some(issue.prompt_item_id());
+        view = view.push(linear_issue_row(issue, selected));
     }
     if let Some(error) = &state.last_error {
         view = view.push(text(error).size(13));
@@ -332,7 +328,9 @@ pub(crate) fn status_pill(label: impl Into<String>, tone: PillTone) -> Element<'
 }
 
 /// A pill summarizing the pull request review decision.
-fn review_pill(decision: &providers::github::ReviewDecision) -> Element<'static, Message> {
+pub(crate) fn review_pill(
+    decision: &providers::github::ReviewDecision,
+) -> Element<'static, Message> {
     use providers::github::ReviewDecision;
     let (label, tone) = match decision {
         ReviewDecision::Approved => ("review ok", PillTone::Success),
@@ -345,7 +343,7 @@ fn review_pill(decision: &providers::github::ReviewDecision) -> Element<'static,
 }
 
 /// A pill summarizing CI checks as `pass/fail/pending` counts.
-fn ci_pill(checks: &[providers::github::CheckRun]) -> Element<'static, Message> {
+pub(crate) fn ci_pill(checks: &[providers::github::CheckRun]) -> Element<'static, Message> {
     use providers::github::CiState;
     let summary = providers::github::CheckSummary::from_checks(checks);
     if summary.total() == 0 {
@@ -367,7 +365,7 @@ fn ci_pill(checks: &[providers::github::CheckRun]) -> Element<'static, Message> 
 }
 
 /// A label pill colored with GitHub's hex color when one is available.
-fn label_pill(label: &providers::github::GitHubLabel) -> Element<'static, Message> {
+pub(crate) fn label_pill(label: &providers::github::GitHubLabel) -> Element<'static, Message> {
     let name = label.name.clone();
     match color_from_hex(&label.color) {
         Some(background) => {
@@ -409,6 +407,27 @@ fn contrast_text_color(background: Color) -> Color {
     } else {
         Color::WHITE
     }
+}
+
+/// A two-line Linear issue row: identifier (monospace) and title on the first
+/// line, a muted branch line below so an operator can scan the list without
+/// opening the item modal.
+fn linear_issue_row(
+    issue: &providers::linear::LinearIssue,
+    selected: bool,
+) -> Element<'_, Message> {
+    let identifier = text(issue.identifier.as_str())
+        .size(13)
+        .font(iced::Font::MONOSPACE);
+    let title_line = row![identifier, text(issue.title.as_str()).size(13)]
+        .spacing(8)
+        .align_y(Center);
+    let branch_line = text(issue.branch.as_str()).size(11).style(muted_style);
+    list_button(
+        column![title_line, branch_line].spacing(4),
+        Message::OpenLinearIssue(issue.prompt_item_id().to_owned()),
+        selected,
+    )
 }
 
 /// A two-line pull request row: a title line and a metadata line.

@@ -73,6 +73,18 @@ pub(crate) fn spawn_notification(command: &str, intent: &NotificationIntent) -> 
         .map_err(|err| format!("failed to spawn notification command `{command}`: {err}"))
 }
 
+/// Opens `url` via `command`, spawned as a single argv argument.
+///
+/// Always argv-spawned (`Command::new(command).arg(url)`), never through a
+/// shell, so a provider-supplied URL cannot inject shell syntax.
+pub(crate) fn spawn_open_url(command: &str, url: &str) -> Result<(), String> {
+    Command::new(command)
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("failed to open URL `{url}` with `{command}`: {err}"))
+}
+
 pub(crate) fn window_dimension_to_f32(value: u32) -> f32 {
     f32::from(u16::try_from(value).unwrap_or(u16::MAX))
 }

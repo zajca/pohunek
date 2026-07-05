@@ -69,6 +69,16 @@ The `attach_command` template supports exactly these placeholders:
 Keep attach delegation external. Do not configure or recommend an embedded
 terminal path; that is intentionally out of scope for the GUI.
 
+Two more top-level keys are optional and default to the freedesktop Linux CLI
+tools of the same purpose:
+
+- `notification_command` (default `notify-send`): spawned with the
+  notification title and body as two argv arguments.
+- `open_url_command` (default `xdg-open`): spawned with a provider item's URL
+  (Linear issue, GitHub PR/issue) as a single argv argument when the operator
+  clicks "Open in browser" in an item detail modal. Always argv-spawned, never
+  a shell, so the URL cannot inject shell syntax.
+
 ## Running
 
 From the repository during development:

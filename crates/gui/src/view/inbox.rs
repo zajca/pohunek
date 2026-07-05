@@ -533,7 +533,10 @@ fn notification_color(theme: &Theme, severity: NotificationSeverity) -> iced::Co
     }
 }
 
-fn notification_age_label(created_at: &str) -> String {
+/// Renders a timestamp as a coarse age label (`now`/`Xm`/`Xh`/`Xd`, falling
+/// back to the `YYYY-MM-DD` date past a week); shared by notification rows and
+/// the provider item modals' `updated <age>` meta line.
+pub(crate) fn notification_age_label(created_at: &str) -> String {
     let Some(created) = parse_rfc3339_utc_seconds(created_at) else {
         return date_part(created_at).to_owned();
     };

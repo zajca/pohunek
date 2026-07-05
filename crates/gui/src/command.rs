@@ -25,7 +25,7 @@ use protocol::{
     SessionSetMetadataParams, WorktreeRemoveParams,
 };
 
-use crate::attach::{attach_task, spawn_notification, window_dimension_to_u32};
+use crate::attach::{attach_task, spawn_notification, spawn_open_url, window_dimension_to_u32};
 use crate::config::AppConfig;
 use crate::message::{
     AgentChoice, AssistantForm, DiscoveryResult, InboxView, Message, ModalView, NotificationAction,
@@ -409,8 +409,16 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         Message::CopyWorktreePath(path) => {
             let display = path.display().to_string();
             app.status = Some(format!("Copied path to clipboard: {display}"));
-            tasks.push(iced::clipboard::write::<Message>(display));
+            tasks.push(clipboard_task(display));
         }
+        Message::CopyText(value) => {
+            app.status = Some(format!("Copied to clipboard: {value}"));
+            tasks.push(clipboard_task(value));
+        }
+        Message::OpenUrl(url) => match open_url_task(app, url) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
         Message::RemoveWorktree(path) => match remove_worktree_task(app, path) {
             Ok(task) => tasks.push(task),
             Err(err) => app.status = Some(err),
@@ -606,7 +614,9 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                 Err(err) => err,
             });
         }
-        Message::NotificationSent(result) | Message::UiStateSaved(result) => {
+        Message::NotificationSent(result)
+        | Message::UiStateSaved(result)
+        | Message::UrlOpened(result) => {
             if let Err(err) = result {
                 app.status = Some(err);
             }
@@ -643,6 +653,27 @@ fn push_provider_task_result(
             Err(_) => app.status = Some(error),
         },
     }
+}
+
+/// Writes `value` to the system clipboard; shared by every "Copy ..." action
+/// (worktree paths, provider item branch names).
+fn clipboard_task(value: String) -> Task<Message> {
+    iced::clipboard::write::<Message>(value)
+}
+
+/// Opens `url` in the OS browser using the configured `open_url_command`,
+/// argv-spawned (see `attach::spawn_open_url`) so the URL cannot inject shell
+/// syntax.
+fn open_url_task(app: &PohunekApp, url: String) -> Result<Task<Message>, String> {
+    let command = app
+        .config
+        .as_ref()
+        .map(|config| config.open_url_command.clone())
+        .map_err(Clone::clone)?;
+    Ok(Task::perform(
+        async move { spawn_open_url(&command, &url) },
+        Message::UrlOpened,
+    ))
 }
 
 fn begin_linear_issues_request(app: &mut PohunekApp) -> Result<ProviderRequestId, String> {

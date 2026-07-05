@@ -270,6 +270,12 @@ pub(crate) enum Message {
     RenameProject,
     /// Copy a worktree's absolute path to the system clipboard.
     CopyWorktreePath(PathBuf),
+    /// Copy arbitrary text (e.g. a Linear/GitHub item's branch name) to the
+    /// system clipboard.
+    CopyText(String),
+    /// Open a provider item's URL in the OS browser (argv-spawned, never a
+    /// shell — see `attach::spawn_open_url`).
+    OpenUrl(String),
     /// Remove a single pohunek-owned worktree by path.
     RemoveWorktree(PathBuf),
     SelectAction(String),
@@ -286,6 +292,7 @@ pub(crate) enum Message {
     CoreCommandCompleted(Result<CoreMessage, String>),
     AttachSpawned(Result<(), String>),
     NotificationSent(Result<(), String>),
+    UrlOpened(Result<(), String>),
     WindowResized(Size),
     UiStateSaved(Result<(), String>),
 }

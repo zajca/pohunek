@@ -15,6 +15,10 @@ const DEFAULT_TERMINAL_ROWS: u16 = 24;
 // notify-send is the freedesktop notification CLI available on target Linux desktops.
 const DEFAULT_NOTIFICATION_COMMAND: &str = "notify-send";
 
+// xdg-open is the freedesktop URL/file opener available on target Linux desktops;
+// it dispatches to the user's configured default browser.
+const DEFAULT_OPEN_URL_COMMAND: &str = "xdg-open";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TerminalSize {
     pub(crate) cols: u16,
@@ -38,6 +42,9 @@ pub(crate) struct AppConfig {
     pub(crate) connection_options: ConnectionOptions,
     pub(crate) terminal_size: TerminalSize,
     pub(crate) notification_command: String,
+    /// Command used to open a provider item's URL in the OS browser, spawned via
+    /// argv (never a shell) so the URL cannot inject shell syntax.
+    pub(crate) open_url_command: String,
     pub(crate) providers: ProviderAppConfig,
 }
 
@@ -66,6 +73,9 @@ impl AppConfig {
             notification_command: raw
                 .notification_command
                 .unwrap_or_else(|| DEFAULT_NOTIFICATION_COMMAND.to_owned()),
+            open_url_command: raw
+                .open_url_command
+                .unwrap_or_else(|| DEFAULT_OPEN_URL_COMMAND.to_owned()),
             providers: raw.providers.unwrap_or_default().into_provider_config()?,
         })
     }
@@ -99,6 +109,8 @@ struct RawConfig {
     pohunek_bin: String,
     #[serde(default)]
     notification_command: Option<String>,
+    #[serde(default)]
+    open_url_command: Option<String>,
     #[serde(default)]
     gui: Option<RawGuiConfig>,
     #[serde(default)]
