@@ -27,6 +27,7 @@ use protocol::{
 
 use crate::attach::{attach_task, spawn_notification, spawn_open_url, window_dimension_to_u32};
 use crate::config::AppConfig;
+use crate::keyboard;
 use crate::message::{
     AgentChoice, AssistantForm, DiscoveryResult, InboxView, Message, ModalView, NotificationAction,
     ResolvedTemplate, StartForm, TemplateRecipe, ASSISTANT_AUTO_AGENT_LABEL, BLANK_TEMPLATE_LABEL,
@@ -627,6 +628,38 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                 height: window_dimension_to_u32(size.height),
             };
             tasks.push(save_ui_state_task(app));
+        }
+        Message::KeyPressed { key, modifiers } => {
+            // Replays the routed message(s) through this same reducer next
+            // tick, so a shortcut has no logic of its own to drift out of
+            // sync with the button it stands in for.
+            for message in keyboard::route_key_press(app, &key, modifiers) {
+                tasks.push(Task::done(message));
+            }
+        }
+        Message::CycleBlockedAgent => {
+            // Mirrors `SelectSession`'s selection-application, minus its
+            // mouse double-click bookkeeping, which has no keyboard
+            // equivalent.
+            let monitor = app.workspace.agent_monitor();
+            if let Some((host_id, session_id)) = monitor.blocked_at(app.blocked_cycle_index) {
+                app.blocked_cycle_index = app.blocked_cycle_index.wrapping_add(1);
+                app.workspace
+                    .select_session(host_id.clone(), session_id.clone());
+                app.ui_state.selection = Some(Selection::Session {
+                    host_id: host_id.clone(),
+                    session_id: session_id.clone(),
+                });
+                app.ui_state.active_tab = RightTab::Detail;
+                app.rename_edit = app
+                    .workspace
+                    .hosts
+                    .get(&host_id)
+                    .and_then(|host| host.sessions.get(&session_id.0))
+                    .and_then(|session| session.name.clone())
+                    .unwrap_or_default();
+                tasks.push(save_ui_state_task(app));
+            }
         }
     }
     Task::batch(tasks)

@@ -6,6 +6,7 @@
 mod attach;
 mod command;
 mod config;
+mod keyboard;
 mod message;
 mod runtime;
 mod selection;
@@ -198,6 +199,11 @@ struct PohunekApp {
     state_dir: Option<PathBuf>,
     status: Option<String>,
     notified_intents: usize,
+    /// Cursor into the agents monitor's blocked-session list, advanced by the
+    /// `b` keyboard shortcut (`keyboard::route_key_press`) so repeated
+    /// presses cycle through every blocked agent instead of reselecting the
+    /// first one.
+    blocked_cycle_index: usize,
 }
 
 impl PohunekApp {
@@ -235,6 +241,7 @@ impl PohunekApp {
                 state_dir: boot.state_dir,
                 status: boot.status,
                 notified_intents: 0,
+                blocked_cycle_index: 0,
             },
             task,
         )
@@ -263,8 +270,10 @@ impl PohunekApp {
 }
 
 fn subscription(app: &PohunekApp) -> Subscription<Message> {
-    let mut subscriptions =
-        vec![window::resize_events().map(|(_id, size)| Message::WindowResized(size))];
+    let mut subscriptions = vec![
+        window::resize_events().map(|(_id, size)| Message::WindowResized(size)),
+        keyboard::subscription(),
+    ];
     if let Ok(config) = &app.config {
         subscriptions.extend(app.hosts.iter().cloned().map(|host| {
             Subscription::run_with(
@@ -397,6 +406,7 @@ mod tests {
             state_dir: None,
             status: None,
             notified_intents: 0,
+            blocked_cycle_index: 0,
         };
         app.workspace.hosts.insert(host_id.clone(), host);
         app
@@ -477,6 +487,7 @@ mod tests {
             state_dir: None,
             status: None,
             notified_intents: 0,
+            blocked_cycle_index: 0,
         };
         app.workspace.hosts.insert(host_id.clone(), host);
         app.ui_state.selection = Some(Selection::Project {
@@ -580,6 +591,7 @@ mod tests {
             state_dir: None,
             status: None,
             notified_intents: 0,
+            blocked_cycle_index: 0,
         };
         app.workspace.hosts.insert(host_id.clone(), host);
         app.hosts.push(HostConfig::local(

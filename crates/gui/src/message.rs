@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use iced::keyboard::{Key, Modifiers};
 use iced::widget::text_editor;
 use iced::Size;
 use pohunek_gui_core::assistant::Intent as AssistantIntent;
@@ -295,6 +296,15 @@ pub(crate) enum Message {
     UrlOpened(Result<(), String>),
     WindowResized(Size),
     UiStateSaved(Result<(), String>),
+    /// A key press Iced did not already hand to a focused widget; routed by
+    /// `crate::keyboard::route_key_press` into zero or more of the messages
+    /// above.
+    KeyPressed {
+        key: Key,
+        modifiers: Modifiers,
+    },
+    /// The `b` shortcut: select the next blocked agent, wrapping around.
+    CycleBlockedAgent,
 }
 
 #[derive(Debug, Clone)]

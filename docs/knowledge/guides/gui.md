@@ -121,6 +121,51 @@ triage never lands behind a Linear/GitHub/Worktrees tab. Selecting a project
 or host leaves the operator's chosen tab as-is. The active tab persists across
 restarts in `UiState::active_tab` (`RightTab`).
 
+## Keyboard Shortcuts
+
+The GUI is keyboard-first. Global shortcuts (no modifier) fire only while no
+modal is open:
+
+- `1` `2` `3` `4`: switch to the Detail / Linear / GitHub / Worktrees tab.
+  `2`-`4` are no-ops without a project in scope, matching the tab strip's own
+  disabled state.
+- `i`: open the Inbox.
+- `b`: select the next blocked agent (agents-monitor order) and force the
+  Detail tab; repeated presses cycle through every blocked agent instead of
+  reselecting the first one. Backed by `AgentMonitor::blocked_at` in
+  `gui-core`, which indexes the blocked subset and wraps around.
+- `o`: open the currently selected session in a terminal (same as the session
+  pane's "Open in terminal" button).
+- `n`: open the "Start a session" modal.
+- `a`: open the "Start assistant" modal.
+- `r`: refresh the active tab — `project.show` for Detail/Worktrees, a Linear
+  issues fetch for Linear, a GitHub PRs+issues fetch for GitHub. No-op
+  without a project in scope.
+
+Modal-scoped shortcuts apply only while a modal is open:
+
+- `Esc`: in the Inbox message layer, step back to the list; otherwise close
+  the modal.
+- `Enter`: the modal's primary action — Start session, Start assistant,
+  Launch (Linear issue / GitHub pull request), or, in the Inbox message
+  layer, Open session. A GitHub issue modal and an empty Linear panel have no
+  Launch button, so Enter is a no-op there, matching the UI.
+- `Shift+Enter` in the Inbox message layer: Open session and also open it in
+  a terminal.
+
+The Inbox list layer's `Enter`/`j`/`k` row navigation is not yet implemented
+(needs a list-selection cursor); it is deferred to a follow-up pass, along
+with `/` to focus a provider tab's search field.
+
+Iced has no direct "is a text input focused" query, but a focused
+`text_input`/`text_editor` already consumes (captures) the key presses it
+handles — typed characters, Backspace, arrows, and Enter when the field has
+`on_submit` — so `keyboard::listen()` never even delivers those presses to
+the shortcut router; typing into a field cannot trigger a global shortcut.
+`Escape` is a partial exception: it unfocuses a field on its own without
+closing anything, so closing a modal from inside a focused field takes two
+`Escape` presses.
+
 ## Project And Worktree Management
 
 The GUI must use existing daemon methods:
@@ -401,6 +446,10 @@ When behavior must be checked against implementation, inspect:
 - `crates/gui/src/view/detail.rs` for the right-pane tab bar (`RightTab`
   routing, the context chip, and the disabled-without-scope tab styling) and
   the Detail tab's session/project/host/start-work bodies.
+- `crates/gui/src/keyboard.rs` for the keyboard shortcut router (the
+  focus-guard rationale, the global/modal key tables, and the blocked-agent
+  cycling) and `AgentMonitor::blocked_at` in `crates/gui-core/src/state.rs`
+  for the cycling logic it calls into.
 - `crates/gui/src/view/project.rs` and `crates/gui/src/view/provider.rs` for
   the Worktrees and Linear/GitHub tab bodies the tab bar promotes to full
   panes.

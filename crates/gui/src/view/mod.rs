@@ -4,7 +4,11 @@ mod detail;
 pub(crate) mod inbox;
 mod modals;
 mod project;
-mod provider;
+// `pub(crate)` so `crate::keyboard` can reuse the "what's selected" lookups
+// (`selected_linear_issue_in_state` and friends) for the provider-item
+// modal's `Enter` shortcut, the same way `inbox` above is widened for its
+// timestamp helpers.
+pub(crate) mod provider;
 mod session;
 mod tree;
 

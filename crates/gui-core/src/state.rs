@@ -1297,6 +1297,25 @@ pub struct AgentMonitor {
     pub sessions: Vec<AgentRow>,
 }
 
+impl AgentMonitor {
+    /// Returns the `index`-th blocked session in stable `sessions` order.
+    ///
+    /// `index` wraps around the blocked-session count, so a caller that
+    /// increments it on every call cycles through every blocked agent
+    /// instead of getting stuck on the first one. Backs the GUI's `b`
+    /// keyboard shortcut. Returns `None` when no agent is blocked.
+    #[must_use]
+    pub fn blocked_at(&self, index: usize) -> Option<(HostId, SessionId)> {
+        let blocked: Vec<&AgentRow> = self
+            .sessions
+            .iter()
+            .filter(|row| row.activity == Some(AgentActivity::Blocked))
+            .collect();
+        let row = *blocked.get(index.checked_rem(blocked.len())?)?;
+        Some((row.host_id.clone(), row.session_id.clone()))
+    }
+}
+
 fn apply_host_event(
     host: &mut HostView,
     host_id: &HostId,
@@ -1555,6 +1574,47 @@ mod tests {
         assert_eq!(monitor.working, 1);
         assert_eq!(monitor.idle, 1);
         assert_eq!(monitor.sessions[1].name.as_deref(), Some("triage build"));
+    }
+
+    #[test]
+    fn blocked_at_cycles_through_blocked_sessions_only() {
+        let mut workspace = Workspace::default();
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot(
+                "local",
+                vec![
+                    session("s-1", Some(AgentActivity::Blocked)),
+                    session("s-2", Some(AgentActivity::Working)),
+                    session("s-3", Some(AgentActivity::Blocked)),
+                ],
+            ),
+        });
+        let monitor = workspace.agent_monitor();
+        let host_id = HostId::new("local");
+
+        assert_eq!(
+            monitor.blocked_at(0),
+            Some((host_id.clone(), SessionId("s-1".to_owned())))
+        );
+        assert_eq!(
+            monitor.blocked_at(1),
+            Some((host_id.clone(), SessionId("s-3".to_owned())))
+        );
+        // Wraps back to the first blocked session rather than stopping.
+        assert_eq!(
+            monitor.blocked_at(2),
+            Some((host_id, SessionId("s-1".to_owned())))
+        );
+    }
+
+    #[test]
+    fn blocked_at_is_none_without_any_blocked_session() {
+        let mut workspace = Workspace::default();
+        workspace.apply(Message::HostSnapshotLoaded {
+            snapshot: snapshot("local", vec![session("s-1", Some(AgentActivity::Working))]),
+        });
+
+        assert_eq!(workspace.agent_monitor().blocked_at(0), None);
     }
 
     #[test]
