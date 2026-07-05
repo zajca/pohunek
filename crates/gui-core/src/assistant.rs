@@ -19,7 +19,8 @@ use protocol::{
 };
 use serde::Serialize;
 
-use crate::{connect_client, ConnectionOptions, CoreError, HostConfig, HostTransport};
+use crate::connection::connect_client;
+use crate::{ConnectionOptions, CoreError, HostConfig, HostTransport};
 
 const SNAPSHOT_FILE: &str = "snapshot.json";
 /// Assistant launch intent.
