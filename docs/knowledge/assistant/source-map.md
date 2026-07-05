@@ -39,8 +39,10 @@ Native GUI client:
 
 - `crates/gui/src/main.rs`
 - `crates/gui/src/runtime.rs`
+- `crates/gui/src/view/inbox.rs`
 - `crates/gui-core/src/assistant.rs`
 - `crates/gui-core/src/lib.rs`
+- `crates/gui-core/src/state.rs`
 - `crates/gui-core/src/providers/linear.rs`
 - `crates/gui-core/src/providers/github.rs`
 - `crates/gui-core/tests/loopback.rs`
@@ -80,6 +82,7 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/integration/assets/claude/pohunek-agent-notify.sh`
 - `crates/daemon/src/notifications/mod.rs`
 - `crates/daemon/src/notifications/store.rs`
+- `crates/daemon/src/notifications/coordinator.rs`
 - `crates/daemon/src/notifications/policy.rs`
 - `crates/daemon/src/notifications/projector.rs`
 - `crates/daemon/src/paths.rs`

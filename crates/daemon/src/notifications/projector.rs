@@ -19,8 +19,8 @@ use tracing::warn;
 use crate::session::SessionRegistry;
 
 use super::{
-    is_attention_create, policy_enables_kind, AttentionCoordinator, NotificationService,
-    ATTENTION_DEDUPE_KEY_PREFIX,
+    is_debounced_create, policy_enables_kind, AttentionCoordinator, NotificationService,
+    ATTENTION_DEDUPE_KEY_PREFIX, TURN_DEDUPE_KEY_PREFIX,
 };
 
 /// Provider namespace used for daemon-derived notification records.
@@ -46,9 +46,9 @@ pub struct NotificationProjector {
 impl NotificationProjector {
     /// Spawn a projector task on the session event broadcast.
     ///
-    /// Derived attention notifications are routed through `attention` (the
-    /// debounce coordinator) rather than persisted directly, and the resume edge
-    /// resolves attention through it too.
+    /// Derived debounced session notifications are routed through `attention`
+    /// (the debounce coordinator) rather than persisted directly, and the resume
+    /// edge resolves session-scoped notification keys through it too.
     #[must_use]
     pub fn spawn(
         sessions: &SessionRegistry,
@@ -164,13 +164,24 @@ pub fn attention_dedupe_key(session_id: &SessionId) -> String {
     format!("{ATTENTION_DEDUPE_KEY_PREFIX}:{}", session_id.0)
 }
 
-/// Resolve attention notifications for a resumed session via the coordinator.
+/// Return the shared session turn-completion dedupe key.
+///
+/// Scheme: `turn:<session_id>`. The key keeps at most one unread completed-turn
+/// notification visible for a session while preserving older superseded turns in
+/// history.
+#[must_use]
+pub fn turn_dedupe_key(session_id: &SessionId) -> String {
+    format!("{TURN_DEDUPE_KEY_PREFIX}:{}", session_id.0)
+}
+
+/// Resolve session notifications for a resumed session via the coordinator.
 ///
 /// The coordinator unifies both paths: it cancels any still-pending (debounced)
-/// attention notification for this session so it never surfaces, and acknowledges
-/// any already-visible attention record sharing the session's dedupe key.
-fn resolve_session_attention(attention: &AttentionCoordinator, session_id: &SessionId) {
+/// session notification for this session so it never surfaces, and acknowledges
+/// any already-visible record sharing the session's dedupe key.
+fn resolve_session_notifications(attention: &AttentionCoordinator, session_id: &SessionId) {
     attention.resolve(attention_dedupe_key(session_id));
+    attention.resolve(turn_dedupe_key(session_id));
 }
 
 /// Return a deterministic projector source id.
@@ -301,15 +312,16 @@ impl ProjectorState {
         let previous = self
             .activity_by_session
             .insert(session_id.clone(), activity);
-        // A session that resumes active work no longer needs owner attention, so
-        // resolve any attention notification sharing its dedupe key through the
-        // coordinator (cancelling a still-pending debounced one and acknowledging
-        // any already-visible one). Only the transition edge into `Working`
-        // triggers the resolve so repeated working events do not rescan the store.
+        // A session that resumes active work no longer needs owner attention or
+        // an unread turn-completed row, so resolve both session dedupe keys
+        // through the coordinator (cancelling still-pending debounced records and
+        // acknowledging already-visible ones). Only the transition edge into
+        // `Working` triggers the resolve so repeated working events do not rescan
+        // the store.
         // Do not gate on the previous state being `Blocked`: provider hooks create
         // attention notifications without the daemon observing a blocked edge.
         if activity == AgentActivity::Working && previous != Some(AgentActivity::Working) {
-            resolve_session_attention(attention, session_id);
+            resolve_session_notifications(attention, session_id);
         }
         if activity != AgentActivity::Blocked || previous == Some(AgentActivity::Blocked) {
             return None;
@@ -480,8 +492,8 @@ fn create_pending_notification(
     attention: &AttentionCoordinator,
     pending: PendingNotification,
 ) {
-    if is_attention_create(pending.kind, pending.params.dedupe_key.as_deref()) {
-        defer_pending_attention(notifications, attention, pending);
+    if is_debounced_create(pending.kind, pending.params.dedupe_key.as_deref()) {
+        defer_pending_notification(notifications, attention, pending);
         return;
     }
     if let Err(err) = notifications.create(pending.params) {
@@ -499,11 +511,11 @@ async fn create_pending_notification_blocking(
     attention: &AttentionCoordinator,
     pending: PendingNotification,
 ) {
-    if is_attention_create(pending.kind, pending.params.dedupe_key.as_deref()) {
+    if is_debounced_create(pending.kind, pending.params.dedupe_key.as_deref()) {
         // Preparing a deferred record does no store I/O and deferring is a
         // channel send, so this stays on the runtime worker; the coordinator
         // commits after the debounce window.
-        defer_pending_attention(&notifications, attention, pending);
+        defer_pending_notification(&notifications, attention, pending);
         return;
     }
     let session_id = pending.session_id;
@@ -533,11 +545,11 @@ async fn create_pending_notification_blocking(
     }
 }
 
-/// Route a derived attention notification through the debounce coordinator.
+/// Route a derived session notification through the debounce coordinator.
 ///
 /// Best-effort: a preparation failure is logged and swallowed so the projector
 /// event loop keeps consuming session events.
-fn defer_pending_attention(
+fn defer_pending_notification(
     notifications: &NotificationService,
     attention: &AttentionCoordinator,
     pending: PendingNotification,
@@ -549,7 +561,7 @@ fn defer_pending_attention(
                 error = %err,
                 session_id = %pending.session_id.0,
                 kind = pending.kind.as_str(),
-                "failed to prepare derived attention notification for debounce"
+                "failed to prepare derived session notification for debounce"
             );
         }
     }
@@ -730,6 +742,17 @@ mod tests {
         service.set_policy(policy).expect("set notification policy");
     }
 
+    fn enable_turn_completed(service: &NotificationService) {
+        let mut policy = default_policy();
+        policy.enabled = NotificationKindPolicy {
+            turn_completed: true,
+            ..policy.enabled
+        };
+        policy.codex = None;
+        policy.claude = None;
+        service.set_policy(policy).expect("set notification policy");
+    }
+
     fn provider_approval_params(session_id: &str) -> NotificationCreateParams {
         let session_id = SessionId(session_id.to_owned());
         NotificationCreateParams {
@@ -747,6 +770,27 @@ mod tests {
             agent_kind: Some(AgentKind::Codex),
             source_id: Some("codex:s-1:permission:1".to_owned()),
             dedupe_key: Some(attention_dedupe_key(&session_id)),
+            project_id: Some("p-test".to_owned()),
+        }
+    }
+
+    fn provider_turn_params(session_id: &str) -> NotificationCreateParams {
+        let session_id = SessionId(session_id.to_owned());
+        NotificationCreateParams {
+            source: NotificationSource {
+                provider: "codex".to_owned(),
+                provider_event: "Stop".to_owned(),
+                host_local_source_id: "codex-stop-s-1".to_owned(),
+            },
+            kind: NotificationKind::TurnCompleted,
+            severity: NotificationSeverity::Info,
+            title: "Turn completed".to_owned(),
+            body: "Codex completed a turn.".to_owned(),
+            metadata: BTreeMap::new(),
+            session_id: Some(session_id.clone()),
+            agent_kind: Some(AgentKind::Codex),
+            source_id: Some("codex:s-1:stop:1".to_owned()),
+            dedupe_key: Some(format!("turn:{}", session_id.0)),
             project_id: Some("p-test".to_owned()),
         }
     }
@@ -854,6 +898,33 @@ mod tests {
         let created = list(&service);
         assert_eq!(created.len(), 1);
         assert_eq!(created[0].kind, NotificationKind::ApprovalRequired);
+        assert_eq!(created[0].status, NotificationStatus::Unread);
+
+        projector.handle_event(
+            &service,
+            &attention,
+            &agent_state_event("s-1", AgentActivity::Working),
+        );
+        settle().await;
+
+        let resolved = list(&service);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].status, NotificationStatus::Acknowledged);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn working_acknowledges_provider_hook_turn_notification() {
+        let service = service("resolve-turn-hook");
+        enable_turn_completed(&service);
+        let (attention, _task) = AttentionCoordinator::spawn(service.clone());
+        let mut projector = ProjectorState::default();
+
+        service
+            .create(provider_turn_params("s-1"))
+            .expect("create provider turn notification");
+        let created = list(&service);
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].kind, NotificationKind::TurnCompleted);
         assert_eq!(created[0].status, NotificationStatus::Unread);
 
         projector.handle_event(

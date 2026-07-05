@@ -3,7 +3,7 @@
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # POHUNEK_INTEGRATION_ID=codex
-# POHUNEK_INTEGRATION_VERSION=1
+# POHUNEK_INTEGRATION_VERSION=2
 #
 # Codex lifecycle notification hook. Fire-and-forget: any missing handshake
 # env, missing python3, invalid input, or socket failure is a silent no-op
@@ -199,6 +199,8 @@ if session_id:
     params["session_id"] = session_id
 if session_id and event["attention"]:
     params["dedupe_key"] = f"attention:{session_id}"
+elif session_id and event["kind"] == "turn_completed":
+    params["dedupe_key"] = f"turn:{session_id}"
 
 send_request("notification.create", params, f"{source_id}:create")
 PY

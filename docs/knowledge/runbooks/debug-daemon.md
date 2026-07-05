@@ -57,27 +57,31 @@ For durable notification issues:
     `dedupe_key`, `source.provider`, `source.provider_event`, and `created_at`.
     Session attention dedupe uses `attention:<session_id>` and only applies
     inside the policy's `attention_dedupe_window_secs`.
-11. If a stale `agent_blocked` or `approval_required` record stays `unread`
-    after the agent already resumed, check that the daemon still observes the
-    session returning to `working` activity. Attention notifications
-    auto-resolve to `acknowledged` when the projector sees the session's
-    activity transition into `working`, keyed by `attention:<session_id>`, so
-    both hook- and projector-produced records are cleared together. A record
-    that never self-resolves usually means no `working` activity edge reached
-    the projector (for example a session whose activity is not being reported).
-12. If an expected `agent_blocked` or `approval_required` notification does not
-    (yet) show up in `pohunek notifications list --json` or
-    `pohunek notifications watch --json`, it may simply be debounced: the
-    daemon holds attention creates pending in memory for
-    `attention_debounce_secs` (5 seconds by default, see
-    `pohunek notifications policy get --json`) before committing and emitting
-    `notification_created`. Wait past the configured window and re-check; if
-    the session resolved back to `working` inside the window, the pending
-    record was dropped and will never appear — that is the intended debounce
-    behavior, not a bug. Pending debounced entries are in-memory only and are
-    not persisted, so a daemon restart while an entry is pending drops that
-    transient signal; this is expected for a sub-10s window and is not a data
-    loss bug worth chasing.
+11. If stale `agent_blocked`, `approval_required`, or `turn_completed` records
+    stay `unread` after the agent already resumed, check that the daemon still
+    observes the session returning to `working` activity. Session notifications
+    auto-resolve to `acknowledged` when the projector sees the transition into
+    `working`, keyed by `attention:<session_id>` and `turn:<session_id>`, so
+    hook- and projector-produced records are cleared together. A record that
+    never self-resolves usually means no `working` activity edge reached the
+    projector (for example a session whose activity is not being reported).
+12. If repeated `turn_completed` rows appear for one session, inspect their
+    `dedupe_key`. Modern hooks send `turn:<session_id>` for `Stop`; a newer
+    unread turn supersedes older unread turns for the same key, and a visible
+    attention record supersedes the unread turn twin. Missing `turn:` keys mean
+    the host likely needs `pohunek integration install` so managed hooks refresh.
+13. If an expected `agent_blocked`, `approval_required`, or `turn_completed`
+    notification does not (yet) show up in `pohunek notifications list --json`
+    or `pohunek notifications watch --json`, it may simply be debounced: the
+    daemon holds session creates pending in memory for `attention_debounce_secs`
+    (5 seconds by default, see `pohunek notifications policy get --json`) before
+    committing and emitting `notification_created`. Wait past the configured
+    window and re-check; if the session resolved back to `working` inside the
+    window, the pending record was dropped and will never appear — that is the
+    intended debounce behavior, not a bug. Pending debounced entries are
+    in-memory only and are not persisted, so a daemon restart while an entry is
+    pending drops that transient signal; this is expected for a sub-10s window
+    and is not a data loss bug worth chasing.
 
 The durable store is under the daemon data directory in `notifications/`.
 `notifications.jsonl` is append-only record history, while `policy.json` is the

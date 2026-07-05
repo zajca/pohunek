@@ -7,15 +7,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use protocol::{
-    NotificationId, NotificationListParams, NotificationListResult, NotificationPolicy,
-    NotificationRecord, NotificationStatus,
+    NotificationId, NotificationKind, NotificationListParams, NotificationListResult,
+    NotificationPolicy, NotificationRecord, NotificationStatus,
 };
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::{
-    apply_status, inside_attention_window, is_attention_kind, is_valid_status_transition,
-    parse_timestamp, same_source_namespace, source_priority, NotificationError, SourcePriority,
+    apply_status, inside_attention_window, is_attention_dedupe_key, is_attention_kind,
+    is_turn_dedupe_key, is_valid_status_transition, parse_timestamp, same_source_namespace,
+    source_priority, NotificationError, SourcePriority, TURN_DEDUPE_KEY_PREFIX,
 };
 
 /// Directory under the daemon data dir holding notification state.
@@ -68,14 +69,28 @@ struct StoreState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum StoreAction {
-    Created { record: NotificationRecord },
-    Updated { record: NotificationRecord },
-    Deleted { record: NotificationRecord },
+    Created {
+        record: NotificationRecord,
+    },
+    CreatedWithUpdates {
+        record: NotificationRecord,
+        updated: Vec<NotificationRecord>,
+    },
+    Updated {
+        record: NotificationRecord,
+    },
+    Deleted {
+        record: NotificationRecord,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CreateOutcome {
     Created(NotificationRecord),
+    CreatedWithUpdates {
+        record: NotificationRecord,
+        updated: Vec<NotificationRecord>,
+    },
     Existing(NotificationRecord),
     Updated(NotificationRecord),
 }
@@ -146,11 +161,51 @@ impl NotificationStore {
             return Ok(CreateOutcome::Existing(existing));
         }
 
+        if let Some(dedupe_key) = candidate
+            .dedupe_key
+            .as_deref()
+            .filter(|dedupe_key| is_turn_dedupe_key(dedupe_key))
+            .filter(|_| candidate.kind == NotificationKind::TurnCompleted)
+        {
+            let updated = supersede_unread_records(
+                &state.records,
+                dedupe_key,
+                candidate.kind,
+                &candidate.id,
+                &candidate.created_at,
+            );
+            if updated.is_empty() {
+                append_action_locked(
+                    &self.path,
+                    &mut state,
+                    StoreAction::Created {
+                        record: candidate.clone(),
+                    },
+                )?;
+                return Ok(CreateOutcome::Created(candidate));
+            }
+            append_action_locked(
+                &self.path,
+                &mut state,
+                StoreAction::CreatedWithUpdates {
+                    record: candidate.clone(),
+                    updated: updated.clone(),
+                },
+            )?;
+            return Ok(CreateOutcome::CreatedWithUpdates {
+                record: candidate,
+                updated,
+            });
+        }
+
         if let Some(dedupe_key) = candidate.dedupe_key.as_deref() {
             let incoming_created_at = parse_timestamp(&candidate.created_at)?;
             let incoming_priority = source_priority(&candidate.source);
             for existing in state.records.values().cloned() {
-                if existing.status == NotificationStatus::Deleted {
+                if !matches!(
+                    existing.status,
+                    NotificationStatus::Unread | NotificationStatus::Read
+                ) {
                     continue;
                 }
                 if existing.dedupe_key.as_deref() != Some(dedupe_key) {
@@ -197,6 +252,43 @@ impl NotificationStore {
             },
         )?;
         Ok(CreateOutcome::Created(candidate))
+    }
+
+    /// Supersede unread `turn_completed` records consumed by visible attention.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationError`] when appending an update action fails.
+    pub(crate) fn supersede_turns_for_attention(
+        &self,
+        attention: &NotificationRecord,
+        now: &str,
+    ) -> Result<Vec<NotificationRecord>, NotificationError> {
+        if !is_attention_kind(attention.kind) {
+            return Ok(Vec::new());
+        }
+        if !matches!(
+            attention.status,
+            NotificationStatus::Unread | NotificationStatus::Read
+        ) {
+            return Ok(Vec::new());
+        }
+        let Some(session_id) = attention.session_id.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let turn_key = format!("{TURN_DEDUPE_KEY_PREFIX}:{}", session_id.0);
+        supersede_unread_records_locked(
+            &self.path,
+            &mut state,
+            &turn_key,
+            NotificationKind::TurnCompleted,
+            &attention.id,
+            now,
+        )
     }
 
     /// Load the persisted notification policy or return `fallback`.
@@ -363,18 +455,19 @@ impl NotificationStore {
         Ok(Some(record))
     }
 
-    /// Acknowledge active attention notifications sharing `dedupe_key`.
+    /// Acknowledge active session notifications sharing `dedupe_key`.
     ///
-    /// Marks `unread` and `read` `agent_blocked`/`approval_required` records that
-    /// carry the given dedupe key as `acknowledged`, appends one update action
-    /// per record, and returns the acknowledged records. Records already
-    /// acknowledged, archived, or deleted, and non-attention kinds, are left
-    /// untouched, so repeated calls are idempotent.
+    /// For `attention:<session_id>`, marks `unread` and `read`
+    /// `agent_blocked`/`approval_required` records as `acknowledged`. For
+    /// `turn:<session_id>`, marks `unread` and `read` `turn_completed` records
+    /// as `acknowledged`. Records already acknowledged, archived, deleted, or
+    /// unrelated to the key prefix are left untouched, so repeated calls are
+    /// idempotent.
     ///
     /// # Errors
     ///
     /// Returns [`NotificationError`] when appending an update action fails.
-    pub(crate) fn resolve_attention(
+    pub(crate) fn resolve_session_notifications(
         &self,
         dedupe_key: &str,
         now: &str,
@@ -391,7 +484,7 @@ impl NotificationStore {
             .values()
             .filter(|record| {
                 record.dedupe_key.as_deref() == Some(dedupe_key)
-                    && is_attention_kind(record.kind)
+                    && resolve_key_matches_kind(dedupe_key, record.kind)
                     && matches!(
                         record.status,
                         NotificationStatus::Unread | NotificationStatus::Read
@@ -532,6 +625,57 @@ fn find_existing_source(
     })
 }
 
+fn supersede_unread_records_locked(
+    path: &Path,
+    state: &mut StoreState,
+    dedupe_key: &str,
+    kind: NotificationKind,
+    superseded_by: &NotificationId,
+    now: &str,
+) -> Result<Vec<NotificationRecord>, NotificationError> {
+    let updated = supersede_unread_records(&state.records, dedupe_key, kind, superseded_by, now);
+    for record in &updated {
+        append_action_locked(
+            path,
+            state,
+            StoreAction::Updated {
+                record: record.clone(),
+            },
+        )?;
+    }
+    Ok(updated)
+}
+
+fn supersede_unread_records(
+    records: &BTreeMap<String, NotificationRecord>,
+    dedupe_key: &str,
+    kind: NotificationKind,
+    superseded_by: &NotificationId,
+    now: &str,
+) -> Vec<NotificationRecord> {
+    records
+        .values()
+        .filter(|record| {
+            record.kind == kind
+                && record.status == NotificationStatus::Unread
+                && record.dedupe_key.as_deref() == Some(dedupe_key)
+        })
+        .cloned()
+        .map(|mut record| {
+            apply_status(&mut record, NotificationStatus::Acknowledged, now);
+            record.superseded_by = Some(superseded_by.clone());
+            record
+        })
+        .collect()
+}
+
+fn resolve_key_matches_kind(dedupe_key: &str, kind: NotificationKind) -> bool {
+    if is_attention_dedupe_key(dedupe_key) {
+        return is_attention_kind(kind);
+    }
+    is_turn_dedupe_key(dedupe_key) && kind == NotificationKind::TurnCompleted
+}
+
 fn upgrade_projector(
     mut existing: NotificationRecord,
     replacement: &NotificationRecord,
@@ -585,12 +729,19 @@ fn is_tolerated_trailing_partial(terminated: bool, err: &serde_json::Error) -> b
 }
 
 fn apply_action(records: &mut BTreeMap<String, NotificationRecord>, action: StoreAction) {
-    let record = match action {
+    match action {
         StoreAction::Created { record }
         | StoreAction::Updated { record }
-        | StoreAction::Deleted { record } => record,
-    };
-    records.insert(record.id.0.clone(), record);
+        | StoreAction::Deleted { record } => {
+            records.insert(record.id.0.clone(), record);
+        }
+        StoreAction::CreatedWithUpdates { record, updated } => {
+            records.insert(record.id.0.clone(), record);
+            for record in updated {
+                records.insert(record.id.0.clone(), record);
+            }
+        }
+    }
 }
 
 fn sort_records_for_list(records: &mut [NotificationRecord]) {
@@ -782,7 +933,7 @@ mod tests {
         store.append_created(other).expect("append other session");
 
         let resolved = store
-            .resolve_attention("attention:s-1", "2026-07-03T10:05:00Z")
+            .resolve_session_notifications("attention:s-1", "2026-07-03T10:05:00Z")
             .expect("resolve attention");
 
         assert_eq!(resolved.len(), 2);
@@ -818,15 +969,94 @@ mod tests {
         store.append_created(errored).expect("append error");
 
         let first = store
-            .resolve_attention("attention:s-1", "2026-07-03T10:05:00Z")
+            .resolve_session_notifications("attention:s-1", "2026-07-03T10:05:00Z")
             .expect("first resolve");
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].id.0, "n-1");
 
         let second = store
-            .resolve_attention("attention:s-1", "2026-07-03T10:06:00Z")
+            .resolve_session_notifications("attention:s-1", "2026-07-03T10:06:00Z")
             .expect("second resolve");
         assert!(second.is_empty());
+
+        let statuses: BTreeMap<String, NotificationStatus> = store
+            .all()
+            .into_iter()
+            .map(|record| (record.id.0, record.status))
+            .collect();
+        assert_eq!(statuses["n-1"], NotificationStatus::Acknowledged);
+        assert_eq!(statuses["n-2"], NotificationStatus::Unread);
+    }
+
+    #[test]
+    fn second_unread_turn_supersedes_previous_turn_without_time_window() {
+        let data_dir = temp_data_dir("turn-supersede");
+        let store = NotificationStore::open(&data_dir).expect("open store");
+
+        let mut first = record("n-1", "2026-07-03T10:00:00Z");
+        first.kind = NotificationKind::TurnCompleted;
+        first.dedupe_key = Some("turn:s-1".to_owned());
+        store
+            .create_or_dedupe(first, 120)
+            .expect("first turn create");
+
+        let mut second = record("n-2", "2026-07-03T11:00:00Z");
+        second.kind = NotificationKind::TurnCompleted;
+        second.dedupe_key = Some("turn:s-1".to_owned());
+        store
+            .create_or_dedupe(second, 120)
+            .expect("second turn create");
+
+        let log = std::fs::read_to_string(store.path()).expect("read notification log");
+        assert_eq!(
+            log.lines().count(),
+            2,
+            "second turn supersede and replacement must be one durable action"
+        );
+
+        let reopened = NotificationStore::open(&data_dir).expect("reopen store");
+        let records: BTreeMap<String, protocol::NotificationRecord> = store
+            .all()
+            .into_iter()
+            .map(|record| (record.id.0.clone(), record))
+            .collect();
+        let replayed: BTreeMap<String, protocol::NotificationRecord> = reopened
+            .all()
+            .into_iter()
+            .map(|record| (record.id.0.clone(), record))
+            .collect();
+        assert_eq!(records, replayed);
+        assert_eq!(records["n-1"].status, NotificationStatus::Acknowledged);
+        assert_eq!(
+            records["n-1"].superseded_by,
+            Some(NotificationId("n-2".to_owned()))
+        );
+        assert_eq!(records["n-2"].status, NotificationStatus::Unread);
+        assert_eq!(records["n-2"].superseded_by, None);
+    }
+
+    #[test]
+    fn resolve_session_notifications_acknowledges_turn_keyed_turns_only() {
+        let data_dir = temp_data_dir("resolve-turn");
+        let store = NotificationStore::open(&data_dir).expect("open store");
+
+        let mut turn = record("n-1", "2026-07-03T10:00:00Z");
+        turn.kind = NotificationKind::TurnCompleted;
+        turn.dedupe_key = Some("turn:s-1".to_owned());
+        store.append_created(turn).expect("append turn");
+
+        let mut attention = record("n-2", "2026-07-03T10:00:01Z");
+        attention.kind = NotificationKind::AgentBlocked;
+        attention.dedupe_key = Some("turn:s-1".to_owned());
+        store.append_created(attention).expect("append attention");
+
+        let resolved = store
+            .resolve_session_notifications("turn:s-1", "2026-07-03T10:05:00Z")
+            .expect("resolve turn");
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].id.0, "n-1");
+        assert_eq!(resolved[0].status, NotificationStatus::Acknowledged);
 
         let statuses: BTreeMap<String, NotificationStatus> = store
             .all()

@@ -251,7 +251,9 @@ Each host snapshot seeds recent records through `notification.list`, and the
 subscription stream keeps the Inbox current with `notification_created`,
 `notification_updated`, and `notification_deleted` events. A host whose daemon
 does not support notifications may still connect; notification seeding is
-non-fatal for the GUI.
+non-fatal for the GUI. The GUI does not deduplicate notification rows locally;
+it renders the daemon's durable records and lifecycle events as the source of
+truth.
 
 The Inbox is a modal, not a pane: the left-rail Inbox button and each host's
 `inbox N` tree row open it over the workspace rather than replacing the detail
@@ -268,6 +270,13 @@ record read or acknowledged does not reshuffle rows under the cursor. Deleted
 records are removed from the Inbox when the daemon reports deleted status or a
 delete event; if the record currently open in the message layer is deleted,
 the modal steps back to the list instead of showing a dead end.
+Daemon-side resolve and supersede processing controls what remains actionable:
+when the operator resumes a session, visible `attention:<session_id>` and
+`turn:<session_id>` records are acknowledged and fall out of `Needs action` but
+remain visible in `All`; when a newer turn or attention record supersedes an
+older unread `turn_completed`, the older record is also acknowledged with a
+`superseded_by` link. At most one unread `turn_completed` row is visible for a
+session.
 
 Opening a message auto-marks it read (there is no separate "Mark read"
 action) and shows its body, metadata, and actions. When the record has a
@@ -281,8 +290,10 @@ delete.
 Fresh durable notifications are the single source for desktop OS notification
 intents. The GUI raises an OS notification only for newly created records whose
 severity is `action_required` or `error`; informational, success, and warning
-records land in the Inbox silently. Updates do not re-raise desktop
-notifications.
+records land in the Inbox silently. Pending debounced records do not raise OS
+notifications until the daemon emits a durable `notification_created` event, and
+`notification_updated` events from resolve or supersede processing do not
+re-raise desktop notifications.
 
 ## Prompt Management
 
@@ -443,6 +454,8 @@ When behavior must be checked against implementation, inspect:
 - `crates/gui/src/main.rs` for config loading, attach spawning, and Iced shell
   behavior, provider task spawning, prompt management controls, provider panels,
   and Inbox rendering/actions.
+- `crates/gui/src/view/inbox.rs` for Inbox list/detail rendering, modal
+  controls, and notification action buttons.
 - `crates/gui/src/view/detail.rs` for the right-pane tab bar (`RightTab`
   routing, the context chip, and the disabled-without-scope tab styling) and
   the Detail tab's session/project/host/start-work bodies.
@@ -459,6 +472,13 @@ When behavior must be checked against implementation, inspect:
   prompt/action state, prompt preview rendering, provider request state, linked
   metadata helpers, Inbox notification state, OS notification intents, and
   attach command rendering.
+- `crates/gui-core/src/state.rs` for notification snapshot/event application,
+  Inbox scopes, and OS notification intent derivation.
+- `crates/daemon/src/notifications/mod.rs`,
+  `crates/daemon/src/notifications/store.rs`,
+  `crates/daemon/src/notifications/coordinator.rs`, and
+  `crates/daemon/src/notifications/projector.rs` for durable notification
+  dedupe, debounce, resolve-on-resume, and supersede semantics.
 - `crates/gui-core/src/providers/linear.rs` for Linear GraphQL requests,
   keyring-token lookup boundaries, and token lookup timeouts.
 - `crates/gui-core/src/providers/github.rs` for `gh` command execution, timeout

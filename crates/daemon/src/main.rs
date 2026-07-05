@@ -119,11 +119,11 @@ async fn run() -> Result<(), DaemonError> {
         &sessions,
         &notifications,
     )?;
-    // Spawn the attention debounce coordinator: it owns the lifecycle of
-    // agent_blocked/approval_required notifications, holding them for the policy
-    // debounce window so transient attention states never surface. Both producers
-    // (the notification.create handler and the projector) route attention through
-    // its clonable command handle.
+    // Spawn the debounce coordinator: it owns the lifecycle of session-scoped
+    // agent_blocked/approval_required and turn_completed notifications, holding
+    // them for the policy debounce window so transient signals never surface.
+    // Both producers (the notification.create handler and the projector) route
+    // debounced notifications through its clonable command handle.
     let (attention_coordinator, attention_task) =
         AttentionCoordinator::spawn(notifications.clone());
     let notification_projector = NotificationProjector::spawn(

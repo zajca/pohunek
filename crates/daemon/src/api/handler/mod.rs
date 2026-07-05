@@ -86,7 +86,7 @@ impl DaemonState {
         self
     }
 
-    /// Attach the attention debounce coordinator to shared daemon state.
+    /// Attach the session notification debounce coordinator to shared daemon state.
     #[must_use]
     pub fn with_attention_coordinator(mut self, attention: AttentionCoordinator) -> Self {
         self.attention = Some(attention);
@@ -446,6 +446,46 @@ mod tests {
         )
     }
 
+    fn turn_create_request(id: &str) -> Request {
+        let params = protocol::NotificationCreateParams {
+            source: protocol::NotificationSource {
+                provider: "codex".to_owned(),
+                provider_event: "Stop".to_owned(),
+                host_local_source_id: "codex-stop-s-1".to_owned(),
+            },
+            kind: protocol::NotificationKind::TurnCompleted,
+            severity: protocol::NotificationSeverity::Info,
+            title: "Turn completed".to_owned(),
+            body: "Codex completed a turn.".to_owned(),
+            metadata: BTreeMap::new(),
+            session_id: Some(SessionId("s-1".to_owned())),
+            agent_kind: Some(AgentKind::Codex),
+            source_id: Some("codex:s-1:stop:1".to_owned()),
+            dedupe_key: Some("turn:s-1".to_owned()),
+            project_id: Some("p-1".to_owned()),
+        };
+        Request::new(
+            id,
+            method::NOTIFICATION_CREATE,
+            serde_json::to_value(params).expect("params serialize"),
+        )
+    }
+
+    fn enable_all_notification_kinds(notifications: &crate::notifications::NotificationService) {
+        let mut policy = crate::notifications::default_policy();
+        policy.enabled = protocol::NotificationKindPolicy {
+            agent_blocked: true,
+            approval_required: true,
+            turn_completed: true,
+            session_finished: true,
+            error: true,
+            system: true,
+        };
+        policy.codex = None;
+        policy.claude = None;
+        notifications.set_policy(policy).expect("set policy");
+    }
+
     async fn create_result(
         state: &DaemonState,
         request: &Request,
@@ -474,12 +514,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn notification_create_defers_attention_but_lists_non_attention_immediately() {
+    async fn notification_create_defers_session_notifications_but_lists_others_immediately() {
         use crate::notifications::{AttentionCoordinator, NotificationService};
         use protocol::NotificationKind;
 
         let notifications = NotificationService::open(&notification_temp_dir("defer"))
             .expect("notification service opens");
+        enable_all_notification_kinds(&notifications);
         let (attention, _task) = AttentionCoordinator::spawn(notifications.clone());
         let state = DaemonState::new(
             HealthInfo::new("test"),
@@ -496,6 +537,15 @@ mod tests {
         assert!(
             list_records(&state).await.is_empty(),
             "an attention create must be debounced, not immediately listable"
+        );
+
+        // Turn create: it is session-scoped and follows the same debounce window.
+        let turn = create_result(&state, &turn_create_request("turn-create")).await;
+        assert!(turn.created);
+        assert_eq!(turn.record.kind, NotificationKind::TurnCompleted);
+        assert!(
+            list_records(&state).await.is_empty(),
+            "a turn_completed create must also be debounced, not immediately listable"
         );
 
         // A non-attention create persists and is listable immediately.
@@ -523,9 +573,17 @@ mod tests {
         }
 
         let flushed = list_records(&state).await;
-        assert_eq!(flushed.len(), 2, "the debounced attention record flushes");
+        assert_eq!(
+            flushed.len(),
+            3,
+            "the debounced session notifications flush"
+        );
         assert!(flushed.iter().any(|record| record.id == created.record.id
             && record.kind == NotificationKind::ApprovalRequired));
+        assert!(flushed
+            .iter()
+            .any(|record| record.id == turn.record.id
+                && record.kind == NotificationKind::TurnCompleted));
     }
 
     #[tokio::test]

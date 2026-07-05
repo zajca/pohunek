@@ -1,15 +1,15 @@
-//! Attention notification debounce coordinator.
+//! Session notification debounce coordinator.
 //!
-//! A single async task owns the lifecycle of attention notifications
-//! (`agent_blocked` / `approval_required`) end to end and is the only place that
-//! decides whether such a notification ever becomes visible. Producers (the
-//! `notification.create` handler and the session-state projector) do not persist
-//! attention creates directly; they mint the record, hand it to this task via a
-//! command channel, and the task holds it *pending* for the policy debounce
-//! window. If the attention state resolves within the window the record is
-//! dropped and nothing is ever persisted or broadcast; otherwise it is committed
-//! through the store and a `notification_created` event is emitted exactly as an
-//! immediate create would be.
+//! A single async task owns the lifecycle of debounced session notifications
+//! (`agent_blocked`, `approval_required`, and session-scoped `turn_completed`)
+//! end to end and is the only place that decides whether such a notification ever
+//! becomes visible. Producers (the `notification.create` handler and the
+//! session-state projector) do not persist debounced creates directly; they mint
+//! the record, hand it to this task via a command channel, and the task holds it
+//! *pending* for the policy debounce window. If the session resumes within the
+//! window the record is dropped and nothing is ever persisted or broadcast;
+//! otherwise it is committed through the store and a `notification_created` event
+//! is emitted exactly as an immediate create would be.
 //!
 //! Pending entries are in-memory only. A daemon restart while an entry is pending
 //! (shorter than the debounce window) drops that transient signal, which is
@@ -24,10 +24,11 @@ use futures::StreamExt;
 use protocol::{NotificationRecord, NotificationSource};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::time::DelayQueue;
 use tracing::warn;
 
-use super::{source_priority, NotificationService, SourcePriority};
+use super::{is_turn_dedupe_key, source_priority, NotificationService, SourcePriority};
 
 /// Maximum time to wait for the coordinator task to stop on shutdown.
 ///
@@ -36,10 +37,10 @@ use super::{source_priority, NotificationService, SourcePriority};
 /// budgets and bounds a wedged runtime.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Command accepted by the attention debounce coordinator task.
+/// Command accepted by the session notification debounce coordinator task.
 #[derive(Debug)]
 enum Command {
-    /// Hold an attention notification pending until the debounce window elapses.
+    /// Hold a session notification pending until the debounce window elapses.
     ///
     /// Boxed so the enum's variants stay similarly sized despite the large
     /// [`NotificationRecord`].
@@ -50,11 +51,11 @@ enum Command {
     Shutdown,
 }
 
-/// Clonable command sink for the attention debounce coordinator.
+/// Clonable command sink for the session notification debounce coordinator.
 ///
 /// Injected into `DaemonState` and the session-state projector so both producers
-/// route attention notifications to the single owning task. Cloning is cheap
-/// (an [`mpsc::UnboundedSender`] handle).
+/// route debounced session notifications to the single owning task. Cloning is
+/// cheap (an [`mpsc::UnboundedSender`] handle).
 #[derive(Debug, Clone)]
 pub struct AttentionCoordinator {
     commands: mpsc::UnboundedSender<Command>,
@@ -68,10 +69,11 @@ impl AttentionCoordinator {
     /// shutdown.
     #[must_use]
     pub fn spawn(notifications: NotificationService) -> (Self, AttentionCoordinatorTask) {
-        // Unbounded: attention commands are produced at human-interaction rate
-        // (an agent blocking, an owner resuming), so growth is not a practical
-        // concern, and an unbounded sink lets both the request handler and the
-        // projector enqueue without send-side backpressure that could stall them.
+        // Unbounded: session notification commands are produced at
+        // human-interaction rate (an agent blocking, an owner resuming), so
+        // growth is not a practical concern, and an unbounded sink lets both the
+        // request handler and the projector enqueue without send-side
+        // backpressure that could stall them.
         let (commands, receiver) = mpsc::unbounded_channel();
         let handle = tokio::spawn(run(notifications, receiver));
         (
@@ -82,7 +84,7 @@ impl AttentionCoordinator {
         )
     }
 
-    /// Defer an attention notification through the debounce window.
+    /// Defer a session notification through the debounce window.
     ///
     /// The record must already be validated and have its id minted (see
     /// [`NotificationService::prepare_deferred`]). A closed channel means the
@@ -92,10 +94,10 @@ impl AttentionCoordinator {
         let _ = self.commands.send(Command::Defer(Box::new(record)));
     }
 
-    /// Resolve pending and visible attention notifications for a dedupe key.
+    /// Resolve pending and visible session notifications for a dedupe key.
     ///
     /// Cancels a matching pending entry (so it never surfaces) and acknowledges
-    /// any already-visible attention record sharing the key.
+    /// any already-visible record sharing the key.
     pub fn resolve(&self, dedupe_key: String) {
         let _ = self.commands.send(Command::Resolve(dedupe_key));
     }
@@ -141,7 +143,7 @@ impl AttentionCoordinatorTask {
     }
 }
 
-/// An attention notification held until its debounce deadline.
+/// A session notification held until its debounce deadline.
 #[derive(Debug)]
 struct Pending {
     record: NotificationRecord,
@@ -163,10 +165,11 @@ struct FlushToken {
 /// Drive the coordinator command loop until shutdown.
 ///
 /// Never panics: store errors on the resolve/flush paths are logged and the loop
-/// continues, so one failed append cannot take down attention handling.
+/// continues, so one failed append cannot take down session notification handling.
 async fn run(notifications: NotificationService, mut commands: mpsc::UnboundedReceiver<Command>) {
     let mut queue: DelayQueue<FlushToken> = DelayQueue::new();
     let mut pending: HashMap<String, Pending> = HashMap::new();
+    let mut recently_resolved_turns: HashMap<String, Instant> = HashMap::new();
     // Global monotonic generation: never reused, so a token from a resolved and
     // re-deferred key can never be mistaken for a current entry.
     let mut generation: u64 = 0;
@@ -178,10 +181,22 @@ async fn run(notifications: NotificationService, mut commands: mpsc::UnboundedRe
             biased;
             command = commands.recv() => match command {
                 Some(Command::Defer(record)) => {
-                    defer(&mut pending, &mut queue, &mut generation, &notifications, *record);
+                    defer(
+                        &mut pending,
+                        &mut queue,
+                        &mut generation,
+                        &mut recently_resolved_turns,
+                        &notifications,
+                        *record,
+                    );
                 }
                 Some(Command::Resolve(dedupe_key)) => {
-                    resolve(&mut pending, &notifications, &dedupe_key);
+                    resolve(
+                        &mut pending,
+                        &mut recently_resolved_turns,
+                        &notifications,
+                        &dedupe_key,
+                    );
                 }
                 Some(Command::Shutdown) | None => break,
             },
@@ -197,19 +212,30 @@ fn defer(
     pending: &mut HashMap<String, Pending>,
     queue: &mut DelayQueue<FlushToken>,
     generation: &mut u64,
+    recently_resolved_turns: &mut HashMap<String, Instant>,
     notifications: &NotificationService,
     record: NotificationRecord,
 ) {
     let Some(dedupe_key) = record.dedupe_key.clone() else {
-        // Attention creates always carry a dedupe key; without one the record
-        // cannot be debounced, so surface it immediately rather than dropping it.
+        // Debounced creates always carry a dedupe key; without one the record
+        // cannot be cancelled by session activity, so surface it immediately
+        // rather than dropping it.
         commit(notifications, record);
         return;
     };
     let debounce = Duration::from_secs(notifications.policy().attention_debounce_secs);
+    prune_recently_resolved_turns(recently_resolved_turns, debounce);
+    if record.kind == protocol::NotificationKind::TurnCompleted
+        && is_turn_dedupe_key(&dedupe_key)
+        && recently_resolved_turns
+            .remove(&dedupe_key)
+            .is_some_and(|resolved_at| resolved_at.elapsed() <= debounce)
+    {
+        return;
+    }
 
-    // Provider reports outrank projector reports for the same attention moment,
-    // so keep the higher-priority record when one is already pending; the store's
+    // Provider reports outrank projector reports for the same session moment, so
+    // keep the higher-priority record when one is already pending; the store's
     // dedupe remains the final authority at flush time.
     let record = match pending.get(&dedupe_key) {
         Some(existing) if outranks(&existing.record, &record) => existing.record.clone(),
@@ -231,22 +257,35 @@ fn defer(
 /// Cancel any pending entry for `dedupe_key` and acknowledge visible records.
 fn resolve(
     pending: &mut HashMap<String, Pending>,
+    recently_resolved_turns: &mut HashMap<String, Instant>,
     notifications: &NotificationService,
     dedupe_key: &str,
 ) {
     // A pending entry that is cancelled never becomes visible. Its DelayQueue
     // timer may still fire, but the generation guard in `flush` makes that a
     // no-op, so the token is left to expire on its own rather than tracked.
-    pending.remove(dedupe_key);
-    // Unify with the already-visible path: acknowledge any surfaced attention
-    // record sharing this session's dedupe key.
-    if let Err(error) = notifications.resolve_attention(dedupe_key) {
+    let removed = pending.remove(dedupe_key);
+    if removed.is_none() && is_turn_dedupe_key(dedupe_key) {
+        let debounce = Duration::from_secs(notifications.policy().attention_debounce_secs);
+        prune_recently_resolved_turns(recently_resolved_turns, debounce);
+        recently_resolved_turns.insert(dedupe_key.to_owned(), Instant::now());
+    }
+    // Unify with the already-visible path: acknowledge any surfaced record
+    // sharing this session's dedupe key.
+    if let Err(error) = notifications.resolve_session_notifications(dedupe_key) {
         warn!(
             dedupe_key,
             error = %error,
-            "failed to acknowledge visible attention notifications on resolve"
+            "failed to acknowledge visible session notifications on resolve"
         );
     }
+}
+
+fn prune_recently_resolved_turns(
+    recently_resolved_turns: &mut HashMap<String, Instant>,
+    debounce: Duration,
+) {
+    recently_resolved_turns.retain(|_, resolved_at| resolved_at.elapsed() <= debounce);
 }
 
 /// Commit a pending entry when its timer is still the current generation.
@@ -271,7 +310,7 @@ fn flush(
 /// Persist a debounced record and emit its event, logging (not panicking) on error.
 fn commit(notifications: &NotificationService, record: NotificationRecord) {
     if let Err(error) = notifications.commit_deferred(record) {
-        warn!(error = %error, "failed to commit debounced attention notification");
+        warn!(error = %error, "failed to commit debounced session notification");
     }
 }
 
@@ -299,14 +338,14 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use protocol::{
-        event, Event, NotificationCreateParams, NotificationKind, NotificationListParams,
-        NotificationRecord, NotificationSeverity, NotificationSource, NotificationStatus,
-        SessionId,
+        event, Event, NotificationCreateParams, NotificationKind, NotificationKindPolicy,
+        NotificationListParams, NotificationRecord, NotificationSeverity, NotificationSource,
+        NotificationStatus, SessionId,
     };
     use tokio::sync::broadcast;
 
     use super::AttentionCoordinator;
-    use crate::notifications::NotificationService;
+    use crate::notifications::{default_policy, NotificationService};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -329,6 +368,17 @@ mod tests {
         NotificationService::open(&temp_data_dir(tag)).expect("open notification service")
     }
 
+    fn enable_turn_completed(service: &NotificationService) {
+        let mut policy = default_policy();
+        policy.enabled = NotificationKindPolicy {
+            turn_completed: true,
+            ..policy.enabled
+        };
+        policy.codex = None;
+        policy.claude = None;
+        service.set_policy(policy).expect("set policy");
+    }
+
     fn projector_params(session: &str) -> NotificationCreateParams {
         params(
             "pohunek",
@@ -349,6 +399,22 @@ mod tests {
             NotificationSeverity::ActionRequired,
             session,
         )
+    }
+
+    fn turn_params(session: &str) -> NotificationCreateParams {
+        let mut params = params(
+            "codex",
+            "Stop",
+            "codex-stop-s-1",
+            NotificationKind::TurnCompleted,
+            NotificationSeverity::Info,
+            session,
+        );
+        params.title = "Turn completed".to_owned();
+        params.body = "Codex completed a turn.".to_owned();
+        params.dedupe_key = Some(format!("turn:{session}"));
+        params.source_id = Some(format!("codex:{session}:stop:1"));
+        params
     }
 
     fn params(
@@ -443,6 +509,60 @@ mod tests {
                 Err(broadcast::error::TryRecvError::Empty)
             ),
             "a suppressed attention notification must not broadcast any event"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolve_before_window_suppresses_turn_entirely() {
+        let service = service("suppress-turn");
+        enable_turn_completed(&service);
+        let mut events = service.subscribe();
+        let (coordinator, _task) = AttentionCoordinator::spawn(service.clone());
+
+        coordinator.defer(record(&service, turn_params("s-1")));
+        settle().await;
+        coordinator.resolve("turn:s-1".to_owned());
+        settle().await;
+        tokio::time::advance(Duration::from_secs(TEST_DEBOUNCE_SECS + 1)).await;
+        settle().await;
+
+        assert!(
+            list(&service).is_empty(),
+            "a resolved-before-window turn notification must never be persisted"
+        );
+        assert!(
+            matches!(
+                events.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "a suppressed turn notification must not broadcast any event"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolve_before_defer_suppresses_delayed_turn_within_window() {
+        let service = service("resolve-before-turn");
+        enable_turn_completed(&service);
+        let mut events = service.subscribe();
+        let (coordinator, _task) = AttentionCoordinator::spawn(service.clone());
+
+        coordinator.resolve("turn:s-1".to_owned());
+        settle().await;
+        coordinator.defer(record(&service, turn_params("s-1")));
+        settle().await;
+        tokio::time::advance(Duration::from_secs(TEST_DEBOUNCE_SECS + 1)).await;
+        settle().await;
+
+        assert!(
+            list(&service).is_empty(),
+            "a turn deferred just after a resolve must be treated as consumed"
+        );
+        assert!(
+            matches!(
+                events.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "a consumed delayed turn must not broadcast any event"
         );
     }
 

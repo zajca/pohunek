@@ -31,7 +31,7 @@ pub use policy::{
     DEFAULT_ATTENTION_DEDUPE_WINDOW_SECS,
 };
 #[doc(inline)]
-pub use projector::{attention_dedupe_key, NotificationProjector};
+pub use projector::{attention_dedupe_key, turn_dedupe_key, NotificationProjector};
 #[doc(inline)]
 pub use store::NOTIFICATIONS_SUBDIR;
 
@@ -98,6 +98,14 @@ const NOTIFICATION_EVENT_CAPACITY: usize = 128;
 /// Kept in sync with [`projector::attention_dedupe_key`], which builds keys with
 /// this prefix. Routing a create to the debounce coordinator matches on it.
 pub(crate) const ATTENTION_DEDUPE_KEY_PREFIX: &str = "attention";
+
+/// Prefix of the shared session turn-completion dedupe key (`turn:<session_id>`).
+///
+/// Turn keys bound the unread inbox row for a completed provider turn. Unlike
+/// attention keys, they require a session suffix and supersede older unread turns
+/// without a time window because a newer turn completion makes the previous one
+/// stale immediately.
+pub(crate) const TURN_DEDUPE_KEY_PREFIX: &str = "turn";
 
 /// Secret-like metadata keys rejected before notification storage.
 const SECRET_METADATA_KEYS: &[&str] = &[
@@ -199,6 +207,15 @@ pub enum NotificationError {
         reason: &'static str,
     },
 
+    /// A reserved dedupe key does not match its session-scoped contract.
+    #[error("invalid notification dedupe key `{key}`: {reason}")]
+    InvalidDedupeKey {
+        /// Rejected key.
+        key: String,
+        /// Stable explanation.
+        reason: &'static str,
+    },
+
     /// Notification policy disables the requested kind for this producer.
     #[error("notification kind {} is disabled for provider `{provider}`", kind.as_str())]
     KindDisabled {
@@ -270,6 +287,15 @@ impl NotificationError {
                         .to_owned(),
                 ),
             ),
+            Self::InvalidDedupeKey { .. } => ProtocolError::new(
+                ErrorClass::Runtime,
+                "invalid_notification_dedupe_key",
+                self.to_string(),
+                Some(
+                    "send attention:<session_id> only for attention notifications and turn:<session_id> only for turn_completed, with a matching session_id"
+                        .to_owned(),
+                ),
+            ),
             Self::KindDisabled { provider, kind } => {
                 ProtocolError::notification_kind_disabled(provider, kind.as_str())
             }
@@ -298,6 +324,11 @@ impl NotificationError {
     #[must_use]
     pub fn is_invalid_session_id(&self) -> bool {
         matches!(self, Self::InvalidSessionId { .. })
+    }
+
+    #[cfg(test)]
+    fn is_invalid_dedupe_key(&self) -> bool {
+        matches!(self, Self::InvalidDedupeKey { .. })
     }
 
     pub(crate) fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
@@ -485,23 +516,26 @@ impl NotificationService {
         })
     }
 
-    /// Acknowledge active attention notifications for `dedupe_key`.
+    /// Acknowledge active session notifications for `dedupe_key`.
     ///
-    /// Called when a session resumes active work so `agent_blocked` and
-    /// `approval_required` notifications sharing that session's attention dedupe
-    /// key stop lingering as unread. Emits `notification_updated` for each
-    /// acknowledged record and returns them; a dedupe key with no active
-    /// attention notification is a no-op.
+    /// Called when a session resumes active work so `agent_blocked`,
+    /// `approval_required`, and session-scoped `turn_completed` notifications
+    /// stop lingering as unread. Emits `notification_updated` for each
+    /// acknowledged record and returns them; a dedupe key with no active matching
+    /// notification is a no-op.
     ///
     /// # Errors
     ///
     /// Returns a [`NotificationError`] when the store append fails.
-    pub fn resolve_attention(
+    pub fn resolve_session_notifications(
         &self,
         dedupe_key: &str,
     ) -> Result<Vec<NotificationRecord>, NotificationError> {
         let now = timestamp_now();
-        let resolved = self.inner.store.resolve_attention(dedupe_key, &now)?;
+        let resolved = self
+            .inner
+            .store
+            .resolve_session_notifications(dedupe_key, &now)?;
         for record in &resolved {
             self.emit_updated(record);
         }
@@ -569,8 +603,8 @@ impl NotificationService {
     /// Build a normalized, validated notification record without persisting it.
     ///
     /// Mints the id now so the `notification.create` response can return it, but
-    /// the caller (the attention debounce coordinator) holds the record pending
-    /// and commits it later via [`Self::commit_deferred`]. Performs no store I/O.
+    /// the caller (the debounce coordinator) holds the record pending and commits
+    /// it later via [`Self::commit_deferred`]. Performs no store I/O.
     ///
     /// # Errors
     ///
@@ -616,6 +650,11 @@ impl NotificationService {
     ) -> Result<NotificationRecord, NotificationError> {
         let mut params = normalize_params(params);
         validate_session_id(params.session_id.as_ref())?;
+        validate_reserved_dedupe_key(
+            params.session_id.as_ref(),
+            params.kind,
+            params.dedupe_key.as_deref(),
+        )?;
         let policy = self.policy();
         if !policy_enables_kind(&policy, &params.source.provider, params.kind) {
             return Err(NotificationError::KindDisabled {
@@ -656,23 +695,54 @@ impl NotificationService {
         match self.inner.store.create_or_dedupe(record, window)? {
             store::CreateOutcome::Created(record) => {
                 self.emit_created(&record);
+                self.emit_turn_supersedes_for_attention(&record)?;
                 Ok(NotificationCreateResult {
                     created: true,
                     record,
                 })
             }
-            store::CreateOutcome::Existing(record) => Ok(NotificationCreateResult {
-                created: false,
-                record,
-            }),
+            store::CreateOutcome::CreatedWithUpdates { record, updated } => {
+                for record in &updated {
+                    self.emit_updated(record);
+                }
+                self.emit_turn_supersedes_for_attention(&record)?;
+                self.emit_created(&record);
+                Ok(NotificationCreateResult {
+                    created: true,
+                    record,
+                })
+            }
+            store::CreateOutcome::Existing(record) => {
+                self.emit_turn_supersedes_for_attention(&record)?;
+                Ok(NotificationCreateResult {
+                    created: false,
+                    record,
+                })
+            }
             store::CreateOutcome::Updated(record) => {
                 self.emit_updated(&record);
+                self.emit_turn_supersedes_for_attention(&record)?;
                 Ok(NotificationCreateResult {
                     created: false,
                     record,
                 })
             }
         }
+    }
+
+    fn emit_turn_supersedes_for_attention(
+        &self,
+        record: &NotificationRecord,
+    ) -> Result<(), NotificationError> {
+        let now = timestamp_now();
+        let updated = self
+            .inner
+            .store
+            .supersede_turns_for_attention(record, &now)?;
+        for record in &updated {
+            self.emit_updated(record);
+        }
+        Ok(())
     }
 
     fn next_id(&self) -> NotificationId {
@@ -758,6 +828,62 @@ fn validate_session_id(session_id: Option<&protocol::SessionId>) -> Result<(), N
         });
     }
     Ok(())
+}
+
+fn validate_reserved_dedupe_key(
+    session_id: Option<&protocol::SessionId>,
+    kind: NotificationKind,
+    dedupe_key: Option<&str>,
+) -> Result<(), NotificationError> {
+    let Some(dedupe_key) = dedupe_key else {
+        return Ok(());
+    };
+    let Some((prefix, suffix)) = reserved_dedupe_session_suffix(dedupe_key) else {
+        return Ok(());
+    };
+    match prefix {
+        ATTENTION_DEDUPE_KEY_PREFIX if !is_attention_kind(kind) => {
+            return Err(NotificationError::InvalidDedupeKey {
+                key: dedupe_key.to_owned(),
+                reason: "attention dedupe key requires an attention notification kind",
+            });
+        }
+        TURN_DEDUPE_KEY_PREFIX if kind != NotificationKind::TurnCompleted => {
+            return Err(NotificationError::InvalidDedupeKey {
+                key: dedupe_key.to_owned(),
+                reason: "turn dedupe key requires turn_completed kind",
+            });
+        }
+        _ => {}
+    }
+    let Some(session_id) = session_id else {
+        return Err(NotificationError::InvalidDedupeKey {
+            key: dedupe_key.to_owned(),
+            reason: "reserved dedupe key requires matching session_id",
+        });
+    };
+    if suffix != session_id.0 {
+        return Err(NotificationError::InvalidDedupeKey {
+            key: dedupe_key.to_owned(),
+            reason: "reserved dedupe key session suffix must match session_id",
+        });
+    }
+    Ok(())
+}
+
+fn reserved_dedupe_session_suffix(dedupe_key: &str) -> Option<(&'static str, &str)> {
+    for prefix in [ATTENTION_DEDUPE_KEY_PREFIX, TURN_DEDUPE_KEY_PREFIX] {
+        if dedupe_key == prefix {
+            return Some((prefix, ""));
+        }
+        if let Some(suffix) = dedupe_key
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix(':'))
+        {
+            return Some((prefix, suffix));
+        }
+    }
+    None
 }
 
 fn normalize_user_string(value: &str, max_chars: usize) -> String {
@@ -873,19 +999,25 @@ pub(crate) fn is_attention_kind(kind: NotificationKind) -> bool {
     )
 }
 
-/// Whether a create should be deferred through the attention debounce coordinator.
+/// Whether a create should be deferred through the notification debounce coordinator.
 ///
-/// Only `agent_blocked`/`approval_required` creates carrying a session attention
-/// dedupe key are debounced; every other create persists immediately.
-pub(crate) fn is_attention_create(kind: NotificationKind, dedupe_key: Option<&str>) -> bool {
+/// Session attention and turn-completion creates are held briefly so owner
+/// activity can consume them before they become durable inbox rows.
+pub(crate) fn is_debounced_create(kind: NotificationKind, dedupe_key: Option<&str>) -> bool {
     is_attention_kind(kind) && dedupe_key.is_some_and(is_attention_dedupe_key)
+        || kind == NotificationKind::TurnCompleted && dedupe_key.is_some_and(is_turn_dedupe_key)
 }
 
 /// Whether `dedupe_key` is a session attention dedupe key (`attention:<id>`).
-fn is_attention_dedupe_key(dedupe_key: &str) -> bool {
-    dedupe_key
-        .strip_prefix(ATTENTION_DEDUPE_KEY_PREFIX)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+pub(crate) fn is_attention_dedupe_key(dedupe_key: &str) -> bool {
+    reserved_dedupe_session_suffix(dedupe_key)
+        .is_some_and(|(prefix, suffix)| prefix == ATTENTION_DEDUPE_KEY_PREFIX && !suffix.is_empty())
+}
+
+/// Whether `dedupe_key` is a session turn dedupe key (`turn:<id>`).
+pub(crate) fn is_turn_dedupe_key(dedupe_key: &str) -> bool {
+    reserved_dedupe_session_suffix(dedupe_key)
+        .is_some_and(|(prefix, suffix)| prefix == TURN_DEDUPE_KEY_PREFIX && !suffix.is_empty())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -941,7 +1073,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use protocol::{
-        ErrorClass, NotificationCreateParams, NotificationDeleteParams, NotificationKind,
+        event, ErrorClass, NotificationCreateParams, NotificationDeleteParams, NotificationKind,
         NotificationKindPolicy, NotificationListParams, NotificationRetentionParams,
         NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
         SessionId,
@@ -1056,6 +1188,30 @@ mod tests {
         }
     }
 
+    fn enable_all_kinds(service: &NotificationService) {
+        let mut policy = default_policy();
+        policy.enabled = all_kinds_enabled_policy();
+        policy.codex = None;
+        policy.claude = None;
+        service.set_policy(policy).expect("set policy");
+    }
+
+    fn provider_turn_params(session_id: &str, source_id: &str) -> NotificationCreateParams {
+        let mut params = params(
+            "codex",
+            "Stop",
+            source_id,
+            NotificationKind::TurnCompleted,
+            NotificationSeverity::Info,
+            Some(source_id),
+            Some(&format!("turn:{session_id}")),
+        );
+        params.session_id = Some(SessionId(session_id.to_owned()));
+        params.body = "Codex completed a turn.".to_owned();
+        params.title = "Codex turn completed".to_owned();
+        params
+    }
+
     fn assert_notification_kind_disabled(err: &super::NotificationError) {
         let protocol = err.to_protocol_error();
         assert_eq!(protocol.class, ErrorClass::Runtime);
@@ -1066,6 +1222,12 @@ mod tests {
         let protocol = err.to_protocol_error();
         assert_eq!(protocol.class, ErrorClass::Runtime);
         assert_eq!(protocol.code, "invalid_notification_session_id");
+    }
+
+    fn assert_invalid_dedupe_key(err: &super::NotificationError) {
+        let protocol = err.to_protocol_error();
+        assert_eq!(protocol.class, ErrorClass::Runtime);
+        assert_eq!(protocol.code, "invalid_notification_dedupe_key");
     }
 
     #[test]
@@ -1156,6 +1318,51 @@ mod tests {
             .expect_err("oversized session_id must fail");
 
         assert_invalid_session_id(&err);
+    }
+
+    #[test]
+    fn create_rejects_reserved_dedupe_key_session_mismatch() {
+        let service = NotificationService::open(&temp_data_dir("dedupe-session-mismatch"))
+            .expect("open service");
+        enable_all_kinds(&service);
+        let mut params = provider_turn_params("s-1", "codex:s-1:stop:1");
+        params.dedupe_key = Some("turn:s-2".to_owned());
+
+        let err = service
+            .create(params)
+            .expect_err("reserved dedupe key must match session_id");
+
+        assert!(err.is_invalid_dedupe_key());
+        assert_invalid_dedupe_key(&err);
+    }
+
+    #[test]
+    fn create_rejects_reserved_dedupe_key_without_session_id() {
+        let service =
+            NotificationService::open(&temp_data_dir("dedupe-no-session")).expect("open service");
+        enable_all_kinds(&service);
+        let mut params = provider_turn_params("s-1", "codex:s-1:stop:1");
+        params.session_id = None;
+
+        let err = service
+            .create(params)
+            .expect_err("reserved dedupe key requires session_id");
+
+        assert_invalid_dedupe_key(&err);
+    }
+
+    #[test]
+    fn create_rejects_reserved_dedupe_key_for_wrong_kind() {
+        let service =
+            NotificationService::open(&temp_data_dir("dedupe-wrong-kind")).expect("open service");
+        let mut params = provider_params(NotificationKind::Error, Some("provider-error"));
+        params.dedupe_key = Some("attention:s-1".to_owned());
+
+        let err = service
+            .create(params)
+            .expect_err("attention key requires attention kind");
+
+        assert_invalid_dedupe_key(&err);
     }
 
     #[test]
@@ -1419,6 +1626,149 @@ mod tests {
         assert!(!projector.created);
         assert_eq!(provider.record.id, projector.record.id);
         assert_eq!(projector.record.kind, NotificationKind::ApprovalRequired);
+    }
+
+    #[test]
+    fn attention_create_supersedes_unread_turn_twin() {
+        let service = NotificationService::open(&temp_data_dir("attention-supersedes-turn"))
+            .expect("open service");
+        enable_all_kinds(&service);
+        let turn = service
+            .create(provider_turn_params("s-1", "codex:s-1:stop:1"))
+            .expect("turn create");
+        let mut attention = provider_params(NotificationKind::ApprovalRequired, Some("provider-1"));
+        attention.dedupe_key = Some("attention:s-1".to_owned());
+
+        let approval = service.create(attention).expect("attention create");
+
+        assert!(turn.created);
+        assert!(approval.created);
+        let records: BTreeMap<String, protocol::NotificationRecord> = service
+            .list(NotificationListParams::default())
+            .expect("list notifications")
+            .notifications
+            .into_iter()
+            .map(|record| (record.id.0.clone(), record))
+            .collect();
+        assert_eq!(
+            records[&turn.record.id.0].status,
+            NotificationStatus::Acknowledged
+        );
+        assert_eq!(
+            records[&turn.record.id.0].superseded_by,
+            Some(approval.record.id.clone())
+        );
+        assert_eq!(
+            records[&approval.record.id.0].status,
+            NotificationStatus::Unread
+        );
+    }
+
+    #[test]
+    fn second_turn_emits_supersede_update_before_replacement_create() {
+        let service =
+            NotificationService::open(&temp_data_dir("turn-event-order")).expect("open service");
+        enable_all_kinds(&service);
+        let mut events = service.subscribe();
+        let first = service
+            .create(provider_turn_params("s-1", "codex:s-1:stop:1"))
+            .expect("first turn create");
+        let first_event = events.try_recv().expect("first create event");
+        assert_eq!(first_event.event, event::NOTIFICATION_CREATED);
+
+        let second = service
+            .create(provider_turn_params("s-1", "codex:s-1:stop:2"))
+            .expect("second turn create");
+
+        let update_event = events.try_recv().expect("supersede update event");
+        assert_eq!(update_event.event, event::NOTIFICATION_UPDATED);
+        let updated =
+            serde_json::from_value::<protocol::NotificationUpdatedEvent>(update_event.payload)
+                .expect("updated payload");
+        assert_eq!(updated.record.id, first.record.id);
+        assert_eq!(updated.record.superseded_by, Some(second.record.id.clone()));
+
+        let create_event = events.try_recv().expect("replacement create event");
+        assert_eq!(create_event.event, event::NOTIFICATION_CREATED);
+        let created =
+            serde_json::from_value::<protocol::NotificationCreatedEvent>(create_event.payload)
+                .expect("created payload");
+        assert_eq!(created.record.id, second.record.id);
+    }
+
+    #[test]
+    fn acknowledged_attention_duplicate_does_not_supersede_later_turn() {
+        let service = NotificationService::open(&temp_data_dir("acked-attention-no-turn-collapse"))
+            .expect("open service");
+        enable_all_kinds(&service);
+        let mut attention = provider_params(NotificationKind::ApprovalRequired, Some("provider-1"));
+        attention.dedupe_key = Some("attention:s-1".to_owned());
+        let approval = service.create(attention.clone()).expect("attention create");
+        service
+            .update(NotificationUpdateParams {
+                id: approval.record.id,
+                status: NotificationStatus::Acknowledged,
+            })
+            .expect("ack attention");
+        let turn = service
+            .create(provider_turn_params("s-1", "codex:s-1:stop:1"))
+            .expect("turn create");
+
+        let duplicate = service
+            .create(attention)
+            .expect("duplicate attention returns existing");
+
+        assert!(!duplicate.created);
+        assert_eq!(duplicate.record.status, NotificationStatus::Acknowledged);
+        let records: BTreeMap<String, protocol::NotificationRecord> = service
+            .list(NotificationListParams::default())
+            .expect("list notifications")
+            .notifications
+            .into_iter()
+            .map(|record| (record.id.0.clone(), record))
+            .collect();
+        assert_eq!(
+            records[&turn.record.id.0].status,
+            NotificationStatus::Unread,
+            "an inactive attention duplicate must not consume a later turn"
+        );
+        assert_eq!(records[&turn.record.id.0].superseded_by, None);
+    }
+
+    #[test]
+    fn acknowledged_attention_does_not_suppress_fresh_attention_create() {
+        let service = NotificationService::open(&temp_data_dir("acked-attention-fresh-create"))
+            .expect("open service");
+        let mut first = provider_params(NotificationKind::ApprovalRequired, Some("provider-1"));
+        first.dedupe_key = Some("attention:s-1".to_owned());
+        let approval = service.create(first).expect("first attention create");
+        service
+            .update(NotificationUpdateParams {
+                id: approval.record.id.clone(),
+                status: NotificationStatus::Acknowledged,
+            })
+            .expect("ack attention");
+
+        let mut second = provider_params(NotificationKind::ApprovalRequired, Some("provider-2"));
+        second.source.host_local_source_id = "codex-hook-s-2".to_owned();
+        second.dedupe_key = Some("attention:s-1".to_owned());
+        let fresh = service
+            .create(second)
+            .expect("fresh attention create after acknowledged record");
+
+        assert!(fresh.created);
+        assert_ne!(fresh.record.id, approval.record.id);
+        let records = service
+            .list(NotificationListParams::default())
+            .expect("list notifications")
+            .notifications;
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|record| record.id == approval.record.id
+            && record.status == NotificationStatus::Acknowledged));
+        assert!(records
+            .iter()
+            .any(|record| record.id == fresh.record.id
+                && record.status == NotificationStatus::Unread));
     }
 
     #[test]

@@ -14,13 +14,13 @@ use super::{parse_timestamp, NotificationError};
 /// delay without merging unrelated later turns.
 pub const DEFAULT_ATTENTION_DEDUPE_WINDOW_SECS: u64 = 120;
 
-/// Default debounce window before a pending attention notification may surface.
+/// Default debounce window before a pending session notification may surface.
 ///
-/// An attention state (`agent_blocked` / `approval_required`) that resolves
-/// within this window never produces a durable record or an OS/GUI notification,
-/// so transient prompts an agent answers itself do not flash at the owner. Five
-/// seconds is long enough to swallow those self-resolving blips while keeping a
-/// genuine wait perceptibly prompt. Distinct from
+/// An attention state (`agent_blocked` / `approval_required`) or completed turn
+/// that resolves within this window never produces a durable record or an OS/GUI
+/// notification, so transient prompts an agent answers itself do not flash at the
+/// owner. Five seconds is long enough to swallow those self-resolving blips while
+/// keeping a genuine wait perceptibly prompt. Distinct from
 /// [`DEFAULT_ATTENTION_DEDUPE_WINDOW_SECS`], which merges duplicate reports of one
 /// attention moment across producers rather than delaying when it surfaces. Must
 /// stay in sync with the protocol crate's `default_attention_debounce_secs`

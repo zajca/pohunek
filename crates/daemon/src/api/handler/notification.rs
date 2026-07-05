@@ -12,7 +12,7 @@ use protocol::{
 };
 
 use super::util::{ok_value, parse_optional_params, parse_params};
-use crate::notifications::{is_attention_create, AttentionCoordinator, NotificationService};
+use crate::notifications::{is_debounced_create, AttentionCoordinator, NotificationService};
 use crate::session::SessionRegistry;
 
 /// Resolve the notification service, or a typed error response when this daemon
@@ -34,8 +34,10 @@ fn require_notifications(
     })
 }
 
-/// Resolve the attention debounce coordinator, or a typed error response when this
-/// daemon state was built with notifications but no coordinator.
+/// Resolve the session notification debounce coordinator.
+///
+/// Returns a typed error response when this daemon state was built with
+/// notifications but no coordinator.
 fn require_attention(
     request: &Request,
     attention: Option<&AttentionCoordinator>,
@@ -46,7 +48,7 @@ fn require_attention(
             ProtocolError::new(
                 protocol::ErrorClass::Daemon,
                 "notifications_not_configured",
-                "the daemon is not configured for attention debounce".to_owned(),
+                "the daemon is not configured for notification debounce".to_owned(),
                 None,
             ),
         )
@@ -71,11 +73,11 @@ where
 
 /// `notification.create`: create or dedupe a durable notification record.
 ///
-/// Attention creates (`agent_blocked`/`approval_required` carrying a session
-/// attention dedupe key) are routed to the debounce coordinator: the id is minted
-/// and `created: true` is returned, but the record is held pending and only
-/// becomes visible in `notification.list` after the debounce window (or never, if
-/// the session resumes first). Every other create persists immediately.
+/// Session-scoped attention and turn-completion creates are routed to the
+/// debounce coordinator: the id is minted and `created: true` is returned, but
+/// the record is held pending and only becomes visible in `notification.list`
+/// after the debounce window (or never, if the session resumes first). Every
+/// other create persists immediately.
 pub(super) async fn handle_notification_create(
     request: &Request,
     notifications: Option<&NotificationService>,
@@ -92,7 +94,7 @@ pub(super) async fn handle_notification_create(
     };
     let params = enrich_notification_session_context(params, sessions).await;
 
-    if is_attention_create(params.kind, params.dedupe_key.as_deref()) {
+    if is_debounced_create(params.kind, params.dedupe_key.as_deref()) {
         let attention = match require_attention(request, attention) {
             Ok(attention) => attention,
             Err(resp) => return resp,

@@ -1063,7 +1063,7 @@ mod tests {
         kind: &str,
         severity: &str,
         matcher: Option<&str>,
-        attention_dedupe: bool,
+        expected_dedupe_key: Option<&str>,
     ) {
         assert_eq!(request["method"], json!(method::NOTIFICATION_CREATE));
         let params = &request["params"];
@@ -1081,10 +1081,9 @@ mod tests {
         } else {
             assert!(params["metadata"].get("matcher").is_none());
         }
-        if attention_dedupe {
-            assert_eq!(params["dedupe_key"], json!("attention:session-123"));
-        } else {
-            assert!(params.get("dedupe_key").is_none());
+        match expected_dedupe_key {
+            Some(expected) => assert_eq!(params["dedupe_key"], json!(expected)),
+            None => assert!(params.get("dedupe_key").is_none()),
         }
 
         let source_id = params["source_id"].as_str().expect("source_id is a string");
@@ -1743,23 +1742,28 @@ mod tests {
 
     #[test]
     fn claude_notification_hook_maps_matchers() {
-        for (matcher, kind, severity, dedupe) in [
+        for (matcher, kind, severity, dedupe_key) in [
             (
                 "permission_prompt",
                 "approval_required",
                 "action_required",
-                true,
+                Some("attention:session-123"),
             ),
             (
                 "elicitation_dialog",
                 "approval_required",
                 "action_required",
-                true,
+                Some("attention:session-123"),
             ),
-            ("idle_prompt", "agent_blocked", "warning", true),
-            ("auth_success", "system", "success", false),
-            ("elicitation_complete", "system", "info", false),
-            ("elicitation_response", "system", "info", false),
+            (
+                "idle_prompt",
+                "agent_blocked",
+                "warning",
+                Some("attention:session-123"),
+            ),
+            ("auth_success", "system", "success", None),
+            ("elicitation_complete", "system", "info", None),
+            ("elicitation_response", "system", "info", None),
         ] {
             let (_stdout, _stderr, request) = captured_notification_request(
                 "claude",
@@ -1773,16 +1777,22 @@ mod tests {
                 kind,
                 severity,
                 Some(matcher),
-                dedupe,
+                dedupe_key,
             );
         }
     }
 
     #[test]
     fn claude_notification_hook_maps_stop_events() {
-        for (action, provider_event, kind, severity) in [
-            ("stop", "Stop", "turn_completed", "info"),
-            ("stop_failure", "StopFailure", "error", "error"),
+        for (action, provider_event, kind, severity, dedupe_key) in [
+            (
+                "stop",
+                "Stop",
+                "turn_completed",
+                "info",
+                Some("turn:session-123"),
+            ),
+            ("stop_failure", "StopFailure", "error", "error", None),
         ] {
             let (_stdout, _stderr, request) = captured_notification_request(
                 "claude",
@@ -1796,22 +1806,28 @@ mod tests {
                 kind,
                 severity,
                 None,
-                false,
+                dedupe_key,
             );
         }
     }
 
     #[test]
     fn codex_notification_hook_maps_lifecycle_events() {
-        for (action, provider_event, kind, severity, dedupe) in [
+        for (action, provider_event, kind, severity, dedupe_key) in [
             (
                 "permission_request",
                 "PermissionRequest",
                 "approval_required",
                 "action_required",
-                true,
+                Some("attention:session-123"),
             ),
-            ("stop", "Stop", "turn_completed", "info", false),
+            (
+                "stop",
+                "Stop",
+                "turn_completed",
+                "info",
+                Some("turn:session-123"),
+            ),
         ] {
             let (_stdout, _stderr, request) = captured_notification_request(
                 "codex",
@@ -1825,7 +1841,7 @@ mod tests {
                 kind,
                 severity,
                 None,
-                dedupe,
+                dedupe_key,
             );
         }
     }

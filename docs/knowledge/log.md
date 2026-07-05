@@ -1,5 +1,12 @@
 # Knowledge Bundle Log
 
+## 0.15.3
+
+- Documented session notification dedupe/debounce behavior for
+  `turn:<session_id>`: turn-completed creates share the debounce window,
+  resolve on session resume, supersede older unread turn rows, and are collapsed
+  by visible attention records.
+
 ## 0.15.2
 
 - Documented the attention notification debounce window

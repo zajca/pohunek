@@ -138,7 +138,7 @@ All params and result type names below refer to structs exported by
 | `subscribe` | `null` | `{subscribed: true}` then event stream | Consumes the connection into a one-way event stream. |
 | `integration.install` | `IntegrationInstallParams` or `null` | `IntegrationInstallResult` | Installs agent hooks for native session id capture. |
 | `assistant.materialize` | `AssistantMaterializeParams` | `AssistantMaterializeResult` | Materializes the assistant knowledge bundle on the daemon host. |
-| `notification.create` | `NotificationCreateParams` | `NotificationCreateResult` | Creates a durable host-local notification. Daemon policy is enforced for every producer, including provider hooks and daemon projectors. Dedupe may return `created: false` with an existing or upgraded record. Attention kinds carrying an `attention:<session_id>` dedupe key are deferred: the result still reports `created: true` with a minted id, but the record is held pending until `attention_debounce_secs` elapses; see `NotificationPolicy`. |
+| `notification.create` | `NotificationCreateParams` | `NotificationCreateResult` | Creates a host-local notification. Daemon policy is enforced for every producer, including provider hooks and daemon projectors. Dedupe may return `created: false` with an existing or upgraded record. `agent_blocked`/`approval_required` with `attention:<session_id>` and `turn_completed` with `turn:<session_id>` are deferred: the result still reports `created: true` with a minted id, but the record is held pending until `attention_debounce_secs` elapses; see `NotificationPolicy`. |
 | `notification.list` | `NotificationListParams` or `null` | `NotificationListResult` | Lists notification records with exact-match filters and cursor pagination. Deleted records are excluded unless `status: deleted` is requested. |
 | `notification.update` | `NotificationUpdateParams` | `NotificationUpdateResult` | Updates one record's lifecycle status. Allowed transitions are `unread -> read`, `read -> acknowledged`, `unread -> acknowledged`, `unread/read/acknowledged -> archived`, and any non-deleted status to deleted. |
 | `notification.delete` | `NotificationDeleteParams` | `NotificationDeleteResult` | Logically deletes one record. Unknown or already-deleted ids return `deleted: false`. |
@@ -244,11 +244,13 @@ Important fields:
 - `source_id`: optional producer-specific id used for idempotence within one
   source namespace.
 - `dedupe_key`: optional source-independent id for one logical event. Session
-  attention notifications use `attention:<session_id>`.
+  attention notifications use `attention:<session_id>`; session turn-completion
+  notifications use `turn:<session_id>`.
 - `read_at`, `acked_at`, `archived_at`, `deleted_at`: lifecycle timestamps set
   by status transitions.
-- `superseded_by`: optional replacement link for implementations that preserve
-  superseded records.
+- `superseded_by`: optional replacement link. Older unread `turn_completed`
+  records are acknowledged with `superseded_by` pointing at the newer turn or
+  attention record that made them stale.
 
 `notification.list` sorts by `created_at` descending, then `id`, and omits
 deleted records by default. `NotificationListParams` can filter by status, kind,
@@ -261,9 +263,10 @@ Important fields:
 
 - `attention_dedupe_window_secs`: window for source-independent attention
   dedupe. The default is 120 seconds.
-- `attention_debounce_secs`: window a deferred attention notification is held
-  pending before it is allowed to surface. The default is 5 seconds. Additive:
-  a policy JSON written before this field existed loads the default.
+- `attention_debounce_secs`: shared window a deferred session attention or
+  turn-completion notification is held pending before it is allowed to surface.
+  The default is 5 seconds. Additive: a policy JSON written before this field
+  existed loads the default.
 - `enabled`: default per-kind flags.
 - `codex` / `claude`: optional provider-specific per-kind overrides.
 
@@ -276,41 +279,53 @@ creates a disabled kind, `notification.create` returns
 `runtime/notification_kind_disabled`.
 
 Provider hooks have higher source priority than daemon projectors for the same
-`dedupe_key` inside `attention_dedupe_window_secs`. A Codex or Claude hook can
-upgrade an existing projector record in place; the daemon returns
-`created: false` and emits `notification_updated`. A later projector create for
-an existing provider-backed attention record is suppressed and returns
-`created: false` with the existing record. Producers other than Codex, Claude,
-`pohunek`, or `daemon` are treated as user/external sources and do not
-automatically supersede provider records.
+`attention:<session_id>` key inside `attention_dedupe_window_secs`. A Codex or
+Claude hook can upgrade an existing projector attention record in place; the
+daemon returns `created: false` and emits `notification_updated`. A later
+projector create for an existing provider-backed attention record is suppressed
+and returns `created: false` with the existing record. Producers other than
+Codex, Claude, `pohunek`, or `daemon` are treated as user/external sources and
+do not automatically supersede provider records.
 
-#### Attention debounce
+`turn:<session_id>` has different semantics: it is not time-window deduped. A
+new unread `turn_completed` for the same session acknowledges any older unread
+turn immediately and sets the older record's `superseded_by` to the newer id.
+The older record remains in history but disappears from default unread inbox
+views. When an attention record for the same session becomes visible, it
+acknowledges any unread `turn:<session_id>` twin with `superseded_by` pointing at
+the attention record because `agent_blocked`/`approval_required` subsumes "the
+turn completed and is waiting".
 
-`agent_blocked` and `approval_required` are held pending rather than persisted
-immediately. When a producer creates one of these kinds with an
-`attention:<session_id>` dedupe key, the daemon mints the notification id and
-returns `notification.create` result `created: true` with the full record, but
-the record is not written to the store and does not appear in
-`notification.list` until it flushes. No `notification_created` event is
+When a session's activity enters `working`, the daemon resolves both
+`attention:<session_id>` and `turn:<session_id>`. Pending records with those
+keys are dropped before they ever persist, and already-visible unread/read
+matching records are acknowledged with `notification_updated`.
+
+#### Session notification debounce
+
+`agent_blocked`, `approval_required`, and session-scoped `turn_completed` are
+held pending rather than persisted immediately when they carry
+`attention:<session_id>` or `turn:<session_id>`. The daemon mints the
+notification id and returns `notification.create` result `created: true` with
+the full record, but the record is not written to the store and does not appear
+in `notification.list` until it flushes. No `notification_created` event is
 emitted for a pending record.
 
 The daemon holds the pending record for `attention_debounce_secs`. If the
-session's activity resolves back to `working` within that window (the same
-edge that acknowledges an already-visible attention record), the pending
-record is dropped entirely: nothing is ever persisted, and no event fires.
-Only if the window elapses with the attention state still outstanding does the
-daemon commit the record through the store and emit `notification_created`,
-exactly as an immediate create would. Debounce applies only to
-`agent_blocked` and `approval_required`; `turn_completed`, `session_finished`,
-`error`, and `system` are always created immediately.
+session resolves back to `working` within that window, the pending record is
+dropped entirely: nothing is ever persisted, and no event fires. Only if the
+window elapses with the session signal still outstanding does the daemon commit
+the record through the store and emit `notification_created`, exactly as an
+immediate create would. Debounce does not apply to `session_finished`, `error`,
+or `system`.
 
-`attention_dedupe_window_secs` and `attention_debounce_secs` are independent
-and answer different questions:
+`attention_dedupe_window_secs` and `attention_debounce_secs` are independent and
+answer different questions:
 
 - `attention_dedupe_window_secs` controls whether two producers reporting the
   *same* attention moment (a provider hook and the daemon projector) collapse
   into one record instead of two.
-- `attention_debounce_secs` controls *whether and when* a pending attention
+- `attention_debounce_secs` controls *whether and when* a pending session
   notification is allowed to surface at all, regardless of how many producers
   reported it.
 
@@ -330,6 +345,11 @@ and `StopFailure`. `Notification` matcher values map as follows:
 `idle_prompt` creates `agent_blocked`, and `auth_success`,
 `elicitation_complete`, and `elicitation_response` create `system`. `Stop`
 creates `turn_completed`; `StopFailure` creates `error`.
+
+When `POHUNEK_SESSION_ID` is valid, hook adapters add
+`attention:<session_id>` to attention events and `turn:<session_id>` to
+`Stop`/`turn_completed` events. Invalid session ids are dropped before either
+`session_id` or `dedupe_key` reaches the daemon.
 
 Hook adapters read at most 64 KiB from provider stdin, validate action and
 environment before reading input, silently drop an invalid `POHUNEK_SESSION_ID`,
@@ -372,7 +392,7 @@ Canonical public codes currently emitted include:
 | `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback` |
 | `transport` | `framing`, `host_unreachable` |
 | `discovery` | `netbird_cli_missing`, `netbird_state_unavailable`, `host_unknown`, `remote_discovery_failed` |
-| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_exit_timeout`, `attach_not_found`, `attach_expired`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor` |
+| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_exit_timeout`, `attach_not_found`, `attach_expired`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor` |
 
 Clients must not parse `msg`. Branch on `class` and `code`, then display `msg`
 and `recover` for unknown codes.
@@ -398,7 +418,7 @@ The daemon then writes these events:
 | `attach_opened` | `{session_id: SessionId, stream_id: string}` | A pending attach token was redeemed and a raw stream opened. |
 | `attach_closed` | `{session_id: SessionId, stream_id: string}` | A raw attach stream ended or was detached. |
 | `notification_created` | `{record: NotificationRecord}` | A durable notification record was created. |
-| `notification_updated` | `{record: NotificationRecord}` | A notification record changed lifecycle status or was upgraded by higher-priority source dedupe. |
+| `notification_updated` | `{record: NotificationRecord}` | A notification record changed lifecycle status, was upgraded by higher-priority source dedupe, or was acknowledged by resolve/supersede processing. |
 | `notification_deleted` | `{notification_id: NotificationId}` | A notification record was logically deleted. |
 
 Subscription connections ignore further client input after the ack. A slow

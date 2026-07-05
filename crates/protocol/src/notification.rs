@@ -165,11 +165,12 @@ pub struct NotificationRecord {
     /// differs from [`Self::dedupe_key`], which is source-independent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
-    /// Source-independent dedupe key for one logical event.
+    /// Source-independent dedupe key for one lifecycle group.
     ///
     /// Additive: an older daemon omits it, and an older client ignores it. This
     /// lets provider hooks and daemon projectors meet on the same event without
-    /// sharing producer-specific ids.
+    /// sharing producer-specific ids. Session-scoped keys use
+    /// `attention:<session_id>` or `turn:<session_id>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedupe_key: Option<String>,
     /// Linked project id, when known.
@@ -197,7 +198,7 @@ pub struct NotificationRecord {
     /// Additive: an older daemon omits it, and an older client ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<String>,
-    /// Replacement record after a higher-priority source superseded this one.
+    /// Replacement record after lifecycle supersede processing.
     ///
     /// Additive: an older daemon omits it, and an older client ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -232,7 +233,9 @@ pub struct NotificationCreateParams {
     /// Producer-specific source id, when the producer provides one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
-    /// Source-independent dedupe key for one logical event.
+    /// Source-independent dedupe key for one lifecycle group.
+    ///
+    /// Session-scoped keys use `attention:<session_id>` or `turn:<session_id>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedupe_key: Option<String>,
     /// Linked project id, when known.
@@ -362,7 +365,7 @@ const fn default_attention_debounce_secs() -> u64 {
 pub struct NotificationPolicy {
     /// Dedupe window for equivalent attention events.
     pub attention_dedupe_window_secs: u64,
-    /// Debounce window before a pending attention notification may surface.
+    /// Debounce window before a pending session notification may surface.
     ///
     /// Additive: an older client omits it, and a policy JSON without it loads the
     /// default so a pre-debounce persisted policy keeps working. Distinct from
