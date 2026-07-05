@@ -69,7 +69,7 @@ pub use state::{
 };
 #[doc(inline)]
 pub use ui_state::{
-    default_state_dir, DetailTab, Selection, TreeNodeId, UiState, UiStateError, WindowSize,
+    default_state_dir, RightTab, Selection, TreeNodeId, UiState, UiStateError, WindowSize,
 };
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);

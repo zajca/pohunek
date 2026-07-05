@@ -89,6 +89,28 @@ If the GUI starts but shows no sessions, verify daemon health and `session.list`
 first. If host discovery fails, the GUI should still try the local host and
 surface a per-host error instead of treating the whole app as failed.
 
+## Navigation
+
+The right pane is a persistent tab bar over a body that switches with the
+active tab: `1 Detail · 2 Linear · 3 GitHub · 4 Worktrees`. Detail is the
+selection-driven session/project/host/start-work landing; Linear, GitHub, and
+Worktrees are full-tab bodies scoped to the current project (previously
+stacked underneath a project selection as `project_pane` sections). A context
+chip at the right end of the strip shows the tabs' project scope as
+`host / project-label`, or just the resolved host's connection dot when no
+project is in scope.
+
+Tabs 2-4 need a project: the scope resolves from a selected project directly,
+or from a selected session's linked project. With no project in scope, those
+tabs render with no click handler (a "Select a project" tooltip explains why)
+and their body shows a "select a project" empty state.
+
+Selecting a session anywhere — the workspace tree, the Agents monitor, or the
+Inbox's Open-session action — always force-switches to the Detail tab, so
+triage never lands behind a Linear/GitHub/Worktrees tab. Selecting a project
+or host leaves the operator's chosen tab as-is. The active tab persists across
+restarts in `UiState::active_tab` (`RightTab`).
+
 ## Project And Worktree Management
 
 The GUI must use existing daemon methods:
@@ -366,6 +388,14 @@ When behavior must be checked against implementation, inspect:
 - `crates/gui/src/main.rs` for config loading, attach spawning, and Iced shell
   behavior, provider task spawning, prompt management controls, provider panels,
   and Inbox rendering/actions.
+- `crates/gui/src/view/detail.rs` for the right-pane tab bar (`RightTab`
+  routing, the context chip, and the disabled-without-scope tab styling) and
+  the Detail tab's session/project/host/start-work bodies.
+- `crates/gui/src/view/project.rs` and `crates/gui/src/view/provider.rs` for
+  the Worktrees and Linear/GitHub tab bodies the tab bar promotes to full
+  panes.
+- `crates/gui-core/src/ui_state.rs` for the persisted `RightTab` enum and the
+  legacy-`DetailTab`-tolerant `UiState::active_tab` load path.
 - `crates/gui-core/src/lib.rs` for headless state transitions, SDK requests,
   prompt/action state, prompt preview rendering, provider request state, linked
   metadata helpers, Inbox notification state, OS notification intents, and

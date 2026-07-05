@@ -1,27 +1,28 @@
 //! Project detail, worktree list, and per-worktree row rendering.
+//!
+//! Worktrees are also promoted into the right-pane Worktrees tab
+//! (`view::detail`); `project_worktrees` is `pub(crate)` for that reuse.
 
-use iced::widget::{button, column, container, row, scrollable, text, text_input};
+use iced::widget::{button, column, container, row, text, text_input};
 use iced::{Background, Center, Element, Fill, Theme};
 use pohunek_gui_core::HostId;
 use protocol::{ProjectWorktree, SessionId};
 
 use crate::message::Message;
-use crate::selection::selected_project;
-use crate::view::provider::provider_browser_view;
+use crate::selection::{scoped_project, selected_project};
 use crate::PohunekApp;
 
 use super::{card, section_title, STATUS_DOT};
 
-/// Project surface: project detail plus the start-session, provider-browser and
-/// action surfaces, all scoped to this project.
+/// Project surface: identity, rename, and the New-session entry point.
+/// Worktrees and the Linear/GitHub browsers live in their own tabs
+/// (`view::detail`) rather than stacked underneath this pane.
 pub(crate) fn project_pane(app: &PohunekApp) -> Element<'_, Message> {
     column![
         project_detail(app),
         button("New session")
             .on_press(Message::OpenStartModal)
             .style(iced::widget::button::primary),
-        project_worktrees(app),
-        provider_browser_view(app),
     ]
     .spacing(16)
     .into()
@@ -56,7 +57,11 @@ fn project_detail(app: &PohunekApp) -> Element<'_, Message> {
 /// status dot, branch, ownership and per-row actions, instead of a flat wall of
 /// `path branch=… session=…` lines. Per-worktree removal is intentionally absent
 /// — the protocol exposes pruning only via project-level Remove + prune.
-fn project_worktrees(app: &PohunekApp) -> Element<'_, Message> {
+///
+/// Fills the Worktrees tab body, so the list is unscrolled and uncapped here;
+/// the right pane's outer `scrollable` (`view::detail::detail_view`) handles
+/// overflow for the whole tab.
+pub(crate) fn project_worktrees(app: &PohunekApp) -> Element<'_, Message> {
     let refresh = button("Refresh")
         .on_press(Message::ShowProject)
         .style(iced::widget::button::secondary);
@@ -67,7 +72,7 @@ fn project_worktrees(app: &PohunekApp) -> Element<'_, Message> {
     ]
     .align_y(Center);
 
-    let Some((host_id, project)) = selected_project(app) else {
+    let Some((host_id, project)) = scoped_project(app) else {
         return card(column![header, text("No project selected").size(13)].spacing(10));
     };
     let Some(host) = app.workspace.hosts.get(host_id) else {
@@ -116,7 +121,7 @@ fn project_worktrees(app: &PohunekApp) -> Element<'_, Message> {
                 "{total} worktrees · {owned} owned · {active} active"
             ))
             .size(13),
-            scrollable(list).height(360),
+            list,
         ]
         .spacing(10),
     )

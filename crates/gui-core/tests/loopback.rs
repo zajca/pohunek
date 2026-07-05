@@ -21,10 +21,10 @@ use pohunek_gui_core::{
     resolve_project_action, resolve_project_prompt, session_link_metadata, session_metadata_rows,
     set_session_metadata, show_project, spawn_attach_command, stop_session as stop_gui_session,
     workspace_connection_stream, AgentStateEvent, AttachCommandSpawner, AttachSpawnIntent,
-    AttachTemplateValues, ConnState, ConnectionOptions, DetailTab, HealthSummary, HostConfig,
-    HostEvent, HostId, HostSnapshot, Message, PromptContext, PromptLaunchParams, PromptPreview,
-    ProviderLaunchItem, ProviderLaunchParams, Selection, SessionLinkKind, SessionLinkProvider,
-    TreeNodeId, UiState, WindowSize, Workspace,
+    AttachTemplateValues, ConnState, ConnectionOptions, HealthSummary, HostConfig, HostEvent,
+    HostId, HostSnapshot, Message, PromptContext, PromptLaunchParams, PromptPreview,
+    ProviderLaunchItem, ProviderLaunchParams, RightTab, Selection, SessionLinkKind,
+    SessionLinkProvider, TreeNodeId, UiState, WindowSize, Workspace,
 };
 use protocol::{
     method, AgentActivity, AgentKind, ErrorClass, ProjectActionParams, ProjectActionResult,
@@ -1351,8 +1351,7 @@ fn ui_state_persists_and_restores() {
             host_id: host.id,
             session_id: SessionId("s-1".to_owned()),
         }),
-        open_tabs: vec![DetailTab::Session, DetailTab::Agents],
-        active_tab: DetailTab::Agents,
+        active_tab: RightTab::Linear,
     };
 
     state.save_to_dir(&state_dir).expect("save ui state");

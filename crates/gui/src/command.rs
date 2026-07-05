@@ -16,7 +16,7 @@ use pohunek_gui_core::{
     resume_session_with_options, set_session_metadata_with_options, show_project_with_options,
     stop_session_with_options, update_notification_with_options, ConnectionOptions, HostConfig,
     HostId, Message as CoreMessage, ProviderLaunchItem, ProviderLaunchParams, ProviderOperation,
-    ProviderPanel, ProviderRequestId, Selection, SessionLinkProvider, WindowSize,
+    ProviderPanel, ProviderRequestId, RightTab, Selection, SessionLinkProvider, WindowSize,
 };
 use protocol::{
     NotificationDeleteParams, NotificationId, NotificationStatus, NotificationUpdateParams,
@@ -70,6 +70,52 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             }
             tasks.push(save_ui_state_task(app));
         }
+        Message::SelectTab(tab) => {
+            app.ui_state.active_tab = tab;
+            tasks.push(save_ui_state_task(app));
+            // Auto-fetch the tab's data so switching in immediately shows
+            // results instead of requiring a separate Fetch click, matching
+            // the pre-B2 Linear|GitHub toggle's behavior.
+            match tab {
+                RightTab::Linear => {
+                    ensure_project_filters_loaded(app);
+                    if let Ok(request_id) = begin_linear_issues_request(app) {
+                        push_provider_task_result(
+                            app,
+                            &mut tasks,
+                            SessionLinkProvider::Linear,
+                            ProviderOperation::LinearIssues,
+                            Some(request_id),
+                            fetch_linear_issues_task(app, request_id),
+                        );
+                    }
+                }
+                RightTab::GitHub => {
+                    ensure_project_filters_loaded(app);
+                    if let Ok(request_id) = begin_github_pull_requests_request(app) {
+                        push_provider_task_result(
+                            app,
+                            &mut tasks,
+                            SessionLinkProvider::GitHub,
+                            ProviderOperation::GitHubPullRequests,
+                            Some(request_id),
+                            fetch_github_pull_requests_task(app, request_id),
+                        );
+                    }
+                    if let Ok(request_id) = begin_github_issues_request(app) {
+                        push_provider_task_result(
+                            app,
+                            &mut tasks,
+                            SessionLinkProvider::GitHub,
+                            ProviderOperation::GitHubIssues,
+                            Some(request_id),
+                            fetch_github_issues_task(app, request_id),
+                        );
+                    }
+                }
+                RightTab::Detail | RightTab::Worktrees => {}
+            }
+        }
         Message::FilterActivity(activity) => app.activity_filter = activity,
         Message::OpenInbox => {
             app.modal = ModalView::Inbox;
@@ -122,9 +168,9 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                 .select_notification_session(&host_id, &notification_id)
             {
                 app.ui_state.selection = app.workspace.selection.clone();
+                app.ui_state.active_tab = RightTab::Detail;
                 app.modal = ModalView::None;
                 app.inbox_view = InboxView::List;
-                // TODO(B2): force Detail tab
                 sync_rename_edit_for_selection(app);
                 tasks.push(save_ui_state_task(app));
             } else {
@@ -160,6 +206,9 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                 host_id: host_id.clone(),
                 session_id: session_id.clone(),
             });
+            // Selecting a session anywhere (tree, agents monitor) must land on
+            // Detail so triage never lands behind a Linear/GitHub/Worktrees tab.
+            app.ui_state.active_tab = RightTab::Detail;
             // Seed the rename buffer with the session's current name so the
             // operator edits it rather than starting from blank.
             app.rename_edit = app
@@ -284,6 +333,14 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         },
         Message::OpenLinearIssue(issue_id) => {
             if let Ok(host_id) = selected_host_id(app) {
+                // Stamp `active_panel` so the shared provider-item modal (which
+                // disambiguates Linear vs. GitHub by that field) shows the
+                // right item; the standalone Linear|GitHub toggle that used to
+                // drive it is retired in favor of the top-level tab bar.
+                app.workspace.apply(CoreMessage::ProviderPanelSelected {
+                    host_id: host_id.clone(),
+                    panel: ProviderPanel::Linear,
+                });
                 app.workspace
                     .apply(CoreMessage::LinearProviderIssueSelected { host_id, issue_id });
                 app.modal = ModalView::ProviderItem;
@@ -291,6 +348,10 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         }
         Message::OpenGitHubPullRequest(number) => {
             if let Ok(host_id) = selected_host_id(app) {
+                app.workspace.apply(CoreMessage::ProviderPanelSelected {
+                    host_id: host_id.clone(),
+                    panel: ProviderPanel::GitHub,
+                });
                 app.workspace
                     .apply(CoreMessage::GitHubProviderPullRequestSelected { host_id, number });
                 app.modal = ModalView::ProviderItem;
@@ -298,6 +359,10 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         }
         Message::OpenGitHubIssue(number) => {
             if let Ok(host_id) = selected_host_id(app) {
+                app.workspace.apply(CoreMessage::ProviderPanelSelected {
+                    host_id: host_id.clone(),
+                    panel: ProviderPanel::GitHub,
+                });
                 app.workspace
                     .apply(CoreMessage::GitHubProviderIssueSelected { host_id, number });
                 app.modal = ModalView::ProviderItem;
@@ -351,51 +416,6 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             Err(err) => app.status = Some(err),
         },
         Message::SelectAction(name) => app.selected_action = Some(name),
-        Message::SelectProviderPanel(panel) => {
-            if let Ok(host_id) = selected_host_id(app) {
-                app.workspace
-                    .apply(CoreMessage::ProviderPanelSelected { host_id, panel });
-                ensure_project_filters_loaded(app);
-                // Auto-fetch the panel's data so switching tabs immediately shows
-                // results instead of requiring a separate Fetch click.
-                match panel {
-                    ProviderPanel::Linear => {
-                        if let Ok(request_id) = begin_linear_issues_request(app) {
-                            push_provider_task_result(
-                                app,
-                                &mut tasks,
-                                SessionLinkProvider::Linear,
-                                ProviderOperation::LinearIssues,
-                                Some(request_id),
-                                fetch_linear_issues_task(app, request_id),
-                            );
-                        }
-                    }
-                    ProviderPanel::GitHub => {
-                        if let Ok(request_id) = begin_github_pull_requests_request(app) {
-                            push_provider_task_result(
-                                app,
-                                &mut tasks,
-                                SessionLinkProvider::GitHub,
-                                ProviderOperation::GitHubPullRequests,
-                                Some(request_id),
-                                fetch_github_pull_requests_task(app, request_id),
-                            );
-                        }
-                        if let Ok(request_id) = begin_github_issues_request(app) {
-                            push_provider_task_result(
-                                app,
-                                &mut tasks,
-                                SessionLinkProvider::GitHub,
-                                ProviderOperation::GitHubIssues,
-                                Some(request_id),
-                                fetch_github_issues_task(app, request_id),
-                            );
-                        }
-                    }
-                }
-            }
-        }
         Message::SelectLinearFilter(name) => {
             if let Ok(host_id) = selected_host_id(app) {
                 app.workspace

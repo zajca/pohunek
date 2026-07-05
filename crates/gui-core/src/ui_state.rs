@@ -55,13 +55,41 @@ impl TreeNodeId {
     }
 }
 
-/// Detail tabs restored by the GUI shell.
+/// The right pane's persistent tab, restored across GUI restarts.
+///
+/// `Detail` is the selection-driven session/project/host/start pane; the other
+/// three promote what used to be stacked inside the project pane
+/// (`linear_provider_view`, `github_provider_view`, `project_worktrees`) to
+/// full tab bodies scoped to the current project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DetailTab {
-    Session,
-    Agents,
-    Project,
+pub enum RightTab {
+    Detail,
+    Linear,
+    GitHub,
+    Worktrees,
+}
+
+/// Restores a persisted `active_tab` value, tolerating UI state written before
+/// the tab-bar rework (B2): the legacy `DetailTab` variants (`session`,
+/// `agents`, `project`) and any other unrecognized string normalize to
+/// `Detail` instead of failing the whole load.
+fn deserialize_right_tab<'de, D>(deserializer: D) -> Result<RightTab, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(match raw.as_str() {
+        "linear" => RightTab::Linear,
+        "git_hub" => RightTab::GitHub,
+        "worktrees" => RightTab::Worktrees,
+        _ => RightTab::Detail,
+    })
+}
+
+/// Default `active_tab` for UI state files that predate the tab bar.
+fn default_right_tab() -> RightTab {
+    RightTab::Detail
 }
 
 /// Persisted window dimensions.
@@ -83,8 +111,11 @@ pub struct UiState {
     pub window_size: WindowSize,
     pub expanded_nodes: BTreeSet<TreeNodeId>,
     pub selection: Option<Selection>,
-    pub open_tabs: Vec<DetailTab>,
-    pub active_tab: DetailTab,
+    #[serde(
+        default = "default_right_tab",
+        deserialize_with = "deserialize_right_tab"
+    )]
+    pub active_tab: RightTab,
 }
 
 impl Default for UiState {
@@ -98,8 +129,7 @@ impl Default for UiState {
             },
             expanded_nodes: BTreeSet::new(),
             selection: None,
-            open_tabs: vec![DetailTab::Session, DetailTab::Agents],
-            active_tab: DetailTab::Session,
+            active_tab: RightTab::Detail,
         }
     }
 }
@@ -184,5 +214,67 @@ pub fn default_state_dir() -> Result<PathBuf, UiStateError> {
             .join("state")
             .join("pohunek-gui")),
         _ => Err(UiStateError::MissingEnv { var: "HOME" }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a UI-state TOML string that mimics a file written before the B2
+    /// tab-bar rework: it carries the removed `open_tabs` field and an
+    /// `active_tab` value drawn from the old `DetailTab` vocabulary.
+    fn legacy_ui_state_toml(legacy_active_tab: &str) -> String {
+        let raw = toml::to_string_pretty(&UiState::default()).expect("serialize default state");
+        let needle = "active_tab = \"detail\"";
+        assert!(raw.contains(needle), "expected default active_tab line");
+        let mut raw = raw.replace(needle, &format!("active_tab = \"{legacy_active_tab}\""));
+        raw.push_str("open_tabs = [\"session\", \"agents\"]\n");
+        raw
+    }
+
+    #[test]
+    fn legacy_detail_tab_values_normalize_to_detail() {
+        for legacy in ["session", "agents", "project", "not-a-real-tab"] {
+            let raw = legacy_ui_state_toml(legacy);
+            let state: UiState = toml::from_str(&raw)
+                .unwrap_or_else(|err| panic!("legacy UI state `{legacy}` should parse: {err}"));
+            assert_eq!(state.active_tab, RightTab::Detail);
+        }
+    }
+
+    #[test]
+    fn current_right_tab_values_round_trip() {
+        for tab in [
+            RightTab::Detail,
+            RightTab::Linear,
+            RightTab::GitHub,
+            RightTab::Worktrees,
+        ] {
+            let state = UiState {
+                active_tab: tab,
+                ..UiState::default()
+            };
+            let raw = toml::to_string_pretty(&state).expect("serialize UI state");
+            let parsed: UiState = toml::from_str(&raw).expect("deserialize UI state");
+            assert_eq!(parsed.active_tab, tab);
+        }
+    }
+
+    #[test]
+    fn missing_active_tab_field_defaults_to_detail() {
+        let raw = toml::to_string_pretty(&UiState::default()).expect("serialize default state");
+        let raw: String = raw
+            .lines()
+            .filter(|line| !line.starts_with("active_tab"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let state: UiState = toml::from_str(&raw).expect("UI state without active_tab parses");
+        assert_eq!(state.active_tab, RightTab::Detail);
+    }
+
+    #[test]
+    fn default_ui_state_opens_on_detail_tab() {
+        assert_eq!(UiState::default().active_tab, RightTab::Detail);
     }
 }

@@ -6,7 +6,7 @@ use iced::widget::text_editor;
 use iced::Size;
 use pohunek_gui_core::assistant::Intent as AssistantIntent;
 use pohunek_gui_core::{
-    HostConfig, HostId, Message as CoreMessage, NotificationScope, ProviderPanel, TreeNodeId,
+    HostConfig, HostId, Message as CoreMessage, NotificationScope, RightTab, TreeNodeId,
 };
 use protocol::{AgentActivity, NotificationId, SessionId};
 
@@ -183,6 +183,10 @@ pub(crate) enum Message {
     Core(CoreMessage),
     HostsDiscovered(DiscoveryResult),
     ToggleNode(TreeNodeId),
+    /// Switch the right pane's persistent tab. Only dispatched for a tab the
+    /// operator can actually reach (tabs 2-4 render with no `on_press` when the
+    /// current selection has no project scope).
+    SelectTab(RightTab),
     FilterActivity(Option<AgentActivity>),
     OpenInbox,
     OpenHostInbox(HostId),
@@ -269,7 +273,6 @@ pub(crate) enum Message {
     /// Remove a single pohunek-owned worktree by path.
     RemoveWorktree(PathBuf),
     SelectAction(String),
-    SelectProviderPanel(ProviderPanel),
     /// Pick a Linear filter and immediately fetch its issues.
     SelectLinearFilter(String),
     /// Pick a GitHub pull request filter and immediately fetch.

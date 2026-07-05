@@ -149,6 +149,49 @@ pub(crate) fn selected_project_identity(app: &PohunekApp) -> Result<(String, Pat
     })
 }
 
+/// Resolves the project the current selection scopes to: the project itself
+/// when a project is selected, or a selected session's linked project. `None`
+/// for a bare host or no selection.
+///
+/// Backs both [`tab_project_scope`] (the tab bar's enable/context-chip check)
+/// and the Worktrees tab body, so a session belonging to a project reaches the
+/// same worktree list as selecting that project directly would.
+pub(crate) fn scoped_project(app: &PohunekApp) -> Option<(&HostId, &ProjectInfo)> {
+    match app.ui_state.selection.as_ref() {
+        Some(Selection::Project {
+            host_id,
+            project_id,
+        }) => app
+            .workspace
+            .hosts
+            .get_key_value(host_id)
+            .and_then(|(host_id, host)| {
+                host.projects
+                    .get(project_id)
+                    .map(|project| (host_id, project))
+            }),
+        Some(Selection::Session {
+            host_id,
+            session_id,
+        }) => {
+            let (host_id, host) = app.workspace.hosts.get_key_value(host_id)?;
+            let project_id = host.sessions.get(&session_id.0)?.project_id.as_ref()?;
+            host.projects
+                .get(project_id)
+                .map(|project| (host_id, project))
+        }
+        _ => None,
+    }
+}
+
+/// Resolves the right-pane tab bar's project scope: the host and project label
+/// the Linear/GitHub/Worktrees tabs operate on. `None` when [`scoped_project`]
+/// finds no project, in which case those tabs render a "select a project"
+/// empty state instead of a body.
+pub(crate) fn tab_project_scope(app: &PohunekApp) -> Option<(HostId, String)> {
+    scoped_project(app).map(|(host_id, project)| (host_id.clone(), project.label.clone()))
+}
+
 pub(crate) fn selected_github_scope(app: &PohunekApp) -> Result<GitHubProviderScope, String> {
     let (project_id, repo_root) = selected_project_identity(app)?;
     Ok(GitHubProviderScope::new(project_id, repo_root))

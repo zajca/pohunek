@@ -1,61 +1,22 @@
-//! Linear/GitHub provider browser, filters, action launcher, and PR pill widgets.
+//! Linear/GitHub provider tab bodies, filters, action launcher, and PR pill widgets.
+//!
+//! `linear_provider_view` and `github_provider_view` are promoted directly
+//! into the right-pane Linear/GitHub tabs (`view::detail`); the combined
+//! Linear|GitHub toggle that used to gate them behind a `project_pane` card is
+//! retired in favor of the top-level tab bar.
 
 use iced::widget::{button, column, container, pick_list, row, text, text_input};
 use iced::{Background, Center, Color, Element, Theme};
 use pohunek_gui_core::{
     providers, session_link_metadata, GitHubProviderScope, GitHubPullRequestStatusKey, HostId,
-    Message as CoreMessage, ProviderPanel, SessionLinkKind, SessionLinkProvider,
+    Message as CoreMessage, SessionLinkKind, SessionLinkProvider,
 };
 use protocol::SessionInfo;
 
 use crate::message::Message;
-use crate::selection::{effective_filters, selected_github_scope, selected_host_id};
 use crate::view::inbox::date_part;
-use crate::PohunekApp;
 
-use super::{card, list_button, muted_style, section_title};
-
-pub(crate) fn provider_browser_view(app: &PohunekApp) -> Element<'_, Message> {
-    let host_id = match selected_host_id(app) {
-        Ok(host_id) => host_id,
-        Err(err) => return column![text("Providers").size(18), text(err).size(13)].into(),
-    };
-    let Some(host) = app.workspace.hosts.get(&host_id) else {
-        return column![
-            text("Providers").size(18),
-            text("Host is not loaded").size(13)
-        ]
-        .into();
-    };
-    let active = host.provider.active_panel;
-    let tab_style = |panel: ProviderPanel| {
-        if panel == active {
-            iced::widget::button::primary
-        } else {
-            iced::widget::button::secondary
-        }
-    };
-    let tabs = row![
-        button("Linear")
-            .on_press(Message::SelectProviderPanel(ProviderPanel::Linear))
-            .style(tab_style(ProviderPanel::Linear)),
-        button("GitHub")
-            .on_press(Message::SelectProviderPanel(ProviderPanel::GitHub))
-            .style(tab_style(ProviderPanel::GitHub))
-    ]
-    .spacing(8);
-    let current_scope = selected_github_scope(app).ok();
-    let filters = effective_filters(app);
-    let body = match active {
-        ProviderPanel::Linear => {
-            linear_provider_view(host_id.clone(), host, filters.linear_names())
-        }
-        ProviderPanel::GitHub => {
-            github_provider_view(host_id.clone(), current_scope, host, filters.github_names())
-        }
-    };
-    card(column![section_title("Providers"), tabs, body].spacing(10))
-}
+use super::{list_button, muted_style};
 
 /// Renders the action picker and launch button for a selected provider item.
 /// When the project defines no matching action, shows guidance rather than a
@@ -114,7 +75,7 @@ fn filter_buttons(
     clippy::needless_pass_by_value,
     reason = "owning host_id keeps the returned Iced element lifetime tied only to host state"
 )]
-fn linear_provider_view(
+pub(crate) fn linear_provider_view(
     host_id: HostId,
     host: &pohunek_gui_core::HostView,
     filter_names: Vec<String>,
@@ -165,7 +126,7 @@ fn linear_provider_view(
     clippy::needless_pass_by_value,
     reason = "owning host_id keeps the returned Iced element lifetime tied only to host state"
 )]
-fn github_provider_view(
+pub(crate) fn github_provider_view(
     host_id: HostId,
     current_scope: Option<GitHubProviderScope>,
     host: &pohunek_gui_core::HostView,
