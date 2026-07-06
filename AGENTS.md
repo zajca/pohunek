@@ -125,6 +125,19 @@ feature — `--all-features` only covers the everything-on case.
 
 - Work on a branch off `main`; do not commit directly to `main`. Commit/push
   only when the user asks.
+- **Milestones run in worktrees against `NEXT.md`.** Development moves one
+  milestone at a time. `NEXT.md` (repo root) is the **transient** spec for the
+  current milestone: it holds the scope and a testable definition-of-done, is
+  **not committed**, and is deleted/replaced once the milestone lands. The loop
+  is: plan the phase into `NEXT.md` → implement it in a fresh worktree off `main`
+  → review the branch against `NEXT.md`'s DoD → merge to `main`, delete the
+  branch/worktree, write the next `NEXT.md`. Longer-lived design docs live under
+  `docs/design/`, not `NEXT.md`.
+- **Plans are end-to-end complete.** Do not propose or build PoCs, minimal
+  versions, or phased-minimal shortcuts unless the user explicitly asks for
+  reduced scope. Plan and implement the full solution.
+- **Commits are never signed.** Use clean, concise, English messages. Do not add
+  a `Co-Authored-By` trailer or any "generated with" footer.
 - Keep changes scoped. If you touch the wire protocol (`crates/protocol`), expect
   ripples in `client`, `daemon`, `cli`, and `gui-core` — update and test all.
 - Run the full gate set above before declaring done. Report failures honestly

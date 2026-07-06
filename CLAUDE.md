@@ -31,6 +31,26 @@ CI is the source of truth. Before reporting a Rust change as done, run the gate
 set from AGENTS.md ("Build, test, lint") — clippy is `-D warnings`, so a warning
 is a failure. For docs/knowledge changes, also run `cargo xtask docs check`.
 
+## Milestone workflow skills
+
+The milestone loop described in AGENTS.md (`plan → implement in a worktree →
+review against NEXT.md → merge and advance → release`) is encoded as skills under
+`.claude/skills/`. Prefer them over re-deriving the steps each time; they auto-
+trigger from the usual phrasing:
+
+- **`plan-phase`** — plan the next phase interactively (one open question at a
+  time) and write a complete end-to-end `NEXT.md`.
+- **`milestone`** — implement the next milestone from `NEXT.md` in a fresh
+  worktree, then run the gates.
+- **`milestone-review`** — review a branch/worktree against `NEXT.md`'s DoD with
+  `path:line` evidence, delegate fixes, re-run the gates.
+- **`merge-advance`** — commit unsigned, merge to `main`, prune the
+  branch/worktree, write the next `NEXT.md`.
+- **`release`** — cut a version with `scripts/release` and verify the Release
+  workflow publishes the glibc + MUSL x86_64 binaries.
+- **`gates`** — the shared verification block (fmt / clippy `-D warnings` / test
+  / release build / `cargo xtask docs check`); the other skills call it.
+
 ## Keep the assistant knowledge bundle current
 
 `docs/knowledge/` is the hand-authored source for the Universal Pohunek
@@ -62,8 +82,10 @@ parallel exploration. Good fits here:
 - **State-machine bugs:** competing-hypothesis investigation across
   `gui-core`/`daemon` session detection.
 
-Brief every sub-agent with concrete `path:line` context (per your global
-briefing protocol); they start with a clean context window.
+By default, delegate milestone implementation and post-review fixes to parallel
+subagents or Codex — this is the standing mode of work here, not something to
+wait for permission on. Brief every sub-agent with concrete `path:line` context
+(per your global briefing protocol); they start with a clean context window.
 
 ## Project memory
 
