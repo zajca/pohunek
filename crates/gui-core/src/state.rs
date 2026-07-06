@@ -140,6 +140,15 @@ impl GitHubPullRequestStatusKey {
     }
 }
 
+/// Keyboard selection target in the combined GitHub provider list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitHubProviderSelection {
+    /// A pull request row.
+    PullRequest(u64),
+    /// An issue row.
+    Issue(u64),
+}
+
 /// Parsed `agent_state` event payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentStateEvent {
@@ -974,6 +983,34 @@ impl Workspace {
         host.provider.linear.selected_issue_id = Some(issue_id);
     }
 
+    /// Select the next visible Linear issue for `host_id`.
+    pub fn select_next_linear_issue(&mut self, host_id: &HostId) -> Option<String> {
+        self.select_linear_issue_by_keyboard(host_id, SelectionDirection::Next)
+    }
+
+    /// Select the previous visible Linear issue for `host_id`.
+    pub fn select_previous_linear_issue(&mut self, host_id: &HostId) -> Option<String> {
+        self.select_linear_issue_by_keyboard(host_id, SelectionDirection::Previous)
+    }
+
+    fn select_linear_issue_by_keyboard(
+        &mut self,
+        host_id: &HostId,
+        direction: SelectionDirection,
+    ) -> Option<String> {
+        let host = self.hosts.get_mut(host_id)?;
+        let state = &mut host.provider.linear;
+        let visible = visible_linear_issue_ids(state);
+        let current = state.selected_issue_id.as_deref();
+        let current_index = visible
+            .iter()
+            .position(|issue_id| Some(issue_id.as_str()) == current);
+        let selected_index = move_selection(current_index, visible.len(), direction)?;
+        let selected_id = visible[selected_index].clone();
+        state.selected_issue_id = Some(selected_id.clone());
+        Some(selected_id)
+    }
+
     /// Pick the named GitHub pull request filter for `host_id`, dropping any
     /// in-flight pull requests request so a stale response cannot land under
     /// the new filter.
@@ -993,12 +1030,113 @@ impl Workspace {
     pub fn select_github_pull_request(&mut self, host_id: HostId, number: u64) {
         let host = self.host_for_ui(host_id);
         host.provider.github.selected_pull_request = Some(number);
+        host.provider.github.selected_issue = None;
+    }
+
+    /// Select the next visible GitHub pull request for `host_id`.
+    pub fn select_next_github_pull_request(&mut self, host_id: &HostId) -> Option<u64> {
+        self.select_github_pull_request_by_keyboard(host_id, SelectionDirection::Next)
+    }
+
+    /// Select the previous visible GitHub pull request for `host_id`.
+    pub fn select_previous_github_pull_request(&mut self, host_id: &HostId) -> Option<u64> {
+        self.select_github_pull_request_by_keyboard(host_id, SelectionDirection::Previous)
+    }
+
+    fn select_github_pull_request_by_keyboard(
+        &mut self,
+        host_id: &HostId,
+        direction: SelectionDirection,
+    ) -> Option<u64> {
+        let host = self.hosts.get_mut(host_id)?;
+        let state = &mut host.provider.github;
+        let visible = visible_github_pull_request_numbers(state);
+        let current_index = visible
+            .iter()
+            .position(|number| Some(*number) == state.selected_pull_request);
+        let selected_index = move_selection(current_index, visible.len(), direction)?;
+        let selected_number = visible[selected_index];
+        state.selected_pull_request = Some(selected_number);
+        Some(selected_number)
     }
 
     /// Select a GitHub issue in the provider browser for `host_id`.
     pub fn select_github_issue(&mut self, host_id: HostId, number: u64) {
         let host = self.host_for_ui(host_id);
         host.provider.github.selected_issue = Some(number);
+        host.provider.github.selected_pull_request = None;
+    }
+
+    /// Select the next visible GitHub issue for `host_id`.
+    pub fn select_next_github_issue(&mut self, host_id: &HostId) -> Option<u64> {
+        self.select_github_issue_by_keyboard(host_id, SelectionDirection::Next)
+    }
+
+    /// Select the previous visible GitHub issue for `host_id`.
+    pub fn select_previous_github_issue(&mut self, host_id: &HostId) -> Option<u64> {
+        self.select_github_issue_by_keyboard(host_id, SelectionDirection::Previous)
+    }
+
+    fn select_github_issue_by_keyboard(
+        &mut self,
+        host_id: &HostId,
+        direction: SelectionDirection,
+    ) -> Option<u64> {
+        let host = self.hosts.get_mut(host_id)?;
+        let state = &mut host.provider.github;
+        let visible = visible_github_issue_numbers(state);
+        let current_index = visible
+            .iter()
+            .position(|number| Some(*number) == state.selected_issue);
+        let selected_index = move_selection(current_index, visible.len(), direction)?;
+        let selected_number = visible[selected_index];
+        state.selected_issue = Some(selected_number);
+        state.selected_pull_request = None;
+        Some(selected_number)
+    }
+
+    /// Select the next visible GitHub provider row for `host_id`.
+    pub fn select_next_github_item(&mut self, host_id: &HostId) -> Option<GitHubProviderSelection> {
+        self.select_github_item_by_keyboard(host_id, SelectionDirection::Next)
+    }
+
+    /// Select the previous visible GitHub provider row for `host_id`.
+    pub fn select_previous_github_item(
+        &mut self,
+        host_id: &HostId,
+    ) -> Option<GitHubProviderSelection> {
+        self.select_github_item_by_keyboard(host_id, SelectionDirection::Previous)
+    }
+
+    fn select_github_item_by_keyboard(
+        &mut self,
+        host_id: &HostId,
+        direction: SelectionDirection,
+    ) -> Option<GitHubProviderSelection> {
+        let host = self.hosts.get_mut(host_id)?;
+        let state = &mut host.provider.github;
+        let visible = visible_github_provider_selections(state);
+        let current = match (state.selected_pull_request, state.selected_issue) {
+            (Some(number), _) => Some(GitHubProviderSelection::PullRequest(number)),
+            (None, Some(number)) => Some(GitHubProviderSelection::Issue(number)),
+            (None, None) => None,
+        };
+        let current_index = visible
+            .iter()
+            .position(|selection| Some(*selection) == current);
+        let selected_index = move_selection(current_index, visible.len(), direction)?;
+        let selection = visible[selected_index];
+        match selection {
+            GitHubProviderSelection::PullRequest(number) => {
+                state.selected_pull_request = Some(number);
+                state.selected_issue = None;
+            }
+            GitHubProviderSelection::Issue(number) => {
+                state.selected_pull_request = None;
+                state.selected_issue = Some(number);
+            }
+        }
+        Some(selection)
     }
 
     /// Select a session in the detail pane.
@@ -1170,6 +1308,96 @@ impl Workspace {
         });
         monitor
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionDirection {
+    Next,
+    Previous,
+}
+
+fn move_selection(
+    current_index: Option<usize>,
+    visible_len: usize,
+    direction: SelectionDirection,
+) -> Option<usize> {
+    if visible_len == 0 {
+        return None;
+    }
+    Some(match (current_index, direction) {
+        (None, SelectionDirection::Next) => 0,
+        (None | Some(0), SelectionDirection::Previous) => visible_len - 1,
+        (Some(index), SelectionDirection::Next) => (index + 1) % visible_len,
+        (Some(index), SelectionDirection::Previous) => index - 1,
+    })
+}
+
+fn visible_linear_issue_ids(state: &LinearProviderState) -> Vec<String> {
+    state
+        .issues
+        .iter()
+        .filter(|issue| linear_issue_matches_search(issue, &state.search))
+        .map(|issue| issue.prompt_item_id().to_owned())
+        .collect()
+}
+
+fn linear_issue_matches_search(issue: &providers::linear::LinearIssue, search: &str) -> bool {
+    let search = search.trim().to_lowercase();
+    search.is_empty()
+        || issue.title.to_lowercase().contains(&search)
+        || issue.identifier.to_lowercase().contains(&search)
+        || issue.prompt_item_id().to_lowercase().contains(&search)
+        || issue.branch.to_lowercase().contains(&search)
+}
+
+fn visible_github_pull_request_numbers(state: &GitHubProviderState) -> Vec<u64> {
+    state
+        .pull_requests
+        .iter()
+        .filter(|pull_request| github_pull_request_matches_search(pull_request, &state.search))
+        .map(|pull_request| pull_request.number)
+        .collect()
+}
+
+fn github_pull_request_matches_search(
+    pull_request: &providers::github::GitHubPullRequest,
+    search: &str,
+) -> bool {
+    let search = search.trim().to_lowercase();
+    search.is_empty()
+        || pull_request.title.to_lowercase().contains(&search)
+        || pull_request.number.to_string().contains(&search)
+        || pull_request.head_ref_name.to_lowercase().contains(&search)
+}
+
+fn visible_github_issue_numbers(state: &GitHubProviderState) -> Vec<u64> {
+    state
+        .issues
+        .iter()
+        .filter(|issue| github_issue_matches_search(issue, &state.search))
+        .map(|issue| issue.number)
+        .collect()
+}
+
+fn visible_github_provider_selections(state: &GitHubProviderState) -> Vec<GitHubProviderSelection> {
+    let pull_requests = state
+        .pull_requests
+        .iter()
+        .filter(|pull_request| github_pull_request_matches_search(pull_request, &state.search))
+        .map(|pull_request| GitHubProviderSelection::PullRequest(pull_request.number));
+    let issues = state
+        .issues
+        .iter()
+        .filter(|issue| github_issue_matches_search(issue, &state.search))
+        .map(|issue| GitHubProviderSelection::Issue(issue.number));
+    pull_requests.chain(issues).collect()
+}
+
+fn github_issue_matches_search(issue: &providers::github::GitHubIssue, search: &str) -> bool {
+    let search = search.trim().to_lowercase();
+    search.is_empty()
+        || issue.title.to_lowercase().contains(&search)
+        || issue.number.to_string().contains(&search)
 }
 
 fn apply_provider_request_failure(
@@ -2023,6 +2251,226 @@ mod tests {
 
         let host = workspace.hosts.get(&host_id).expect("host");
         assert!(host.provider.github.last_error.is_none());
+    }
+
+    #[test]
+    fn provider_keyboard_selection_linear_issues_wraps_through_filtered_rows() {
+        let host_id = HostId::new("local");
+        let mut workspace = Workspace::default();
+        workspace.set_linear_search(host_id.clone(), "launch".to_owned());
+        workspace
+            .hosts
+            .get_mut(&host_id)
+            .expect("host")
+            .provider
+            .linear
+            .issues = vec![
+            linear_issue("LIN-1", "Fix launcher", "lin-1-fix-launcher"),
+            linear_issue("LIN-2", "Update docs", "lin-2-update-docs"),
+            linear_issue("OPS-3", "Launch checklist", "ops-3-checklist"),
+        ];
+
+        assert_eq!(
+            workspace.select_next_linear_issue(&host_id).as_deref(),
+            Some("LIN-1")
+        );
+        assert_eq!(
+            workspace.select_next_linear_issue(&host_id).as_deref(),
+            Some("OPS-3")
+        );
+        assert_eq!(
+            workspace.select_next_linear_issue(&host_id).as_deref(),
+            Some("LIN-1")
+        );
+        assert_eq!(
+            workspace.select_previous_linear_issue(&host_id).as_deref(),
+            Some("OPS-3")
+        );
+    }
+
+    #[test]
+    fn provider_keyboard_selection_linear_issues_match_identifier_and_branch() {
+        let host_id = HostId::new("local");
+        let mut workspace = Workspace::default();
+        workspace.set_linear_search(host_id.clone(), "eng-22".to_owned());
+        workspace
+            .hosts
+            .get_mut(&host_id)
+            .expect("host")
+            .provider
+            .linear
+            .issues = vec![
+            linear_issue("ENG-21", "Unrelated", "eng-21-old"),
+            linear_issue("ENG-22", "Narrow match", "feature/narrow-match"),
+        ];
+
+        assert_eq!(
+            workspace.select_next_linear_issue(&host_id).as_deref(),
+            Some("ENG-22")
+        );
+
+        workspace.set_linear_search(host_id.clone(), "narrow-match".to_owned());
+        assert_eq!(
+            workspace.select_next_linear_issue(&host_id).as_deref(),
+            Some("ENG-22")
+        );
+    }
+
+    #[test]
+    fn provider_keyboard_selection_github_pull_requests_wraps_through_filtered_rows() {
+        let host_id = HostId::new("local");
+        let mut workspace = Workspace::default();
+        workspace.set_github_search(host_id.clone(), "stack".to_owned());
+        workspace
+            .hosts
+            .get_mut(&host_id)
+            .expect("host")
+            .provider
+            .github
+            .pull_requests = vec![
+            github_pull_request(7, "Stack navigation", "feature/stack-nav"),
+            github_pull_request(8, "Release notes", "docs/release"),
+            github_pull_request(9, "Provider focus", "stack-provider-focus"),
+        ];
+
+        assert_eq!(workspace.select_next_github_pull_request(&host_id), Some(7));
+        assert_eq!(workspace.select_next_github_pull_request(&host_id), Some(9));
+        assert_eq!(workspace.select_next_github_pull_request(&host_id), Some(7));
+        assert_eq!(
+            workspace.select_previous_github_pull_request(&host_id),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn provider_keyboard_selection_github_pull_requests_match_number() {
+        let host_id = HostId::new("local");
+        let mut workspace = Workspace::default();
+        workspace.set_github_search(host_id.clone(), "42".to_owned());
+        workspace
+            .hosts
+            .get_mut(&host_id)
+            .expect("host")
+            .provider
+            .github
+            .pull_requests = vec![
+            github_pull_request(41, "Unrelated", "feature/unrelated"),
+            github_pull_request(42, "Exact number", "feature/exact-number"),
+        ];
+
+        assert_eq!(
+            workspace.select_next_github_pull_request(&host_id),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn provider_keyboard_selection_github_issues_wraps_through_filtered_rows() {
+        let host_id = HostId::new("local");
+        let mut workspace = Workspace::default();
+        workspace.set_github_search(host_id.clone(), "nav".to_owned());
+        workspace
+            .hosts
+            .get_mut(&host_id)
+            .expect("host")
+            .provider
+            .github
+            .issues = vec![
+            github_issue(11, "Keyboard navigation"),
+            github_issue(12, "Release docs"),
+            github_issue(13, "Navigation focus"),
+        ];
+
+        assert_eq!(workspace.select_next_github_issue(&host_id), Some(11));
+        assert_eq!(workspace.select_next_github_issue(&host_id), Some(13));
+        assert_eq!(workspace.select_next_github_issue(&host_id), Some(11));
+        assert_eq!(workspace.select_previous_github_issue(&host_id), Some(13));
+    }
+
+    #[test]
+    fn provider_keyboard_selection_github_issues_clear_pull_request_selection() {
+        let host_id = HostId::new("local");
+        let mut workspace = Workspace::default();
+        let host = workspace.host_for_ui(host_id.clone());
+        host.provider.github.selected_pull_request = Some(7);
+        host.provider.github.issues = vec![github_issue(11, "Keyboard navigation")];
+
+        assert_eq!(workspace.select_next_github_issue(&host_id), Some(11));
+
+        let host = workspace.hosts.get(&host_id).expect("host");
+        assert_eq!(host.provider.github.selected_pull_request, None);
+        assert_eq!(host.provider.github.selected_issue, Some(11));
+    }
+
+    #[test]
+    fn provider_keyboard_selection_github_items_moves_between_pull_requests_and_issues() {
+        let host_id = HostId::new("local");
+        let mut workspace = Workspace::default();
+        workspace.set_github_search(host_id.clone(), "nav".to_owned());
+        let host = workspace.hosts.get_mut(&host_id).expect("host");
+        host.provider.github.pull_requests = vec![
+            github_pull_request(7, "Stack navigation", "feature/stack-nav"),
+            github_pull_request(8, "Release notes", "docs/release"),
+        ];
+        host.provider.github.issues = vec![
+            github_issue(11, "Keyboard navigation"),
+            github_issue(12, "Release docs"),
+            github_issue(13, "Navigation focus"),
+        ];
+
+        assert_eq!(
+            workspace.select_next_github_item(&host_id),
+            Some(GitHubProviderSelection::PullRequest(7))
+        );
+        assert_eq!(
+            workspace.select_next_github_item(&host_id),
+            Some(GitHubProviderSelection::Issue(11))
+        );
+        assert_eq!(
+            workspace.select_next_github_item(&host_id),
+            Some(GitHubProviderSelection::Issue(13))
+        );
+        assert_eq!(
+            workspace.select_next_github_item(&host_id),
+            Some(GitHubProviderSelection::PullRequest(7))
+        );
+        assert_eq!(
+            workspace.select_previous_github_item(&host_id),
+            Some(GitHubProviderSelection::Issue(13))
+        );
+    }
+
+    #[test]
+    fn provider_keyboard_selection_empty_and_unknown_hosts_noop() {
+        let host_id = HostId::new("local");
+        let missing_host_id = HostId::new("missing");
+        let mut workspace = Workspace::default();
+        workspace.set_linear_search(host_id.clone(), "nothing".to_owned());
+        workspace.set_github_search(host_id.clone(), "nothing".to_owned());
+        let host = workspace.hosts.get_mut(&host_id).expect("host");
+        host.provider.linear.selected_issue_id = Some("ENG-404".to_owned());
+        host.provider.github.selected_pull_request = Some(404);
+        host.provider.github.selected_issue = Some(405);
+
+        assert_eq!(workspace.select_next_linear_issue(&missing_host_id), None);
+        assert_eq!(workspace.select_previous_linear_issue(&host_id), None);
+        assert_eq!(
+            workspace.select_next_github_pull_request(&missing_host_id),
+            None
+        );
+        assert_eq!(
+            workspace.select_previous_github_pull_request(&host_id),
+            None
+        );
+        assert_eq!(workspace.select_next_github_issue(&missing_host_id), None);
+        assert_eq!(workspace.select_previous_github_issue(&host_id), None);
+        let host = workspace.hosts.get(&host_id).expect("host");
+        assert_eq!(
+            host.provider.linear.selected_issue_id.as_deref(),
+            Some("ENG-404")
+        );
+        assert_eq!(host.provider.github.selected_pull_request, Some(404));
+        assert_eq!(host.provider.github.selected_issue, Some(405));
     }
 
     #[test]
@@ -2893,6 +3341,45 @@ mod tests {
             is_bare: false,
             added_at: "2026-01-01T00:00:00Z".to_owned(),
             last_used_at: "2026-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn linear_issue(identifier: &str, title: &str, branch: &str) -> providers::linear::LinearIssue {
+        providers::linear::LinearIssue {
+            id: format!("opaque-{identifier}"),
+            identifier: identifier.to_owned(),
+            title: title.to_owned(),
+            body: String::new(),
+            branch: branch.to_owned(),
+            url: format!("https://linear.test/{identifier}"),
+            state: None,
+            state_type: None,
+            assignee: None,
+            updated_at: None,
+        }
+    }
+
+    fn github_pull_request(
+        number: u64,
+        title: &str,
+        head_ref_name: &str,
+    ) -> providers::github::GitHubPullRequest {
+        providers::github::GitHubPullRequest::new(
+            number,
+            title,
+            "",
+            head_ref_name,
+            format!("https://github.example/repo/pull/{number}"),
+        )
+    }
+
+    fn github_issue(number: u64, title: &str) -> providers::github::GitHubIssue {
+        providers::github::GitHubIssue {
+            number,
+            title: title.to_owned(),
+            body: String::new(),
+            url: format!("https://github.example/repo/issues/{number}"),
+            branch: None,
         }
     }
 

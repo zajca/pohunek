@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use iced::widget::text_editor;
+use iced::widget::{operation, text_editor};
 use iced::Task;
 use pohunek_gui_core::assistant::{AssistantPaths, LaunchParams as AssistantLaunchParams};
 use pohunek_gui_core::{
@@ -30,19 +30,21 @@ use crate::attach::{attach_task, spawn_notification, spawn_open_url, window_dime
 use crate::config::AppConfig;
 use crate::keyboard;
 use crate::message::{
-    AgentChoice, AssistantForm, DiscoveryResult, InboxView, Message, ModalView, NotificationAction,
-    ResolvedTemplate, StartForm, TemplateRecipe, ASSISTANT_AUTO_AGENT_LABEL, BLANK_TEMPLATE_LABEL,
+    AgentChoice, AssistantForm, DiscoveryResult, InboxView, ListDirection, Message, ModalView,
+    NotificationAction, ResolvedTemplate, StartForm, TemplateRecipe, ASSISTANT_AUTO_AGENT_LABEL,
+    BLANK_TEMPLATE_LABEL,
 };
 use crate::runtime;
 use crate::selection::{
     active_github_filter, active_linear_filter, connection_options, ensure_project_filters_loaded,
     github_client_for_selected_project, host_config, launch_action_name, optional_field,
     required_field, save_ui_state_task, selected_assistant_project,
-    selected_github_pr_status_target, selected_github_pull_request, selected_host_config,
-    selected_host_id, selected_linear_issue, selected_project, selected_project_identity,
-    selected_project_reference, selected_session_target, sync_rename_edit_for_selection,
-    terminal_size,
+    selected_github_pr_status_target, selected_github_pull_request, selected_github_scope,
+    selected_host_config, selected_host_id, selected_linear_issue, selected_project,
+    selected_project_identity, selected_project_reference, selected_session_target,
+    sync_rename_edit_for_selection, tab_project_scope, terminal_size,
 };
+use crate::view::provider::{github_search_input_id, linear_search_input_id};
 use crate::PohunekApp;
 
 // A second click on the same session within this window counts as a double-click
@@ -58,6 +60,7 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
     match message {
         Message::Core(event) => {
             app.workspace.apply(event);
+            normalize_inbox_cursor(app);
             tasks.push(notification_tasks(app));
         }
         Message::HostsDiscovered(result) => {
@@ -123,18 +126,29 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             app.modal = ModalView::Inbox;
             app.inbox_view = InboxView::List;
             app.notification_filter.host_id = None;
+            app.inbox_cursor = None;
+            normalize_inbox_cursor(app);
         }
         Message::OpenHostInbox(host_id) => {
             app.modal = ModalView::Inbox;
             app.inbox_view = InboxView::List;
             app.notification_filter.host_id = Some(host_id);
+            app.inbox_cursor = None;
+            normalize_inbox_cursor(app);
         }
-        Message::SetInboxScope(scope) => app.inbox_scope = scope,
-        Message::FilterNotificationHost(host_id) => app.notification_filter.host_id = host_id,
+        Message::SetInboxScope(scope) => {
+            app.inbox_scope = scope;
+            normalize_inbox_cursor(app);
+        }
+        Message::FilterNotificationHost(host_id) => {
+            app.notification_filter.host_id = host_id;
+            normalize_inbox_cursor(app);
+        }
         Message::SelectNotification {
             host_id,
             notification_id,
         } => {
+            app.inbox_cursor = Some((host_id.clone(), notification_id.clone()));
             app.inbox_details_expanded = false;
             // Auto-mark-read on open: there is no separate "Mark read" action.
             let unread = app
@@ -157,7 +171,10 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                 notification_id,
             };
         }
-        Message::InboxBack => app.inbox_view = InboxView::List,
+        Message::InboxBack => {
+            app.inbox_view = InboxView::List;
+            normalize_inbox_cursor(app);
+        }
         Message::ToggleInboxDetails => {
             app.inbox_details_expanded = !app.inbox_details_expanded;
         }
@@ -271,6 +288,7 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             app.assistant_editor = text_editor::Content::new();
             app.modal = ModalView::Assistant;
         }
+        Message::OpenKeymapModal => app.modal = ModalView::Keymap,
         Message::CloseModal => app.modal = ModalView::None,
         Message::StartAgentSelected(agent) => app.start.agent = agent,
         Message::StartTemplateSelected(template) => {
@@ -416,6 +434,12 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             Ok(task) => tasks.push(task),
             Err(err) => app.status = Some(err),
         },
+        Message::MoveListSelection(direction) => move_list_selection(app, direction),
+        Message::FocusProviderSearch => {
+            if let Some(task) = provider_search_focus_task(app) {
+                tasks.push(task);
+            }
+        }
         Message::SelectAction(name) => app.selected_action = Some(name),
         Message::SelectLinearFilter(name) => {
             if let Ok(host_id) = selected_host_id(app) {
@@ -571,6 +595,7 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                         None
                     };
                 app.workspace.apply(message);
+                normalize_inbox_cursor(app);
                 if let Some((host_id, session_id)) = removed_session {
                     if app.ui_state.selection
                         == Some(Selection::Session {
@@ -656,6 +681,116 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         }
     }
     Task::batch(tasks)
+}
+
+fn move_list_selection(app: &mut PohunekApp, direction: ListDirection) {
+    if app.modal == ModalView::Inbox && matches!(app.inbox_view, InboxView::List) {
+        move_inbox_cursor(app, direction);
+        return;
+    }
+    if app.modal == ModalView::None {
+        move_provider_selection(app, direction);
+    }
+}
+
+fn move_inbox_cursor(app: &mut PohunekApp, direction: ListDirection) {
+    let rows = app
+        .workspace
+        .inbox_rows(app.inbox_scope, &app.notification_filter);
+    if rows.is_empty() {
+        app.inbox_cursor = None;
+        return;
+    }
+    let current_index = app.inbox_cursor.as_ref().and_then(|(host_id, id)| {
+        rows.iter()
+            .position(|row| &row.host_id == host_id && &row.record.id == id)
+    });
+    let selected_index = match (current_index, direction) {
+        (None, ListDirection::Down) => 0,
+        (None | Some(0), ListDirection::Up) => rows.len() - 1,
+        (Some(index), ListDirection::Down) => (index + 1) % rows.len(),
+        (Some(index), ListDirection::Up) => index - 1,
+    };
+    let row = &rows[selected_index];
+    app.inbox_cursor = Some((row.host_id.clone(), row.record.id.clone()));
+}
+
+fn normalize_inbox_cursor(app: &mut PohunekApp) {
+    if app.modal != ModalView::Inbox || !matches!(app.inbox_view, InboxView::List) {
+        return;
+    }
+    let rows = app
+        .workspace
+        .inbox_rows(app.inbox_scope, &app.notification_filter);
+    if rows.is_empty() {
+        app.inbox_cursor = None;
+        return;
+    }
+    let cursor_is_visible = app.inbox_cursor.as_ref().is_some_and(|(host_id, id)| {
+        rows.iter()
+            .any(|row| &row.host_id == host_id && &row.record.id == id)
+    });
+    if !cursor_is_visible {
+        let row = &rows[0];
+        app.inbox_cursor = Some((row.host_id.clone(), row.record.id.clone()));
+    }
+}
+
+fn move_provider_selection(app: &mut PohunekApp, direction: ListDirection) {
+    let Ok(host_id) = selected_host_id(app) else {
+        return;
+    };
+    match app.ui_state.active_tab {
+        RightTab::Linear => {
+            app.workspace
+                .set_active_panel(host_id.clone(), ProviderPanel::Linear);
+            match direction {
+                ListDirection::Down => {
+                    app.workspace.select_next_linear_issue(&host_id);
+                }
+                ListDirection::Up => {
+                    app.workspace.select_previous_linear_issue(&host_id);
+                }
+            }
+        }
+        RightTab::GitHub => {
+            app.workspace
+                .set_active_panel(host_id.clone(), ProviderPanel::GitHub);
+            if !github_provider_scope_matches(app, &host_id) {
+                return;
+            }
+            match direction {
+                ListDirection::Down => {
+                    app.workspace.select_next_github_item(&host_id);
+                }
+                ListDirection::Up => {
+                    app.workspace.select_previous_github_item(&host_id);
+                }
+            }
+        }
+        RightTab::Detail | RightTab::Worktrees => {}
+    }
+}
+
+fn github_provider_scope_matches(app: &PohunekApp, host_id: &HostId) -> bool {
+    let Ok(scope) = selected_github_scope(app) else {
+        return false;
+    };
+    app.workspace
+        .hosts
+        .get(host_id)
+        .is_some_and(|host| host.provider.github.scope.as_ref() == Some(&scope))
+}
+
+fn provider_search_focus_task(app: &PohunekApp) -> Option<Task<Message>> {
+    if app.modal != ModalView::None || tab_project_scope(app).is_none() {
+        return None;
+    }
+    match app.ui_state.active_tab {
+        RightTab::Linear => Some(operation::focus(linear_search_input_id())),
+        RightTab::GitHub => Some(operation::focus(github_search_input_id())),
+        RightTab::Detail | RightTab::Worktrees => None,
+    }
 }
 
 fn push_provider_task_result(
@@ -1433,4 +1568,276 @@ fn launch_github_pull_request_task(app: &PohunekApp) -> Result<Task<Message>, St
         }),
         Message::CoreCommandCompleted,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use pohunek_gui_core::{
+        ConnState, GitHubProviderScope, HostView, NotificationFilter, NotificationScope,
+        PromptState, ProviderState, UiState, Workspace,
+    };
+    use protocol::{
+        AgentKind, NotificationKind, NotificationRecord, NotificationSeverity, NotificationSource,
+        ProjectInfo, ProjectSource,
+    };
+
+    use super::*;
+    use crate::message::{MetadataEdit, ProjectEdit};
+
+    #[test]
+    fn move_list_selection_moves_inbox_cursor_with_wrapping() {
+        let host_id = HostId::new("local");
+        let first_id = NotificationId("n-1".to_owned());
+        let second_id = NotificationId("n-2".to_owned());
+        let mut host = test_host();
+        host.notifications.insert(
+            first_id.0.clone(),
+            test_notification(&first_id, "2026-07-06T00:00:00Z"),
+        );
+        host.notifications.insert(
+            second_id.0.clone(),
+            test_notification(&second_id, "2026-07-05T00:00:00Z"),
+        );
+        let mut app = app_without_selection();
+        app.workspace.hosts.insert(host_id.clone(), host);
+        app.modal = ModalView::Inbox;
+        app.inbox_view = InboxView::List;
+
+        let _ = update(&mut app, Message::MoveListSelection(ListDirection::Down));
+        assert_eq!(app.inbox_cursor, Some((host_id.clone(), first_id.clone())));
+
+        let _ = update(&mut app, Message::MoveListSelection(ListDirection::Down));
+        assert_eq!(app.inbox_cursor, Some((host_id.clone(), second_id.clone())));
+
+        let _ = update(&mut app, Message::MoveListSelection(ListDirection::Down));
+        assert_eq!(app.inbox_cursor, Some((host_id, first_id)));
+    }
+
+    #[test]
+    fn move_list_selection_moves_linear_provider_selection() {
+        let host_id = HostId::new("local");
+        let mut host = test_host();
+        host.provider.linear.issues = vec![
+            test_linear_issue("ENG-1", "First issue"),
+            test_linear_issue("ENG-2", "Second issue"),
+        ];
+        let mut app = app_without_selection();
+        app.workspace.hosts.insert(host_id.clone(), host);
+        app.ui_state.active_tab = RightTab::Linear;
+        app.ui_state.selection = Some(Selection::Project {
+            host_id: host_id.clone(),
+            project_id: "p-1".to_owned(),
+        });
+
+        let _ = update(&mut app, Message::MoveListSelection(ListDirection::Down));
+        assert_eq!(
+            app.workspace.hosts.get(&host_id).and_then(|host| host
+                .provider
+                .linear
+                .selected_issue_id
+                .as_deref()),
+            Some("ENG-1")
+        );
+
+        let _ = update(&mut app, Message::MoveListSelection(ListDirection::Down));
+        assert_eq!(
+            app.workspace.hosts.get(&host_id).and_then(|host| host
+                .provider
+                .linear
+                .selected_issue_id
+                .as_deref()),
+            Some("ENG-2")
+        );
+    }
+
+    #[test]
+    fn move_list_selection_moves_github_selection_across_pull_requests_and_issues() {
+        let host_id = HostId::new("local");
+        let mut host = test_host();
+        host.provider.github.scope = Some(test_github_scope());
+        host.provider.github.search = "nav".to_owned();
+        host.provider.github.pull_requests = vec![
+            test_github_pull_request(7, "Stack navigation", "feature/stack-nav"),
+            test_github_pull_request(8, "Release notes", "docs/release"),
+        ];
+        host.provider.github.issues = vec![
+            test_github_issue(11, "Keyboard navigation"),
+            test_github_issue(13, "Navigation focus"),
+        ];
+        let mut app = app_without_selection();
+        app.workspace.hosts.insert(host_id.clone(), host);
+        app.ui_state.active_tab = RightTab::GitHub;
+        app.ui_state.selection = Some(Selection::Project {
+            host_id: host_id.clone(),
+            project_id: "p-1".to_owned(),
+        });
+
+        let _ = update(&mut app, Message::MoveListSelection(ListDirection::Down));
+        let host = app.workspace.hosts.get(&host_id).expect("host");
+        assert_eq!(host.provider.github.selected_pull_request, Some(7));
+        assert_eq!(host.provider.github.selected_issue, None);
+
+        let _ = update(&mut app, Message::MoveListSelection(ListDirection::Down));
+        let host = app.workspace.hosts.get(&host_id).expect("host");
+        assert_eq!(host.provider.github.selected_pull_request, None);
+        assert_eq!(host.provider.github.selected_issue, Some(11));
+    }
+
+    #[test]
+    fn move_list_selection_does_not_select_github_item_from_stale_scope() {
+        let host_id = HostId::new("local");
+        let mut host = test_host();
+        host.provider.github.scope = Some(GitHubProviderScope::new("old-project", "/tmp/old"));
+        host.provider.github.pull_requests = vec![test_github_pull_request(
+            7,
+            "Hidden pull request",
+            "feature/hidden-pr",
+        )];
+        let mut app = app_without_selection();
+        app.workspace.hosts.insert(host_id.clone(), host);
+        app.ui_state.active_tab = RightTab::GitHub;
+        app.ui_state.selection = Some(Selection::Project {
+            host_id: host_id.clone(),
+            project_id: "p-1".to_owned(),
+        });
+
+        let _ = update(&mut app, Message::MoveListSelection(ListDirection::Down));
+
+        let host = app.workspace.hosts.get(&host_id).expect("host");
+        assert_eq!(host.provider.github.selected_pull_request, None);
+        assert_eq!(host.provider.github.selected_issue, None);
+    }
+
+    fn app_without_selection() -> PohunekApp {
+        PohunekApp {
+            workspace: Workspace::default(),
+            config: Err("test config is intentionally absent".to_owned()),
+            keymap: keyboard::KeyMap::default(),
+            hosts: Vec::new(),
+            ui_state: UiState::default(),
+            start: StartForm::default(),
+            assistant: AssistantForm::default(),
+            prompt_editor: text_editor::Content::new(),
+            assistant_editor: text_editor::Content::new(),
+            template_recipe: None,
+            modal: ModalView::None,
+            activity_filter: None,
+            notification_filter: NotificationFilter::default(),
+            inbox_scope: NotificationScope::default(),
+            inbox_view: InboxView::default(),
+            inbox_cursor: None,
+            inbox_details_expanded: false,
+            metadata_edit: MetadataEdit::default(),
+            rename_edit: String::new(),
+            project_edit: ProjectEdit::default(),
+            selected_action: None,
+            project_filters: BTreeMap::new(),
+            last_session_click: None,
+            state_dir: None,
+            status: None,
+            notified_intents: 0,
+            blocked_cycle_index: 0,
+        }
+    }
+
+    fn test_host() -> HostView {
+        HostView {
+            conn: ConnState::Connected,
+            health: None,
+            sessions: BTreeMap::new(),
+            projects: BTreeMap::from([("p-1".to_owned(), test_project())]),
+            project_details: BTreeMap::new(),
+            notifications: BTreeMap::new(),
+            prompt: PromptState::default(),
+            provider: ProviderState::default(),
+            last_agent_state: None,
+            last_error: None,
+        }
+    }
+
+    fn test_project() -> ProjectInfo {
+        ProjectInfo {
+            id: "p-1".to_owned(),
+            label: "Project".to_owned(),
+            repo_root: PathBuf::from("/tmp/project"),
+            git_common_dir: PathBuf::from("/tmp/project/.git"),
+            origin_url: None,
+            default_base_branch: None,
+            source: ProjectSource::Manual,
+            is_bare: false,
+            added_at: "2026-07-06T00:00:00Z".to_owned(),
+            last_used_at: "2026-07-06T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn test_linear_issue(identifier: &str, title: &str) -> providers::linear::LinearIssue {
+        providers::linear::LinearIssue {
+            id: format!("{identifier}-opaque"),
+            identifier: identifier.to_owned(),
+            title: title.to_owned(),
+            body: "Issue body".to_owned(),
+            branch: format!("feature/{}", identifier.to_lowercase()),
+            url: format!("https://linear.example/{identifier}"),
+            state: None,
+            state_type: None,
+            assignee: None,
+            updated_at: None,
+        }
+    }
+
+    fn test_github_pull_request(
+        number: u64,
+        title: &str,
+        head_ref_name: &str,
+    ) -> providers::github::GitHubPullRequest {
+        providers::github::GitHubPullRequest::new(
+            number,
+            title,
+            "",
+            head_ref_name,
+            format!("https://github.example/repo/pull/{number}"),
+        )
+    }
+
+    fn test_github_issue(number: u64, title: &str) -> providers::github::GitHubIssue {
+        providers::github::GitHubIssue {
+            number,
+            title: title.to_owned(),
+            body: String::new(),
+            url: format!("https://github.example/repo/issues/{number}"),
+            branch: None,
+        }
+    }
+
+    fn test_github_scope() -> GitHubProviderScope {
+        GitHubProviderScope::new("p-1", "/tmp/project")
+    }
+
+    fn test_notification(id: &NotificationId, created_at: &str) -> NotificationRecord {
+        NotificationRecord {
+            id: id.clone(),
+            source: NotificationSource {
+                provider: "test".to_owned(),
+                provider_event: "event".to_owned(),
+                host_local_source_id: "source-1".to_owned(),
+            },
+            kind: NotificationKind::AgentBlocked,
+            severity: NotificationSeverity::Warning,
+            status: NotificationStatus::Unread,
+            title: "Blocked".to_owned(),
+            body: "Needs attention".to_owned(),
+            metadata: BTreeMap::new(),
+            created_at: created_at.to_owned(),
+            session_id: None,
+            agent_kind: Some(AgentKind::Codex),
+            source_id: None,
+            dedupe_key: None,
+            project_id: Some("p-1".to_owned()),
+            read_at: None,
+            acked_at: None,
+            archived_at: None,
+            deleted_at: None,
+            superseded_by: None,
+        }
+    }
 }

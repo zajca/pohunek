@@ -38,8 +38,12 @@ Current CLI and command surface:
 Native GUI client:
 
 - `crates/gui/src/main.rs`
+- `crates/gui/src/config.rs`
+- `crates/gui/src/command.rs`
+- `crates/gui/src/keyboard.rs`
 - `crates/gui/src/runtime.rs`
 - `crates/gui/src/view/inbox.rs`
+- `crates/gui/src/view/provider.rs`
 - `crates/gui-core/src/assistant.rs`
 - `crates/gui-core/src/lib.rs`
 - `crates/gui-core/src/state.rs`

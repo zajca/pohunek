@@ -18,6 +18,17 @@ use crate::view::inbox::date_part;
 
 use super::{list_button, muted_style};
 
+const LINEAR_SEARCH_INPUT_ID: &str = "linear-provider-search";
+const GITHUB_SEARCH_INPUT_ID: &str = "github-provider-search";
+
+pub(crate) fn linear_search_input_id() -> iced::widget::Id {
+    iced::widget::Id::new(LINEAR_SEARCH_INPUT_ID)
+}
+
+pub(crate) fn github_search_input_id() -> iced::widget::Id {
+    iced::widget::Id::new(GITHUB_SEARCH_INPUT_ID)
+}
+
 /// Renders the action picker and launch button for a selected provider item.
 /// When the project defines no matching action, shows guidance rather than a
 /// launch button that would fail.
@@ -89,13 +100,15 @@ pub(crate) fn linear_provider_view(
     let mut view = column![
         filters,
         row![
-            text_input("search", &state.search).on_input({
-                let host_id = host_id.clone();
-                move |value| Message::LinearSearchChanged {
-                    host_id: host_id.clone(),
-                    value,
-                }
-            }),
+            text_input("search", &state.search)
+                .id(linear_search_input_id())
+                .on_input({
+                    let host_id = host_id.clone();
+                    move |value| Message::LinearSearchChanged {
+                        host_id: host_id.clone(),
+                        value,
+                    }
+                }),
             button("Fetch")
                 .on_press(Message::FetchLinearIssues)
                 .style(iced::widget::button::secondary),
@@ -106,7 +119,7 @@ pub(crate) fn linear_provider_view(
     if !state.issues.is_empty() {
         view = view.push(text("Pick an issue, choose an action, then Launch.").size(12));
     }
-    for issue in &state.issues {
+    for issue in filtered_linear_issues(state) {
         let selected = state.selected_issue_id.as_deref() == Some(issue.prompt_item_id());
         view = view.push(linear_issue_row(issue, selected));
     }
@@ -144,13 +157,15 @@ pub(crate) fn github_provider_view(
     let mut view = column![
         pr_filter_row,
         row![
-            text_input("search", &state.search).on_input({
-                let host_id = host_id.clone();
-                move |value| Message::GitHubSearchChanged {
-                    host_id: host_id.clone(),
-                    value,
-                }
-            }),
+            text_input("search", &state.search)
+                .id(github_search_input_id())
+                .on_input({
+                    let host_id = host_id.clone();
+                    move |value| Message::GitHubSearchChanged {
+                        host_id: host_id.clone(),
+                        value,
+                    }
+                }),
             button("Fetch issues")
                 .on_press(Message::FetchGitHubIssues)
                 .style(iced::widget::button::secondary),
@@ -178,10 +193,11 @@ pub(crate) fn github_provider_view(
     }
     view = view.push(text("Issues").size(15));
     for issue in filtered_github_issues(state) {
+        let selected = state.selected_issue == Some(issue.number);
         view = view.push(list_button(
             text(format!("#{}  {}", issue.number, issue.title)).size(13),
             Message::OpenGitHubIssue(issue.number),
-            false,
+            selected,
         ));
     }
     if let Some(error) = &state.last_error {
@@ -194,27 +210,34 @@ pub(crate) fn selected_linear_issue_in_state(
     state: &pohunek_gui_core::LinearProviderState,
 ) -> Option<&providers::linear::LinearIssue> {
     let selected = state.selected_issue_id.as_ref()?;
-    state
-        .issues
-        .iter()
-        .find(|issue| issue.prompt_item_id() == selected)
+    filtered_linear_issues(state).find(|issue| issue.prompt_item_id() == selected)
 }
 
 pub(crate) fn selected_pull_request_in_state(
     state: &pohunek_gui_core::GitHubProviderState,
 ) -> Option<&providers::github::GitHubPullRequest> {
     let selected = state.selected_pull_request?;
-    state
-        .pull_requests
-        .iter()
-        .find(|pull_request| pull_request.number == selected)
+    filtered_pull_requests(state).find(|pull_request| pull_request.number == selected)
 }
 
 pub(crate) fn selected_github_issue_in_state(
     state: &pohunek_gui_core::GitHubProviderState,
 ) -> Option<&providers::github::GitHubIssue> {
     let selected = state.selected_issue?;
-    state.issues.iter().find(|issue| issue.number == selected)
+    filtered_github_issues(state).find(|issue| issue.number == selected)
+}
+
+fn filtered_linear_issues(
+    state: &pohunek_gui_core::LinearProviderState,
+) -> impl Iterator<Item = &providers::linear::LinearIssue> {
+    let search = state.search.trim().to_lowercase();
+    state.issues.iter().filter(move |issue| {
+        search.is_empty()
+            || issue.title.to_lowercase().contains(&search)
+            || issue.identifier.to_lowercase().contains(&search)
+            || issue.prompt_item_id().to_lowercase().contains(&search)
+            || issue.branch.to_lowercase().contains(&search)
+    })
 }
 
 fn filtered_pull_requests(

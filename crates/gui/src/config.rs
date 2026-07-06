@@ -1,11 +1,14 @@
 //! GUI configuration: `gui.toml` loading, validation, and provider filter files.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use pohunek_gui_core::{providers, ConnectionOptions, HostConfig};
 use serde::Deserialize;
 use thiserror::Error;
+
+use crate::keyboard::{KeyMap, KeyMapError};
 
 // 80x24 is the traditional terminal size expected by many CLI tools.
 const DEFAULT_TERMINAL_COLS: u16 = 80;
@@ -45,6 +48,7 @@ pub(crate) struct AppConfig {
     /// Command used to open a provider item's URL in the OS browser, spawned via
     /// argv (never a shell) so the URL cannot inject shell syntax.
     pub(crate) open_url_command: String,
+    pub(crate) keymap: KeyMap,
     pub(crate) providers: ProviderAppConfig,
 }
 
@@ -64,6 +68,7 @@ impl AppConfig {
         let raw_gui = raw.gui.unwrap_or_default();
         let connection_options = raw_gui.connection_options()?;
         let terminal_size = raw_gui.terminal_size()?;
+        let keymap = keymap_from_raw_keybindings(&raw.keybindings)?;
         Ok(Self {
             attach_command: raw.attach_command,
             pohunek_bin: raw.pohunek_bin,
@@ -76,6 +81,7 @@ impl AppConfig {
             open_url_command: raw
                 .open_url_command
                 .unwrap_or_else(|| DEFAULT_OPEN_URL_COMMAND.to_owned()),
+            keymap,
             providers: raw.providers.unwrap_or_default().into_provider_config()?,
         })
     }
@@ -113,6 +119,8 @@ struct RawConfig {
     open_url_command: Option<String>,
     #[serde(default)]
     gui: Option<RawGuiConfig>,
+    #[serde(default)]
+    keybindings: BTreeMap<String, String>,
     #[serde(default)]
     providers: Option<RawProvidersConfig>,
 }
@@ -375,6 +383,12 @@ pub(crate) enum ConfigError {
     },
     #[error("invalid provider filter: {message}")]
     ProviderFilter { message: String },
+    #[error("invalid keybindings: {source}")]
+    Keybindings { source: KeyMapError },
+}
+
+fn keymap_from_raw_keybindings(raw: &BTreeMap<String, String>) -> Result<KeyMap, ConfigError> {
+    KeyMap::from_config(raw).map_err(|source| ConfigError::Keybindings { source })
 }
 
 fn non_empty_config_value(value: String, field: &'static str) -> Result<String, ConfigError> {
@@ -505,5 +519,37 @@ fn config_dir() -> Result<PathBuf, ConfigError> {
 fn config_path_error(err: pohunek_paths::PathError) -> ConfigError {
     match err {
         pohunek_paths::PathError::MissingEnv { var } => ConfigError::MissingEnv { var },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iced::keyboard::Modifiers;
+
+    use super::*;
+    use crate::keyboard::{KeyAction, KeyChord, KeyContext};
+
+    #[test]
+    fn keybindings_table_builds_config_keymap() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+attach_command = "foot -- {bin} attach {host} {id}"
+pohunek_bin = "pohunek"
+
+[keybindings]
+open_inbox = "ctrl+i"
+"#,
+        )
+        .expect("raw config");
+
+        let keymap = keymap_from_raw_keybindings(&raw.keybindings).expect("keymap");
+
+        assert_eq!(
+            keymap.action_for(
+                KeyContext::Global,
+                &KeyChord::character("i").with_modifiers(Modifiers::CTRL)
+            ),
+            Some(KeyAction::OpenInbox)
+        );
     }
 }

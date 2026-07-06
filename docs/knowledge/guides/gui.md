@@ -123,39 +123,57 @@ restarts in `UiState::active_tab` (`RightTab`).
 
 ## Keyboard Shortcuts
 
-The GUI is keyboard-first. Global shortcuts (no modifier) fire only while no
-modal is open:
+The GUI is keyboard-first. Global shortcuts fire only while no modal is open;
+modal shortcuts apply only while a modal is open. The default keymap is:
 
-- `1` `2` `3` `4`: switch to the Detail / Linear / GitHub / Worktrees tab.
-  `2`-`4` are no-ops without a project in scope, matching the tab strip's own
-  disabled state.
-- `i`: open the Inbox.
-- `b`: select the next blocked agent (agents-monitor order) and force the
-  Detail tab; repeated presses cycle through every blocked agent instead of
-  reselecting the first one. Backed by `AgentMonitor::blocked_at` in
-  `gui-core`, which indexes the blocked subset and wraps around.
-- `o`: open the currently selected session in a terminal (same as the session
-  pane's "Open in terminal" button).
-- `n`: open the "Start a session" modal.
-- `a`: open the "Start assistant" modal.
-- `r`: refresh the active tab — `project.show` for Detail/Worktrees, a Linear
-  issues fetch for Linear, a GitHub PRs+issues fetch for GitHub. No-op
-  without a project in scope.
+| Context | Keybinding name | Default | Behavior |
+|---------|-----------------|---------|----------|
+| Global | `tab_detail` | `1` | Switch to the Detail tab. |
+| Global | `tab_linear` | `2` | Switch to the Linear tab when a project is in scope. |
+| Global | `tab_github` | `3` | Switch to the GitHub tab when a project is in scope. |
+| Global | `tab_worktrees` | `4` | Switch to the Worktrees tab when a project is in scope. |
+| Global | `open_inbox` | `i` | Open the Inbox. |
+| Global | `cycle_blocked` | `b` | Select the next blocked agent, wrapping through the blocked subset. |
+| Global | `open_selected_session` | `o` | Open the selected provider item when a provider tab is active; otherwise open the selected session in a terminal. |
+| Global | `activate_selection` | `enter` | Activate the selected provider item or selected session. |
+| Global | `open_keymap_help` | `shift+?` | Open the effective keyboard shortcut table. |
+| Global | `list_up`, `list_up_arrow` | `k`, `arrowup` | Move the active provider list selection up. |
+| Global | `list_down`, `list_down_arrow` | `j`, `arrowdown` | Move the active provider list selection down. |
+| Global | `focus_search` | `/` | Focus the active Linear/GitHub provider search box. |
+| Global | `new_session` | `n` | Open the "Start a session" modal. |
+| Global | `open_assistant` | `a` | Open the "Start assistant" modal. |
+| Global | `refresh_tab` | `r` | Refresh the active tab (`project.show`, Linear issues, or GitHub PRs+issues). |
+| Modal | `modal_back` | `escape` | In Inbox message detail, step back to the list; otherwise close the modal. |
+| Modal | `modal_primary` | `enter` | Run the modal primary action, or open the selected Inbox row from the list. |
+| Modal | `modal_primary_with_terminal` | `shift+enter` | In Inbox message detail, open the linked session and also open it in a terminal. |
+| Modal | `modal_list_up`, `modal_list_up_arrow` | `k`, `arrowup` | Move the Inbox list selection up. |
+| Modal | `modal_list_down`, `modal_list_down_arrow` | `j`, `arrowdown` | Move the Inbox list selection down. |
+| Modal | `modal_open_linked_session` | `o` | Jump from the selected Inbox row to its linked live session. |
 
-Modal-scoped shortcuts apply only while a modal is open:
+Add an optional top-level `[keybindings]` table to `gui.toml` to remap any of
+those binding names. Overrides are partial: names that are not listed keep their
+default chord.
 
-- `Esc`: in the Inbox message layer, step back to the list; otherwise close
-  the modal.
-- `Enter`: the modal's primary action — Start session, Start assistant,
-  Launch (Linear issue / GitHub pull request), or, in the Inbox message
-  layer, Open session. A GitHub issue modal and an empty Linear panel have no
-  Launch button, so Enter is a no-op there, matching the UI.
-- `Shift+Enter` in the Inbox message layer: Open session and also open it in
-  a terminal.
+```toml
+[keybindings]
+open_inbox = "ctrl+i"
+refresh_tab = "ctrl+r"
+modal_primary_with_terminal = "shift+enter"
+```
 
-The Inbox list layer's `Enter`/`j`/`k` row navigation is not yet implemented
-(needs a list-selection cursor); it is deferred to a follow-up pass, along
-with `/` to focus a provider tab's search field.
+Key strings are case-insensitive. They can be a one-character key (`i`, `1`,
+`/`) or a named key (`escape`, `enter`, `tab`, `space`, `backspace`, `delete`,
+`home`, `end`, `pageup`, `pagedown`, `arrowup`, `arrowdown`, `arrowleft`,
+`arrowright`) with optional `ctrl`, `alt`, `shift`, and `logo` modifiers joined
+by `+`, such as `ctrl+r` or `shift+enter`.
+
+The GUI fails fast on unknown keybinding names, invalid key strings, or two
+different actions using the same chord in the same context. Global and modal
+contexts are independent, so the same chord may be reused once globally and once
+in a modal. Modal shortcuts support bare keys, plus the dedicated
+`shift+enter` path for `modal_primary_with_terminal`; other modified modal
+chords are rejected because the modal event router intentionally ignores those
+modifiers.
 
 Iced has no direct "is a text input focused" query, but a focused
 `text_input`/`text_editor` already consumes (captures) the key presses it

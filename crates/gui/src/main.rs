@@ -1,6 +1,6 @@
 //! Native Iced shell for the pohunek control plane.
 
-// Rust guideline compliant 2026-07-05
+// Rust guideline compliant 2026-07-06
 #![forbid(unsafe_code)]
 
 mod attach;
@@ -24,7 +24,7 @@ use pohunek_gui_core::{
     default_state_dir, providers, AttachTemplateValues, HostConfig, HostId, NotificationFilter,
     NotificationScope, UiState, Workspace,
 };
-use protocol::{AgentActivity, SessionId};
+use protocol::{AgentActivity, NotificationId, SessionId};
 use thiserror::Error;
 
 use attach::window_dimension_to_f32;
@@ -159,6 +159,7 @@ impl BootState {
 struct PohunekApp {
     workspace: Workspace,
     config: Result<AppConfig, String>,
+    keymap: keyboard::KeyMap,
     hosts: Vec<HostConfig>,
     ui_state: UiState,
     start: StartForm,
@@ -180,6 +181,9 @@ struct PohunekApp {
     inbox_scope: NotificationScope,
     /// Which layer of the inbox modal is showing.
     inbox_view: InboxView,
+    /// Keyboard cursor for the inbox list layer. This stays local UI state; the
+    /// persisted UI selection remains reserved for workspace tree entities.
+    inbox_cursor: Option<(HostId, NotificationId)>,
     /// Whether the inbox message layer's `> Details` section is expanded.
     inbox_details_expanded: bool,
     metadata_edit: MetadataEdit,
@@ -209,6 +213,10 @@ struct PohunekApp {
 impl PohunekApp {
     fn boot(boot: BootState) -> (Self, Task<Message>) {
         let config = AppConfig::load().map_err(|err| err.to_string());
+        let keymap = config.as_ref().map_or_else(
+            |_| keyboard::KeyMap::default(),
+            |config| config.keymap.clone(),
+        );
         let task = match &config {
             Ok(config) => discover_hosts_task(config),
             Err(_) => Task::none(),
@@ -219,6 +227,7 @@ impl PohunekApp {
             Self {
                 workspace,
                 config,
+                keymap,
                 hosts: Vec::new(),
                 ui_state: boot.ui_state,
                 start: StartForm::default(),
@@ -231,6 +240,7 @@ impl PohunekApp {
                 notification_filter: NotificationFilter::default(),
                 inbox_scope: NotificationScope::default(),
                 inbox_view: InboxView::default(),
+                inbox_cursor: None,
                 inbox_details_expanded: false,
                 metadata_edit: MetadataEdit::default(),
                 rename_edit: String::new(),
@@ -384,6 +394,7 @@ mod tests {
         let mut app = PohunekApp {
             workspace: Workspace::default(),
             config: Err("test config is intentionally absent".to_owned()),
+            keymap: keyboard::KeyMap::default(),
             hosts: Vec::new(),
             ui_state: UiState::default(),
             start: StartForm::default(),
@@ -396,6 +407,7 @@ mod tests {
             notification_filter: NotificationFilter::default(),
             inbox_scope: NotificationScope::default(),
             inbox_view: InboxView::default(),
+            inbox_cursor: None,
             inbox_details_expanded: false,
             metadata_edit: MetadataEdit::default(),
             rename_edit: String::new(),
@@ -462,6 +474,7 @@ mod tests {
         let mut app = PohunekApp {
             workspace: Workspace::default(),
             config: Err("test config is intentionally absent".to_owned()),
+            keymap: keyboard::KeyMap::default(),
             hosts: Vec::new(),
             ui_state: UiState::default(),
             start: StartForm::default(),
@@ -474,6 +487,7 @@ mod tests {
             notification_filter: NotificationFilter::default(),
             inbox_scope: NotificationScope::default(),
             inbox_view: InboxView::default(),
+            inbox_cursor: None,
             inbox_details_expanded: false,
             metadata_edit: MetadataEdit::default(),
             rename_edit: String::new(),
@@ -569,6 +583,7 @@ mod tests {
         let mut app = PohunekApp {
             workspace: Workspace::default(),
             config: Err("test config is intentionally absent".to_owned()),
+            keymap: keyboard::KeyMap::default(),
             hosts: Vec::new(),
             ui_state: UiState::default(),
             start: StartForm::default(),
@@ -581,6 +596,7 @@ mod tests {
             notification_filter: NotificationFilter::default(),
             inbox_scope: NotificationScope::default(),
             inbox_view: InboxView::default(),
+            inbox_cursor: None,
             inbox_details_expanded: false,
             metadata_edit: MetadataEdit::default(),
             rename_edit: String::new(),

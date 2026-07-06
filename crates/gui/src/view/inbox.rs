@@ -88,7 +88,11 @@ fn inbox_list_content(app: &PohunekApp) -> Element<'_, Message> {
         list = list.push(text(inbox_empty_label(app.inbox_scope)).size(13));
     } else {
         for row in rows {
-            list = list.push(notification_row(app, row.host_id, row.record));
+            let selected = app
+                .inbox_cursor
+                .as_ref()
+                .is_some_and(|(host_id, id)| host_id == &row.host_id && id == &row.record.id);
+            list = list.push(notification_row(app, row.host_id, row.record, selected));
         }
     }
 
@@ -178,6 +182,7 @@ fn notification_row(
     app: &PohunekApp,
     host_id: HostId,
     record: NotificationRecord,
+    selected: bool,
 ) -> Element<'static, Message> {
     let unread = record.status == NotificationStatus::Unread;
     let needs_action = matches!(
@@ -226,7 +231,7 @@ fn notification_row(
             host_id,
             notification_id,
         },
-        false,
+        selected,
     )
 }
 

@@ -8,6 +8,7 @@ use pohunek_gui_core::assistant::Intent as AssistantIntent;
 use pohunek_gui_core::{providers, ProviderPanel, Toast};
 use protocol::ProviderKind;
 
+use crate::keyboard::{KeyBindingHelp, KeyContext};
 use crate::message::{AgentChoice, Message, ASSISTANT_AUTO_AGENT_LABEL, BLANK_TEMPLATE_LABEL};
 use crate::selection::{available_actions, selected_assistant_project, selected_host_id};
 use crate::view::inbox::notification_age_label;
@@ -167,6 +168,36 @@ pub(crate) fn assistant_modal_content(app: &PohunekApp) -> Element<'_, Message> 
             .style(iced::widget::button::primary),
     );
     dialog_card("Start assistant", panel)
+}
+
+pub(crate) fn keymap_modal_content(app: &PohunekApp) -> Element<'_, Message> {
+    let rows = app.keymap.help_rows();
+    dialog_card(
+        "Keyboard shortcuts",
+        column![
+            keymap_section("Global", &rows, KeyContext::Global),
+            keymap_section("Modal", &rows, KeyContext::Modal),
+        ]
+        .spacing(14),
+    )
+}
+
+fn keymap_section(
+    title: &'static str,
+    rows: &[KeyBindingHelp],
+    context: KeyContext,
+) -> Element<'static, Message> {
+    let mut section = column![text(title).size(15)].spacing(6);
+    for row in rows.iter().filter(|row| row.context == context) {
+        section = section.push(
+            row![
+                text(row.chord.clone()).size(13).font(iced::Font::MONOSPACE),
+                text(row.name).size(13).style(muted_style),
+            ]
+            .spacing(14),
+        );
+    }
+    section.into()
 }
 
 fn assistant_agent_options(app: &PohunekApp) -> Vec<String> {

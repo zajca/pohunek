@@ -21,7 +21,9 @@ use crate::PohunekApp;
 
 use detail::detail_view;
 use inbox::inbox_modal_content;
-use modals::{assistant_modal_content, provider_item_modal_content, start_modal_content};
+use modals::{
+    assistant_modal_content, keymap_modal_content, provider_item_modal_content, start_modal_content,
+};
 use tree::{
     agents_monitor, assistant_entry_button, conn_color, inbox_entry_button, workspace_tree,
 };
@@ -119,6 +121,7 @@ pub(crate) fn view(app: &PohunekApp) -> Element<'_, Message> {
             assistant_modal_content(app),
             Message::CloseModal,
         ),
+        ModalView::Keymap => modal(base.into(), keymap_modal_content(app), Message::CloseModal),
         ModalView::ProviderItem => modal(
             base.into(),
             provider_item_modal_content(app),

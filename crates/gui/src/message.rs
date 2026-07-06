@@ -25,6 +25,8 @@ pub(crate) enum ModalView {
     Start,
     /// The "Start assistant" dialog.
     Assistant,
+    /// The effective keyboard shortcut table.
+    Keymap,
     /// The selected provider item (PR/issue) detail and launch dialog.
     ProviderItem,
     /// The inbox: notification list, or one message's detail.
@@ -179,6 +181,13 @@ pub(crate) enum NotificationAction {
     Delete,
 }
 
+/// Direction for keyboard-driven list movement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListDirection {
+    Up,
+    Down,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
     Core(CoreEvent),
@@ -226,6 +235,7 @@ pub(crate) enum Message {
     },
     OpenStartModal,
     OpenAssistantModal,
+    OpenKeymapModal,
     CloseModal,
     StartAgentSelected(AgentChoice),
     StartTemplateSelected(String),
@@ -279,6 +289,10 @@ pub(crate) enum Message {
     OpenUrl(String),
     /// Remove a single pohunek-owned worktree by path.
     RemoveWorktree(PathBuf),
+    /// Move the keyboard cursor in the active list, wrapping at either end.
+    MoveListSelection(ListDirection),
+    /// Focus the active provider tab's local search box.
+    FocusProviderSearch,
     SelectAction(String),
     /// Pick a Linear filter and immediately fetch its issues.
     SelectLinearFilter(String),
