@@ -1,5 +1,13 @@
 # Knowledge Bundle Log
 
+## 0.18.3
+
+- Documented native GUI keyboard list navigation and configurable
+  `[keybindings]` overrides in `gui.toml`, including default binding names,
+  key-string syntax, and same-context conflict validation.
+- Linked GUI keyboard/config/reducer/provider source files from the assistant
+  source map.
+
 ## 0.15.3
 
 - Documented session notification dedupe/debounce behavior for
