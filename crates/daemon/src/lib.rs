@@ -12,8 +12,9 @@
 //! JSON-lines metadata store (resume + worktree bindings), an append-only event
 //! log, and direct remote transport over `NetBird`.
 
-// Unsafe is denied by default; the few FFI sites (advisory flock, socket chmod)
-// opt back in with a localized `#[allow(unsafe_code)]` and a SAFETY comment.
+// Unsafe is denied by default; the few FFI sites (advisory flock, socket chmod,
+// pidfd syscalls) opt back in with localized `#[expect(unsafe_code)]` and SAFETY
+// comments.
 #![deny(unsafe_code)]
 
 pub mod error;
@@ -33,8 +34,10 @@ pub mod session;
 pub mod agent;
 pub mod detect;
 pub mod events;
+mod external;
 pub mod integration;
 pub mod notifications;
+pub mod procwatch;
 pub mod project;
 pub mod store;
 pub(crate) mod time;

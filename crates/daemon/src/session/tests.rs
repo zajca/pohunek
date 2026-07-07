@@ -1,12 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    AgentActivity, AgentKind, Event, ProjectSource, SessionAttachParams, SessionId, SessionInfo,
-    SessionNewParams, SessionReleaseAgentParams, SessionReportAgentParams,
+    AgentActivity, AgentKind, CwdSource, Event, ProjectSource, SessionAttachParams, SessionId,
+    SessionInfo, SessionNewParams, SessionReleaseAgentParams, SessionReportAgentParams,
     SessionReportNativeIdParams, SessionState, StateSource,
 };
 
@@ -15,6 +16,7 @@ use crate::detect::{ActivityTransition, DetectorConfig, ManifestRegion, MatchCon
 use crate::integration::{
     ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
+use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessInspector};
 use crate::pty::{PtyCommand, PtyExit};
 
 use super::{SessionRegistry, SessionRegistryConfig, ShellCommand, MAX_SESSION_NAME_BYTES};
@@ -155,6 +157,118 @@ fn transition(activity: AgentActivity) -> ActivityTransition {
     }
 }
 
+#[test]
+fn external_observer_defaults_off() {
+    assert!(
+        !SessionRegistryConfig::default().observe_external_agents,
+        "external observation watches provider transcript trees and must remain opt-in"
+    );
+}
+
+#[derive(Debug, Default)]
+struct MockInspector {
+    inner: Mutex<MockInspectorState>,
+}
+
+#[derive(Debug, Default)]
+struct MockInspectorState {
+    descendants: HashMap<Pid, Vec<ProcessFact>>,
+    descendants_error: Option<std::io::ErrorKind>,
+    cwd: HashMap<Pid, PathBuf>,
+    exits: HashMap<Pid, tokio::sync::watch::Sender<bool>>,
+}
+
+impl MockInspector {
+    fn set_descendants(&self, root: Pid, facts: Vec<ProcessFact>) {
+        let mut inner = self.inner.lock().expect("mock inspector lock");
+        for fact in &facts {
+            inner
+                .cwd
+                .entry(fact.pid)
+                .or_insert_with(|| PathBuf::from("/tmp"));
+            inner
+                .exits
+                .entry(fact.pid)
+                .or_insert_with(|| tokio::sync::watch::channel(false).0);
+        }
+        inner.descendants.insert(root, facts);
+    }
+
+    fn fail_descendants_with(&self, kind: std::io::ErrorKind) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .descendants_error = Some(kind);
+    }
+
+    fn fire_exit(&self, pid: Pid) {
+        let sender = {
+            let mut inner = self.inner.lock().expect("mock inspector lock");
+            inner
+                .exits
+                .entry(pid)
+                .or_insert_with(|| tokio::sync::watch::channel(false).0)
+                .clone()
+        };
+        sender.send_replace(true);
+    }
+
+    fn set_cwd(&self, pid: Pid, cwd: PathBuf) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .cwd
+            .insert(pid, cwd);
+    }
+}
+
+impl ProcessInspector for MockInspector {
+    fn same_user_processes(&self) -> std::io::Result<Vec<ProcessFact>> {
+        let mut facts = self
+            .inner
+            .lock()
+            .expect("mock inspector lock")
+            .descendants
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        facts.sort_by_key(|fact| fact.pid);
+        facts.dedup_by_key(|fact| fact.pid);
+        Ok(facts)
+    }
+
+    fn descendants(&self, root: Pid) -> std::io::Result<Vec<ProcessFact>> {
+        let inner = self.inner.lock().expect("mock inspector lock");
+        if let Some(kind) = inner.descendants_error {
+            return Err(std::io::Error::new(kind, "mock descendants failure"));
+        }
+        Ok(inner.descendants.get(&root).cloned().unwrap_or_default())
+    }
+
+    fn cwd(&self, pid: Pid) -> std::io::Result<PathBuf> {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .cwd
+            .get(&pid)
+            .cloned()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing mock cwd"))
+    }
+
+    fn exit_watch(&self, pid: Pid) -> std::io::Result<ExitWatch> {
+        let receiver = {
+            let mut inner = self.inner.lock().expect("mock inspector lock");
+            inner
+                .exits
+                .entry(pid)
+                .or_insert_with(|| tokio::sync::watch::channel(false).0)
+                .subscribe()
+        };
+        Ok(ExitWatch::from_test_signal(receiver))
+    }
+}
+
 fn title_activity(config: &DetectorConfig, title: &str) -> Option<AgentActivity> {
     config
         .manifest
@@ -217,6 +331,27 @@ async fn next_session_removed(rx: &mut tokio::sync::broadcast::Receiver<Event>) 
     .await
     .expect("session_removed event");
     serde_json::from_value(event.payload["session"].clone()).expect("session info payload")
+}
+
+async fn wait_for_cwd_source(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    cwd: &std::path::Path,
+    source: CwdSource,
+) -> SessionInfo {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let info = registry.inspect(id).await.expect("inspect session");
+        if info.cwd == cwd && info.cwd_source == Some(source) {
+            return info;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for cwd {} from {source:?}",
+            cwd.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Run git in `dir`, asserting success (test helper for the worktree path).
@@ -928,6 +1063,61 @@ async fn session_new_branch_with_detected_project_binds_worktree_carrying_projec
         Some(project_id.as_str()),
         "the worktree binding must carry the project id"
     );
+}
+
+#[tokio::test]
+async fn cwd_hint_remaps_between_registered_worktrees() {
+    let (registry, repo) = project_registry("cwd-remap-worktrees");
+    let first = registry
+        .create(SessionNewParams {
+            cwd: Some(repo.clone()),
+            name: None,
+            branch: Some("feat/a".to_owned()),
+            ..params()
+        })
+        .await
+        .expect("first worktree session");
+    let second = registry
+        .create(SessionNewParams {
+            cwd: Some(repo),
+            name: None,
+            branch: Some("feat/b".to_owned()),
+            ..params()
+        })
+        .await
+        .expect("second worktree session");
+
+    let first_path = first.worktree_path.clone().expect("first worktree");
+    let second_path = second.worktree_path.clone().expect("second worktree");
+    let second_nested = second_path.join("nested");
+    fs::create_dir_all(&second_nested).expect("create nested cwd");
+
+    registry
+        .record_cwd_hint(&first.id, second_nested.display().to_string())
+        .await;
+    let moved = registry.inspect(&first.id).await.expect("inspect moved");
+
+    assert_eq!(moved.cwd, second_nested);
+    assert_eq!(moved.cwd_source, Some(CwdSource::Osc7));
+    assert_eq!(moved.worktree_path.as_deref(), Some(second_path.as_path()));
+    assert_eq!(moved.branch.as_deref(), Some("feat/b"));
+    assert_eq!(moved.is_linked_worktree, Some(true));
+    assert_eq!(moved.project_id, first.project_id);
+
+    registry
+        .record_cwd_hint(&first.id, first_path.display().to_string())
+        .await;
+    let restored = registry.inspect(&first.id).await.expect("inspect restored");
+
+    assert_eq!(restored.cwd, first_path);
+    assert_eq!(restored.cwd_source, Some(CwdSource::Osc7));
+    assert_eq!(restored.worktree_path, first.worktree_path);
+    assert_eq!(restored.branch.as_deref(), Some("feat/a"));
+    assert_eq!(restored.is_linked_worktree, Some(true));
+    assert_eq!(restored.project_id, first.project_id);
+
+    let _ = registry.stop(&first.id).await;
+    let _ = registry.stop(&second.id).await;
 }
 
 #[tokio::test]
@@ -2349,6 +2539,7 @@ async fn report_agent_on_shell_session_sets_active_agent_without_changing_launch
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Working),
             seq: Some(1),
+            pid: None,
             agent_session_id: Some("codex-native".to_owned()),
             agent_session_path: None,
         })
@@ -2424,6 +2615,7 @@ async fn report_agent_reconfigures_detector_and_release_restores_default_config(
             agent: "nested-codex".to_owned(),
             activity: Some(AgentActivity::Working),
             seq: Some(1),
+            pid: None,
             agent_session_id: None,
             agent_session_path: None,
         })
@@ -2459,6 +2651,43 @@ async fn report_agent_reconfigures_detector_and_release_restores_default_config(
 }
 
 #[tokio::test]
+async fn osc_7_output_updates_cwd_before_next_procwatch_tick() {
+    /// Gives the immediate procwatch tick after spawn time to observe launch cwd.
+    const INITIAL_PROCWATCH_SETTLE: Duration = Duration::from_millis(100);
+
+    let cwd = temp_dir("osc7-cwd");
+    let script = format!(
+        "IFS= read -r _; printf '\\033]7;file://{}\\007'; sleep 30",
+        cwd.display()
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", script.as_str()]),
+        stop_grace: Duration::from_millis(50),
+        procwatch_poll: Duration::from_mins(1),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    tokio::time::sleep(INITIAL_PROCWATCH_SETTLE).await;
+    registry
+        .input(protocol::SessionInputParams {
+            session_id: created.id.clone(),
+            text: "trigger".to_owned(),
+        })
+        .await
+        .expect("trigger OSC 7 output");
+
+    let updated = wait_for_cwd_source(&registry, &created.id, &cwd, CwdSource::Osc7).await;
+
+    assert_eq!(updated.cwd, cwd);
+    assert_eq!(updated.cwd_source, Some(CwdSource::Osc7));
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
 async fn release_agent_clears_current_active_agent_but_ignores_stale_sequence() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
@@ -2477,6 +2706,7 @@ async fn release_agent_clears_current_active_agent_but_ignores_stale_sequence() 
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Working),
             seq: Some(10),
+            pid: None,
             agent_session_id: Some("codex-newer".to_owned()),
             agent_session_path: None,
         })
@@ -2538,6 +2768,7 @@ async fn report_agent_release_with_no_sequence_does_not_clear_newer_sequenced_re
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Working),
             seq: Some(10),
+            pid: None,
             agent_session_id: Some("codex-newer".to_owned()),
             agent_session_path: None,
         })
@@ -2583,6 +2814,7 @@ async fn report_agent_with_no_sequence_does_not_overwrite_newer_sequenced_report
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Working),
             seq: Some(10),
+            pid: None,
             agent_session_id: Some("codex-newer".to_owned()),
             agent_session_path: None,
         })
@@ -2596,6 +2828,7 @@ async fn report_agent_with_no_sequence_does_not_overwrite_newer_sequenced_report
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Blocked),
             seq: None,
+            pid: None,
             agent_session_id: Some("codex-stale".to_owned()),
             agent_session_path: None,
         })
@@ -2632,6 +2865,7 @@ async fn report_agent_release_tombstone_rejects_delayed_lower_sequence() {
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Blocked),
             seq: Some(10),
+            pid: None,
             agent_session_id: Some("codex-seq-10".to_owned()),
             agent_session_path: None,
         })
@@ -2668,6 +2902,7 @@ async fn report_agent_release_tombstone_rejects_delayed_lower_sequence() {
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Blocked),
             seq: Some(10),
+            pid: None,
             agent_session_id: Some("codex-stale".to_owned()),
             agent_session_path: None,
         })
@@ -2688,6 +2923,7 @@ async fn report_agent_release_tombstone_rejects_delayed_lower_sequence() {
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Blocked),
             seq: Some(12),
+            pid: None,
             agent_session_id: Some("codex-seq-12".to_owned()),
             agent_session_path: None,
         })
@@ -2724,6 +2960,7 @@ async fn report_agent_activity_blocks_detector_until_release() {
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Blocked),
             seq: Some(1),
+            pid: None,
             agent_session_id: None,
             agent_session_path: None,
         })
@@ -2776,6 +3013,7 @@ async fn report_agent_without_activity_keeps_detector_activity_enabled() {
             agent: "codex".to_owned(),
             activity: None,
             seq: Some(1),
+            pid: None,
             agent_session_id: Some("codex-native".to_owned()),
             agent_session_path: None,
         })
@@ -2833,6 +3071,7 @@ async fn report_agent_active_metadata_is_cleared_on_terminal_session() {
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Blocked),
             seq: Some(1),
+            pid: None,
             agent_session_id: Some("codex-native".to_owned()),
             agent_session_path: Some("/tmp/codex-session.jsonl".to_owned()),
         })
@@ -2870,6 +3109,7 @@ async fn report_agent_returns_false_for_unknown_agent() {
             agent: "not-a-real-agent".to_owned(),
             activity: Some(AgentActivity::Working),
             seq: Some(1),
+            pid: None,
             agent_session_id: None,
             agent_session_path: None,
         })
@@ -2880,6 +3120,564 @@ async fn report_agent_returns_false_for_unknown_agent() {
     assert_eq!(inspected.active_agent, None);
     assert_eq!(inspected.activity, None);
 
+    let _ = registry.stop(&created.id).await;
+}
+
+fn codex_fact(process_id: Pid, parent_id: Pid) -> ProcessFact {
+    ProcessFact {
+        pid: process_id,
+        ppid: parent_id,
+        comm: "codex".to_owned(),
+        cmdline: vec!["/usr/bin/codex".to_owned()],
+    }
+}
+
+fn claude_fact(process_id: Pid, parent_id: Pid) -> ProcessFact {
+    ProcessFact {
+        pid: process_id,
+        ppid: parent_id,
+        comm: "claude".to_owned(),
+        cmdline: vec!["/usr/bin/claude".to_owned()],
+    }
+}
+
+/// PID used by the P3 release-path matrix to model the nested Codex process.
+const RELEASE_MATRIX_AGENT_PID: Pid = 100;
+/// `SessionStart` sequence used by the P3 release-path matrix.
+const RELEASE_MATRIX_REPORT_SEQ: u64 = 1_000;
+/// `SessionEnd` sequence used by the P3 release-path matrix.
+const RELEASE_MATRIX_RELEASE_SEQ: u64 = RELEASE_MATRIX_REPORT_SEQ + 1;
+/// Hook source used by Codex state callbacks.
+const CODEX_HOOK_SOURCE: &str = "pohunek:codex";
+/// Agent name used by Codex state callbacks.
+const CODEX_HOOK_AGENT: &str = "codex";
+/// Native session id used by the P3 release-path matrix.
+const RELEASE_MATRIX_NATIVE_ID: &str = "codex-native";
+/// Hook sequence used by direct-agent root-pid regression tests.
+const DIRECT_AGENT_REPORT_SEQ: u64 = 2_000;
+/// Number of reconcile ticks used to catch direct-agent active-agent flapping.
+const DIRECT_AGENT_RESCAN_COUNT: usize = 3;
+/// PID reused across two scans to model OS pid reuse before an exit watch fires.
+const PID_REUSE_AGENT_PID: Pid = 225;
+/// Delay separating pid-reuse observations so `first_seen` changes if reset.
+const PID_REUSE_RESCAN_DELAY: Duration = Duration::from_millis(5);
+
+async fn mock_procwatch_registry(tag: &str) -> (SessionRegistry, Arc<MockInspector>, SessionInfo) {
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            procwatch_poll: Duration::from_mins(1),
+            active_agent_claim_ttl: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    let created = registry
+        .create(SessionNewParams {
+            name: Some(tag.to_owned()),
+            ..params()
+        })
+        .await
+        .expect("create shell session");
+    (registry, inspector, created)
+}
+
+async fn mock_direct_codex_registry(
+    tag: &str,
+) -> (SessionRegistry, Arc<MockInspector>, SessionInfo) {
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let agents_dir = temp_agents_dir_with(
+        tag,
+        "direct-codex",
+        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
+    );
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            procwatch_poll: Duration::from_mins(1),
+            active_agent_claim_ttl: Duration::from_millis(50),
+            agents_dir: Some(agents_dir),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    let created = registry
+        .create(SessionNewParams {
+            name: Some(tag.to_owned()),
+            agent: "direct-codex".to_owned(),
+            ..params()
+        })
+        .await
+        .expect("create direct codex session");
+    (registry, inspector, created)
+}
+
+async fn wait_for_active_agent_pid(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    expected: Option<Pid>,
+) -> SessionInfo {
+    for _ in 0..50 {
+        let info = registry.inspect(id).await.expect("inspect session");
+        if info.active_agent_pid == expected {
+            return info;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for active_agent_pid {expected:?}");
+}
+
+async fn report_release_matrix_agent(registry: &SessionRegistry, created: &SessionInfo) {
+    let report = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: CODEX_HOOK_SOURCE.to_owned(),
+            agent: CODEX_HOOK_AGENT.to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(RELEASE_MATRIX_REPORT_SEQ),
+            pid: Some(RELEASE_MATRIX_AGENT_PID),
+            agent_session_id: Some(RELEASE_MATRIX_NATIVE_ID.to_owned()),
+            agent_session_path: None,
+        })
+        .await;
+    assert!(report.recorded);
+
+    let inspected = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(inspected.active_agent.as_deref(), Some(CODEX_HOOK_AGENT));
+    assert_eq!(inspected.active_agent_base, Some(AgentKind::Codex));
+    assert_eq!(inspected.active_agent_pid, Some(RELEASE_MATRIX_AGENT_PID));
+    assert_eq!(
+        inspected.active_agent_session_id.as_deref(),
+        Some(RELEASE_MATRIX_NATIVE_ID)
+    );
+}
+
+#[tokio::test]
+async fn direct_agent_root_pid_hook_claim_survives_procwatch_reconciles() {
+    let (registry, inspector, created) = mock_direct_codex_registry("direct-root").await;
+    inspector.set_descendants(created.pid, Vec::new());
+    inspector.set_cwd(created.pid, temp_dir("direct-root-cwd"));
+
+    let report = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: CODEX_HOOK_SOURCE.to_owned(),
+            agent: CODEX_HOOK_AGENT.to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(DIRECT_AGENT_REPORT_SEQ),
+            pid: Some(created.pid),
+            agent_session_id: Some("direct-native".to_owned()),
+            agent_session_path: None,
+        })
+        .await;
+    assert!(report.recorded);
+
+    for _ in 0..DIRECT_AGENT_RESCAN_COUNT {
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let inspected = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(inspected.active_agent.as_deref(), Some(CODEX_HOOK_AGENT));
+        assert_eq!(inspected.active_agent_base, Some(AgentKind::Codex));
+        assert_eq!(inspected.active_agent_pid, Some(created.pid));
+        assert_eq!(
+            inspected.active_agent_session_id.as_deref(),
+            Some("direct-native")
+        );
+    }
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn direct_agent_without_hook_does_not_auto_report_root() {
+    let (registry, inspector, created) = mock_direct_codex_registry("direct-no-hook").await;
+    inspector.set_descendants(created.pid, Vec::new());
+    inspector.set_cwd(created.pid, temp_dir("direct-no-hook-cwd"));
+
+    for _ in 0..DIRECT_AGENT_RESCAN_COUNT {
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let inspected = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(inspected.active_agent, None);
+        assert_eq!(inspected.active_agent_base, None);
+        assert_eq!(inspected.active_agent_pid, None);
+    }
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn procwatch_refreshes_agent_base_when_pid_is_reused() {
+    let (registry, inspector, created) = mock_procwatch_registry("pid-reuse-base").await;
+    inspector.set_descendants(
+        created.pid,
+        vec![codex_fact(PID_REUSE_AGENT_PID, created.pid)],
+    );
+    let first_scan = Instant::now();
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, first_scan)
+        .await;
+    let first_seen = {
+        let sessions = registry.inner.sessions.lock().await;
+        let observed = sessions
+            .get(&created.id)
+            .expect("session entry")
+            .observed_agents
+            .iter()
+            .find(|observed| observed.pid == PID_REUSE_AGENT_PID)
+            .expect("observed codex pid");
+        assert_eq!(observed.agent_base, AgentKind::Codex);
+        observed.first_seen
+    };
+
+    inspector.set_descendants(
+        created.pid,
+        vec![claude_fact(PID_REUSE_AGENT_PID, created.pid)],
+    );
+    let second_scan = first_seen + PID_REUSE_RESCAN_DELAY;
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, second_scan)
+        .await;
+
+    {
+        let sessions = registry.inner.sessions.lock().await;
+        let observed = sessions
+            .get(&created.id)
+            .expect("session entry")
+            .observed_agents
+            .iter()
+            .find(|observed| observed.pid == PID_REUSE_AGENT_PID)
+            .expect("observed reused pid");
+        assert_eq!(observed.agent_base, AgentKind::Claude);
+        assert_eq!(observed.first_seen, second_scan);
+    };
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn procwatch_reconciles_unbound_claim_after_descendants_error() {
+    let (registry, inspector, created) = mock_procwatch_registry("ttl-descendants-error").await;
+    let report = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: CODEX_HOOK_SOURCE.to_owned(),
+            agent: CODEX_HOOK_AGENT.to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(DIRECT_AGENT_REPORT_SEQ),
+            pid: None,
+            agent_session_id: Some("codex-unbound".to_owned()),
+            agent_session_path: None,
+        })
+        .await;
+    assert!(report.recorded);
+    let reported_at = {
+        let sessions = registry.inner.sessions.lock().await;
+        sessions
+            .get(&created.id)
+            .expect("session entry")
+            .active_agent
+            .as_ref()
+            .expect("active report")
+            .reported_at
+    };
+
+    inspector.fail_descendants_with(std::io::ErrorKind::Other);
+    registry
+        .rescan_procwatch_at(
+            &created.id,
+            created.pid,
+            reported_at + Duration::from_millis(50),
+        )
+        .await;
+    let cleared = registry.inspect(&created.id).await.expect("inspect");
+
+    assert_eq!(cleared.active_agent, None);
+    assert_eq!(cleared.active_agent_base, None);
+    assert_eq!(cleared.active_agent_pid, None);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn procwatch_updates_cwd_from_active_agent_pid() {
+    let (registry, inspector, created) = mock_procwatch_registry("procwatch-cwd").await;
+    let root_cwd = temp_dir("procwatch-root-cwd");
+    let agent_cwd = temp_dir("procwatch-agent-cwd");
+
+    inspector.set_cwd(created.pid, root_cwd.clone());
+    inspector.set_descendants(
+        created.pid,
+        vec![codex_fact(RELEASE_MATRIX_AGENT_PID, created.pid)],
+    );
+    inspector.set_cwd(RELEASE_MATRIX_AGENT_PID, agent_cwd.clone());
+
+    report_release_matrix_agent(&registry, &created).await;
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let updated = registry.inspect(&created.id).await.expect("inspect");
+
+    assert_eq!(
+        updated.cwd, agent_cwd,
+        "procwatch must use the active agent pid as the cwd focus"
+    );
+    assert_ne!(
+        updated.cwd, root_cwd,
+        "root shell cwd must not win while an active agent pid is bound"
+    );
+    assert_eq!(updated.cwd_source, Some(CwdSource::Procwatch));
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn active_agent_release_matrix_covers_hook_fast_path_and_procwatch_backstop() {
+    let (hook_registry, _hook_inspector, hook_created) =
+        mock_procwatch_registry("hook-release-matrix").await;
+    report_release_matrix_agent(&hook_registry, &hook_created).await;
+
+    let release = hook_registry
+        .release_agent(SessionReleaseAgentParams {
+            session_id: hook_created.id.clone(),
+            source: CODEX_HOOK_SOURCE.to_owned(),
+            agent: CODEX_HOOK_AGENT.to_owned(),
+            seq: Some(RELEASE_MATRIX_RELEASE_SEQ),
+        })
+        .await;
+    assert!(release.released);
+    let hook_cleared = hook_registry
+        .inspect(&hook_created.id)
+        .await
+        .expect("inspect");
+    assert_eq!(hook_cleared.active_agent, None);
+    assert_eq!(hook_cleared.active_agent_base, None);
+    assert_eq!(hook_cleared.active_agent_pid, None);
+    assert_eq!(hook_cleared.active_agent_session_id, None);
+    let _ = hook_registry.stop(&hook_created.id).await;
+
+    let (backstop_registry, backstop_inspector, backstop_created) =
+        mock_procwatch_registry("procwatch-release-matrix").await;
+    backstop_inspector.set_descendants(
+        backstop_created.pid,
+        vec![codex_fact(RELEASE_MATRIX_AGENT_PID, backstop_created.pid)],
+    );
+    backstop_registry
+        .rescan_procwatch_at(&backstop_created.id, backstop_created.pid, Instant::now())
+        .await;
+    report_release_matrix_agent(&backstop_registry, &backstop_created).await;
+
+    backstop_inspector.set_descendants(backstop_created.pid, Vec::new());
+    backstop_inspector.fire_exit(RELEASE_MATRIX_AGENT_PID);
+    let backstop_cleared =
+        wait_for_active_agent_pid(&backstop_registry, &backstop_created.id, None).await;
+    assert_eq!(backstop_cleared.active_agent, None);
+    assert_eq!(backstop_cleared.active_agent_base, None);
+    assert_eq!(backstop_cleared.active_agent_session_id, None);
+    let _ = backstop_registry.stop(&backstop_created.id).await;
+}
+
+#[tokio::test]
+async fn procwatch_releases_hook_claim_when_observed_pid_exits() {
+    let (registry, inspector, created) = mock_procwatch_registry("hook-exit").await;
+    inspector.set_descendants(created.pid, vec![codex_fact(100, created.pid)]);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+
+    let report = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: "pohunek:codex".to_owned(),
+            agent: "codex".to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(10),
+            pid: Some(100),
+            agent_session_id: Some("codex-native".to_owned()),
+            agent_session_path: None,
+        })
+        .await;
+    assert!(report.recorded);
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect")
+            .active_agent_pid,
+        Some(100)
+    );
+
+    inspector.set_descendants(created.pid, Vec::new());
+    inspector.fire_exit(100);
+    let cleared = wait_for_active_agent_pid(&registry, &created.id, None).await;
+
+    assert_eq!(cleared.active_agent, None);
+    assert_eq!(cleared.active_agent_base, None);
+    assert_eq!(cleared.active_agent_session_id, None);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn procwatch_late_hook_report_for_dead_pid_is_cleared_on_reconcile() {
+    let (registry, inspector, created) = mock_procwatch_registry("late-hook").await;
+    inspector.set_descendants(created.pid, vec![codex_fact(100, created.pid)]);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    inspector.set_descendants(created.pid, Vec::new());
+    inspector.fire_exit(100);
+    wait_for_active_agent_pid(&registry, &created.id, None).await;
+
+    let late = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: "pohunek:codex".to_owned(),
+            agent: "codex".to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(20),
+            pid: Some(100),
+            agent_session_id: Some("late-native".to_owned()),
+            agent_session_path: None,
+        })
+        .await;
+    assert!(late.recorded);
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let cleared = registry.inspect(&created.id).await.expect("inspect");
+
+    assert_eq!(cleared.active_agent, None);
+    assert_eq!(cleared.active_agent_pid, None);
+    assert_eq!(cleared.active_agent_session_id, None);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn procwatch_auto_report_releases_immediately_on_sigkill_style_exit() {
+    let (registry, inspector, created) = mock_procwatch_registry("sigkill").await;
+    inspector.set_descendants(created.pid, vec![codex_fact(100, created.pid)]);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let active = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(active.active_agent.as_deref(), Some("codex"));
+    assert_eq!(active.active_agent_base, Some(AgentKind::Codex));
+    assert_eq!(active.active_agent_pid, Some(100));
+
+    inspector.set_descendants(created.pid, Vec::new());
+    inspector.fire_exit(100);
+    let cleared = wait_for_active_agent_pid(&registry, &created.id, None).await;
+
+    assert_eq!(cleared.active_agent, None);
+    assert_eq!(cleared.active_agent_base, None);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn procwatch_expires_unbound_hook_claim_after_ttl() {
+    let (registry, _inspector, created) = mock_procwatch_registry("ttl").await;
+    let report = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: "pohunek:codex".to_owned(),
+            agent: "codex".to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(30),
+            pid: None,
+            agent_session_id: Some("codex-native".to_owned()),
+            agent_session_path: None,
+        })
+        .await;
+    assert!(report.recorded);
+    let reported_at = {
+        let sessions = registry.inner.sessions.lock().await;
+        sessions
+            .get(&created.id)
+            .expect("session entry")
+            .active_agent
+            .as_ref()
+            .expect("active report")
+            .reported_at
+    };
+
+    registry
+        .rescan_procwatch_at(
+            &created.id,
+            created.pid,
+            reported_at + Duration::from_millis(49),
+        )
+        .await;
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect")
+            .active_agent_pid,
+        None
+    );
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect")
+            .active_agent
+            .as_deref(),
+        Some("codex")
+    );
+
+    registry
+        .rescan_procwatch_at(
+            &created.id,
+            created.pid,
+            reported_at + Duration::from_millis(50),
+        )
+        .await;
+    let cleared = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(cleared.active_agent, None);
+    assert_eq!(cleared.active_agent_pid, None);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn procwatch_rebinds_restart_to_new_observed_pid() {
+    let (registry, inspector, created) = mock_procwatch_registry("restart").await;
+    inspector.set_descendants(created.pid, vec![codex_fact(100, created.pid)]);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let report = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: "pohunek:codex".to_owned(),
+            agent: "codex".to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(40),
+            pid: Some(100),
+            agent_session_id: Some("old-native".to_owned()),
+            agent_session_path: None,
+        })
+        .await;
+    assert!(report.recorded);
+
+    inspector.set_descendants(created.pid, vec![codex_fact(200, created.pid)]);
+    registry
+        .rescan_procwatch_at(
+            &created.id,
+            created.pid,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+    let rebound = registry.inspect(&created.id).await.expect("inspect");
+
+    assert_eq!(rebound.active_agent.as_deref(), Some("codex"));
+    assert_eq!(rebound.active_agent_base, Some(AgentKind::Codex));
+    assert_eq!(rebound.active_agent_pid, Some(200));
+    assert_eq!(rebound.active_agent_session_id, None);
     let _ = registry.stop(&created.id).await;
 }
 

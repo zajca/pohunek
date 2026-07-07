@@ -21,6 +21,17 @@ pub enum DaemonError {
         var: String,
     },
 
+    /// An environment variable was present but not one of the accepted values.
+    #[error("environment variable {var} has invalid value {value:?}; expected {expected}")]
+    InvalidEnv {
+        /// The invalid variable name.
+        var: String,
+        /// The invalid raw value.
+        value: String,
+        /// Human-readable accepted value set.
+        expected: &'static str,
+    },
+
     /// Another daemon already holds the single-instance lock.
     #[error("another pohunek daemon is already running (lock held: {lock})")]
     AlreadyRunning {

@@ -49,8 +49,12 @@ const CODEX_NOTIFY_HOOK_ASSET: &str = include_str!("assets/codex/pohunek-agent-n
 const HOOK_TIMEOUT_SECS: u64 = 10;
 /// Action argument passed to the hook script for the `SessionStart` event.
 const HOOK_ACTION: &str = "session";
+/// Action argument passed to the hook script for the `SessionEnd` event.
+const HOOK_RELEASE_ACTION: &str = "release";
 /// `SessionStart` event name in the agents' hook config.
 const SESSION_START_EVENT: &str = "SessionStart";
+/// `SessionEnd` event name in Claude's hook config.
+const SESSION_END_EVENT: &str = "SessionEnd";
 /// Codex lifecycle event fired before provider approval prompts.
 const CODEX_PERMISSION_REQUEST_EVENT: &str = "PermissionRequest";
 /// Codex lifecycle event fired when a turn completes.
@@ -188,6 +192,7 @@ pub fn codex_config_dir() -> Result<PathBuf, ProtocolError> {
 /// Install the Claude hooks into `claude_dir`.
 ///
 /// Writes managed scripts under `hooks/` and merges `SessionStart`,
+/// `SessionEnd`,
 /// `Notification`, `Stop`, and `StopFailure` hooks into `settings.json`,
 /// stripping any hooks this installer owns first so reinstall is idempotent.
 ///
@@ -212,14 +217,19 @@ pub fn install_claude(claude_dir: &Path) -> Result<InstallPaths, ProtocolError> 
     let settings_path = claude_dir.join("settings.json");
     let mut settings = read_json_object_or_empty(&settings_path)?;
     let hooks = ensure_hooks_object(&mut settings, &settings_path)?;
-    remove_owned_command_hooks(hooks, &[hook_command(&hook_path, HOOK_ACTION)]);
+    let state_hook_commands = [
+        hook_command(&hook_path, HOOK_ACTION),
+        hook_command(&hook_path, HOOK_RELEASE_ACTION),
+    ];
+    remove_owned_command_hooks(hooks, &state_hook_commands);
     remove_owned_command_hooks(hooks, &claude_notify_hook_commands(&notify_hook_path));
     ensure_command_hook(
         hooks,
         SESSION_START_EVENT,
-        &hook_command(&hook_path, HOOK_ACTION),
+        &state_hook_commands[0],
         Some("*"),
     )?;
+    ensure_command_hook(hooks, SESSION_END_EVENT, &state_hook_commands[1], Some("*"))?;
     for matcher in CLAUDE_NOTIFICATION_MATCHERS {
         ensure_command_hook(
             hooks,
@@ -275,6 +285,8 @@ pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
     let hooks = ensure_hooks_object(&mut hooks_file, &hooks_path)?;
     remove_owned_command_hooks(hooks, &[hook_command(&hook_path, HOOK_ACTION)]);
     remove_owned_command_hooks(hooks, &codex_notify_hook_commands(&notify_hook_path));
+    // Codex exposes `Stop` for turn completion, not session/process exit. Do
+    // not wire state release to it; procwatch is the lifecycle backstop.
     let codex_hooks = [
         CodexManagedHook {
             event: SESSION_START_EVENT,
@@ -811,6 +823,22 @@ mod tests {
     const LARGE_HOOK_INPUT_BYTES: usize = 1024 * 1024;
     /// Minimal successful JSON-RPC response expected by notification hook scripts.
     const HOOK_RESPONSE: &[u8] = b"{\"v\":1,\"id\":\"test\",\"result\":{}}\n";
+    /// Maximum time a hook test waits for expected Unix-socket callbacks.
+    const HOOK_CAPTURE_TIMEOUT_SECS: u64 = 2;
+    /// Poll interval for nonblocking hook socket accept loops.
+    const HOOK_CAPTURE_POLL_MS: u64 = 10;
+    /// State-hook requests expected from a successful `SessionStart` callback.
+    const STATE_SESSION_REQUEST_COUNT: usize = 2;
+    /// State-hook requests expected from a successful release callback.
+    const STATE_RELEASE_REQUEST_COUNT: usize = 1;
+    /// Integration asset version expected after PID-bearing state hooks ship.
+    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=2";
+    /// Action argument for state-hook `SessionStart` reporting.
+    const STATE_SESSION_ACTION: &str = "session";
+    /// Action argument for state-hook release reporting.
+    const STATE_RELEASE_ACTION: &str = "release";
+    /// Claude lifecycle event used for active-agent release.
+    const CLAUDE_SESSION_END_EVENT: &str = "SessionEnd";
 
     fn temp_dir(tag: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -875,6 +903,94 @@ mod tests {
         daemon_manifest_asset(agent, "pohunek-agent-notify.sh")
     }
 
+    fn state_asset(agent: &str) -> PathBuf {
+        daemon_manifest_asset(agent, "pohunek-agent-state.sh")
+    }
+
+    fn run_state_asset(
+        agent: &str,
+        args: &[&str],
+        input: &Value,
+        socket_available: bool,
+        expected_requests: usize,
+    ) -> (std::process::ExitStatus, String, String, Vec<Value>) {
+        let asset_path = state_asset(agent);
+        assert!(
+            asset_path.is_file(),
+            "missing state hook asset at {}",
+            asset_path.display()
+        );
+
+        let temp = temp_dir(&format!("{agent}-state-run"));
+        let socket_path = temp.join("daemon.sock");
+        let handle = socket_available.then(|| {
+            let listener = UnixListener::bind(&socket_path).expect("bind hook socket");
+            listener
+                .set_nonblocking(true)
+                .expect("make hook socket nonblocking");
+            thread::spawn(move || {
+                let deadline =
+                    std::time::Instant::now() + Duration::from_secs(HOOK_CAPTURE_TIMEOUT_SECS);
+                let mut requests = Vec::new();
+                while requests.len() < expected_requests && std::time::Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut stream, _addr)) => {
+                            let mut raw = Vec::new();
+                            let mut byte = [0_u8; 1];
+                            while stream.read(&mut byte).expect("read hook request") == 1 {
+                                raw.push(byte[0]);
+                                if byte[0] == b'\n' {
+                                    break;
+                                }
+                            }
+                            let request = serde_json::from_slice::<Value>(&raw)
+                                .expect("hook request is JSON");
+                            requests.push(request);
+                            write_hook_response(&mut stream);
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(HOOK_CAPTURE_POLL_MS));
+                        }
+                        Err(err) => panic!("accept hook request: {err}"),
+                    }
+                }
+                requests
+            })
+        });
+
+        let mut command = Command::new("sh");
+        command
+            .arg(&asset_path)
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("TMPDIR", &temp)
+            .env(ENV_FLAG, "1")
+            .env(ENV_SOCKET_PATH, &socket_path)
+            .env(ENV_SESSION_ID, "session-123")
+            .env(ENV_PROTOCOL_VERSION, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn state hook");
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(input.to_string().as_bytes())
+                .expect("write state hook stdin");
+        }
+        let output = child.wait_with_output().expect("wait for state hook");
+
+        let requests = handle
+            .map(|handle| handle.join().expect("hook socket thread"))
+            .unwrap_or_default();
+        (
+            output.status,
+            String::from_utf8(output.stdout).expect("hook stdout utf8"),
+            String::from_utf8(output.stderr).expect("hook stderr utf8"),
+            requests,
+        )
+    }
+
     fn run_notification_asset(
         agent: &str,
         args: &[&str],
@@ -918,7 +1034,8 @@ mod tests {
                 .set_nonblocking(true)
                 .expect("make hook socket nonblocking");
             thread::spawn(move || {
-                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                let deadline =
+                    std::time::Instant::now() + Duration::from_secs(HOOK_CAPTURE_TIMEOUT_SECS);
                 let mut requests = Vec::new();
                 while std::time::Instant::now() < deadline {
                     match listener.accept() {
@@ -938,7 +1055,7 @@ mod tests {
                             break;
                         }
                         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(10));
+                            thread::sleep(Duration::from_millis(HOOK_CAPTURE_POLL_MS));
                         }
                         Err(err) => panic!("accept hook request: {err}"),
                     }
@@ -1241,10 +1358,14 @@ mod tests {
 
     #[test]
     fn assets_fire_active_agent_then_native_id_with_our_env_and_exit_zero_on_missing_env() {
-        for asset in [CLAUDE_HOOK_ASSET, CODEX_HOOK_ASSET] {
+        for (agent, asset) in [("claude", CLAUDE_HOOK_ASSET), ("codex", CODEX_HOOK_ASSET)] {
             assert!(
                 asset.starts_with("#!/bin/sh"),
                 "hook must be a POSIX sh script"
+            );
+            assert!(
+                asset.contains(STATE_ASSET_VERSION_HEADER),
+                "{agent} hook must carry integration version 2"
             );
             assert!(
                 asset.contains(method::SESSION_REPORT_AGENT),
@@ -1267,6 +1388,14 @@ mod tests {
             assert!(
                 asset.contains("native_id_params[\"transcript_path\"] = transcript_path"),
                 "hook must forward transcript_path to native-id reports for path-kind resume"
+            );
+            assert!(
+                asset.contains("POHUNEK_AGENT_PID"),
+                "{agent} hook must pass the parent agent pid into Python"
+            );
+            assert!(
+                asset.contains("report_agent_params[\"pid\"] = agent_pid"),
+                "{agent} hook must include a parsed pid in active-agent reports"
             );
             for env_name in [
                 ENV_FLAG,
@@ -1296,6 +1425,99 @@ mod tests {
                 "the python heredoc must be guarded with `|| exit 0`"
             );
         }
+
+        assert!(
+            CLAUDE_HOOK_ASSET.contains(method::SESSION_RELEASE_AGENT),
+            "Claude state hook must expose a release path"
+        );
+        assert!(
+            CLAUDE_HOOK_ASSET.contains(STATE_RELEASE_ACTION),
+            "Claude state hook must accept the release action"
+        );
+    }
+
+    #[test]
+    fn state_hooks_send_pid_on_session_start_reports() {
+        for agent in ["claude", "codex"] {
+            let input = json!({
+                "session_id": format!("{agent}-native"),
+                "transcript_path": format!("/tmp/{agent}-transcript.jsonl"),
+            });
+
+            let (status, stdout, stderr, requests) = run_state_asset(
+                agent,
+                &[STATE_SESSION_ACTION],
+                &input,
+                true,
+                STATE_SESSION_REQUEST_COUNT,
+            );
+
+            assert!(
+                status.success(),
+                "{agent} state hook exited with {status}: {stderr}"
+            );
+            assert_eq!(stdout, "", "{agent} state hook must not print stdout");
+            assert_eq!(stderr, "", "{agent} state hook must not print stderr");
+            assert_eq!(
+                requests.len(),
+                STATE_SESSION_REQUEST_COUNT,
+                "{agent} state hook must send active-agent and native-id requests"
+            );
+
+            let report = &requests[0];
+            assert_eq!(report["method"], json!(method::SESSION_REPORT_AGENT));
+            assert_eq!(report["params"]["session_id"], json!("session-123"));
+            assert_eq!(
+                report["params"]["source"],
+                json!(format!("pohunek:{agent}"))
+            );
+            assert_eq!(report["params"]["agent"], json!(agent));
+            assert_eq!(report["params"]["pid"], json!(std::process::id()));
+            assert_eq!(
+                report["params"]["agent_session_id"],
+                json!(format!("{agent}-native"))
+            );
+            assert_eq!(
+                report["params"]["agent_session_path"],
+                json!(format!("/tmp/{agent}-transcript.jsonl"))
+            );
+
+            let native = &requests[1];
+            assert_eq!(native["method"], json!(method::SESSION_REPORT_NATIVE_ID));
+        }
+    }
+
+    #[test]
+    fn claude_state_hook_release_sends_release_agent() {
+        let (status, stdout, stderr, requests) = run_state_asset(
+            "claude",
+            &[STATE_RELEASE_ACTION],
+            &json!({}),
+            true,
+            STATE_RELEASE_REQUEST_COUNT,
+        );
+
+        assert!(
+            status.success(),
+            "Claude hook exited with {status}: {stderr}"
+        );
+        assert_eq!(stdout, "", "Claude hook must not print stdout");
+        assert_eq!(stderr, "", "Claude hook must not print stderr");
+        assert_eq!(
+            requests.len(),
+            STATE_RELEASE_REQUEST_COUNT,
+            "Claude release hook must send one release request"
+        );
+
+        let request = &requests[0];
+        assert_eq!(request["method"], json!(method::SESSION_RELEASE_AGENT));
+        assert_eq!(request["params"]["session_id"], json!("session-123"));
+        assert_eq!(request["params"]["source"], json!("pohunek:claude"));
+        assert_eq!(request["params"]["agent"], json!("claude"));
+        assert!(
+            request["params"]["seq"].as_u64().is_some(),
+            "Claude release request must carry a fresh sequence"
+        );
     }
 
     #[test]
@@ -1320,6 +1542,18 @@ mod tests {
         assert!(commands[0].contains(paths.hook_path.to_str().unwrap()));
         // matcher is "*"
         assert_eq!(settings["hooks"]["SessionStart"][0]["matcher"], json!("*"));
+
+        let release_commands = command_hooks(&settings, CLAUDE_SESSION_END_EVENT);
+        assert_eq!(release_commands.len(), 1, "exactly one SessionEnd hook");
+        assert!(release_commands[0].contains(paths.hook_path.to_str().unwrap()));
+        assert!(
+            release_commands[0].ends_with(STATE_RELEASE_ACTION),
+            "SessionEnd hook must call release action: {release_commands:?}"
+        );
+        assert_eq!(
+            settings["hooks"][CLAUDE_SESSION_END_EVENT][0]["matcher"],
+            json!("*")
+        );
     }
 
     #[test]
@@ -1340,6 +1574,11 @@ mod tests {
                     "SessionStart": [
                         { "matcher": "*", "hooks": [
                             { "type": "command", "command": "echo user-sessionstart" }
+                        ]}
+                    ],
+                    "SessionEnd": [
+                        { "matcher": "*", "hooks": [
+                            { "type": "command", "command": "echo user-sessionend" }
                         ]}
                     ]
                 }
@@ -1370,6 +1609,17 @@ mod tests {
         assert_eq!(
             ours, 1,
             "reinstall must not duplicate our hook: {commands:?}"
+        );
+
+        let release_commands = command_hooks(&settings, CLAUDE_SESSION_END_EVENT);
+        assert!(release_commands.contains(&"echo user-sessionend".to_owned()));
+        let release_ours = release_commands
+            .iter()
+            .filter(|command| command.contains("pohunek-agent-state.sh"))
+            .count();
+        assert_eq!(
+            release_ours, 1,
+            "reinstall must not duplicate our release hook: {release_commands:?}"
         );
     }
 

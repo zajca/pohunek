@@ -4,6 +4,10 @@
 # herdr fields (`visible_working`, `visible_idle`, `skip_state_update`) and the
 # `unknown` transcript-viewer rule are intentionally omitted.
 
+[process]
+comm = ["^codex$"]
+cmdline = ['(^|/)codex($| )']
+
 [[rules]]
 id = "osc_title_blocked"
 state = "blocked"

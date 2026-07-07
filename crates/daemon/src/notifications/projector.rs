@@ -701,10 +701,12 @@ mod tests {
     fn session_info(session_id: &str, state: SessionState, exit_code: Option<i32>) -> SessionInfo {
         SessionInfo {
             id: SessionId(session_id.to_owned()),
+            external: Some(false),
             name: None,
             agent: "codex".to_owned(),
             agent_base: AgentKind::Codex,
             cwd: std::path::PathBuf::from("/workspace/project"),
+            cwd_source: Some(protocol::CwdSource::Launch),
             pid: 1234,
             cols: 120,
             rows: 40,
@@ -713,6 +715,7 @@ mod tests {
             activity: None,
             active_agent: None,
             active_agent_base: None,
+            active_agent_pid: None,
             active_agent_session_id: None,
             active_agent_session_path: None,
             native_session_id: None,

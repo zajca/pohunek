@@ -202,10 +202,18 @@ fn session_tree_row(
 ) -> Element<'static, Message> {
     let provider_status = linked_pr_status_label(host, session);
     let selected = session_is_selected(app, host_id, &session.id);
+    let origin = if session.external == Some(true) {
+        "  external"
+    } else {
+        ""
+    };
     // Lead with the display name when set; otherwise fall back to the id.
     let label = match &session.name {
-        Some(name) => format!("{name}  {}{provider_status}", session.agent),
-        None => format!("{}  {}{provider_status}", session.id.0, session.agent),
+        Some(name) => format!("{name}  {}{origin}{provider_status}", session.agent),
+        None => format!(
+            "{}  {}{origin}{provider_status}",
+            session.id.0, session.agent
+        ),
     };
     indent(
         2,

@@ -6,22 +6,23 @@ use std::{collections::BTreeMap, path::PathBuf};
 use protocol::{
     event, method, negotiate, AgentActivity, AgentKind, AgentRuntime, AssistantMaterializeParams,
     AssistantMaterializeResult, AttachHeader, ConceptDeprecation, ConceptIntent, ConceptMeta,
-    ConceptType, DaemonDoctorResult, DoctorCheck, DoctorReport, DoctorStatus, ErrorClass, Event,
-    HostCapabilities, IntegrationInstallParams, IntegrationInstallReport, IntegrationInstallResult,
-    NotificationCreateParams, NotificationCreateResult, NotificationCreatedEvent,
-    NotificationDeleteParams, NotificationDeleteResult, NotificationDeletedEvent, NotificationId,
-    NotificationKind, NotificationKindPolicy, NotificationListParams, NotificationListResult,
-    NotificationPolicy, NotificationPolicyParams, NotificationPolicyResult, NotificationRecord,
-    NotificationRetentionParams, NotificationRetentionResult, NotificationSeverity,
-    NotificationSource, NotificationStatus, NotificationUpdateParams, NotificationUpdateResult,
-    NotificationUpdatedEvent, ProjectSource, ProtocolError, ProtocolVersion, ProviderKind, Request,
-    Response, SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult,
-    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter,
-    SessionListParams, SessionNewParams, SessionReleaseAgentParams, SessionReleaseAgentResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
-    SessionWarning, SessionWarningKind, StateSource, PROTOCOL_VERSION,
+    ConceptType, CwdSource, DaemonDoctorResult, DoctorCheck, DoctorReport, DoctorStatus,
+    ErrorClass, Event, HostCapabilities, IntegrationInstallParams, IntegrationInstallReport,
+    IntegrationInstallResult, NotificationCreateParams, NotificationCreateResult,
+    NotificationCreatedEvent, NotificationDeleteParams, NotificationDeleteResult,
+    NotificationDeletedEvent, NotificationId, NotificationKind, NotificationKindPolicy,
+    NotificationListParams, NotificationListResult, NotificationPolicy, NotificationPolicyParams,
+    NotificationPolicyResult, NotificationRecord, NotificationRetentionParams,
+    NotificationRetentionResult, NotificationSeverity, NotificationSource, NotificationStatus,
+    NotificationUpdateParams, NotificationUpdateResult, NotificationUpdatedEvent, ProjectSource,
+    ProtocolError, ProtocolVersion, ProviderKind, Request, Response, SessionAttachParams,
+    SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId, SessionInfo,
+    SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
+    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionSetMetadataParams, SessionSetMetadataResult,
+    SessionState, SessionStopResult, SessionWarning, SessionWarningKind, StateSource,
+    PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 
@@ -49,9 +50,11 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
     SessionInfo {
         name: None,
         id: SessionId("s-42".to_owned()),
+        external: Some(false),
         agent: "shell".to_owned(),
         agent_base: AgentKind::Shell,
         cwd: PathBuf::from("/workspace/project"),
+        cwd_source: Some(CwdSource::Launch),
         pid: 4242,
         cols: 120,
         rows: 40,
@@ -60,6 +63,7 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         activity: None,
         active_agent: None,
         active_agent_base: None,
+        active_agent_pid: None,
         active_agent_session_id: None,
         active_agent_session_path: None,
         native_session_id: None,
@@ -1031,9 +1035,11 @@ fn session_info_json_shape_roundtrips_with_activity() {
         value,
         json!({
             "id": "s-42",
+            "external": false,
             "agent": "shell",
             "agent_base": "shell",
             "cwd": "/workspace/project",
+            "cwd_source": "launch",
             "pid": 4242,
             "cols": 120,
             "rows": 40,
@@ -1047,6 +1053,30 @@ fn session_info_json_shape_roundtrips_with_activity() {
 
     let back = line_roundtrip(&info);
     assert_eq!(back, info);
+}
+
+#[test]
+fn session_info_external_marker_roundtrips() {
+    let managed = SessionInfo {
+        external: Some(false),
+        ..running_shell_session(None)
+    };
+    let external = SessionInfo {
+        id: SessionId("ext-4242".to_owned()),
+        external: Some(true),
+        ..running_shell_session(None)
+    };
+
+    assert_eq!(
+        serde_json::to_value(&managed).expect("serialize managed session")["external"],
+        json!(false)
+    );
+    assert_eq!(
+        serde_json::to_value(&external).expect("serialize external session")["external"],
+        json!(true)
+    );
+    assert_eq!(line_roundtrip(&managed), managed);
+    assert_eq!(line_roundtrip(&external), external);
 }
 
 #[test]
@@ -1079,9 +1109,11 @@ fn session_info_json_shape_roundtrips_with_exit_code() {
         value,
         json!({
             "id": "s-42",
+            "external": false,
             "agent": "shell",
             "agent_base": "shell",
             "cwd": "/workspace/project",
+            "cwd_source": "launch",
             "pid": 4242,
             "cols": 120,
             "rows": 40,
@@ -1196,6 +1228,7 @@ fn session_report_agent_params_roundtrip_with_optional_native_refs() {
         agent: "codex".to_owned(),
         activity: Some(AgentActivity::Working),
         seq: Some(123),
+        pid: Some(9001),
         agent_session_id: Some("codex-native".to_owned()),
         agent_session_path: None,
     };
@@ -1206,6 +1239,7 @@ fn session_report_agent_params_roundtrip_with_optional_native_refs() {
     assert_eq!(value["agent"], json!("codex"));
     assert_eq!(value["activity"], json!("working"));
     assert_eq!(value["seq"], json!(123));
+    assert_eq!(value["pid"], json!(9001));
     assert_eq!(value["agent_session_id"], json!("codex-native"));
     assert!(
         !value
@@ -1351,6 +1385,7 @@ fn session_info_roundtrips_with_active_agent_fields() {
     let info = SessionInfo {
         active_agent: Some("codex".to_owned()),
         active_agent_base: Some(AgentKind::Codex),
+        active_agent_pid: Some(9001),
         active_agent_session_id: Some("codex-native".to_owned()),
         active_agent_session_path: None,
         ..running_shell_session(None)
@@ -1360,6 +1395,7 @@ fn session_info_roundtrips_with_active_agent_fields() {
     assert_eq!(value["agent"], json!("shell"));
     assert_eq!(value["active_agent"], json!("codex"));
     assert_eq!(value["active_agent_base"], json!("codex"));
+    assert_eq!(value["active_agent_pid"], json!(9001));
     assert_eq!(value["active_agent_session_id"], json!("codex-native"));
     assert!(
         !value
@@ -1643,9 +1679,11 @@ fn session_resize_result_carries_updated_session_info() {
         json!({
             "session": {
                 "id": "s-42",
+                "external": false,
                 "agent": "shell",
                 "agent_base": "shell",
                 "cwd": "/workspace/project",
+                "cwd_source": "launch",
                 "pid": 4242,
                 "cols": 120,
                 "rows": 40,

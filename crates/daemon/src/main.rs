@@ -40,6 +40,9 @@ const WORKTREES_SUBDIR: &str = "worktrees";
 /// Subdirectory under the data dir holding the append-only event log.
 const EVENTS_SUBDIR: &str = "events";
 
+/// Env var enabling opt-in observation of agents outside pohunek-owned PTYs.
+const OBSERVE_EXTERNAL_AGENTS_ENV: &str = "POHUNEK_OBSERVE_EXTERNAL_AGENTS";
+
 /// Maximum time to let event-log drains flush on daemon shutdown.
 ///
 /// Event log writes are local owner-private JSONL appends and should finish
@@ -102,6 +105,7 @@ async fn run() -> Result<(), DaemonError> {
         config_dir: Some(paths.config_dir.clone()),
         // Part C: host agent profiles live under <config_dir>/agents.
         agents_dir: Some(paths.config_dir.join("agents")),
+        observe_external_agents: env_bool(OBSERVE_EXTERNAL_AGENTS_ENV)?,
         ..SessionRegistryConfig::default()
     };
     let sessions = SessionRegistry::new(config);
@@ -198,6 +202,28 @@ async fn run() -> Result<(), DaemonError> {
 
     info!("pohunekd stopped");
     Ok(())
+}
+
+fn env_bool(var: &str) -> Result<bool, DaemonError> {
+    let Some(value) = std::env::var_os(var) else {
+        return Ok(false);
+    };
+    let Some(value) = value.to_str() else {
+        return Err(DaemonError::InvalidEnv {
+            var: var.to_owned(),
+            value: "<non-utf8>".to_owned(),
+            expected: "true/false, 1/0, yes/no, or on/off",
+        });
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        _ => Err(DaemonError::InvalidEnv {
+            var: var.to_owned(),
+            value: value.to_owned(),
+            expected: "true/false, 1/0, yes/no, or on/off",
+        }),
+    }
 }
 
 #[derive(Debug)]

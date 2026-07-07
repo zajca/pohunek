@@ -10,6 +10,8 @@ use std::time::Instant;
 
 use protocol::{AgentActivity, AgentKind, StateSource};
 
+use crate::procwatch::ProcessFact;
+
 mod machine;
 mod manifest;
 mod osc;
@@ -17,6 +19,7 @@ mod osc;
 pub use machine::{ActivityEvidence, ActivityTransition, DetectionConfig, StateMachine};
 pub use manifest::{
     Manifest, ManifestError, ManifestMatch, ManifestRegion, MatchContext, MatcherKind,
+    ProcessMatchers,
 };
 pub use osc::{OscEvidence, OscParser};
 // The VT screen model lives in `pohunek-terminal` so the daemon and CLI share
@@ -118,6 +121,24 @@ pub fn claude_manifest() -> &'static Manifest {
         .get_or_init(|| Manifest::parse_str(CLAUDE_MANIFEST).expect("claude manifest must parse"))
 }
 
+/// Identifies a built-in agent from process facts.
+#[must_use]
+pub fn identify_agent(fact: &ProcessFact) -> Option<AgentKind> {
+    if codex_manifest()
+        .process_matchers()
+        .is_some_and(|matchers| matchers.matches(fact))
+    {
+        Some(AgentKind::Codex)
+    } else if claude_manifest()
+        .process_matchers()
+        .is_some_and(|matchers| matchers.matches(fact))
+    {
+        Some(AgentKind::Claude)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug)]
 pub struct Detector {
     osc: OscParser,
@@ -126,6 +147,7 @@ pub struct Detector {
     manifest: Option<Manifest>,
     latest_title: Option<String>,
     latest_progress: Option<String>,
+    latest_cwd_hint: Option<String>,
     process_activity: ProcessActivityScanner,
     needs_visible_recheck: bool,
 }
@@ -140,6 +162,7 @@ impl Detector {
             manifest: config.manifest,
             latest_title: None,
             latest_progress: None,
+            latest_cwd_hint: None,
             process_activity: ProcessActivityScanner::default(),
             needs_visible_recheck: false,
         }
@@ -218,6 +241,7 @@ impl Detector {
         self.state.clear_pending();
         self.latest_title = None;
         self.latest_progress = None;
+        self.latest_cwd_hint = None;
         self.screen.reset();
         self.needs_visible_recheck = false;
     }
@@ -232,6 +256,11 @@ impl Detector {
         self.latest_progress.as_deref()
     }
 
+    /// Takes the latest OSC 7 cwd hint, if one has arrived.
+    pub fn take_cwd_hint(&mut self) -> Option<String> {
+        self.latest_cwd_hint.take()
+    }
+
     fn collect_osc_evidence(&mut self, osc_items: Vec<OscEvidence>) -> OscChanges {
         let mut changes = OscChanges::default();
 
@@ -244,6 +273,9 @@ impl Detector {
                 OscEvidence::Progress(progress) => {
                     changes.progress |= self.latest_progress.as_deref() != Some(progress.as_str());
                     self.latest_progress = Some(progress);
+                }
+                OscEvidence::Cwd(path) => {
+                    self.latest_cwd_hint = Some(path);
                 }
             }
         }
@@ -456,9 +488,10 @@ fn push_transition(
 mod tests {
     use std::time::{Duration, Instant};
 
-    use protocol::{AgentActivity, StateSource};
+    use protocol::{AgentActivity, AgentKind, StateSource};
 
     use super::{ActivityTransition, DetectionConfig, Detector, DetectorConfig, Manifest};
+    use crate::procwatch::ProcessFact;
 
     fn instant() -> Instant {
         Instant::now()
@@ -501,6 +534,40 @@ mod tests {
 
     fn manifest(source: &str) -> Manifest {
         Manifest::parse_str(source).expect("manifest should parse")
+    }
+
+    #[test]
+    fn identify_agent_matches_builtin_process_sections() {
+        assert_eq!(
+            super::identify_agent(&ProcessFact {
+                pid: 100,
+                ppid: 1,
+                comm: "codex".to_owned(),
+                cmdline: vec!["/usr/bin/codex".to_owned()],
+            }),
+            Some(AgentKind::Codex)
+        );
+        assert_eq!(
+            super::identify_agent(&ProcessFact {
+                pid: 101,
+                ppid: 1,
+                comm: "node".to_owned(),
+                cmdline: vec![
+                    "node".to_owned(),
+                    "/opt/claude-code/bin/claude.js".to_owned()
+                ],
+            }),
+            Some(AgentKind::Claude)
+        );
+        assert_eq!(
+            super::identify_agent(&ProcessFact {
+                pid: 102,
+                ppid: 1,
+                comm: "sleep".to_owned(),
+                cmdline: vec!["sleep".to_owned(), "30".to_owned()],
+            }),
+            None
+        );
     }
 
     #[test]
@@ -565,6 +632,34 @@ mod tests {
             detector.feed(started_at + Duration::from_millis(20), b"\x1b[?25l"),
             vec![transition(AgentActivity::Working, StateSource::Process)]
         );
+    }
+
+    #[test]
+    fn osc_7_cwd_hint_is_taken_once_without_activity_transition() {
+        let started_at = instant();
+        let mut detector = Detector::new(3, 80, started_at, config());
+
+        assert!(detector
+            .feed(started_at, b"\x1b]7;file:///tmp/pohunek-cwd\x07")
+            .is_empty());
+        assert_eq!(
+            detector.take_cwd_hint(),
+            Some("/tmp/pohunek-cwd".to_owned())
+        );
+        assert_eq!(detector.take_cwd_hint(), None);
+    }
+
+    #[test]
+    fn resync_after_lag_clears_pending_cwd_hint() {
+        let started_at = instant();
+        let mut detector = Detector::new(3, 80, started_at, config());
+
+        assert!(detector
+            .feed(started_at, b"\x1b]7;file:///tmp/pohunek-cwd\x07")
+            .is_empty());
+        detector.resync_after_lag();
+
+        assert_eq!(detector.take_cwd_hint(), None);
     }
 
     #[test]

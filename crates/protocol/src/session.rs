@@ -46,6 +46,30 @@ impl AgentActivity {
     }
 }
 
+/// Source of the current working-directory value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CwdSource {
+    /// Captured at session launch or resume.
+    Launch,
+    /// Read from the focus process through procwatch.
+    Procwatch,
+    /// Reported by OSC 7 terminal output.
+    Osc7,
+}
+
+impl CwdSource {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Launch => "launch",
+            Self::Procwatch => "procwatch",
+            Self::Osc7 => "osc7",
+        }
+    }
+}
+
 /// Parameters for `session.new`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionNewParams {
@@ -262,6 +286,9 @@ pub struct SessionReportAgentParams {
     /// Optional monotonic sequence from the reporting hook.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
+    /// OS pid of the active nested agent process, when the hook can report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
     /// Native session id for the active nested agent, when reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session_id: Option<String>,
@@ -420,6 +447,14 @@ pub struct SessionWarning {
 pub struct SessionInfo {
     /// Stable session identifier.
     pub id: SessionId,
+    /// Whether this entry represents an observe-only process outside pohunek.
+    ///
+    /// `Some(false)` marks a normal PTY-backed session owned by the daemon.
+    /// `Some(true)` marks an external agent observed by the opt-in external
+    /// observer; those entries are read-only and have no PTY. `None` means the
+    /// peer predates this additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<bool>,
     /// Owner-set display name, or `None` when the session is shown by its id.
     /// Set at `session.new` and changed via `session.rename`; cosmetic only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -430,6 +465,9 @@ pub struct SessionInfo {
     pub agent_base: AgentKind,
     /// Current working directory for the session.
     pub cwd: PathBuf,
+    /// Source that last set [`Self::cwd`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd_source: Option<CwdSource>,
     /// Operating-system process id of the session root process.
     pub pid: u32,
     /// Current terminal width in columns.
@@ -452,6 +490,9 @@ pub struct SessionInfo {
     /// Resolved base kind for [`Self::active_agent`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_agent_base: Option<AgentKind>,
+    /// OS pid backing [`Self::active_agent`], when process facts have bound it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_agent_pid: Option<u32>,
     /// Native session id for the active nested agent, when reported.
     ///
     /// This metadata is distinct from [`Self::native_session_id`] and never acts
@@ -630,10 +671,12 @@ mod tests {
     fn session(id: &str) -> SessionInfo {
         SessionInfo {
             id: SessionId(id.to_owned()),
+            external: Some(false),
             name: None,
             agent: "claude".to_owned(),
             agent_base: AgentKind::Claude,
             cwd: PathBuf::from("/workspace"),
+            cwd_source: Some(CwdSource::Launch),
             pid: 4242,
             cols: 80,
             rows: 24,
@@ -642,6 +685,7 @@ mod tests {
             activity: Some(AgentActivity::Working),
             active_agent: None,
             active_agent_base: None,
+            active_agent_pid: None,
             active_agent_session_id: None,
             active_agent_session_path: None,
             native_session_id: None,
@@ -686,6 +730,13 @@ mod tests {
         assert_eq!(AgentActivity::Working.as_str(), "working");
         assert_eq!(AgentActivity::Blocked.as_str(), "blocked");
         assert_eq!(AgentActivity::Idle.as_str(), "idle");
+    }
+
+    #[test]
+    fn cwd_source_strings_match_wire_repr() {
+        assert_eq!(CwdSource::Launch.as_str(), "launch");
+        assert_eq!(CwdSource::Procwatch.as_str(), "procwatch");
+        assert_eq!(CwdSource::Osc7.as_str(), "osc7");
     }
 
     #[test]

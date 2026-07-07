@@ -347,9 +347,11 @@ mod tests {
         SessionInfo {
             name: None,
             id: SessionId(id.to_owned()),
+            external: Some(false),
             agent: "codex".to_owned(),
             agent_base: protocol::AgentKind::Codex,
             cwd: PathBuf::from("/tmp/project"),
+            cwd_source: Some(protocol::CwdSource::Launch),
             pid: 42,
             cols: 80,
             rows: 24,
@@ -358,6 +360,7 @@ mod tests {
             activity: None,
             active_agent: None,
             active_agent_base: None,
+            active_agent_pid: None,
             active_agent_session_id: None,
             active_agent_session_path: None,
             native_session_id: Some("native-1".to_owned()),
@@ -535,36 +538,14 @@ mod tests {
             added_at: "2026-06-29T00:00:00Z".to_owned(),
             last_used_at: "2026-06-29T00:00:00Z".to_owned(),
         };
-        let session = SessionInfo {
-            name: None,
-            id: SessionId("s-1".to_owned()),
-            agent: "codex".to_owned(),
-            agent_base: protocol::AgentKind::Codex,
-            cwd: PathBuf::from("/tmp/selected-project"),
-            pid: 42,
-            cols: 80,
-            rows: 24,
-            state: protocol::SessionState::Running,
-            state_source: protocol::StateSource::Process,
-            activity: None,
-            active_agent: None,
-            active_agent_base: None,
-            active_agent_session_id: None,
-            active_agent_session_path: None,
-            native_session_id: None,
-            native_session_path: None,
-            project_id: Some(project.id.clone()),
-            project_label: Some(project.label.clone()),
-            metadata: BTreeMap::new(),
-            is_linked_worktree: Some(false),
-            repo: Some(project.repo_root.clone()),
-            branch: Some("main".to_owned()),
-            worktree_path: Some(project.repo_root.clone()),
-            warnings: Vec::new(),
-            created_at: "2026-06-29T00:00:00Z".to_owned(),
-            updated_at: "2026-06-29T00:00:00Z".to_owned(),
-            exit_code: None,
-        };
+        let mut session = test_session("s-1", protocol::SessionState::Running);
+        session.cwd.clone_from(&project.repo_root);
+        session.native_session_id = None;
+        session.project_id = Some(project.id.clone());
+        session.project_label = Some(project.label.clone());
+        session.repo = Some(project.repo_root.clone());
+        session.branch = Some("main".to_owned());
+        session.worktree_path = Some(project.repo_root.clone());
         let mut host = pohunek_gui_core::HostView {
             conn: ConnState::Connected,
             health: None,

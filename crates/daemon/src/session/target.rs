@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 
 use super::{
     build_pty_command, debug, detect_at, event, launch_adapter_for, plan_initial_input_delivery,
-    runtime_error, spawn_error_to_protocol, timestamp_now, warn, watch, AgentKind,
-    CancellationToken, DetectedProject, DetectorConfig, InputRules, LaunchOpts, Manifest, PathBuf,
-    ProjectRecord, ProtocolError, PtyCommand, PtyHandle, ResolvedAgent, ResumeSnapshot,
-    SessionEntry, SessionId, SessionInfo, SessionNewParams, SessionRegistry, SessionState,
-    SessionWarning, ShellCommand, StateSource, WorktreeRequest,
+    runtime_error, spawn_error_to_protocol, timestamp_now, warn, watch, AgentKind, Arc,
+    CancellationToken, CwdSource, DetectedProject, DetectorConfig, InputRules, LaunchOpts,
+    Manifest, Notify, PathBuf, ProjectRecord, ProtocolError, PtyCommand, PtyHandle, ResolvedAgent,
+    ResumeSnapshot, SessionEntry, SessionId, SessionInfo, SessionNewParams, SessionRegistry,
+    SessionState, SessionWarning, ShellCommand, StateSource, WorktreeRequest,
 };
 
 /// Everything needed to spawn and register one PTY-backed session, shared by
@@ -354,6 +354,10 @@ impl SessionRegistry {
         clippy::map_err_ignore,
         reason = "spawn_blocking JoinError has no meaningful source to surface in ProtocolError"
     )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "session registration assembles one protocol snapshot plus task handles"
+    )]
     pub(super) async fn register_pty_session(
         &self,
         spec: PtySessionSpec,
@@ -392,17 +396,22 @@ impl SessionRegistry {
                 .map_err(|err| spawn_error_to_protocol(err, &program))?;
         let detector_output = pty.subscribe_output();
         let detector_cancel = CancellationToken::new();
+        let procwatch_cancel = CancellationToken::new();
+        let procwatch_rescan = Arc::new(Notify::new());
         let (detector_resize, detector_resize_rx) = watch::channel((rows, cols));
         let default_detector_config = DetectorConfig::for_profile(agent_base, manifest_override);
         let (detector_config, detector_config_rx) = watch::channel(default_detector_config.clone());
+        let root_pid = pty.pid();
 
         let now = timestamp_now();
         let info = SessionInfo {
             id: id.clone(),
+            external: Some(false),
             name,
             agent,
             agent_base,
             cwd,
+            cwd_source: Some(CwdSource::Launch),
             pid: pty.pid(),
             cols,
             rows,
@@ -411,6 +420,7 @@ impl SessionRegistry {
             activity: None,
             active_agent: None,
             active_agent_base: None,
+            active_agent_pid: None,
             active_agent_session_id: None,
             active_agent_session_path: None,
             native_session_id,
@@ -440,11 +450,14 @@ impl SessionRegistry {
                     detector_resize,
                     detector_config,
                     default_detector_config,
+                    procwatch_cancel: procwatch_cancel.clone(),
+                    procwatch_rescan: Arc::clone(&procwatch_rescan),
                     stopping: false,
                     input_rules,
                     snapshot,
                     active_agent: None,
                     last_agent_report: None,
+                    observed_agents: Vec::new(),
                 },
             )
         };
@@ -458,6 +471,7 @@ impl SessionRegistry {
             detector_resize_rx,
             detector_config_rx,
         );
+        self.spawn_procwatch(id.clone(), root_pid, procwatch_cancel, procwatch_rescan);
         self.spawn_exit_watcher(id, pty);
         Ok(info)
     }
