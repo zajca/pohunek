@@ -3,9 +3,9 @@
 use iced::widget::{button, column, row, text, text_input};
 use iced::{Center, Element};
 use pohunek_gui_core::{
-    session_link_metadata, session_metadata_rows, SessionLinkKind, SessionLinkProvider,
+    session_link_metadata, session_metadata_rows, HostId, SessionLinkKind, SessionLinkProvider,
 };
-use protocol::SessionInfo;
+use protocol::{CwdSource, SessionInfo};
 
 use crate::message::Message;
 use crate::selection::{selected_host_config, selected_session};
@@ -23,6 +23,7 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
     let mut detail = column![section_title("Session")].spacing(8);
     match selected_session(app) {
         Some((host_id, session)) => {
+            let external = is_external_session(session);
             let activity = session
                 .activity
                 .map_or("unknown", |activity| activity.as_str());
@@ -35,6 +36,7 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
             detail = detail
                 .push(text(heading).size(16))
                 .push(text(format!("agent: {}", session.agent)).size(14))
+                .push(text(origin_label(session)).size(14))
                 .push(text(format!("state: {}", session.state.as_str())).size(14))
                 .push(text(format!("activity: {activity}")).size(14));
             if let Some(project) = session
@@ -77,33 +79,82 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
             }
             detail = detail.push(text(format!("cwd: {}", session.cwd.display())).size(14));
             detail = detail.push(
-                row![
-                    button("Open in terminal")
-                        .on_press(Message::OpenSession {
-                            host_id: host_id.clone(),
-                            session_id: session.id.clone(),
-                        })
-                        .style(iced::widget::button::primary),
-                    button("Inspect")
-                        .on_press(Message::InspectSelectedSession)
-                        .style(iced::widget::button::secondary),
-                    button("Stop")
-                        .on_press(Message::StopSelectedSession)
-                        .style(iced::widget::button::danger),
-                    button("Remove")
-                        .on_press(Message::RemoveSelectedSession)
-                        .style(iced::widget::button::danger)
-                ]
-                .spacing(8),
+                text(format!(
+                    "cwd source: {}",
+                    cwd_source_label(session.cwd_source)
+                ))
+                .size(14),
             );
-            detail = detail.push(rename_view(app));
-            detail = detail.push(metadata_view(app, session));
+            if has_worktree_drift(session) {
+                detail = detail.push(text("worktree drift: yes").size(14));
+            }
+            detail = detail.push(session_actions(host_id, session, external));
+            if !external {
+                detail = detail.push(rename_view(app));
+                detail = detail.push(metadata_view(app, session));
+            }
         }
         None => {
             detail = detail.push(text("No session selected").size(16));
         }
     }
     card(detail)
+}
+
+fn session_actions<'a>(
+    host_id: &'a HostId,
+    session: &'a SessionInfo,
+    external: bool,
+) -> Element<'a, Message> {
+    let mut actions = row![button("Inspect")
+        .on_press(Message::InspectSelectedSession)
+        .style(iced::widget::button::secondary)]
+    .spacing(8);
+    if !external {
+        actions = actions
+            .push(
+                button("Open in terminal")
+                    .on_press(Message::OpenSession {
+                        host_id: host_id.clone(),
+                        session_id: session.id.clone(),
+                    })
+                    .style(iced::widget::button::primary),
+            )
+            .push(
+                button("Stop")
+                    .on_press(Message::StopSelectedSession)
+                    .style(iced::widget::button::danger),
+            )
+            .push(
+                button("Remove")
+                    .on_press(Message::RemoveSelectedSession)
+                    .style(iced::widget::button::danger),
+            );
+    }
+    actions.into()
+}
+
+fn cwd_source_label(source: Option<CwdSource>) -> &'static str {
+    source.map_or("unknown", CwdSource::as_str)
+}
+
+fn origin_label(session: &SessionInfo) -> &'static str {
+    if is_external_session(session) {
+        "origin: external (read-only)"
+    } else {
+        "origin: managed"
+    }
+}
+
+fn is_external_session(session: &SessionInfo) -> bool {
+    session.external == Some(true)
+}
+
+fn has_worktree_drift(session: &SessionInfo) -> bool {
+    session
+        .worktree_path
+        .as_ref()
+        .is_some_and(|worktree_path| !session.cwd.starts_with(worktree_path))
 }
 
 /// Rename control for the selected session: a name field plus set/clear buttons,

@@ -84,11 +84,42 @@ explanatory text replaces the button so the record is not a dead end.
 
 Every session has an immutable launch identity: `agent` is the selected profile
 name and `agent_base` is the base kind (`shell`, `codex`, or `claude`). A shell
-session can temporarily host a nested Codex or Claude Code process. When that
-nested agent's hook reports back, the daemon records active runtime metadata in
-`active_agent`, `active_agent_base`, and the optional active native session
-fields. This affects display, filtering, and detector behavior, but it does not
-change the launch `agent` / `agent_base`.
+session can temporarily host a nested Codex or Claude Code process. The daemon
+now treats active nested-agent state as an evidence tripod: process facts from
+procwatch are authoritative for start/stop, hooks are the fast path for rich
+claims and clean release, and PTY output remains an activity signal rather than
+lifecycle authority. `SessionStart` hooks report the nested agent's PID when the
+provider exposes it as the hook parent, so procwatch can bind the claim exactly.
+Claude `SessionEnd` sends an explicit release for prompt clean-exit clearing;
+Codex has no installed session-end release because its `Stop` event is
+turn-level, so procwatch remains the release backstop. Hook claims must be
+backed by a live process and age out when unbound. `active_agent`,
+`active_agent_base`, and `active_agent_pid` are runtime metadata for display,
+filtering, and detector behavior; they do not change the launch `agent` /
+`agent_base`.
+
+The same runtime model keeps `cwd` current. A session starts with its launch
+directory, then procwatch reads the cwd of the focus process on each tick: the
+active nested-agent PID when one is bound, otherwise the root PTY child. OSC 7
+terminal output is accepted as an immediate cwd hint, but procwatch remains
+authoritative and overwrites a hint that the process cwd contradicts. Each cwd
+change emits `session_updated` and re-resolves project and worktree context. If
+the new cwd is inside another registered active worktree, `worktree_path`,
+`branch`, and project metadata move to that worktree; if it is outside every
+known worktree, `worktree_path` is cleared while git `repo`/`branch` metadata is
+kept when detection still finds a repository.
+
+External observer mode is opt-in with `POHUNEK_OBSERVE_EXTERNAL_AGENTS=1` (or
+`SessionRegistryConfig.observe_external_agents = true`) and defaults off because
+it watches provider transcript trees under the operator's Claude/Codex homes.
+When enabled, the daemon combines same-user process facts with transcript JSONL
+candidates to show agents that were started outside pohunek. These entries use
+synthetic ids such as `ext-12345`, carry `external: true`, and appear in
+`session.list`, `session.inspect`, and the GUI as read-only sessions. They have
+no pohunek-owned PTY: attach, input, resize, stop, remove, rename, metadata, and
+resume operations are rejected with `session_external_read_only`. The observer
+removes the entry when the external process exits, including `kill -9` via the
+pidfd-backed exit path.
 
 Detach and client restarts do not stop a session because the daemon owns the PTY.
 A daemon restart is different: the live PTY and process are gone, and only
@@ -100,9 +131,11 @@ agent profile or base kind, so a nested different agent cannot overwrite the
 parent session's resume binding. Nested active-agent reports are therefore
 runtime evidence only: they can expose the currently active agent and active
 native metadata while the nested process runs, but they never populate or replace
-`native_session_id` / `native_session_path` for the parent session. Releasing the
-active report clears those active fields and restores the parent session's
-default detector identity.
+`native_session_id` / `native_session_path` for the parent session. Procwatch can
+auto-report a matching nested agent even when hooks are missing, and auto-release
+clears stale active fields when the backing process exits or an unbound claim
+exceeds the active-agent claim TTL. Both explicit release and auto-release
+restore the parent session's default detector identity.
 
 An in-memory terminal session (`stopped`, `done`, or `failed`) that still carries
 captured native resume metadata can be explicitly relaunched with `session.resume`.

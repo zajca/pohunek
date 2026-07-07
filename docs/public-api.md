@@ -130,13 +130,13 @@ All params and result type names below refer to structs exported by
 | `session.detach` | `SessionDetachParams` | `SessionDetachResult` | Cancels an active attach stream. Unknown streams return `detached: false`. |
 | `session.resize` | `SessionResizeParams` | `SessionResizeResult` | Resizes the PTY on the control connection. |
 | `session.input` | `SessionInputParams` | `SessionInputResult` | Injects text using agent-specific input framing. |
-| `session.report_agent` | `SessionReportAgentParams` | `SessionReportAgentResult` | Hook callback for nested agents running inside an existing session. It records active runtime identity and optional active native metadata without changing launch identity or resume binding; ignored reports return `recorded: false`. |
-| `session.release_agent` | `SessionReleaseAgentParams` | `SessionReleaseAgentResult` | Hook callback that clears a matching active nested-agent report and restores the session's default detector identity. Non-current releases return `released: false`. |
+| `session.report_agent` | `SessionReportAgentParams` | `SessionReportAgentResult` | Hook callback for nested agents running inside an existing session. It records an active-agent claim, optional process binding, and optional active native metadata without changing launch identity or resume binding; ignored reports return `recorded: false`. Claims are reconciled with process facts and can be auto-released when no live backing process remains. |
+| `session.release_agent` | `SessionReleaseAgentParams` | `SessionReleaseAgentResult` | Hook callback that clears a matching active nested-agent report and restores the session's default detector identity. Claude `SessionEnd` hooks use this as the clean-exit fast path; non-current releases return `released: false`; process-backed auto-release uses the same clear path. |
 | `session.report_native_id` | `SessionReportNativeIdParams` | `SessionReportNativeIdResult` | Hook callback for launch-agent resume metadata. The daemon records only reports whose `agent` matches the session profile name or base kind; ignored reports return `recorded: false`. This is not the nested-agent active identity callback. |
 | `session.set_metadata` | `SessionSetMetadataParams` | `SessionSetMetadataResult` | Merges owner-controlled metadata. Values must not contain secrets. |
 | `session.rename` | `SessionRenameParams` | `SessionRenameResult` | Sets or clears a session's owner display name (`name: null` clears). Cosmetic; the daemon trims it and rejects a control character or over-long name. |
 | `subscribe` | `null` | `{subscribed: true}` then event stream | Consumes the connection into a one-way event stream. |
-| `integration.install` | `IntegrationInstallParams` or `null` | `IntegrationInstallResult` | Installs agent hooks for native session id capture. |
+| `integration.install` | `IntegrationInstallParams` or `null` | `IntegrationInstallResult` | Installs agent hooks for active-agent state, native session id capture, and provider notifications. |
 | `assistant.materialize` | `AssistantMaterializeParams` | `AssistantMaterializeResult` | Materializes the assistant knowledge bundle on the daemon host. |
 | `notification.create` | `NotificationCreateParams` | `NotificationCreateResult` | Creates a host-local notification. Daemon policy is enforced for every producer, including provider hooks and daemon projectors. Dedupe may return `created: false` with an existing or upgraded record. `agent_blocked`/`approval_required` with `attention:<session_id>` and `turn_completed` with `turn:<session_id>` are deferred: the result still reports `created: true` with a minted id, but the record is held pending until `attention_debounce_secs` elapses; see `NotificationPolicy`. |
 | `notification.list` | `NotificationListParams` or `null` | `NotificationListResult` | Lists notification records with exact-match filters and cursor pagination. Deleted records are excluded unless `status: deleted` is requested. |
@@ -158,6 +158,15 @@ All params and result type names below refer to structs exported by
 `status` exists as a method constant in `crates/protocol` but is not a supported
 daemon method in this API version. It returns `daemon/method_not_found`.
 
+### Daemon Runtime Configuration
+
+`POHUNEK_OBSERVE_EXTERNAL_AGENTS` is an opt-in daemon environment flag. Accepted
+true values are `1`, `true`, `yes`, and `on`; accepted false values are `0`,
+`false`, `no`, `off`, or an unset variable. When true, the daemon watches the
+operator's Claude and Codex transcript trees and same-user process table for
+agents started outside pohunek. The corresponding `SessionRegistryConfig`
+setting is `observe_external_agents`, default `false`.
+
 ## Core Payloads
 
 This section names the high-value fields clients commonly branch on. The full
@@ -168,21 +177,34 @@ wire shapes are the exported `crates/protocol` structs.
 Important fields:
 
 - `id`: stable session id.
+- `external`: optional bool. `false` means a normal pohunek-owned PTY session;
+  `true` means an opt-in observed external agent. External sessions are
+  read-only: attach, input, resize, stop, remove, rename, metadata updates, and
+  resume return `runtime/session_external_read_only`.
 - `name`: optional owner-set display name; absent means the session is shown by
   its id. Set at `session.new` and changed via `session.rename`.
 - `agent`: profile name.
 - `agent_base`: `shell`, `codex`, or `claude`.
 - `active_agent`: optional runtime agent profile currently active inside the
-  session. Present for nested agents reported through hooks.
+  session. Present for nested agents reported through hooks or inferred from
+  process facts.
 - `active_agent_base`: optional runtime base kind (`shell`, `codex`, or
   `claude`) for `active_agent`.
+- `active_agent_pid`: optional process id backing `active_agent`. When present,
+  the daemon auto-releases the active agent if that process exits.
 - `active_agent_session_id` / `active_agent_session_path`: optional native
   metadata for the active nested agent. These fields are display/runtime
   metadata only and do not make the parent session resumable as that nested
   agent.
-- `cwd`: host-local working directory.
-- `pid`: root process id.
-- `cols`, `rows`: current PTY size.
+- `cwd`: current host-local working directory. It starts as the launch
+  directory and can change while the session runs when procwatch observes the
+  focus process in a new directory or the PTY emits an OSC 7 cwd hint.
+- `cwd_source`: optional source of the current `cwd`: `launch`, `procwatch`, or
+  `osc7`. `procwatch` is authoritative; `osc7` is an immediate hint that the
+  next procwatch tick can overwrite if the focus process disagrees.
+- `pid`: root process id, or the observed external agent process id.
+- `cols`, `rows`: current PTY size. External sessions have no PTY and report
+  `0x0`.
 - `state`: `starting`, `running`, `stopped`, `done`, or `failed`.
 - `state_source`: `osc_title`, `osc_progress`, `screen`, `process`, or
   `report`.
@@ -191,11 +213,32 @@ Important fields:
   These belong to the immutable launch agent and are written by
   `session.report_native_id`, not by nested active-agent reports.
 - `project_id`, `project_label`, `repo`, `branch`, `worktree_path`: optional git
-  and project context.
+  and project context for the current `cwd`. A cwd change re-resolves this
+  context. When a session leaves every known active worktree, `worktree_path` is
+  cleared; `repo` and `branch` remain populated when git detection still finds a
+  repository at the new cwd.
 - `warnings`: non-fatal worktree setup warnings.
 - `metadata`: owner-controlled strings; must not contain secrets.
 - `created_at`, `updated_at`: RFC3339 timestamps.
 - `exit_code`: optional process exit code.
+
+### Active-Agent Hook Payloads
+
+`session.report_agent` accepts the nested agent `source`, `agent`, optional
+`activity`, optional `seq`, optional `pid`, and optional active native metadata.
+`pid` is the OS process id for the active nested agent. When present, the daemon
+binds the active claim to that process and clears the claim when procwatch sees
+the process exit. The shipped integration state hooks use
+`POHUNEK_INTEGRATION_VERSION=2` and send the hook process's parent PID on
+`SessionStart`.
+
+`session.release_agent` accepts the same `source`/`agent` identity plus an
+optional `seq`. A release clears only the current matching active-agent claim;
+stale releases do not clear newer reports. Claude installs a `SessionEnd` state
+hook that sends `session.release_agent` with a fresh timestamp sequence, so
+clean exits normally clear active state promptly. Codex has no installed
+session-end release path because its `Stop` hook is turn completion, not process
+exit; procwatch remains the Codex release backstop.
 
 ### Session and Project Filters
 
@@ -331,8 +374,9 @@ answer different questions:
 
 ### Provider Notification Hooks
 
-`integration.install` installs durable notification hook adapters for current
-Codex and Claude builds only. There is no fallback for older provider hook APIs.
+`integration.install` installs durable state and notification hook adapters for
+current Codex and Claude builds only. There is no fallback for older provider
+hook APIs.
 
 Codex notification support requires modern lifecycle hooks for
 `PermissionRequest` and `Stop`. The installer writes managed command hooks to
@@ -392,7 +436,7 @@ Canonical public codes currently emitted include:
 | `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback` |
 | `transport` | `framing`, `host_unreachable` |
 | `discovery` | `netbird_cli_missing`, `netbird_state_unavailable`, `host_unknown`, `remote_discovery_failed` |
-| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_exit_timeout`, `attach_not_found`, `attach_expired`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor` |
+| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `attach_not_found`, `attach_expired`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor` |
 
 Clients must not parse `msg`. Branch on `class` and `code`, then display `msg`
 and `recover` for unknown codes.
@@ -411,7 +455,7 @@ The daemon then writes these events:
 | Event | Payload | Meaning |
 |---|---|---|
 | `session_created` | `{session: SessionInfo}` | A session was created or explicitly resumed into a new live PTY. |
-| `session_updated` | `{session: SessionInfo}` | Session metadata, active-agent report/release, state, resize, resume binding, or terminal state changed. |
+| `session_updated` | `{session: SessionInfo}` | Session metadata, active-agent report/release, cwd/worktree/project association, state, resize, resume binding, or terminal state changed. |
 | `session_stopped` | `{session: SessionInfo}` | A user-requested stop completed. |
 | `session_removed` | `{session: SessionInfo}` | A session was evicted from the registry; clients drop it from their view. |
 | `agent_state` | `{session_id: SessionId, activity: AgentActivity, source: StateSource}` | Agent activity changed. `source` may be `report` when a hook report supplied explicit active-agent state. |

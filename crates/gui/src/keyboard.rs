@@ -1770,10 +1770,12 @@ mod tests {
     fn test_session(session_id: &SessionId) -> SessionInfo {
         SessionInfo {
             id: session_id.clone(),
+            external: Some(false),
             name: None,
             agent: "codex".to_owned(),
             agent_base: AgentKind::Codex,
             cwd: PathBuf::from("/tmp/project"),
+            cwd_source: Some(protocol::CwdSource::Launch),
             pid: 42,
             cols: 80,
             rows: 24,
@@ -1782,6 +1784,7 @@ mod tests {
             activity: None,
             active_agent: None,
             active_agent_base: None,
+            active_agent_pid: None,
             active_agent_session_id: None,
             active_agent_session_path: None,
             native_session_id: Some("native-1".to_owned()),

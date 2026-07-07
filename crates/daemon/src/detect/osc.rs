@@ -2,11 +2,16 @@ const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
 const MAX_OSC_COMMAND_BYTES: usize = 16;
 const MAX_SUPPORTED_OSC_PAYLOAD_BYTES: usize = 4096;
+const FILE_URL_PREFIX: &[u8] = b"file://";
+const PERCENT_HEX_DIGITS: usize = 2;
+const HEX_HIGH_NIBBLE_SHIFT: u8 = 4;
+const HEX_ALPHA_OFFSET: u8 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OscEvidence {
     Title(String),
     Progress(String),
+    Cwd(String),
 }
 
 #[derive(Debug, Default)]
@@ -164,12 +169,13 @@ impl OscParser {
     }
 
     fn is_supported_command(&self) -> bool {
-        matches!(self.command.as_slice(), b"0" | b"2" | b"9")
+        matches!(self.command.as_slice(), b"0" | b"2" | b"7" | b"9")
     }
 
     fn finish_osc(&mut self, evidence: &mut Vec<OscEvidence>) {
         let item = match self.command.as_slice() {
             b"0" | b"2" => Some(OscEvidence::Title(self.payload_string())),
+            b"7" => self.cwd_payload().map(OscEvidence::Cwd),
             b"9" => Some(OscEvidence::Progress(self.payload_string())),
             _ => None,
         };
@@ -183,6 +189,48 @@ impl OscParser {
 
     fn payload_string(&self) -> String {
         String::from_utf8_lossy(&self.payload).into_owned()
+    }
+
+    fn cwd_payload(&self) -> Option<String> {
+        parse_file_url_cwd(&self.payload)
+    }
+}
+
+fn parse_file_url_cwd(payload: &[u8]) -> Option<String> {
+    let without_scheme = payload.strip_prefix(FILE_URL_PREFIX)?;
+    let path_start = without_scheme.iter().position(|&byte| byte == b'/')?;
+    let path = &without_scheme[path_start..];
+    if path.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&percent_decode(path)).into_owned())
+}
+
+fn percent_decode(input: &[u8]) -> Vec<u8> {
+    let mut decoded = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if input[index] == b'%' && index + PERCENT_HEX_DIGITS < input.len() {
+            if let (Some(high), Some(low)) =
+                (hex_nibble(input[index + 1]), hex_nibble(input[index + 2]))
+            {
+                decoded.push((high << HEX_HIGH_NIBBLE_SHIFT) | low);
+                index += PERCENT_HEX_DIGITS + 1;
+                continue;
+            }
+        }
+        decoded.push(input[index]);
+        index += 1;
+    }
+    decoded
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + HEX_ALPHA_OFFSET),
+        b'A'..=b'F' => Some(byte - b'A' + HEX_ALPHA_OFFSET),
+        _ => None,
     }
 }
 
@@ -247,6 +295,37 @@ mod tests {
             parser.advance(b"\x1b]9;50%\x1b\\"),
             vec![OscEvidence::Progress("50%".to_string())]
         );
+    }
+
+    #[test]
+    fn parses_osc_7_cwd_fragmented_and_bel_terminated() {
+        let mut parser = OscParser::new();
+
+        assert!(parser.advance(b"\x1b]7;file://").is_empty());
+        assert!(parser.advance(b"localhost/tmp/proj").is_empty());
+        assert_eq!(
+            parser.advance(b"ect\x07"),
+            vec![OscEvidence::Cwd("/tmp/project".to_string())]
+        );
+    }
+
+    #[test]
+    fn parses_osc_7_cwd_st_terminated_and_percent_decoded() {
+        let mut parser = OscParser::new();
+
+        assert_eq!(
+            parser.advance(b"\x1b]7;file:///tmp/has%20space\x1b\\"),
+            vec![OscEvidence::Cwd("/tmp/has space".to_string())]
+        );
+    }
+
+    #[test]
+    fn ignores_osc_7_non_file_url() {
+        let mut parser = OscParser::new();
+
+        assert!(parser
+            .advance(b"\x1b]7;ssh://host/tmp/project\x07")
+            .is_empty());
     }
 
     #[test]

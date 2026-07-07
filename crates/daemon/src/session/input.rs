@@ -32,6 +32,7 @@ impl SessionRegistry {
         session_id: &SessionId,
         text: &str,
     ) -> Result<(), ProtocolError> {
+        self.ensure_not_external(session_id).await?;
         let (pty, rules) = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions

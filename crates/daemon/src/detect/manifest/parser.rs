@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use super::error::{ManifestError, MatcherKind};
 use super::matcher::Gate;
-use super::ManifestRegion;
+use super::{ManifestRegion, ProcessMatchers};
 
 /// Maximum number of `[[rules]]` entries a manifest may declare.
 ///
@@ -35,6 +35,10 @@ pub(super) const MAX_SOURCE_BYTES: usize = 256 * 1024;
 /// `contains` needle or `regex`/`line_regex` pattern from being absurdly large
 /// (regex compile/run cost scales with pattern size); real matchers are short.
 pub(super) const MAX_MATCHER_BYTES: usize = 4096;
+/// Synthetic rule id used in errors for `[process].comm` matchers.
+const PROCESS_COMM_MATCHER_ID: &str = "process.comm";
+/// Synthetic rule id used in errors for `[process].cmdline` matchers.
+const PROCESS_CMDLINE_MATCHER_ID: &str = "process.cmdline";
 
 #[derive(Debug, Clone)]
 pub(super) struct Rule {
@@ -271,6 +275,34 @@ fn compile_regex(rule_id: &str, pattern: String) -> Result<Regex, ManifestError>
     })
 }
 
+pub(super) fn compile_process_matchers(
+    raw: RawProcessSection,
+    budget: &mut ComplexityBudget,
+) -> Result<ProcessMatchers, ManifestError> {
+    let RawProcessSection { comm, cmdline } = raw;
+    Ok(ProcessMatchers::new(
+        compile_process_regexes(PROCESS_COMM_MATCHER_ID, comm, budget)?,
+        compile_process_regexes(PROCESS_CMDLINE_MATCHER_ID, cmdline, budget)?,
+    ))
+}
+
+fn compile_process_regexes(
+    rule_id: &str,
+    input: Option<MatcherInput>,
+    budget: &mut ComplexityBudget,
+) -> Result<Vec<Regex>, ManifestError> {
+    let Some(input) = input else {
+        return Ok(Vec::new());
+    };
+    let mut regexes = Vec::new();
+    for pattern in input.into_vec() {
+        check_matcher_value(rule_id, MatcherKind::Regex, &pattern)?;
+        budget.note_matcher(1)?;
+        regexes.push(compile_regex(rule_id, pattern)?);
+    }
+    Ok(regexes)
+}
+
 fn finish_gate_parts(
     rule_id: &str,
     parts: Vec<Gate>,
@@ -354,6 +386,14 @@ fn check_depth(depth: usize) -> Result<(), ManifestError> {
 pub(super) struct RawManifest {
     #[serde(default)]
     pub(super) rules: Vec<RawRule>,
+    pub(super) process: Option<RawProcessSection>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RawProcessSection {
+    comm: Option<MatcherInput>,
+    cmdline: Option<MatcherInput>,
 }
 
 #[derive(Debug, Deserialize)]

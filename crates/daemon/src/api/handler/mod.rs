@@ -284,10 +284,12 @@ mod tests {
         let path = PathBuf::from(format!("/work/{id}"));
         SessionInfo {
             id: SessionId(id.to_owned()),
+            external: Some(false),
             name: None,
             agent: "shell".to_owned(),
             agent_base: AgentKind::Shell,
             cwd: path.clone(),
+            cwd_source: Some(protocol::CwdSource::Launch),
             pid: 0,
             cols: 80,
             rows: 24,
@@ -296,6 +298,7 @@ mod tests {
             activity: None,
             active_agent: None,
             active_agent_base: None,
+            active_agent_pid: None,
             active_agent_session_id: None,
             active_agent_session_path: None,
             native_session_id: None,

@@ -13,9 +13,10 @@ use std::path::PathBuf;
 #[cfg(test)]
 use protocol::Request;
 use protocol::{
-    method, AgentActivity, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionListFilter, SessionListParams, SessionNewParams, SessionRemoveResult,
-    SessionRenameParams, SessionState, SessionStopResult, SessionWarningKind, StateSource,
+    method, AgentActivity, CwdSource, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
+    SessionRemoveResult, SessionRenameParams, SessionState, SessionStopResult, SessionWarningKind,
+    StateSource,
 };
 
 use crate::client::Client;
@@ -591,16 +592,17 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
     let mut output = String::new();
     let _ = writeln!(
         output,
-        "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  CWD",
-        "ID", "NAME", "AGENT", "STATE", "ACTIVITY", "SOURCE", "PID", "SIZE", "PROJECT", "BRANCH", "WARN",
+        "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<8}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  CWD",
+        "ID", "NAME", "AGENT", "ORIGIN", "STATE", "ACTIVITY", "SOURCE", "PID", "SIZE", "PROJECT", "BRANCH", "WARN",
     );
     for session in sessions {
         let _ = writeln!(
             output,
-            "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {}",
+            "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<8}  {:<7}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {}",
             session.id.0,
             name_label(session),
             session_agent_label(session),
+            origin_label(session),
             state_label(session.state),
             activity_label_option(session.activity),
             state_source_label(session.state_source),
@@ -679,13 +681,38 @@ fn warn_count_label(info: &SessionInfo) -> String {
     }
 }
 
+fn origin_label(info: &SessionInfo) -> &'static str {
+    if is_external_session(info) {
+        "external"
+    } else {
+        "managed"
+    }
+}
+
+fn cwd_source_label(source: Option<CwdSource>) -> &'static str {
+    source.map_or("<none>", CwdSource::as_str)
+}
+
+fn is_external_session(info: &SessionInfo) -> bool {
+    info.external == Some(true)
+}
+
+fn has_worktree_drift(info: &SessionInfo) -> bool {
+    info.worktree_path
+        .as_ref()
+        .is_some_and(|worktree_path| !info.cwd.starts_with(worktree_path))
+}
+
 fn render_inspect_human(info: &SessionInfo) -> String {
     let none = || "<none>".to_owned();
     let mut rows: Vec<(&str, String)> = vec![
         ("id", info.id.0.clone()),
+        ("external", yes_no(is_external_session(info)).to_owned()),
+        ("read_only", yes_no(is_external_session(info)).to_owned()),
         ("name", info.name.clone().unwrap_or_else(&none)),
         ("agent", agent_label(&info.agent).to_owned()),
         ("cwd", info.cwd.display().to_string()),
+        ("cwd_source", cwd_source_label(info.cwd_source).to_owned()),
         ("pid", info.pid.to_string()),
         ("cols", info.cols.to_string()),
         ("rows", info.rows.to_string()),
@@ -738,11 +765,17 @@ fn render_inspect_human(info: &SessionInfo) -> String {
     if let Some(active_base) = info.active_agent_base {
         rows.insert(4, ("active_base", agent_kind_label(active_base).to_owned()));
     }
+    if let Some(active_pid) = info.active_agent_pid {
+        rows.insert(5, ("active_pid", active_pid.to_string()));
+    }
     if let Some(active_id) = &info.active_agent_session_id {
-        rows.insert(5, ("active_native_session_id", active_id.clone()));
+        rows.insert(6, ("active_native_session_id", active_id.clone()));
     }
     if let Some(active_path) = &info.active_agent_session_path {
-        rows.insert(6, ("active_native_session_path", active_path.clone()));
+        rows.insert(7, ("active_native_session_path", active_path.clone()));
+    }
+    if has_worktree_drift(info) {
+        rows.push(("worktree_drift", "yes".to_owned()));
     }
     let width = rows
         .iter()
@@ -770,6 +803,14 @@ fn render_inspect_human(info: &SessionInfo) -> String {
         }
     }
     output
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 fn render_stop_human(session_id: &str, result: &SessionStopResult) -> String {
@@ -885,9 +926,11 @@ mod tests {
         SessionInfo {
             name: None,
             id: protocol::SessionId(id.to_owned()),
+            external: Some(false),
             agent: "shell".to_owned(),
             agent_base: protocol::AgentKind::Shell,
             cwd: PathBuf::from("/workspace/project"),
+            cwd_source: Some(protocol::CwdSource::Launch),
             pid: 4242,
             cols: 120,
             rows: 40,
@@ -898,6 +941,7 @@ mod tests {
             native_session_path: None,
             active_agent: None,
             active_agent_base: None,
+            active_agent_pid: None,
             active_agent_session_id: None,
             active_agent_session_path: None,
             project_id: None,
@@ -1519,17 +1563,18 @@ mod tests {
 
         let header = output.lines().next().expect("header line");
         for column in [
-            "ID", "NAME", "AGENT", "STATE", "PROJECT", "BRANCH", "WARN", "CWD",
+            "ID", "NAME", "AGENT", "ORIGIN", "STATE", "PROJECT", "BRANCH", "WARN", "CWD",
         ] {
             assert!(header.contains(column), "header missing {column}: {header}");
         }
-        // Columns: ID NAME AGENT STATE ACTIVITY SOURCE PID SIZE PROJECT BRANCH WARN CWD.
+        // Columns: ID NAME AGENT ORIGIN STATE ACTIVITY SOURCE PID SIZE PROJECT BRANCH WARN CWD.
         assert_eq!(
             list_row(&output, "s-42"),
             vec![
                 "s-42",
                 "-", // NAME
                 "shell",
+                "managed",
                 "running",
                 "-",
                 "process",
@@ -1557,6 +1602,7 @@ mod tests {
                 "s-42",
                 "-", // NAME
                 "shell",
+                "managed",
                 "running",
                 "working",
                 "osc_title",
@@ -1568,6 +1614,16 @@ mod tests {
                 "/workspace/project",
             ]
         );
+    }
+
+    #[test]
+    fn renders_external_origin_in_session_list_table() {
+        let mut session = running_session("ext-42");
+        session.external = Some(true);
+
+        let output = render_list_human(&[session]);
+
+        assert_eq!(list_row(&output, "ext-42")[3], "external");
     }
 
     #[test]
@@ -1615,15 +1671,15 @@ mod tests {
 
         let output = render_list_human(&[session]);
         let row = list_row(&output, "s-42");
-        // Columns: ID NAME AGENT STATE ACTIVITY SOURCE PID SIZE PROJECT BRANCH WARN CWD.
+        // Columns: ID NAME AGENT ORIGIN STATE ACTIVITY SOURCE PID SIZE PROJECT BRANCH WARN CWD.
         assert_eq!(
-            row[8], "login-ui",
+            row[9], "login-ui",
             "project column shows the label: {row:?}"
         );
-        assert_eq!(row[9], "feature/login", "branch column: {row:?}");
-        assert_eq!(row[10], "1", "warning-count column: {row:?}");
+        assert_eq!(row[10], "feature/login", "branch column: {row:?}");
+        assert_eq!(row[11], "1", "warning-count column: {row:?}");
         assert_eq!(
-            row[11], "/data/worktrees/s-42-project-feature-login",
+            row[12], "/data/worktrees/s-42-project-feature-login",
             "cwd is the worktree path: {row:?}"
         );
     }
@@ -1643,6 +1699,8 @@ mod tests {
 
         assert!(has_row(&output, "FIELD", "VALUE"));
         assert!(has_row(&output, "id", "s-42"));
+        assert!(has_row(&output, "external", "no"));
+        assert!(has_row(&output, "read_only", "no"));
         assert!(has_row(&output, "agent", "shell"));
         assert!(has_row(&output, "state", "running"));
         assert!(has_row(&output, "activity", "-"));
@@ -1650,6 +1708,17 @@ mod tests {
         assert!(has_row(&output, "native_session_id", "<none>"));
         assert!(has_row(&output, "resumable", "no"));
         assert!(has_row(&output, "exit_code", "<none>"));
+    }
+
+    #[test]
+    fn renders_external_read_only_in_inspect_table() {
+        let mut session = running_session("ext-42");
+        session.external = Some(true);
+
+        let output = render_inspect_human(&session);
+
+        assert!(has_row(&output, "external", "yes"));
+        assert!(has_row(&output, "read_only", "yes"));
     }
 
     #[test]
@@ -1705,6 +1774,7 @@ mod tests {
         let mut session = running_session("s-42");
         session.active_agent = Some("codex".to_owned());
         session.active_agent_base = Some(protocol::AgentKind::Codex);
+        session.active_agent_pid = Some(9001);
         session.active_agent_session_id = Some("codex-native".to_owned());
         session.active_agent_session_path = Some("/tmp/codex/session.json".to_owned());
 
@@ -1713,6 +1783,7 @@ mod tests {
         assert!(has_row(&output, "agent", "shell"));
         assert!(has_row(&output, "active_agent", "codex"));
         assert!(has_row(&output, "active_base", "codex"));
+        assert!(has_row(&output, "active_pid", "9001"));
         assert!(has_row(&output, "active_native_session_id", "codex-native"));
         assert!(has_row(
             &output,
@@ -1753,6 +1824,19 @@ mod tests {
             output.contains("detail: git rev-parse failed"),
             "inspect must show warning detail: {output}"
         );
+    }
+
+    #[test]
+    fn renders_cwd_source_and_worktree_drift_in_inspect() {
+        let mut session = running_session("s-42");
+        session.cwd_source = Some(protocol::CwdSource::Osc7);
+        session.worktree_path = Some(PathBuf::from("/data/worktrees/s-42-project-feature-login"));
+        session.cwd = PathBuf::from("/workspace/project");
+
+        let output = render_inspect_human(&session);
+
+        assert!(has_row(&output, "cwd_source", "osc7"));
+        assert!(has_row(&output, "worktree_drift", "yes"));
     }
 
     #[test]

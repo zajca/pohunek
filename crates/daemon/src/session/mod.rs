@@ -5,22 +5,23 @@
 //! session's public info, including owner-controlled metadata, is persisted via
 //! the resume binding store.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    event, AgentActivity, AgentKind, ErrorClass, Event, ProjectRemoveResult, ProtocolError,
-    SessionAttachParams, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionNewParams, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionSetMetadataResult, SessionState, SessionStopResult,
-    SessionWarning, StateSource, WorktreeRemoveResult, PROTOCOL_VERSION,
+    event, AgentActivity, AgentKind, CwdSource, ErrorClass, Event, ProjectRemoveResult,
+    ProtocolError, SessionAttachParams, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionNewParams, SessionReleaseAgentParams, SessionReleaseAgentResult,
+    SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionSetMetadataResult,
+    SessionState, SessionStopResult, SessionWarning, StateSource, WorktreeRemoveResult,
+    PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, watch, Mutex};
+use tokio::sync::{broadcast, mpsc, watch, Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -30,14 +31,19 @@ use crate::agent::{
     launch_adapter_for, resume_pty_command_from_template, AgentAdapter, InputRules, LaunchOpts,
     ProfileRegistry, ResolvedAgent, ResumeTemplate, SessionRef, SessionRefKind,
 };
-use crate::detect::{ActivityTransition, Detector, DetectorConfig, Manifest};
+use crate::detect::{identify_agent, ActivityTransition, Detector, DetectorConfig, Manifest};
+use crate::external::{
+    external_session_id, ExternalSessionChange, ExternalSessions, TranscriptCandidate,
+    TranscriptIndex, EXTERNAL_TERMINAL_COLS, EXTERNAL_TERMINAL_ROWS,
+};
 use crate::integration::{
     ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
-use crate::project::detect::DetectedProject;
+use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessInspector};
+use crate::project::detect::{project_id, DetectedProject};
 use crate::project::{detect_at, ProjectManager};
 use crate::pty::{PtyCommand, PtyError, PtyExit, PtyHandle};
-use crate::store::{ProjectRecord, ResumeBinding, Store};
+use crate::store::{ProjectRecord, ResumeBinding, Store, WorktreeStatus};
 use crate::time::now_rfc3339;
 use crate::worktree::{
     canonical_or_original, run_hook, HookContext, HookEvent, WorktreeManager, WorktreeRequest,
@@ -48,6 +54,7 @@ mod detector;
 mod hooks;
 mod input;
 mod lag;
+mod procwatch;
 mod resume;
 mod target;
 
@@ -98,6 +105,18 @@ const DEFAULT_INITIAL_INPUT_STARTUP_GRACE: Duration = Duration::from_millis(500)
 /// resyncs on every lag — only the logging is rate-limited. Overridable via
 /// [`SessionRegistryConfig::detector_lag_warn_interval`].
 const DEFAULT_DETECTOR_LAG_WARN_INTERVAL: Duration = Duration::from_secs(5);
+/// Default process-observer poll interval.
+///
+/// Polling is only the discovery and fallback path; pidfd exit watches provide
+/// immediate stop detection after a process has been observed. One second keeps
+/// launch detection responsive without continuously scanning procfs.
+const DEFAULT_PROCWATCH_POLL: Duration = Duration::from_secs(1);
+/// Default maximum age for an unbound active-agent hook claim.
+///
+/// Hooks are rich but lossy claims. Thirty seconds gives procwatch enough time
+/// to observe a legitimate live process while ensuring a stale claim cannot pin
+/// `active_agent` forever.
+const DEFAULT_ACTIVE_AGENT_CLAIM_TTL: Duration = Duration::from_secs(30);
 
 const MAX_SESSION_METADATA_KEYS: usize = 32;
 const MAX_SESSION_METADATA_KEY_BYTES: usize = 64;
@@ -217,6 +236,12 @@ pub struct SessionRegistryConfig {
     /// summary WARN when the window elapses, so a runaway session cannot flood the
     /// log. Defaults to [`DEFAULT_DETECTOR_LAG_WARN_INTERVAL`].
     pub detector_lag_warn_interval: Duration,
+    /// Poll interval for per-session process discovery and fallback cleanup.
+    pub procwatch_poll: Duration,
+    /// Maximum age for an active-agent claim with no backing observed process.
+    pub active_agent_claim_ttl: Duration,
+    /// Whether to observe same-user agents started outside pohunek-owned PTYs.
+    pub observe_external_agents: bool,
 }
 
 impl Default for SessionRegistryConfig {
@@ -236,6 +261,9 @@ impl Default for SessionRegistryConfig {
             config_dir: None,
             agents_dir: None,
             detector_lag_warn_interval: DEFAULT_DETECTOR_LAG_WARN_INTERVAL,
+            procwatch_poll: DEFAULT_PROCWATCH_POLL,
+            active_agent_claim_ttl: DEFAULT_ACTIVE_AGENT_CLAIM_TTL,
+            observe_external_agents: false,
         }
     }
 }
@@ -294,6 +322,16 @@ struct SessionRegistryInner {
     agent_state_hook_shutdown: CancellationToken,
     /// Join handle of the spawned agent-state hook dispatcher.
     agent_state_hook_task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// OS process inspector used to reconcile hook claims with live processes.
+    inspector: Arc<dyn ProcessInspector>,
+    /// Monotonic sequence for procwatch-generated active-agent reports.
+    ///
+    /// It is seeded from wall-clock milliseconds in the constructor so values live
+    /// in the same numeric space as hook timestamps, while same-source ordering
+    /// remains monotonic if multiple procwatch events happen within one millisecond.
+    procwatch_seq: AtomicU64,
+    /// Read-only external agent sessions observed outside pohunek-owned PTYs.
+    external: ExternalSessions,
 }
 
 #[derive(Debug, Clone)]
@@ -304,6 +342,8 @@ struct SessionEntry {
     detector_resize: watch::Sender<(u16, u16)>,
     detector_config: watch::Sender<DetectorConfig>,
     default_detector_config: DetectorConfig,
+    procwatch_cancel: CancellationToken,
+    procwatch_rescan: Arc<Notify>,
     stopping: bool,
     /// Resolved input-framing rules (base-kind defaults, profile-overridden), used
     /// by `session.input` so a profile's `[input_rules]` is honored on every write.
@@ -314,6 +354,7 @@ struct SessionEntry {
     snapshot: ResumeSnapshot,
     active_agent: Option<ActiveAgentReport>,
     last_agent_report: Option<ActiveAgentReport>,
+    observed_agents: Vec<ObservedAgent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,7 +362,26 @@ struct ActiveAgentReport {
     source: String,
     agent: String,
     seq: Option<u64>,
+    pid: Option<Pid>,
+    reported_at: Instant,
     activity_reported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedAgent {
+    pid: Pid,
+    agent_base: AgentKind,
+    first_seen: Instant,
+    cwd: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CwdAssociation {
+    project_id: Option<String>,
+    is_linked_worktree: Option<bool>,
+    repo: Option<PathBuf>,
+    branch: Option<String>,
+    worktree_path: Option<PathBuf>,
 }
 
 impl Default for SessionRegistry {
@@ -334,6 +394,23 @@ impl SessionRegistry {
     /// Create a new empty registry with the supplied runtime config.
     #[must_use]
     pub fn new(config: SessionRegistryConfig) -> Self {
+        Self::new_with_inspector(config, Arc::new(crate::procwatch::LinuxInspector::new()))
+    }
+
+    /// Create a registry with an injected process inspector.
+    ///
+    /// Production uses [`crate::procwatch::LinuxInspector`]. Tests use this to
+    /// drive process facts and exit events deterministically without touching the
+    /// host process table.
+    #[must_use]
+    pub fn new_with_inspector(
+        config: SessionRegistryConfig,
+        inspector: Arc<dyn ProcessInspector>,
+    ) -> Self {
+        let external = ExternalSessions::new();
+        let external_observer = config
+            .observe_external_agents
+            .then(|| ExternalSessions::observer_config(config.procwatch_poll));
         let (events, _) = broadcast::channel(128);
         // One unified store instance, shared (`Arc`) with the worktree manager so
         // resume and worktree records live in one file behind one serialization
@@ -361,7 +438,7 @@ impl SessionRegistry {
         // Host agent profiles resolve the free-string `agent` name; built from the
         // configured agents dir (a bare base kind still resolves when it is unset).
         let profiles = ProfileRegistry::new(config.agents_dir.clone());
-        Self {
+        let registry = Self {
             inner: Arc::new(SessionRegistryInner {
                 sessions: Mutex::new(HashMap::new()),
                 pending_attaches: Mutex::new(HashMap::new()),
@@ -381,8 +458,15 @@ impl SessionRegistry {
                 event_log_task: std::sync::Mutex::new(None),
                 agent_state_hook_shutdown: CancellationToken::new(),
                 agent_state_hook_task: std::sync::Mutex::new(None),
+                inspector,
+                procwatch_seq: AtomicU64::new(current_time_millis()),
+                external: external.clone(),
             }),
+        };
+        if let Some(config) = external_observer {
+            external.spawn_observer(registry.clone(), config);
         }
+        registry
     }
 
     /// Subscribe to session lifecycle events.
@@ -430,6 +514,7 @@ impl SessionRegistry {
         if !already_started {
             info!("daemon shutdown started; preserving restart-resume bindings");
         }
+        self.inner.external.shutdown();
     }
 
     /// The project manager, when the metadata store is configured. Exposed for
@@ -1026,7 +1111,7 @@ impl SessionRegistry {
             validate_agent_session_path(&params.session_id, params.agent_session_path.as_deref());
         let reported_activity = params.activity;
         let active_detector_config = detector_config_for_resolved_agent(&resolved);
-        let info = {
+        let (info, rescan) = {
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(&params.session_id) else {
                 debug!(
@@ -1058,16 +1143,20 @@ impl SessionRegistry {
                 return not_recorded;
             }
 
+            let pid = bind_report_pid(entry, params.pid, resolved.base);
             let report = ActiveAgentReport {
                 source: params.source.clone(),
                 agent: resolved.name.clone(),
                 seq: params.seq,
+                pid,
+                reported_at: Instant::now(),
                 activity_reported: reported_activity.is_some(),
             };
             entry.active_agent = Some(report.clone());
             entry.last_agent_report = Some(report);
             entry.info.active_agent = Some(resolved.name.clone());
             entry.info.active_agent_base = Some(resolved.base);
+            entry.info.active_agent_pid = pid;
             entry.info.active_agent_session_id = valid_session_id;
             entry.info.active_agent_session_path = valid_session_path;
             if let Some(activity) = reported_activity {
@@ -1076,10 +1165,11 @@ impl SessionRegistry {
             }
             let _ = entry.detector_config.send(active_detector_config);
             entry.info.updated_at = timestamp_now();
-            entry.info.clone()
+            (entry.info.clone(), Arc::clone(&entry.procwatch_rescan))
         };
 
         self.emit(event::SESSION_UPDATED, &info);
+        rescan.notify_one();
         if let Some(activity) = reported_activity {
             let event = Event::new(
                 event::AGENT_STATE,
@@ -1142,27 +1232,15 @@ impl SessionRegistry {
                 );
                 return not_released;
             }
-            let activity_reported = active.activity_reported;
-
-            entry.last_agent_report = Some(ActiveAgentReport {
+            let tombstone = ActiveAgentReport {
                 source: params.source.clone(),
                 agent: resolved.name.clone(),
                 seq: params.seq,
+                pid: None,
+                reported_at: Instant::now(),
                 activity_reported: false,
-            });
-            entry.active_agent = None;
-            entry.info.active_agent = None;
-            entry.info.active_agent_base = None;
-            entry.info.active_agent_session_id = None;
-            entry.info.active_agent_session_path = None;
-            if activity_reported {
-                entry.info.activity = None;
-                entry.info.state_source = StateSource::Process;
-            }
-            let default_detector_config = entry.default_detector_config.clone();
-            let _ = entry.detector_config.send(default_detector_config);
-            entry.info.updated_at = timestamp_now();
-            entry.info.clone()
+            };
+            clear_active_agent(entry, tombstone)
         };
 
         self.emit(event::SESSION_UPDATED, &info);
@@ -1188,6 +1266,7 @@ impl SessionRegistry {
             .values()
             .map(|entry| entry.info.clone())
             .collect::<Vec<_>>();
+        sessions.extend(self.inner.external.list().await);
         sessions.sort_by(|left, right| left.id.0.cmp(&right.id.0));
         sessions
     }
@@ -1220,9 +1299,14 @@ impl SessionRegistry {
     /// Inspect a session by id.
     pub async fn inspect(&self, id: &SessionId) -> Result<SessionInfo, ProtocolError> {
         let sessions = self.inner.sessions.lock().await;
-        sessions
-            .get(id)
-            .map(|entry| entry.info.clone())
+        if let Some(entry) = sessions.get(id) {
+            return Ok(entry.info.clone());
+        }
+        drop(sessions);
+        self.inner
+            .external
+            .inspect(id)
+            .await
             .ok_or_else(|| session_not_found(&id.0))
     }
 
@@ -1231,12 +1315,106 @@ impl SessionRegistry {
         self.inspect(&SessionId(id.to_owned())).await
     }
 
+    pub(super) async fn record_cwd_hint(&self, id: &SessionId, path: String) {
+        let cwd = PathBuf::from(path);
+        if !cwd.is_absolute() {
+            debug!(
+                session_id = %id.0,
+                cwd = %cwd.display(),
+                "ignoring relative OSC 7 cwd hint"
+            );
+            return;
+        }
+        match cwd.try_exists() {
+            Ok(true) => self.apply_cwd_change(id, cwd, CwdSource::Osc7).await,
+            Ok(false) => {
+                debug!(
+                    session_id = %id.0,
+                    cwd = %cwd.display(),
+                    "ignoring OSC 7 cwd hint for a missing path"
+                );
+            }
+            Err(err) => {
+                debug!(
+                    session_id = %id.0,
+                    cwd = %cwd.display(),
+                    error = %err,
+                    "failed to validate OSC 7 cwd hint"
+                );
+            }
+        }
+    }
+
+    async fn apply_cwd_change(&self, id: &SessionId, cwd: PathBuf, source: CwdSource) {
+        if !self.cwd_update_needed(id, &cwd).await {
+            return;
+        }
+
+        let association = self.resolve_cwd_association(id, cwd.clone()).await;
+        let updated = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get_mut(id) else {
+                debug!(session_id = %id.0, "cwd update arrived for unknown session");
+                return;
+            };
+            if entry.stopping || is_terminal(entry.info.state) || entry.info.cwd == cwd {
+                return;
+            }
+            Some(apply_cwd_change(entry, cwd, source, association))
+        };
+
+        if let Some(info) = updated {
+            self.emit(event::SESSION_UPDATED, &info);
+        }
+    }
+
+    async fn cwd_update_needed(&self, id: &SessionId, cwd: &Path) -> bool {
+        let sessions = self.inner.sessions.lock().await;
+        let Some(entry) = sessions.get(id) else {
+            return false;
+        };
+        !entry.stopping && !is_terminal(entry.info.state) && entry.info.cwd != cwd
+    }
+
+    async fn resolve_cwd_association(
+        &self,
+        id: &SessionId,
+        cwd: PathBuf,
+    ) -> Option<CwdAssociation> {
+        let store = self.inner.store.clone();
+        let projects = self.inner.projects.clone();
+        match tokio::task::spawn_blocking(move || {
+            resolve_cwd_association(cwd.as_path(), store.as_deref(), projects.as_deref())
+        })
+        .await
+        {
+            Ok(Ok(association)) => Some(association),
+            Ok(Err(err)) => {
+                warn!(
+                    session_id = %id.0,
+                    error = %err,
+                    "failed to resolve cwd project/worktree association"
+                );
+                None
+            }
+            Err(err) => {
+                warn!(
+                    session_id = %id.0,
+                    error = %err,
+                    "cwd association task panicked"
+                );
+                None
+            }
+        }
+    }
+
     /// Merge owner-controlled metadata into a session and return the updated info.
     pub async fn set_metadata(
         &self,
         id: &SessionId,
         merge: BTreeMap<String, Option<String>>,
     ) -> Result<SessionSetMetadataResult, ProtocolError> {
+        self.ensure_not_external(id).await?;
         let (info, has_native) = {
             let mut sessions = self.inner.sessions.lock().await;
             let entry = sessions
@@ -1283,6 +1461,7 @@ impl SessionRegistry {
         id: &SessionId,
         name: Option<String>,
     ) -> Result<protocol::SessionRenameResult, ProtocolError> {
+        self.ensure_not_external(id).await?;
         let normalized = validate_session_name(name.as_deref())?;
         let (info, has_native) = {
             let mut sessions = self.inner.sessions.lock().await;
@@ -1313,6 +1492,7 @@ impl SessionRegistry {
         cols: u16,
         rows: u16,
     ) -> Result<protocol::SessionResizeResult, ProtocolError> {
+        self.ensure_not_external(id).await?;
         if cols == 0 || rows == 0 {
             return Err(ProtocolError::bad_request(
                 "session.resize requires non-zero cols and rows",
@@ -1369,7 +1549,8 @@ impl SessionRegistry {
 
     /// Stop a running session.
     pub async fn stop(&self, id: &SessionId) -> Result<SessionStopResult, ProtocolError> {
-        let (pty, detector_cancel) = {
+        self.ensure_not_external(id).await?;
+        let (pty, detector_cancel, procwatch_cancel) = {
             let mut sessions = self.inner.sessions.lock().await;
             let entry = sessions
                 .get_mut(id)
@@ -1379,10 +1560,15 @@ impl SessionRegistry {
             }
 
             entry.stopping = true;
-            (entry.pty.clone(), entry.detector_cancel.clone())
+            (
+                entry.pty.clone(),
+                entry.detector_cancel.clone(),
+                entry.procwatch_cancel.clone(),
+            )
         };
 
         detector_cancel.cancel();
+        procwatch_cancel.cancel();
         self.remove_pending_attaches_for_session(id).await;
         self.cancel_session_attaches(id).await;
 
@@ -1419,6 +1605,7 @@ impl SessionRegistry {
     /// Returns `session_not_found` when no session has the given id, and
     /// surfaces any PTY shutdown error from the implied stop of a live session.
     pub async fn remove(&self, id: &SessionId) -> Result<SessionRemoveResult, ProtocolError> {
+        self.ensure_not_external(id).await?;
         let was_live = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
@@ -1552,11 +1739,14 @@ impl SessionRegistry {
             entry.last_agent_report = None;
             entry.info.active_agent = None;
             entry.info.active_agent_base = None;
+            entry.info.active_agent_pid = None;
             entry.info.active_agent_session_id = None;
             entry.info.active_agent_session_path = None;
+            entry.observed_agents.clear();
             entry.info.exit_code = exit.exit_code;
             entry.info.updated_at = timestamp_now();
             entry.detector_cancel.cancel();
+            entry.procwatch_cancel.cancel();
             let event = if stopped {
                 event::SESSION_STOPPED
             } else {
@@ -1595,6 +1785,7 @@ impl SessionRegistry {
     }
 
     async fn ensure_session_running(&self, id: &SessionId) -> Result<(), ProtocolError> {
+        self.ensure_not_external(id).await?;
         let sessions = self.inner.sessions.lock().await;
         let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
         if entry.info.state == SessionState::Running {
@@ -1604,10 +1795,328 @@ impl SessionRegistry {
         }
     }
 
+    async fn ensure_not_external(&self, id: &SessionId) -> Result<(), ProtocolError> {
+        if self.inner.external.contains_id(id).await {
+            Err(session_external_read_only(id))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Rescan same-user processes for external agents.
+    pub(crate) async fn rescan_external_agents(&self, transcripts: &TranscriptIndex) {
+        let facts = match self.inner.inspector.same_user_processes() {
+            Ok(facts) => facts,
+            Err(err) => {
+                warn!(error = %err, "failed to inspect same-user processes for external agents");
+                // Per-external pidfd exit watches remain the authoritative removal
+                // backstop when a sweep cannot refresh process facts.
+                return;
+            }
+        };
+        let owned_pids = self.owned_process_pids(&facts).await;
+        let existing_pids = self.inner.external.pids().await;
+        let mut observed_pids = HashSet::new();
+
+        for fact in facts {
+            if owned_pids.contains(&fact.pid) {
+                continue;
+            }
+            let Some(agent_base) = identify_agent(&fact) else {
+                continue;
+            };
+            let cwd = match self.inner.inspector.cwd(fact.pid) {
+                Ok(cwd) => cwd,
+                Err(err) => {
+                    debug!(
+                        pid = fact.pid,
+                        error = %err,
+                        "failed to inspect external agent cwd"
+                    );
+                    continue;
+                }
+            };
+            observed_pids.insert(fact.pid);
+            let candidate = transcripts.best_match(agent_base, &cwd, &fact);
+            let association = self
+                .resolve_external_cwd_association(fact.pid, cwd.clone())
+                .await;
+            let info = external_session_info(&fact, agent_base, cwd, candidate, association);
+            let change = self.inner.external.upsert(info).await;
+            match change {
+                Some(ExternalSessionChange::Created(info)) => {
+                    if !existing_pids.contains(&fact.pid) {
+                        self.spawn_external_exit_watch(fact.pid);
+                    }
+                    self.emit(event::SESSION_CREATED, &info);
+                }
+                Some(ExternalSessionChange::Updated(info)) => {
+                    self.emit(event::SESSION_UPDATED, &info);
+                }
+                None => {}
+            }
+        }
+
+        for removed in self.inner.external.remove_unobserved(&observed_pids).await {
+            self.emit(event::SESSION_REMOVED, &removed);
+        }
+    }
+
+    async fn owned_process_pids(&self, facts: &[ProcessFact]) -> HashSet<Pid> {
+        let roots = {
+            let sessions = self.inner.sessions.lock().await;
+            sessions
+                .values()
+                .filter(|entry| !is_terminal(entry.info.state))
+                .map(|entry| entry.info.pid)
+                .collect::<Vec<_>>()
+        };
+        let mut owned = roots.iter().copied().collect::<HashSet<_>>();
+        let mut queue = VecDeque::from(roots);
+        let mut children_by_parent: HashMap<Pid, Vec<Pid>> = HashMap::new();
+        for fact in facts {
+            children_by_parent
+                .entry(fact.ppid)
+                .or_default()
+                .push(fact.pid);
+        }
+        while let Some(parent) = queue.pop_front() {
+            let Some(children) = children_by_parent.get(&parent) else {
+                continue;
+            };
+            for &child in children {
+                if owned.insert(child) {
+                    queue.push_back(child);
+                }
+            }
+        }
+        owned
+    }
+
+    async fn resolve_external_cwd_association(
+        &self,
+        pid: Pid,
+        cwd: PathBuf,
+    ) -> Option<CwdAssociation> {
+        let store = self.inner.store.clone();
+        let projects = self.inner.projects.clone();
+        match tokio::task::spawn_blocking(move || {
+            resolve_cwd_association(cwd.as_path(), store.as_deref(), projects.as_deref())
+        })
+        .await
+        {
+            Ok(Ok(association)) => Some(association),
+            Ok(Err(err)) => {
+                debug!(
+                    pid,
+                    error = %err,
+                    "failed to resolve external agent cwd association"
+                );
+                None
+            }
+            Err(err) => {
+                warn!(
+                    pid,
+                    error = %err,
+                    "external cwd association task panicked"
+                );
+                None
+            }
+        }
+    }
+
+    fn spawn_external_exit_watch(&self, pid: Pid) {
+        let watch = match self.inner.inspector.exit_watch(pid) {
+            Ok(watch) => watch,
+            Err(err) => {
+                debug!(
+                    pid,
+                    error = %err,
+                    "failed to arm external agent exit watch; falling back to poll cleanup"
+                );
+                return;
+            }
+        };
+        self.spawn_external_exit_watch_task(pid, watch);
+    }
+
+    fn spawn_external_exit_watch_task(&self, pid: Pid, watch: ExitWatch) {
+        let registry = self.clone();
+        let shutdown = self.inner.external.shutdown_token();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = shutdown.cancelled() => {}
+                result = watch.wait() => {
+                    if let Err(err) = result {
+                        debug!(
+                            pid,
+                            error = %err,
+                            "external process exit watch failed"
+                        );
+                        return;
+                    }
+                    registry.on_external_agent_exit(pid).await;
+                }
+            }
+        });
+    }
+
+    async fn on_external_agent_exit(&self, pid: Pid) {
+        if let Some(info) = self.inner.external.remove_pid(pid).await {
+            self.emit(event::SESSION_REMOVED, &info);
+        }
+    }
+
     fn emit(&self, name: &str, info: &SessionInfo) {
         let event = Event::new(name, json!({ "session": info }));
         let _ = self.inner.events.send(event);
     }
+}
+
+fn apply_cwd_change(
+    entry: &mut SessionEntry,
+    cwd: PathBuf,
+    source: CwdSource,
+    association: Option<CwdAssociation>,
+) -> SessionInfo {
+    entry.info.cwd = cwd;
+    entry.info.cwd_source = Some(source);
+    if let Some(association) = association {
+        entry.info.project_id = association.project_id;
+        entry.info.project_label = None;
+        entry.info.is_linked_worktree = association.is_linked_worktree;
+        entry.info.repo = association.repo;
+        entry.info.branch = association.branch;
+        entry.info.worktree_path = association.worktree_path;
+    }
+    entry.info.updated_at = timestamp_now();
+    entry.info.clone()
+}
+
+fn external_session_info(
+    fact: &ProcessFact,
+    agent_base: AgentKind,
+    cwd: PathBuf,
+    candidate: Option<TranscriptCandidate>,
+    association: Option<CwdAssociation>,
+) -> SessionInfo {
+    let now = timestamp_now();
+    let agent = agent_kind_label(agent_base).to_owned();
+    let (native_session_id, native_session_path) = candidate.map_or((None, None), |candidate| {
+        (
+            candidate.native_session_id,
+            Some(candidate.native_session_path),
+        )
+    });
+    let association = association.unwrap_or_default();
+    SessionInfo {
+        id: external_session_id(fact.pid),
+        external: Some(true),
+        name: None,
+        agent,
+        agent_base,
+        cwd,
+        cwd_source: Some(CwdSource::Procwatch),
+        pid: fact.pid,
+        cols: EXTERNAL_TERMINAL_COLS,
+        rows: EXTERNAL_TERMINAL_ROWS,
+        state: SessionState::Running,
+        state_source: StateSource::Process,
+        activity: None,
+        active_agent: None,
+        active_agent_base: None,
+        active_agent_pid: None,
+        active_agent_session_id: None,
+        active_agent_session_path: None,
+        native_session_id,
+        native_session_path,
+        project_id: association.project_id,
+        project_label: None,
+        is_linked_worktree: association.is_linked_worktree,
+        repo: association.repo,
+        branch: association.branch,
+        worktree_path: association.worktree_path,
+        warnings: Vec::new(),
+        metadata: BTreeMap::new(),
+        created_at: now.clone(),
+        updated_at: now,
+        exit_code: None,
+    }
+}
+
+fn resolve_cwd_association(
+    cwd: &Path,
+    store: Option<&Store>,
+    projects: Option<&ProjectManager>,
+) -> Result<CwdAssociation, ProtocolError> {
+    let canonical_cwd = canonical_or_original(cwd);
+    let worktree = match store {
+        Some(store) => active_worktree_for_cwd(store, &canonical_cwd)?,
+        None => None,
+    };
+    let detected = detect_at(cwd)?;
+    let mut association = match detected {
+        Some(detected) => association_from_detected_project(&detected, projects)?,
+        None => CwdAssociation::default(),
+    };
+
+    if let Some(binding) = worktree {
+        association.worktree_path = Some(binding.path);
+        association.repo = Some(binding.repository);
+        association.branch = Some(binding.branch);
+        association.is_linked_worktree = Some(true);
+        if binding.project_id.is_some() {
+            association.project_id = binding.project_id;
+        }
+    }
+
+    Ok(association)
+}
+
+fn association_from_detected_project(
+    detected: &DetectedProject,
+    projects: Option<&ProjectManager>,
+) -> Result<CwdAssociation, ProtocolError> {
+    let project_id = match projects {
+        Some(projects) => Some(projects.register(detected, false)?.id()),
+        None => Some(project_id(&detected.git_common_dir)),
+    };
+    Ok(CwdAssociation {
+        project_id,
+        is_linked_worktree: Some(detected.is_linked_worktree),
+        repo: Some(detected.repo_root.clone()),
+        branch: detected.branch.clone(),
+        worktree_path: None,
+    })
+}
+
+fn active_worktree_for_cwd(
+    store: &Store,
+    canonical_cwd: &Path,
+) -> Result<Option<crate::store::WorktreeBinding>, ProtocolError> {
+    let mut best = None;
+    for binding in store.load_worktrees().map_err(|err| {
+        runtime_error(
+            "cwd_worktree_resolve_failed",
+            format!("failed to load worktree bindings: {err}"),
+        )
+    })? {
+        if binding.status != WorktreeStatus::Active {
+            continue;
+        }
+        let path = canonical_or_original(&binding.path);
+        if !canonical_cwd.starts_with(&path) {
+            continue;
+        }
+        let depth = path.components().count();
+        let replace = best
+            .as_ref()
+            .is_none_or(|(best_depth, _)| depth > *best_depth);
+        if replace {
+            best = Some((depth, binding));
+        }
+    }
+    Ok(best.map(|(_, binding)| binding))
 }
 
 fn validate_new_params(params: &SessionNewParams) -> Result<(), ProtocolError> {
@@ -1714,6 +2223,49 @@ fn detector_config_for_resolved_agent(resolved: &ResolvedAgent) -> DetectorConfi
     )
 }
 
+fn bind_report_pid(
+    entry: &SessionEntry,
+    reported_pid: Option<Pid>,
+    agent_base: AgentKind,
+) -> Option<Pid> {
+    if let Some(pid) = reported_pid {
+        // PID-bearing hooks are exact claims. If procwatch has not observed the
+        // process yet, keep the exact pid so the immediate rescan can either bind
+        // it or release it instead of falling back to an ambiguous base-kind match.
+        return Some(pid);
+    }
+
+    let mut matching = entry
+        .observed_agents
+        .iter()
+        .filter(|observed| observed.agent_base == agent_base)
+        .map(|observed| observed.pid);
+    let first = matching.next()?;
+    matching.next().is_none().then_some(first)
+}
+
+fn clear_active_agent(entry: &mut SessionEntry, tombstone: ActiveAgentReport) -> SessionInfo {
+    let activity_reported = entry
+        .active_agent
+        .as_ref()
+        .is_some_and(|active| active.activity_reported);
+    entry.last_agent_report = Some(tombstone);
+    entry.active_agent = None;
+    entry.info.active_agent = None;
+    entry.info.active_agent_base = None;
+    entry.info.active_agent_pid = None;
+    entry.info.active_agent_session_id = None;
+    entry.info.active_agent_session_path = None;
+    if activity_reported {
+        entry.info.activity = None;
+        entry.info.state_source = StateSource::Process;
+    }
+    let default_detector_config = entry.default_detector_config.clone();
+    let _ = entry.detector_config.send(default_detector_config);
+    entry.info.updated_at = timestamp_now();
+    entry.info.clone()
+}
+
 fn report_is_current(
     current: Option<&ActiveAgentReport>,
     source: &str,
@@ -1792,6 +2344,20 @@ fn session_not_running(id: &SessionId) -> ProtocolError {
     )
 }
 
+fn session_external_read_only(id: &SessionId) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Runtime,
+        "session_external_read_only",
+        format!(
+            "session {} is an external observe-only agent and has no pohunek-owned PTY",
+            id.0
+        ),
+        Some(
+            "start the agent through pohunek to attach, send input, resize, or stop it".to_owned(),
+        ),
+    )
+}
+
 #[expect(
     clippy::needless_pass_by_value,
     reason = "used directly as a `.map_err` function pointer, which requires owning the error"
@@ -1832,6 +2398,14 @@ fn runtime_error(code: impl Into<String>, msg: impl Into<String>) -> ProtocolErr
 
 fn timestamp_now() -> String {
     now_rfc3339()
+}
+
+fn current_time_millis() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

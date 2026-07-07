@@ -2203,6 +2203,7 @@ async fn report_agent_api_records_active_agent_and_streams_report_state() {
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Blocked),
             seq: Some(1),
+            pid: None,
             agent_session_id: None,
             agent_session_path: None,
         })

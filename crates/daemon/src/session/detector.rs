@@ -2,7 +2,7 @@
 
 use super::{
     broadcast, debug, event, is_terminal, json, log_lag_warn, timestamp_now, watch,
-    ActivityTransition, CancellationToken, Detector, DetectorConfig, Event, Instant,
+    ActivityTransition, AgentActivity, CancellationToken, Detector, DetectorConfig, Event, Instant,
     LagWarnThrottle, SessionId, SessionRegistry,
 };
 
@@ -67,6 +67,9 @@ impl SessionRegistry {
                                 for transition in detector.feed(Instant::now(), &chunk) {
                                     registry.record_activity(&id, transition).await;
                                 }
+                                if let Some(path) = detector.take_cwd_hint() {
+                                    registry.record_cwd_hint(&id, path).await;
+                                }
                             }
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                 // Always resync; only the logging is rate-limited
@@ -114,15 +117,20 @@ impl SessionRegistry {
             entry.info.activity = Some(transition.activity);
             entry.info.state_source = transition.source;
             entry.info.updated_at = timestamp_now();
-            transition
+            let rescan = (transition.activity == AgentActivity::Working)
+                .then(|| std::sync::Arc::clone(&entry.procwatch_rescan));
+            (transition, rescan)
         };
+        if let Some(rescan) = updated.1 {
+            rescan.notify_one();
+        }
 
         let event = Event::new(
             event::AGENT_STATE,
             json!({
                 "session_id": id,
-                "activity": updated.activity,
-                "source": updated.source,
+                "activity": updated.0.activity,
+                "source": updated.0.source,
             }),
         );
         let _ = self.inner.events.send(event);

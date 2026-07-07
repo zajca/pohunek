@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
+use crate::procwatch::ProcessFact;
 use protocol::AgentActivity;
+use regex::Regex;
 
 mod error;
 mod matcher;
@@ -10,16 +12,19 @@ mod parser;
 pub use error::{ManifestError, MatcherKind};
 
 use matcher::MatchEvaluation;
-use parser::{ComplexityBudget, RawManifest, Rule, MAX_RULES, MAX_SOURCE_BYTES};
+use parser::{
+    compile_process_matchers, ComplexityBudget, RawManifest, Rule, MAX_RULES, MAX_SOURCE_BYTES,
+};
 
 // `MAX_MATCHER_BYTES` is only referenced by the test module (which sees it via
 // `use super::*`); `MAX_SOURCE_BYTES` is already in scope for `parse_str`.
 #[cfg(test)]
-use parser::MAX_MATCHER_BYTES;
+use parser::{MAX_MATCHERS, MAX_MATCHER_BYTES};
 
 #[derive(Debug, Clone)]
 pub struct Manifest {
     rules: Vec<Rule>,
+    process: Option<ProcessMatchers>,
 }
 
 impl Manifest {
@@ -44,8 +49,12 @@ impl Manifest {
         for raw_rule in raw.rules {
             rules.push(Rule::try_from_raw(raw_rule, &mut budget)?);
         }
+        let process = raw
+            .process
+            .map(|raw_process| compile_process_matchers(raw_process, &mut budget))
+            .transpose()?;
 
-        Ok(Self { rules })
+        Ok(Self { rules, process })
     }
 
     #[must_use]
@@ -90,6 +99,40 @@ impl Manifest {
         }
 
         regions
+    }
+
+    /// Returns process matchers when this manifest declares `[process]`.
+    #[must_use]
+    pub fn process_matchers(&self) -> Option<&ProcessMatchers> {
+        self.process.as_ref()
+    }
+}
+
+/// Process-level matchers compiled from a manifest `[process]` section.
+#[derive(Debug, Clone)]
+pub struct ProcessMatchers {
+    comm: Vec<Regex>,
+    cmdline: Vec<Regex>,
+}
+
+impl ProcessMatchers {
+    pub(super) fn new(comm: Vec<Regex>, cmdline: Vec<Regex>) -> Self {
+        Self { comm, cmdline }
+    }
+
+    /// Returns whether process facts match this manifest.
+    ///
+    /// Matching is an OR: any `comm` regex matching the task command name, or any
+    /// `cmdline` regex matching argv joined with spaces, is enough. An empty
+    /// `[process]` section never matches.
+    #[must_use]
+    pub fn matches(&self, fact: &ProcessFact) -> bool {
+        self.comm.iter().any(|regex| regex.is_match(&fact.comm))
+            || (!self.cmdline.is_empty()
+                && self
+                    .cmdline
+                    .iter()
+                    .any(|regex| regex.is_match(&fact.cmdline.join(" "))))
     }
 }
 
@@ -203,6 +246,58 @@ mod tests {
                 visible_blocker: false,
             })
         );
+    }
+
+    #[test]
+    fn process_section_matches_comm_or_joined_cmdline() {
+        let manifest = Manifest::parse_str(
+            r#"
+            [process]
+            comm = ["^codex$"]
+            cmdline = ["(^|/)codex($| )"]
+            "#,
+        )
+        .expect("manifest should parse");
+        let matchers = manifest
+            .process_matchers()
+            .expect("process section should compile");
+
+        assert!(matchers.matches(&ProcessFact {
+            pid: 100,
+            ppid: 1,
+            comm: "codex".to_owned(),
+            cmdline: vec!["/usr/bin/other".to_owned()],
+        }));
+        assert!(matchers.matches(&ProcessFact {
+            pid: 101,
+            ppid: 1,
+            comm: "sleep".to_owned(),
+            cmdline: vec!["/tmp/tools/codex".to_owned(), "30".to_owned()],
+        }));
+        assert!(!matchers.matches(&ProcessFact {
+            pid: 102,
+            ppid: 1,
+            comm: "sleep".to_owned(),
+            cmdline: vec!["/tmp/tools/not-codex".to_owned(), "30".to_owned()],
+        }));
+    }
+
+    #[test]
+    fn process_matchers_count_against_manifest_complexity_budget() {
+        let patterns = (0..=MAX_MATCHERS)
+            .map(|index| format!("\"pattern-{index}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source = format!(
+            r"
+            [process]
+            cmdline = [{patterns}]
+            "
+        );
+
+        let err = Manifest::parse_str(&source).expect_err("manifest should exceed matcher budget");
+
+        assert!(matches!(err, ManifestError::TooManyMatchers { .. }));
     }
 
     #[test]

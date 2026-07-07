@@ -4,6 +4,10 @@
 # herdr fields (`visible_working`, `visible_idle`, `skip_state_update`) and
 # `unknown` menu/transcript rules are intentionally omitted.
 
+[process]
+comm = ["^claude$"]
+cmdline = ['(^|/)claude($| )', '(^|/)(node|bun)\b.*\bclaude\b']
+
 [[rules]]
 id = "osc_title_working"
 state = "working"

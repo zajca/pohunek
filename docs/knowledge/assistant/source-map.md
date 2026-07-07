@@ -44,6 +44,7 @@ Native GUI client:
 - `crates/gui/src/runtime.rs`
 - `crates/gui/src/view/inbox.rs`
 - `crates/gui/src/view/provider.rs`
+- `crates/gui/src/view/session.rs`
 - `crates/gui-core/src/assistant.rs`
 - `crates/gui-core/src/lib.rs`
 - `crates/gui-core/src/state.rs`
@@ -73,6 +74,11 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/session/mod.rs`
 - `crates/daemon/src/session/hooks.rs`
 - `crates/daemon/src/session/detector.rs`
+- `crates/daemon/src/session/procwatch.rs`
+- `crates/daemon/src/external/mod.rs`
+- `crates/daemon/tests/procwatch.rs`
+- `crates/daemon/src/procwatch/mod.rs`
+- `crates/daemon/src/procwatch/linux.rs`
 - `crates/daemon/src/project/mod.rs`
 - `crates/daemon/src/project/config.rs`
 - `crates/daemon/src/project/detect.rs`
@@ -100,6 +106,7 @@ Agent runtime and profile resolution:
 - `crates/daemon/src/agent/claude.rs`
 - `crates/daemon/src/agent/shell.rs`
 - `crates/daemon/src/detect/mod.rs`
+- `crates/daemon/src/detect/osc.rs`
 - `crates/daemon/src/detect/manifest/mod.rs`
 - `crates/daemon/src/detect/manifests/codex.toml`
 - `crates/daemon/src/detect/manifests/claude.toml`

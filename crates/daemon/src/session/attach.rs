@@ -51,6 +51,7 @@ impl SessionRegistry {
     ) -> Result<protocol::SessionAttachResult, ProtocolError> {
         let id = &params.session_id;
         self.prune_expired_pending_attaches().await;
+        self.ensure_not_external(id).await?;
         {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;

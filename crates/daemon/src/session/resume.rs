@@ -160,6 +160,7 @@ impl SessionRegistry {
     /// native reference required by its frozen resume template, or any PTY launch
     /// error from the relaunch.
     pub async fn resume(&self, id: &SessionId) -> Result<SessionInfo, ProtocolError> {
+        self.ensure_not_external(id).await?;
         let binding = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;

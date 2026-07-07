@@ -74,7 +74,7 @@ pub use project::{
 };
 #[doc(inline)]
 pub use session::{
-    AgentActivity, AgentKind, AttachHeader, SessionAttachParams, SessionAttachResult,
+    AgentActivity, AgentKind, AttachHeader, CwdSource, SessionAttachParams, SessionAttachResult,
     SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
     SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams, SessionNewResult,
     SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams,
