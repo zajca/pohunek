@@ -47,8 +47,8 @@ pub use message::DomainEvent;
 #[doc(inline)]
 pub use sdk::{
     add_project, add_project_with_options, create_session, create_session_with_options,
-    delete_notification, delete_notification_with_options, inspect_session,
-    inspect_session_with_options, launch_action_prompt_with_options,
+    delete_notification, delete_notification_with_options, fork_session, fork_session_with_options,
+    inspect_session, inspect_session_with_options, launch_action_prompt_with_options,
     launch_provider_item_with_options, list_notifications, list_notifications_with_options,
     list_project_actions, list_project_actions_with_options, list_projects,
     list_projects_with_options, load_host, load_host_snapshot, remove_project,

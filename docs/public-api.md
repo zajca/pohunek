@@ -125,6 +125,7 @@ All params and result type names below refer to structs exported by
 | `session.inspect` | `SessionId` | `SessionInfo` | `SessionId` is a JSON string, e.g. `"s-1"`. |
 | `session.stop` | `SessionId` | `SessionStopResult` | Stops a live session (the entry stays in `list`). |
 | `session.resume` | `SessionId` | `SessionResumeResult` | Relaunches a terminal session from captured native resume metadata, reusing the same session id. Live sessions return `session_not_terminal`; terminal sessions without native metadata return `not_resumable` or `agent_not_resumable`. |
+| `session.fork` | `SessionForkParams` | `SessionForkResult` | Forks a native agent conversation into a new pohunek session id and PTY, using the source session's cwd/worktree for `cwd_mode: "same"`. Live sources are allowed. Unknown ids return `session_not_found`; external sessions return `session_external_read_only`; sources without launch-agent native metadata return `not_resumable` or `agent_not_resumable`; Codex-backed sessions return `agent_fork_unsupported`. A successful fork emits `session_created`. |
 | `session.remove` | `SessionId` | `SessionRemoveResult` | Evicts a session from the registry, stopping it first if still live. Unknown id is `session_not_found`. |
 | `session.attach` | `SessionAttachParams` | `SessionAttachResult` | Mints a one-shot attach stream id. |
 | `session.detach` | `SessionDetachParams` | `SessionDetachResult` | Cancels an active attach stream. Unknown streams return `detached: false`. |
@@ -211,7 +212,9 @@ Important fields:
 - `activity`: optional `working`, `blocked`, or `idle`.
 - `native_session_id` / `native_session_path`: optional agent resume binding.
   These belong to the immutable launch agent and are written by
-  `session.report_native_id`, not by nested active-agent reports.
+  `session.report_native_id`, not by nested active-agent reports. A forked
+  session copies the source launch-agent native metadata so the new session is
+  also resumable.
 - `project_id`, `project_label`, `repo`, `branch`, `worktree_path`: optional git
   and project context for the current `cwd`. A cwd change re-resolves this
   context. When a session leaves every known active worktree, `worktree_path` is
@@ -454,7 +457,7 @@ The daemon then writes these events:
 
 | Event | Payload | Meaning |
 |---|---|---|
-| `session_created` | `{session: SessionInfo}` | A session was created or explicitly resumed into a new live PTY. |
+| `session_created` | `{session: SessionInfo}` | A session was created, forked, or explicitly resumed into a new live PTY. |
 | `session_updated` | `{session: SessionInfo}` | Session metadata, active-agent report/release, cwd/worktree/project association, state, resize, resume binding, or terminal state changed. |
 | `session_stopped` | `{session: SessionInfo}` | A user-requested stop completed. |
 | `session_removed` | `{session: SessionInfo}` | A session was evicted from the registry; clients drop it from their view. |

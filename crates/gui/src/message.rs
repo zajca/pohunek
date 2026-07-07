@@ -265,6 +265,7 @@ pub(crate) enum Message {
     OpenGitHubPullRequest(u64),
     OpenGitHubIssue(u64),
     InspectSelectedSession,
+    ForkSelectedSession,
     StopSelectedSession,
     /// Remove the selected session from the daemon, stopping it first if live.
     RemoveSelectedSession,

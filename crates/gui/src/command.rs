@@ -9,21 +9,21 @@ use iced::Task;
 use pohunek_gui_core::assistant::{AssistantPaths, LaunchParams as AssistantLaunchParams};
 use pohunek_gui_core::{
     add_project_with_options, assistant as assistant_core, create_session_with_options,
-    delete_notification_with_options, discover_hosts, inspect_session_with_options,
-    launch_provider_item_with_options, list_project_actions_with_options, preview_action_prompt,
-    providers, remove_session_with_options, remove_worktree_with_options,
-    rename_project_with_options, rename_session_with_options, resolve_project_action_with_options,
-    resume_session_with_options, set_session_metadata_with_options, show_project_with_options,
-    stop_session_with_options, update_notification_with_options, ConnectionOptions,
-    DomainEvent as CoreEvent, HostConfig, HostId, ProviderLaunchItem, ProviderLaunchParams,
-    ProviderOperation, ProviderPanel, ProviderRequestId, RightTab, Selection, SessionLinkProvider,
-    WindowSize,
+    delete_notification_with_options, discover_hosts, fork_session_with_options,
+    inspect_session_with_options, launch_provider_item_with_options,
+    list_project_actions_with_options, preview_action_prompt, providers,
+    remove_session_with_options, remove_worktree_with_options, rename_project_with_options,
+    rename_session_with_options, resolve_project_action_with_options, resume_session_with_options,
+    set_session_metadata_with_options, show_project_with_options, stop_session_with_options,
+    update_notification_with_options, ConnectionOptions, DomainEvent as CoreEvent, HostConfig,
+    HostId, ProviderLaunchItem, ProviderLaunchParams, ProviderOperation, ProviderPanel,
+    ProviderRequestId, RightTab, Selection, SessionLinkProvider, WindowSize,
 };
 use protocol::{
-    NotificationDeleteParams, NotificationId, NotificationStatus, NotificationUpdateParams,
-    ProjectActionParams, ProjectActionsParams, ProjectAddParams, ProjectRenameParams,
-    ProjectShowParams, ProviderKind, SessionId, SessionNewParams, SessionRenameParams,
-    SessionSetMetadataParams, WorktreeRemoveParams,
+    ForkCwdMode, NotificationDeleteParams, NotificationId, NotificationStatus,
+    NotificationUpdateParams, ProjectActionParams, ProjectActionsParams, ProjectAddParams,
+    ProjectRenameParams, ProjectShowParams, ProviderKind, SessionForkParams, SessionId,
+    SessionNewParams, SessionRenameParams, SessionSetMetadataParams, WorktreeRemoveParams,
 };
 
 use crate::attach::{attach_task, spawn_notification, spawn_open_url, window_dimension_to_u32};
@@ -383,6 +383,10 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             Ok(task) => tasks.push(task),
             Err(err) => app.status = Some(err),
         },
+        Message::ForkSelectedSession => match fork_selected_session_task(app) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
         Message::StopSelectedSession => match stop_selected_session_task(app) {
             Ok(task) => tasks.push(task),
             Err(err) => app.status = Some(err),
@@ -570,6 +574,9 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                         Some((host_id.clone(), session.id.clone()))
                     }
                     CoreEvent::SessionResumed { host_id, result } => {
+                        Some((host_id.clone(), result.session.id.clone()))
+                    }
+                    CoreEvent::SessionForked { host_id, result } => {
                         Some((host_id.clone(), result.session.id.clone()))
                     }
                     _ => None,
@@ -993,6 +1000,11 @@ fn inspect_selected_session_task(app: &PohunekApp) -> Result<Task<Message>, Stri
     ))
 }
 
+fn fork_selected_session_task(app: &PohunekApp) -> Result<Task<Message>, String> {
+    let (host, session_id) = selected_session_target(app)?;
+    fork_session_task(app, &host.id, &session_id)
+}
+
 /// Resolves a selected template (a `None`-provider action), renders its static
 /// prompt, and returns the rendered text plus recipe so the Start modal can show
 /// it in an editable buffer before the operator launches the session.
@@ -1157,6 +1169,34 @@ pub(crate) fn resume_session_task(
             resume_session_with_options(&host, &session_id, options)
                 .await
                 .map(|result| CoreEvent::SessionResumed { host_id, result })
+                .map_err(|err| err.to_string())
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+pub(crate) fn fork_session_task(
+    app: &PohunekApp,
+    host_id: &HostId,
+    session_id: &SessionId,
+) -> Result<Task<Message>, String> {
+    let host = host_config(app, host_id)?;
+    let host_id = host_id.clone();
+    let session_id = session_id.clone();
+    let options = connection_options(app)?;
+    let terminal_size = terminal_size(app)?;
+    let params = SessionForkParams {
+        session_id,
+        name: None,
+        cwd_mode: ForkCwdMode::Same,
+        cols: terminal_size.cols,
+        rows: terminal_size.rows,
+    };
+    Ok(Task::perform(
+        runtime::perform(async move {
+            fork_session_with_options(&host, params, options)
+                .await
+                .map(|result| CoreEvent::SessionForked { host_id, result })
                 .map_err(|err| err.to_string())
         }),
         Message::CoreCommandCompleted,

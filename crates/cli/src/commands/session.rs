@@ -13,8 +13,8 @@ use std::path::PathBuf;
 #[cfg(test)]
 use protocol::Request;
 use protocol::{
-    method, AgentActivity, CwdSource, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
+    method, AgentActivity, CwdSource, ForkCwdMode, SessionForkParams, SessionId, SessionInfo,
+    SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
     SessionRemoveResult, SessionRenameParams, SessionState, SessionStopResult, SessionWarningKind,
     StateSource,
 };
@@ -25,6 +25,16 @@ use crate::commands::request_with_params;
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::{is_local_host, Target};
+
+/// Default fork PTY width when the command is not launched from an attach view.
+///
+/// Matches `session new`'s CLI default so non-interactive fork callers get the
+/// same baseline terminal geometry unless a richer surface supplies live size.
+const DEFAULT_FORK_COLS: u16 = 80;
+/// Default fork PTY height when the command is not launched from an attach view.
+///
+/// Matches `session new`'s CLI default; attach and GUI surfaces send live size.
+const DEFAULT_FORK_ROWS: u16 = 24;
 
 /// Arguments for `session new`, grouped to keep the call site readable as the
 /// optional worktree flags accumulate.
@@ -352,6 +362,39 @@ pub(crate) async fn run_stop(
     Ok(())
 }
 
+/// Fork a session's native agent conversation into a new session.
+///
+/// # Errors
+///
+/// Returns [`CliError`] if the daemon is unreachable, the host cannot be
+/// resolved, the daemon rejects the fork, or the payload does not match the
+/// contract.
+pub(crate) async fn run_fork(
+    host: &str,
+    paths: &Paths,
+    target: &Target,
+    name: Option<String>,
+    json: bool,
+) -> Result<(), CliError> {
+    let mut client = Client::connect(host, paths).await?;
+    let forked = client
+        .call::<method::SessionFork>(fork_params(
+            target,
+            name,
+            DEFAULT_FORK_COLS,
+            DEFAULT_FORK_ROWS,
+        ))
+        .await?;
+    let info = &forked.session;
+
+    if json {
+        print!("{}", crate::commands::render_json(info)?);
+    } else {
+        print!("{}", render_fork_human(info));
+    }
+    Ok(())
+}
+
 /// Run `session rm` against the daemon for `host`.
 ///
 /// Removal evicts the session from the daemon's registry, stopping it first if
@@ -508,6 +551,26 @@ fn build_remove_request(target: &Target) -> Result<Request, CliError> {
     )
 }
 
+fn fork_params(target: &Target, name: Option<String>, cols: u16, rows: u16) -> SessionForkParams {
+    SessionForkParams {
+        session_id: SessionId(target.session_id.clone()),
+        name,
+        cwd_mode: ForkCwdMode::Same,
+        cols,
+        rows,
+    }
+}
+
+#[cfg(test)]
+fn build_fork_request(
+    target: &Target,
+    name: Option<String>,
+    cols: u16,
+    rows: u16,
+) -> Result<Request, CliError> {
+    request_with_params(method::SESSION_FORK, &fork_params(target, name, cols, rows))
+}
+
 fn input_params(target: &Target, text: &str) -> SessionInputParams {
     SessionInputParams {
         session_id: SessionId(target.session_id.clone()),
@@ -555,6 +618,14 @@ fn render_new_human(info: &SessionInfo) -> String {
         );
     }
     output
+}
+
+fn render_fork_human(info: &SessionInfo) -> String {
+    format!(
+        "session {} forked (state: {})\n",
+        info.id.0,
+        state_label(info.state)
+    )
 }
 
 fn render_list_human(sessions: &[SessionInfo]) -> String {
@@ -1903,11 +1974,38 @@ mod tests {
     }
 
     #[test]
+    fn renders_fork_result_with_new_session_id() {
+        let output = render_fork_human(&running_session("s-99"));
+
+        assert_eq!(output, "session s-99 forked (state: running)\n");
+    }
+
+    #[test]
     fn build_remove_request_targets_session_remove_method() {
         let target: Target = "local/s-42".parse().expect("parse target");
         let request = build_remove_request(&target).expect("build remove request");
 
         assert_request(&request, method::SESSION_REMOVE, serde_json::json!("s-42"));
+    }
+
+    #[test]
+    fn build_fork_request_targets_session_fork_method() {
+        let target: Target = "host-a/s-42".parse().expect("target");
+
+        let request = build_fork_request(&target, Some("forked review".to_owned()), 100, 30)
+            .expect("build fork request");
+
+        assert_request(
+            &request,
+            method::SESSION_FORK,
+            serde_json::json!({
+                "session_id": "s-42",
+                "name": "forked review",
+                "cwd_mode": "same",
+                "cols": 100,
+                "rows": 30
+            }),
+        );
     }
 
     #[test]

@@ -7,17 +7,18 @@ use protocol::{
     event, method, negotiate, AgentActivity, AgentKind, AgentRuntime, AssistantMaterializeParams,
     AssistantMaterializeResult, AttachHeader, ConceptDeprecation, ConceptIntent, ConceptMeta,
     ConceptType, CwdSource, DaemonDoctorResult, DoctorCheck, DoctorReport, DoctorStatus,
-    ErrorClass, Event, HostCapabilities, IntegrationInstallParams, IntegrationInstallReport,
-    IntegrationInstallResult, NotificationCreateParams, NotificationCreateResult,
-    NotificationCreatedEvent, NotificationDeleteParams, NotificationDeleteResult,
-    NotificationDeletedEvent, NotificationId, NotificationKind, NotificationKindPolicy,
-    NotificationListParams, NotificationListResult, NotificationPolicy, NotificationPolicyParams,
-    NotificationPolicyResult, NotificationRecord, NotificationRetentionParams,
-    NotificationRetentionResult, NotificationSeverity, NotificationSource, NotificationStatus,
-    NotificationUpdateParams, NotificationUpdateResult, NotificationUpdatedEvent, ProjectSource,
-    ProtocolError, ProtocolVersion, ProviderKind, Request, Response, SessionAttachParams,
-    SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId, SessionInfo,
-    SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
+    ErrorClass, Event, ForkCwdMode, HostCapabilities, IntegrationInstallParams,
+    IntegrationInstallReport, IntegrationInstallResult, NotificationCreateParams,
+    NotificationCreateResult, NotificationCreatedEvent, NotificationDeleteParams,
+    NotificationDeleteResult, NotificationDeletedEvent, NotificationId, NotificationKind,
+    NotificationKindPolicy, NotificationListParams, NotificationListResult, NotificationPolicy,
+    NotificationPolicyParams, NotificationPolicyResult, NotificationRecord,
+    NotificationRetentionParams, NotificationRetentionResult, NotificationSeverity,
+    NotificationSource, NotificationStatus, NotificationUpdateParams, NotificationUpdateResult,
+    NotificationUpdatedEvent, ProjectSource, ProtocolError, ProtocolVersion, ProviderKind, Request,
+    Response, SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult,
+    SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
     SessionReleaseAgentParams, SessionReleaseAgentResult, SessionReportAgentParams,
     SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
     SessionResizeParams, SessionResizeResult, SessionSetMetadataParams, SessionSetMetadataResult,
@@ -934,6 +935,69 @@ fn session_new_params_roundtrips_with_initial_input() {
 
     let back = line_roundtrip(&params);
     assert_eq!(back, params);
+}
+
+#[test]
+fn session_fork_params_json_shape_roundtrips() {
+    let params = SessionForkParams {
+        session_id: SessionId("s-42".to_owned()),
+        name: Some("forked review".to_owned()),
+        cwd_mode: ForkCwdMode::Same,
+        cols: 100,
+        rows: 30,
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize fork params");
+    assert_eq!(
+        value,
+        json!({
+            "session_id": "s-42",
+            "name": "forked review",
+            "cwd_mode": "same",
+            "cols": 100,
+            "rows": 30
+        })
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn session_fork_params_default_to_same_cwd_mode() {
+    let params: SessionForkParams = serde_json::from_value(json!({
+        "session_id": "s-42",
+        "cols": 100,
+        "rows": 30
+    }))
+    .expect("deserialize fork params without cwd_mode");
+
+    assert_eq!(params.cwd_mode, ForkCwdMode::Same);
+}
+
+#[test]
+fn session_fork_result_flattens_session_info() {
+    let result = SessionForkResult {
+        session: SessionInfo {
+            id: SessionId("s-99".to_owned()),
+            ..running_shell_session(None)
+        },
+        applied_input: None,
+    };
+
+    let value = serde_json::to_value(&result).expect("serialize fork result");
+    assert_eq!(value["id"], "s-99");
+    assert!(
+        value.get("session").is_none(),
+        "fork result must flatten SessionInfo, not wrap it: {value}"
+    );
+    assert!(
+        value.get("applied_input").is_none(),
+        "absent applied_input must stay omitted: {value}"
+    );
+
+    let back = line_roundtrip(&result);
+    assert_eq!(back, result);
 }
 
 #[test]

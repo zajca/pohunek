@@ -180,6 +180,7 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::SESSION_INSPECT => session::handle_session_inspect(request, &state.sessions).await,
         method::SESSION_STOP => session::handle_session_stop(request, &state.sessions).await,
         method::SESSION_RESUME => session::handle_session_resume(request, &state.sessions).await,
+        method::SESSION_FORK => session::handle_session_fork(request, &state.sessions).await,
         method::SESSION_REMOVE => session::handle_session_remove(request, &state.sessions).await,
         method::SESSION_ATTACH => session::handle_session_attach(request, &state.sessions).await,
         method::SESSION_DETACH => session::handle_session_detach(request, &state.sessions).await,

@@ -6,10 +6,11 @@
 //! are thin transport glue.
 
 use protocol::{
-    Request, Response, SessionAttachParams, SessionDetachParams, SessionId, SessionInputParams,
-    SessionListParams, SessionNewParams, SessionNewResult, SessionReleaseAgentParams,
-    SessionRenameParams, SessionReportAgentParams, SessionReportNativeIdParams,
-    SessionResizeParams, SessionResumeResult, SessionSetMetadataParams,
+    Request, Response, SessionAttachParams, SessionDetachParams, SessionForkParams,
+    SessionForkResult, SessionId, SessionInputParams, SessionListParams, SessionNewParams,
+    SessionNewResult, SessionReleaseAgentParams, SessionRenameParams, SessionReportAgentParams,
+    SessionReportNativeIdParams, SessionResizeParams, SessionResumeResult,
+    SessionSetMetadataParams,
 };
 
 use super::util::{ok_value, parse_optional_params, parse_params};
@@ -84,6 +85,23 @@ pub(super) async fn handle_session_resume(
     };
     match sessions.resume(&id).await {
         Ok(session) => ok_value(request, &SessionResumeResult { session }),
+        Err(err) => Response::err(request.id.clone(), err),
+    }
+}
+
+pub(super) async fn handle_session_fork(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_params::<SessionForkParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    match sessions.fork(params).await {
+        Ok(session) => ok_value(
+            request,
+            &SessionForkResult {
+                session,
+                applied_input: None,
+            },
+        ),
         Err(err) => Response::err(request.id.clone(), err),
     }
 }

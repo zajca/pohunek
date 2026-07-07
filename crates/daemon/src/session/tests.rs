@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    AgentActivity, AgentKind, CwdSource, Event, ProjectSource, SessionAttachParams, SessionId,
-    SessionInfo, SessionNewParams, SessionReleaseAgentParams, SessionReportAgentParams,
-    SessionReportNativeIdParams, SessionState, StateSource,
+    AgentActivity, AgentKind, CwdSource, Event, ForkCwdMode, ProjectSource, SessionAttachParams,
+    SessionForkParams, SessionId, SessionInfo, SessionNewParams, SessionReleaseAgentParams,
+    SessionReportAgentParams, SessionReportNativeIdParams, SessionState, StateSource,
 };
 
 use crate::agent::{InputRules, ResumeMode, SessionRefKind};
@@ -3835,6 +3835,165 @@ fn resumable_params() -> SessionNewParams {
         agent: "resumable".to_owned(),
         ..params()
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fork_live_claude_session_mints_new_id_and_builds_fork_argv() {
+    let dir = temp_dir("fork-claude-runtime");
+    let script = dir.join("fork-agent");
+    let marker = dir.join("argv.txt");
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\nsleep 30\n",
+            marker.display()
+        ),
+    );
+    let agents_dir = temp_agents_dir_with(
+        "fork-claude",
+        "forkable",
+        &format!(
+            "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"sonnet\"]\n",
+            script.display()
+        ),
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        agents_dir: Some(agents_dir),
+        ..SessionRegistryConfig::default()
+    });
+
+    let created = registry
+        .create(SessionNewParams {
+            agent: "forkable".to_owned(),
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect("create forkable session");
+    assert_eq!(created.state, SessionState::Running);
+    let recorded = registry
+        .report_native_id(SessionReportNativeIdParams {
+            session_id: created.id.clone(),
+            agent: "claude".to_owned(),
+            native_session_id: "native-live".to_owned(),
+            transcript_path: None,
+        })
+        .await;
+    assert!(recorded.recorded);
+
+    let forked = registry
+        .fork(SessionForkParams {
+            session_id: created.id.clone(),
+            name: Some("forked review".to_owned()),
+            cwd_mode: ForkCwdMode::Same,
+            cols: 100,
+            rows: 30,
+        })
+        .await
+        .expect("fork live claude session");
+
+    assert_ne!(forked.id, created.id, "fork must mint a fresh pohunek id");
+    assert_eq!(forked.name.as_deref(), Some("forked review"));
+    assert_eq!(forked.cwd, created.cwd);
+    assert_eq!((forked.cols, forked.rows), (100, 30));
+    assert_eq!(forked.native_session_id.as_deref(), Some("native-live"));
+
+    let argv = wait_for_file_contains(&marker, "--fork-session").await;
+    let lines = argv.lines().collect::<Vec<_>>();
+    assert!(
+        lines.windows(5).any(|window| {
+            window
+                == [
+                    "--model",
+                    "sonnet",
+                    "--resume",
+                    "native-live",
+                    "--fork-session",
+                ]
+        }),
+        "fork argv must preserve frozen args and append the Claude fork flag: {argv:?}"
+    );
+
+    let _ = registry.stop(&created.id).await;
+    let _ = registry.stop(&forked.id).await;
+}
+
+#[tokio::test]
+async fn fork_shell_session_reports_agent_not_resumable() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+
+    let err = registry
+        .fork(SessionForkParams {
+            session_id: created.id.clone(),
+            name: None,
+            cwd_mode: ForkCwdMode::Same,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .expect_err("shell sessions cannot be forked");
+
+    assert_eq!(err.code, "agent_not_resumable");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fork_codex_session_reports_agent_fork_unsupported() {
+    let dir = temp_dir("fork-codex-runtime");
+    let script = dir.join("codex-agent");
+    write_executable(&script, "#!/bin/sh\nsleep 30\n");
+    let agents_dir = temp_agents_dir_with(
+        "fork-codex",
+        "codex-fork",
+        &format!("base = \"codex\"\nprogram = \"{}\"\n", script.display()),
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        agents_dir: Some(agents_dir),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(SessionNewParams {
+            agent: "codex-fork".to_owned(),
+            cwd: Some(dir),
+            ..params()
+        })
+        .await
+        .expect("create codex session");
+    let recorded = registry
+        .report_native_id(SessionReportNativeIdParams {
+            session_id: created.id.clone(),
+            agent: "codex".to_owned(),
+            native_session_id: "codex-native".to_owned(),
+            transcript_path: None,
+        })
+        .await;
+    assert!(recorded.recorded);
+
+    let err = registry
+        .fork(SessionForkParams {
+            session_id: created.id.clone(),
+            name: None,
+            cwd_mode: ForkCwdMode::Same,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .expect_err("codex fork is intentionally unsupported");
+
+    assert_eq!(err.code, "agent_fork_unsupported");
+    let _ = registry.stop(&created.id).await;
 }
 
 #[tokio::test]

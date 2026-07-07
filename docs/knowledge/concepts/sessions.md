@@ -145,5 +145,14 @@ uses this before attaching, so a finished resumable session opens as a live PTY
 instead of flashing a terminal that immediately exits. A removed session is gone
 and cannot be resumed.
 
+`session.fork` creates a new pohunek session id and PTY from the source session's
+native agent conversation. The source may still be live; fork does not require a
+terminal state. With `cwd_mode: "same"`, the new session starts in the source
+cwd/worktree and carries the same launch-agent native metadata, so the fork is
+resumable too. Claude forks as `claude --resume <native_session_id>
+--fork-session`. Codex fork is intentionally not enabled in this daemon contract;
+Codex-backed sessions return the typed `agent_fork_unsupported` error instead
+of fabricating an unsupported branch.
+
 For project-aware work, prefer a registered project or repository target over an
 ad hoc directory. See [projects](projects.md) and [worktrees](worktrees.md).

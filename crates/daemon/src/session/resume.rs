@@ -1,10 +1,12 @@
 //! Resume-binding persistence and relaunch after a daemon restart.
 
 use super::{
-    agent_not_resumable, base_resume_template, default_program, info, input_rules_for_agent,
-    is_terminal, resume_pty_command_from_template, runtime_error, session_not_found, warn,
-    LaunchOpts, Ordering, PathBuf, ProtocolError, PtySessionSpec, ResumeBinding, ResumeTemplate,
-    SessionEntry, SessionId, SessionInfo, SessionRef, SessionRefKind, SessionRegistry,
+    agent_fork_unsupported, agent_not_resumable, base_resume_template, default_program,
+    fork_pty_command_from_template, info, input_rules_for_agent, is_terminal,
+    resume_pty_command_from_template, runtime_error, session_not_found, validate_session_name,
+    warn, LaunchOpts, Ordering, PathBuf, ProtocolError, PtySessionSpec, ResumeBinding,
+    ResumeTemplate, SessionEntry, SessionForkParams, SessionId, SessionInfo, SessionRef,
+    SessionRefKind, SessionRegistry,
 };
 
 use std::io;
@@ -178,6 +180,126 @@ impl SessionRegistry {
         Ok(info)
     }
 
+    /// Fork a native agent conversation into a new pohunek session.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "fork mirrors resume launch assembly while minting a fresh session id"
+    )]
+    pub async fn fork(&self, params: SessionForkParams) -> Result<SessionInfo, ProtocolError> {
+        self.ensure_not_external(&params.session_id).await?;
+        let (binding, repo, branch, worktree_path) = {
+            let sessions = self.inner.sessions.lock().await;
+            let entry = sessions
+                .get(&params.session_id)
+                .ok_or_else(|| session_not_found(&params.session_id.0))?;
+            (
+                Self::resume_binding_from_entry(&params.session_id, entry),
+                entry.info.repo.clone(),
+                entry.info.branch.clone(),
+                entry.info.worktree_path.clone(),
+            )
+        };
+
+        match params.cwd_mode {
+            protocol::ForkCwdMode::Same => {}
+        }
+
+        if !binding.resumable && !binding.program.is_empty() {
+            return Err(agent_not_resumable(&binding.agent));
+        }
+        let template = match (binding.resume_mode, binding.ref_kind) {
+            (Some(mode), Some(ref_kind)) => ResumeTemplate { mode, ref_kind },
+            _ => base_resume_template(binding.agent_base)
+                .ok_or_else(|| agent_not_resumable(&binding.agent))?,
+        };
+        let session_ref = session_ref_from_binding(template, &binding)?;
+        if binding.agent_base == protocol::AgentKind::Codex {
+            return Err(agent_fork_unsupported(&binding.agent));
+        }
+
+        let id = SessionId(format!(
+            "s-{}",
+            self.inner.next_id.fetch_add(1, Ordering::Relaxed)
+        ));
+        let has_snapshot = !binding.program.is_empty();
+        let program = if has_snapshot {
+            binding.program.clone()
+        } else {
+            default_program(binding.agent_base)
+        };
+        let input_rules = if has_snapshot {
+            binding.input_rules.to_input_rules()
+        } else {
+            input_rules_for_agent(binding.agent_base, &self.inner.config)
+        };
+
+        let (profile_env, manifest_override) = match self
+            .inner
+            .profiles
+            .resolve_agent(&binding.agent)
+        {
+            Ok(resolved) => resolved.profile.map_or((Vec::new(), None), |profile| {
+                (profile.env, profile.manifest)
+            }),
+            Err(err) => {
+                warn!(
+                    session_id = %binding.session_id,
+                    agent = %binding.agent,
+                    error = %err,
+                    "agent profile no longer resolves at fork; launching from the structural snapshot without profile env"
+                );
+                (Vec::new(), None)
+            }
+        };
+        let mut env_extra = profile_env;
+        env_extra.extend(self.session_pty_env(binding.agent_base, &id));
+        let opts = LaunchOpts {
+            cwd: binding.cwd.clone(),
+            cols: params.cols,
+            rows: params.rows,
+            env_extra,
+        };
+        let command = fork_pty_command_from_template(
+            &binding.agent,
+            &program,
+            binding.args.clone(),
+            template,
+            &session_ref,
+            &opts,
+        )?;
+        let snapshot = ResumeSnapshot {
+            program,
+            args: binding.args.clone(),
+            resume: Some(template),
+        };
+        let info = self
+            .register_pty_session(PtySessionSpec {
+                id,
+                name: validate_session_name(params.name.as_deref())?,
+                agent: binding.agent,
+                agent_base: binding.agent_base,
+                input_rules,
+                snapshot,
+                manifest_override,
+                cwd: binding.cwd,
+                cols: params.cols,
+                rows: params.rows,
+                command,
+                native_session_id: binding.native_session_id,
+                native_session_path: binding.native_session_path,
+                project_id: binding.project_id,
+                is_linked_worktree: binding.is_linked_worktree,
+                repo,
+                branch,
+                worktree_path,
+                metadata: binding.metadata,
+                warnings: Vec::new(),
+            })
+            .await?;
+        self.persist_resume_binding(&info.id).await;
+        Ok(info)
+    }
+
     fn resume_binding_from_entry(id: &SessionId, entry: &SessionEntry) -> ResumeBinding {
         ResumeBinding {
             session_id: id.0.clone(),
@@ -209,10 +331,6 @@ impl SessionRegistry {
     }
 
     /// Relaunch one session from its stored resume binding, reusing its id.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "tracked for session module decomposition"
-    )]
     pub(super) async fn resume_binding(
         &self,
         binding: ResumeBinding,
@@ -231,32 +349,7 @@ impl SessionRegistry {
         // Build the native reference from the field the frozen `ref_kind` names, so
         // a `path`-kind profile inherits the absolute-path guard and an `id`-kind the
         // leading-dash guard (the documented asymmetry).
-        let session_ref = match template.ref_kind {
-            SessionRefKind::Id => match &binding.native_session_id {
-                Some(value) => SessionRef::id(value)?,
-                None => {
-                    return Err(runtime_error(
-                        "not_resumable",
-                        format!(
-                            "resume binding for {} is id-kind but has no native id",
-                            binding.session_id
-                        ),
-                    ));
-                }
-            },
-            SessionRefKind::Path => match &binding.native_session_path {
-                Some(value) => SessionRef::path(value)?,
-                None => {
-                    return Err(runtime_error(
-                        "not_resumable",
-                        format!(
-                            "resume binding for {} is path-kind but has no native path",
-                            binding.session_id
-                        ),
-                    ));
-                }
-            },
-        };
+        let session_ref = session_ref_from_binding(template, &binding)?;
 
         let id = SessionId(binding.session_id.clone());
         self.bump_next_id_past(&id);
@@ -415,6 +508,34 @@ impl SessionRegistry {
                 Err(actual) => current = actual,
             }
         }
+    }
+}
+
+fn session_ref_from_binding(
+    template: ResumeTemplate,
+    binding: &ResumeBinding,
+) -> Result<SessionRef, ProtocolError> {
+    match template.ref_kind {
+        SessionRefKind::Id => match &binding.native_session_id {
+            Some(value) => SessionRef::id(value),
+            None => Err(runtime_error(
+                "not_resumable",
+                format!(
+                    "resume binding for {} is id-kind but has no native id",
+                    binding.session_id
+                ),
+            )),
+        },
+        SessionRefKind::Path => match &binding.native_session_path {
+            Some(value) => SessionRef::path(value),
+            None => Err(runtime_error(
+                "not_resumable",
+                format!(
+                    "resume binding for {} is path-kind but has no native path",
+                    binding.session_id
+                ),
+            )),
+        },
     }
 }
 

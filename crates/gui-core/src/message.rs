@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use protocol::{
     NotificationDeleteResult, NotificationUpdateResult, ProjectActionResult, ProjectActionsResult,
-    ProjectInfo, ProjectPromptResult, ProjectRemoveResult, ProjectShowResult, SessionId,
-    SessionInfo, SessionRemoveResult, SessionRenameResult, SessionResumeResult,
+    ProjectInfo, ProjectPromptResult, ProjectRemoveResult, ProjectShowResult, SessionForkResult,
+    SessionId, SessionInfo, SessionRemoveResult, SessionRenameResult, SessionResumeResult,
     SessionSetMetadataResult, SessionStopResult, WorktreeRemoveResult,
 };
 
@@ -59,6 +59,10 @@ pub enum DomainEvent {
     SessionResumed {
         host_id: HostId,
         result: SessionResumeResult,
+    },
+    SessionForked {
+        host_id: HostId,
+        result: SessionForkResult,
     },
     SessionStopCompleted {
         host_id: HostId,
