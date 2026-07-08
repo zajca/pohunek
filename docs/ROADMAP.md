@@ -76,17 +76,20 @@ Phase 4 so the desktop app and the browser app build on the same contract.
   public API is documented in [`docs/public-api.md`](public-api.md): methods,
   envelopes, error classes/codes, events, version negotiation, and the attach
   stream as public protocol surface.
-- **S.3 — TS SDK (`web/sdk`).** Needed only when the browser track starts:
-  `ts-rs`-generated types (`web/shared`) + a runtime client with pluggable
-  transports (TCP for Node/Bun → daemon direct; WebSocket for browser → backend).
-  CI **drift check** fails if generated TS types diverge from the Rust source.
+- **S.3 — TS SDK (`web/sdk`) — complete.** `ts-rs`-generated types
+  (`web/shared`) + a runtime client with pluggable transports (TCP for Node/Bun
+  → daemon direct; WebSocket for browser → backend). CI **drift check** fails if
+  generated TS types diverge from the Rust source. Track B inherits
+  `web/backend` (`@pohunek/relay`) as its tested WebSocket transport core
+  instead of starting from a spec.
 
 **Stability:** no compatibility promise pre-1.0; SDK semver tracks the protocol
 version; breaking changes allowed with a version bump until the promise is made.
 
-*Done when:* a minimal client on the Rust SDK does `daemon.health` / `session.list`,
-subscribes to an event, and round-trips an attach stream — directly against a
-daemon. (TS SDK check deferred to the browser track.)
+*Done when:* minimal clients on the Rust SDK and TypeScript SDK do `daemon.health`
+/ `session.list`, subscribe to an event, and round-trip an attach stream against
+a daemon; the TypeScript SDK also verifies the same flow through the WebSocket
+relay transport.
 
 ### Track D — Native Desktop Companion App *(primary GUI)*
 
@@ -183,9 +186,10 @@ Phase 4 as designed ([`phases/04`](phases/04-browser-control-center.md)) — a
 standalone **TS aggregator backend** (Bun) + **Svelte 5 SPA** (xterm.js) + optional
 single-cert **mobile PWA**, with the same provider seam. Kept in the roadmap as a
 **later, optional** surface for **mobile / from-any-device** access (the one thing
-a native desktop app can't give you). It reuses **Track S** (TS SDK) and the **same
-opaque-link store + prompt-template conventions** as the desktop app and the sway
-scripts — one source of truth, multiple clients.
+a native desktop app can't give you). It reuses **Track S** (TS SDK), inherits
+`web/backend` (`@pohunek/relay`) as the WebSocket daemon transport core, and
+keeps the **same opaque-link store + prompt-template conventions** as the desktop
+app and the sway scripts — one source of truth, multiple clients.
 
 Built **after** the desktop app proves the SDK and the provider seam. Nothing here
 changes the daemon (no gateway, no embedded assets, no daemon-side auth).
@@ -218,5 +222,6 @@ changes the daemon (no gateway, no embedded assets, no daemon-side auth).
    → D.3 (session/project/worktree) → D.4 (prompts) → D.5 (Linear + PRs); attach is
    delegated (D.2 folded in). **v1.1:** D.6 (diff review + comment-to-session loop).
 4. **Track B (later/optional)** — when mobile / from-any-device access is wanted:
-   S.3 (TS SDK + drift check) → aggregator backend → Svelte SPA → PWA → provider
-   parity, reusing the desktop app's provider seam and the shared link store.
+   build the aggregator backend on the completed S.3 TS SDK and inherited
+   `web/backend` relay core → Svelte SPA → PWA → provider parity, reusing the
+   desktop app's provider seam and the shared link store.
