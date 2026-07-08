@@ -1,4 +1,12 @@
 export { Client, nextRequestId } from "./client";
+export {
+  attachRaw,
+  attachRawLocal,
+  attachRawTcp,
+  connectRawLocal,
+  connectRawTcp,
+} from "./attach";
+export type { RawStream } from "./attach";
 export { ClientError, ClientErrorClass, ClientErrorCode } from "./error";
 export type { ClientErrorKind } from "./error";
 export {

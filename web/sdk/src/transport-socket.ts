@@ -1,5 +1,4 @@
 import { createConnection, type Socket } from "node:net";
-import { Readable, Writable } from "node:stream";
 import { ClientError } from "./error";
 import { encodeControlLine, readControlLines } from "./framing";
 import type { ConnectOptions, ControlChannel, RawDuplex, ResolvedConnectOptions, Transport } from "./transport";
@@ -37,23 +36,19 @@ export class SocketTransport implements Transport {
 
   public async raw(): Promise<RawDuplex> {
     const socket = await this.connect();
-    return {
-      readable: Readable.toWeb(socket) as ReadableStream<Uint8Array>,
-      writable: Writable.toWeb(socket) as WritableStream<Uint8Array>,
-      close: (): Promise<void> => {
-        socket.end();
-        socket.destroy();
-        return Promise.resolve();
-      },
-    };
+    return socketRawDuplex(socket);
   }
 
   private connect(): Promise<Socket> {
     return new Promise((resolve, reject) => {
+      // `allowHalfOpen` keeps the read side draining after the caller closes
+      // the write side (attach can finish sending input while the daemon is
+      // still streaming output); without it the socket auto-closes on the
+      // peer's FIN and truncates an in-flight full-duplex round-trip.
       const socket =
         this.target.kind === "unix"
-          ? createConnection({ path: this.target.socketPath })
-          : createConnection({ host: this.target.host, port: this.target.port });
+          ? createConnection({ path: this.target.socketPath, allowHalfOpen: true })
+          : createConnection({ host: this.target.host, port: this.target.port, allowHalfOpen: true });
       let settled = false;
       const timer = setTimeout(() => {
         fail(timeoutError(this.target.kind === "unix" ? "daemon socket connect" : "daemon tcp connect", this.options.connectTimeoutMs));
@@ -130,6 +125,101 @@ function writeBytes(socket: Socket, bytes: Uint8Array): Promise<void> {
       resolve();
     });
   });
+}
+
+// Bridge a duplex `node:net` socket to a Web Streams `RawDuplex` for attach.
+//
+// The two halves are wired INDEPENDENTLY so a full-duplex round-trip is not
+// truncated: closing the writable half only half-closes the socket (`end()`,
+// sending FIN) and leaves the readable half draining the peer's remaining bytes
+// until it observes `end`. `Readable.toWeb`/`Writable.toWeb` couple both halves
+// to the same lifecycle and destroy the socket when the writable finishes,
+// dropping in-flight inbound bytes — which a multi-megabyte round-trip exposes.
+// Backpressure is honored in both directions: the readable pauses the socket
+// once its queue fills and resumes on `pull`; the writable defers resolving a
+// write until `drain` when the OS buffer is full.
+function socketRawDuplex(socket: Socket): RawDuplex {
+  let readerClosed = false;
+
+  const readable = new ReadableStream<Uint8Array>({
+    start(controller): void {
+      socket.on("data", (chunk: Buffer): void => {
+        if (readerClosed) {
+          return;
+        }
+        controller.enqueue(new Uint8Array(chunk));
+        if (controller.desiredSize !== null && controller.desiredSize <= 0) {
+          socket.pause();
+        }
+      });
+      socket.on("end", (): void => {
+        if (!readerClosed) {
+          readerClosed = true;
+          controller.close();
+        }
+      });
+      socket.on("error", (error: Error): void => {
+        if (!readerClosed) {
+          readerClosed = true;
+          controller.error(ClientError.io(error));
+        }
+      });
+    },
+    pull(): void {
+      socket.resume();
+    },
+    cancel(): void {
+      readerClosed = true;
+      socket.destroy();
+    },
+  });
+
+  const writable = new WritableStream<Uint8Array>({
+    write(chunk): Promise<void> {
+      return new Promise((resolve, reject) => {
+        if (socket.destroyed) {
+          reject(ClientError.io("socket is closed"));
+          return;
+        }
+        const flushed = socket.write(chunk, (error) => {
+          if (error instanceof Error) {
+            reject(ClientError.io(error));
+          }
+        });
+        // Apply backpressure: only resolve once the OS buffer has drained, so
+        // the producer cannot outrun the socket and buffer unboundedly.
+        if (flushed) {
+          resolve();
+        } else {
+          socket.once("drain", resolve);
+        }
+      });
+    },
+    close(): Promise<void> {
+      // Intentionally do NOT `socket.end()` here. A half-close (FIN on the
+      // write side only) is unreliable across runtimes: Bun does not honor
+      // `allowHalfOpen`, so ending the write side also tears down the read
+      // side and truncates in-flight daemon output. Closing the writable half
+      // therefore just stops further writes; the underlying socket stays open
+      // for reading until `RawDuplex.close()` (or the daemon) ends it. This
+      // matches attach semantics: input ends, output keeps flowing until the
+      // caller closes the stream or detaches on the control connection.
+      return Promise.resolve();
+    },
+    abort(): void {
+      socket.destroy();
+    },
+  });
+
+  return {
+    readable,
+    writable,
+    close: (): Promise<void> => {
+      readerClosed = true;
+      socket.destroy();
+      return Promise.resolve();
+    },
+  };
 }
 
 function timeoutError(action: string, timeoutMs: number): Error {
