@@ -53,6 +53,27 @@ per line. The current daemon and Rust SDK cap control lines at 1 MiB.
 Raw terminal bytes are never multiplexed onto a JSON control connection. Attach
 uses a separate connection described in "Attach Stream".
 
+The TypeScript SDK also supports a WebSocket relay transport for browser and
+Bun/Node clients that cannot dial Unix sockets or daemon TCP directly. The relay
+is not a daemon protocol endpoint and does not aggregate state. It is a pure
+one-WebSocket-to-one-daemon-connection tunnel:
+
+- `GET /daemon/<host>/control` upgrades to a WebSocket whose text frames are
+  control lines. The relay writes each frame's UTF-8 bytes plus the daemon's
+  newline delimiter to one daemon control connection, and sends each daemon
+  newline-delimited response/event line back as one text frame.
+- `GET /daemon/<host>/attach` upgrades to a WebSocket whose binary frames are
+  opaque attach bytes. The relay forwards bytes unframed to/from one raw daemon
+  connection.
+- The relay enforces the 1 MiB control-line cap in both directions and closes
+  the WebSocket on oversize input. It does not parse JSON, multiplex sessions,
+  discover hosts, or retain protocol state.
+- The `<host>` URL segment is resolved only through the relay operator's static
+  target map. Unknown hosts are rejected during upgrade.
+- The relay must bind fail-closed to a NetBird CGNAT address
+  (`100.64.0.0/10`). Loopback is allowed only for explicit local testing or
+  development; wildcard addresses such as `0.0.0.0` and `::` are never valid.
+
 ## Envelopes
 
 ### Request
@@ -534,6 +555,9 @@ Attach stream rules:
 - `session.attach` may include `origin_session_id` and `origin_daemon_id`. When
   both identify the same daemon-owned session the client is already running
   inside, the daemon rejects the attach with `daemon/attach_self_feedback`.
+- On the WebSocket relay transport, the attach prelude is sent as the first
+  bytes on the `/daemon/<host>/attach` binary WebSocket. After redemption, every
+  binary frame remains opaque PTY data.
 
 Rust SDK helpers:
 
@@ -604,3 +628,61 @@ Request APIs:
 SDK error mapping preserves daemon protocol errors and adds host/transport
 context for local and remote failures. Use `ClientError::to_protocol_error()` to
 render SDK failures in the same envelope taxonomy as daemon errors.
+
+## TypeScript SDK Surface
+
+The `@pohunek/sdk` package mirrors the Rust SDK surface for Bun, Node, and
+browser clients. Domain types and method maps come from `@pohunek/protocol`;
+the SDK owns only envelopes, framing, transports, and helper APIs.
+
+Public exports:
+
+- `Client`: framed request/response and subscription client.
+- `SocketTransport`: direct Unix/TCP `node:net` transport for Bun/Node.
+- `WsTransport`: WebSocket relay transport using the WHATWG `WebSocket` global.
+- `Subscription`: event-line stream after a successful `subscribe`.
+- `RawStream`: `ReadableStream<Uint8Array>` plus `WritableStream<Uint8Array>`
+  attach duplex.
+- `ClientError`: structured SDK error with `toProtocolError()`.
+- Raw and attach helpers: `connectRawLocal`, `connectRawTcp`, `connectRawWs`,
+  `attachRaw`, `attachRawLocal`, `attachRawTcp`, `attachRawWs`.
+
+Connection APIs:
+
+- `Client.connectLocal(socketPath, opts?)`: direct Unix socket.
+- `Client.connectTcp(host, {host, port}, opts?)`: direct daemon TCP address with
+  host context preserved for remote errors.
+- `Client.connectWs(baseUrl, host, opts?)`: WebSocket relay. `baseUrl` may use
+  `http`, `https`, `ws`, or `wss`; the SDK connects to
+  `/daemon/<host>/control` under that base URL.
+- `Client.connectTransport(transport, opts?, remoteHost?)`: injection point for
+  tests and custom transports that implement `Transport`.
+
+Request APIs:
+
+- `client.call(method, params)`: typed call keyed by the generated `Methods`
+  map.
+- `client.handshake()`: calls `daemon.health` and enforces strict protocol
+  version equality.
+- `client.request(request)`: sends one raw request envelope and returns the
+  `ok` payload.
+- `client.subscribe(request)`: consumes the control connection after the
+  subscribe ack and returns `Subscription`.
+- `subscription.nextLine()`: returns raw event JSON text or `null` on close.
+- `subscription.nextEvent()`: decodes known generated events and preserves
+  unknown event names as a catch-all object.
+
+Attach APIs:
+
+- `connectRawLocal`, `connectRawTcp`, and `connectRawWs` open unframed raw byte
+  channels without writing the attach prelude.
+- `attachRawLocal`, `attachRawTcp`, and `attachRawWs` open a raw channel, write
+  exactly one attach prelude, parse a failed redemption response as
+  `ClientError`, and otherwise return the raw attach stream.
+
+The `@pohunek/relay` package exports the transport-core server used by
+`WsTransport`: `startRelay({bindHost, port, targets, allowLoopbackBind?})`,
+`validateRelayBindAddr`, `isNetbirdIp`, `RelayBindAddrError`, and the
+`DaemonTarget`/`RelayHandle` types. The package is pre-1.0 transport
+infrastructure for Track B; auth, TLS, host discovery, aggregation, and SPA
+serving are outside this relay core.

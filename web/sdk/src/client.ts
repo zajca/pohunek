@@ -6,6 +6,7 @@ import { Subscription } from "./subscription";
 import type { ConnectOptions, ControlChannel, ResolvedConnectOptions, Transport } from "./transport";
 import { resolveConnectOptions } from "./transport";
 import { SocketTransport } from "./transport-socket";
+import { WsTransport } from "./transport-ws";
 
 const RUN_TOKEN = `${randomUUID().replaceAll("-", "")}${Date.now().toString(16)}`;
 let nextSequence = 0;
@@ -39,6 +40,10 @@ export class Client {
     opts?: ConnectOptions,
   ): Promise<Client> {
     return Client.connectTransport(SocketTransport.tcp(host, addr, opts), opts, host);
+  }
+
+  public static async connectWs(baseUrl: string, host: string, opts?: ConnectOptions): Promise<Client> {
+    return Client.connectTransport(WsTransport.relay(baseUrl, host, opts), opts, host);
   }
 
   public async call<K extends keyof Methods>(

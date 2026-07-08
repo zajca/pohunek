@@ -5,6 +5,9 @@
   "dependencies": {
     "@pohunek/protocol": "workspace:*"
   },
+  "devDependencies": {
+    "@pohunek/relay": "workspace:*"
+  },
   "exports": {
     ".": {
       "types": "./src/index.ts",

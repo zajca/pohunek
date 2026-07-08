@@ -3,6 +3,7 @@ import { ClientError } from "./error";
 import { decodeResponse } from "./envelope";
 import { SocketTransport } from "./transport-socket";
 import type { ConnectOptions, RawDuplex, Transport } from "./transport";
+import { WsTransport } from "./transport-ws";
 
 export type RawStream = RawDuplex;
 
@@ -23,6 +24,14 @@ export async function connectRawTcp(
   opts?: ConnectOptions,
 ): Promise<RawStream> {
   return connectRawTransport(SocketTransport.tcp(host, addr, opts));
+}
+
+export async function connectRawWs(
+  baseUrl: string,
+  host: string,
+  opts?: ConnectOptions,
+): Promise<RawStream> {
+  return connectRawTransport(WsTransport.relay(baseUrl, host, opts));
 }
 
 export async function connectRawTransport(transport: Transport): Promise<RawStream> {
@@ -70,6 +79,16 @@ export async function attachRawTcp(
   opts?: ConnectOptions,
 ): Promise<RawStream> {
   const raw = await connectRawTcp(host, addr, opts);
+  return redeemAttach(raw, streamId, host);
+}
+
+export async function attachRawWs(
+  baseUrl: string,
+  host: string,
+  streamId: string,
+  opts?: ConnectOptions,
+): Promise<RawStream> {
+  const raw = await connectRawWs(baseUrl, host, opts);
   return redeemAttach(raw, streamId, host);
 }
 

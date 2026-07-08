@@ -12,11 +12,17 @@
     },
     "backend": {
       "name": "@pohunek/relay",
+      "dependencies": {
+        "@pohunek/protocol": "workspace:*",
+      },
     },
     "sdk": {
       "name": "@pohunek/sdk",
       "dependencies": {
         "@pohunek/protocol": "workspace:*",
+      },
+      "devDependencies": {
+        "@pohunek/relay": "workspace:*",
       },
     },
     "shared": {

@@ -3,8 +3,10 @@ export {
   attachRaw,
   attachRawLocal,
   attachRawTcp,
+  attachRawWs,
   connectRawLocal,
   connectRawTcp,
+  connectRawWs,
 } from "./attach";
 export type { RawStream } from "./attach";
 export { ClientError, ClientErrorClass, ClientErrorCode } from "./error";
@@ -30,6 +32,7 @@ export type {
   Transport,
 } from "./transport";
 export { SocketTransport } from "./transport-socket";
+export { WsTransport } from "./transport-ws";
 export { Subscription, decodeProtocolEvent } from "./subscription";
 export type { CatchAllEvent } from "./subscription";
 export * from "@pohunek/protocol";

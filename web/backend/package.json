@@ -2,6 +2,9 @@
   "name": "@pohunek/relay",
   "private": true,
   "type": "module",
+  "dependencies": {
+    "@pohunek/protocol": "workspace:*"
+  },
   "exports": {
     ".": {
       "types": "./src/index.ts",
