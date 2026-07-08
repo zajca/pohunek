@@ -41,15 +41,20 @@ pub const ENV_PROTOCOL_VERSION: &str = "POHUNEK_PROTOCOL_VERSION";
 
 /// Parameters for `integration.install`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationInstallParams.ts"))]
 pub struct IntegrationInstallParams {
     /// Agent to install the hook for. When omitted, the daemon installs the
     /// hook for every supported agent whose config dir is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub agent: Option<AgentKind>,
 }
 
 /// Result returned by `integration.install`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationInstallResult.ts"))]
 pub struct IntegrationInstallResult {
     /// One report per agent the hook was installed for.
     pub installed: Vec<IntegrationInstallReport>,
@@ -57,6 +62,8 @@ pub struct IntegrationInstallResult {
 
 /// Per-agent record of what the installer wrote.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationInstallReport.ts"))]
 pub struct IntegrationInstallReport {
     /// Agent the hook was installed for.
     pub agent: AgentKind,

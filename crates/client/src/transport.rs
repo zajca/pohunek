@@ -8,7 +8,10 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::{SinkExt, StreamExt};
-use protocol::{AttachHeader, Event, Method, ProtocolError, ProtocolVersion, Request, Response};
+use protocol::{
+    AttachHeader, Event, Method, ProtocolError, ProtocolVersion, Request, Response,
+    MAX_CONTROL_LINE_BYTES,
+};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
@@ -20,7 +23,6 @@ use crate::ClientError;
 pub const LOCAL_HOST: &str = "local";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_LINE_BYTES: usize = 1024 * 1024;
 
 /// A connected SDK client over either the local Unix socket or remote TCP.
 #[derive(Debug)]
@@ -266,7 +268,10 @@ where
 {
     fn new(stream: S, remote_host: Option<String>, options: ClientOptions) -> Self {
         Self {
-            framed: Framed::new(stream, LinesCodec::new_with_max_length(MAX_LINE_BYTES)),
+            framed: Framed::new(
+                stream,
+                LinesCodec::new_with_max_length(MAX_CONTROL_LINE_BYTES),
+            ),
             remote_host,
             request_timeout: options.request_timeout,
             poisoned: None,

@@ -1,0 +1,5 @@
+{
+  "class": "daemon",
+  "code": "method_not_found",
+  "msg": "unknown control method: session.unknown"
+}

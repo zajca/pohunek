@@ -1,0 +1,41 @@
+{
+  "active_agent": "claude",
+  "active_agent_base": "claude",
+  "active_agent_pid": 42425,
+  "active_agent_session_id": "claude-native-fixture",
+  "active_agent_session_path": "/workspace/pohunek/.claude/session.json",
+  "activity": "idle",
+  "agent": "codex",
+  "agent_base": "codex",
+  "branch": "zajca/12-typescript-sdk",
+  "cols": 120,
+  "created_at": "2026-07-08T00:00:00Z",
+  "cwd": "/workspace/pohunek",
+  "cwd_source": "osc7",
+  "exit_code": 0,
+  "external": false,
+  "id": "s-fixture-1",
+  "is_linked_worktree": true,
+  "metadata": {
+    "ticket": "POH-12",
+    "track": "S.3"
+  },
+  "name": "TypeScript SDK phase 1",
+  "native_session_id": "codex-native-fixture",
+  "pid": 42424,
+  "project_id": "p-fixture",
+  "project_label": "pohunek",
+  "repo": "/workspace/pohunek",
+  "rows": 32,
+  "state": "done",
+  "state_source": "report",
+  "updated_at": "2026-07-08T00:01:00Z",
+  "warnings": [
+    {
+      "detail": "origin unreachable in fixture environment",
+      "kind": "fetch",
+      "message": "fetch failed; using local base branch"
+    }
+  ],
+  "worktree_path": "/workspace/pohunek-sdk"
+}

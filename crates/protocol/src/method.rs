@@ -42,6 +42,20 @@ pub trait Method {
     type Output: DeserializeOwned;
 }
 
+/// Static TypeScript metadata for one control method.
+///
+/// The `params_ts` and `output_ts` strings are TypeScript type references used
+/// by `cargo xtask ts generate` when it emits the SDK method map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MethodSpec {
+    /// Wire method name.
+    pub name: &'static str,
+    /// TypeScript request params type.
+    pub params_ts: &'static str,
+    /// TypeScript success payload type.
+    pub output_ts: &'static str,
+}
+
 macro_rules! method_marker {
     (
         $(#[$docs:meta])*
@@ -62,358 +76,435 @@ macro_rules! method_marker {
     };
 }
 
-method_marker!(
-    /// Liveness/version probe.
-    DaemonHealth,
-    DAEMON_HEALTH,
-    "daemon.health",
-    (),
-    DaemonHealthResult
-);
+macro_rules! method_table {
+    (
+        $(
+            $(#[$docs:meta])*
+            $marker:ident,
+            $constant:ident,
+            $name:literal,
+            $params:ty,
+            $output:ty,
+            $params_ts:literal,
+            $output_ts:literal
+        );+ $(;)?
+    ) => {
+        $(
+            method_marker!(
+                $(#[$docs])*
+                $marker,
+                $constant,
+                $name,
+                $params,
+                $output
+            );
+        )+
 
-method_marker!(
-    /// Start a new agent session.
-    SessionNew,
-    SESSION_NEW,
-    "session.new",
-    SessionNewParams,
-    SessionNewResult
-);
-
-method_marker!(
-    /// List sessions.
-    SessionList,
-    SESSION_LIST,
-    "session.list",
-    SessionListParams,
-    Vec<SessionInfo>
-);
-
-method_marker!(
-    /// Inspect one session.
-    SessionInspect,
-    SESSION_INSPECT,
-    "session.inspect",
-    SessionId,
-    SessionInfo
-);
-
-method_marker!(
-    /// Stop one session.
-    SessionStop,
-    SESSION_STOP,
-    "session.stop",
-    SessionId,
-    SessionStopResult
-);
-
-method_marker!(
-    /// Relaunch a terminal session from captured native resume metadata.
-    SessionResume,
-    SESSION_RESUME,
-    "session.resume",
-    SessionId,
-    SessionResumeResult
-);
-
-method_marker!(
-    /// Fork a native agent conversation into a new pohunek session.
-    SessionFork,
-    SESSION_FORK,
-    "session.fork",
-    SessionForkParams,
-    SessionForkResult
-);
-
-method_marker!(
-    /// Evict a session from the registry, stopping it first if still live.
-    SessionRemove,
-    SESSION_REMOVE,
-    "session.remove",
-    SessionId,
-    SessionRemoveResult
-);
-
-method_marker!(
-    /// Create an attach stream for a session.
-    SessionAttach,
-    SESSION_ATTACH,
-    "session.attach",
-    SessionAttachParams,
-    SessionAttachResult
-);
-
-method_marker!(
-    /// Detach an active attach stream.
-    SessionDetach,
-    SESSION_DETACH,
-    "session.detach",
-    SessionDetachParams,
-    SessionDetachResult
-);
-
-method_marker!(
-    /// Resize a session PTY.
-    SessionResize,
-    SESSION_RESIZE,
-    "session.resize",
-    SessionResizeParams,
-    SessionResizeResult
-);
-
-method_marker!(
-    /// Inject input into a session PTY.
-    SessionInput,
-    SESSION_INPUT,
-    "session.input",
-    SessionInputParams,
-    SessionInputResult
-);
+        /// TypeScript method-map metadata generated from the marker table.
+        pub const METHOD_SPECS: &[MethodSpec] = &[
+            $(
+                MethodSpec {
+                    name: $name,
+                    params_ts: $params_ts,
+                    output_ts: $output_ts,
+                },
+            )+
+        ];
+    };
+}
 
 /// Historical status method name. Kept as an open-string constant for
 /// compatibility with older docs and consumers; current daemons answer
 /// [`DAEMON_HEALTH`] for health/status checks.
 pub const STATUS: &str = "status";
 
-method_marker!(
+method_table!(
+    /// Liveness/version probe.
+    DaemonHealth,
+    DAEMON_HEALTH,
+    "daemon.health",
+    (),
+    DaemonHealthResult,
+    "null",
+    "DaemonHealthResult";
+
+    /// Start a new agent session.
+    SessionNew,
+    SESSION_NEW,
+    "session.new",
+    SessionNewParams,
+    SessionNewResult,
+    "SessionNewParams",
+    "SessionNewResult";
+
+    /// List sessions.
+    SessionList,
+    SESSION_LIST,
+    "session.list",
+    SessionListParams,
+    Vec<SessionInfo>,
+    "SessionListParams",
+    "SessionInfo[]";
+
+    /// Inspect one session.
+    SessionInspect,
+    SESSION_INSPECT,
+    "session.inspect",
+    SessionId,
+    SessionInfo,
+    "SessionId",
+    "SessionInfo";
+
+    /// Stop one session.
+    SessionStop,
+    SESSION_STOP,
+    "session.stop",
+    SessionId,
+    SessionStopResult,
+    "SessionId",
+    "SessionStopResult";
+
+    /// Relaunch a terminal session from captured native resume metadata.
+    SessionResume,
+    SESSION_RESUME,
+    "session.resume",
+    SessionId,
+    SessionResumeResult,
+    "SessionId",
+    "SessionResumeResult";
+
+    /// Fork a native agent conversation into a new pohunek session.
+    SessionFork,
+    SESSION_FORK,
+    "session.fork",
+    SessionForkParams,
+    SessionForkResult,
+    "SessionForkParams",
+    "SessionForkResult";
+
+    /// Evict a session from the registry, stopping it first if still live.
+    SessionRemove,
+    SESSION_REMOVE,
+    "session.remove",
+    SessionId,
+    SessionRemoveResult,
+    "SessionId",
+    "SessionRemoveResult";
+
+    /// Create an attach stream for a session.
+    SessionAttach,
+    SESSION_ATTACH,
+    "session.attach",
+    SessionAttachParams,
+    SessionAttachResult,
+    "SessionAttachParams",
+    "SessionAttachResult";
+
+    /// Detach an active attach stream.
+    SessionDetach,
+    SESSION_DETACH,
+    "session.detach",
+    SessionDetachParams,
+    SessionDetachResult,
+    "SessionDetachParams",
+    "SessionDetachResult";
+
+    /// Resize a session PTY.
+    SessionResize,
+    SESSION_RESIZE,
+    "session.resize",
+    SessionResizeParams,
+    SessionResizeResult,
+    "SessionResizeParams",
+    "SessionResizeResult";
+
+    /// Inject input into a session PTY.
+    SessionInput,
+    SESSION_INPUT,
+    "session.input",
+    SessionInputParams,
+    SessionInputResult,
+    "SessionInputParams",
+    "SessionInputResult";
+
     /// Subscribe to daemon events.
     Subscribe,
     SUBSCRIBE,
     "subscribe",
     (),
-    serde_json::Value
-);
+    serde_json::Value,
+    "null",
+    "JsonValue";
 
-method_marker!(
     /// Record native session metadata reported by an agent hook.
     SessionReportNativeId,
     SESSION_REPORT_NATIVE_ID,
     "session.report_native_id",
     SessionReportNativeIdParams,
-    SessionReportNativeIdResult
-);
+    SessionReportNativeIdResult,
+    "SessionReportNativeIdParams",
+    "SessionReportNativeIdResult";
 
-method_marker!(
     /// Record active nested-agent metadata reported by an inherited hook.
     SessionReportAgent,
     SESSION_REPORT_AGENT,
     "session.report_agent",
     SessionReportAgentParams,
-    SessionReportAgentResult
-);
+    SessionReportAgentResult,
+    "SessionReportAgentParams",
+    "SessionReportAgentResult";
 
-method_marker!(
     /// Release active nested-agent metadata reported by an inherited hook.
     SessionReleaseAgent,
     SESSION_RELEASE_AGENT,
     "session.release_agent",
     SessionReleaseAgentParams,
-    SessionReleaseAgentResult
-);
+    SessionReleaseAgentResult,
+    "SessionReleaseAgentParams",
+    "SessionReleaseAgentResult";
 
-method_marker!(
     /// Merge owner-controlled metadata for a session.
     SessionSetMetadata,
     SESSION_SET_METADATA,
     "session.set_metadata",
     SessionSetMetadataParams,
-    SessionSetMetadataResult
-);
+    SessionSetMetadataResult,
+    "SessionSetMetadataParams",
+    "SessionSetMetadataResult";
 
-method_marker!(
     /// Set or clear a session's owner-set display name.
     SessionRename,
     SESSION_RENAME,
     "session.rename",
     SessionRenameParams,
-    SessionRenameResult
-);
+    SessionRenameResult,
+    "SessionRenameParams",
+    "SessionRenameResult";
 
-method_marker!(
     /// Install per-agent native-session capture hooks.
     IntegrationInstall,
     INTEGRATION_INSTALL,
     "integration.install",
     IntegrationInstallParams,
-    IntegrationInstallResult
-);
+    IntegrationInstallResult,
+    "IntegrationInstallParams",
+    "IntegrationInstallResult";
 
-method_marker!(
     /// Inspect live host capabilities.
     HostInspect,
     HOST_INSPECT,
     "host.inspect",
     (),
-    HostCapabilities
-);
+    HostCapabilities,
+    "null",
+    "HostCapabilities";
 
-method_marker!(
     /// Materialize the embedded assistant knowledge bundle on the agent host.
     AssistantMaterialize,
     ASSISTANT_MATERIALIZE,
     "assistant.materialize",
     AssistantMaterializeParams,
-    AssistantMaterializeResult
-);
+    AssistantMaterializeResult,
+    "AssistantMaterializeParams",
+    "AssistantMaterializeResult";
 
-method_marker!(
     /// Run daemon-local doctor checks.
     DaemonDoctor,
     DAEMON_DOCTOR,
     "daemon.doctor",
     (),
-    DaemonDoctorResult
-);
+    DaemonDoctorResult,
+    "null",
+    "DaemonDoctorResult";
 
-method_marker!(
     /// Enumerate and classify the local host's `NetBird` peers.
     HostDiscover,
     HOST_DISCOVER,
     "host.discover",
     HostDiscoverParams,
-    Vec<HostRecord>
-);
+    Vec<HostRecord>,
+    "HostDiscoverParams",
+    "HostRecord[]";
 
-method_marker!(
     /// Create a durable notification record.
     NotificationCreate,
     NOTIFICATION_CREATE,
     "notification.create",
     NotificationCreateParams,
-    NotificationCreateResult
-);
+    NotificationCreateResult,
+    "NotificationCreateParams",
+    "NotificationCreateResult";
 
-method_marker!(
     /// List durable notification records.
     NotificationList,
     NOTIFICATION_LIST,
     "notification.list",
     NotificationListParams,
-    NotificationListResult
-);
+    NotificationListResult,
+    "NotificationListParams",
+    "NotificationListResult";
 
-method_marker!(
     /// Update a notification lifecycle status.
     NotificationUpdate,
     NOTIFICATION_UPDATE,
     "notification.update",
     NotificationUpdateParams,
-    NotificationUpdateResult
-);
+    NotificationUpdateResult,
+    "NotificationUpdateParams",
+    "NotificationUpdateResult";
 
-method_marker!(
     /// Delete a notification record.
     NotificationDelete,
     NOTIFICATION_DELETE,
     "notification.delete",
     NotificationDeleteParams,
-    NotificationDeleteResult
-);
+    NotificationDeleteResult,
+    "NotificationDeleteParams",
+    "NotificationDeleteResult";
 
-method_marker!(
     /// Read the notification policy.
     NotificationPolicyGet,
     NOTIFICATION_POLICY_GET,
     "notification.policy.get",
     (),
-    NotificationPolicyResult
-);
+    NotificationPolicyResult,
+    "null",
+    "NotificationPolicyResult";
 
-method_marker!(
     /// Replace the notification policy.
     NotificationPolicySet,
     NOTIFICATION_POLICY_SET,
     "notification.policy.set",
     NotificationPolicyParams,
-    NotificationPolicyResult
-);
+    NotificationPolicyResult,
+    "NotificationPolicyParams",
+    "NotificationPolicyResult";
 
-method_marker!(
     /// Prune notifications through the retention policy.
     NotificationRetentionPrune,
     NOTIFICATION_RETENTION_PRUNE,
     "notification.retention.prune",
     NotificationRetentionParams,
-    NotificationRetentionResult
-);
+    NotificationRetentionResult,
+    "NotificationRetentionParams",
+    "NotificationRetentionResult";
 
-method_marker!(
     /// List known projects on the target host.
     ProjectList,
     PROJECT_LIST,
     "project.list",
     ProjectListParams,
-    Vec<ProjectInfo>
-);
+    Vec<ProjectInfo>,
+    "ProjectListParams",
+    "ProjectInfo[]";
 
-method_marker!(
     /// Register or re-add a project by host-local path.
     ProjectAdd,
     PROJECT_ADD,
     "project.add",
     ProjectAddParams,
-    ProjectInfo
-);
+    ProjectInfo,
+    "ProjectAddParams",
+    "ProjectInfo";
 
-method_marker!(
     /// Show a project plus its live worktrees.
     ProjectShow,
     PROJECT_SHOW,
     "project.show",
     ProjectShowParams,
-    ProjectShowResult
-);
+    ProjectShowResult,
+    "ProjectShowParams",
+    "ProjectShowResult";
 
-method_marker!(
     /// Set a project's custom display name.
     ProjectRename,
     PROJECT_RENAME,
     "project.rename",
     ProjectRenameParams,
-    ProjectInfo
-);
+    ProjectInfo,
+    "ProjectRenameParams",
+    "ProjectInfo";
 
-method_marker!(
     /// Forget a project record, optionally pruning owned worktrees.
     ProjectRemove,
     PROJECT_REMOVE,
     "project.remove",
     ProjectRemoveParams,
-    ProjectRemoveResult
-);
+    ProjectRemoveResult,
+    "ProjectRemoveParams",
+    "ProjectRemoveResult";
 
-method_marker!(
     /// Resolve one prompt by name to template content.
     ProjectPrompt,
     PROJECT_PROMPT,
     "project.prompt",
     ProjectPromptParams,
-    ProjectPromptResult
-);
+    ProjectPromptResult,
+    "ProjectPromptParams",
+    "ProjectPromptResult";
 
-method_marker!(
     /// Resolve one action by name to launch recipe and prompt content.
     ProjectAction,
     PROJECT_ACTION,
     "project.action",
     ProjectActionParams,
-    ProjectActionResult
-);
+    ProjectActionResult,
+    "ProjectActionParams",
+    "ProjectActionResult";
 
-method_marker!(
     /// List available project actions after layer shadowing.
     ProjectActions,
     PROJECT_ACTIONS,
     "project.actions",
     ProjectActionsParams,
-    ProjectActionsResult
-);
+    ProjectActionsResult,
+    "ProjectActionsParams",
+    "ProjectActionsResult";
 
-method_marker!(
     /// Remove one pohunek-owned worktree by path.
     WorktreeRemove,
     WORKTREE_REMOVE,
     "worktree.remove",
     WorktreeRemoveParams,
-    WorktreeRemoveResult
+    WorktreeRemoveResult,
+    "WorktreeRemoveParams",
+    "WorktreeRemoveResult";
 );
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    fn spec(name: &str) -> &'static MethodSpec {
+        METHOD_SPECS
+            .iter()
+            .find(|spec| spec.name == name)
+            .expect("method spec exists")
+    }
+
+    #[test]
+    fn method_specs_pin_special_ts_mappings() {
+        assert_eq!(spec(DAEMON_HEALTH).params_ts, "null");
+        assert_eq!(spec(DAEMON_HEALTH).output_ts, "DaemonHealthResult");
+        assert_eq!(spec(SUBSCRIBE).params_ts, "null");
+        assert_eq!(spec(SUBSCRIBE).output_ts, "JsonValue");
+        assert_eq!(spec(SESSION_LIST).params_ts, "SessionListParams");
+        assert_eq!(spec(SESSION_LIST).output_ts, "SessionInfo[]");
+        assert_eq!(spec(HOST_DISCOVER).output_ts, "HostRecord[]");
+    }
+
+    #[test]
+    fn method_specs_have_unique_wire_names() {
+        let mut names = BTreeSet::new();
+        for spec in METHOD_SPECS {
+            assert!(
+                names.insert(spec.name),
+                "duplicate method spec {}",
+                spec.name
+            );
+        }
+        assert_eq!(names.len(), METHOD_SPECS.len());
+    }
+}

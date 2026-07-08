@@ -30,7 +30,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use futures::{SinkExt, StreamExt};
-use protocol::{Event, Response};
+use protocol::{Event, Response, MAX_CONTROL_LINE_BYTES};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::broadcast;
@@ -61,17 +61,6 @@ const DIR_MODE: u32 = 0o700;
 /// limiting read/write to the owner keeps other local users off the control
 /// plane.
 const SOCKET_MODE: u32 = 0o600;
-/// Max accepted control line length, in bytes (1 MiB).
-///
-/// Control traffic is line-framed JSON, so without a cap a malicious or buggy
-/// client could stream a single unterminated line and force the codec to
-/// buffer it without bound, exhausting memory for that connection. This cap
-/// bounds per-connection memory while staying generous: legitimate control
-/// envelopes are small, and raw terminal bytes travel on the separate attach
-/// path rather than through this framed channel, so 1 MiB comfortably covers
-/// the largest real control message.
-const MAX_LINE_BYTES: usize = 1024 * 1024;
-
 /// The bound control server, ready to accept connections.
 #[derive(Debug)]
 pub struct ControlServer {
@@ -315,7 +304,7 @@ async fn serve_connection<S>(stream: S, state: DaemonState) -> Result<(), io::Er
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let codec = LinesCodec::new_with_max_length(MAX_LINE_BYTES);
+    let codec = LinesCodec::new_with_max_length(MAX_CONTROL_LINE_BYTES);
     let mut framed = Framed::new(stream, codec);
 
     while let Some(line) = framed.next().await {

@@ -22,6 +22,8 @@ use crate::version::ProtocolVersion;
 /// host, and, when known, the resolved path to it. The shell runtime is always
 /// available and typically carries no path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "AgentRuntime.ts"))]
 pub struct AgentRuntime {
     /// Agent profile or built-in base name this runtime entry describes.
     pub agent: String,
@@ -29,6 +31,7 @@ pub struct AgentRuntime {
     pub available: bool,
     /// Resolved path to the agent binary, when one was found.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub path: Option<String>,
 }
 
@@ -37,6 +40,8 @@ pub struct AgentRuntime {
 /// Built fresh on each request from the host's running daemon and a probe of its
 /// `PATH`; it is never cached, so it always reflects the host as it is now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "HostCapabilities.ts"))]
 pub struct HostCapabilities {
     /// Version string of the daemon answering on the host.
     pub daemon_version: String,

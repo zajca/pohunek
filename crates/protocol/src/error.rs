@@ -15,6 +15,8 @@ use crate::version::ProtocolVersion;
 /// Serialized in lowercase snake form on the wire (e.g. `"daemon"`). Mirrors the
 /// distinctions in `docs/architecture.md` "Error Handling".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ErrorClass.ts"))]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorClass {
     /// Missing or invalid required configuration.
@@ -52,6 +54,8 @@ impl std::fmt::Display for ErrorClass {
 /// Machine codes are stable strings; see the constructors for the canonical
 /// ones used in Phase 1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProtocolError.ts"))]
 #[error("{class}/{code}: {msg}")]
 pub struct ProtocolError {
     /// Broad category, for coarse branching.
@@ -62,6 +66,7 @@ pub struct ProtocolError {
     pub msg: String,
     /// Optional suggested recovery action (e.g. "install claude").
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub recover: Option<String>,
 }
 

@@ -12,15 +12,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    event, AgentActivity, AgentKind, CwdSource, ErrorClass, Event, ProjectRemoveResult,
-    ProtocolError, SessionAttachParams, SessionForkParams, SessionId, SessionInfo,
-    SessionInputParams, SessionInputResult, SessionNewParams, SessionReleaseAgentParams,
-    SessionReleaseAgentResult, SessionRemoveResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWarning, StateSource,
-    WorktreeRemoveResult, PROTOCOL_VERSION,
+    event, AgentActivity, AgentKind, AgentStateEvent, AttachEvent, CwdSource, ErrorClass, Event,
+    ProjectRemoveResult, ProtocolError, SessionAttachParams, SessionEvent, SessionForkParams,
+    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionNewParams,
+    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionSetMetadataResult, SessionState, SessionStopResult,
+    SessionWarning, StateSource, WorktreeRemoveResult, PROTOCOL_VERSION,
 };
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, watch, Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -1174,10 +1174,10 @@ impl SessionRegistry {
         if let Some(activity) = reported_activity {
             let event = Event::new(
                 event::AGENT_STATE,
-                json!({
-                    "session_id": params.session_id,
-                    "activity": activity,
-                    "source": StateSource::Report,
+                event_payload(AgentStateEvent {
+                    session_id: params.session_id.clone(),
+                    activity,
+                    source: StateSource::Report,
                 }),
             );
             let _ = self.inner.events.send(event);
@@ -1969,9 +1969,21 @@ impl SessionRegistry {
     }
 
     fn emit(&self, name: &str, info: &SessionInfo) {
-        let event = Event::new(name, json!({ "session": info }));
+        let event = Event::new(
+            name,
+            event_payload(SessionEvent {
+                session: info.clone(),
+            }),
+        );
         let _ = self.inner.events.send(event);
     }
+}
+
+fn event_payload<T>(payload: T) -> Value
+where
+    T: serde::Serialize,
+{
+    serde_json::to_value(payload).expect("protocol event payload serialization is infallible")
 }
 
 fn apply_cwd_change(

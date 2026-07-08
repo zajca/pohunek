@@ -1,0 +1,10 @@
+{
+  "err": {
+    "class": "runtime",
+    "code": "agent_binary_missing",
+    "msg": "agent binary not found on PATH: codex",
+    "recover": "install the codex CLI and ensure it is on PATH; run `pohunek doctor` to verify"
+  },
+  "id": "req-fixture-1",
+  "v": 1
+}

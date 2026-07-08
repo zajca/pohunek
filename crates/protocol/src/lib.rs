@@ -26,6 +26,7 @@ mod doctor;
 mod envelope;
 mod error;
 mod integration;
+mod limits;
 pub mod method;
 mod notification;
 mod project;
@@ -53,6 +54,8 @@ pub use integration::{
     ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
 #[doc(inline)]
+pub use limits::MAX_CONTROL_LINE_BYTES;
+#[doc(inline)]
 pub use method::Method;
 #[doc(inline)]
 pub use notification::{
@@ -74,10 +77,10 @@ pub use project::{
 };
 #[doc(inline)]
 pub use session::{
-    AgentActivity, AgentKind, AttachHeader, CwdSource, ForkCwdMode, SessionAttachParams,
-    SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionForkParams,
-    SessionForkResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionListFilter, SessionListParams, SessionNewParams, SessionNewResult,
+    AgentActivity, AgentKind, AgentStateEvent, AttachEvent, AttachHeader, CwdSource, ForkCwdMode,
+    SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult,
+    SessionEvent, SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams, SessionNewResult,
     SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams,
     SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
     SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
@@ -92,14 +95,78 @@ pub use version::{negotiate, ProtocolVersion, PROTOCOL_VERSION};
 /// These are the `event` values published on subscription connections. The
 /// payload remains an open JSON object at the envelope layer.
 pub mod event {
-    pub const AGENT_STATE: &str = "agent_state";
-    pub const ATTACH_OPENED: &str = "attach_opened";
-    pub const ATTACH_CLOSED: &str = "attach_closed";
-    pub const NOTIFICATION_CREATED: &str = "notification_created";
-    pub const NOTIFICATION_UPDATED: &str = "notification_updated";
-    pub const NOTIFICATION_DELETED: &str = "notification_deleted";
-    pub const SESSION_CREATED: &str = "session_created";
-    pub const SESSION_UPDATED: &str = "session_updated";
-    pub const SESSION_STOPPED: &str = "session_stopped";
-    pub const SESSION_REMOVED: &str = "session_removed";
+    /// Static TypeScript metadata for one protocol event payload.
+    ///
+    /// `cargo xtask ts generate` consumes this table to emit the discriminated
+    /// event union from the same source that declares the wire event names.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct EventSpec {
+        /// Wire event name.
+        pub name: &'static str,
+        /// TypeScript payload type exported by the generated protocol bindings.
+        pub payload_ts: &'static str,
+    }
+
+    const fn payload_ts<T>(name: &'static str) -> &'static str {
+        let _ = core::mem::size_of::<Option<fn() -> T>>();
+        name
+    }
+
+    macro_rules! event_table {
+        (
+            $(
+                $constant:ident,
+                $name:literal,
+                $payload:ty,
+                $payload_ts:literal
+            );+ $(;)?
+        ) => {
+            $(
+                pub const $constant: &str = $name;
+            )+
+
+            /// Event metadata used by TypeScript binding generation.
+            pub const EVENT_SPECS: &[EventSpec] = &[
+                $(
+                    EventSpec {
+                        name: $constant,
+                        payload_ts: payload_ts::<$payload>($payload_ts),
+                    },
+                )+
+            ];
+        };
+    }
+
+    event_table!(
+        AGENT_STATE, "agent_state", crate::AgentStateEvent, "AgentStateEvent";
+        ATTACH_OPENED, "attach_opened", crate::AttachEvent, "AttachEvent";
+        ATTACH_CLOSED, "attach_closed", crate::AttachEvent, "AttachEvent";
+        NOTIFICATION_CREATED, "notification_created", crate::NotificationCreatedEvent, "NotificationCreatedEvent";
+        NOTIFICATION_UPDATED, "notification_updated", crate::NotificationUpdatedEvent, "NotificationUpdatedEvent";
+        NOTIFICATION_DELETED, "notification_deleted", crate::NotificationDeletedEvent, "NotificationDeletedEvent";
+        SESSION_CREATED, "session_created", crate::SessionEvent, "SessionEvent";
+        SESSION_UPDATED, "session_updated", crate::SessionEvent, "SessionEvent";
+        SESSION_STOPPED, "session_stopped", crate::SessionEvent, "SessionEvent";
+        SESSION_REMOVED, "session_removed", crate::SessionEvent, "SessionEvent";
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use std::collections::BTreeSet;
+
+        use super::*;
+
+        #[test]
+        fn event_specs_have_unique_wire_names() {
+            let mut names = BTreeSet::new();
+            for spec in EVENT_SPECS {
+                assert!(
+                    names.insert(spec.name),
+                    "duplicate event spec {}",
+                    spec.name
+                );
+            }
+            assert_eq!(names.len(), EVENT_SPECS.len());
+        }
+    }
 }

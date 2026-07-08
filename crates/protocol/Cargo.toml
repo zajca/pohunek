@@ -10,10 +10,14 @@ description = "Shared control-protocol envelopes and version negotiation for poh
 name = "protocol"
 path = "src/lib.rs"
 
+[features]
+ts = ["dep:ts-rs"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+ts-rs = { version = "12", optional = true, features = ["serde-json-impl", "format"] }
 
 [lints]
 workspace = true

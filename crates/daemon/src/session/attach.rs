@@ -1,9 +1,9 @@
 //! Raw attach stream tokens, redemption, and lifecycle.
 
 use super::{
-    debug, event, json, session_not_found, session_not_running, AtomicU64, CancellationToken,
-    ErrorClass, Event, Ordering, ProtocolError, PtyHandle, SessionAttachParams, SessionId,
-    SessionRegistry, SessionState, SystemTime, UNIX_EPOCH,
+    debug, event, event_payload, session_not_found, session_not_running, AtomicU64, AttachEvent,
+    CancellationToken, ErrorClass, Event, Ordering, ProtocolError, PtyHandle, SessionAttachParams,
+    SessionId, SessionRegistry, SessionState, SystemTime, UNIX_EPOCH,
 };
 
 #[derive(Debug, Clone)]
@@ -188,9 +188,9 @@ impl SessionRegistry {
     fn emit_attach(&self, name: &str, session_id: &SessionId, stream_id: &str) {
         let event = Event::new(
             name,
-            json!({
-                "session_id": session_id,
-                "stream_id": stream_id,
+            event_payload(AttachEvent {
+                session_id: session_id.clone(),
+                stream_id: stream_id.to_owned(),
             }),
         );
         let _ = self.inner.events.send(event);

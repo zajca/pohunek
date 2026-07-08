@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 /// the rofi switcher) can branch on it, e.g.
 /// `{"classification":"reachable_daemon","daemon_version":"0.1.0"}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "HostClass.ts"))]
 #[serde(rename_all = "snake_case", tag = "classification")]
 pub enum HostClass {
     /// A compatible daemon answered with our protocol version.
@@ -46,6 +48,8 @@ pub enum HostClass {
 /// Field order and names are part of the wire contract the rofi switcher parses
 /// (`name`, `netbird_ip`, and the flattened `classification`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "HostRecord.ts"))]
 pub struct HostRecord {
     /// Short host name (first DNS label of the fqdn), when derivable.
     pub name: Option<String>,
@@ -63,6 +67,8 @@ pub struct HostRecord {
 /// `force` bypasses the daemon's discovery cache and re-probes immediately;
 /// omitted/false returns the cached snapshot when it is still fresh.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "HostDiscoverParams.ts"))]
 pub struct HostDiscoverParams {
     /// Skip the cache and re-probe now.
     #[serde(default)]

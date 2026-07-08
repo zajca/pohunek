@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 
 /// Parameters for `assistant.materialize`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "AssistantMaterializeParams.ts")
+)]
 pub struct AssistantMaterializeParams {
     /// Redacted live snapshot JSON to persist beside the materialized bundle.
     pub snapshot: String,
@@ -11,6 +16,11 @@ pub struct AssistantMaterializeParams {
 
 /// Result returned by `assistant.materialize`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "AssistantMaterializeResult.ts")
+)]
 pub struct AssistantMaterializeResult {
     /// Host-local path to the materialized assistant knowledge bundle.
     pub bundle_path: String,
@@ -29,6 +39,8 @@ pub struct AssistantMaterializeResult {
 /// This mirrors the allowlisted knowledge bundle index fields without depending
 /// on the knowledge crate, keeping the protocol contract self-contained.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ConceptMeta.ts"))]
 pub struct ConceptMeta {
     /// Concept type from the knowledge frontmatter.
     #[serde(rename = "type")]
@@ -41,15 +53,19 @@ pub struct ConceptMeta {
     pub description: String,
     /// Assistant intents this concept can support.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub intents: Option<Vec<ConceptIntent>>,
     /// First Pohunek version this concept applies to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub since: Option<String>,
     /// Last Pohunek version where this concept changed materially.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub changed_in: Option<Vec<String>>,
     /// Whether the concept is deprecated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub deprecated: Option<ConceptDeprecation>,
 }
 
@@ -58,6 +74,8 @@ pub struct ConceptMeta {
 /// Mirrors `knowledge::ConceptType`; the two are bridged in the knowledge
 /// crate's `protocol_conversions.rs` and guarded by a parity test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ConceptType.ts"))]
 #[serde(rename_all = "PascalCase")]
 pub enum ConceptType {
     /// General explanatory concept.
@@ -92,6 +110,8 @@ pub enum ConceptType {
 
 /// Protocol-local copy of assistant intent names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ConceptIntent.ts"))]
 #[serde(rename_all = "kebab-case")]
 pub enum ConceptIntent {
     Setup,
@@ -103,12 +123,15 @@ pub enum ConceptIntent {
 
 /// Deprecation metadata exposed for concepts that describe retired behavior.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ConceptDeprecation.ts"))]
 #[serde(untagged)]
 pub enum ConceptDeprecation {
     Version(String),
     Details {
         version: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         successor: Option<String>,
     },
 }

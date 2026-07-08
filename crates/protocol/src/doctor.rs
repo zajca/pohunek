@@ -6,6 +6,8 @@ use crate::version::ProtocolVersion;
 
 /// Outcome of a single doctor check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "DoctorStatus.ts"))]
 #[serde(rename_all = "snake_case")]
 pub enum DoctorStatus {
     /// Check passed.
@@ -30,6 +32,8 @@ impl DoctorStatus {
 
 /// One reported doctor check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "DoctorCheck.ts"))]
 pub struct DoctorCheck {
     /// Short check name.
     pub name: String,
@@ -52,6 +56,8 @@ impl DoctorCheck {
 
 /// Aggregated doctor report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "DoctorReport.ts"))]
 pub struct DoctorReport {
     /// Individual checks that were run.
     pub checks: Vec<DoctorCheck>,
@@ -76,6 +82,8 @@ impl DoctorReport {
 
 /// Result returned by `daemon.health`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "DaemonHealthResult.ts"))]
 pub struct DaemonHealthResult {
     /// Liveness status. Current daemons return `"ok"`.
     pub status: String,
@@ -87,6 +95,8 @@ pub struct DaemonHealthResult {
 
 /// Result returned by `daemon.doctor`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "DaemonDoctorResult.ts"))]
 pub struct DaemonDoctorResult {
     /// Full doctor report produced by the daemon.
     pub report: DoctorReport,
