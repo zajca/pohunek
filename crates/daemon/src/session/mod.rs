@@ -13,12 +13,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::{
     event, AgentActivity, AgentKind, CwdSource, ErrorClass, Event, ProjectRemoveResult,
-    ProtocolError, SessionAttachParams, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionNewParams, SessionReleaseAgentParams, SessionReleaseAgentResult,
-    SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
-    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionSetMetadataResult,
-    SessionState, SessionStopResult, SessionWarning, StateSource, WorktreeRemoveResult,
-    PROTOCOL_VERSION,
+    ProtocolError, SessionAttachParams, SessionForkParams, SessionId, SessionInfo,
+    SessionInputParams, SessionInputResult, SessionNewParams, SessionReleaseAgentParams,
+    SessionReleaseAgentResult, SessionRemoveResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWarning, StateSource,
+    WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, watch, Mutex, Notify};
@@ -27,9 +27,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::agent::{
-    adapter_for, agent_not_resumable, base_resume_template, build_pty_command, default_program,
-    launch_adapter_for, resume_pty_command_from_template, AgentAdapter, InputRules, LaunchOpts,
-    ProfileRegistry, ResolvedAgent, ResumeTemplate, SessionRef, SessionRefKind,
+    adapter_for, agent_fork_unsupported, agent_not_resumable, base_resume_template,
+    build_pty_command, default_program, fork_pty_command_from_template, launch_adapter_for,
+    resume_pty_command_from_template, AgentAdapter, InputRules, LaunchOpts, ProfileRegistry,
+    ResolvedAgent, ResumeTemplate, SessionRef, SessionRefKind,
 };
 use crate::detect::{identify_agent, ActivityTransition, Detector, DetectorConfig, Manifest};
 use crate::external::{

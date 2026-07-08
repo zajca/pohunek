@@ -121,6 +121,11 @@ fn session_actions<'a>(
                     .style(iced::widget::button::primary),
             )
             .push(
+                button("Fork")
+                    .on_press(Message::ForkSelectedSession)
+                    .style(iced::widget::button::secondary),
+            )
+            .push(
                 button("Stop")
                     .on_press(Message::StopSelectedSession)
                     .style(iced::widget::button::danger),

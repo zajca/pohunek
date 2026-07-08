@@ -704,6 +704,18 @@ enum SessionAction {
         json: bool,
     },
 
+    /// Fork an agent conversation into a new session.
+    Fork {
+        /// Source session target: `session-id` or `local/session-id`.
+        target: Target,
+        /// Owner-set display name for the forked session.
+        #[arg(long)]
+        name: Option<String>,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Remove one session from the daemon, stopping it first if still live.
     Rm {
         /// Session target: `session-id` or `local/session-id`.
@@ -887,6 +899,7 @@ impl SessionAction {
             | SessionAction::List { json, .. }
             | SessionAction::Inspect { json, .. }
             | SessionAction::Stop { json, .. }
+            | SessionAction::Fork { json, .. }
             | SessionAction::Rm { json, .. }
             | SessionAction::Input { json, .. }
             | SessionAction::Rename { json, .. } => *json,
@@ -1030,6 +1043,10 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 SessionAction::Stop { target, json } => {
                     let host = effective_host(&global_host, Some(&target));
                     commands::session::run_stop(&host, &paths, &target, json).await?;
+                }
+                SessionAction::Fork { target, name, json } => {
+                    let host = effective_host(&global_host, Some(&target));
+                    commands::session::run_fork(&host, &paths, &target, name, json).await?;
                 }
                 SessionAction::Rm { target, json } => {
                     let host = effective_host(&global_host, Some(&target));
@@ -1632,6 +1649,32 @@ mod tests {
                 assert_eq!(target.host.as_deref(), Some("local"));
                 assert_eq!(text, "write tests first");
                 assert!(!json, "json defaults to false");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_session_fork_target_name_and_json_flag() {
+        let cli = Cli::try_parse_from([
+            "pohunek",
+            "session",
+            "fork",
+            "host-a/s-42",
+            "--name",
+            "forked review",
+            "--json",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Commands::Session {
+                action: SessionAction::Fork { target, name, json },
+            } => {
+                assert_eq!(target.session_id, "s-42");
+                assert_eq!(target.host.as_deref(), Some("host-a"));
+                assert_eq!(name.as_deref(), Some("forked review"));
+                assert!(json);
             }
             other => panic!("unexpected command: {other:?}"),
         }

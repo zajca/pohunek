@@ -29,6 +29,8 @@ static CLAUDE_ADAPTER: ClaudeAdapter = ClaudeAdapter;
 
 /// Default submit delay for Claude Code's Ink TUI.
 pub const DEFAULT_CLAUDE_SUBMIT_DELAY: Duration = Duration::from_millis(150);
+/// Claude Code flag that forks a resumed native conversation into a new branch.
+const CLAUDE_FORK_SESSION_ARG: &str = "--fork-session";
 
 /// Options supplied by the session registry when launching an agent process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +186,18 @@ impl ResumeMode {
             ResumeMode::Subcommand => vec!["resume".to_owned(), value.to_owned()],
         }
     }
+
+    /// Build the fork argv (excluding `argv[0]`) for `value`.
+    fn fork_argv(self, value: &str) -> Option<Vec<String>> {
+        match self {
+            ResumeMode::Flag => {
+                let mut args = self.argv(value);
+                args.push(CLAUDE_FORK_SESSION_ARG.to_owned());
+                Some(args)
+            }
+            ResumeMode::Subcommand => None,
+        }
+    }
 }
 
 /// The resolved "how to resume" for a session: the argv mode plus which native
@@ -298,12 +312,39 @@ pub(crate) fn resume_pty_command_from_template(
     build_pty_command(program, args, opts)
 }
 
+/// Build the PTY command that forks a native session from a frozen snapshot.
+pub(crate) fn fork_pty_command_from_template(
+    agent: &str,
+    program: &str,
+    frozen_args: Vec<String>,
+    template: ResumeTemplate,
+    session_ref: &SessionRef,
+    opts: &LaunchOpts,
+) -> Result<PtyCommand, ProtocolError> {
+    let mut args = frozen_args;
+    let fork_args = template
+        .mode
+        .fork_argv(session_ref.value())
+        .ok_or_else(|| agent_fork_unsupported(agent))?;
+    args.extend(fork_args);
+    build_pty_command(program, args, opts)
+}
+
 pub(crate) fn agent_not_resumable(agent: &str) -> ProtocolError {
     ProtocolError::new(
         ErrorClass::Runtime,
         "agent_not_resumable",
         format!("{agent} sessions cannot be resumed"),
         None,
+    )
+}
+
+pub(crate) fn agent_fork_unsupported(agent: &str) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Runtime,
+        "agent_fork_unsupported",
+        format!("{agent} sessions cannot be forked by this daemon"),
+        Some("forking is currently supported only for Claude-backed sessions".to_owned()),
     )
 }
 

@@ -575,6 +575,13 @@ impl Workspace {
                 let session = result.session;
                 host.sessions.insert(session.id.0.clone(), session);
             }
+            DomainEvent::SessionForked { host_id, result } => {
+                let Some(host) = self.host_mut_if_known(&host_id, "session fork result") else {
+                    return;
+                };
+                let session = result.session;
+                host.sessions.insert(session.id.0.clone(), session);
+            }
             DomainEvent::SessionStopCompleted {
                 host_id,
                 session_id,
@@ -1908,6 +1915,34 @@ mod tests {
 
         let host = workspace.hosts.get(&HostId::new("local")).expect("host");
         let session = host.sessions.get("s-1").expect("resumed session");
+        assert_eq!(session.state, SessionState::Running);
+        assert_eq!(session.pid, 99);
+    }
+
+    #[test]
+    fn session_forked_inserts_new_session_snapshot() {
+        let mut source = session("s-1", None);
+        source.state = SessionState::Running;
+        let mut forked = source.clone();
+        forked.id = SessionId("s-2".to_owned());
+        forked.pid = 99;
+
+        let mut workspace = Workspace::default();
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
+            snapshot: snapshot("local", vec![source]),
+        });
+
+        workspace.apply(DomainEvent::SessionForked {
+            host_id: HostId::new("local"),
+            result: protocol::SessionForkResult {
+                session: forked,
+                applied_input: None,
+            },
+        });
+
+        let host = workspace.hosts.get(&HostId::new("local")).expect("host");
+        assert!(host.sessions.contains_key("s-1"));
+        let session = host.sessions.get("s-2").expect("forked session");
         assert_eq!(session.state, SessionState::Running);
         assert_eq!(session.pid, 99);
     }

@@ -9,10 +9,10 @@ use protocol::{
     NotificationUpdateResult, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
     ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams, ProjectPromptParams,
     ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
-    ProjectShowParams, ProjectShowResult, SessionId, SessionInfo, SessionListParams,
-    SessionNewParams, SessionNewResult, SessionRemoveResult, SessionRenameParams,
-    SessionRenameResult, SessionResumeResult, SessionSetMetadataParams, SessionSetMetadataResult,
-    SessionStopResult, WorktreeRemoveParams, WorktreeRemoveResult,
+    ProjectShowParams, ProjectShowResult, SessionForkParams, SessionForkResult, SessionId,
+    SessionInfo, SessionListParams, SessionNewParams, SessionNewResult, SessionRemoveResult,
+    SessionRenameParams, SessionRenameResult, SessionResumeResult, SessionSetMetadataParams,
+    SessionSetMetadataResult, SessionStopResult, WorktreeRemoveParams, WorktreeRemoveResult,
 };
 
 use crate::connection::connect_client;
@@ -87,6 +87,23 @@ pub async fn resume_session_with_options(
     options: ConnectionOptions,
 ) -> Result<SessionResumeResult, CoreError> {
     call_host::<method::SessionResume>(config, options, session_id.clone()).await
+}
+
+/// Fork a session's native agent conversation on a host through the SDK.
+pub async fn fork_session(
+    config: &HostConfig,
+    params: SessionForkParams,
+) -> Result<SessionForkResult, CoreError> {
+    fork_session_with_options(config, params, ConnectionOptions::default()).await
+}
+
+/// Fork a session with explicit connection options.
+pub async fn fork_session_with_options(
+    config: &HostConfig,
+    params: SessionForkParams,
+    options: ConnectionOptions,
+) -> Result<SessionForkResult, CoreError> {
+    call_host::<method::SessionFork>(config, options, params).await
 }
 
 /// Stop a session on a host through the SDK.

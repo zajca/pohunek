@@ -19,10 +19,10 @@ use crate::{
     ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams, ProjectPromptParams,
     ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
     ProjectShowParams, ProjectShowResult, SessionAttachParams, SessionAttachResult,
-    SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult,
-    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams,
-    SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionDetachParams, SessionDetachResult, SessionForkParams, SessionForkResult, SessionId,
+    SessionInfo, SessionInputParams, SessionInputResult, SessionListParams, SessionNewParams,
+    SessionNewResult, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    SessionRenameParams, SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
     SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
     SessionResizeResult, SessionResumeResult, SessionSetMetadataParams, SessionSetMetadataResult,
     SessionStopResult, WorktreeRemoveParams, WorktreeRemoveResult,
@@ -114,6 +114,15 @@ method_marker!(
     "session.resume",
     SessionId,
     SessionResumeResult
+);
+
+method_marker!(
+    /// Fork a native agent conversation into a new pohunek session.
+    SessionFork,
+    SESSION_FORK,
+    "session.fork",
+    SessionForkParams,
+    SessionForkResult
 );
 
 method_marker!(

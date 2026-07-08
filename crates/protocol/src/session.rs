@@ -120,6 +120,32 @@ pub struct SessionNewParams {
     pub metadata: BTreeMap<String, String>,
 }
 
+/// Working-directory policy for `session.fork`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkCwdMode {
+    /// Launch the fork in the source session's current worktree or directory.
+    #[default]
+    Same,
+}
+
+/// Parameters for `session.fork`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionForkParams {
+    /// Source session whose native agent conversation should be forked.
+    pub session_id: SessionId,
+    /// Owner-set display name for the forked session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Working-directory policy for the fork.
+    #[serde(default)]
+    pub cwd_mode: ForkCwdMode,
+    /// Initial terminal width in columns.
+    pub cols: u16,
+    /// Initial terminal height in rows.
+    pub rows: u16,
+}
+
 /// Parameters for `session.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SessionListParams {
@@ -584,6 +610,17 @@ pub struct SessionNewResult {
     /// `Some(true)` when the daemon applied an initial `input` in this same
     /// round-trip; absent when no initial input was requested or the daemon does
     /// not support it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_input: Option<bool>,
+}
+
+/// Result returned by `session.fork`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionForkResult {
+    /// The freshly forked session.
+    #[serde(flatten)]
+    pub session: SessionInfo,
+    /// Reserved for parity with session-creation flows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_input: Option<bool>,
 }
