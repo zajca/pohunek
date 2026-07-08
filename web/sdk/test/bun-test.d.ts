@@ -14,7 +14,12 @@ declare module "bun:test" {
     <T>(actual: T): Matchers;
   }
 
+  export interface Test {
+    (name: string, fn: () => void | Promise<void>, timeout?: number): void;
+    skip(name: string, fn?: () => void | Promise<void>, timeout?: number): void;
+  }
+
   export const expect: Expect;
   export function describe(name: string, fn: () => void): void;
-  export function test(name: string, fn: () => void | Promise<void>): void;
+  export const test: Test;
 }

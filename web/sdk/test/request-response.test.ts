@@ -212,6 +212,32 @@ describe("Client request/response", () => {
     });
   });
 
+  test("close shuts down the control channel and prevents later requests", async () => {
+    const daemon = await startUnixDaemon([
+      {
+        kind: "reply",
+        line: (requestLine) =>
+          okResponseLine(requestIdFromLine(requestLine), {
+            status: "ok",
+            daemon_version: "0.0.0-test",
+            protocol_version: PROTOCOL_VERSION,
+          }),
+      },
+    ]);
+    try {
+      const client = await connectClient(daemon);
+
+      await client.close();
+      const error = await expectClientError(client.call("daemon.health", null));
+
+      expect(error.toProtocolError().class).toBe("transport");
+      expect(error.toProtocolError().code).toBe("framing");
+      await daemon.expectNoRequest(50);
+    } finally {
+      await daemon.close();
+    }
+  });
+
   test("local daemon unreachable maps to daemon_unreachable with recovery hint", async () => {
     const clientPromise = Client.connectLocal("/tmp/pohunek-sdk-missing-daemon.sock");
 

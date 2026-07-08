@@ -66,6 +66,56 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
 
+      - name: TS binding drift
+        run: cargo xtask ts check
+        env:
+          RUSTFLAGS: -D warnings
+
+  web:
+    name: web SDK + relay
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: web
+
+      - name: Install web dependencies
+        working-directory: web
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck web
+        working-directory: web
+        run: bun run typecheck
+
+      - name: Lint web
+        working-directory: web
+        run: bun run lint
+
+      - name: Test web
+        working-directory: web
+        run: bun test
+
+      - name: Build daemon for web e2e
+        run: cargo build -p pohunek-daemon
+
+      - name: Web e2e against real daemon
+        working-directory: web
+        run: bun test sdk/test/e2e.test.ts
+        env:
+          POHUNEK_E2E: "1"
+          POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
+
   # Dependency hygiene (M-STATIC-VERIFICATION): security advisories, the Cargo
   # feature matrix, and unused dependencies. Kept off the critical `test` job so
   # an advisory in a transitive crate stays visible without masking a real

@@ -18,6 +18,7 @@ export class Client {
   private readonly remoteHost: string | undefined;
   private poisoned: string | undefined;
   private consumed = false;
+  private closed = false;
 
   private constructor(channel: ControlChannel, options: ResolvedConnectOptions, remoteHost?: string) {
     this.channel = channel;
@@ -114,6 +115,14 @@ export class Client {
     return new Subscription(this.channel, this.remoteHost);
   }
 
+  public async close(): Promise<void> {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    await this.channel.close();
+  }
+
   public static async connectTransport(
     transport: Transport,
     opts?: ConnectOptions,
@@ -125,6 +134,9 @@ export class Client {
   }
 
   private ensureUsable(): void {
+    if (this.closed) {
+      throw ClientError.framing("connection is closed");
+    }
     if (this.consumed) {
       throw ClientError.framing("connection is unusable: subscription consumed the control channel");
     }
