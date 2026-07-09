@@ -39,6 +39,9 @@ interface RelayWebSocketData {
   // one `once("drain")` listener each (unbounded listener growth + unbounded
   // socket buffering); chaining bounds both to a single in-flight write.
   writeChain: Promise<void>;
+  // Bytes queued client->daemon but not yet written. Bounded so a fast client
+  // against a slow daemon target cannot grow the write chain without limit.
+  pendingWriteBytes: number;
 }
 
 interface BunServeOptions<TData> {
@@ -49,6 +52,7 @@ interface BunServeOptions<TData> {
     open(ws: BunServerWebSocket<TData>): void;
     message(ws: BunServerWebSocket<TData>, message: BunWebSocketMessage): void;
     close(ws: BunServerWebSocket<TData>): void;
+    drain(ws: BunServerWebSocket<TData>): void;
   };
 }
 
@@ -62,6 +66,7 @@ interface BunServerWebSocket<TData> {
   readonly data: TData;
   readonly readyState: number;
   send(message: string | Uint8Array): number | boolean;
+  getBufferedAmount(): number;
   close(code?: number, reason?: string): void;
 }
 
@@ -80,6 +85,16 @@ const POLICY_CLOSE_CODE = 1008;
 const INTERNAL_CLOSE_CODE = 1011;
 const LINE_FEED = 0x0a;
 const CONTROL_FRAME_DELIMITER = Uint8Array.of(LINE_FEED);
+
+// daemon->client backpressure: once the WebSocket's outbound buffer exceeds this
+// many bytes, stop reading from the daemon socket until the `drain` callback
+// fires. This keeps the WS send buffer well under Bun's internal backpressure
+// limit (past which frames are silently dropped) without ever losing data.
+const WS_SEND_HIGH_WATER_BYTES = 1024 * 1024;
+// client->daemon backpressure bound: cap the bytes queued but not yet written to
+// the daemon socket. A fast client against a slow daemon target that exceeds
+// this is closed fail-closed rather than allowed to grow memory without limit.
+const DAEMON_WRITE_QUEUE_CAP_BYTES = 8 * 1024 * 1024;
 
 const RESPONSE_NOT_FOUND = new Response("unknown relay target", { status: 404 });
 const RESPONSE_UPGRADE_REQUIRED = new Response("websocket upgrade required", { status: 426 });
@@ -123,6 +138,7 @@ export function startRelay(options: StartRelayOptions): Promise<RelayHandle> {
             controlBuffer: [],
             closed: false,
             writeChain: Promise.resolve(),
+            pendingWriteBytes: 0,
           },
         });
         return upgraded ? undefined : RESPONSE_BAD_UPGRADE;
@@ -133,6 +149,11 @@ export function startRelay(options: StartRelayOptions): Promise<RelayHandle> {
         },
         message(ws, message): void {
           handleClientMessage(ws, message);
+        },
+        drain(ws): void {
+          // The client's WebSocket send buffer drained; resume reading daemon
+          // output that daemon->client backpressure had paused.
+          ws.data.socket?.resume();
         },
         close(ws): void {
           closeTunnel(ws.data, NORMAL_CLOSE_CODE, "websocket closed");
@@ -164,7 +185,8 @@ function openTunnel(ws: BunServerWebSocket<RelayWebSocketData>): void {
     }
     sendBinaryFrame(ws, new Uint8Array(chunk));
   });
-  socket.once("error", (): void => {
+  socket.once("error", (error: Error): void => {
+    logRelayError(ws.data, "daemon connection failed", error);
     closeTunnel(ws.data, INTERNAL_CLOSE_CODE, "daemon connection failed", ws);
   });
   socket.once("end", (): void => {
@@ -240,6 +262,18 @@ function queueDaemonWrite(
   socket: Socket,
   chunks: readonly Uint8Array[],
 ): void {
+  let queued = 0;
+  for (const chunk of chunks) {
+    queued += chunk.byteLength;
+  }
+  ws.data.pendingWriteBytes += queued;
+  if (ws.data.pendingWriteBytes > DAEMON_WRITE_QUEUE_CAP_BYTES) {
+    // Fail closed rather than let a fast client outrun a slow daemon target and
+    // grow the write chain without bound.
+    closeTunnel(ws.data, POLICY_CLOSE_CODE, "daemon write queue overflow", ws);
+    return;
+  }
+
   ws.data.writeChain = ws.data.writeChain
     .then(async () => {
       if (ws.data.closed || socket.destroyed) {
@@ -249,9 +283,33 @@ function queueDaemonWrite(
         await writeBytes(socket, chunk);
       }
     })
-    .catch(() => {
-      closeTunnel(ws.data, INTERNAL_CLOSE_CODE, "daemon write failed", ws);
-    });
+    .then(
+      () => {
+        ws.data.pendingWriteBytes -= queued;
+      },
+      (error: unknown) => {
+        ws.data.pendingWriteBytes -= queued;
+        logRelayError(ws.data, "daemon write failed", error);
+        closeTunnel(ws.data, INTERNAL_CLOSE_CODE, "daemon write failed", ws);
+      },
+    );
+}
+
+// Minimal structured error logging to stderr so a failing relay tunnel leaves a
+// diagnosable trace (the relay is a server component; silent teardown would give
+// an operator nothing to backtest against). Payload bytes are never logged.
+function logRelayError(data: RelayWebSocketData, context: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(
+    JSON.stringify({
+      level: "error",
+      component: "pohunek-relay",
+      host: data.host,
+      mode: data.mode,
+      context,
+      error: message,
+    }),
+  );
 }
 
 function relayControlBytes(
@@ -290,12 +348,24 @@ function flushControlLine(ws: BunServerWebSocket<RelayWebSocketData>): void {
 function sendTextFrame(ws: BunServerWebSocket<RelayWebSocketData>, line: string): void {
   if (ws.readyState === WEBSOCKET_OPEN_STATE) {
     ws.send(line);
+    applySendBackpressure(ws);
   }
 }
 
 function sendBinaryFrame(ws: BunServerWebSocket<RelayWebSocketData>, bytes: Uint8Array): void {
   if (ws.readyState === WEBSOCKET_OPEN_STATE) {
     ws.send(bytes);
+    applySendBackpressure(ws);
+  }
+}
+
+// If the WebSocket's outbound buffer is filling faster than the client drains
+// it, pause the daemon socket so we stop producing frames. The `drain` handler
+// resumes it. Without this, Bun silently drops frames once its send buffer
+// exceeds the backpressure limit, truncating attach output / control lines.
+function applySendBackpressure(ws: BunServerWebSocket<RelayWebSocketData>): void {
+  if (ws.getBufferedAmount() > WS_SEND_HIGH_WATER_BYTES) {
+    ws.data.socket?.pause();
   }
 }
 
