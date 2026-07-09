@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 /// Re-adding an `Auto` project flips it to `Manual` so it is never treated as
 /// stale auto data (if garbage collection is ever added).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProjectSource.ts"))]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectSource {
     /// Auto-registered when a session started inside the repository's work tree.
@@ -40,6 +42,8 @@ impl ProjectSource {
 /// (mirrors [`crate::SessionInfo`]'s role for sessions). The `id` and `label` are
 /// the daemon-derived display handles; the canonical `git_common_dir` is the key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProjectInfo.ts"))]
 pub struct ProjectInfo {
     /// Stable derived id (`p-…`, an FNV-1a hash of the canonical key).
     pub id: String,
@@ -51,9 +55,11 @@ pub struct ProjectInfo {
     pub git_common_dir: PathBuf,
     /// The `origin` remote URL, credentials redacted; absent when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub origin_url: Option<String>,
     /// Base branch new worktrees branch from; absent ⇒ repo HEAD at creation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub default_base_branch: Option<String>,
     /// Whether the record was auto-registered or added explicitly.
     pub source: ProjectSource,
@@ -67,6 +73,8 @@ pub struct ProjectInfo {
 
 /// Parameters for `project.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProjectListParams.ts"))]
 pub struct ProjectListParams {
     /// Exact-match filters applied with AND semantics (mirrors `session.list`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -75,6 +83,8 @@ pub struct ProjectListParams {
 
 /// A single exact-match `project list --filter key=value` predicate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProjectListFilter.ts"))]
 #[serde(tag = "key", content = "value", rename_all = "snake_case")]
 pub enum ProjectListFilter {
     /// Match [`ProjectInfo::source`] (`auto`/`manual`).
@@ -99,21 +109,28 @@ impl ProjectListFilter {
 
 /// Parameters for `project.add`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProjectAddParams.ts"))]
 pub struct ProjectAddParams {
     /// Path to register, on the **target host**. `None` means the caller's `cwd`
     /// (local only); a remote add must give a path valid on that host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub path: Option<PathBuf>,
     /// Optional custom display name to set on the project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub name: Option<String>,
     /// Optional default base branch for worktrees created against the project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub base_branch: Option<String>,
 }
 
 /// Parameters for `project.show`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProjectShowParams.ts"))]
 pub struct ProjectShowParams {
     /// The `<id|label>` reference to resolve against the host's store.
     pub reference: String,
@@ -121,6 +138,8 @@ pub struct ProjectShowParams {
 
 /// Parameters for `project.rename`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProjectRenameParams.ts"))]
 pub struct ProjectRenameParams {
     /// The `<id|label>` reference to resolve.
     pub reference: String,
@@ -130,6 +149,8 @@ pub struct ProjectRenameParams {
 
 /// Parameters for `project.remove`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProjectRemoveParams.ts"))]
 pub struct ProjectRemoveParams {
     /// The `<id|label>` reference to resolve.
     pub reference: String,
@@ -143,14 +164,18 @@ pub struct ProjectRemoveParams {
 /// enriched with pohunek's own view (whether it created the worktree, and whether
 /// a live session runs in it).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProjectWorktree.ts"))]
 pub struct ProjectWorktree {
     /// Absolute path of the worktree.
     pub path: PathBuf,
     /// Checked-out branch; absent on a detached HEAD.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub branch: Option<String>,
     /// Current HEAD commit, when git reports one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub head: Option<String>,
     /// Whether git reports this entry as the bare main repository.
     pub bare: bool,
@@ -160,11 +185,14 @@ pub struct ProjectWorktree {
     pub owned: bool,
     /// The id of a live pohunek session running in this worktree, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub session_id: Option<String>,
 }
 
 /// Result of `project.show`: the project plus its live worktrees.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProjectShowResult.ts"))]
 pub struct ProjectShowResult {
     /// The project record (display shape).
     pub project: ProjectInfo,
@@ -177,6 +205,8 @@ pub struct ProjectShowResult {
 /// In-repo `<repo_root>/.pohunek/` shadows the host-default `<config_dir>/` layer
 /// per name; this records which one won so a caller (and `--json`) can see it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "PromptLayer.ts"))]
 #[serde(rename_all = "snake_case")]
 pub enum PromptLayer {
     /// Resolved from the repository's in-repo `.pohunek/` (travels with the repo).
@@ -187,6 +217,8 @@ pub enum PromptLayer {
 
 /// Parameters for `project.prompt`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProjectPromptParams.ts"))]
 pub struct ProjectPromptParams {
     /// The `<id|label>` reference to resolve against the host's store.
     pub reference: String,
@@ -200,6 +232,8 @@ pub struct ProjectPromptParams {
 /// layer it came from. The daemon does **not** render it — provider data and
 /// rendering stay caller-side (A.4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProjectPromptResult.ts"))]
 pub struct ProjectPromptResult {
     /// The resolved prompt name (echoed back).
     pub name: String,
@@ -211,6 +245,8 @@ pub struct ProjectPromptResult {
 
 /// Provider-specific reference type an action expects the launcher to supply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProviderKind.ts"))]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     /// A Linear issue reference; the launcher fetches Linear data caller-side.
@@ -235,6 +271,8 @@ impl ProviderKind {
 
 /// Parameters for `project.action`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProjectActionParams.ts"))]
 pub struct ProjectActionParams {
     /// The `<id|label>` reference to resolve against the host's store.
     pub reference: String,
@@ -244,6 +282,8 @@ pub struct ProjectActionParams {
 
 /// Result of `project.action`: a resolved launch recipe plus prompt content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProjectActionResult.ts"))]
 pub struct ProjectActionResult {
     /// Which provider data shape the caller should fetch/render for this action.
     pub provider: ProviderKind,
@@ -251,9 +291,11 @@ pub struct ProjectActionResult {
     pub agent: String,
     /// Template-selected base branch; absent means fall through to project default / HEAD.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub base_branch: Option<String>,
     /// Static branch for provider-less actions; absent when provider supplies it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub branch: Option<String>,
     /// Name of the prompt template used to populate [`Self::prompt_content`].
     pub prompt_name: String,
@@ -263,6 +305,8 @@ pub struct ProjectActionResult {
 
 /// Parameters for `project.actions`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProjectActionsParams.ts"))]
 pub struct ProjectActionsParams {
     /// The `<id|label>` reference to resolve against the host's store.
     pub reference: String,
@@ -270,6 +314,8 @@ pub struct ProjectActionsParams {
 
 /// Result of `project.actions`: available action summaries after layer shadowing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProjectActionsResult.ts"))]
 pub struct ProjectActionsResult {
     /// Available action definitions.
     pub actions: Vec<ActionSummary>,
@@ -277,6 +323,8 @@ pub struct ProjectActionsResult {
 
 /// One available action after applying in-repo-over-host shadowing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ActionSummary.ts"))]
 pub struct ActionSummary {
     /// Action name.
     pub name: String,
@@ -290,6 +338,8 @@ pub struct ActionSummary {
 
 /// Result of `project.remove`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProjectRemoveResult.ts"))]
 pub struct ProjectRemoveResult {
     /// Whether a project record was removed.
     pub removed: bool,
@@ -304,6 +354,8 @@ pub struct ProjectRemoveResult {
 
 /// Parameters for `worktree.remove`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "WorktreeRemoveParams.ts"))]
 pub struct WorktreeRemoveParams {
     /// Absolute path of the worktree to remove, as reported by `project.show`.
     /// The daemon matches it against its worktree bindings (canonicalized), so
@@ -313,6 +365,8 @@ pub struct WorktreeRemoveParams {
 
 /// Result of `worktree.remove`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "WorktreeRemoveResult.ts"))]
 pub struct WorktreeRemoveResult {
     /// Whether the worktree (and its binding) was removed. Always `true` on a
     /// successful response; the failure cases (`worktree_not_owned`,

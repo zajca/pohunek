@@ -4,6 +4,7 @@ mod checks;
 mod eval;
 mod generators;
 mod site;
+mod ts;
 
 use std::error::Error;
 use std::ffi::OsString;
@@ -78,7 +79,7 @@ impl fmt::Display for XtaskError {
             Self::UnsupportedFileType(path) => {
                 write!(f, "unsupported file type in `{}`", path.display())
             }
-            Self::Json(error) => write!(f, "failed to write manifest json: {error}"),
+            Self::Json(error) => write!(f, "failed to serialize json: {error}"),
             Self::InvalidPath(path) => write!(
                 f,
                 "path `{}` cannot be represented as a deterministic relative path",
@@ -273,6 +274,21 @@ where
                 Ok(())
             }
         },
+        TopCommand::Ts { action } => match action {
+            TsAction::Generate => {
+                let summary = ts::generate(&root)?;
+                println!(
+                    "ts generate ok: {} bindings, {} fixtures",
+                    summary.generated_files, summary.fixture_files
+                );
+                Ok(())
+            }
+            TsAction::Check => {
+                ts::check(&root)?;
+                println!("ts check ok: generated TypeScript protocol files are current");
+                Ok(())
+            }
+        },
     }
 }
 
@@ -290,6 +306,10 @@ enum TopCommand {
         #[command(subcommand)]
         action: DocsAction,
     },
+    Ts {
+        #[command(subcommand)]
+        action: TsAction,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -298,6 +318,12 @@ enum DocsAction {
     Build,
     Check,
     Site,
+}
+
+#[derive(Debug, Subcommand)]
+enum TsAction {
+    Generate,
+    Check,
 }
 
 fn repo_root() -> PathBuf {

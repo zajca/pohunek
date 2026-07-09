@@ -5,7 +5,9 @@ use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use pohunek_client::protocol::{self, ErrorClass, ProtocolError, Request, Response};
+use pohunek_client::protocol::{
+    self, ErrorClass, ProtocolError, Request, Response, MAX_CONTROL_LINE_BYTES,
+};
 use pohunek_client::{next_request_id, Client, ClientError, ClientOptions};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -14,8 +16,6 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 const HOST: &str = "build-box";
-const MAX_CONTROL_LINE_BYTES: usize = 1024 * 1024;
-
 static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]

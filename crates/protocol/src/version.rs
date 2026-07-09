@@ -23,7 +23,8 @@ pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(1);
 /// Wrapped in a newtype so it serializes transparently as an integer on the
 /// wire (`"v": 1`) while remaining type-safe in Rust.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProtocolVersion.ts"))]
 pub struct ProtocolVersion(pub u32);
 
 impl ProtocolVersion {

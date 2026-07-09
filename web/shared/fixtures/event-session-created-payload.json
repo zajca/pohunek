@@ -1,0 +1,15 @@
+{
+  "session": {
+    "agent": "codex",
+    "agent_base": "codex",
+    "cols": 120,
+    "created_at": "2026-07-08T00:00:00Z",
+    "cwd": "/workspace/pohunek",
+    "id": "s-fixture-1",
+    "pid": 42424,
+    "rows": 32,
+    "state": "running",
+    "state_source": "process",
+    "updated_at": "2026-07-08T00:01:00Z"
+  }
+}

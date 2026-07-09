@@ -12,6 +12,8 @@ use crate::envelope::StateSource;
 
 /// The kind of agent backing a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "AgentKind.ts"))]
 #[serde(rename_all = "snake_case")]
 pub enum AgentKind {
     /// A plain shell session.
@@ -24,6 +26,8 @@ pub enum AgentKind {
 
 /// Current detected agent activity within a running session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "AgentActivity.ts"))]
 #[serde(rename_all = "snake_case")]
 pub enum AgentActivity {
     /// The agent is actively processing work.
@@ -48,6 +52,8 @@ impl AgentActivity {
 
 /// Source of the current working-directory value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "CwdSource.ts"))]
 #[serde(rename_all = "snake_case")]
 pub enum CwdSource {
     /// Captured at session launch or resume.
@@ -72,6 +78,8 @@ impl CwdSource {
 
 /// Parameters for `session.new`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionNewParams.ts"))]
 pub struct SessionNewParams {
     /// Agent profile name to start.
     pub agent: String,
@@ -79,9 +87,11 @@ pub struct SessionNewParams {
     /// targeting or resume, and `None` leaves the session showing its id. The
     /// daemon trims it and rejects an over-long or control-character name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub name: Option<String>,
     /// Working directory for the session. If omitted, the daemon chooses one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub cwd: Option<PathBuf>,
     /// Initial terminal width in columns.
     pub cols: u16,
@@ -94,6 +104,7 @@ pub struct SessionNewParams {
     /// source repository (the project's `repo_root`); without `branch` the agent
     /// runs in-place in that checkout. Takes precedence over `cwd` auto-detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub project: Option<String>,
     /// Git repository to bind a dedicated worktree for. When set together with
     /// `branch`, the daemon creates/binds one worktree per
@@ -101,19 +112,23 @@ pub struct SessionNewParams {
     /// of in `cwd` (see `docs/plan-phase-1.md` "Worktree-per-Session"). `repo`
     /// and `branch` must be supplied together.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub repo: Option<PathBuf>,
     /// Branch to check out in the bound worktree. Requires `repo`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub branch: Option<String>,
     /// Base branch the worktree's branch is created from. When the named base
     /// branch is missing the daemon falls back to the repository's default
     /// branch and records a non-fatal warning. Requires `repo` + `branch`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub base_branch: Option<String>,
     /// Initial text to inject into the freshly spawned PTY in the same
     /// `session.new` round-trip. The daemon applies the same agent-specific
     /// submit framing used by `session.input`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub input: Option<String>,
     /// Owner-controlled metadata for the session. Must not contain secrets.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -122,6 +137,8 @@ pub struct SessionNewParams {
 
 /// Working-directory policy for `session.fork`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ForkCwdMode.ts"))]
 #[serde(rename_all = "snake_case")]
 pub enum ForkCwdMode {
     /// Launch the fork in the source session's current worktree or directory.
@@ -131,11 +148,14 @@ pub enum ForkCwdMode {
 
 /// Parameters for `session.fork`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionForkParams.ts"))]
 pub struct SessionForkParams {
     /// Source session whose native agent conversation should be forked.
     pub session_id: SessionId,
     /// Owner-set display name for the forked session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub name: Option<String>,
     /// Working-directory policy for the fork.
     #[serde(default)]
@@ -148,6 +168,8 @@ pub struct SessionForkParams {
 
 /// Parameters for `session.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionListParams.ts"))]
 pub struct SessionListParams {
     /// Exact-match filters applied with AND semantics.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -156,6 +178,8 @@ pub struct SessionListParams {
 
 /// A single exact-match session-list filter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionListFilter.ts"))]
 #[serde(tag = "key", content = "value", rename_all = "snake_case")]
 pub enum SessionListFilter {
     /// Match [`SessionInfo::state`].
@@ -207,11 +231,14 @@ fn base_kind_label(agent: AgentKind) -> &'static str {
 
 /// Opaque session identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionId.ts"))]
 pub struct SessionId(pub String);
 
 /// Parameters for `session.attach`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionAttachParams.ts"))]
 pub struct SessionAttachParams {
     /// Session to attach to.
     pub session_id: SessionId,
@@ -227,6 +254,7 @@ pub struct SessionAttachParams {
     /// different daemon that reuses the same id string. Additive: an older daemon
     /// ignores it; an older CLI omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub origin_session_id: Option<SessionId>,
     /// Daemon instance the [`Self::origin_session_id`] belongs to, from
     /// `POHUNEK_DAEMON_ID` (see [`ENV_DAEMON_ID`](crate::ENV_DAEMON_ID)).
@@ -237,11 +265,14 @@ pub struct SessionAttachParams {
     /// id on another daemon, or a stale value from a previous daemon process, has
     /// a different instance id and is correctly allowed. Additive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub origin_daemon_id: Option<String>,
 }
 
 /// Result returned by `session.attach`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionAttachResult.ts"))]
 pub struct SessionAttachResult {
     /// One-shot stream identifier used by the attach connection header.
     pub stream_id: String,
@@ -249,6 +280,8 @@ pub struct SessionAttachResult {
 
 /// Parameters for `session.input`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionInputParams.ts"))]
 pub struct SessionInputParams {
     /// Session whose PTY should receive input.
     pub session_id: SessionId,
@@ -258,6 +291,8 @@ pub struct SessionInputParams {
 
 /// Result returned by `session.input`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionInputResult.ts"))]
 pub struct SessionInputResult {
     /// Whether the daemon accepted the input for delivery.
     pub accepted: bool,
@@ -271,6 +306,11 @@ pub struct SessionInputResult {
 /// agent's own `native_session_id` (and optional `transcript_path`) from its
 /// stdin JSON. The daemon records it as the session's resume binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "SessionReportNativeIdParams.ts")
+)]
 pub struct SessionReportNativeIdParams {
     /// The pohunek session id the agent was launched under.
     pub session_id: SessionId,
@@ -280,6 +320,7 @@ pub struct SessionReportNativeIdParams {
     pub native_session_id: String,
     /// Optional transcript path reported by the agent (Claude provides one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub transcript_path: Option<String>,
 }
 
@@ -288,6 +329,11 @@ pub struct SessionReportNativeIdParams {
 /// The hook fires-and-forgets and ignores this body; it exists so the method has
 /// a typed, round-trippable response like every other control method.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "SessionReportNativeIdResult.ts")
+)]
 pub struct SessionReportNativeIdResult {
     /// Whether the daemon recorded the report as a resume binding.
     pub recorded: bool,
@@ -299,6 +345,8 @@ pub struct SessionReportNativeIdResult {
 /// session. The daemon treats it as active runtime identity only; it does not
 /// replace the parent session's launch agent or native resume binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionReportAgentParams.ts"))]
 pub struct SessionReportAgentParams {
     /// The pohunek session id that currently hosts the nested agent.
     pub session_id: SessionId,
@@ -308,18 +356,23 @@ pub struct SessionReportAgentParams {
     pub agent: String,
     /// Current activity reported by the hook, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub activity: Option<AgentActivity>,
     /// Optional monotonic sequence from the reporting hook.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub seq: Option<u64>,
     /// OS pid of the active nested agent process, when the hook can report it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub pid: Option<u32>,
     /// Native session id for the active nested agent, when reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub agent_session_id: Option<String>,
     /// Native session path for the active nested agent, when reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub agent_session_path: Option<String>,
 }
 
@@ -328,6 +381,8 @@ pub struct SessionReportAgentParams {
 /// Fire-and-forget release sent by a nested agent hook when the active agent no
 /// longer owns the host session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionReleaseAgentParams.ts"))]
 pub struct SessionReleaseAgentParams {
     /// The pohunek session id that currently hosts the nested agent.
     pub session_id: SessionId,
@@ -337,11 +392,14 @@ pub struct SessionReleaseAgentParams {
     pub agent: String,
     /// Optional monotonic sequence from the reporting hook.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub seq: Option<u64>,
 }
 
 /// Result returned by `session.report_agent`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionReportAgentResult.ts"))]
 pub struct SessionReportAgentResult {
     /// Whether the daemon recorded the active-agent report.
     pub recorded: bool,
@@ -349,6 +407,8 @@ pub struct SessionReportAgentResult {
 
 /// Result returned by `session.release_agent`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionReleaseAgentResult.ts"))]
 pub struct SessionReleaseAgentResult {
     /// Whether the daemon released the active-agent report.
     pub released: bool,
@@ -356,6 +416,8 @@ pub struct SessionReleaseAgentResult {
 
 /// Parameters for `session.detach`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionDetachParams.ts"))]
 pub struct SessionDetachParams {
     /// Active attach stream to detach.
     pub stream_id: String,
@@ -363,6 +425,8 @@ pub struct SessionDetachParams {
 
 /// Result returned by `session.detach`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionDetachResult.ts"))]
 pub struct SessionDetachResult {
     /// Whether an active attach stream was detached.
     pub detached: bool,
@@ -370,6 +434,8 @@ pub struct SessionDetachResult {
 
 /// Parameters for `session.resize`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionResizeParams.ts"))]
 pub struct SessionResizeParams {
     /// Session whose PTY should be resized.
     pub session_id: SessionId,
@@ -381,6 +447,8 @@ pub struct SessionResizeParams {
 
 /// Header sent as the first line on a raw attach connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "AttachHeader.ts"))]
 pub struct AttachHeader {
     /// One-shot stream identifier returned by `session.attach`.
     pub attach: String,
@@ -388,6 +456,8 @@ pub struct AttachHeader {
 
 /// Lifecycle state of a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionState.ts"))]
 #[serde(rename_all = "snake_case")]
 pub enum SessionState {
     /// The daemon accepted the session and is starting its process.
@@ -434,6 +504,8 @@ impl SessionState {
 /// creation — the worktree is kept, the warning is surfaced, and the user
 /// decides whether to intervene.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionWarningKind.ts"))]
 #[serde(rename_all = "snake_case")]
 pub enum SessionWarningKind {
     /// A `git fetch` from the configured remote failed; the worktree was bound
@@ -458,6 +530,8 @@ pub enum SessionWarningKind {
 /// and optional raw detail (e.g. trimmed git output) for debugging. Never
 /// contains secrets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionWarning.ts"))]
 pub struct SessionWarning {
     /// Machine-readable warning kind.
     pub kind: SessionWarningKind,
@@ -465,11 +539,14 @@ pub struct SessionWarning {
     pub message: String,
     /// Optional longer detail (e.g. trimmed git stderr) for diagnostics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub detail: Option<String>,
 }
 
 /// Summary returned by session lifecycle methods and published by events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionInfo.ts"))]
 pub struct SessionInfo {
     /// Stable session identifier.
     pub id: SessionId,
@@ -480,10 +557,12 @@ pub struct SessionInfo {
     /// observer; those entries are read-only and have no PTY. `None` means the
     /// peer predates this additive field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub external: Option<bool>,
     /// Owner-set display name, or `None` when the session is shown by its id.
     /// Set at `session.new` and changed via `session.rename`; cosmetic only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub name: Option<String>,
     /// Agent profile name backing the session.
     pub agent: String,
@@ -493,6 +572,7 @@ pub struct SessionInfo {
     pub cwd: PathBuf,
     /// Source that last set [`Self::cwd`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub cwd_source: Option<CwdSource>,
     /// Operating-system process id of the session root process.
     pub pid: u32,
@@ -506,30 +586,36 @@ pub struct SessionInfo {
     pub state_source: StateSource,
     /// Current detected agent activity, when the detector has published one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub activity: Option<AgentActivity>,
     /// Active nested agent profile name reported by a session-level hook.
     ///
     /// This is runtime metadata only: it does not change the launch identity in
     /// [`Self::agent`] and is cleared when the nested agent releases the session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub active_agent: Option<String>,
     /// Resolved base kind for [`Self::active_agent`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub active_agent_base: Option<AgentKind>,
     /// OS pid backing [`Self::active_agent`], when process facts have bound it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub active_agent_pid: Option<u32>,
     /// Native session id for the active nested agent, when reported.
     ///
     /// This metadata is distinct from [`Self::native_session_id`] and never acts
     /// as the parent session's resume binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub active_agent_session_id: Option<String>,
     /// Native session path for the active nested agent, when reported.
     ///
     /// This metadata is distinct from [`Self::native_session_path`] and never
     /// acts as the parent session's resume binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub active_agent_session_path: Option<String>,
     /// Native agent session id captured via the `SessionStart` hook, when one
     /// has been reported (see `docs/plan-phase-1.md` "Resume Model"). A session
@@ -537,6 +623,7 @@ pub struct SessionInfo {
     /// session is non-terminal: the daemon drops the resume binding on exit, so a
     /// terminal session can retain this id for reference yet not be resumable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub native_session_id: Option<String>,
     /// Native agent session **path** captured via the `SessionStart` hook, for an
     /// agent whose host profile resumes from a transcript path rather than an
@@ -544,33 +631,40 @@ pub struct SessionInfo {
     /// [`Self::native_session_id`]: a session resumes by exactly one of the two,
     /// chosen by its frozen `ref_kind`. `None` for the common id-resuming agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub native_session_path: Option<String>,
     /// Project this session belongs to, by derived id (`p-…`), when it started
     /// inside (or was pointed at) a git repository. `None` for a session with no
     /// git identity (a plain shell in a non-git directory).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub project_id: Option<String>,
     /// Current display label of [`Self::project_id`]'s project, **denormalized for
     /// display** and populated only by `session.list` (resolved fresh from the
     /// store at list time, so it reflects a rename). `None` for a session with no
     /// project or on responses that do not enrich it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub project_label: Option<String>,
     /// Whether the session's checkout is a linked git worktree rather than the
     /// repository's main checkout. `Some(true)` for a worktree-per-session, the
     /// detected value for an in-place session in a linked worktree, `Some(false)`
     /// for the main checkout, and `None` when the session has no git identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub is_linked_worktree: Option<bool>,
     /// Source git repository, when the session is bound to a worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub repo: Option<PathBuf>,
     /// Branch checked out in the bound worktree, when the session has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub branch: Option<String>,
     /// Path to the bound worktree, when the session was launched in one. Equal
     /// to `cwd` for worktree sessions; absent for plain-`cwd` sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub worktree_path: Option<PathBuf>,
     /// Non-fatal warnings raised while setting up the worktree. Empty when the
     /// session has no worktree or setup was clean; omitted from the wire form
@@ -587,7 +681,41 @@ pub struct SessionInfo {
     pub updated_at: String,
     /// Process exit code, when the session has exited with one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub exit_code: Option<i32>,
+}
+
+/// Payload shared by session lifecycle events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionEvent.ts"))]
+pub struct SessionEvent {
+    /// Session summary carried by the lifecycle event.
+    pub session: SessionInfo,
+}
+
+/// Payload for an `agent_state` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "AgentStateEvent.ts"))]
+pub struct AgentStateEvent {
+    /// Session whose activity changed.
+    pub session_id: SessionId,
+    /// Current detected activity.
+    pub activity: AgentActivity,
+    /// Signal source that produced the activity value.
+    pub source: StateSource,
+}
+
+/// Payload shared by attach lifecycle events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "AttachEvent.ts"))]
+pub struct AttachEvent {
+    /// Session owning the attach stream.
+    pub session_id: SessionId,
+    /// One-shot attach stream identifier.
+    pub stream_id: String,
 }
 
 /// Result returned by `session.new`.
@@ -603,6 +731,8 @@ pub struct SessionInfo {
 /// support silently drops the field and returns `None` here, so the client can
 /// warn instead of falsely reporting an injected prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionNewResult.ts"))]
 pub struct SessionNewResult {
     /// The freshly created session.
     #[serde(flatten)]
@@ -611,22 +741,28 @@ pub struct SessionNewResult {
     /// round-trip; absent when no initial input was requested or the daemon does
     /// not support it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub applied_input: Option<bool>,
 }
 
 /// Result returned by `session.fork`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionForkResult.ts"))]
 pub struct SessionForkResult {
     /// The freshly forked session.
     #[serde(flatten)]
     pub session: SessionInfo,
     /// Reserved for parity with session-creation flows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub applied_input: Option<bool>,
 }
 
 /// Result returned by `session.stop`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionStopResult.ts"))]
 pub struct SessionStopResult {
     /// Whether the daemon stopped a live session.
     pub stopped: bool,
@@ -634,6 +770,8 @@ pub struct SessionStopResult {
 
 /// Result returned by `session.resume`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionResumeResult.ts"))]
 pub struct SessionResumeResult {
     /// Relaunched session summary.
     pub session: SessionInfo,
@@ -647,6 +785,8 @@ pub struct SessionResumeResult {
 /// that entry, stopping a still-live session first so removal never orphans a
 /// live PTY.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionRemoveResult.ts"))]
 pub struct SessionRemoveResult {
     /// Whether the daemon evicted a session entry from its registry. `false`
     /// only when a concurrent remove already evicted the same session.
@@ -657,6 +797,8 @@ pub struct SessionRemoveResult {
 
 /// Result returned by `session.resize`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionResizeResult.ts"))]
 pub struct SessionResizeResult {
     /// Updated session summary after the resize.
     pub session: SessionInfo,
@@ -664,6 +806,8 @@ pub struct SessionResizeResult {
 
 /// Parameters for `session.set_metadata`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionSetMetadataParams.ts"))]
 pub struct SessionSetMetadataParams {
     /// Session whose metadata should be merged.
     pub session_id: SessionId,
@@ -674,6 +818,8 @@ pub struct SessionSetMetadataParams {
 
 /// Result returned by `session.set_metadata`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionSetMetadataResult.ts"))]
 pub struct SessionSetMetadataResult {
     /// Updated session summary after the metadata merge.
     pub session: SessionInfo,
@@ -681,17 +827,22 @@ pub struct SessionSetMetadataResult {
 
 /// Parameters for `session.rename`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionRenameParams.ts"))]
 pub struct SessionRenameParams {
     /// Session whose display name should change.
     pub session_id: SessionId,
     /// New display name. `Some(name)` sets it (trimmed by the daemon) and `None`
     /// clears it back to id-only display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub name: Option<String>,
 }
 
 /// Result returned by `session.rename`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionRenameResult.ts"))]
 pub struct SessionRenameResult {
     /// Updated session summary after the rename.
     pub session: SessionInfo,
@@ -877,5 +1028,59 @@ mod tests {
         );
         let parsed: SessionAttachParams = serde_json::from_value(value).expect("parse");
         assert_eq!(parsed, with_origin);
+    }
+
+    #[test]
+    fn session_event_payload_matches_legacy_json_payload() {
+        let info = session("s-1");
+        let typed = serde_json::to_value(SessionEvent {
+            session: info.clone(),
+        })
+        .expect("serialize typed session event");
+        let legacy = serde_json::json!({ "session": info });
+
+        assert_eq!(
+            serde_json::to_string(&typed).expect("typed json string"),
+            serde_json::to_string(&legacy).expect("legacy json string")
+        );
+    }
+
+    #[test]
+    fn agent_state_event_payload_matches_legacy_json_payload() {
+        let typed = serde_json::to_value(AgentStateEvent {
+            session_id: SessionId("s-1".to_owned()),
+            activity: AgentActivity::Working,
+            source: StateSource::Report,
+        })
+        .expect("serialize typed agent-state event");
+        let legacy = serde_json::json!({
+            "session_id": SessionId("s-1".to_owned()),
+            "activity": AgentActivity::Working,
+            "source": StateSource::Report,
+        });
+
+        assert_eq!(
+            serde_json::to_string(&typed).expect("typed json string"),
+            serde_json::to_string(&legacy).expect("legacy json string")
+        );
+    }
+
+    #[test]
+    fn attach_event_payload_matches_legacy_json_payload() {
+        let session_id = SessionId("s-1".to_owned());
+        let typed = serde_json::to_value(AttachEvent {
+            session_id: session_id.clone(),
+            stream_id: "a-1".to_owned(),
+        })
+        .expect("serialize typed attach event");
+        let legacy = serde_json::json!({
+            "session_id": session_id,
+            "stream_id": "a-1",
+        });
+
+        assert_eq!(
+            serde_json::to_string(&typed).expect("typed json string"),
+            serde_json::to_string(&legacy).expect("legacy json string")
+        );
     }
 }

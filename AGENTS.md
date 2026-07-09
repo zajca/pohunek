@@ -51,6 +51,7 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | `crates/gui-core` | Pure, headless state + SDK bridge for the GUI (no Iced dependency; fully unit-testable). |
 | `crates/gui`      | Native Iced shell that wraps `gui-core` in `Task`/`Subscription`. |
 | `crates/xtask`    | Workspace automation (docs build/validate/check). |
+| `web/`            | Bun workspace for the TypeScript SDK packages: generated protocol types, SDK runtime, and relay core. |
 
 Other top-level: `docs/` (architecture, roadmap, phases, knowledge source),
 `scripts/` (rofi/sway launchers, release helper).
@@ -67,6 +68,19 @@ cargo test --workspace --all-features
 cargo build --workspace --release                        # release profile must build
 cargo xtask docs check                                   # schema/drift/source-map/secrets/runbooks
 ```
+
+Web workspace gates:
+
+```bash
+cd web
+bun install --frozen-lockfile
+bun run typecheck
+bun run lint
+bun test
+```
+
+A protocol change is not done until `cargo xtask ts check` passes; regenerate
+with `cargo xtask ts generate`.
 
 Useful narrower loops:
 

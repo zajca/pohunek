@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 knowledge = { workspace = true }
 cli = { workspace = true }
+pohunek-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

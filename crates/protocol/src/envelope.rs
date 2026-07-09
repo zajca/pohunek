@@ -133,6 +133,8 @@ impl Response {
 /// the wire contract; the detection engine that produces it lands in a later
 /// milestone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "StateSource.ts"))]
 #[serde(rename_all = "snake_case")]
 pub enum StateSource {
     /// Derived from the OSC terminal title.

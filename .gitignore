@@ -11,6 +11,15 @@
 # Local tool/runtime caches (per-machine; not shared)
 /.cache
 
+# TypeScript/Bun workspace artifacts. `bun.lock` is intentionally committed.
+node_modules/
+web/node_modules/
+web/**/dist/
+web/**/*.tsbuildinfo
+
+# ts-rs default export directory; committed bindings live under web/shared.
+crates/protocol/bindings/
+
 # Local agent memory written by Claude Code subagents (per-machine; not shared)
 /.claude/agent-memory
 

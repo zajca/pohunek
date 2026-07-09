@@ -1,0 +1,13 @@
+{
+  "id": "req-fixture-1",
+  "method": "session.list",
+  "params": {
+    "filters": [
+      {
+        "key": "state",
+        "value": "running"
+      }
+    ]
+  },
+  "v": 1
+}

@@ -13,11 +13,14 @@ use crate::session::{AgentKind, SessionId};
 
 /// Opaque notification identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationId.ts"))]
 pub struct NotificationId(pub String);
 
 /// High-level notification category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationKind.ts"))]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationKind {
     /// An agent is waiting for owner attention.
@@ -51,6 +54,8 @@ impl NotificationKind {
 
 /// User-facing urgency class for a notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationSeverity.ts"))]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationSeverity {
     /// Informational notice.
@@ -81,6 +86,8 @@ impl NotificationSeverity {
 
 /// Lifecycle status of a durable notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationStatus.ts"))]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationStatus {
     /// The owner has not opened or acted on the notification.
@@ -111,6 +118,8 @@ impl NotificationStatus {
 
 /// Source that produced a notification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationSource.ts"))]
 pub struct NotificationSource {
     /// Provider or daemon component name.
     pub provider: String,
@@ -126,6 +135,8 @@ pub struct NotificationSource {
 
 /// Durable notification record stored by one host daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationRecord.ts"))]
 pub struct NotificationRecord {
     /// Stable notification id assigned by the host daemon.
     pub id: NotificationId,
@@ -153,17 +164,20 @@ pub struct NotificationRecord {
     ///
     /// Additive: an older daemon omits it, and an older client ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub session_id: Option<SessionId>,
     /// Linked agent kind, when known.
     ///
     /// Additive: an older daemon omits it, and an older client ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub agent_kind: Option<AgentKind>,
     /// Producer-specific source id, when the producer provides one.
     ///
     /// Additive: an older daemon omits it, and an older client ignores it. This
     /// differs from [`Self::dedupe_key`], which is source-independent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub source_id: Option<String>,
     /// Source-independent dedupe key for one lifecycle group.
     ///
@@ -172,41 +186,50 @@ pub struct NotificationRecord {
     /// sharing producer-specific ids. Session-scoped keys use
     /// `attention:<session_id>` or `turn:<session_id>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub dedupe_key: Option<String>,
     /// Linked project id, when known.
     ///
     /// Additive: an older daemon omits it, and an older client ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub project_id: Option<String>,
     /// Timestamp when the owner marked the notification read.
     ///
     /// Additive: an older daemon omits it, and an older client ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub read_at: Option<String>,
     /// Timestamp when the owner acknowledged the notification.
     ///
     /// Additive: an older daemon omits it, and an older client ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub acked_at: Option<String>,
     /// Timestamp when the owner archived the notification.
     ///
     /// Additive: an older daemon omits it, and an older client ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub archived_at: Option<String>,
     /// Timestamp when the owner deleted the notification.
     ///
     /// Additive: an older daemon omits it, and an older client ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub deleted_at: Option<String>,
     /// Replacement record after lifecycle supersede processing.
     ///
     /// Additive: an older daemon omits it, and an older client ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub superseded_by: Option<NotificationId>,
 }
 
 /// Parameters for `notification.create`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationCreateParams.ts"))]
 pub struct NotificationCreateParams {
     /// Sanitized source metadata for the producer.
     pub source: NotificationSource,
@@ -226,25 +249,32 @@ pub struct NotificationCreateParams {
     pub metadata: BTreeMap<String, String>,
     /// Linked pohunek session id, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub session_id: Option<SessionId>,
     /// Linked agent kind, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub agent_kind: Option<AgentKind>,
     /// Producer-specific source id, when the producer provides one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub source_id: Option<String>,
     /// Source-independent dedupe key for one lifecycle group.
     ///
     /// Session-scoped keys use `attention:<session_id>` or `turn:<session_id>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub dedupe_key: Option<String>,
     /// Linked project id, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub project_id: Option<String>,
 }
 
 /// Result returned by `notification.create`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationCreateResult.ts"))]
 pub struct NotificationCreateResult {
     /// Whether the daemon created a new record.
     ///
@@ -256,48 +286,64 @@ pub struct NotificationCreateResult {
 
 /// Parameters for `notification.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationListParams.ts"))]
 pub struct NotificationListParams {
     /// Match [`NotificationRecord::status`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub status: Option<NotificationStatus>,
     /// Match [`NotificationRecord::kind`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub kind: Option<NotificationKind>,
     /// Match [`NotificationRecord::severity`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub severity: Option<NotificationSeverity>,
     /// Match [`NotificationSource::provider`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub provider: Option<String>,
     /// Match [`NotificationRecord::session_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub session_id: Option<SessionId>,
     /// Return records created at or after this timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub created_after: Option<String>,
     /// Return records created before this timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub created_before: Option<String>,
     /// Maximum number of records to return.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub limit: Option<u32>,
     /// Pagination cursor returned by a previous list call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub cursor: Option<String>,
 }
 
 /// Result returned by `notification.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationListResult.ts"))]
 pub struct NotificationListResult {
     /// Matching notification records.
     pub notifications: Vec<NotificationRecord>,
     /// Cursor for the next page, when more records are available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub next_cursor: Option<String>,
 }
 
 /// Parameters for `notification.update`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationUpdateParams.ts"))]
 pub struct NotificationUpdateParams {
     /// Notification to update.
     pub id: NotificationId,
@@ -307,6 +353,8 @@ pub struct NotificationUpdateParams {
 
 /// Result returned by `notification.update`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationUpdateResult.ts"))]
 pub struct NotificationUpdateResult {
     /// Updated notification record.
     pub record: NotificationRecord,
@@ -314,6 +362,8 @@ pub struct NotificationUpdateResult {
 
 /// Parameters for `notification.delete`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationDeleteParams.ts"))]
 pub struct NotificationDeleteParams {
     /// Notification to delete.
     pub id: NotificationId,
@@ -321,6 +371,8 @@ pub struct NotificationDeleteParams {
 
 /// Result returned by `notification.delete`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationDeleteResult.ts"))]
 pub struct NotificationDeleteResult {
     /// Deleted notification id.
     pub id: NotificationId,
@@ -334,6 +386,8 @@ pub struct NotificationDeleteResult {
     reason = "wire policy intentionally exposes one enable flag per notification kind"
 )]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationKindPolicy.ts"))]
 pub struct NotificationKindPolicy {
     /// Whether `agent_blocked` notifications are enabled.
     pub agent_blocked: bool,
@@ -362,6 +416,8 @@ const fn default_attention_debounce_secs() -> u64 {
 
 /// Durable notification policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationPolicy.ts"))]
 pub struct NotificationPolicy {
     /// Dedupe window for equivalent attention events.
     pub attention_dedupe_window_secs: u64,
@@ -379,16 +435,20 @@ pub struct NotificationPolicy {
     ///
     /// Additive: an older daemon omits it, and an older client ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub codex: Option<NotificationKindPolicy>,
     /// Claude-specific per-kind override, when configured.
     ///
     /// Additive: an older daemon omits it, and an older client ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub claude: Option<NotificationKindPolicy>,
 }
 
 /// Parameters for `notification.policy.set`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationPolicyParams.ts"))]
 pub struct NotificationPolicyParams {
     /// Replacement notification policy.
     pub policy: NotificationPolicy,
@@ -396,6 +456,8 @@ pub struct NotificationPolicyParams {
 
 /// Result returned by `notification.policy.get` and `notification.policy.set`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationPolicyResult.ts"))]
 pub struct NotificationPolicyResult {
     /// Current notification policy.
     pub policy: NotificationPolicy,
@@ -403,23 +465,36 @@ pub struct NotificationPolicyResult {
 
 /// Parameters for `notification.retention.prune`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "NotificationRetentionParams.ts")
+)]
 pub struct NotificationRetentionParams {
     /// Whether to report matches without deleting them.
     #[serde(default)]
     pub dry_run: bool,
     /// Restrict pruning to this lifecycle status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub status: Option<NotificationStatus>,
     /// Prune records created before this timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub before: Option<String>,
     /// Maximum number of records to prune.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub limit: Option<u32>,
 }
 
 /// Result returned by `notification.retention.prune`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "NotificationRetentionResult.ts")
+)]
 pub struct NotificationRetentionResult {
     /// Whether the daemon reported matches without deleting them.
     pub dry_run: bool,
@@ -429,6 +504,8 @@ pub struct NotificationRetentionResult {
 
 /// Payload for a `notification_created` event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationCreatedEvent.ts"))]
 pub struct NotificationCreatedEvent {
     /// Created notification record.
     pub record: NotificationRecord,
@@ -436,6 +513,8 @@ pub struct NotificationCreatedEvent {
 
 /// Payload for a `notification_updated` event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationUpdatedEvent.ts"))]
 pub struct NotificationUpdatedEvent {
     /// Updated notification record.
     pub record: NotificationRecord,
@@ -443,6 +522,8 @@ pub struct NotificationUpdatedEvent {
 
 /// Payload for a `notification_deleted` event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "NotificationDeletedEvent.ts"))]
 pub struct NotificationDeletedEvent {
     /// Deleted notification id.
     pub notification_id: NotificationId,

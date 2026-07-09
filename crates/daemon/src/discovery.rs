@@ -20,7 +20,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::future::join_all;
-use protocol::{method, HostClass, HostRecord, Request, Response, PROTOCOL_VERSION};
+use protocol::{
+    method, HostClass, HostRecord, Request, Response, MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION,
+};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -36,9 +38,6 @@ const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(30);
 /// before classifying it as unreachable. Kept short so discovery over many peers
 /// stays responsive; probes run concurrently regardless.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
-
-/// Mirrors the control-line cap used elsewhere; bounds a misbehaving peer.
-const MAX_PROBE_LINE_BYTES: usize = 1024 * 1024;
 
 /// A transport/parse failure while probing a peer. Swallowed by [`classify`]
 /// (every such failure collapses to [`HostClass::Unreachable`]), so its only
@@ -183,7 +182,7 @@ async fn probe_health(addr: SocketAddr) -> Result<Response, ProbeError> {
 
     // Read a single response line, capped so a misbehaving peer cannot exhaust
     // memory. We stop at the first newline.
-    let reply = read_line(&mut stream, MAX_PROBE_LINE_BYTES).await?;
+    let reply = read_line(&mut stream, MAX_CONTROL_LINE_BYTES).await?;
     Ok(serde_json::from_slice(&reply)?)
 }
 

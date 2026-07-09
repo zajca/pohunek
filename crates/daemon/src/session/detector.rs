@@ -1,9 +1,9 @@
 //! Per-session activity detector task and activity recording.
 
 use super::{
-    broadcast, debug, event, is_terminal, json, log_lag_warn, timestamp_now, watch,
-    ActivityTransition, AgentActivity, CancellationToken, Detector, DetectorConfig, Event, Instant,
-    LagWarnThrottle, SessionId, SessionRegistry,
+    broadcast, debug, event, event_payload, is_terminal, log_lag_warn, timestamp_now, watch,
+    ActivityTransition, AgentActivity, AgentStateEvent, CancellationToken, Detector,
+    DetectorConfig, Event, Instant, LagWarnThrottle, SessionId, SessionRegistry,
 };
 
 fn detection_interval(config: &DetectorConfig) -> tokio::time::Interval {
@@ -127,10 +127,10 @@ impl SessionRegistry {
 
         let event = Event::new(
             event::AGENT_STATE,
-            json!({
-                "session_id": id,
-                "activity": updated.0.activity,
-                "source": updated.0.source,
+            event_payload(AgentStateEvent {
+                session_id: id.clone(),
+                activity: updated.0.activity,
+                source: updated.0.source,
             }),
         );
         let _ = self.inner.events.send(event);
