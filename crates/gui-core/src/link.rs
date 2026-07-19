@@ -2,11 +2,14 @@
 
 use std::collections::BTreeMap;
 
+use pohunek_prompt::link::{
+    branch_from_provider_json, checked_link_value, LINK_BRANCH_KEY, LINK_ID_KEY, LINK_KIND_KEY,
+    LINK_PROVIDER_KEY, LINK_URL_KEY,
+};
+pub use pohunek_prompt::link::{SessionLinkKind, SessionLinkMetadata, SessionLinkProvider};
 use protocol::{ProjectActionResult, ProviderKind, SessionInfo};
-use serde_json::Value;
 
-use crate::providers;
-use crate::{render_prompt, CoreError, PromptProvider};
+use crate::{render_prompt, CoreError, PromptError, PromptProvider};
 
 /// Provider context used to render a prompt preview.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,127 +38,6 @@ pub struct PromptLaunchParams {
     pub metadata: BTreeMap<String, String>,
     /// Owner-set display name for the launched session, or `None` for id-only.
     pub name: Option<String>,
-}
-
-/// Provider session link owner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionLinkProvider {
-    /// Linear issue provider.
-    Linear,
-    /// GitHub provider.
-    GitHub,
-}
-
-impl SessionLinkProvider {
-    /// Stable metadata value.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Linear => "linear",
-            Self::GitHub => "github",
-        }
-    }
-
-    const fn from_metadata(value: &str) -> Option<Self> {
-        match value.as_bytes() {
-            b"linear" => Some(Self::Linear),
-            b"github" => Some(Self::GitHub),
-            _ => None,
-        }
-    }
-}
-
-/// Provider item kind stored in session link metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionLinkKind {
-    /// Issue work item.
-    Issue,
-    /// Pull request work item.
-    PullRequest,
-}
-
-impl SessionLinkKind {
-    /// Stable metadata value.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Issue => "issue",
-            Self::PullRequest => "pull_request",
-        }
-    }
-
-    const fn from_metadata(value: &str) -> Option<Self> {
-        match value.as_bytes() {
-            b"issue" => Some(Self::Issue),
-            b"pull_request" => Some(Self::PullRequest),
-            _ => None,
-        }
-    }
-}
-
-/// Opaque provider link metadata written at `session.new`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionLinkMetadata {
-    pub provider: SessionLinkProvider,
-    pub kind: SessionLinkKind,
-    pub id: String,
-    pub url: String,
-    pub branch: String,
-}
-
-impl SessionLinkMetadata {
-    /// Creates validated link metadata.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CoreError::MissingLinkField`] when an opaque link value is empty.
-    pub fn new(
-        provider: SessionLinkProvider,
-        kind: SessionLinkKind,
-        id: impl Into<String>,
-        url: impl Into<String>,
-        branch: impl Into<String>,
-    ) -> Result<Self, CoreError> {
-        let link = Self {
-            provider,
-            kind,
-            id: id.into(),
-            url: url.into(),
-            branch: branch.into(),
-        };
-        link.validate()?;
-        Ok(link)
-    }
-
-    /// Returns metadata keys accepted by `session.new`.
-    #[must_use]
-    pub fn to_session_metadata(&self) -> BTreeMap<String, String> {
-        BTreeMap::from([
-            (
-                "link.provider".to_owned(),
-                self.provider.as_str().to_owned(),
-            ),
-            ("link.kind".to_owned(), self.kind.as_str().to_owned()),
-            ("link.id".to_owned(), self.id.clone()),
-            ("link.url".to_owned(), self.url.clone()),
-            ("link.branch".to_owned(), self.branch.clone()),
-        ])
-    }
-
-    fn validate(&self) -> Result<(), CoreError> {
-        checked_link_value("link.id", self.id.clone())?;
-        checked_link_value("link.url", self.url.clone())?;
-        checked_link_value("link.branch", self.branch.clone())?;
-        Ok(())
-    }
-}
-
-fn checked_link_value(field: &'static str, value: String) -> Result<String, CoreError> {
-    if value.trim().is_empty() {
-        Err(CoreError::MissingLinkField { field })
-    } else {
-        Ok(value)
-    }
 }
 
 /// Provider item context used to resolve, render, launch, and link a session.
@@ -187,19 +69,21 @@ impl ProviderLaunchItem {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::MissingLinkField`] when required link metadata is empty.
+    /// Returns [`CoreError::MissingLinkField`] when required link metadata is
+    /// empty. Returns [`CoreError::InvalidLinkField`] when required link
+    /// metadata contains an ASCII control character.
     pub fn linear_issue(
         item_id: impl Into<String>,
         context_json: impl Into<String>,
         url: impl Into<String>,
     ) -> Result<Self, CoreError> {
-        let item_id = checked_link_value("link.id", item_id.into())?;
+        let item_id = checked_link_value(LINK_ID_KEY, item_id).map_err(link_error_to_core)?;
         Ok(Self {
             action_provider: ProviderKind::LinearIssue,
             prompt_provider: PromptProvider::LinearIssue,
             link_provider: SessionLinkProvider::Linear,
             link_kind: SessionLinkKind::Issue,
-            link_url: checked_link_value("link.url", url.into())?,
+            link_url: checked_link_value(LINK_URL_KEY, url).map_err(link_error_to_core)?,
             item_id,
             context_json: context_json.into(),
         })
@@ -209,19 +93,21 @@ impl ProviderLaunchItem {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::MissingLinkField`] when required link metadata is empty.
+    /// Returns [`CoreError::MissingLinkField`] when required link metadata is
+    /// empty. Returns [`CoreError::InvalidLinkField`] when required link
+    /// metadata contains an ASCII control character.
     pub fn github_pull_request(
         number: impl Into<String>,
         context_json: impl Into<String>,
         url: impl Into<String>,
     ) -> Result<Self, CoreError> {
-        let number = checked_link_value("link.id", number.into())?;
+        let number = checked_link_value(LINK_ID_KEY, number).map_err(link_error_to_core)?;
         Ok(Self {
             action_provider: ProviderKind::GithubPr,
             prompt_provider: PromptProvider::GitHubPr,
             link_provider: SessionLinkProvider::GitHub,
             link_kind: SessionLinkKind::PullRequest,
-            link_url: checked_link_value("link.url", url.into())?,
+            link_url: checked_link_value(LINK_URL_KEY, url).map_err(link_error_to_core)?,
             item_id: number,
             context_json: context_json.into(),
         })
@@ -262,6 +148,7 @@ impl ProviderLaunchItem {
             self.link_url.clone(),
             branch,
         )
+        .map_err(link_error_to_core)
     }
 }
 
@@ -289,11 +176,11 @@ pub fn session_metadata_rows(session: &SessionInfo) -> Vec<MetadataRow> {
 #[must_use]
 pub fn session_link_metadata(session: &SessionInfo) -> Option<SessionLinkMetadata> {
     let provider =
-        SessionLinkProvider::from_metadata(session.metadata.get("link.provider")?.as_str())?;
-    let kind = SessionLinkKind::from_metadata(session.metadata.get("link.kind")?.as_str())?;
-    let id = session.metadata.get("link.id")?.clone();
-    let url = session.metadata.get("link.url")?.clone();
-    let branch = session.metadata.get("link.branch")?.clone();
+        SessionLinkProvider::from_metadata(session.metadata.get(LINK_PROVIDER_KEY)?.as_str())?;
+    let kind = SessionLinkKind::from_metadata(session.metadata.get(LINK_KIND_KEY)?.as_str())?;
+    let id = session.metadata.get(LINK_ID_KEY)?.clone();
+    let url = session.metadata.get(LINK_URL_KEY)?.clone();
+    let branch = session.metadata.get(LINK_BRANCH_KEY)?.clone();
     SessionLinkMetadata::new(provider, kind, id, url, branch).ok()
 }
 
@@ -358,20 +245,23 @@ pub(crate) fn action_prompt_provider(provider: &ProviderKind) -> Result<PromptPr
 }
 
 fn branch_from_context(provider: PromptProvider, raw_json: &str) -> Result<String, CoreError> {
-    let data: Value = serde_json::from_str(raw_json)?;
-    let fields = match provider {
-        PromptProvider::LinearIssue => providers::linear::ISSUE_BRANCH_FIELDS,
-        PromptProvider::GitHubPr => providers::github::PULL_REQUEST_BRANCH_FIELDS,
-    };
-    fields
-        .iter()
-        .find_map(|field| {
-            data.get(*field)
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-        })
-        .ok_or(CoreError::MissingPromptBranch {
+    branch_from_provider_json(provider, raw_json).map_err(|err| branch_error_to_core(provider, err))
+}
+
+fn branch_error_to_core(provider: PromptProvider, err: PromptError) -> CoreError {
+    match err {
+        PromptError::InvalidJson(err) => CoreError::Json(err),
+        PromptError::MissingRequiredField(_) => CoreError::MissingPromptBranch {
             provider: provider.as_str(),
-        })
+        },
+        err => CoreError::Prompt(err),
+    }
+}
+
+fn link_error_to_core(err: PromptError) -> CoreError {
+    match err {
+        PromptError::MissingLinkField { field } => CoreError::MissingLinkField { field },
+        PromptError::InvalidLinkField { field } => CoreError::InvalidLinkField { field },
+        err => CoreError::Prompt(err),
+    }
 }

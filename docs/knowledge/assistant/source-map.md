@@ -29,11 +29,14 @@ Current CLI and command surface:
 - `crates/cli/src/commands/setup.rs`
 - `crates/cli/src/commands/host.rs`
 - `crates/cli/src/commands/integration.rs`
+- `crates/cli/src/commands/prompt.rs`
 - `crates/cli/src/client.rs`
 - `crates/cli/src/target.rs`
 - `crates/cli/src/paths.rs`
 - `crates/cli/src/error.rs`
 - `crates/cli/tests/notifications_clap.rs`
+- `crates/cli/tests/prompt_link.rs`
+- `crates/cli/tests/scripts.rs`
 
 Native GUI client:
 
@@ -54,10 +57,18 @@ Native GUI client:
 - `crates/gui-core/tests/linear_provider.rs`
 - `crates/gui-core/tests/github_provider.rs`
 - `crates/prompt/src/lib.rs`
+- `crates/prompt/src/link.rs`
 - `crates/cli/tests/gui_prompt_parity.rs`
 - `docs/knowledge/guides/gui.md`
 - `docs/phases/06-native-app.md`
 - `docs/design/track-d-native-app.md`
+
+Launcher scripts:
+
+- `scripts/lib.sh`
+- `scripts/pohunek-launch-issue`
+- `scripts/pohunek-launch-pr`
+- `docs/knowledge/guides/launcher.md`
 
 Release packaging:
 

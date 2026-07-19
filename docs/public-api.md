@@ -145,7 +145,7 @@ All params and result type names below refer to structs exported by
 | `daemon.doctor` | `null` | `DaemonDoctorResult` | Runs daemon-local checks. Non-null params are `daemon/bad_request`. |
 | `host.inspect` | `null` | `HostCapabilities` | Live capability snapshot for the daemon's host. |
 | `host.discover` | `HostDiscoverParams` or `null` | `Vec<HostRecord>` | Enumerates NetBird peers and classifies daemon reachability. |
-| `session.new` | `SessionNewParams` | `SessionNewResult` | Starts an agent PTY session. |
+| `session.new` | `SessionNewParams` | `SessionNewResult` | Starts an agent PTY session. Optional `metadata` is written atomically with the session (see the `metadata` field note under `SessionInfo` below); the CLI exposes it as repeatable `--meta key=value`. |
 | `session.list` | `SessionListParams` or `null` | `Vec<SessionInfo>` | Lists sessions; filters use AND semantics. |
 | `session.inspect` | `SessionId` | `SessionInfo` | `SessionId` is a JSON string, e.g. `"s-1"`. |
 | `session.stop` | `SessionId` | `SessionStopResult` | Stops a live session (the entry stays in `list`). |
@@ -246,7 +246,12 @@ Important fields:
   cleared; `repo` and `branch` remain populated when git detection still finds a
   repository at the new cwd.
 - `warnings`: non-fatal worktree setup warnings.
-- `metadata`: owner-controlled strings; must not contain secrets.
+- `metadata`: owner-controlled strings; must not contain secrets. The daemon
+  treats every key opaquely; clients own the convention. One such
+  client-defined convention is the `link.*` key family (`link.provider`,
+  `link.kind`, `link.id`, `link.url`, `link.branch`) written by the GUI and
+  the launch scripts to tie a session to a work item — no protocol surface
+  is dedicated to it.
 - `created_at`, `updated_at`: RFC3339 timestamps.
 - `exit_code`: optional process exit code.
 

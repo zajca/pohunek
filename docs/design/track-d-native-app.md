@@ -261,15 +261,14 @@ running on its host (daemon owns the PTY).
 
 ---
 
-## 7. Work-item link metadata schema (NEW — defined here)
+## 7. Work-item link metadata schema (shipped)
 
-Today **no surface writes a link** (the scripts only call `session new …`). This
-schema is the shared contract both the GUI and the (to-be-updated) scripts write,
-stored in `SessionInfo.metadata` (opaque to the chassis):
+Both the GUI and the scripts write this schema, stored in `SessionInfo.metadata`
+(opaque to the chassis):
 
 ```
 link.provider   = "linear" | "github"
-link.kind       = "issue" | "pr"
+link.kind       = "issue" | "pull_request"
 link.id         = "<identifier or number>"   # e.g. "ENG-123" / "456"
 link.url        = "<https://…>"              # optional
 link.branch     = "<branch the work item maps to>"
@@ -278,12 +277,17 @@ link.branch     = "<branch the work item maps to>"
 (D.6 adds, on the dispatched session: `review.source` = `app-local review id`,
 `review.dispatched_at` = RFC3339.)
 
-A link made in the GUI and one made by a script must be **byte-identical** given
-the same work item — guaranteed by both writing exactly these keys via the same
-atomic `session.new metadata` path, and by the shared render (D-11) producing the
-same `link.branch`/prompt. **Required follow-up task:** add the keys to
-`pohunek-launch-issue` / `-pr` (a CLI `--meta key=value` flag on `session new`, or
-`set_metadata` post-launch), since they write nothing today.
+The schema lives once, in `pohunek_prompt::link` (`crates/prompt/src/link.rs`);
+`crates/gui-core` re-exports it rather than keeping its own copy. A link made in
+the GUI and one made by a script are **byte-identical** given the same work
+item, guaranteed by construction: both write exactly these keys via the same
+atomic `session.new metadata` path (the CLI's repeatable `session new --meta
+key=value` flag), and both derive `link.branch` through the shared
+`branch_from_provider_json`. The **former required follow-up task** — the
+scripts wrote nothing at launch — is done: `pohunek-launch-issue` / `-pr` build
+the link with the client-side `pohunek prompt link` subcommand (provider JSON
+on stdin, same convention as `pohunek prompt render`) and pass it into
+`session new` as repeated `--meta` pairs.
 
 ---
 
@@ -300,8 +304,8 @@ this design:
 3. The "Done when" clause "**attaches and round-trips terminal I/O**" changes to
    "**spawns the configured `attach_command` for the selected session**" — the
    GUI is not on the terminal I/O path.
-4. The claim "the same store the sway scripts write" is **not yet true**; §7 makes
-   it a defined, shared schema with a scripts follow-up.
+4. The claim "the same store the sway scripts write" is now true; §7 is a
+   shipped, shared schema and the scripts write it via `pohunek prompt link`.
 
 ---
 

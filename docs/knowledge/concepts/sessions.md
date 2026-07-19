@@ -32,6 +32,18 @@ The assistant feature reuses this session lifecycle. Its opening prompt is just
 initial input to a normal session, so session warnings and applied-input status
 remain the source of truth for whether the agent received that prompt.
 
+A session can also carry owner metadata, set atomically at creation with
+repeatable `pohunek session new --meta key=value` flags (split on the first
+`=`, so a value may itself contain `=`; a missing `=`, an empty key, or a key
+repeated across separate `--meta` flags fails before any connection is
+dialed). The daemon enforces size limits on the values. The `link.*` key
+family (`link.provider`, `link.kind`, `link.id`, `link.url`, `link.branch`) is
+the cross-surface convention for tying a session to a work item: both the GUI
+and the launch scripts write exactly these five keys through the shared
+`pohunek_prompt::link` implementation, so a link is byte-identical regardless
+of which surface created the session. The daemon treats all metadata as
+opaque owner-controlled strings.
+
 Notifications can be linked to a session through `session_id`. Provider hook
 adapters attach the id when `POHUNEK_SESSION_ID` is present and shape-valid;
 invalid values are dropped so the notification is still created without session

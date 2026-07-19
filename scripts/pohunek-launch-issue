@@ -33,16 +33,10 @@ recipe_branch="$(printf '%s\n' "$recipe" | sed -n 4p)"
 
 context_json="$("$linear_cli" issue view "$issue_id" --json)"
 prompt="$(pohunek_render_provider_prompt "$prompt_template" linear_issue "$issue_id" "$context_json")"
-branch="$(python3 - "$context_json" <<'PY'
-import json
-import sys
+url="$(pohunek_json_url "$context_json")"
+[ -n "$url" ] || pohunek_fail "provider JSON missing url"
+link_meta="$(pohunek_link_meta linear_issue "$issue_id" "$url" "$context_json")"
+branch="$(printf '%s\n' "$link_meta" | sed -n 's/^link\.branch=//p')"
+[ -n "$branch" ] || pohunek_fail "provider link metadata missing link.branch"
 
-data = json.loads(sys.argv[1])
-branch = data.get("branchName") or data.get("branch")
-if not isinstance(branch, str) or not branch:
-    raise SystemExit("Linear issue JSON missing branchName")
-sys.stdout.write(branch)
-PY
-)"
-
-pohunek_run_session_new "$pohunek_bin" "$host" "$agent" "$project" "$branch" "$prompt" "$yes" "$base_branch"
+pohunek_run_session_new "$pohunek_bin" "$host" "$agent" "$project" "$branch" "$prompt" "$yes" "$base_branch" "$link_meta"

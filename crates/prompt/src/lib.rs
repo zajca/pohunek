@@ -6,6 +6,8 @@
 
 // Rust guideline compliant 2026-06-26
 
+pub mod link;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
@@ -103,6 +105,12 @@ pub enum Error {
     /// The provider JSON did not contain a required field.
     #[error("provider JSON missing required field: {0}")]
     MissingRequiredField(&'static str),
+    /// A session link metadata field was empty.
+    #[error("provider link metadata is missing `{field}`")]
+    MissingLinkField { field: &'static str },
+    /// A session link metadata field contained invalid bytes.
+    #[error("provider link metadata `{field}` contains an ASCII control character")]
+    InvalidLinkField { field: &'static str },
     /// The template referenced variables outside the provider context.
     #[error("template references unknown variable(s): {}", .0.join(", "))]
     UnknownVariables(Vec<String>),

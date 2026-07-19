@@ -66,6 +66,16 @@ fn wait_for_file_contains(path: &Path, needles: &[&str], label: &str) {
     }
 }
 
+fn assert_meta_args(args: &str, expected: &[(&str, &str)]) {
+    for (key, value) in expected {
+        let needle = format!("--meta\n{key}={value}\n");
+        assert!(
+            args.contains(&needle),
+            "missing metadata arg {key}={value} in:\n{args}"
+        );
+    }
+}
+
 fn write_config(root: &Path, lines: &[(&str, &str)]) -> PathBuf {
     let config_dir = root.join("config").join("pohunek");
     fs::create_dir_all(config_dir.join("prompts")).expect("create config dirs");
@@ -105,7 +115,7 @@ printf '{"title":"Fix filters","body":"Body text","headRefName":"feature/filters
         &pohunek,
         r#"#!/bin/sh
 for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
-if [ "${1:-}" = "prompt" ] && [ "${2:-}" = "render" ]; then
+if [ "${1:-}" = "prompt" ]; then
   exec "$POHUNEK_TEST_REAL_POHUNEK" "$@"
 fi
 case " $* " in
@@ -159,6 +169,7 @@ esac
         "{args}"
     );
     assert!(args.contains("prompt\nrender\n"), "{args}");
+    assert!(args.contains("prompt\nlink\n"), "{args}");
     assert!(args.contains("--provider\ngithub_pr\n"), "{args}");
     assert!(args.contains("--item-id\n7\n"), "{args}");
     assert!(args.contains("--host\nlocal\nsession\nnew\n"), "{args}");
@@ -168,6 +179,16 @@ esac
     assert!(args.contains("--project\nui\n"), "{args}");
     assert!(!args.contains("--repo"), "no --repo leaks: {args}");
     assert!(args.contains("--branch\nfeature/filters\n"), "{args}");
+    assert_meta_args(
+        &args,
+        &[
+            ("link.branch", "feature/filters"),
+            ("link.id", "7"),
+            ("link.kind", "pull_request"),
+            ("link.provider", "github"),
+            ("link.url", "https://example.test/pr/7"),
+        ],
+    );
     assert!(args.contains("--yes\n"), "{args}");
     assert!(
         args.contains("PR 7: Fix filters\nBody text\nbranch=feature/filters\n"),
@@ -200,7 +221,7 @@ printf '{"id":"LIN-123","title":"Fix launcher","description":"Issue body","branc
         &pohunek,
         r#"#!/bin/sh
 for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
-if [ "${1:-}" = "prompt" ] && [ "${2:-}" = "render" ]; then
+if [ "${1:-}" = "prompt" ]; then
   exec "$POHUNEK_TEST_REAL_POHUNEK" "$@"
 fi
 case " $* " in
@@ -244,6 +265,7 @@ esac
         "{args}"
     );
     assert!(args.contains("prompt\nrender\n"), "{args}");
+    assert!(args.contains("prompt\nlink\n"), "{args}");
     assert!(args.contains("--provider\nlinear_issue\n"), "{args}");
     assert!(args.contains("--item-id\nLIN-123\n"), "{args}");
     assert!(args.contains("--host\nbuild-box\nsession\nnew\n"), "{args}");
@@ -251,6 +273,16 @@ esac
     assert!(args.contains("--project\nui\n"), "{args}");
     assert!(!args.contains("--repo"), "no --repo leaks: {args}");
     assert!(args.contains("--branch\nlin-123-fix-launcher\n"), "{args}");
+    assert_meta_args(
+        &args,
+        &[
+            ("link.branch", "lin-123-fix-launcher"),
+            ("link.id", "LIN-123"),
+            ("link.kind", "issue"),
+            ("link.provider", "linear"),
+            ("link.url", "https://linear.test/LIN-123"),
+        ],
+    );
     // The template's base branch is honored.
     assert!(args.contains("--base-branch\ndevelop\n"), "{args}");
     assert!(
@@ -260,6 +292,17 @@ esac
     // Credential isolation: the Linear token never reaches the pohunek command
     // line — auth stays inside the linear CLI's own seam.
     assert!(!args.contains("lin_secret_should_not_leak"), "{args}");
+}
+
+#[test]
+fn launch_scripts_do_not_embed_python_branch_extractors() {
+    for script in ["pohunek-launch-issue", "pohunek-launch-pr"] {
+        let source = fs::read_to_string(script_path(script)).expect("read launch script");
+        assert!(
+            !source.contains("python3"),
+            "{script} must not embed python3 in its branch/link path"
+        );
+    }
 }
 
 #[test]
@@ -283,7 +326,7 @@ printf '{"id":"LIN-1","title":"T","description":"B","branchName":"lin-1","url":"
         &pohunek,
         r#"#!/bin/sh
 for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_POHUNEK_ARGS"; done
-if [ "${1:-}" = "prompt" ] && [ "${2:-}" = "render" ]; then
+if [ "${1:-}" = "prompt" ]; then
   exec "$POHUNEK_TEST_REAL_POHUNEK" "$@"
 fi
 case " $* " in

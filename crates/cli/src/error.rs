@@ -56,6 +56,16 @@ pub(crate) enum CliError {
     #[error(transparent)]
     Prompt(#[from] pohunek_prompt::Error),
 
+    /// A `session new --meta` key was supplied more than once. Caught client-side
+    /// (before any connection is dialed) because metadata travels as a flat map:
+    /// a repeated key would otherwise silently collapse to whichever occurrence
+    /// is applied last, which is a confusing outcome for a caller-visible flag.
+    #[error("duplicate --meta key {key:?} (each key may be set once)")]
+    DuplicateMetaKey {
+        /// The metadata key that was named more than once.
+        key: String,
+    },
+
     /// A remote `session new` named no target. No filesystem path crosses the
     /// wire to another host, so a remote session must be referenced by `--project`
     /// (or, for first-introduction, `--repo` with a path valid on that host). Fails
@@ -141,6 +151,15 @@ impl CliError {
                 "daemon_unreachable",
                 format!("cannot reach the daemon at {}: {source}", socket.display()),
                 Some("start the daemon with `pohunek daemon start`".to_owned()),
+            ),
+            CliError::DuplicateMetaKey { key } => ProtocolError::new(
+                ErrorClass::Configuration,
+                // Same stable code as a clap usage failure: from a script's
+                // perspective this is the same family of mistake ("I mis-invoked
+                // the CLI"), just caught after clap's own parse succeeds.
+                "cli_usage",
+                format!("duplicate --meta key {key:?} (each key may be set once)"),
+                Some("pass --meta only once per key; a repeated key would be ambiguous".to_owned()),
             ),
             CliError::RemoteTargetRequired => ProtocolError::new(
                 ErrorClass::Configuration,
@@ -369,6 +388,18 @@ mod tests {
             .recover
             .expect("daemon-unreachable carries a hint");
         assert!(hint.contains("daemon start"), "hint: {hint}");
+    }
+
+    #[test]
+    fn duplicate_meta_key_maps_to_cli_usage_with_hint() {
+        let err = CliError::DuplicateMetaKey {
+            key: "link.provider".to_owned(),
+        };
+        let structured = err.to_protocol_error();
+        assert_eq!(structured.class, ErrorClass::Configuration);
+        assert_eq!(structured.code, "cli_usage");
+        assert!(structured.msg.contains("link.provider"), "{structured:?}");
+        assert!(structured.recover.is_some());
     }
 
     #[test]

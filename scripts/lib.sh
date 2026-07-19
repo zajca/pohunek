@@ -155,6 +155,23 @@ pohunek_render_provider_prompt() {
     --template-file "$template"
 }
 
+pohunek_link_meta() {
+  provider="$1"
+  item_id="$2"
+  url="$3"
+  json="$4"
+  pohunek_bin="$(pohunek_optional_config pohunek_bin pohunek)"
+  printf '%s' "$json" | "$pohunek_bin" prompt link \
+    --provider "$provider" \
+    --item-id "$item_id" \
+    --url "$url"
+}
+
+pohunek_json_url() {
+  # Assumes no escaped quote inside the URL value; true for GitHub/Linear API URLs.
+  printf '%s' "$1" | sed -n 's/.*"url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1
+}
+
 pohunek_run_session_new() {
   pohunek_bin="$1"
   host="$2"
@@ -164,6 +181,7 @@ pohunek_run_session_new() {
   prompt="$6"
   yes="$7"
   base_branch="${8:-}"
+  link_meta="${9:-}"
 
   if [ -n "$host" ]; then
     set -- "$pohunek_bin" --host "$host" session new
@@ -178,6 +196,14 @@ pohunek_run_session_new() {
   # to the project default / repo HEAD.
   if [ -n "$base_branch" ]; then
     set -- "$@" --base-branch "$base_branch"
+  fi
+  if [ -n "$link_meta" ]; then
+    while IFS= read -r meta_line; do
+      [ -n "$meta_line" ] || continue
+      set -- "$@" --meta "$meta_line"
+    done <<EOF
+$link_meta
+EOF
   fi
   if [ "$yes" = "true" ]; then
     set -- "$@" --yes

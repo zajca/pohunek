@@ -553,6 +553,21 @@ enum PromptAction {
         #[arg(long)]
         template_file: PathBuf,
     },
+    /// Print provider link metadata using context JSON from stdin.
+    Link {
+        /// Provider context shape to read.
+        #[arg(long, value_parser = parse_prompt_provider)]
+        provider: pohunek_prompt::Provider,
+        /// Provider item identifier (Linear key or GitHub PR number).
+        #[arg(long)]
+        item_id: String,
+        /// Provider item URL.
+        #[arg(long)]
+        url: String,
+        /// Emit machine-readable JSON errors instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -662,6 +677,11 @@ enum SessionAction {
         /// Initial text to inject into the session after the PTY is spawned.
         #[arg(long)]
         input: Option<String>,
+        /// Session metadata in key=value form (repeatable). Split on the first
+        /// `=` only, so a value may itself contain `=`. Each key may be set at
+        /// most once; the daemon enforces size limits on the values.
+        #[arg(long = "meta", value_name = "key=value", value_parser = commands::session::parse_meta_pair)]
+        meta: Vec<(String, String)>,
         /// Skip the confirmation prompt when starting a session on a remote
         /// host. Required on the `--json` path for a remote host (the machine
         /// path must not block on a prompt). Ignored for local sessions.
@@ -775,7 +795,8 @@ impl Commands {
                 action.as_ref().map_or(args.json, |a| a.parts().1.json)
             }
             Commands::Subscribe { json } => *json,
-            Commands::Attach { .. } | Commands::Daemon { .. } | Commands::Prompt { .. } => false,
+            Commands::Prompt { action } => action.wants_json(),
+            Commands::Attach { .. } | Commands::Daemon { .. } => false,
         }
     }
 
@@ -915,6 +936,15 @@ impl IntegrationAction {
     }
 }
 
+impl PromptAction {
+    fn wants_json(&self) -> bool {
+        match self {
+            PromptAction::Render { .. } => false,
+            PromptAction::Link { json, .. } => *json,
+        }
+    }
+}
+
 pub async fn run_cli() -> ExitCode {
     // Parse manually (not `Cli::parse`) so a clap usage error can be rendered as a
     // structured `--json` document instead of clap's human text + hard process
@@ -997,6 +1027,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     branch,
                     base_branch,
                     input,
+                    meta,
                     yes,
                     json,
                 } => {
@@ -1015,6 +1046,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                             branch,
                             base_branch,
                             input,
+                            meta,
                         },
                         json,
                         yes,
@@ -1256,6 +1288,15 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                         commands::prompt::render_prompt(provider, &item_id, &template_file)?;
                     print!("{rendered}");
                 }
+                PromptAction::Link {
+                    provider,
+                    item_id,
+                    url,
+                    ..
+                } => {
+                    let output = commands::prompt::link_metadata(provider, &item_id, &url)?;
+                    print!("{output}");
+                }
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -1482,6 +1523,7 @@ mod tests {
                         branch,
                         base_branch,
                         input,
+                        meta,
                         yes,
                         json,
                     },
@@ -1496,6 +1538,7 @@ mod tests {
                 assert_eq!(branch, None);
                 assert_eq!(base_branch, None);
                 assert_eq!(input, None);
+                assert!(meta.is_empty(), "meta defaults to empty");
                 assert!(!yes, "yes defaults to false");
                 assert!(!json, "json defaults to false");
             }
@@ -1605,6 +1648,43 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_session_new_repeated_meta_flags() {
+        let cli = Cli::try_parse_from([
+            "pohunek",
+            "session",
+            "new",
+            "--meta",
+            "link.provider=github",
+            "--meta",
+            "link.kind=pull_request",
+        ])
+        .expect("parse");
+        match cli.command {
+            Commands::Session {
+                action: SessionAction::New { meta, .. },
+            } => {
+                assert_eq!(
+                    meta,
+                    vec![
+                        ("link.provider".to_owned(), "github".to_owned()),
+                        ("link.kind".to_owned(), "pull_request".to_owned()),
+                    ]
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_session_new_malformed_meta_flag() {
+        // A `--meta` value missing `=` fails at parse time (clap usage error),
+        // not silently or after a daemon round-trip.
+        let err = Cli::try_parse_from(["pohunek", "session", "new", "--meta", "no-equals-sign"])
+            .expect_err("malformed --meta must fail to parse");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
