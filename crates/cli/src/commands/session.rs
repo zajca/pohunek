@@ -6,6 +6,7 @@
 //! request-building functions are transport-agnostic. Starting a session on a
 //! *remote* host goes through a confirmation gate (see [`confirmation_decision`]).
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -61,6 +62,10 @@ pub(crate) struct NewArgs {
     pub base_branch: Option<String>,
     /// Initial text to inject into the spawned PTY.
     pub input: Option<String>,
+    /// Parsed `--meta KEY=VALUE` pairs, one per repeated flag. Shape-validated
+    /// per pair by [`parse_meta_pair`] (the clap value parser); duplicate-key
+    /// rejection happens once the full set is known, in [`parse_meta_pairs`].
+    pub meta: Vec<(String, String)>,
 }
 
 /// The decision the confirmation gate makes before a `session new` connects.
@@ -154,6 +159,41 @@ pub(crate) fn parse_list_filter(input: &str) -> Result<ListFilter, String> {
     }
 }
 
+/// Parse one `session new --meta key=value` argument.
+///
+/// Used as clap's value parser, so a malformed pair fails the parse before any
+/// connection is dialed (same usage-error surface as [`parse_list_filter`]).
+/// Splits on the **first** `=` only, so a value may itself contain `=` (e.g. a
+/// URL query string). Only shape is checked here — a key repeated across
+/// separate `--meta` flags is caught later, once the full set is known, by
+/// [`parse_meta_pairs`].
+pub(crate) fn parse_meta_pair(input: &str) -> Result<(String, String), String> {
+    let (key, value) = input
+        .split_once('=')
+        .ok_or_else(|| format!("invalid --meta {input:?}: expected key=value"))?;
+    if key.is_empty() {
+        return Err(format!(
+            "invalid --meta {input:?}: metadata key cannot be empty"
+        ));
+    }
+    Ok((key.to_owned(), value.to_owned()))
+}
+
+/// Build `SessionNewParams::metadata` from parsed `--meta` pairs.
+///
+/// Rejects a key named more than once: metadata travels as a flat map, so a
+/// repeated key would otherwise silently collapse to whichever occurrence is
+/// inserted last, which is a confusing outcome for a caller-visible CLI flag.
+fn parse_meta_pairs(pairs: &[(String, String)]) -> Result<BTreeMap<String, String>, CliError> {
+    let mut metadata = BTreeMap::new();
+    for (key, value) in pairs {
+        if metadata.insert(key.clone(), value.clone()).is_some() {
+            return Err(CliError::DuplicateMetaKey { key: key.clone() });
+        }
+    }
+    Ok(metadata)
+}
+
 fn parse_state_filter(value: &str) -> Result<SessionState, String> {
     match value {
         "starting" => Ok(SessionState::Starting),
@@ -243,7 +283,9 @@ pub(crate) async fn run_new(
     }
 
     let mut client = Client::connect(host, paths).await?;
-    let result = client.call::<method::SessionNew>(new_params(&args)).await?;
+    let result = client
+        .call::<method::SessionNew>(new_params(&args)?)
+        .await?;
     let info = &result.session;
 
     // We asked the daemon to inject an initial prompt but it did not confirm
@@ -472,8 +514,8 @@ pub(crate) async fn run_rename(
     Ok(())
 }
 
-fn new_params(args: &NewArgs) -> SessionNewParams {
-    SessionNewParams {
+fn new_params(args: &NewArgs) -> Result<SessionNewParams, CliError> {
+    Ok(SessionNewParams {
         agent: args.agent.clone(),
         name: args.name.clone(),
         cwd: args.cwd.clone(),
@@ -484,13 +526,13 @@ fn new_params(args: &NewArgs) -> SessionNewParams {
         branch: args.branch.clone(),
         base_branch: args.base_branch.clone(),
         input: args.input.clone(),
-        metadata: std::collections::BTreeMap::new(),
-    }
+        metadata: parse_meta_pairs(&args.meta)?,
+    })
 }
 
 #[cfg(test)]
 fn build_new_request(args: &NewArgs) -> Result<Request, CliError> {
-    request_with_params(method::SESSION_NEW, &new_params(args))
+    request_with_params(method::SESSION_NEW, &new_params(args)?)
 }
 
 /// Prepare the `session new` args for the target host (design Decision 1).
@@ -1041,6 +1083,7 @@ mod tests {
             branch: None,
             base_branch: None,
             input: None,
+            meta: Vec::new(),
         }
     }
 
@@ -1119,6 +1162,7 @@ mod tests {
             branch: Some("feature/login".to_owned()),
             base_branch: Some("main".to_owned()),
             input: None,
+            meta: Vec::new(),
         };
         let request = build_new_request(&args).expect("request");
 
@@ -1149,6 +1193,7 @@ mod tests {
             branch: None,
             base_branch: None,
             input: None,
+            meta: Vec::new(),
         })
         .expect("request");
 
@@ -1179,6 +1224,96 @@ mod tests {
                 "rows": 24,
                 "input": "Fix #1234"
             }),
+        );
+    }
+
+    #[test]
+    fn parse_meta_pair_accepts_valid_pair() {
+        assert_eq!(
+            parse_meta_pair("link.provider=github").expect("valid pair"),
+            ("link.provider".to_owned(), "github".to_owned())
+        );
+    }
+
+    #[test]
+    fn parse_meta_pair_rejects_missing_equals() {
+        let err = parse_meta_pair("link.provider").expect_err("missing =");
+        assert!(err.contains("expected key=value"), "{err}");
+    }
+
+    #[test]
+    fn parse_meta_pair_rejects_empty_key() {
+        let err = parse_meta_pair("=github").expect_err("empty key");
+        assert!(err.contains("key cannot be empty"), "{err}");
+    }
+
+    #[test]
+    fn parse_meta_pair_preserves_value_containing_equals() {
+        // Split on the FIRST '=' only, so a value that itself contains '=' (e.g.
+        // a URL query string) is preserved whole rather than truncated.
+        assert_eq!(
+            parse_meta_pair("link.url=https://example.com?a=1&b=2").expect("value with ="),
+            (
+                "link.url".to_owned(),
+                "https://example.com?a=1&b=2".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn new_request_carries_single_meta_pair() {
+        let mut args = new_args("shell", None);
+        args.meta = vec![("link.provider".to_owned(), "github".to_owned())];
+        let request = build_new_request(&args).expect("request");
+
+        assert_request(
+            &request,
+            method::SESSION_NEW,
+            json!({
+                "agent": "shell",
+                "cols": 80,
+                "rows": 24,
+                "metadata": { "link.provider": "github" }
+            }),
+        );
+    }
+
+    #[test]
+    fn new_request_carries_multiple_meta_pairs() {
+        let mut args = new_args("shell", None);
+        args.meta = vec![
+            ("link.provider".to_owned(), "github".to_owned()),
+            ("link.kind".to_owned(), "pull_request".to_owned()),
+        ];
+        let request = build_new_request(&args).expect("request");
+
+        assert_request(
+            &request,
+            method::SESSION_NEW,
+            json!({
+                "agent": "shell",
+                "cols": 80,
+                "rows": 24,
+                "metadata": {
+                    "link.kind": "pull_request",
+                    "link.provider": "github"
+                }
+            }),
+        );
+    }
+
+    #[test]
+    fn new_params_rejects_duplicate_meta_key() {
+        let mut args = new_args("shell", None);
+        args.meta = vec![
+            ("link.provider".to_owned(), "github".to_owned()),
+            ("link.provider".to_owned(), "linear".to_owned()),
+        ];
+
+        let err = new_params(&args).expect_err("duplicate key must be rejected");
+        assert!(
+            matches!(&err, CliError::DuplicateMetaKey { key } if key == "link.provider"),
+            "expected DuplicateMetaKey(\"link.provider\"), got {err:?}"
         );
     }
 

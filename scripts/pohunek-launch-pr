@@ -33,16 +33,10 @@ recipe_branch="$(printf '%s\n' "$recipe" | sed -n 4p)"
 
 context_json="$("$gh_bin" pr view "$pr_number" --json title,body,headRefName,url)"
 prompt="$(pohunek_render_provider_prompt "$prompt_template" github_pr "$pr_number" "$context_json")"
-branch="$(python3 - "$context_json" <<'PY'
-import json
-import sys
+url="$(pohunek_json_url "$context_json")"
+[ -n "$url" ] || pohunek_fail "provider JSON missing url"
+link_meta="$(pohunek_link_meta github_pr "$pr_number" "$url" "$context_json")"
+branch="$(printf '%s\n' "$link_meta" | sed -n 's/^link\.branch=//p')"
+[ -n "$branch" ] || pohunek_fail "provider link metadata missing link.branch"
 
-data = json.loads(sys.argv[1])
-branch = data.get("headRefName") or data.get("branch") or data.get("branchName")
-if not isinstance(branch, str) or not branch:
-    raise SystemExit("GitHub PR JSON missing headRefName")
-sys.stdout.write(branch)
-PY
-)"
-
-pohunek_run_session_new "$pohunek_bin" "$host" "$agent" "$project" "$branch" "$prompt" "$yes" "$base_branch"
+pohunek_run_session_new "$pohunek_bin" "$host" "$agent" "$project" "$branch" "$prompt" "$yes" "$base_branch" "$link_meta"

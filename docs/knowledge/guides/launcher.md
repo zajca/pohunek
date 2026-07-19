@@ -50,3 +50,22 @@ Attach terminals automatically retry after an unexpected daemon stream close.
 sessions that the restarted daemon can resume from native agent metadata; live
 PTYs and plain shell processes still do not survive a daemon restart. Set
 `attach_reconnect_seconds=0` to disable the retry behavior.
+
+## Work-item Links
+
+`pohunek-launch-issue` and `pohunek-launch-pr` render the action's prompt with
+`pohunek prompt render` (the same shared `crates/prompt` renderer the GUI
+uses), then build the session-link metadata with a sibling client-side
+subcommand, `pohunek prompt link --provider <linear_issue|github_pr>
+--item-id <id> --url <url>`, reading the same provider JSON from stdin. It
+derives `link.branch` from the provider JSON and prints the five canonical
+`link.provider`/`link.kind`/`link.id`/`link.url`/`link.branch` lines. Neither
+subcommand talks to the daemon.
+
+`scripts/lib.sh`'s `pohunek_link_meta` helper wraps that call, and
+`pohunek_run_session_new` forwards each line as a repeated `session new --meta
+key=value` flag, so the link is written atomically in the same `session.new`
+call that starts the agent — never as a separate post-launch step. Because
+both surfaces build the metadata from the one shared implementation, a link
+written by a launch script is byte-identical to one written by the GUI for the
+same work item; see [GUI setup](gui.md) for the GUI side of this convention.

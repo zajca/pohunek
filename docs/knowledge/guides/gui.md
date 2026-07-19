@@ -444,6 +444,14 @@ At session creation, linked provider launches write only these metadata keys:
 - `link.url`
 - `link.branch`
 
+This schema is shared, not GUI-owned: it lives once in `pohunek_prompt::link`
+(`crates/prompt/src/link.rs`), and `crates/gui-core` re-exports the types
+rather than defining its own copy. The launch scripts (`pohunek-launch-issue`,
+`pohunek-launch-pr`) write the same five keys through the `pohunek prompt link`
+CLI subcommand, so a link made by a script and a link made by the GUI are
+byte-identical for the same work item; see
+[launcher](launcher.md#work-item-links).
+
 The daemon treats those values as opaque. Do not write provider tokens, raw
 provider payloads, GraphQL responses, `gh` output, or secret-bearing config into
 metadata, logs, snapshots, fixtures, or prompt text.
@@ -512,6 +520,8 @@ When behavior must be checked against implementation, inspect:
   sources, fake `gh` scripts, parsing coverage, timeout behavior, and error
   paths.
 - `crates/prompt/src/lib.rs` for prompt rendering rules shared by CLI and GUI.
+- `crates/prompt/src/link.rs` for the shared `link.*` session-metadata schema
+  (types, validation, `branch_from_provider_json`) `gui-core` re-exports.
 - `crates/cli/tests/gui_prompt_parity.rs` for byte-identical GUI/CLI prompt
-  rendering coverage.
+  rendering and GUI/script `link.*` coverage.
 - `docs/phases/06-native-app.md` for Track D milestone scope and constraints.

@@ -31,6 +31,8 @@ pub enum CoreError {
     MissingPromptBranch { provider: &'static str },
     #[error("provider link metadata is missing `{field}`")]
     MissingLinkField { field: &'static str },
+    #[error("provider link metadata `{field}` is invalid")]
+    InvalidLinkField { field: &'static str },
     #[error("project action resolved provider `{actual}` but provider item requires `{expected}`")]
     ProviderActionMismatch {
         expected: &'static str,

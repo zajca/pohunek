@@ -126,10 +126,10 @@ launcher scripts already use, so the two surfaces share one source of truth:
   render`) the GUI and the rewritten scripts both call;
 - atomic launch via `session new --input`;
 - work-item / PR links stored as **opaque `link.*` metadata** on the session in
-  the daemon store (the chassis never interprets them) — the same keys the
-  (to-be-updated) sway scripts write, so a link made in one surface shows in the
-  other. *(Today the scripts write no link; defining the schema + updating them is
-  part of D.5.)*
+  the daemon store (the chassis never interprets them) — the same keys the sway
+  scripts write via the shared `pohunek_prompt::link` implementation and the
+  client-side `pohunek prompt link` subcommand, so a link made in one surface
+  shows in the other, byte-identical.
 
 Provider credentials live **only** in the app (gh's own auth; a Linear token read
 by name from the OS keyring) — never in daemon state, session metadata, or the
