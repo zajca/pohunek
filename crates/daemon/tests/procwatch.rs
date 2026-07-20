@@ -13,7 +13,7 @@ use pohunek_daemon::procwatch::{LinuxInspector, ProcessInspector};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use protocol::{
     AgentKind, CwdSource, SessionAttachParams, SessionId, SessionInfo, SessionInputParams,
-    SessionNewParams,
+    SessionNewParams, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
 
 const TEST_COLS: u16 = 80;
@@ -286,6 +286,12 @@ fn spawn_fake_agent(program: &Path, cwd: &Path) -> Child {
     Command::new(program)
         .arg("60")
         .current_dir(cwd)
+        // Scrub the pohunek ownership markers the test runner may itself carry
+        // (e.g. when the suite runs inside a pohunek-managed session): a marked
+        // process is treated as another daemon's agent and would never surface
+        // as external. The fake agent models a genuinely external process.
+        .env_remove(ENV_DAEMON_ID)
+        .env_remove(ENV_SESSION_ID)
         .spawn()
         .expect("spawn fake agent")
 }

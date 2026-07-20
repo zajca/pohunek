@@ -13,10 +13,12 @@ use protocol::{
 
 use crate::agent::{InputRules, ResumeMode, SessionRefKind};
 use crate::detect::{ActivityTransition, DetectorConfig, ManifestRegion, MatchContext};
+use crate::external::TranscriptIndex;
 use crate::integration::{
     ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
-use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessInspector};
+use crate::procwatch::{ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessInspector};
+use crate::project::detect::project_id;
 use crate::pty::{PtyCommand, PtyExit};
 
 use super::{SessionRegistry, SessionRegistryConfig, ShellCommand, MAX_SESSION_NAME_BYTES};
@@ -176,6 +178,7 @@ struct MockInspectorState {
     descendants_error: Option<std::io::ErrorKind>,
     cwd: HashMap<Pid, PathBuf>,
     exits: HashMap<Pid, tokio::sync::watch::Sender<bool>>,
+    ownership_markers: HashMap<Pid, OwnershipMarkers>,
 }
 
 impl MockInspector {
@@ -219,6 +222,14 @@ impl MockInspector {
             .expect("mock inspector lock")
             .cwd
             .insert(pid, cwd);
+    }
+
+    fn set_ownership_markers(&self, pid: Pid, markers: OwnershipMarkers) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .ownership_markers
+            .insert(pid, markers);
     }
 }
 
@@ -266,6 +277,17 @@ impl ProcessInspector for MockInspector {
                 .subscribe()
         };
         Ok(ExitWatch::from_test_signal(receiver))
+    }
+
+    fn ownership_markers(&self, pid: Pid) -> std::io::Result<OwnershipMarkers> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("mock inspector lock")
+            .ownership_markers
+            .get(&pid)
+            .cloned()
+            .unwrap_or_default())
     }
 }
 
@@ -1118,6 +1140,55 @@ async fn cwd_hint_remaps_between_registered_worktrees() {
 
     let _ = registry.stop(&first.id).await;
     let _ = registry.stop(&second.id).await;
+}
+
+#[tokio::test]
+async fn cwd_hint_into_an_unregistered_repo_registers_no_project() {
+    // Regression: cwd hints (OSC 7 / procwatch focus) used to upsert an Auto
+    // project record for whatever repo the observed cwd landed in, so a repo a
+    // watched process merely sat in — e.g. a throwaway fixture repo created by
+    // a nested test-suite daemon — permanently polluted the registry. Hints
+    // must only *derive* the association; registration stays on session.new
+    // and explicit `project add`.
+    let (registry, repo) = project_registry("hint-no-register");
+    let session = registry
+        .create(SessionNewParams {
+            cwd: Some(repo),
+            ..params()
+        })
+        .await
+        .expect("session in the repo");
+
+    let other_repo = init_git_repo("hint-no-register-other");
+    registry
+        .record_cwd_hint(&session.id, other_repo.display().to_string())
+        .await;
+    let moved = registry.inspect(&session.id).await.expect("inspect moved");
+
+    assert_eq!(moved.cwd, other_repo);
+    assert_eq!(moved.cwd_source, Some(CwdSource::Osc7));
+    let other_git_common_dir =
+        std::fs::canonicalize(other_repo.join(".git")).expect("canonical other .git");
+    assert_eq!(
+        moved.project_id.as_deref(),
+        Some(project_id(&other_git_common_dir).as_str()),
+        "the association still carries the stable derived project id"
+    );
+
+    let projects = registry
+        .projects()
+        .expect("projects configured")
+        .store()
+        .load_projects()
+        .expect("load projects");
+    assert_eq!(
+        projects.len(),
+        1,
+        "only the session.new repo is registered; the hinted repo must not be: {projects:?}"
+    );
+    assert_eq!(projects[0].id(), session.project_id.expect("stamped"));
+
+    let _ = registry.stop(&session.id).await;
 }
 
 #[tokio::test]
@@ -3159,6 +3230,8 @@ const DIRECT_AGENT_REPORT_SEQ: u64 = 2_000;
 const DIRECT_AGENT_RESCAN_COUNT: usize = 3;
 /// PID reused across two scans to model OS pid reuse before an exit watch fires.
 const PID_REUSE_AGENT_PID: Pid = 225;
+/// PID used by the ownership-marker tests to model a nested daemon's agent.
+const FOREIGN_AGENT_PID: Pid = 240;
 /// Delay separating pid-reuse observations so `first_seen` changes if reset.
 const PID_REUSE_RESCAN_DELAY: Duration = Duration::from_millis(5);
 
@@ -3433,6 +3506,131 @@ async fn procwatch_updates_cwd_from_active_agent_pid() {
     assert_eq!(updated.cwd_source, Some(CwdSource::Procwatch));
 
     let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn procwatch_skips_agents_owned_by_another_daemon_or_session() {
+    // Regression: a nested daemon (a test-suite loopback instance, a
+    // self-hosted dev run) spawns its own agent PTYs *inside* this session's
+    // process subtree. Those processes look exactly like this session's agent
+    // (`comm = codex`), but their ownership markers name the other daemon —
+    // adopting one hijacked the session's active agent, cwd focus, and project
+    // association. Only a process carrying this session's own markers (or no
+    // markers at all) may be adopted.
+    let (registry, inspector, created) = mock_procwatch_registry("foreign-agent").await;
+    let root_cwd = temp_dir("foreign-agent-root-cwd");
+    let agent_cwd = temp_dir("foreign-agent-agent-cwd");
+    inspector.set_cwd(created.pid, root_cwd.clone());
+    inspector.set_descendants(
+        created.pid,
+        vec![codex_fact(FOREIGN_AGENT_PID, created.pid)],
+    );
+    inspector.set_cwd(FOREIGN_AGENT_PID, agent_cwd.clone());
+
+    // A foreign daemon's agent: never adopted, cwd focus stays on the root.
+    inspector.set_ownership_markers(
+        FOREIGN_AGENT_PID,
+        OwnershipMarkers {
+            daemon_id: Some("d-foreign".to_owned()),
+            session_id: Some("s-1".to_owned()),
+        },
+    );
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let skipped = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(skipped.active_agent, None, "foreign daemon must be skipped");
+    assert_eq!(skipped.active_agent_pid, None);
+    assert_eq!(skipped.cwd, root_cwd, "cwd focus must stay on the root");
+    {
+        let sessions = registry.inner.sessions.lock().await;
+        assert!(
+            sessions
+                .get(&created.id)
+                .expect("session entry")
+                .observed_agents
+                .is_empty(),
+            "a foreign-owned process must not become an observed agent"
+        );
+    }
+
+    // This daemon, but another session's agent: also skipped.
+    inspector.set_ownership_markers(
+        FOREIGN_AGENT_PID,
+        OwnershipMarkers {
+            daemon_id: Some(registry.daemon_instance_id().to_owned()),
+            session_id: Some(format!("{}-other", created.id.0)),
+        },
+    );
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let sibling = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(
+        sibling.active_agent, None,
+        "sibling session must be skipped"
+    );
+
+    // The session's own agent (inherited markers) is adopted as before.
+    inspector.set_ownership_markers(
+        FOREIGN_AGENT_PID,
+        OwnershipMarkers {
+            daemon_id: Some(registry.daemon_instance_id().to_owned()),
+            session_id: Some(created.id.0.clone()),
+        },
+    );
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let adopted = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(adopted.active_agent.as_deref(), Some("codex"));
+    assert_eq!(adopted.active_agent_pid, Some(FOREIGN_AGENT_PID));
+    assert_eq!(adopted.cwd, agent_cwd, "own agent drives the cwd focus");
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn external_rescan_skips_processes_marked_by_any_pohunek_daemon() {
+    // A process carrying pohunek ownership markers is a PTY child of *some*
+    // daemon instance — it is managed, not external, even when the owned-pid
+    // tree walk cannot connect it to a local session (nested daemons, ppid
+    // gaps). It must not surface as an external session.
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    inspector.set_descendants(1, vec![codex_fact(FOREIGN_AGENT_PID, 1)]);
+    inspector.set_ownership_markers(
+        FOREIGN_AGENT_PID,
+        OwnershipMarkers {
+            daemon_id: Some("d-foreign".to_owned()),
+            session_id: None,
+        },
+    );
+
+    registry
+        .rescan_external_agents(&TranscriptIndex::default())
+        .await;
+    assert!(
+        registry.list().await.is_empty(),
+        "a marked process must not surface as an external session"
+    );
+
+    // The same process without markers is genuinely external and surfaces.
+    inspector.set_ownership_markers(FOREIGN_AGENT_PID, OwnershipMarkers::default());
+    registry
+        .rescan_external_agents(&TranscriptIndex::default())
+        .await;
+    let sessions = registry.list().await;
+    assert_eq!(sessions.len(), 1, "unmarked agent surfaces as external");
+    assert_eq!(sessions[0].external, Some(true));
+    assert_eq!(sessions[0].pid, FOREIGN_AGENT_PID);
 }
 
 #[tokio::test]

@@ -10,7 +10,9 @@ use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
-use super::{ExitWatch, Pid, ProcessFact, ProcessInspector};
+use protocol::{ENV_DAEMON_ID, ENV_SESSION_ID};
+
+use super::{ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessInspector};
 
 /// Linux proc filesystem root.
 ///
@@ -62,6 +64,41 @@ impl ProcessInspector for LinuxInspector {
     fn exit_watch(&self, pid: Pid) -> io::Result<ExitWatch> {
         ExitWatch::from_fd(pidfd_open(pid)?)
     }
+
+    fn ownership_markers(&self, pid: Pid) -> io::Result<OwnershipMarkers> {
+        ownership_markers(pid)
+    }
+}
+
+/// Reads `POHUNEK_DAEMON_ID` / `POHUNEK_SESSION_ID` from `/proc/<pid>/environ`.
+///
+/// `environ` holds the environment the process was `execve`d with, which is
+/// exactly where a pohunek daemon's PTY markers live — they are injected before
+/// exec and inherited by every child. Entries are NUL-separated `KEY=VALUE`
+/// pairs; values are decoded lossily because marker ids are ASCII.
+fn ownership_markers(pid: Pid) -> io::Result<OwnershipMarkers> {
+    let bytes = match fs::read(proc_path(pid).join("environ")) {
+        Ok(bytes) => bytes,
+        Err(err) if is_process_race(&err) => return Ok(OwnershipMarkers::default()),
+        Err(err) => return Err(err),
+    };
+    let mut markers = OwnershipMarkers::default();
+    for entry in bytes.split(|byte| *byte == 0) {
+        let Some(separator) = entry.iter().position(|byte| *byte == b'=') else {
+            continue;
+        };
+        let (key, rest) = entry.split_at(separator);
+        let value = || String::from_utf8_lossy(&rest[1..]).into_owned();
+        if key == ENV_DAEMON_ID.as_bytes() {
+            markers.daemon_id = Some(value());
+        } else if key == ENV_SESSION_ID.as_bytes() {
+            markers.session_id = Some(value());
+        }
+        if markers.daemon_id.is_some() && markers.session_id.is_some() {
+            break;
+        }
+    }
+    Ok(markers)
 }
 
 fn same_user_processes() -> io::Result<Vec<ProcessFact>> {

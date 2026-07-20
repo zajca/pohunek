@@ -48,7 +48,7 @@ impl SessionRegistry {
 
     pub(super) async fn rescan_procwatch_at(&self, id: &SessionId, root_pid: Pid, now: Instant) {
         let observed_refresh = match self.inner.inspector.descendants(root_pid) {
-            Ok(facts) => Some(self.observed_agents_from_facts(facts, now)),
+            Ok(facts) => Some(self.observed_agents_from_facts(id, facts, now)),
             Err(err) => {
                 warn!(
                     session_id = %id.0,
@@ -162,6 +162,7 @@ impl SessionRegistry {
 
     fn observed_agents_from_facts(
         &self,
+        id: &SessionId,
         facts: Vec<ProcessFact>,
         now: Instant,
     ) -> HashMap<Pid, ObservedAgent> {
@@ -169,6 +170,9 @@ impl SessionRegistry {
             .into_iter()
             .filter_map(|fact| {
                 let agent_base = identify_agent(&fact)?;
+                if self.is_foreign_owned_agent(id, fact.pid) {
+                    return None;
+                }
                 let cwd = self.inner.inspector.cwd(fact.pid).ok();
                 Some((
                     fact.pid,
@@ -181,6 +185,40 @@ impl SessionRegistry {
                 ))
             })
             .collect()
+    }
+
+    /// Whether `pid` carries pohunek ownership markers naming a different
+    /// daemon instance or session — an agent PTY spawned by a *nested* daemon
+    /// (a test-suite loopback daemon, a self-hosted dev run) that lives inside
+    /// this session's process subtree. Adopting it would hijack this session's
+    /// active agent and cwd (and, transitively, its project association), so it
+    /// must never become an observed agent. Missing markers keep the process
+    /// eligible: an agent this session launched inherits the session's own
+    /// markers, and an env-scrubbed process stays observable as before.
+    /// Unreadable markers also keep it eligible — preferring the established
+    /// behavior over dropping a legitimate agent on a transient read failure.
+    fn is_foreign_owned_agent(&self, id: &SessionId, pid: Pid) -> bool {
+        let markers = match self.inner.inspector.ownership_markers(pid) {
+            Ok(markers) => markers,
+            Err(err) => {
+                debug!(
+                    session_id = %id.0,
+                    pid,
+                    error = %err,
+                    "failed to read process ownership markers; keeping it observable"
+                );
+                return false;
+            }
+        };
+        let foreign_daemon = markers
+            .daemon_id
+            .as_deref()
+            .is_some_and(|daemon_id| daemon_id != self.inner.daemon_instance_id);
+        let foreign_session = markers
+            .session_id
+            .as_deref()
+            .is_some_and(|session_id| session_id != id.0);
+        foreign_daemon || foreign_session
     }
 
     async fn existing_observed_pids(&self, id: &SessionId) -> HashSet<Pid> {

@@ -35,6 +35,31 @@ pub struct ProcessFact {
     pub cmdline: Vec<String>,
 }
 
+/// Pohunek ownership markers read from a process environment.
+///
+/// Every PTY a pohunek daemon spawns carries `POHUNEK_DAEMON_ID` and
+/// `POHUNEK_SESSION_ID` (see `session_pty_env`), and children inherit them at
+/// `execve`. Reconciliation uses these markers to tell *whose* agent a process
+/// is: a `codex`/`claude` process carrying another daemon's or another
+/// session's markers (a nested test-suite daemon, a self-hosted dev instance)
+/// must never be adopted as this session's active agent. A process without
+/// markers carries `None` in both fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnershipMarkers {
+    /// Value of `POHUNEK_DAEMON_ID`, when present.
+    pub daemon_id: Option<String>,
+    /// Value of `POHUNEK_SESSION_ID`, when present.
+    pub session_id: Option<String>,
+}
+
+impl OwnershipMarkers {
+    /// Whether the process carries any pohunek ownership marker at all.
+    #[must_use]
+    pub fn is_marked(&self) -> bool {
+        self.daemon_id.is_some() || self.session_id.is_some()
+    }
+}
+
 /// Guaranteed process-exit notification.
 #[derive(Debug)]
 pub struct ExitWatch {
@@ -132,4 +157,17 @@ pub trait ProcessInspector: Debug + Send + Sync + 'static {
     ///
     /// Returns the OS error from opening or registering the process exit handle.
     fn exit_watch(&self, pid: Pid) -> io::Result<ExitWatch>;
+
+    /// Returns the pohunek ownership markers from the process environment of
+    /// `pid`.
+    ///
+    /// Implementations read the environment the process was started with (on
+    /// Linux `/proc/<pid>/environ`) and extract `POHUNEK_DAEMON_ID` /
+    /// `POHUNEK_SESSION_ID`. A process that exited during inspection yields
+    /// empty markers, mirroring the race handling of the other methods.
+    ///
+    /// # Errors
+    ///
+    /// Returns OS I/O errors that are not normal process-exit races.
+    fn ownership_markers(&self, pid: Pid) -> io::Result<OwnershipMarkers>;
 }

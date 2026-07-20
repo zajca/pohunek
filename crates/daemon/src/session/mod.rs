@@ -1383,9 +1383,8 @@ impl SessionRegistry {
         cwd: PathBuf,
     ) -> Option<CwdAssociation> {
         let store = self.inner.store.clone();
-        let projects = self.inner.projects.clone();
         match tokio::task::spawn_blocking(move || {
-            resolve_cwd_association(cwd.as_path(), store.as_deref(), projects.as_deref())
+            resolve_cwd_association(cwd.as_path(), store.as_deref())
         })
         .await
         {
@@ -1826,6 +1825,22 @@ impl SessionRegistry {
             let Some(agent_base) = identify_agent(&fact) else {
                 continue;
             };
+            // A process carrying pohunek ownership markers is a PTY child of
+            // *some* pohunek daemon — this one (already excluded by the owned
+            // pid walk, markers are the backstop for ppid gaps) or another
+            // instance (a nested test-suite daemon, a second dev daemon). A
+            // managed agent must never surface as an external session.
+            match self.inner.inspector.ownership_markers(fact.pid) {
+                Ok(markers) if markers.is_marked() => continue,
+                Ok(_) => {}
+                Err(err) => {
+                    debug!(
+                        pid = fact.pid,
+                        error = %err,
+                        "failed to read external candidate ownership markers; keeping it observable"
+                    );
+                }
+            }
             let cwd = match self.inner.inspector.cwd(fact.pid) {
                 Ok(cwd) => cwd,
                 Err(err) => {
@@ -1900,9 +1915,8 @@ impl SessionRegistry {
         cwd: PathBuf,
     ) -> Option<CwdAssociation> {
         let store = self.inner.store.clone();
-        let projects = self.inner.projects.clone();
         match tokio::task::spawn_blocking(move || {
-            resolve_cwd_association(cwd.as_path(), store.as_deref(), projects.as_deref())
+            resolve_cwd_association(cwd.as_path(), store.as_deref())
         })
         .await
         {
@@ -2060,7 +2074,6 @@ fn external_session_info(
 fn resolve_cwd_association(
     cwd: &Path,
     store: Option<&Store>,
-    projects: Option<&ProjectManager>,
 ) -> Result<CwdAssociation, ProtocolError> {
     let canonical_cwd = canonical_or_original(cwd);
     let worktree = match store {
@@ -2069,7 +2082,7 @@ fn resolve_cwd_association(
     };
     let detected = detect_at(cwd)?;
     let mut association = match detected {
-        Some(detected) => association_from_detected_project(&detected, projects)?,
+        Some(detected) => association_from_detected_project(&detected),
         None => CwdAssociation::default(),
     };
 
@@ -2086,21 +2099,22 @@ fn resolve_cwd_association(
     Ok(association)
 }
 
-fn association_from_detected_project(
-    detected: &DetectedProject,
-    projects: Option<&ProjectManager>,
-) -> Result<CwdAssociation, ProtocolError> {
-    let project_id = match projects {
-        Some(projects) => Some(projects.register(detected, false)?.id()),
-        None => Some(project_id(&detected.git_common_dir)),
-    };
-    Ok(CwdAssociation {
-        project_id,
+/// Associates a detected repo with its *derived* project id — deliberately
+/// without registering it. Cwd hints (OSC 7, procwatch focus) are transient
+/// observations; letting them upsert project records means any repo a watched
+/// process merely sits in — e.g. a throwaway fixture repo created by a nested
+/// test-suite daemon — permanently pollutes the registry. Registration happens
+/// only on `session.new` (see `SessionTarget` resolution) and explicit
+/// `project add`. The derived id is stable, so it matches the record whenever
+/// the project is (or later becomes) registered.
+fn association_from_detected_project(detected: &DetectedProject) -> CwdAssociation {
+    CwdAssociation {
+        project_id: Some(project_id(&detected.git_common_dir)),
         is_linked_worktree: Some(detected.is_linked_worktree),
         repo: Some(detected.repo_root.clone()),
         branch: detected.branch.clone(),
         worktree_path: None,
-    })
+    }
 }
 
 fn active_worktree_for_cwd(
