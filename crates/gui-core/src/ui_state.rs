@@ -57,10 +57,14 @@ impl TreeNodeId {
 
 /// The right pane's persistent tab, restored across GUI restarts.
 ///
-/// `Detail` is the selection-driven session/project/host/start pane; the other
-/// three promote what used to be stacked inside the project pane
-/// (`linear_provider_view`, `github_provider_view`, `project_worktrees`) to
-/// full tab bodies scoped to the current project.
+/// `Detail` is the selection-driven session/project/host/start pane; `Linear`,
+/// `GitHub`, and `Worktrees` promote what used to be stacked inside the
+/// project pane (`linear_provider_view`, `github_provider_view`,
+/// `project_worktrees`) to full tab bodies scoped to the current project.
+/// `Review` (Track D.6, `docs/design/track-d-ui-brief.md` §3.9) is opened
+/// from a session's worktree detail or a GitHub pull request row rather than
+/// always being reachable from project scope alone, but is otherwise a
+/// persistent tab like the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RightTab {
@@ -68,6 +72,7 @@ pub enum RightTab {
     Linear,
     GitHub,
     Worktrees,
+    Review,
 }
 
 /// Restores a persisted `active_tab` value, tolerating UI state written before
@@ -83,6 +88,7 @@ where
         "linear" => RightTab::Linear,
         "git_hub" => RightTab::GitHub,
         "worktrees" => RightTab::Worktrees,
+        "review" => RightTab::Review,
         _ => RightTab::Detail,
     })
 }
@@ -250,6 +256,7 @@ mod tests {
             RightTab::Linear,
             RightTab::GitHub,
             RightTab::Worktrees,
+            RightTab::Review,
         ] {
             let state = UiState {
                 active_tab: tab,

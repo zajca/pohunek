@@ -62,8 +62,11 @@ const SETUP_SCRIPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Bounds network-facing operations such as `git fetch` so a dead remote cannot
 /// pin one daemon blocking thread indefinitely. The value is intentionally
 /// shorter than a human-facing command timeout, but long enough for normal local
-/// and NetBird-backed repositories.
-const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// and NetBird-backed repositories. Also reused by `session::diff` to bound its
+/// (local, non-network) `git diff`/`status`/`merge-base` subprocesses, so a
+/// pathological repo (e.g. a hanging diff/textconv filter) cannot wedge a
+/// blocking-pool thread indefinitely either.
+pub(crate) const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Poll interval for bounded git subprocesses.
 ///
 /// Matches the setup-script poll cadence: prompt enough for tests and short
@@ -754,7 +757,11 @@ impl WorktreeManager {
     /// `refs/heads/--upload-pack=evil`) to smuggle a `git` flag into the
     /// positional sinks. Validating it here closes that argv-injection path even
     /// though the user never typed the name.
-    fn default_branch(repository: &Path) -> Result<String, ProtocolError> {
+    ///
+    /// Also used by `session::diff` to resolve the fallback base ref when a
+    /// session's `session.diff` request gives no explicit `base` and the
+    /// worktree binding recorded none either.
+    pub(crate) fn default_branch(repository: &Path) -> Result<String, ProtocolError> {
         let default = current_branch(repository).map_err(|message| {
             error(
                 ErrorClass::Runtime,
@@ -856,7 +863,10 @@ fn is_branch_in_use_error(message: &str) -> bool {
 /// carry control characters. These values arrive from the socket and are passed
 /// positionally to `git`, so a leading `-` would let a caller inject an argv
 /// flag (mirrors the resume-id guard in `agent::SessionRef`).
-fn validate_git_ref_arg(value: &str, what: &str) -> Result<(), ProtocolError> {
+///
+/// Also the trust-boundary check `session::diff` runs on an explicit
+/// `session.diff` `base` param before it ever reaches a `git` argv.
+pub(crate) fn validate_git_ref_arg(value: &str, what: &str) -> Result<(), ProtocolError> {
     if value.is_empty() {
         return Err(error(
             ErrorClass::Runtime,
@@ -1385,7 +1395,7 @@ fn terminate_process_group(child: &mut Child) {
 
 /// A `git` command scoped to `repo` via `-C` (passed as an `OsStr` so non-UTF-8
 /// repo paths survive).
-fn git_command(repo: &Path) -> Command {
+pub(crate) fn git_command(repo: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo);
     cmd
@@ -1402,7 +1412,13 @@ fn run_command(cmd: Command) -> Result<String, String> {
 }
 
 /// Run a command to completion, killing it when `timeout` elapses.
-fn run_output_bounded(mut cmd: Command, timeout: Duration) -> Result<Output, String> {
+///
+/// Returns `Ok(Output)` for any completed process regardless of exit status
+/// (including a non-zero one) — only a spawn failure, a wait failure, or a
+/// timeout is `Err`. Callers branch on `Output::status` for command-specific
+/// success/failure semantics (e.g. `session::diff`'s `git diff --no-index`,
+/// which uses exit code 1 to mean "files differ", not "failed").
+pub(crate) fn run_output_bounded(mut cmd: Command, timeout: Duration) -> Result<Output, String> {
     configure_process_group(&mut cmd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd
@@ -1493,7 +1509,7 @@ fn git_capture(repo: &Path, args: &[&str]) -> Result<String, String> {
 /// error output for a credentials-in-URL remote echoes the token verbatim, and
 /// this message can be persisted (event log) or returned on the wire, so it must
 /// never carry a secret.
-fn output_failure_message(output: &std::process::Output) -> String {
+pub(crate) fn output_failure_message(output: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let message = if stderr.is_empty() { stdout } else { stderr };

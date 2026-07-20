@@ -189,6 +189,7 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
             session::handle_session_set_metadata(request, &state.sessions).await
         }
         method::SESSION_RENAME => session::handle_session_rename(request, &state.sessions).await,
+        method::SESSION_DIFF => session::handle_session_diff(request, &state.sessions).await,
         method::SESSION_INPUT => session::handle_session_input(request, &state.sessions).await,
         method::SESSION_REPORT_NATIVE_ID => {
             session::handle_session_report_native_id(request, &state.sessions).await

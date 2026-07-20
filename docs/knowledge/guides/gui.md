@@ -102,18 +102,20 @@ surface a per-host error instead of treating the whole app as failed.
 ## Navigation
 
 The right pane is a persistent tab bar over a body that switches with the
-active tab: `1 Detail · 2 Linear · 3 GitHub · 4 Worktrees`. Detail is the
-selection-driven session/project/host/start-work landing; Linear, GitHub, and
-Worktrees are full-tab bodies scoped to the current project (previously
-stacked underneath a project selection as `project_pane` sections). A context
-chip at the right end of the strip shows the tabs' project scope as
-`host / project-label`, or just the resolved host's connection dot when no
-project is in scope.
+active tab: `1 Detail · 2 Linear · 3 GitHub · 4 Worktrees · 5 Review`. Detail is
+the selection-driven session/project/host/start-work landing; Linear, GitHub,
+Worktrees, and Review are full-tab bodies scoped to the current project
+(previously stacked underneath a project selection as `project_pane`
+sections). A context chip at the right end of the strip shows the tabs'
+project scope as `host / project-label`, or just the resolved host's
+connection dot when no project is in scope.
 
-Tabs 2-4 need a project: the scope resolves from a selected project directly,
+Tabs 2-5 need a project: the scope resolves from a selected project directly,
 or from a selected session's linked project. With no project in scope, those
 tabs render with no click handler (a "Select a project" tooltip explains why)
-and their body shows a "select a project" empty state.
+and their body shows a "select a project" empty state. Unlike Linear/GitHub,
+Review's body shows its own "no review open" placeholder once a project is in
+scope but nothing has been opened yet — see [Review](#review).
 
 Selecting a session anywhere — the workspace tree, the Agents monitor, or the
 Inbox's Open-session action — always force-switches to the Detail tab, so
@@ -132,17 +134,18 @@ modal shortcuts apply only while a modal is open. The default keymap is:
 | Global | `tab_linear` | `2` | Switch to the Linear tab when a project is in scope. |
 | Global | `tab_github` | `3` | Switch to the GitHub tab when a project is in scope. |
 | Global | `tab_worktrees` | `4` | Switch to the Worktrees tab when a project is in scope. |
+| Global | `tab_review` | `5` | Switch to the Review tab when a project is in scope. |
 | Global | `open_inbox` | `i` | Open the Inbox. |
 | Global | `cycle_blocked` | `b` | Select the next blocked agent, wrapping through the blocked subset. |
 | Global | `open_selected_session` | `o` | Open the selected provider item when a provider tab is active; otherwise open the selected session in a terminal. |
-| Global | `activate_selection` | `enter` | Activate the selected provider item or selected session. |
+| Global | `activate_selection` | `enter` | Activate the selected provider item or selected session; on the Review tab, opens the inline comment editor for the currently selected diff line. |
 | Global | `open_keymap_help` | `shift+?` | Open the effective keyboard shortcut table. |
-| Global | `list_up`, `list_up_arrow` | `k`, `arrowup` | Move the active provider list selection up. |
-| Global | `list_down`, `list_down_arrow` | `j`, `arrowdown` | Move the active provider list selection down. |
+| Global | `list_up`, `list_up_arrow` | `k`, `arrowup` | Move the active provider list selection up; on the Review tab, moves the diff-line cursor to the previous line, walking backward across hunks and files. |
+| Global | `list_down`, `list_down_arrow` | `j`, `arrowdown` | Move the active provider list selection down; on the Review tab, moves the diff-line cursor to the next line, walking forward across hunks and files. |
 | Global | `focus_search` | `/` | Focus the active Linear/GitHub provider search box. |
 | Global | `new_session` | `n` | Open the "Start a session" modal. |
 | Global | `open_assistant` | `a` | Open the "Start assistant" modal. |
-| Global | `refresh_tab` | `r` | Refresh the active tab (`project.show`, Linear issues, or GitHub PRs+issues). |
+| Global | `refresh_tab` | `r` | Refresh the active tab (`project.show`, Linear issues, GitHub PRs+issues, or the Review tab's diff). |
 | Modal | `modal_back` | `escape` | In Inbox message detail, step back to the list; otherwise close the modal. |
 | Modal | `modal_primary` | `enter` | Run the modal primary action, or open the selected Inbox row from the list. |
 | Modal | `modal_primary_with_terminal` | `shift+enter` | In Inbox message detail, open the linked session and also open it in a terminal. |
@@ -461,6 +464,79 @@ agent badge. That status is best effort and should degrade to an unknown/error
 state when `gh` is unavailable or unauthenticated. GitHub issues can be browsed
 for context, but native provider launch is currently implemented for GitHub pull
 requests and Linear issues.
+
+## Review
+
+The Review tab (`5`, Track D.6) browses a change set — a session's worktree
+diff against its base, or a GitHub pull request's diff — and turns inline
+comments into a new session that acts on exactly the reviewed code.
+
+Open a review from:
+
+- A session's Detail pane: the "Review changes" button appears once the
+  session has a bound worktree, and opens that session's worktree-vs-base
+  diff (`session.diff`).
+- A GitHub pull request modal: the "Review diff" button fetches the PR's diff
+  with `gh pr diff`.
+
+Opening a review from either entry point switches to the Review tab,
+replacing whatever review was previously open for that host — there is one
+active review per host at a time, the same scoping Linear/GitHub browsing
+uses. It resumes the most-recently-updated persisted draft for the exact
+same source (same session, or same pull request) when one exists, and starts
+a brand-new empty draft only when it does not; a review that has already
+been dispatched is never resumed, so returning to a dispatched session's
+worktree always opens a fresh draft rather than the one that was already
+sent.
+
+Browsing: the left pane lists the changed files with a status glyph
+(`M`/`A`/`D`/`R`/`B` for modified/added/deleted/renamed/binary) and a
+per-file comment count; selecting a file shows its hunks in the right pane as
+a scrollable unified diff with old/new line-number gutters and hunk headers.
+`j`/`k`/the arrow keys step the selected line forward or backward across every
+hunk in the currently selected file's diff, matching provider-list navigation
+elsewhere in the GUI (see [Keyboard Shortcuts](#keyboard-shortcuts)); clicking
+a file or a line selects it directly.
+
+Commenting: click the selected line's "+ Comment" affordance, or press
+`Enter`, to open an inline editor under that line; `Enter` in the editor
+saves, `Escape`/Cancel discards. Existing comments render inline under their
+line with Edit/Delete actions, and the same comments are collected in a
+review tray below the diff pane with a running count. Every add, edit, or
+delete is persisted immediately to that review's JSON file — there is no
+separate "save" step for the draft as a whole, and reopening the same
+session's or pull request's review later (see above) picks the comments back
+up.
+
+Dispatch: the tray's "Dispatch as session…" action opens a modal with an
+agent picker (`shell`/`codex`/`claude`, seeded with the source session's
+current agent and freely overridable), a rendered prompt preview (or the
+render error, e.g. a missing `review.tmpl`), and — when the source session's
+agent is currently `working` — a warning that dispatching now may interrupt
+it. Confirming dispatch calls `session.new` with the picked agent, `cwd` set
+to the source session's worktree path (the *same* worktree, not a new
+checkout — git refuses a second worktree on a branch that is already checked
+out), the rendered review as `input`, and
+metadata `review.source` (this review's id) and `review.dispatched_at`
+(RFC3339) alongside every `link.*` key already present on the source
+session, copied verbatim. On success the review is marked dispatched and
+shows its target session id instead of the dispatch button; on failure the
+draft is untouched and the modal shows the error. A pull-request-sourced
+review has no source session or worktree to dispatch into, so its "Dispatch
+as session…" action is disabled with a tooltip explaining that the PR must be
+reviewed from an existing session's worktree instead.
+
+States: while a diff is loading the tab shows a fetching placeholder; a diff
+with no changes shows "No changes vs `<base>`"; a fetch failure shows the
+daemon or `gh` error text; and a diff that hit the size cap
+(`MAX_SESSION_DIFF_BYTES`) shows a banner above the file list noting that
+later files in the change set were cut and are not shown.
+
+Dispatch renders `~/.config/pohunek/prompts/review.tmpl` through the shared
+`crates/prompt` renderer, with `${branch}`, `${source}`, `${comments}`, and
+`${comment_count}` available (`${provider}` is always `"review"`). A missing
+`review.tmpl` is a typed error, not a silent default — run `pohunek setup
+config` to install the starter template alongside `issue.tmpl`/`pr.tmpl`.
 
 ## Secrets
 

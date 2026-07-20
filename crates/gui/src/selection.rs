@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 use iced::Task;
 use pohunek_gui_core::{
-    providers, session_link_metadata, ConnectionOptions, GitHubProviderScope,
-    GitHubPullRequestStatusKey, HostConfig, HostId, Selection, SessionLinkKind,
-    SessionLinkProvider,
+    default_reviews_dir, providers, session_link_metadata, ConnectionOptions, GitHubProviderScope,
+    GitHubPullRequestStatusKey, HostConfig, HostId, Review, ReviewSource, ReviewStore, Selection,
+    SessionLinkKind, SessionLinkProvider,
 };
 use protocol::{ProjectInfo, ProviderKind, SessionId, SessionInfo};
 
@@ -499,6 +499,31 @@ pub(crate) fn session_is_selected(
         app.ui_state.selection.as_ref(),
         Some(Selection::Session { host_id: h, session_id: s }) if h == host_id && s == session_id
     )
+}
+
+/// Resolves the reviews store rooted at the default XDG data directory.
+/// Recomputed on every call rather than cached on `PohunekApp`: it only reads
+/// environment variables (no I/O until a save/load call), so there is
+/// nothing to gain from caching it, and every call site already goes through
+/// a `Result<_, String>` fallible-config path the same way `connection_options`/
+/// `terminal_size` do.
+pub(crate) fn review_store() -> Result<ReviewStore, String> {
+    default_reviews_dir()
+        .map(ReviewStore::new)
+        .map_err(|err| err.to_string())
+}
+
+/// Human-readable summary of what a review was fetched from, for the
+/// `${source}` template variable (`render_review_prompt`). `base` is the
+/// resolved base ref from the diff fetch, when known.
+pub(crate) fn review_source_description(review: &Review, base: Option<&str>) -> String {
+    match &review.source {
+        ReviewSource::Session { session_id, .. } => match base {
+            Some(base) => format!("session {} worktree diff vs {base}", session_id.0),
+            None => format!("session {} worktree diff", session_id.0),
+        },
+        ReviewSource::PullRequest { pr_number, .. } => format!("GitHub pull request #{pr_number}"),
+    }
 }
 
 pub(crate) fn selected_session(app: &PohunekApp) -> Option<(&HostId, &SessionInfo)> {

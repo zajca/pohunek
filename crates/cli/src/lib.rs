@@ -770,6 +770,19 @@ enum SessionAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// Show a unified diff of a session's worktree against its base.
+    Diff {
+        /// Session target: `session-id` or `local/session-id`.
+        target: Target,
+        /// Explicit base ref to diff against. Defaults to the worktree
+        /// binding's recorded base branch, then the repository default.
+        #[arg(long)]
+        base: Option<String>,
+        /// Emit the structured result as JSON instead of raw diff text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl Commands {
@@ -923,7 +936,8 @@ impl SessionAction {
             | SessionAction::Fork { json, .. }
             | SessionAction::Rm { json, .. }
             | SessionAction::Input { json, .. }
-            | SessionAction::Rename { json, .. } => *json,
+            | SessionAction::Rename { json, .. }
+            | SessionAction::Diff { json, .. } => *json,
         }
     }
 }
@@ -1098,6 +1112,10 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     // `--clear` (or no name) clears it; a positional name sets it.
                     let new_name = if clear { None } else { name };
                     commands::session::run_rename(&host, &paths, &target, new_name, json).await?;
+                }
+                SessionAction::Diff { target, base, json } => {
+                    let host = effective_host(&global_host, Some(&target));
+                    commands::session::run_diff(&host, &paths, &target, base, json).await?;
                 }
             }
             Ok(ExitCode::SUCCESS)

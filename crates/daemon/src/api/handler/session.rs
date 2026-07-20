@@ -6,11 +6,11 @@
 //! are thin transport glue.
 
 use protocol::{
-    Request, Response, SessionAttachParams, SessionDetachParams, SessionForkParams,
-    SessionForkResult, SessionId, SessionInputParams, SessionListParams, SessionNewParams,
-    SessionNewResult, SessionReleaseAgentParams, SessionRenameParams, SessionReportAgentParams,
-    SessionReportNativeIdParams, SessionResizeParams, SessionResumeResult,
-    SessionSetMetadataParams,
+    Request, Response, SessionAttachParams, SessionDetachParams, SessionDiffParams,
+    SessionForkParams, SessionForkResult, SessionId, SessionInputParams, SessionListParams,
+    SessionNewParams, SessionNewResult, SessionReleaseAgentParams, SessionRenameParams,
+    SessionReportAgentParams, SessionReportNativeIdParams, SessionResizeParams,
+    SessionResumeResult, SessionSetMetadataParams,
 };
 
 use super::util::{ok_value, parse_optional_params, parse_params};
@@ -189,6 +189,17 @@ pub(super) async fn handle_session_rename(
         Err(err) => return Response::err(request.id.clone(), err),
     };
     match sessions.rename(&params.session_id, params.name).await {
+        Ok(result) => ok_value(request, &result),
+        Err(err) => Response::err(request.id.clone(), err),
+    }
+}
+
+pub(super) async fn handle_session_diff(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_params::<SessionDiffParams>(request) {
+        Ok(params) => params,
+        Err(err) => return Response::err(request.id.clone(), err),
+    };
+    match sessions.diff(&params.session_id, params.base).await {
         Ok(result) => ok_value(request, &result),
         Err(err) => Response::err(request.id.clone(), err),
     }

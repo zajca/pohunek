@@ -21,6 +21,7 @@ use crate::selection::{
 use crate::view::modals::toast_view;
 use crate::view::project::{project_pane, project_worktrees};
 use crate::view::provider::{github_provider_view, linear_provider_view};
+use crate::view::review::review_tab_body;
 use crate::view::session::session_pane;
 use crate::view::tree::conn_label;
 use crate::PohunekApp;
@@ -40,8 +41,12 @@ pub(crate) fn detail_view(app: &PohunekApp) -> Element<'_, Message> {
     scrollable(detail).into()
 }
 
-/// The `1 Detail · 2 Linear · 3 GitHub · 4 Worktrees` tab strip, with a
-/// trailing context chip showing the project scope tabs 2-4 operate on.
+/// The `1 Detail · 2 Linear · 3 GitHub · 4 Worktrees · 5 Review` tab strip,
+/// with a trailing context chip showing the project scope tabs 2-5 operate
+/// on. Review is enabled by the same project-scope gate as the others (its
+/// body shows its own "open a review" placeholder when nothing has been
+/// opened yet), rather than only appearing once a review exists — consistent
+/// with how Linear/GitHub/Worktrees are always reachable, just empty.
 fn tab_bar(app: &PohunekApp) -> Element<'_, Message> {
     let scope = tab_project_scope(app);
     let bar = row![
@@ -49,6 +54,7 @@ fn tab_bar(app: &PohunekApp) -> Element<'_, Message> {
         tab_button(app, RightTab::Linear, "2 Linear", scope.is_some()),
         tab_button(app, RightTab::GitHub, "3 GitHub", scope.is_some()),
         tab_button(app, RightTab::Worktrees, "4 Worktrees", scope.is_some()),
+        tab_button(app, RightTab::Review, "5 Review", scope.is_some()),
     ]
     .spacing(6)
     .align_y(Center)
@@ -116,6 +122,7 @@ fn tab_body(app: &PohunekApp) -> Element<'_, Message> {
         RightTab::Linear => linear_tab_body(app),
         RightTab::GitHub => github_tab_body(app),
         RightTab::Worktrees => worktrees_tab_body(app),
+        RightTab::Review => review_tab_body(app),
     }
 }
 
@@ -133,11 +140,12 @@ fn detail_body(app: &PohunekApp) -> Element<'_, Message> {
     }
 }
 
-/// Empty state for a project-scoped tab (Linear/GitHub/Worktrees) rendered
-/// when [`tab_project_scope`] finds none — reachable even though the tab
-/// button itself is disabled in that state, since switching selection away
-/// from a project while the tab is already active must not panic or stall.
-fn project_scope_placeholder() -> Element<'static, Message> {
+/// Empty state for a project-scoped tab (Linear/GitHub/Worktrees/Review)
+/// rendered when [`tab_project_scope`] finds none — reachable even though the
+/// tab button itself is disabled in that state, since switching selection
+/// away from a project while the tab is already active must not panic or
+/// stall. `pub(crate)` so `view::review` can reuse it for the Review tab.
+pub(crate) fn project_scope_placeholder() -> Element<'static, Message> {
     card(text("Select a project to view this tab.").size(13))
 }
 

@@ -5,14 +5,14 @@ use std::path::PathBuf;
 use protocol::{
     NotificationDeleteResult, NotificationUpdateResult, ProjectActionResult, ProjectActionsResult,
     ProjectInfo, ProjectPromptResult, ProjectRemoveResult, ProjectShowResult, SessionForkResult,
-    SessionId, SessionInfo, SessionRemoveResult, SessionRenameResult, SessionResumeResult,
-    SessionSetMetadataResult, SessionStopResult, WorktreeRemoveResult,
+    SessionId, SessionInfo, SessionNewResult, SessionRemoveResult, SessionRenameResult,
+    SessionResumeResult, SessionSetMetadataResult, SessionStopResult, WorktreeRemoveResult,
 };
 
 use crate::providers;
 use crate::{
     GitHubProviderScope, GitHubPullRequestStatusKey, HostEvent, HostId, HostSnapshot,
-    PromptPreview, ProviderOperation, ProviderRequestId, SessionLinkProvider,
+    PromptPreview, ProviderOperation, ProviderRequestId, Review, SessionLinkProvider,
 };
 
 /// Result of async daemon/provider I/O, reduced by [`Workspace::apply`].
@@ -169,5 +169,39 @@ pub enum DomainEvent {
     NotificationDeleteCompleted {
         host_id: HostId,
         result: NotificationDeleteResult,
+    },
+    /// A `session.diff`/`gh pr diff` fetch for the Review tab completed.
+    /// `request_id` guards against a stale fetch overwriting a diff the
+    /// operator has since navigated away from (same pattern as the Linear/
+    /// GitHub provider fetches above).
+    ReviewDiffLoaded {
+        host_id: HostId,
+        request_id: ProviderRequestId,
+        /// Raw unified-diff text, parsed into a `DiffModel` by the reducer.
+        diff_text: String,
+        /// Base ref the diff was actually computed against.
+        base: String,
+        /// Whether the daemon truncated the diff at a file boundary.
+        truncated: bool,
+    },
+    ReviewDiffFailed {
+        host_id: HostId,
+        request_id: ProviderRequestId,
+        error: String,
+    },
+    /// A review was successfully dispatched as a new same-worktree session.
+    /// Carries the whole updated (now `Dispatched`) review, since the
+    /// dispatching task owns a private copy rather than a `Workspace`-held one.
+    /// `result` is boxed: `SessionNewResult` is the largest field in this
+    /// enum by a wide margin (`clippy::large_enum_variant`), and every other
+    /// variant stays unboxed and cheap to move.
+    ReviewDispatched {
+        host_id: HostId,
+        review: Review,
+        result: Box<SessionNewResult>,
+    },
+    ReviewDispatchFailed {
+        host_id: HostId,
+        error: String,
     },
 }

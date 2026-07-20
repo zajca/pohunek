@@ -9,21 +9,23 @@ use iced::Task;
 use pohunek_gui_core::assistant::{AssistantPaths, LaunchParams as AssistantLaunchParams};
 use pohunek_gui_core::{
     add_project_with_options, assistant as assistant_core, create_session_with_options,
-    delete_notification_with_options, discover_hosts, fork_session_with_options,
-    inspect_session_with_options, launch_provider_item_with_options,
+    delete_notification_with_options, diff_session_with_options, discover_hosts, dispatch_review,
+    fork_session_with_options, inspect_session_with_options, launch_provider_item_with_options,
     list_project_actions_with_options, preview_action_prompt, providers,
     remove_session_with_options, remove_worktree_with_options, rename_project_with_options,
-    rename_session_with_options, resolve_project_action_with_options, resume_session_with_options,
-    set_session_metadata_with_options, show_project_with_options, stop_session_with_options,
-    update_notification_with_options, ConnectionOptions, DomainEvent as CoreEvent, HostConfig,
-    HostId, ProviderLaunchItem, ProviderLaunchParams, ProviderOperation, ProviderPanel,
-    ProviderRequestId, RightTab, Selection, SessionLinkProvider, WindowSize,
+    rename_session_with_options, render_review_prompt, resolve_project_action_with_options,
+    resume_session_with_options, set_session_metadata_with_options, show_project_with_options,
+    stop_session_with_options, update_notification_with_options, ConnectionOptions,
+    DomainEvent as CoreEvent, HostConfig, HostId, ProviderLaunchItem, ProviderLaunchParams,
+    ProviderOperation, ProviderPanel, ProviderRequestId, ReviewDiffStatus, ReviewDispatchParams,
+    ReviewSource, RightTab, Selection, SessionLinkProvider, WindowSize,
 };
 use protocol::{
-    ForkCwdMode, NotificationDeleteParams, NotificationId, NotificationStatus,
+    AgentActivity, ForkCwdMode, NotificationDeleteParams, NotificationId, NotificationStatus,
     NotificationUpdateParams, ProjectActionParams, ProjectActionsParams, ProjectAddParams,
-    ProjectRenameParams, ProjectShowParams, ProviderKind, SessionForkParams, SessionId,
-    SessionNewParams, SessionRenameParams, SessionSetMetadataParams, WorktreeRemoveParams,
+    ProjectRenameParams, ProjectShowParams, ProviderKind, SessionDiffParams, SessionForkParams,
+    SessionId, SessionNewParams, SessionRenameParams, SessionSetMetadataParams,
+    WorktreeRemoveParams,
 };
 
 use crate::attach::{attach_task, spawn_notification, spawn_open_url, window_dimension_to_u32};
@@ -38,11 +40,11 @@ use crate::runtime;
 use crate::selection::{
     active_github_filter, active_linear_filter, connection_options, ensure_project_filters_loaded,
     github_client_for_selected_project, host_config, launch_action_name, optional_field,
-    required_field, save_ui_state_task, selected_assistant_project,
-    selected_github_pr_status_target, selected_github_pull_request, selected_github_scope,
-    selected_host_config, selected_host_id, selected_linear_issue, selected_project,
-    selected_project_identity, selected_project_reference, selected_session_target,
-    sync_rename_edit_for_selection, tab_project_scope, terminal_size,
+    required_field, review_source_description, review_store, save_ui_state_task,
+    selected_assistant_project, selected_github_pr_status_target, selected_github_pull_request,
+    selected_github_scope, selected_host_config, selected_host_id, selected_linear_issue,
+    selected_project, selected_project_identity, selected_project_reference,
+    selected_session_target, sync_rename_edit_for_selection, tab_project_scope, terminal_size,
 };
 use crate::view::provider::{github_search_input_id, linear_search_input_id};
 use crate::PohunekApp;
@@ -118,7 +120,12 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                         );
                     }
                 }
-                RightTab::Detail | RightTab::Worktrees => {}
+                // Review has no project-scoped "fetch everything" concept:
+                // it needs an explicit source (a session's worktree or a PR)
+                // picked via `OpenSessionReview`/`OpenPullRequestReview`, not
+                // just a project scope, so switching into it auto-fetches
+                // nothing.
+                RightTab::Detail | RightTab::Worktrees | RightTab::Review => {}
             }
         }
         Message::FilterActivity(activity) => app.activity_filter = activity,
@@ -289,7 +296,14 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             app.modal = ModalView::Assistant;
         }
         Message::OpenKeymapModal => app.modal = ModalView::Keymap,
-        Message::CloseModal => app.modal = ModalView::None,
+        Message::CloseModal => {
+            if app.modal == ModalView::DispatchReview {
+                if let Ok(host_id) = selected_host_id(app) {
+                    app.workspace.close_review_dispatch_modal(&host_id);
+                }
+            }
+            app.modal = ModalView::None;
+        }
         Message::StartAgentSelected(agent) => app.start.agent = agent,
         Message::StartTemplateSelected(template) => {
             let chosen = (template != BLANK_TEMPLATE_LABEL).then_some(template);
@@ -686,6 +700,77 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                 tasks.push(save_ui_state_task(app));
             }
         }
+        Message::OpenSessionReview {
+            host_id,
+            session_id,
+        } => match open_session_review_task(app, host_id, &session_id) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
+        Message::OpenPullRequestReview { number } => {
+            match open_pull_request_review_task(app, number) {
+                Ok(task) => tasks.push(task),
+                Err(err) => app.status = Some(err),
+            }
+        }
+        Message::RefreshReviewDiff => match refresh_review_diff_task(app) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
+        Message::SelectReviewFile(index) => {
+            if let Ok(host_id) = selected_host_id(app) {
+                app.workspace.select_review_file(&host_id, index);
+            }
+        }
+        Message::SelectReviewLine(target) => {
+            if let Ok(host_id) = selected_host_id(app) {
+                app.workspace.select_review_line(&host_id, target);
+            }
+        }
+        Message::BeginReviewComment => {
+            if let Ok(host_id) = selected_host_id(app) {
+                app.workspace.begin_review_comment(&host_id);
+            }
+        }
+        Message::BeginEditReviewComment(index) => {
+            if let Ok(host_id) = selected_host_id(app) {
+                app.workspace.begin_edit_review_comment(&host_id, index);
+            }
+        }
+        Message::ReviewCommentDraftChanged(value) => {
+            if let Ok(host_id) = selected_host_id(app) {
+                app.workspace.update_review_comment_draft(&host_id, value);
+            }
+        }
+        Message::SaveReviewComment => {
+            if let Err(err) = save_review_comment(app) {
+                app.status = Some(err);
+            }
+        }
+        Message::CancelReviewComment => {
+            if let Ok(host_id) = selected_host_id(app) {
+                app.workspace.cancel_review_comment_editor(&host_id);
+            }
+        }
+        Message::RemoveReviewComment(index) => {
+            if let Err(err) = remove_review_comment(app, index) {
+                app.status = Some(err);
+            }
+        }
+        Message::OpenReviewDispatchModal => match open_review_dispatch_modal(app) {
+            Ok(()) => app.modal = ModalView::DispatchReview,
+            Err(err) => app.status = Some(err),
+        },
+        Message::DispatchAgentSelected(agent) => {
+            if let Ok(host_id) = selected_host_id(app) {
+                app.workspace
+                    .set_review_dispatch_agent(&host_id, agent.as_str().to_owned());
+            }
+        }
+        Message::ConfirmReviewDispatch => match confirm_review_dispatch_task(app) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
     }
     Task::batch(tasks)
 }
@@ -775,6 +860,14 @@ fn move_provider_selection(app: &mut PohunekApp, direction: ListDirection) {
                 }
             }
         }
+        RightTab::Review => match direction {
+            ListDirection::Down => {
+                app.workspace.select_next_review_line(&host_id);
+            }
+            ListDirection::Up => {
+                app.workspace.select_previous_review_line(&host_id);
+            }
+        },
         RightTab::Detail | RightTab::Worktrees => {}
     }
 }
@@ -796,7 +889,7 @@ fn provider_search_focus_task(app: &PohunekApp) -> Option<Task<Message>> {
     match app.ui_state.active_tab {
         RightTab::Linear => Some(operation::focus(linear_search_input_id())),
         RightTab::GitHub => Some(operation::focus(github_search_input_id())),
-        RightTab::Detail | RightTab::Worktrees => None,
+        RightTab::Detail | RightTab::Worktrees | RightTab::Review => None,
     }
 }
 
@@ -866,6 +959,322 @@ fn begin_github_pull_request_status_request(
     Ok(app
         .workspace
         .begin_github_pull_request_status_request(host_id))
+}
+
+/// Opens the Review tab for `session_id`'s worktree diff, switches the active
+/// tab to Review, and kicks off the async `session.diff` fetch. Errors when
+/// the session is not loaded or has no bound worktree (D.6 — a session
+/// without a worktree has nothing to diff).
+fn open_session_review_task(
+    app: &mut PohunekApp,
+    host_id: HostId,
+    session_id: &SessionId,
+) -> Result<Task<Message>, String> {
+    let host = host_config(app, &host_id)?;
+    let options = connection_options(app)?;
+    let host_view = app
+        .workspace
+        .hosts
+        .get(&host_id)
+        .ok_or_else(|| format!("unknown host `{host_id}`"))?;
+    let session = host_view
+        .sessions
+        .get(&session_id.0)
+        .cloned()
+        .ok_or_else(|| "session is not loaded".to_owned())?;
+    if session.worktree_path.is_none() {
+        return Err("this session has no worktree to review".to_owned());
+    }
+    let project_label = session
+        .project_id
+        .as_ref()
+        .and_then(|project_id| host_view.projects.get(project_id))
+        .map_or_else(
+            || session.project_id.clone().unwrap_or_default(),
+            |project| project.label.clone(),
+        );
+    let store = review_store()?;
+    let request_id =
+        app.workspace
+            .begin_review_from_session(host_id.clone(), &store, &session, project_label);
+    app.ui_state.active_tab = RightTab::Review;
+    let diff_task = fetch_session_review_diff_task(host, options, host_id, session.id, request_id);
+    Ok(Task::batch([diff_task, save_ui_state_task(app)]))
+}
+
+/// Opens the Review tab for a GitHub pull request's diff (`gh pr diff`).
+/// Errors when the pull request is not the one currently loaded in the
+/// GitHub provider browser (it must be, since the "Review diff" button only
+/// renders inside that PR's own item modal).
+fn open_pull_request_review_task(
+    app: &mut PohunekApp,
+    number: u64,
+) -> Result<Task<Message>, String> {
+    let (host_id, scope, client) = github_client_for_selected_project(app)?;
+    let pull_request = selected_github_pull_request(app)
+        .ok()
+        .filter(|pull_request| pull_request.number == number)
+        .ok_or_else(|| "GitHub pull request is not loaded".to_owned())?;
+    let project_label = app
+        .workspace
+        .hosts
+        .get(&host_id)
+        .and_then(|host| host.projects.get(&scope.project_id))
+        .map_or_else(|| scope.project_id.clone(), |project| project.label.clone());
+    let store = review_store()?;
+    let request_id = app.workspace.begin_review_from_pull_request(
+        host_id.clone(),
+        &store,
+        number,
+        project_label,
+        pull_request.head_ref_name.clone(),
+    );
+    app.ui_state.active_tab = RightTab::Review;
+    let diff_task = fetch_pull_request_review_diff_task(client, host_id, number, request_id);
+    Ok(Task::batch([diff_task, save_ui_state_task(app)]))
+}
+
+/// Re-fetches the Review tab's diff for whichever source is currently open,
+/// without disturbing the collected comments — mirroring the `r` refresh
+/// shortcut Linear/GitHub already have (`keyboard::refresh_active_tab`).
+fn refresh_review_diff_task(app: &mut PohunekApp) -> Result<Task<Message>, String> {
+    let host_id = selected_host_id(app)?;
+    let source = app
+        .workspace
+        .hosts
+        .get(&host_id)
+        .and_then(|host| host.review.active_review.as_ref())
+        .map(|review| review.source.clone())
+        .ok_or_else(|| "no review is open".to_owned())?;
+    let request_id = app
+        .workspace
+        .begin_review_diff_refresh(&host_id)
+        .ok_or_else(|| "no review is open".to_owned())?;
+    match source {
+        ReviewSource::Session { session_id, .. } => {
+            let host = host_config(app, &host_id)?;
+            let options = connection_options(app)?;
+            Ok(fetch_session_review_diff_task(
+                host, options, host_id, session_id, request_id,
+            ))
+        }
+        ReviewSource::PullRequest { pr_number, .. } => {
+            let (_, _, client) = github_client_for_selected_project(app)?;
+            Ok(fetch_pull_request_review_diff_task(
+                client, host_id, pr_number, request_id,
+            ))
+        }
+    }
+}
+
+fn fetch_session_review_diff_task(
+    host: HostConfig,
+    options: ConnectionOptions,
+    host_id: HostId,
+    session_id: SessionId,
+    request_id: ProviderRequestId,
+) -> Task<Message> {
+    Task::perform(
+        runtime::perform(async move {
+            let params = SessionDiffParams {
+                session_id,
+                base: None,
+            };
+            let event = match diff_session_with_options(&host, params, options).await {
+                Ok(result) => CoreEvent::ReviewDiffLoaded {
+                    host_id,
+                    request_id,
+                    diff_text: result.diff,
+                    base: result.base,
+                    truncated: result.truncated,
+                },
+                Err(err) => CoreEvent::ReviewDiffFailed {
+                    host_id,
+                    request_id,
+                    error: err.to_string(),
+                },
+            };
+            Ok(event)
+        }),
+        Message::CoreCommandCompleted,
+    )
+}
+
+fn fetch_pull_request_review_diff_task(
+    client: providers::github::GitHubClient<providers::github::CommandGhRunner>,
+    host_id: HostId,
+    number: u64,
+    request_id: ProviderRequestId,
+) -> Task<Message> {
+    Task::perform(
+        runtime::perform(async move {
+            // `gh pr diff` reports no explicit base ref and no truncation
+            // signal (unlike `session.diff`, which has both) — see
+            // `providers::github::GitHubClient::pull_request_diff`.
+            let event = match client.pull_request_diff(number).await {
+                Ok(diff_text) => CoreEvent::ReviewDiffLoaded {
+                    host_id,
+                    request_id,
+                    diff_text,
+                    base: "the pull request's base branch".to_owned(),
+                    truncated: false,
+                },
+                Err(err) => CoreEvent::ReviewDiffFailed {
+                    host_id,
+                    request_id,
+                    error: err.to_string(),
+                },
+            };
+            Ok(event)
+        }),
+        Message::CoreCommandCompleted,
+    )
+}
+
+/// Saves the Review tab's open comment editor (add or edit) and persists the
+/// review through the reviews store.
+fn save_review_comment(app: &mut PohunekApp) -> Result<(), String> {
+    let host_id = selected_host_id(app)?;
+    let store = review_store()?;
+    app.workspace
+        .save_review_comment(&host_id, &store)
+        .map_err(|err| err.to_string())
+}
+
+/// Removes one comment from the active review and persists it.
+fn remove_review_comment(app: &mut PohunekApp, index: usize) -> Result<(), String> {
+    let host_id = selected_host_id(app)?;
+    let store = review_store()?;
+    app.workspace
+        .remove_review_comment(&host_id, &store, index)
+        .map_err(|err| err.to_string())
+}
+
+/// Opens the "Dispatch as session…" modal: renders the prompt preview (or
+/// captures its typed render error to show inline), seeds the agent picker
+/// with the source session's current agent (operator-editable from here via
+/// `Message::DispatchAgentSelected`), and resolves its working status.
+/// Errors (rather than opening the modal with an error preview) only for
+/// conditions the modal cannot meaningfully display: no review open, or a
+/// pull-request-sourced review with no existing session to dispatch into
+/// (`dispatch_review` always requires one — see
+/// `pohunek_gui_core::ReviewDispatchModal`'s doc comment).
+fn open_review_dispatch_modal(app: &mut PohunekApp) -> Result<(), String> {
+    let host_id = selected_host_id(app)?;
+    let host = app
+        .workspace
+        .hosts
+        .get(&host_id)
+        .ok_or_else(|| format!("unknown host `{host_id}`"))?;
+    let review = host
+        .review
+        .active_review
+        .clone()
+        .ok_or_else(|| "no review is open".to_owned())?;
+    let ReviewSource::Session { session_id, .. } = &review.source else {
+        return Err(
+            "dispatching requires reviewing from an existing session's worktree".to_owned(),
+        );
+    };
+    let session = host
+        .sessions
+        .get(&session_id.0)
+        .cloned()
+        .ok_or_else(|| "the source session is no longer loaded".to_owned())?;
+    let base = match &host.review.diff {
+        ReviewDiffStatus::Loaded { base, .. } | ReviewDiffStatus::Empty { base } => {
+            Some(base.clone())
+        }
+        ReviewDiffStatus::Idle | ReviewDiffStatus::Fetching | ReviewDiffStatus::Error(_) => None,
+    };
+    let source_description = review_source_description(&review, base.as_deref());
+    let prompt_preview =
+        render_review_prompt(&review, &source_description).map_err(|err| err.to_string());
+    let source_working = session.activity == Some(AgentActivity::Working);
+    app.workspace.open_review_dispatch_modal(
+        &host_id,
+        prompt_preview,
+        session.agent.clone(),
+        source_working,
+    );
+    Ok(())
+}
+
+/// Confirms dispatching the active review: re-inspects the source session
+/// (so `dispatch_review` gets its *current* worktree path/agent, not a
+/// snapshot from whenever the modal was opened), then dispatches with the
+/// prompt already rendered for the modal preview.
+fn confirm_review_dispatch_task(app: &PohunekApp) -> Result<Task<Message>, String> {
+    let host_id = selected_host_id(app)?;
+    let host_config = host_config(app, &host_id)?;
+    let options = connection_options(app)?;
+    let terminal_size = terminal_size(app)?;
+    let host = app
+        .workspace
+        .hosts
+        .get(&host_id)
+        .ok_or_else(|| format!("unknown host `{host_id}`"))?;
+    let review = host
+        .review
+        .active_review
+        .clone()
+        .ok_or_else(|| "no review is open".to_owned())?;
+    let dispatch = host
+        .review
+        .dispatch
+        .as_ref()
+        .ok_or_else(|| "no dispatch in progress".to_owned())?;
+    let rendered_prompt = dispatch.prompt_preview.clone()?;
+    let agent = dispatch.agent.clone();
+    let ReviewSource::Session { session_id, .. } = &review.source else {
+        return Err(
+            "dispatching requires reviewing from an existing session's worktree".to_owned(),
+        );
+    };
+    let session_id = session_id.clone();
+    let store = review_store()?;
+    Ok(Task::perform(
+        runtime::perform(async move {
+            let session_info =
+                match inspect_session_with_options(&host_config, &session_id, options).await {
+                    Ok(session) => session,
+                    Err(err) => {
+                        return Ok(CoreEvent::ReviewDispatchFailed {
+                            host_id,
+                            error: err.to_string(),
+                        });
+                    }
+                };
+            let mut review = review;
+            let dispatched = dispatch_review(
+                &mut review,
+                ReviewDispatchParams {
+                    config: &host_config,
+                    store: &store,
+                    session_info: &session_info,
+                    agent: Some(agent),
+                    rendered_prompt,
+                    cols: terminal_size.cols,
+                    rows: terminal_size.rows,
+                    options,
+                },
+            )
+            .await;
+            let event = match dispatched {
+                Ok(result) => CoreEvent::ReviewDispatched {
+                    host_id,
+                    review,
+                    result: Box::new(result),
+                },
+                Err(err) => CoreEvent::ReviewDispatchFailed {
+                    host_id,
+                    error: err.to_string(),
+                },
+            };
+            Ok(event)
+        }),
+        Message::CoreCommandCompleted,
+    ))
 }
 
 pub(crate) fn discover_hosts_task(config: &AppConfig) -> Task<Message> {
@@ -1613,8 +2022,8 @@ fn launch_github_pull_request_task(app: &PohunekApp) -> Result<Task<Message>, St
 #[cfg(test)]
 mod tests {
     use pohunek_gui_core::{
-        ConnState, GitHubProviderScope, HostView, NotificationFilter, NotificationScope,
-        PromptState, ProviderState, UiState, Workspace,
+        parse_unified_diff, ConnState, GitHubProviderScope, HostView, NotificationFilter,
+        NotificationScope, PromptState, ProviderState, Review, UiState, Workspace,
     };
     use protocol::{
         AgentKind, NotificationKind, NotificationRecord, NotificationSeverity, NotificationSource,
@@ -1748,6 +2157,57 @@ mod tests {
         assert_eq!(host.provider.github.selected_issue, None);
     }
 
+    #[test]
+    fn move_list_selection_moves_review_line_selection() {
+        let host_id = HostId::new("local");
+        let mut host = test_host();
+        let diff_text = "diff --git a/f.rs b/f.rs\n\
+             --- a/f.rs\n\
+             +++ b/f.rs\n\
+             @@ -1,2 +1,2 @@\n\
+             -old line\n\
+             +new line\n\
+              context line\n";
+        host.review.diff = ReviewDiffStatus::Loaded {
+            model: parse_unified_diff(diff_text),
+            base: "main".to_owned(),
+            truncated: false,
+        };
+        host.review.active_review = Some(Review::new(
+            ReviewSource::Session {
+                host_id: host_id.clone(),
+                session_id: SessionId("s-1".to_owned()),
+            },
+            "project-1",
+            "feature/x",
+        ));
+        let mut app = app_without_selection();
+        app.workspace.hosts.insert(host_id.clone(), host);
+        app.ui_state.active_tab = RightTab::Review;
+        app.ui_state.selection = Some(Selection::Project {
+            host_id: host_id.clone(),
+            project_id: "p-1".to_owned(),
+        });
+
+        let _ = update(&mut app, Message::MoveListSelection(ListDirection::Down));
+        let first_selection = app
+            .workspace
+            .hosts
+            .get(&host_id)
+            .and_then(|host| host.review.selected_line)
+            .expect("first line selected");
+
+        let _ = update(&mut app, Message::MoveListSelection(ListDirection::Down));
+        let second_selection = app
+            .workspace
+            .hosts
+            .get(&host_id)
+            .and_then(|host| host.review.selected_line)
+            .expect("second line selected");
+
+        assert_ne!(first_selection, second_selection);
+    }
+
     fn app_without_selection() -> PohunekApp {
         PohunekApp {
             workspace: Workspace::default(),
@@ -1790,6 +2250,7 @@ mod tests {
             notifications: BTreeMap::new(),
             prompt: PromptState::default(),
             provider: ProviderState::default(),
+            review: pohunek_gui_core::ReviewTabState::default(),
             last_agent_state: None,
             last_error: None,
         }

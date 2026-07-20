@@ -54,7 +54,7 @@ pub use integration::{
     ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
 #[doc(inline)]
-pub use limits::MAX_CONTROL_LINE_BYTES;
+pub use limits::{MAX_CONTROL_LINE_BYTES, MAX_SESSION_DIFF_BYTES};
 #[doc(inline)]
 pub use method::Method;
 #[doc(inline)]
@@ -79,13 +79,14 @@ pub use project::{
 pub use session::{
     AgentActivity, AgentKind, AgentStateEvent, AttachEvent, AttachHeader, CwdSource, ForkCwdMode,
     SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult,
-    SessionEvent, SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams, SessionNewResult,
-    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams,
-    SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
-    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
-    SessionResizeResult, SessionResumeResult, SessionSetMetadataParams, SessionSetMetadataResult,
-    SessionState, SessionStopResult, SessionWarning, SessionWarningKind,
+    SessionDiffParams, SessionDiffResult, SessionEvent, SessionForkParams, SessionForkResult,
+    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter,
+    SessionListParams, SessionNewParams, SessionNewResult, SessionReleaseAgentParams,
+    SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams, SessionRenameResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeResult,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
+    SessionWarning, SessionWarningKind,
 };
 #[doc(inline)]
 pub use version::{negotiate, ProtocolVersion, PROTOCOL_VERSION};

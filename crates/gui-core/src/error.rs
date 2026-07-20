@@ -1,8 +1,10 @@
 //! Errors raised by the GUI core bridge.
 
+use std::path::PathBuf;
+
 use thiserror::Error;
 
-use crate::PromptError;
+use crate::{PromptError, ReviewStoreError};
 
 /// Errors raised by the GUI core bridge.
 #[derive(Debug, Error)]
@@ -42,4 +44,15 @@ pub enum CoreError {
     ProviderLaunchItemMismatch { message: &'static str },
     #[error("provider `{provider}` cannot be converted to a prompt provider")]
     UnsupportedPromptProvider { provider: &'static str },
+    #[error(transparent)]
+    ReviewStore(#[from] ReviewStoreError),
+    #[error("review template `{}` is missing; run `pohunek setup` to install it", path.display())]
+    MissingReviewTemplate { path: PathBuf },
+    #[error("failed to read review template `{}`: {source}", path.display())]
+    ReviewTemplateIo {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("session `{}` has no bound worktree to dispatch a review into", session_id.0)]
+    ReviewSessionMissingWorktree { session_id: protocol::SessionId },
 }

@@ -19,10 +19,11 @@ use crate::{
     ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams, ProjectPromptParams,
     ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
     ProjectShowParams, ProjectShowResult, SessionAttachParams, SessionAttachResult,
-    SessionDetachParams, SessionDetachResult, SessionForkParams, SessionForkResult, SessionId,
-    SessionInfo, SessionInputParams, SessionInputResult, SessionListParams, SessionNewParams,
-    SessionNewResult, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
-    SessionRenameParams, SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionDetachParams, SessionDetachResult, SessionDiffParams, SessionDiffResult,
+    SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult,
+    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams,
+    SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
     SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
     SessionResizeResult, SessionResumeResult, SessionSetMetadataParams, SessionSetMetadataResult,
     SessionStopResult, WorktreeRemoveParams, WorktreeRemoveResult,
@@ -280,6 +281,15 @@ method_table!(
     SessionRenameResult,
     "SessionRenameParams",
     "SessionRenameResult";
+
+    /// Compute a unified diff of a session's worktree against its base.
+    SessionDiff,
+    SESSION_DIFF,
+    "session.diff",
+    SessionDiffParams,
+    SessionDiffResult,
+    "SessionDiffParams",
+    "SessionDiffResult";
 
     /// Install per-agent native-session capture hooks.
     IntegrationInstall,

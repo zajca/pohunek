@@ -15,6 +15,18 @@ inspect with `pohunek session inspect`, list with `pohunek session list`, send
 input with `pohunek session input`, stop with `pohunek session stop`, and attach
 with `pohunek attach`.
 
+`pohunek session diff <target> [--base <ref>] [--json]` prints a unified diff
+of a session's worktree against a base ref: raw diff text on stdout by
+default, or the structured `SessionDiffResult` (`diff`, `base`, `truncated`)
+with `--json`. `--base` overrides the base ref; omitted, the daemon falls back
+to the worktree binding's recorded base branch, then the repository's default
+branch, and always echoes whichever ref it actually used in the result's
+`base` field. A session without a bound worktree fails with a typed
+`session_no_worktree` error — there is nothing to diff for a plain-`cwd`
+session. The diff covers tracked changes plus untracked files (rendered as
+added-file diffs) and is truncated at a file boundary when it exceeds the
+daemon's size cap, reported via `truncated: true`.
+
 Session targets are host-aware. A bare session id targets the local host; a
 `<host>/<session-id>` target names a specific host. Remote session creation keeps
 the existing confirmation behavior: non-local starts require explicit approval,
@@ -43,6 +55,15 @@ and the launch scripts write exactly these five keys through the shared
 `pohunek_prompt::link` implementation, so a link is byte-identical regardless
 of which surface created the session. The daemon treats all metadata as
 opaque owner-controlled strings.
+
+A session created by dispatching a GUI review (Track D.6, see
+[GUI setup](../guides/gui.md#review)) carries `review.source` (the dispatched
+review's app-local id) and `review.dispatched_at` (RFC3339), plus every
+`link.*` key already present on the source session, copied verbatim. Review
+dispatch always targets the source session's own worktree with `cwd` rather
+than minting a new one — git refuses a second worktree on a branch already
+checked out — so a review session's `worktree_path` and `branch` match its
+source session's.
 
 Notifications can be linked to a session through `session_id`. Provider hook
 adapters attach the id when `POHUNEK_SESSION_ID` is present and shape-valid;

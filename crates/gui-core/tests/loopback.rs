@@ -15,22 +15,24 @@ use pohunek_daemon::api::{DaemonState, HealthInfo, RemoteServer};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use pohunek_gui_core::assistant::{self, AssistantPaths, Intent, LaunchParams};
 use pohunek_gui_core::{
-    add_project, host_subscription_stream, inspect_session, launch_action_prompt_with_options,
-    launch_provider_item_with_options, list_project_actions, list_projects, load_host_snapshot,
-    preview_action_prompt, preview_prompt_content, remove_project, rename_project,
+    add_project, dispatch_review, host_subscription_stream, inspect_session,
+    launch_action_prompt_with_options, launch_provider_item_with_options, list_project_actions,
+    list_projects, load_host_snapshot, parse_unified_diff, preview_action_prompt,
+    preview_prompt_content, remove_project, rename_project, render_review_prompt,
     resolve_project_action, resolve_project_prompt, session_link_metadata, session_metadata_rows,
     set_session_metadata, show_project, spawn_attach_command, stop_session as stop_gui_session,
     workspace_connection_stream, AgentStateEvent, AttachCommandSpawner, AttachSpawnIntent,
-    AttachTemplateValues, ConnState, ConnectionOptions, DomainEvent, HealthSummary, HostConfig,
-    HostEvent, HostId, HostSnapshot, PromptContext, PromptLaunchParams, PromptPreview,
-    ProviderLaunchItem, ProviderLaunchParams, RightTab, Selection, SessionLinkKind,
-    SessionLinkProvider, TreeNodeId, UiState, WindowSize, Workspace,
+    AttachTemplateValues, ConnState, ConnectionOptions, CoreError, DiffFileStatus, DomainEvent,
+    HealthSummary, HostConfig, HostEvent, HostId, HostSnapshot, PromptContext, PromptLaunchParams,
+    PromptPreview, ProviderLaunchItem, ProviderLaunchParams, Review, ReviewComment,
+    ReviewDispatchParams, ReviewSide, ReviewSource, ReviewStatus, ReviewStore, RightTab, Selection,
+    SessionLinkKind, SessionLinkProvider, TreeNodeId, UiState, WindowSize, Workspace,
 };
 use protocol::{
     method, AgentActivity, AgentKind, ErrorClass, ProjectActionParams, ProjectActionResult,
     ProjectActionsParams, ProjectAddParams, ProjectPromptParams, ProjectRemoveParams,
     ProjectRenameParams, ProjectShowParams, ProtocolError, ProviderKind, Request, Response,
-    SessionId, SessionInfo, SessionNewParams, SessionReportNativeIdParams,
+    SessionDiffParams, SessionId, SessionInfo, SessionNewParams, SessionReportNativeIdParams,
     SessionSetMetadataParams, StateSource,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1372,6 +1374,558 @@ fn ui_state_load_raises_legacy_agents_pane_height() {
     let restored = UiState::load_from_dir(&state_dir).expect("restore ui state");
 
     assert_eq!(restored.agents_pane_height, 360);
+}
+
+fn review_prompt_template() -> &'static str {
+    "Review of ${source} on branch ${branch} (${comment_count} comments):\n${comments}\n"
+}
+
+/// Points `XDG_CONFIG_HOME` at a fresh temp dir with a `review.tmpl` in place,
+/// so [`render_review_prompt`] finds a template without touching the real
+/// operator config.
+fn install_review_template(tag: &str) -> EnvGuard {
+    let config_home = temp_dir(tag);
+    write_file(
+        &config_home.join("pohunek/prompts/review.tmpl"),
+        review_prompt_template(),
+    );
+    EnvGuard::set("XDG_CONFIG_HOME", config_home)
+}
+
+async fn create_worktree_session(host: &HostConfig, project_id: &str, branch: &str) -> SessionInfo {
+    pohunek_gui_core::create_session(
+        host,
+        SessionNewParams {
+            agent: agent_name(AgentKind::Codex).to_owned(),
+            name: None,
+            cwd: None,
+            cols: 80,
+            rows: 24,
+            project: Some(project_id.to_owned()),
+            repo: None,
+            branch: Some(branch.to_owned()),
+            base_branch: Some("main".to_owned()),
+            input: None,
+            metadata: std::collections::BTreeMap::new(),
+        },
+    )
+    .await
+    .expect("session.new creates worktree")
+    .session
+}
+
+#[tokio::test]
+async fn review_session_diff_is_parsed_into_added_and_modified_files() {
+    let _path_lock = PATH_LOCK.lock().await;
+    let bin_dir = temp_dir("gui-core-review-diff-bin");
+    write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
+    let _path = PathGuard::prepend(&bin_dir);
+
+    let daemon = LoopbackDaemon::spawn("review-diff", "0.1.0-review-diff").await;
+    let host = HostConfig::tcp("host-review-diff", daemon.addr);
+    let repo = init_git_repo("gui-core-review-diff-repo");
+    let project = add_project(
+        &host,
+        ProjectAddParams {
+            path: Some(repo),
+            name: Some("Review Diff Project".to_owned()),
+            base_branch: Some("main".to_owned()),
+        },
+    )
+    .await
+    .expect("project.add");
+
+    let session = create_worktree_session(&host, &project.id, "feature/diff-review").await;
+    let worktree_path = session
+        .worktree_path
+        .clone()
+        .expect("worktree path present");
+
+    std::fs::write(worktree_path.join("README.md"), "init\nchanged\n").expect("edit README");
+    std::fs::write(worktree_path.join("new_file.txt"), "brand new content\n")
+        .expect("write new file");
+
+    let diff_result = pohunek_gui_core::diff_session(
+        &host,
+        SessionDiffParams {
+            session_id: session.id.clone(),
+            base: None,
+        },
+    )
+    .await
+    .expect("session.diff");
+    assert!(!diff_result.truncated);
+
+    let model = parse_unified_diff(&diff_result.diff);
+    let readme = model
+        .files
+        .iter()
+        .find(|file| file.path == "README.md")
+        .expect("README.md present in the parsed diff");
+    assert_eq!(readme.status, DiffFileStatus::Modified);
+    let new_file = model
+        .files
+        .iter()
+        .find(|file| file.path == "new_file.txt")
+        .expect("new_file.txt present in the parsed diff");
+    assert_eq!(new_file.status, DiffFileStatus::Added);
+
+    stop_session(&host, &session.id).await;
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps the dispatch, metadata-copy, and reload-after-dispatch assertions in one end-to-end flow"
+)]
+async fn review_dispatch_creates_one_session_in_the_same_worktree_with_copied_link_metadata() {
+    let _path_lock = PATH_LOCK.lock().await;
+    let _xdg = install_review_template("gui-core-review-dispatch-config-home");
+
+    // Plain no-op `codex` for the *source* session: it takes no `input`, so
+    // it must not touch `POHUNEK_TEST_PROMPT_OUT` at all. If it shared the
+    // recording script installed below, its own (empty) invocation could win
+    // a race against the dispatched session's write to the same file.
+    let sleep_bin_dir = temp_dir("gui-core-review-dispatch-sleep-bin");
+    write_executable(&sleep_bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
+    let _sleep_path = PathGuard::prepend(&sleep_bin_dir);
+
+    let daemon = LoopbackDaemon::spawn("review-dispatch", "0.1.0-review-dispatch").await;
+    let host = HostConfig::tcp("host-review-dispatch", daemon.addr);
+    let repo = init_git_repo("gui-core-review-dispatch-repo");
+    let project = add_project(
+        &host,
+        ProjectAddParams {
+            path: Some(repo),
+            name: Some("Review Dispatch Project".to_owned()),
+            base_branch: Some("main".to_owned()),
+        },
+    )
+    .await
+    .expect("project.add");
+
+    let session = create_worktree_session(&host, &project.id, "feature/diff-review").await;
+
+    // Only now install the recording `codex` script, prepended in front of
+    // the plain one above, so exactly one process — the one dispatch spawns
+    // below — ever writes to `prompt_out`.
+    let record_bin_dir = temp_dir("gui-core-review-dispatch-record-bin");
+    let record_dir = temp_dir("gui-core-review-dispatch-record");
+    let prompt_out = record_dir.join("prompt.txt");
+    let _prompt_out = EnvGuard::set("POHUNEK_TEST_PROMPT_OUT", &prompt_out);
+    write_executable(
+        &record_bin_dir.join("codex"),
+        "#!/bin/sh\nprintf '%s' \"${1:-}\" > \"$POHUNEK_TEST_PROMPT_OUT\"\n/bin/sleep 30\n",
+    );
+    let _record_path = PathGuard::prepend(&record_bin_dir);
+
+    set_session_metadata(
+        &host,
+        SessionSetMetadataParams {
+            session_id: session.id.clone(),
+            metadata: std::collections::BTreeMap::from([
+                ("link.provider".to_owned(), Some("github".to_owned())),
+                ("link.kind".to_owned(), Some("pull_request".to_owned())),
+                ("link.id".to_owned(), Some("42".to_owned())),
+                (
+                    "link.url".to_owned(),
+                    Some("https://github.test/pull/42".to_owned()),
+                ),
+                (
+                    "link.branch".to_owned(),
+                    Some("feature/diff-review".to_owned()),
+                ),
+                (
+                    "not_link_key".to_owned(),
+                    Some("must not be copied".to_owned()),
+                ),
+            ]),
+        },
+    )
+    .await
+    .expect("session.set_metadata");
+
+    let session_info = inspect_session(&host, &session.id)
+        .await
+        .expect("session.inspect");
+
+    let store = ReviewStore::new(temp_dir("gui-core-review-dispatch-store"));
+    let mut review = Review::new(
+        ReviewSource::Session {
+            host_id: host.id.clone(),
+            session_id: session.id.clone(),
+        },
+        project.id.clone(),
+        "feature/diff-review",
+    );
+    review.add_comment(ReviewComment::new(
+        "src/lib.rs",
+        ReviewSide::New,
+        10,
+        "fix this",
+    ));
+    store.save(&review).expect("save draft review");
+
+    let rendered_prompt =
+        render_review_prompt(&review, "session diff-review worktree diff vs main")
+            .expect("render review prompt");
+
+    let dispatched = dispatch_review(
+        &mut review,
+        ReviewDispatchParams {
+            config: &host,
+            store: &store,
+            session_info: &session_info,
+            agent: None,
+            rendered_prompt,
+            cols: 80,
+            rows: 24,
+            options: test_connection_options(),
+        },
+    )
+    .await
+    .expect("dispatch review");
+
+    assert_eq!(
+        dispatched.session.cwd,
+        session_info.worktree_path.clone().expect("worktree path")
+    );
+    assert_eq!(
+        dispatched
+            .session
+            .metadata
+            .get("link.provider")
+            .map(String::as_str),
+        Some("github")
+    );
+    assert_eq!(
+        dispatched
+            .session
+            .metadata
+            .get("link.id")
+            .map(String::as_str),
+        Some("42")
+    );
+    assert!(!dispatched.session.metadata.contains_key("not_link_key"));
+    assert_eq!(
+        dispatched
+            .session
+            .metadata
+            .get("review.source")
+            .map(String::as_str),
+        Some(review.id.as_str())
+    );
+    assert!(dispatched
+        .session
+        .metadata
+        .contains_key("review.dispatched_at"));
+
+    assert_eq!(review.status, ReviewStatus::Dispatched);
+    assert_eq!(
+        review.dispatched_session_id,
+        Some(dispatched.session.id.clone())
+    );
+
+    let reloaded = store
+        .load_all()
+        .into_iter()
+        .find_map(|entry| entry.ok().filter(|loaded| loaded.id == review.id))
+        .expect("reloaded dispatched review");
+    assert_eq!(reloaded.status, ReviewStatus::Dispatched);
+    assert_eq!(reloaded.dispatched_session_id, review.dispatched_session_id);
+
+    let prompt_content = wait_for_file(&prompt_out).await;
+    assert!(prompt_content.contains("fix this"));
+
+    stop_session(&host, &session.id).await;
+    stop_session(&host, &dispatched.session.id).await;
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn review_dispatch_leaves_the_draft_byte_identical_when_session_new_fails() {
+    let _path_lock = PATH_LOCK.lock().await;
+    let _xdg = install_review_template("gui-core-review-dispatch-fail-config-home");
+
+    let bin_dir = temp_dir("gui-core-review-dispatch-fail-bin");
+    write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
+    let _path = PathGuard::prepend(&bin_dir);
+
+    let daemon = LoopbackDaemon::spawn("review-dispatch-fail", "0.1.0-review-dispatch-fail").await;
+    let host = HostConfig::tcp("host-review-dispatch-fail", daemon.addr);
+    let repo = init_git_repo("gui-core-review-dispatch-fail-repo");
+    let project = add_project(
+        &host,
+        ProjectAddParams {
+            path: Some(repo),
+            name: Some("Review Dispatch Fail Project".to_owned()),
+            base_branch: Some("main".to_owned()),
+        },
+    )
+    .await
+    .expect("project.add");
+
+    let session = create_worktree_session(&host, &project.id, "feature/diff-review").await;
+
+    // Force the daemon to refuse `session.new`: a bogus agent profile name
+    // fails `resolve_agent` while the worktree path is still valid, so this
+    // exercises the daemon-refusal path specifically, not the local
+    // missing-worktree pre-check.
+    let mut session_info = inspect_session(&host, &session.id)
+        .await
+        .expect("session.inspect");
+    session_info.agent = "not-a-real-agent-profile".to_owned();
+
+    let store = ReviewStore::new(temp_dir("gui-core-review-dispatch-fail-store"));
+    let mut review = Review::new(
+        ReviewSource::Session {
+            host_id: host.id.clone(),
+            session_id: session.id.clone(),
+        },
+        project.id.clone(),
+        "feature/diff-review",
+    );
+    store.save(&review).expect("save draft review");
+    let draft_before =
+        std::fs::read(store.path_for(&review.id)).expect("read draft before dispatch attempt");
+
+    let rendered_prompt =
+        render_review_prompt(&review, "session diff-review worktree diff vs main")
+            .expect("render review prompt");
+
+    let error = dispatch_review(
+        &mut review,
+        ReviewDispatchParams {
+            config: &host,
+            store: &store,
+            session_info: &session_info,
+            agent: None,
+            rendered_prompt,
+            cols: 80,
+            rows: 24,
+            options: test_connection_options(),
+        },
+    )
+    .await
+    .expect_err("dispatch fails when the daemon refuses the bogus agent");
+    assert!(!matches!(
+        error,
+        CoreError::ReviewSessionMissingWorktree { .. }
+    ));
+
+    assert_eq!(review.status, ReviewStatus::Draft);
+    assert!(review.dispatched_session_id.is_none());
+    let draft_after =
+        std::fs::read(store.path_for(&review.id)).expect("read draft after failed dispatch");
+    assert_eq!(draft_before, draft_after);
+
+    stop_session(&host, &session.id).await;
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn review_dispatch_uses_the_overridden_agent_instead_of_the_source_sessions() {
+    let _path_lock = PATH_LOCK.lock().await;
+    let _xdg = install_review_template("gui-core-review-dispatch-agent-override-config-home");
+
+    let bin_dir = temp_dir("gui-core-review-dispatch-agent-override-bin");
+    write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
+    let _path = PathGuard::prepend(&bin_dir);
+
+    let daemon = LoopbackDaemon::spawn(
+        "review-dispatch-agent-override",
+        "0.1.0-review-dispatch-agent-override",
+    )
+    .await;
+    let host = HostConfig::tcp("host-review-dispatch-agent-override", daemon.addr);
+    let repo = init_git_repo("gui-core-review-dispatch-agent-override-repo");
+    let project = add_project(
+        &host,
+        ProjectAddParams {
+            path: Some(repo),
+            name: Some("Review Dispatch Agent Override Project".to_owned()),
+            base_branch: Some("main".to_owned()),
+        },
+    )
+    .await
+    .expect("project.add");
+
+    // The source session runs `codex`; the override below dispatches into
+    // `shell` instead, proving `ReviewDispatchParams::agent` — not
+    // `session_info.agent` — decides the dispatched session's agent.
+    let session = create_worktree_session(&host, &project.id, "feature/diff-review").await;
+    let session_info = inspect_session(&host, &session.id)
+        .await
+        .expect("session.inspect");
+    assert_eq!(session_info.agent, agent_name(AgentKind::Codex));
+
+    let store = ReviewStore::new(temp_dir("gui-core-review-dispatch-agent-override-store"));
+    let mut review = Review::new(
+        ReviewSource::Session {
+            host_id: host.id.clone(),
+            session_id: session.id.clone(),
+        },
+        project.id.clone(),
+        "feature/diff-review",
+    );
+    store.save(&review).expect("save draft review");
+
+    let rendered_prompt =
+        render_review_prompt(&review, "session diff-review worktree diff vs main")
+            .expect("render review prompt");
+
+    let dispatched = dispatch_review(
+        &mut review,
+        ReviewDispatchParams {
+            config: &host,
+            store: &store,
+            session_info: &session_info,
+            agent: Some(agent_name(AgentKind::Shell).to_owned()),
+            rendered_prompt,
+            cols: 80,
+            rows: 24,
+            options: test_connection_options(),
+        },
+    )
+    .await
+    .expect("dispatch review with agent override");
+
+    assert_eq!(dispatched.session.agent, agent_name(AgentKind::Shell));
+    assert_ne!(dispatched.session.agent, session_info.agent);
+
+    stop_session(&host, &session.id).await;
+    stop_session(&host, &dispatched.session.id).await;
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn review_state_never_contains_diff_content_or_embedded_secrets() {
+    const SECRET_FIXTURE: &str = "gh_api_secret_fixture_should_never_persist";
+
+    let _path_lock = PATH_LOCK.lock().await;
+    let _xdg = install_review_template("gui-core-review-secret-scan-config-home");
+
+    let bin_dir = temp_dir("gui-core-review-secret-scan-bin");
+    write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
+    let _path = PathGuard::prepend(&bin_dir);
+
+    let daemon = LoopbackDaemon::spawn("review-secret-scan", "0.1.0-review-secret-scan").await;
+    let host = HostConfig::tcp("host-review-secret-scan", daemon.addr);
+    let repo = init_git_repo("gui-core-review-secret-scan-repo");
+    let project = add_project(
+        &host,
+        ProjectAddParams {
+            path: Some(repo),
+            name: Some("Review Secret Scan Project".to_owned()),
+            base_branch: Some("main".to_owned()),
+        },
+    )
+    .await
+    .expect("project.add");
+
+    let session = create_worktree_session(&host, &project.id, "feature/diff-review").await;
+    let worktree_path = session
+        .worktree_path
+        .clone()
+        .expect("worktree path present");
+
+    std::fs::write(
+        worktree_path.join("config.txt"),
+        format!("token = {SECRET_FIXTURE}\n"),
+    )
+    .expect("write file containing fixture secret");
+
+    let diff_params = SessionDiffParams {
+        session_id: session.id.clone(),
+        base: None,
+    };
+    let diff_result = pohunek_gui_core::diff_session(&host, diff_params.clone())
+        .await
+        .expect("session.diff");
+    // Sanity: the secret really is present in the fetched diff text, so the
+    // absence checks below are meaningful rather than vacuous.
+    assert!(diff_result.diff.contains(SECRET_FIXTURE));
+    // `session.diff`'s own request carries only a session id/base, never file
+    // content, so it cannot leak the secret either.
+    let request_json = serde_json::to_string(&diff_params).expect("serialize request params");
+    assert!(!request_json.contains(SECRET_FIXTURE));
+
+    let session_info = inspect_session(&host, &session.id)
+        .await
+        .expect("session.inspect");
+
+    let store = ReviewStore::new(temp_dir("gui-core-review-secret-scan-store"));
+    let mut review = Review::new(
+        ReviewSource::Session {
+            host_id: host.id.clone(),
+            session_id: session.id.clone(),
+        },
+        project.id.clone(),
+        "feature/diff-review",
+    );
+    // Operator-authored comment text; deliberately does not quote the secret,
+    // matching how a real reviewer would comment on the file without pasting
+    // its content back.
+    review.add_comment(ReviewComment::new(
+        "config.txt",
+        ReviewSide::New,
+        1,
+        "do not commit real tokens here",
+    ));
+    store.save(&review).expect("save draft review");
+
+    let rendered_prompt =
+        render_review_prompt(&review, "session diff-review worktree diff vs main")
+            .expect("render review prompt");
+    let dispatched = dispatch_review(
+        &mut review,
+        ReviewDispatchParams {
+            config: &host,
+            store: &store,
+            session_info: &session_info,
+            agent: None,
+            rendered_prompt,
+            cols: 80,
+            rows: 24,
+            options: test_connection_options(),
+        },
+    )
+    .await
+    .expect("dispatch review");
+
+    let review_json =
+        std::fs::read_to_string(store.path_for(&review.id)).expect("read persisted review");
+    assert!(!review_json.contains(SECRET_FIXTURE));
+    let metadata_json =
+        serde_json::to_string(&dispatched.session.metadata).expect("serialize dispatch metadata");
+    assert!(!metadata_json.contains(SECRET_FIXTURE));
+
+    stop_session(&host, &session.id).await;
+    stop_session(&host, &dispatched.session.id).await;
+    daemon.shutdown().await;
+}
+
+#[test]
+fn review_store_load_all_surfaces_corrupt_file_errors_without_dropping_good_reviews() {
+    let dir = temp_dir("gui-core-review-corrupt-file");
+    let store = ReviewStore::new(&dir);
+    let review = Review::new(
+        ReviewSource::PullRequest {
+            host_id: HostId::new("host-1"),
+            pr_number: 7,
+        },
+        "project-1",
+        "feature/x",
+    );
+    store.save(&review).expect("save good review");
+    std::fs::write(dir.join("corrupt.json"), b"{not valid json").expect("write corrupt file");
+
+    let loaded = store.load_all();
+
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(loaded.iter().filter(|entry| entry.is_ok()).count(), 1);
+    assert_eq!(loaded.iter().filter(|entry| entry.is_err()).count(), 1);
 }
 
 struct LoopbackDaemon {

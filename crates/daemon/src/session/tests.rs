@@ -4977,3 +4977,370 @@ fn claude_input_rules_use_configured_submit_delay() {
     assert!(!rules.bracketed_paste);
     assert_eq!(rules.submit_delay, Duration::from_millis(75));
 }
+
+// ---------------------------------------------------------------------------
+// session.diff
+// ---------------------------------------------------------------------------
+//
+// The git-diff computation matrix below drives `diff::compute_session_diff`
+// directly against a plain fixture repo (no live session/registry needed —
+// it is a pure read over a worktree path). The base-precedence, hostile-ref,
+// no-worktree, and unresolved-base tests drive the real `SessionRegistry::diff`
+// entry point, reusing `project_registry`/`init_git_repo`/`git_in`/`params`.
+
+#[test]
+fn session_diff_modified_tracked_file_appears_as_a_change() {
+    let repo = init_git_repo("diff-modified");
+    std::fs::write(repo.join("README.md"), "modified\n").expect("modify tracked file");
+
+    let result = super::diff::compute_session_diff(&repo, "main").expect("diff succeeds");
+
+    assert!(!result.truncated);
+    assert_eq!(result.base, "main");
+    assert!(result.diff.contains("diff --git a/README.md b/README.md"));
+    assert!(result.diff.contains("-init"));
+    assert!(result.diff.contains("+modified"));
+}
+
+#[test]
+fn session_diff_added_tracked_file_reflects_unstaged_edits_made_after_staging() {
+    // `git diff <commit>` compares the commit tree directly to the working
+    // tree (bypassing the index), so a staged-then-further-edited new file
+    // must show its final, unstaged content — not just the staged blob.
+    let repo = init_git_repo("diff-added");
+    std::fs::write(repo.join("added.txt"), "staged content\n").expect("write added file");
+    git_in(&repo, &["add", "added.txt"]);
+    std::fs::write(
+        repo.join("added.txt"),
+        "staged content\nunstaged extra line\n",
+    )
+    .expect("unstaged edit atop the staged add");
+
+    let result = super::diff::compute_session_diff(&repo, "main").expect("diff succeeds");
+
+    assert!(!result.truncated);
+    assert!(result.diff.contains("new file mode"));
+    assert!(result.diff.contains("+staged content"));
+    assert!(
+        result.diff.contains("+unstaged extra line"),
+        "git diff <commit> must reflect the working tree, not just the staged blob: {}",
+        result.diff
+    );
+}
+
+#[test]
+fn session_diff_deleted_tracked_file_appears_as_a_deletion() {
+    let repo = init_git_repo("diff-deleted");
+    std::fs::remove_file(repo.join("README.md")).expect("delete tracked file from disk");
+
+    let result = super::diff::compute_session_diff(&repo, "main").expect("diff succeeds");
+
+    assert!(!result.truncated);
+    assert!(result.diff.contains("deleted file mode"));
+    assert!(result.diff.contains("-init"));
+}
+
+#[test]
+fn session_diff_renamed_tracked_file_with_an_edit_is_detected_as_a_rename() {
+    let repo = init_git_repo("diff-renamed");
+    // A single-line file renamed and edited has too little byte overlap with
+    // its original to clear git's default 50% rename-similarity threshold;
+    // commit enough shared content first so the rename is actually detected.
+    std::fs::write(
+        repo.join("README.md"),
+        "line one\nline two\nline three\nline four\nline five\n",
+    )
+    .expect("write substantial tracked content");
+    git_in(&repo, &["add", "README.md"]);
+    git_in(&repo, &["commit", "-q", "-m", "more content"]);
+
+    git_in(&repo, &["mv", "README.md", "renamed.md"]);
+    std::fs::write(
+        repo.join("renamed.md"),
+        "line one\nline two\nline three\nline four\nline five\nline six\n",
+    )
+    .expect("edit the renamed file");
+
+    let result = super::diff::compute_session_diff(&repo, "main").expect("diff succeeds");
+
+    assert!(!result.truncated);
+    assert!(result.diff.contains("rename from README.md"));
+    assert!(result.diff.contains("rename to renamed.md"));
+}
+
+#[test]
+fn session_diff_untracked_text_file_appears_as_an_added_file_diff() {
+    let repo = init_git_repo("diff-untracked-text");
+    std::fs::write(repo.join("new.txt"), "hello\n").expect("write untracked file");
+
+    let result = super::diff::compute_session_diff(&repo, "main").expect("diff succeeds");
+
+    assert!(!result.truncated);
+    assert!(result.diff.contains("diff --git a/new.txt b/new.txt"));
+    assert!(result.diff.contains("new file mode"));
+    assert!(result.diff.contains("+hello"));
+}
+
+#[test]
+fn session_diff_binary_tracked_file_change_shows_gits_binary_stanza() {
+    let repo = init_git_repo("diff-binary-tracked");
+    std::fs::write(repo.join("bin.dat"), [0u8, 1, 2, 3, 255, 254]).expect("write binary file");
+    git_in(&repo, &["add", "bin.dat"]);
+    git_in(&repo, &["commit", "-q", "-m", "add binary"]);
+    std::fs::write(repo.join("bin.dat"), [0u8, 9, 9, 9, 255, 254]).expect("modify binary file");
+
+    let result = super::diff::compute_session_diff(&repo, "main").expect("diff succeeds");
+
+    assert!(!result.truncated);
+    assert!(result
+        .diff
+        .contains("Binary files a/bin.dat and b/bin.dat differ"));
+}
+
+#[test]
+fn session_diff_untracked_binary_file_shows_gits_binary_stanza() {
+    let repo = init_git_repo("diff-binary-untracked");
+    std::fs::write(repo.join("new.bin"), [0u8, 1, 2, 255]).expect("write untracked binary file");
+
+    let result = super::diff::compute_session_diff(&repo, "main").expect("diff succeeds");
+
+    assert!(!result.truncated);
+    assert!(result
+        .diff
+        .contains("Binary files /dev/null and b/new.bin differ"));
+}
+
+#[test]
+fn cap_to_budget_stops_at_a_file_boundary_once_the_cap_is_exceeded() {
+    // Two synthetic "files" shaped like real `diff --git` chunks: the first
+    // fits comfortably under the cap, the second alone is already far over it.
+    let first = format!("diff --git a/first b/first\n{}\n", "x".repeat(100));
+    let second = format!(
+        "diff --git a/second b/second\n{}\n",
+        "y".repeat(protocol::MAX_SESSION_DIFF_BYTES)
+    );
+    let combined = format!("{first}{second}");
+
+    let (capped, truncated) = super::diff::cap_to_budget(&combined);
+
+    assert!(truncated);
+    assert_eq!(
+        capped, first,
+        "must include the first file whole and stop exactly at the next file boundary"
+    );
+}
+
+#[test]
+fn session_diff_truncates_a_large_untracked_file_and_keeps_the_response_envelope_within_control_line_bytes(
+) {
+    let repo = init_git_repo("diff-truncate");
+    // Comfortably over the cap once rendered as unified-diff `+` content; JSON
+    // escaping only adds overhead on top of the raw byte count, never removes
+    // it, so this is guaranteed to exceed `MAX_SESSION_DIFF_BYTES` once diffed.
+    let huge = "x".repeat(protocol::MAX_SESSION_DIFF_BYTES + 4096);
+    std::fs::write(repo.join("huge.txt"), &huge).expect("write huge untracked file");
+
+    let result = super::diff::compute_session_diff(&repo, "main").expect("diff succeeds");
+
+    assert!(
+        result.truncated,
+        "a file exceeding the cap on its own must truncate"
+    );
+    assert!(
+        result.diff.is_empty(),
+        "the only file did not fit at all, so nothing is included: {} bytes",
+        result.diff.len()
+    );
+
+    let response = protocol::Response::ok(
+        "req-1".to_owned(),
+        serde_json::to_value(&result).expect("serialize SessionDiffResult"),
+    );
+    let serialized = serde_json::to_string(&response).expect("serialize Response envelope");
+    assert!(
+        serialized.len() < protocol::MAX_CONTROL_LINE_BYTES,
+        "a truncated envelope must still fit one control line: {} bytes",
+        serialized.len()
+    );
+}
+
+#[test]
+fn resolve_base_prefers_the_explicit_param_over_everything_else() {
+    let resolved = super::diff::resolve_base(Some("explicit-ref".to_owned()), None, "s-none", None)
+        .expect("an explicit base short-circuits before touching the store or a repository");
+
+    assert_eq!(resolved, "explicit-ref");
+}
+
+#[test]
+fn resolve_base_falls_back_to_the_repository_default_branch_when_no_store_or_binding_exists() {
+    let repo = init_git_repo("diff-default-fallback");
+
+    let resolved = super::diff::resolve_base(None, None, "s-none", Some(&repo))
+        .expect("the repository's current branch resolves");
+
+    assert_eq!(resolved, "main");
+}
+
+#[tokio::test]
+async fn session_diff_session_without_a_worktree_fails_with_a_typed_error() {
+    let registry = SessionRegistry::new(SessionRegistryConfig::default());
+    let info = registry
+        .create(params())
+        .await
+        .expect("plain session is created");
+
+    let err = registry
+        .diff(&info.id, None)
+        .await
+        .expect_err("a session with no worktree must fail session.diff");
+
+    assert_eq!(err.code, "session_no_worktree");
+    assert!(err.recover.is_some(), "must carry a recover hint: {err:?}");
+}
+
+#[tokio::test]
+async fn session_diff_rejects_an_empty_explicit_base() {
+    let registry = SessionRegistry::new(SessionRegistryConfig::default());
+
+    let err = registry
+        .diff(
+            &SessionId("s-does-not-matter".to_owned()),
+            Some(String::new()),
+        )
+        .await
+        .expect_err("an empty base must be rejected before the session is even looked up");
+
+    assert_eq!(err.code, "invalid_branch");
+}
+
+#[tokio::test]
+async fn session_diff_rejects_a_dash_leading_explicit_base() {
+    let registry = SessionRegistry::new(SessionRegistryConfig::default());
+
+    let err = registry
+        .diff(
+            &SessionId("s-does-not-matter".to_owned()),
+            Some("--upload-pack=evil".to_owned()),
+        )
+        .await
+        .expect_err("a dash-leading base must be rejected as a possible argv flag injection");
+
+    assert_eq!(err.code, "invalid_branch");
+}
+
+#[tokio::test]
+async fn session_diff_rejects_a_control_character_in_the_explicit_base() {
+    let registry = SessionRegistry::new(SessionRegistryConfig::default());
+
+    let err = registry
+        .diff(
+            &SessionId("s-does-not-matter".to_owned()),
+            Some("feat/x\u{7}".to_owned()),
+        )
+        .await
+        .expect_err("a control character in the base must be rejected");
+
+    assert_eq!(err.code, "invalid_branch");
+}
+
+#[tokio::test]
+async fn session_diff_explicit_base_overrides_the_recorded_worktree_binding() {
+    let (registry, repo) = project_registry("diff-explicit-base");
+    git_in(&repo, &["branch", "release"]);
+
+    let info = registry
+        .create(SessionNewParams {
+            repo: Some(repo.clone()),
+            branch: Some("feat/explicit-base".to_owned()),
+            ..params()
+        })
+        .await
+        .expect("worktree-bound session is created");
+
+    let result = registry
+        .diff(&info.id, Some("release".to_owned()))
+        .await
+        .expect("diff succeeds with an explicit base");
+
+    assert_eq!(result.base, "release");
+}
+
+#[tokio::test]
+async fn session_diff_falls_back_to_the_recorded_worktree_base_branch_when_no_explicit_base_given()
+{
+    let (registry, repo) = project_registry("diff-recorded-base");
+    git_in(&repo, &["branch", "release"]);
+
+    let info = registry
+        .create(SessionNewParams {
+            repo: Some(repo.clone()),
+            branch: Some("feat/recorded-base".to_owned()),
+            base_branch: Some("release".to_owned()),
+            ..params()
+        })
+        .await
+        .expect("worktree-bound session is created with an explicit base branch");
+
+    let result = registry
+        .diff(&info.id, None)
+        .await
+        .expect("diff succeeds using the recorded base branch");
+
+    assert_eq!(
+        result.base, "release",
+        "must use the worktree binding's recorded base branch, not the repository's current branch"
+    );
+}
+
+#[tokio::test]
+async fn session_diff_reports_a_typed_error_when_the_base_ref_does_not_resolve() {
+    let (registry, repo) = project_registry("diff-bad-base");
+    let info = registry
+        .create(SessionNewParams {
+            repo: Some(repo.clone()),
+            branch: Some("feat/bad-base".to_owned()),
+            ..params()
+        })
+        .await
+        .expect("worktree-bound session is created");
+
+    let err = registry
+        .diff(
+            &info.id,
+            Some("totally-bogus-ref-that-does-not-exist".to_owned()),
+        )
+        .await
+        .expect_err("an unresolvable base ref must fail, not silently succeed with an empty diff");
+
+    assert_eq!(err.code, "session_diff_base_unresolved");
+    assert!(!err.msg.is_empty());
+}
+
+#[tokio::test]
+async fn session_diff_registry_end_to_end_reflects_worktree_changes_against_the_repository_default_base(
+) {
+    let (registry, repo) = project_registry("diff-e2e");
+    let info = registry
+        .create(SessionNewParams {
+            repo: Some(repo.clone()),
+            branch: Some("feat/e2e".to_owned()),
+            ..params()
+        })
+        .await
+        .expect("worktree-bound session is created");
+    let worktree = info
+        .worktree_path
+        .clone()
+        .expect("session must be worktree-bound for this test");
+
+    std::fs::write(worktree.join("README.md"), "changed in the worktree\n")
+        .expect("modify the tracked file inside the bound worktree");
+
+    let result = registry.diff(&info.id, None).await.expect("diff succeeds");
+
+    assert_eq!(result.base, "main");
+    assert!(!result.truncated);
+    assert!(result.diff.contains("README.md"));
+    assert!(result.diff.contains("+changed in the worktree"));
+}

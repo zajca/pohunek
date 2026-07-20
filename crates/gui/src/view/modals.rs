@@ -350,7 +350,14 @@ fn github_pull_request_modal<'a>(
             available_actions(app, &ProviderKind::GithubPr),
             selected_action,
             Message::LaunchGitHubPullRequest,
-        ));
+        ))
+        .push(
+            button(text("Review diff").size(13))
+                .on_press(Message::OpenPullRequestReview {
+                    number: pull_request.number,
+                })
+                .style(iced::widget::button::secondary),
+        );
     dialog_card("Pull request", body)
 }
 
@@ -419,6 +426,74 @@ fn open_in_browser_button(url: String) -> Element<'static, Message> {
         .on_press(Message::OpenUrl(url))
         .style(iced::widget::button::secondary)
         .into()
+}
+
+/// The Review tab's "Dispatch as session…" confirmation: the source
+/// session's working-agent warning (when applicable), an agent picker
+/// (defaults to the source session's own profile, reusing the Start modal's
+/// `AgentChoice` picker/pattern), the rendered prompt preview or its render
+/// error, and the confirm action.
+pub(crate) fn dispatch_review_modal_content(app: &PohunekApp) -> Element<'_, Message> {
+    let Ok(host_id) = selected_host_id(app) else {
+        return dialog_card(
+            "Dispatch review",
+            text("select a session or project first").size(13),
+        );
+    };
+    let Some(host) = app.workspace.hosts.get(&host_id) else {
+        return dialog_card("Dispatch review", text("Host is not loaded").size(13));
+    };
+    let Some(dispatch) = &host.review.dispatch else {
+        return dialog_card("Dispatch review", text("No dispatch in progress").size(13));
+    };
+    let mut body = column![].spacing(12);
+    if dispatch.source_working {
+        body = body.push(
+            container(
+                text(
+                    "The source session's agent is currently working; dispatching now may \
+                     interrupt it.",
+                )
+                .size(13),
+            )
+            .padding(8)
+            .style(iced::widget::container::rounded_box),
+        );
+    }
+    body = body.push(
+        row![
+            text("Agent").size(13),
+            pick_list(
+                AgentChoice::ALL,
+                Some(AgentChoice::from_wire(&dispatch.agent)),
+                Message::DispatchAgentSelected,
+            ),
+        ]
+        .spacing(8)
+        .align_y(Center),
+    );
+    match &dispatch.prompt_preview {
+        Ok(preview) => {
+            body = body
+                .push(text("Prompt preview").size(14))
+                .push(
+                    scrollable(text(preview.clone()).size(12).font(iced::Font::MONOSPACE))
+                        .height(240),
+                )
+                .push(
+                    button("Dispatch")
+                        .on_press(Message::ConfirmReviewDispatch)
+                        .style(iced::widget::button::primary),
+                );
+        }
+        Err(error) => {
+            body = body.push(text(format!("Cannot render the review prompt: {error}")).size(13));
+        }
+    }
+    if let Some(error) = &dispatch.dispatch_error {
+        body = body.push(text(format!("Dispatch failed: {error}")).size(13));
+    }
+    dialog_card("Dispatch review", body)
 }
 
 pub(crate) fn toast_view(toast: &Toast) -> Element<'_, Message> {

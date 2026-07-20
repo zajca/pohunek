@@ -4,7 +4,7 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-06-26
+// Rust guideline compliant 2026-07-19
 
 pub mod link;
 
@@ -54,6 +54,25 @@ const URL_FIELD: Field = Field {
     label: "url",
     required: false,
 };
+const REVIEW_BRANCH_FIELD: Field = Field {
+    names: &["branch"],
+    label: "branch",
+    required: true,
+};
+const REVIEW_SOURCE_FIELD: Field = Field {
+    names: &["source"],
+    label: "source",
+    required: true,
+};
+const REVIEW_COMMENTS_FIELD: Field = Field {
+    names: &["comments"],
+    label: "comments",
+    required: false,
+};
+/// JSON key for the review comment count. Not a [`Field`]/[`pick`] constant
+/// because, unlike every other field, it accepts either a JSON integer or a
+/// JSON string (see [`pick_comment_count`]).
+const REVIEW_COMMENT_COUNT_KEY: &str = "comment_count";
 
 /// Provider context supported by the shared prompt renderer.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -62,6 +81,16 @@ pub enum Provider {
     LinearIssue,
     /// A GitHub pull request JSON object.
     GitHubPr,
+    /// A review draft built by gui-core from typed `Review`/`ReviewComment` data.
+    ///
+    /// Context keys: `${provider}` (always `"review"`), `${branch}`, `${source}`
+    /// (a human description of what was reviewed, e.g. `"PR #42"` or `"session
+    /// abc12345 worktree diff"`), `${comments}` (pre-rendered `path:line (side):
+    /// text` blocks, empty string when there are none), and `${comment_count}`.
+    /// Unlike the other providers, gui-core is the sole producer of this JSON,
+    /// so field extraction uses direct single-name lookups rather than the
+    /// multi-name aliasing [`pick`] exists for.
+    Review,
 }
 
 impl Provider {
@@ -71,6 +100,7 @@ impl Provider {
         match self {
             Self::LinearIssue => "linear_issue",
             Self::GitHubPr => "github_pr",
+            Self::Review => "review",
         }
     }
 }
@@ -88,6 +118,7 @@ impl FromStr for Provider {
         match value {
             "linear_issue" => Ok(Self::LinearIssue),
             "github_pr" => Ok(Self::GitHubPr),
+            "review" => Ok(Self::Review),
             other => Err(Error::UnknownProvider(other.to_owned())),
         }
     }
@@ -114,12 +145,21 @@ pub enum Error {
     /// The template referenced variables outside the provider context.
     #[error("template references unknown variable(s): {}", .0.join(", "))]
     UnknownVariables(Vec<String>),
+    /// The provider does not support deriving session-link metadata.
+    #[error(
+        "provider `{0}` does not support link metadata derivation; \
+         review sessions copy `link.*` keys from their source session instead"
+    )]
+    LinkUnsupportedProvider(&'static str),
 }
 
 /// Renders a provider prompt template.
 ///
 /// Substitution is single-pass: provider values containing `${name}` are copied
-/// literally and are never expanded again.
+/// literally and are never expanded again. See each [`Provider`] variant's docs
+/// for the `${var}` names its context provides; for [`Provider::Review`],
+/// `item_id` is not part of the rendered context — pass the review id there for
+/// error context only, since the review context is self-contained.
 ///
 /// # Errors
 ///
@@ -184,9 +224,29 @@ fn build_context(
             context.insert("branch", pick(data, LINEAR_BRANCH_FIELD)?);
             context.insert("url", pick(data, URL_FIELD)?);
         }
+        Provider::Review => {
+            // `item_id` is not part of this context: gui-core builds the review
+            // context directly from typed data, so callers pass the review id as
+            // `item_id` for error/log context only, not for substitution.
+            context.insert("provider", "review".to_owned());
+            context.insert("branch", pick(data, REVIEW_BRANCH_FIELD)?);
+            context.insert("source", pick(data, REVIEW_SOURCE_FIELD)?);
+            context.insert("comments", pick(data, REVIEW_COMMENTS_FIELD)?);
+            context.insert("comment_count", pick_comment_count(data)?);
+        }
     }
 
     Ok(context)
+}
+
+/// Extracts the review comment count, accepted as a JSON integer or a
+/// non-empty JSON string so gui-core's context builder can send either.
+fn pick_comment_count(data: &serde_json::Value) -> Result<String, Error> {
+    match data.get(REVIEW_COMMENT_COUNT_KEY) {
+        Some(serde_json::Value::Number(count)) => Ok(count.to_string()),
+        Some(serde_json::Value::String(count)) if !count.is_empty() => Ok(count.clone()),
+        _ => Err(Error::MissingRequiredField("comment_count")),
+    }
 }
 
 fn pick(data: &serde_json::Value, field: Field) -> Result<String, Error> {
@@ -285,7 +345,9 @@ fn is_variable_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_static, Error};
+    use std::str::FromStr as _;
+
+    use super::{render, render_static, Error, Provider};
 
     #[test]
     fn static_render_accepts_literal_template() {
@@ -299,5 +361,85 @@ mod tests {
         let err = render_static("Issue ${title}").expect_err("unknown variable");
 
         assert!(matches!(err, Error::UnknownVariables(names) if names == vec!["title"]));
+    }
+
+    #[test]
+    fn provider_from_str_and_as_str_round_trip_includes_review() {
+        assert_eq!(Provider::Review.as_str(), "review");
+        assert_eq!(
+            Provider::from_str("review").expect("parse review provider"),
+            Provider::Review
+        );
+    }
+
+    #[test]
+    fn render_review_golden_produces_expected_prompt_text() {
+        let template = "Review of ${source} on branch ${branch} (${comment_count} comments):\n\
+                         ${comments}\n";
+        let context_json = r#"{
+            "branch": "feature/diff-review",
+            "source": "PR #42",
+            "comments": "src/lib.rs:10 (new): fix this\nsrc/lib.rs:20 (old): remove dead code",
+            "comment_count": 2
+        }"#;
+
+        let rendered = render(template, Provider::Review, "review-abc123", context_json)
+            .expect("review render");
+
+        assert_eq!(
+            rendered,
+            "Review of PR #42 on branch feature/diff-review (2 comments):\n\
+             src/lib.rs:10 (new): fix this\nsrc/lib.rs:20 (old): remove dead code\n"
+        );
+    }
+
+    #[test]
+    fn render_review_accepts_comment_count_as_json_string() {
+        let context_json = r#"{"branch":"b","source":"s","comment_count":"3"}"#;
+
+        let rendered = render("${comment_count}", Provider::Review, "id", context_json)
+            .expect("review render with string comment_count");
+
+        assert_eq!(rendered, "3");
+    }
+
+    #[test]
+    fn render_review_treats_missing_comments_as_empty_string() {
+        let context_json = r#"{"branch":"b","source":"s","comment_count":0}"#;
+
+        let rendered = render("[${comments}]", Provider::Review, "id", context_json)
+            .expect("review render with no comments");
+
+        assert_eq!(rendered, "[]");
+    }
+
+    #[test]
+    fn render_review_rejects_unknown_variables() {
+        let context_json = r#"{"branch":"b","source":"s","comment_count":0}"#;
+
+        let err = render("${nope}", Provider::Review, "id", context_json)
+            .expect_err("unknown variable rejected");
+
+        assert!(matches!(err, Error::UnknownVariables(names) if names == vec!["nope"]));
+    }
+
+    #[test]
+    fn render_review_missing_branch_errors() {
+        let context_json = r#"{"source":"s","comment_count":0}"#;
+
+        let err = render("${branch}", Provider::Review, "id", context_json)
+            .expect_err("missing branch rejected");
+
+        assert!(matches!(err, Error::MissingRequiredField("branch"),));
+    }
+
+    #[test]
+    fn render_review_missing_comment_count_errors() {
+        let context_json = r#"{"branch":"b","source":"s"}"#;
+
+        let err = render("${comment_count}", Provider::Review, "id", context_json)
+            .expect_err("missing comment_count rejected");
+
+        assert!(matches!(err, Error::MissingRequiredField("comment_count"),));
     }
 }

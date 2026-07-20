@@ -76,6 +76,8 @@ export type { SessionAttachParams } from "./SessionAttachParams";
 export type { SessionAttachResult } from "./SessionAttachResult";
 export type { SessionDetachParams } from "./SessionDetachParams";
 export type { SessionDetachResult } from "./SessionDetachResult";
+export type { SessionDiffParams } from "./SessionDiffParams";
+export type { SessionDiffResult } from "./SessionDiffResult";
 export type { SessionEvent } from "./SessionEvent";
 export type { SessionForkParams } from "./SessionForkParams";
 export type { SessionForkResult } from "./SessionForkResult";

@@ -411,6 +411,42 @@ async fn pull_request_checks_include_check_run_statuses() {
 }
 
 #[tokio::test]
+async fn pull_request_diff_shells_out_and_returns_raw_unified_diff_text() {
+    let diff_text = "diff --git a/src/lib.rs b/src/lib.rs\n\
+                      index abc123..def456 100644\n\
+                      --- a/src/lib.rs\n\
+                      +++ b/src/lib.rs\n\
+                      @@ -1,1 +1,1 @@\n\
+                      -old\n\
+                      +new\n";
+    let runner = FakeGhRunner::new(vec![Ok(FakeGhRunner::json(diff_text))]);
+    let client = GitHubClient::new(runner.clone());
+
+    let diff = client.pull_request_diff(7).await.expect("pr diff");
+
+    assert_eq!(
+        runner.calls(),
+        vec![RecordedGhCall {
+            args: vec!["pr".to_owned(), "diff".to_owned(), "7".to_owned()],
+        }]
+    );
+    assert_eq!(diff, diff_text);
+}
+
+#[tokio::test]
+async fn pull_request_diff_nonzero_gh_exit_is_typed_and_graceful() {
+    let runner = FakeGhRunner::new(vec![Ok(FakeGhRunner::nonzero("no such pull request"))]);
+    let client = GitHubClient::new(runner);
+
+    let err = client
+        .pull_request_diff(999)
+        .await
+        .expect_err("nonzero gh exit");
+
+    assert!(matches!(err, GitHubError::GhFailed { status: 1, .. }));
+}
+
+#[tokio::test]
 async fn pull_request_status_includes_review_decision_and_checks() {
     let runner = FakeGhRunner::new(vec![
         Ok(FakeGhRunner::json(

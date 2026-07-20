@@ -48,11 +48,17 @@ Native GUI client:
 - `crates/gui/src/view/inbox.rs`
 - `crates/gui/src/view/provider.rs`
 - `crates/gui/src/view/session.rs`
+- `crates/gui/src/view/review.rs`
 - `crates/gui-core/src/assistant.rs`
 - `crates/gui-core/src/lib.rs`
 - `crates/gui-core/src/state.rs`
 - `crates/gui-core/src/providers/linear.rs`
 - `crates/gui-core/src/providers/github.rs`
+- `crates/gui-core/src/review/mod.rs`
+- `crates/gui-core/src/review/diff.rs`
+- `crates/gui-core/src/review/model.rs`
+- `crates/gui-core/src/review/store.rs`
+- `crates/gui-core/src/review/dispatch.rs`
 - `crates/gui-core/tests/loopback.rs`
 - `crates/gui-core/tests/linear_provider.rs`
 - `crates/gui-core/tests/github_provider.rs`
@@ -83,6 +89,7 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/lib.rs`
 - `crates/daemon/src/api/handler/mod.rs`
 - `crates/daemon/src/session/mod.rs`
+- `crates/daemon/src/session/diff.rs`
 - `crates/daemon/src/session/hooks.rs`
 - `crates/daemon/src/session/detector.rs`
 - `crates/daemon/src/session/procwatch.rs`

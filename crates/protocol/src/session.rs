@@ -848,6 +848,37 @@ pub struct SessionRenameResult {
     pub session: SessionInfo,
 }
 
+/// Parameters for `session.diff`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionDiffParams.ts"))]
+pub struct SessionDiffParams {
+    /// Session whose worktree should be diffed against its base.
+    pub session_id: SessionId,
+    /// Explicit base ref to diff against. `None` defers to the worktree
+    /// binding's recorded base branch, then the repository's default branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub base: Option<String>,
+}
+
+/// Result returned by `session.diff`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionDiffResult.ts"))]
+pub struct SessionDiffResult {
+    /// Unified diff text of the session's worktree against `base`. May be
+    /// truncated at a file boundary; see [`Self::truncated`].
+    pub diff: String,
+    /// Base ref the diff was actually computed against: the caller's explicit
+    /// `base` when given, otherwise the resolved worktree/repository default.
+    pub base: String,
+    /// Whether `diff` was cut short at a file boundary to stay within
+    /// [`crate::MAX_SESSION_DIFF_BYTES`]. When `true`, later files in the
+    /// change set are omitted from `diff` entirely.
+    pub truncated: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1082,5 +1113,55 @@ mod tests {
             serde_json::to_string(&typed).expect("typed json string"),
             serde_json::to_string(&legacy).expect("legacy json string")
         );
+    }
+
+    #[test]
+    fn diff_params_omit_base_when_absent() {
+        // Without an explicit base the wire form carries only the session id,
+        // so an older daemon that predates `base` still parses the request.
+        let bare = SessionDiffParams {
+            session_id: SessionId("s-1".to_owned()),
+            base: None,
+        };
+        let value = serde_json::to_value(&bare).expect("serialize");
+        assert_eq!(value, serde_json::json!({ "session_id": "s-1" }));
+        let parsed: SessionDiffParams =
+            serde_json::from_value(serde_json::json!({ "session_id": "s-1" })).expect("parse");
+        assert_eq!(parsed, bare);
+    }
+
+    #[test]
+    fn diff_params_round_trip_with_explicit_base() {
+        let with_base = SessionDiffParams {
+            session_id: SessionId("s-1".to_owned()),
+            base: Some("main".to_owned()),
+        };
+        let value = serde_json::to_value(&with_base).expect("serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({ "session_id": "s-1", "base": "main" })
+        );
+        let parsed: SessionDiffParams = serde_json::from_value(value).expect("parse");
+        assert_eq!(parsed, with_base);
+    }
+
+    #[test]
+    fn diff_result_round_trips_all_fields() {
+        let result = SessionDiffResult {
+            diff: "diff --git a/f b/f\n".to_owned(),
+            base: "main".to_owned(),
+            truncated: true,
+        };
+        let value = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "diff": "diff --git a/f b/f\n",
+                "base": "main",
+                "truncated": true,
+            })
+        );
+        let parsed: SessionDiffResult = serde_json::from_value(value).expect("parse");
+        assert_eq!(parsed, result);
     }
 }
