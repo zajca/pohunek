@@ -143,6 +143,32 @@ Link: ${url}
 Please address the outstanding work on this PR, then summarize what you did.
 ";
 
+/// Default `prompts/review.tmpl`. May only reference the variables
+/// `pohunek-prompt`'s `Provider::Review` context builds: `provider, branch,
+/// source, comments, comment_count`. Unlike [`ISSUE_TMPL`]/[`PR_TMPL`] (rendered
+/// by the shell launcher's own renderer in `lib.sh`), this template is
+/// GUI-only: gui-core reads it directly and renders it through
+/// `pohunek_prompt::render`, dispatching the result as a new session in the
+/// SAME worktree that was reviewed (Track D.6).
+const REVIEW_TMPL: &str = "You are addressing a ${provider} of branch `${branch}` in this worktree.
+
+## What was reviewed
+${source}
+
+## Review comments (${comment_count})
+${comments}
+
+## Working agreement
+- Work directly in this worktree; the branch above is already checked out.
+- Address every comment listed above. If a comment is unclear or you disagree
+  with it, say so explicitly rather than silently skipping it.
+- Run the project's checks (build, lint, tests) and make them pass before you
+  consider the work done.
+
+## When done
+Summarize what you changed for each comment, and flag anything still open.
+";
+
 /// Result of `setup scripts`: the absolute paths written.
 #[derive(Debug, Serialize)]
 struct ScriptsResult {
@@ -309,6 +335,7 @@ fn install_config(paths: &Paths, force: bool) -> Result<ConfigResult, CliError> 
         (paths.config_dir.join("launcher.conf"), LAUNCHER_CONF),
         (prompts_dir.join("issue.tmpl"), ISSUE_TMPL),
         (prompts_dir.join("pr.tmpl"), PR_TMPL),
+        (prompts_dir.join("review.tmpl"), REVIEW_TMPL),
     ];
 
     let mut created = Vec::new();
@@ -556,31 +583,34 @@ mod tests {
     fn install_config_creates_then_skips_then_force_rewrites() {
         let tp = temp_paths();
 
-        // First run creates all three files.
+        // First run creates all four files.
         let first = install_config(&tp.paths, false).expect("first config");
-        assert_eq!(first.created.len(), 3, "first run creates 3 files");
+        assert_eq!(first.created.len(), 4, "first run creates 4 files");
         assert!(first.skipped.is_empty());
 
         let conf = tp.paths.config_dir.join("launcher.conf");
         assert!(conf.is_file());
-        assert!(tp
-            .paths
-            .config_dir
-            .join("prompts")
-            .join("issue.tmpl")
-            .is_file());
-        assert!(tp
-            .paths
-            .config_dir
-            .join("prompts")
-            .join("pr.tmpl")
-            .is_file());
+        let prompts_dir = tp.paths.config_dir.join("prompts");
+        assert!(prompts_dir.join("issue.tmpl").is_file());
+        assert!(prompts_dir.join("pr.tmpl").is_file());
+        assert!(
+            prompts_dir.join("review.tmpl").is_file(),
+            "install_config must materialize the Track D.6 review starter template"
+        );
 
         // A user edit must survive a non-forced re-run.
         fs::write(&conf, "user-edited").expect("user edit");
         let second = install_config(&tp.paths, false).expect("second config");
         assert!(second.created.is_empty(), "non-forced run creates nothing");
-        assert_eq!(second.skipped.len(), 3, "all three are skipped");
+        assert_eq!(second.skipped.len(), 4, "all four are skipped");
+        assert!(
+            second
+                .skipped
+                .iter()
+                .any(|path| path.ends_with("review.tmpl")),
+            "review.tmpl must be reported as skipped on a non-forced re-run: {:?}",
+            second.skipped
+        );
         assert_eq!(
             fs::read_to_string(&conf).expect("read conf"),
             "user-edited",
@@ -589,12 +619,17 @@ mod tests {
 
         // `force` rewrites, restoring the default content.
         let third = install_config(&tp.paths, true).expect("forced config");
-        assert_eq!(third.created.len(), 3, "forced run rewrites all three");
+        assert_eq!(third.created.len(), 4, "forced run rewrites all four");
         assert!(third.skipped.is_empty());
         assert_eq!(
             fs::read_to_string(&conf).expect("read conf"),
             LAUNCHER_CONF,
             "forced run restored the default config"
+        );
+        assert_eq!(
+            fs::read_to_string(prompts_dir.join("review.tmpl")).expect("read review.tmpl"),
+            REVIEW_TMPL,
+            "forced run restored the default review template"
         );
     }
 
@@ -752,5 +787,56 @@ mod tests {
                 rest = &after[end + 1..];
             }
         }
+    }
+
+    #[test]
+    fn review_template_only_references_known_variables() {
+        // `Provider::Review`'s context builder in `pohunek-prompt` provides
+        // exactly these five keys; guard review.tmpl the same way
+        // `templates_only_reference_known_variables` guards the launcher
+        // templates, so drift is caught here rather than at dispatch time.
+        const KNOWN: &[&str] = &["provider", "branch", "source", "comments", "comment_count"];
+        let mut rest = REVIEW_TMPL;
+        while let Some(start) = rest.find("${") {
+            let after = &rest[start + 2..];
+            let end = after.find('}').expect("unterminated ${ in review.tmpl");
+            let var = &after[..end];
+            assert!(
+                KNOWN.contains(&var),
+                "review.tmpl references unknown variable: {var}"
+            );
+            rest = &after[end + 1..];
+        }
+    }
+
+    #[test]
+    fn review_template_renders_against_its_own_context_builder() {
+        // Sanity-checks REVIEW_TMPL through the real `pohunek_prompt::render`
+        // path so template/context drift is caught here, not only at dispatch
+        // time in gui-core. `pohunek-cli` depends on `pohunek-prompt`, so this
+        // is a real, non-mocked render call.
+        let context_json = serde_json::json!({
+            "branch": "feature/diff-review",
+            "source": "PR #42",
+            "comments": "src/lib.rs:10 (new): fix this",
+            "comment_count": 1,
+        })
+        .to_string();
+
+        let rendered = pohunek_prompt::render(
+            REVIEW_TMPL,
+            pohunek_prompt::Provider::Review,
+            "review-id-for-error-context-only",
+            context_json,
+        )
+        .expect("review.tmpl renders against Provider::Review's own context builder");
+
+        assert!(
+            rendered.contains("review of branch `feature/diff-review`"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("PR #42"), "{rendered}");
+        assert!(rendered.contains("fix this"), "{rendered}");
+        assert!(rendered.contains("Review comments (1)"), "{rendered}");
     }
 }

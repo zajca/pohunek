@@ -584,6 +584,25 @@ where
             .map(|decision| decision.review_decision)
     }
 
+    /// Fetches the unified diff for one GitHub pull request.
+    ///
+    /// Output is `gh pr diff`'s raw unified-diff text, not JSON — the same
+    /// format the shared diff parser (`crate::parse_unified_diff`) also
+    /// consumes from `session.diff`, so one parser serves both sources. No
+    /// token handling: authentication is delegated entirely to `gh`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`GitHubError`] for missing `gh`, nonzero exit, or
+    /// invalid UTF-8 output.
+    pub async fn pull_request_diff(&self, number: u64) -> Result<String, GitHubError> {
+        let number = number.to_string();
+        let output = self
+            .run_gh("pr diff", vec!["pr".to_owned(), "diff".to_owned(), number])
+            .await?;
+        Ok(output.stdout)
+    }
+
     /// Fetches review and check status for one GitHub pull request.
     ///
     /// # Errors

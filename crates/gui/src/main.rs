@@ -389,6 +389,7 @@ mod tests {
             notifications: BTreeMap::new(),
             prompt: pohunek_gui_core::PromptState::default(),
             provider: pohunek_gui_core::ProviderState::default(),
+            review: pohunek_gui_core::ReviewTabState::default(),
             last_agent_state: None,
             last_error: None,
         };
@@ -469,6 +470,7 @@ mod tests {
             notifications: BTreeMap::new(),
             prompt: pohunek_gui_core::PromptState::default(),
             provider: pohunek_gui_core::ProviderState::default(),
+            review: pohunek_gui_core::ReviewTabState::default(),
             last_agent_state: None,
             last_error: None,
         };
@@ -555,6 +557,7 @@ mod tests {
             notifications: BTreeMap::new(),
             prompt: pohunek_gui_core::PromptState::default(),
             provider: pohunek_gui_core::ProviderState::default(),
+            review: pohunek_gui_core::ReviewTabState::default(),
             last_agent_state: None,
             last_error: None,
         };

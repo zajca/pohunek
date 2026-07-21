@@ -135,6 +135,16 @@ fn session_actions<'a>(
                     .on_press(Message::RemoveSelectedSession)
                     .style(iced::widget::button::danger),
             );
+        if session.worktree_path.is_some() {
+            actions = actions.push(
+                button("Review changes")
+                    .on_press(Message::OpenSessionReview {
+                        host_id: host_id.clone(),
+                        session_id: session.id.clone(),
+                    })
+                    .style(iced::widget::button::secondary),
+            );
+        }
     }
     actions.into()
 }

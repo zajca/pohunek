@@ -59,6 +59,7 @@ pub(crate) enum KeyAction {
     TabLinear,
     TabGitHub,
     TabWorktrees,
+    TabReview,
     OpenInbox,
     CycleBlocked,
     OpenSelectedSession,
@@ -130,6 +131,7 @@ enum KeyBindingId {
     TabLinear,
     TabGitHub,
     TabWorktrees,
+    TabReview,
     OpenInbox,
     CycleBlocked,
     OpenSelectedSession,
@@ -159,6 +161,7 @@ impl KeyBindingId {
         Self::TabLinear,
         Self::TabGitHub,
         Self::TabWorktrees,
+        Self::TabReview,
         Self::OpenInbox,
         Self::CycleBlocked,
         Self::OpenSelectedSession,
@@ -195,6 +198,7 @@ impl KeyBindingId {
             Self::TabLinear => "tab_linear",
             Self::TabGitHub => "tab_github",
             Self::TabWorktrees => "tab_worktrees",
+            Self::TabReview => "tab_review",
             Self::OpenInbox => "open_inbox",
             Self::CycleBlocked => "cycle_blocked",
             Self::OpenSelectedSession => "open_selected_session",
@@ -565,6 +569,7 @@ impl Default for KeyMap {
             default_global_character(KeyBindingId::TabLinear, "2", KeyAction::TabLinear),
             default_global_character(KeyBindingId::TabGitHub, "3", KeyAction::TabGitHub),
             default_global_character(KeyBindingId::TabWorktrees, "4", KeyAction::TabWorktrees),
+            default_global_character(KeyBindingId::TabReview, "5", KeyAction::TabReview),
             default_global_character(KeyBindingId::OpenInbox, "i", KeyAction::OpenInbox),
             default_global_character(KeyBindingId::CycleBlocked, "b", KeyAction::CycleBlocked),
             default_global_character(
@@ -740,6 +745,7 @@ fn action_to_messages(app: &PohunekApp, action: KeyAction) -> Vec<Message> {
         KeyAction::TabLinear => tab_shortcut(app, RightTab::Linear),
         KeyAction::TabGitHub => tab_shortcut(app, RightTab::GitHub),
         KeyAction::TabWorktrees => tab_shortcut(app, RightTab::Worktrees),
+        KeyAction::TabReview => tab_shortcut(app, RightTab::Review),
         KeyAction::OpenInbox => vec![Message::OpenInbox],
         KeyAction::CycleBlocked => vec![Message::CycleBlockedAgent],
         KeyAction::OpenSelectedSession => open_selected_session_or_active_item(app),
@@ -815,6 +821,12 @@ fn activate_selected_provider_item(app: &PohunekApp) -> Option<Vec<Message>> {
                         .map(|issue| vec![Message::OpenGitHubIssue(issue.number)])
                 })
         }
+        // `Enter` opens the inline comment editor on the currently selected
+        // diff line, matching `view::review`'s per-line "+ Comment" button.
+        RightTab::Review => host
+            .review
+            .selected_line
+            .map(|_| vec![Message::BeginReviewComment]),
         RightTab::Detail | RightTab::GitHub | RightTab::Worktrees => None,
     }
 }
@@ -881,6 +893,7 @@ fn refresh_active_tab(app: &PohunekApp) -> Vec<Message> {
         RightTab::Detail | RightTab::Worktrees => vec![Message::ShowProject],
         RightTab::Linear => vec![Message::FetchLinearIssues],
         RightTab::GitHub => vec![Message::FetchGitHubPullRequests, Message::FetchGitHubIssues],
+        RightTab::Review => vec![Message::RefreshReviewDiff],
     }
 }
 
@@ -901,6 +914,7 @@ fn enter_messages(app: &PohunekApp, open_terminal: bool) -> Vec<Message> {
         ModalView::Assistant => vec![Message::LaunchAssistant],
         ModalView::ProviderItem => provider_item_enter(app),
         ModalView::Inbox => inbox_enter(app, open_terminal),
+        ModalView::DispatchReview => vec![Message::ConfirmReviewDispatch],
         // `route_key_press` only calls into modal-scoped routing when a modal
         // is open; kept explicit (no wildcard) so a future `ModalView`
         // variant fails to compile here instead of silently doing nothing.
@@ -981,8 +995,8 @@ mod tests {
     use std::path::PathBuf;
 
     use pohunek_gui_core::{
-        providers, ConnState, GitHubProviderScope, HostId, NotificationFilter, NotificationScope,
-        Selection,
+        parse_unified_diff, providers, ConnState, GitHubProviderScope, HostId, NotificationFilter,
+        NotificationScope, Review, ReviewDiffStatus, ReviewLineTarget, ReviewSource, Selection,
     };
     use protocol::{
         AgentKind, NotificationId, NotificationKind, NotificationRecord, NotificationSeverity,
@@ -1016,6 +1030,10 @@ mod tests {
         assert_eq!(
             keymap.action_for(KeyContext::Global, &KeyChord::character("4")),
             Some(KeyAction::TabWorktrees)
+        );
+        assert_eq!(
+            keymap.action_for(KeyContext::Global, &KeyChord::character("5")),
+            Some(KeyAction::TabReview)
         );
         assert_eq!(
             keymap.action_for(KeyContext::Global, &KeyChord::character("i")),
@@ -1350,6 +1368,70 @@ mod tests {
             .as_slice(),
             [Message::FocusProviderSearch]
         ));
+    }
+
+    #[test]
+    fn default_keymap_routes_review_tab_shortcuts() {
+        let host_id = HostId::new("local");
+        let mut app = app_with_project_selection();
+        app.ui_state.active_tab = RightTab::Review;
+        let keymap = KeyMap::default();
+
+        // `r` refreshes the Review tab's diff, mirroring Linear/GitHub's own
+        // refresh shortcut.
+        let messages = route_key_press_with_keymap(
+            &app,
+            &keymap,
+            &Key::Character("r".into()),
+            Modifiers::empty(),
+        );
+        assert!(matches!(messages.as_slice(), [Message::RefreshReviewDiff]));
+
+        // `Enter` with no line selected is a no-op (falls through to the
+        // session-open fallback, which also finds nothing selected here).
+        let messages = route_key_press_with_keymap(
+            &app,
+            &keymap,
+            &Key::Named(Named::Enter),
+            Modifiers::empty(),
+        );
+        assert!(messages.is_empty());
+
+        // Once a diff is loaded and a line selected, `Enter` opens the inline
+        // comment editor for that line.
+        let diff_text = "diff --git a/f.rs b/f.rs\n\
+             --- a/f.rs\n\
+             +++ b/f.rs\n\
+             @@ -1,2 +1,2 @@\n\
+             -old line\n\
+             +new line\n";
+        let host = app.workspace.hosts.get_mut(&host_id).expect("host");
+        host.review.diff = ReviewDiffStatus::Loaded {
+            model: parse_unified_diff(diff_text),
+            base: "main".to_owned(),
+            truncated: false,
+        };
+        host.review.active_review = Some(Review::new(
+            ReviewSource::Session {
+                host_id: host_id.clone(),
+                session_id: SessionId("s-1".to_owned()),
+            },
+            "project-1",
+            "feature/x",
+        ));
+        host.review.selected_line = Some(ReviewLineTarget {
+            file_index: 0,
+            hunk_index: 0,
+            line_index: 0,
+        });
+
+        let messages = route_key_press_with_keymap(
+            &app,
+            &keymap,
+            &Key::Named(Named::Enter),
+            Modifiers::empty(),
+        );
+        assert!(matches!(messages.as_slice(), [Message::BeginReviewComment]));
     }
 
     #[test]
@@ -1747,6 +1829,7 @@ mod tests {
             notifications: BTreeMap::new(),
             prompt: pohunek_gui_core::PromptState::default(),
             provider: pohunek_gui_core::ProviderState::default(),
+            review: pohunek_gui_core::ReviewTabState::default(),
             last_agent_state: None,
             last_error: None,
         }

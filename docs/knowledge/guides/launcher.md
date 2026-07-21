@@ -17,7 +17,12 @@ Use the split setup commands when diagnosing or applying changes:
 1. `pohunek setup scripts` materializes launcher scripts into the data directory
    bin path.
 2. `pohunek setup config` writes default launcher configuration and prompt
-   templates without overwriting existing files unless `--force` is used.
+   templates (`issue.tmpl`, `pr.tmpl`, `review.tmpl`) without overwriting
+   existing files unless `--force` is used. `review.tmpl` is GUI-only
+   (Track D.6, see [GUI setup](gui.md#review)): the shell launcher scripts
+   render `issue.tmpl`/`pr.tmpl` themselves, but `pohunek-gui` reads and
+   renders `review.tmpl` directly to build a review-dispatch session's
+   prompt.
 3. `pohunek setup sway` writes the sway drop-in, or `pohunek setup sway --print`
    prints the snippet for manual review.
 

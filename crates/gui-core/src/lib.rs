@@ -13,6 +13,7 @@ mod connection;
 mod error;
 mod link;
 mod message;
+mod review;
 mod sdk;
 mod state;
 mod ui_state;
@@ -45,13 +46,20 @@ pub use link::{
 #[doc(inline)]
 pub use message::DomainEvent;
 #[doc(inline)]
+pub use review::{
+    default_reviews_dir, dispatch_review, new_review_id, parse_unified_diff, render_review_prompt,
+    DiffFile, DiffFileStatus, DiffHunk, DiffLine, DiffLineKind, DiffModel, Review, ReviewComment,
+    ReviewDispatchParams, ReviewId, ReviewLoadError, ReviewSide, ReviewSource, ReviewStatus,
+    ReviewStore, ReviewStoreError, REVIEW_DISPATCHED_AT_KEY, REVIEW_SOURCE_KEY,
+};
+#[doc(inline)]
 pub use sdk::{
     add_project, add_project_with_options, create_session, create_session_with_options,
-    delete_notification, delete_notification_with_options, fork_session, fork_session_with_options,
-    inspect_session, inspect_session_with_options, launch_action_prompt_with_options,
-    launch_provider_item_with_options, list_notifications, list_notifications_with_options,
-    list_project_actions, list_project_actions_with_options, list_projects,
-    list_projects_with_options, load_host, load_host_snapshot, remove_project,
+    delete_notification, delete_notification_with_options, diff_session, diff_session_with_options,
+    fork_session, fork_session_with_options, inspect_session, inspect_session_with_options,
+    launch_action_prompt_with_options, launch_provider_item_with_options, list_notifications,
+    list_notifications_with_options, list_project_actions, list_project_actions_with_options,
+    list_projects, list_projects_with_options, load_host, load_host_snapshot, remove_project,
     remove_project_with_options, remove_session, remove_session_with_options, remove_worktree,
     remove_worktree_with_options, rename_project, rename_project_with_options, rename_session,
     rename_session_with_options, resolve_project_action, resolve_project_action_with_options,
@@ -65,7 +73,8 @@ pub use state::{
     AgentMonitor, AgentRow, AgentStateEvent, ConnState, GitHubProviderScope, GitHubProviderState,
     GitHubPullRequestStatusKey, HostEvent, HostView, LinearProviderState, NotificationFilter,
     NotificationIntent, NotificationRow, NotificationScope, PromptState, ProviderOperation,
-    ProviderPanel, ProviderRequestId, ProviderState, Toast, Workspace,
+    ProviderPanel, ProviderRequestId, ProviderState, ReviewCommentEditor, ReviewDiffStatus,
+    ReviewDispatchModal, ReviewLineTarget, ReviewTabState, Toast, Workspace,
 };
 #[doc(inline)]
 pub use ui_state::{

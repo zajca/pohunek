@@ -161,6 +161,7 @@ All params and result type names below refer to structs exported by
 | `session.report_native_id` | `SessionReportNativeIdParams` | `SessionReportNativeIdResult` | Hook callback for launch-agent resume metadata. The daemon records only reports whose `agent` matches the session profile name or base kind; ignored reports return `recorded: false`. This is not the nested-agent active identity callback. |
 | `session.set_metadata` | `SessionSetMetadataParams` | `SessionSetMetadataResult` | Merges owner-controlled metadata. Values must not contain secrets. |
 | `session.rename` | `SessionRenameParams` | `SessionRenameResult` | Sets or clears a session's owner display name (`name: null` clears). Cosmetic; the daemon trims it and rejects a control character or over-long name. |
+| `session.diff` | `SessionDiffParams` | `SessionDiffResult` | Computes a unified diff of a session's worktree against a base ref. `base: null` defers to the worktree binding's recorded base branch, then the repository default. A session without a bound worktree returns `session_no_worktree`; a hostile explicit `base` (empty, leading `-`, or a control character) returns `invalid_branch`; a `base` that cannot be resolved to a merge-base against `HEAD` returns `session_diff_base_unresolved`. See `SessionDiffResult` under Core Payloads for the size cap and truncation semantics. |
 | `subscribe` | `null` | `{subscribed: true}` then event stream | Consumes the connection into a one-way event stream. |
 | `integration.install` | `IntegrationInstallParams` or `null` | `IntegrationInstallResult` | Installs agent hooks for active-agent state, native session id capture, and provider notifications. |
 | `assistant.materialize` | `AssistantMaterializeParams` | `AssistantMaterializeResult` | Materializes the assistant knowledge bundle on the daemon host. |
@@ -433,6 +434,23 @@ environment before reading input, silently drop an invalid `POHUNEK_SESSION_ID`,
 and exit successfully without output on local failures so agent sessions are not
 disrupted. Reinstalling hooks removes only exact command shapes managed by
 Pohunek; user hooks that merely reference the managed script path are preserved.
+
+### `SessionDiffResult`
+
+Important fields:
+
+- `diff`: unified diff text of the session's worktree against `base`. Covers
+  tracked changes plus untracked files (rendered as added-file diffs); binary
+  files appear as git's usual "Binary files differ" stanza.
+- `base`: the base ref the diff was actually computed against — the caller's
+  explicit `SessionDiffParams.base` when given, otherwise the resolved
+  worktree/repository default. Always present even when the request omitted
+  `base`, so a client can display which ref it diffed against.
+- `truncated`: `true` when `diff` was cut short at a file boundary to stay
+  within `MAX_SESSION_DIFF_BYTES` (half of `MAX_CONTROL_LINE_BYTES`, chosen so
+  the full response envelope always fits one control line). When `true`, later
+  files in the change set are omitted from `diff` entirely; a client should
+  surface this rather than treat the diff as complete.
 
 ## Error Contract
 

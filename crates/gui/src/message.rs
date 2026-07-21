@@ -7,7 +7,8 @@ use iced::widget::text_editor;
 use iced::Size;
 use pohunek_gui_core::assistant::Intent as AssistantIntent;
 use pohunek_gui_core::{
-    DomainEvent as CoreEvent, HostConfig, HostId, NotificationScope, RightTab, TreeNodeId,
+    DomainEvent as CoreEvent, HostConfig, HostId, NotificationScope, ReviewLineTarget, RightTab,
+    TreeNodeId,
 };
 use protocol::{AgentActivity, NotificationId, SessionId};
 
@@ -31,6 +32,8 @@ pub(crate) enum ModalView {
     ProviderItem,
     /// The inbox: notification list, or one message's detail.
     Inbox,
+    /// The Review tab's "Dispatch as session…" confirmation.
+    DispatchReview,
 }
 
 /// Which layer of the inbox modal is showing.
@@ -330,6 +333,42 @@ pub(crate) enum Message {
     },
     /// The `b` shortcut: select the next blocked agent, wrapping around.
     CycleBlockedAgent,
+    /// Open the Review tab for a session's worktree diff against its base.
+    OpenSessionReview {
+        host_id: HostId,
+        session_id: SessionId,
+    },
+    /// Open the Review tab for a GitHub pull request diff (matching
+    /// `OpenGitHubPullRequest`'s shape: the host resolves from the current
+    /// selection, the same way opening the item modal already does).
+    OpenPullRequestReview {
+        number: u64,
+    },
+    /// Re-fetch the Review tab's diff for its current source.
+    RefreshReviewDiff,
+    /// Select a file row in the Review tab's file list.
+    SelectReviewFile(usize),
+    /// Select one diff line in the Review tab (mouse click on a line).
+    SelectReviewLine(ReviewLineTarget),
+    /// Open the inline comment editor for the currently selected line.
+    BeginReviewComment,
+    /// Open the inline comment editor to edit an existing comment.
+    BeginEditReviewComment(usize),
+    /// Edit the open comment editor's draft text.
+    ReviewCommentDraftChanged(String),
+    /// Save the open comment editor (add or edit a comment) and persist it.
+    SaveReviewComment,
+    /// Close the comment editor without saving.
+    CancelReviewComment,
+    /// Remove a comment from the active review and persist it.
+    RemoveReviewComment(usize),
+    /// Open the "Dispatch as session…" modal for the active review.
+    OpenReviewDispatchModal,
+    /// Pick the agent the dispatched session will run, overriding the source
+    /// session's own profile (reuses the Start modal's `AgentChoice` picker).
+    DispatchAgentSelected(AgentChoice),
+    /// Confirm dispatching the active review as a new same-worktree session.
+    ConfirmReviewDispatch,
 }
 
 #[derive(Debug, Clone)]

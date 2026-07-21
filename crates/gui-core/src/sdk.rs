@@ -9,10 +9,11 @@ use protocol::{
     NotificationUpdateResult, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
     ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams, ProjectPromptParams,
     ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
-    ProjectShowParams, ProjectShowResult, SessionForkParams, SessionForkResult, SessionId,
-    SessionInfo, SessionListParams, SessionNewParams, SessionNewResult, SessionRemoveResult,
-    SessionRenameParams, SessionRenameResult, SessionResumeResult, SessionSetMetadataParams,
-    SessionSetMetadataResult, SessionStopResult, WorktreeRemoveParams, WorktreeRemoveResult,
+    ProjectShowParams, ProjectShowResult, SessionDiffParams, SessionDiffResult, SessionForkParams,
+    SessionForkResult, SessionId, SessionInfo, SessionListParams, SessionNewParams,
+    SessionNewResult, SessionRemoveResult, SessionRenameParams, SessionRenameResult,
+    SessionResumeResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult,
+    WorktreeRemoveParams, WorktreeRemoveResult,
 };
 
 use crate::connection::connect_client;
@@ -175,6 +176,23 @@ pub async fn rename_session_with_options(
     options: ConnectionOptions,
 ) -> Result<SessionRenameResult, CoreError> {
     call_host::<method::SessionRename>(config, options, params).await
+}
+
+/// Diff a session's worktree against its base on a host through the SDK.
+pub async fn diff_session(
+    config: &HostConfig,
+    params: SessionDiffParams,
+) -> Result<SessionDiffResult, CoreError> {
+    diff_session_with_options(config, params, ConnectionOptions::default()).await
+}
+
+/// Diff a session's worktree against its base with explicit connection options.
+pub async fn diff_session_with_options(
+    config: &HostConfig,
+    params: SessionDiffParams,
+    options: ConnectionOptions,
+) -> Result<SessionDiffResult, CoreError> {
+    call_host::<method::SessionDiff>(config, options, params).await
 }
 
 /// List notification records on a host through the SDK.

@@ -11,7 +11,11 @@ use protocol::{
 };
 
 use crate::providers;
-use crate::{DomainEvent, HealthSummary, HostId, PromptPreview, Selection, SessionLinkProvider};
+use crate::{
+    parse_unified_diff, CoreError, DiffModel, DomainEvent, HealthSummary, HostId, PromptPreview,
+    Review, ReviewComment, ReviewSide, ReviewSource, ReviewStatus, ReviewStore, Selection,
+    SessionLinkProvider,
+};
 
 /// Prompt/action browse and preview state for one host.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -147,6 +151,93 @@ pub enum GitHubProviderSelection {
     PullRequest(u64),
     /// An issue row.
     Issue(u64),
+}
+
+/// Diff fetch/parse status for the Review tab (`docs/design/track-d-ui-brief.md`
+/// §3.9, UI-brief §5 loading/empty/error states).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ReviewDiffStatus {
+    /// No review opened yet for this host.
+    #[default]
+    Idle,
+    /// A `session.diff`/`gh pr diff` fetch is in flight.
+    Fetching,
+    /// Diff fetched and parsed; the change set has at least one file.
+    Loaded {
+        model: DiffModel,
+        /// Base ref the diff was actually computed against.
+        base: String,
+        /// Whether the daemon/`gh` truncated the diff at a file boundary.
+        truncated: bool,
+    },
+    /// Diff fetched and parsed, but the change set touched no files.
+    Empty { base: String },
+    /// The fetch failed; `String` is the error message to display.
+    Error(String),
+}
+
+/// Identifies one selectable diff line: a file/hunk/line triple into
+/// [`ReviewDiffStatus::Loaded`]'s model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReviewLineTarget {
+    pub file_index: usize,
+    pub hunk_index: usize,
+    pub line_index: usize,
+}
+
+/// Inline comment editor state: which line it targets and its draft text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCommentEditor {
+    pub path: String,
+    pub side: ReviewSide,
+    pub line: u32,
+    pub draft_text: String,
+    /// `Some(index)` into `Review::comments` when editing an existing
+    /// comment in place; `None` when composing a new one.
+    pub editing_index: Option<usize>,
+}
+
+/// "Dispatch as session…" modal state.
+///
+/// `agent` is the operator's current pick from the modal's agent picker,
+/// seeded from the source session's own profile when the modal opens
+/// (see [`Workspace::open_review_dispatch_modal`]) and changed via
+/// [`Workspace::set_review_dispatch_agent`]. It flows into
+/// [`crate::ReviewDispatchParams::agent`] at confirm time, overriding
+/// `session_info.agent` for the dispatched session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewDispatchModal {
+    /// Rendered prompt preview, or the render error message
+    /// (`render_review_prompt` failure, e.g. a missing `review.tmpl`).
+    pub prompt_preview: Result<String, String>,
+    /// Wire agent name the dispatched session will run: the source
+    /// session's profile by default, or the operator's picked override.
+    pub agent: String,
+    /// Whether the source session's agent is currently `Working`.
+    pub source_working: bool,
+    /// Set after a failed dispatch attempt; the draft stays untouched and
+    /// the modal stays open showing this message.
+    pub dispatch_error: Option<String>,
+}
+
+/// Review tab state owned by gui-core: diff fetch status, the active draft
+/// review, file/line selection, and modal state.
+///
+/// One active review per host at a time, matching how
+/// [`GitHubProviderState`]/[`LinearProviderState`] scope to a single active
+/// browse target rather than per-session slots — opening a review from a
+/// different session or pull request replaces this state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewTabState {
+    pub diff: ReviewDiffStatus,
+    pub active_review: Option<Review>,
+    pub selected_file: Option<usize>,
+    pub selected_line: Option<ReviewLineTarget>,
+    pub comment_editor: Option<ReviewCommentEditor>,
+    pub dispatch: Option<ReviewDispatchModal>,
+    /// Request id of the in-flight diff fetch, guarding a stale completion
+    /// (same pattern as the Linear/GitHub provider fetch requests).
+    pub diff_request: Option<ProviderRequestId>,
 }
 
 /// Parsed `agent_state` event payload.
@@ -325,6 +416,8 @@ pub struct HostView {
     pub project_details: BTreeMap<String, ProjectShowResult>,
     pub prompt: PromptState,
     pub provider: ProviderState,
+    /// Diff review tab state: fetch status, active draft, selection, modals.
+    pub review: ReviewTabState,
     /// Durable notification records for this host, keyed by notification id.
     pub notifications: BTreeMap<String, NotificationRecord>,
     pub last_agent_state: Option<AgentStateEvent>,
@@ -341,6 +434,7 @@ impl HostView {
             project_details: BTreeMap::new(),
             prompt: PromptState::default(),
             provider: ProviderState::default(),
+            review: ReviewTabState::default(),
             notifications: BTreeMap::new(),
             last_agent_state: None,
             last_error: None,
@@ -492,6 +586,10 @@ impl Workspace {
                     .hosts
                     .get(&host_id)
                     .map_or_else(ProviderState::default, |host| host.provider.clone());
+                let previous_review = self
+                    .hosts
+                    .get(&host_id)
+                    .map_or_else(ReviewTabState::default, |host| host.review.clone());
                 // Notifications reconcile by merge, not wholesale replacement: the
                 // seed query returns a bounded recent window, so previously
                 // received records are preserved and missed records are folded in
@@ -513,6 +611,7 @@ impl Workspace {
                         project_details: previous_details,
                         prompt: previous_prompt,
                         provider: previous_provider,
+                        review: previous_review,
                         notifications,
                         last_agent_state: None,
                         last_error: snapshot.project_error,
@@ -940,6 +1039,68 @@ impl Workspace {
                     .or_insert_with(HostView::connecting);
                 remove_notification(&mut host.notifications, &result.id);
             }
+            DomainEvent::ReviewDiffLoaded {
+                host_id,
+                request_id,
+                diff_text,
+                base,
+                truncated,
+            } => {
+                let Some(host) = self.host_mut_if_known(&host_id, "review diff result") else {
+                    return;
+                };
+                if host.review.diff_request != Some(request_id) {
+                    // A stale completion: the operator opened a different
+                    // review (or closed this one) before this fetch landed.
+                    return;
+                }
+                host.review.diff_request = None;
+                let model = parse_unified_diff(&diff_text);
+                host.review.diff = if model.files.is_empty() {
+                    ReviewDiffStatus::Empty { base }
+                } else {
+                    ReviewDiffStatus::Loaded {
+                        model,
+                        base,
+                        truncated,
+                    }
+                };
+            }
+            DomainEvent::ReviewDiffFailed {
+                host_id,
+                request_id,
+                error,
+            } => {
+                let Some(host) = self.host_mut_if_known(&host_id, "review diff failure") else {
+                    return;
+                };
+                if host.review.diff_request != Some(request_id) {
+                    return;
+                }
+                host.review.diff_request = None;
+                host.review.diff = ReviewDiffStatus::Error(error);
+            }
+            DomainEvent::ReviewDispatched {
+                host_id,
+                review,
+                result,
+            } => {
+                let Some(host) = self.host_mut_if_known(&host_id, "review dispatch result") else {
+                    return;
+                };
+                let session = result.session;
+                host.sessions.insert(session.id.0.clone(), session);
+                host.review.active_review = Some(review);
+                host.review.dispatch = None;
+            }
+            DomainEvent::ReviewDispatchFailed { host_id, error } => {
+                let Some(host) = self.host_mut_if_known(&host_id, "review dispatch failure") else {
+                    return;
+                };
+                if let Some(dispatch) = &mut host.review.dispatch {
+                    dispatch.dispatch_error = Some(error);
+                }
+            }
         }
     }
 
@@ -1146,6 +1307,309 @@ impl Workspace {
         Some(selection)
     }
 
+    /// Opens (or replaces) `host_id`'s Review tab for a session's worktree
+    /// diff and marks the fetch pending. Returns the request id the caller's
+    /// async diff fetch must complete with via [`DomainEvent::ReviewDiffLoaded`]
+    /// or [`DomainEvent::ReviewDiffFailed`].
+    ///
+    /// Resumes the most-recently-updated `Draft` review in `store` for this
+    /// exact source (same host + session id), comments and all, instead of
+    /// minting a fresh one — otherwise a persisted draft would become an
+    /// unreachable orphan the moment the operator navigated away and back
+    /// (reviews are expected to survive a GUI restart). Mints a new
+    /// [`Review`] only when no matching draft exists on disk.
+    pub fn begin_review_from_session(
+        &mut self,
+        host_id: HostId,
+        store: &ReviewStore,
+        session: &SessionInfo,
+        project: impl Into<String>,
+    ) -> ProviderRequestId {
+        let request_id = self.next_provider_request_id();
+        let source = ReviewSource::Session {
+            host_id: host_id.clone(),
+            session_id: session.id.clone(),
+        };
+        let review = resume_or_new_review(
+            store,
+            &source,
+            project,
+            session.branch.clone().unwrap_or_default(),
+        );
+        let host = self.host_for_ui(host_id);
+        host.review = ReviewTabState {
+            diff: ReviewDiffStatus::Fetching,
+            active_review: Some(review),
+            diff_request: Some(request_id),
+            ..ReviewTabState::default()
+        };
+        request_id
+    }
+
+    /// Opens (or replaces) `host_id`'s Review tab for a GitHub pull request
+    /// diff. See [`Self::begin_review_from_session`] for the resume
+    /// rationale (same host + PR number here), which applies identically.
+    pub fn begin_review_from_pull_request(
+        &mut self,
+        host_id: HostId,
+        store: &ReviewStore,
+        pr_number: u64,
+        project: impl Into<String>,
+        branch: impl Into<String>,
+    ) -> ProviderRequestId {
+        let request_id = self.next_provider_request_id();
+        let source = ReviewSource::PullRequest {
+            host_id: host_id.clone(),
+            pr_number,
+        };
+        let review = resume_or_new_review(store, &source, project, branch);
+        let host = self.host_for_ui(host_id);
+        host.review = ReviewTabState {
+            diff: ReviewDiffStatus::Fetching,
+            active_review: Some(review),
+            diff_request: Some(request_id),
+            ..ReviewTabState::default()
+        };
+        request_id
+    }
+
+    /// Re-marks `host_id`'s Review tab diff fetch pending without disturbing
+    /// the active draft review (its comments, dispatch state, file/line
+    /// selection). Returns `None` (no-op) when there is no active review to
+    /// refresh.
+    pub fn begin_review_diff_refresh(&mut self, host_id: &HostId) -> Option<ProviderRequestId> {
+        self.hosts.get(host_id)?.review.active_review.as_ref()?;
+        let request_id = self.next_provider_request_id();
+        let host = self.hosts.get_mut(host_id)?;
+        host.review.diff = ReviewDiffStatus::Fetching;
+        host.review.diff_request = Some(request_id);
+        Some(request_id)
+    }
+
+    /// Selects a file in the Review tab's file list, clearing any line
+    /// selection (mirrors clicking a file row rather than a specific line).
+    pub fn select_review_file(&mut self, host_id: &HostId, file_index: usize) {
+        let Some(host) = self.hosts.get_mut(host_id) else {
+            return;
+        };
+        host.review.selected_file = Some(file_index);
+        host.review.selected_line = None;
+    }
+
+    /// Selects one diff line directly (mouse click on a line).
+    pub fn select_review_line(&mut self, host_id: &HostId, target: ReviewLineTarget) {
+        let Some(host) = self.hosts.get_mut(host_id) else {
+            return;
+        };
+        host.review.selected_file = Some(target.file_index);
+        host.review.selected_line = Some(target);
+    }
+
+    /// Moves the Review tab's line cursor to the next selectable line,
+    /// flowing from one file's lines into the next file's lines at the
+    /// boundary (`docs/design/track-d-ui-brief.md` §3.9's "files → hunks →
+    /// lines" browsing, folded into one continuous keyboard traversal).
+    pub fn select_next_review_line(&mut self, host_id: &HostId) -> Option<ReviewLineTarget> {
+        self.select_review_line_by_keyboard(host_id, SelectionDirection::Next)
+    }
+
+    /// Moves the Review tab's line cursor to the previous selectable line.
+    pub fn select_previous_review_line(&mut self, host_id: &HostId) -> Option<ReviewLineTarget> {
+        self.select_review_line_by_keyboard(host_id, SelectionDirection::Previous)
+    }
+
+    fn select_review_line_by_keyboard(
+        &mut self,
+        host_id: &HostId,
+        direction: SelectionDirection,
+    ) -> Option<ReviewLineTarget> {
+        let host = self.hosts.get_mut(host_id)?;
+        let ReviewDiffStatus::Loaded { model, .. } = &host.review.diff else {
+            return None;
+        };
+        let targets = flattened_review_line_targets(model);
+        let current_index = host
+            .review
+            .selected_line
+            .and_then(|current| targets.iter().position(|target| *target == current));
+        let selected_index = move_selection(current_index, targets.len(), direction)?;
+        let target = targets[selected_index];
+        host.review.selected_file = Some(target.file_index);
+        host.review.selected_line = Some(target);
+        Some(target)
+    }
+
+    /// Opens the inline comment editor for the currently selected line with a
+    /// blank draft. Returns `false` (no-op) when no line is selected or the
+    /// diff is not loaded.
+    pub fn begin_review_comment(&mut self, host_id: &HostId) -> bool {
+        let Some(host) = self.hosts.get_mut(host_id) else {
+            return false;
+        };
+        let ReviewDiffStatus::Loaded { model, .. } = &host.review.diff else {
+            return false;
+        };
+        let Some(target) = host.review.selected_line else {
+            return false;
+        };
+        let Some((path, side, line)) = review_line_anchor(model, target) else {
+            return false;
+        };
+        host.review.comment_editor = Some(ReviewCommentEditor {
+            path,
+            side,
+            line,
+            draft_text: String::new(),
+            editing_index: None,
+        });
+        true
+    }
+
+    /// Opens the inline comment editor pre-filled to edit an existing
+    /// comment on the active review. Returns `false` (no-op) when there is no
+    /// active review or `index` is out of range.
+    pub fn begin_edit_review_comment(&mut self, host_id: &HostId, index: usize) -> bool {
+        let Some(host) = self.hosts.get_mut(host_id) else {
+            return false;
+        };
+        let Some(review) = &host.review.active_review else {
+            return false;
+        };
+        let Some(comment) = review.comments.get(index) else {
+            return false;
+        };
+        host.review.comment_editor = Some(ReviewCommentEditor {
+            path: comment.path.clone(),
+            side: comment.side,
+            line: comment.line,
+            draft_text: comment.text.clone(),
+            editing_index: Some(index),
+        });
+        true
+    }
+
+    /// Updates the open comment editor's draft text. No-op without an open
+    /// editor.
+    pub fn update_review_comment_draft(&mut self, host_id: &HostId, text: String) {
+        let Some(host) = self.hosts.get_mut(host_id) else {
+            return;
+        };
+        let Some(editor) = &mut host.review.comment_editor else {
+            return;
+        };
+        editor.draft_text = text;
+    }
+
+    /// Closes the comment editor without saving.
+    pub fn cancel_review_comment_editor(&mut self, host_id: &HostId) {
+        let Some(host) = self.hosts.get_mut(host_id) else {
+            return;
+        };
+        host.review.comment_editor = None;
+    }
+
+    /// Saves the open comment editor: appends a new comment, or edits the one
+    /// at `editing_index` in place, persists the review via `store`, and
+    /// closes the editor. No-op returning `Ok(())` when no editor is open or
+    /// there is no active review (idempotent under a double-submit).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ReviewStore`] when persisting fails; the
+    /// in-memory review still reflects the added/edited comment (only the
+    /// disk write failed), so the next successful save includes it.
+    pub fn save_review_comment(
+        &mut self,
+        host_id: &HostId,
+        store: &ReviewStore,
+    ) -> Result<(), CoreError> {
+        let Some(host) = self.hosts.get_mut(host_id) else {
+            return Ok(());
+        };
+        let Some(editor) = host.review.comment_editor.take() else {
+            return Ok(());
+        };
+        let Some(review) = &mut host.review.active_review else {
+            return Ok(());
+        };
+        if let Some(index) = editor.editing_index {
+            review.edit_comment(index, editor.draft_text);
+        } else {
+            review.add_comment(ReviewComment::new(
+                editor.path,
+                editor.side,
+                editor.line,
+                editor.draft_text,
+            ));
+        }
+        store.save(review)?;
+        Ok(())
+    }
+
+    /// Removes the comment at `index` from the active review and persists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ReviewStore`] when persisting fails.
+    pub fn remove_review_comment(
+        &mut self,
+        host_id: &HostId,
+        store: &ReviewStore,
+        index: usize,
+    ) -> Result<(), CoreError> {
+        let Some(host) = self.hosts.get_mut(host_id) else {
+            return Ok(());
+        };
+        let Some(review) = &mut host.review.active_review else {
+            return Ok(());
+        };
+        review.remove_comment(index);
+        store.save(review)?;
+        Ok(())
+    }
+
+    /// Opens the "Dispatch as session…" modal for the active review, seeded
+    /// with a prompt preview render outcome, the resolved agent label, and
+    /// whether the source session is currently working.
+    pub fn open_review_dispatch_modal(
+        &mut self,
+        host_id: &HostId,
+        prompt_preview: Result<String, String>,
+        agent: String,
+        source_working: bool,
+    ) {
+        let Some(host) = self.hosts.get_mut(host_id) else {
+            return;
+        };
+        host.review.dispatch = Some(ReviewDispatchModal {
+            prompt_preview,
+            agent,
+            source_working,
+            dispatch_error: None,
+        });
+    }
+
+    /// Closes the dispatch modal without dispatching.
+    pub fn close_review_dispatch_modal(&mut self, host_id: &HostId) {
+        let Some(host) = self.hosts.get_mut(host_id) else {
+            return;
+        };
+        host.review.dispatch = None;
+    }
+
+    /// Sets the dispatch modal's agent picker to `agent`, overriding the
+    /// source session's profile for the dispatched session. No-op without an
+    /// open dispatch modal.
+    pub fn set_review_dispatch_agent(&mut self, host_id: &HostId, agent: String) {
+        let Some(host) = self.hosts.get_mut(host_id) else {
+            return;
+        };
+        let Some(dispatch) = &mut host.review.dispatch else {
+            return;
+        };
+        dispatch.agent = agent;
+    }
+
     /// Select a session in the detail pane.
     pub fn select_session(&mut self, host_id: HostId, session_id: SessionId) {
         self.invalidate_github_provider_requests(&host_id);
@@ -1337,6 +1801,72 @@ fn move_selection(
         (Some(index), SelectionDirection::Next) => (index + 1) % visible_len,
         (Some(index), SelectionDirection::Previous) => index - 1,
     })
+}
+
+/// Resumes the most-recently-updated `Draft` review in `store` whose
+/// `source` matches exactly, or mints a fresh one when none does.
+///
+/// Comparing `ReviewSource` by `PartialEq` is an exact identity check
+/// already (host id together with session id for `Session`, host id together
+/// with PR number for `PullRequest`), so no separate lookup key is needed. A
+/// corrupt review file surfaces via `ReviewStore::load_all`'s `Err` entries,
+/// which this silently skips: it simply cannot match anything, the same as
+/// an unrelated review would, never mistaking a broken file for "no draft
+/// exists" in a way that could shadow a real one. Surfacing the corrupt-file
+/// condition itself remains `ReviewStore`'s own concern, not this resume
+/// lookup's.
+fn resume_or_new_review(
+    store: &ReviewStore,
+    source: &ReviewSource,
+    project: impl Into<String>,
+    branch: impl Into<String>,
+) -> Review {
+    let existing = store
+        .load_all()
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|review| &review.source == source && review.status == ReviewStatus::Draft)
+        .max_by(|left, right| left.updated_at.cmp(&right.updated_at));
+    existing.unwrap_or_else(|| Review::new(source.clone(), project, branch))
+}
+
+/// Flattens every selectable line across every file/hunk of `model`, in
+/// source order, so the Review tab's keyboard nav can move through one
+/// continuous list spanning "files → hunks → lines".
+fn flattened_review_line_targets(model: &DiffModel) -> Vec<ReviewLineTarget> {
+    let mut targets = Vec::new();
+    for (file_index, file) in model.files.iter().enumerate() {
+        for (hunk_index, hunk) in file.hunks.iter().enumerate() {
+            for line_index in 0..hunk.lines.len() {
+                targets.push(ReviewLineTarget {
+                    file_index,
+                    hunk_index,
+                    line_index,
+                });
+            }
+        }
+    }
+    targets
+}
+
+/// Resolves the `path`/`side`/`line` a new comment on `target` should anchor
+/// to: the new-side line number when the line has one (an added or context
+/// line), otherwise the old-side line number (a removed line has no new-side
+/// counterpart). Returns `None` when `target` does not resolve to a line in
+/// `model` (stale selection against a since-changed diff).
+fn review_line_anchor(
+    model: &DiffModel,
+    target: ReviewLineTarget,
+) -> Option<(String, ReviewSide, u32)> {
+    let file = model.files.get(target.file_index)?;
+    let hunk = file.hunks.get(target.hunk_index)?;
+    let line = hunk.lines.get(target.line_index)?;
+    let (side, number) = match (line.new_line, line.old_line) {
+        (Some(new_line), _) => (ReviewSide::New, new_line),
+        (None, Some(old_line)) => (ReviewSide::Old, old_line),
+        (None, None) => return None,
+    };
+    Some((file.path.clone(), side, number))
 }
 
 fn visible_linear_issue_ids(state: &LinearProviderState) -> Vec<String> {
@@ -1702,7 +2232,7 @@ mod tests {
     use crate::link::action_prompt_provider;
     use crate::sdk::notification_seed_queries;
     use crate::{
-        render_attach_command, AttachTemplateValues, ConnectionOptions, CoreError, HostSnapshot,
+        render_attach_command, AttachTemplateValues, ConnectionOptions, HostSnapshot,
         DEFAULT_BACKOFF_MAX,
     };
 
@@ -3476,5 +4006,223 @@ mod tests {
             host_id: HostId::new(host),
             event: HostEvent::NotificationUpdated(record),
         }
+    }
+
+    #[test]
+    fn review_dispatch_modal_agent_defaults_and_can_be_overridden() {
+        let host_id = HostId::new("local");
+        let mut workspace = Workspace::default();
+        workspace.host_for_ui(host_id.clone());
+
+        workspace.open_review_dispatch_modal(
+            &host_id,
+            Ok("rendered prompt".to_owned()),
+            "codex".to_owned(),
+            false,
+        );
+        assert_eq!(
+            workspace
+                .hosts
+                .get(&host_id)
+                .and_then(|host| host.review.dispatch.as_ref())
+                .map(|dispatch| dispatch.agent.as_str()),
+            Some("codex")
+        );
+
+        workspace.set_review_dispatch_agent(&host_id, "shell".to_owned());
+        assert_eq!(
+            workspace
+                .hosts
+                .get(&host_id)
+                .and_then(|host| host.review.dispatch.as_ref())
+                .map(|dispatch| dispatch.agent.as_str()),
+            Some("shell")
+        );
+
+        workspace.close_review_dispatch_modal(&host_id);
+        assert!(workspace
+            .hosts
+            .get(&host_id)
+            .is_some_and(|host| host.review.dispatch.is_none()));
+    }
+
+    #[test]
+    fn set_review_dispatch_agent_is_a_no_op_without_an_open_modal() {
+        let host_id = HostId::new("local");
+        let mut workspace = Workspace::default();
+        workspace.host_for_ui(host_id.clone());
+
+        workspace.set_review_dispatch_agent(&host_id, "shell".to_owned());
+
+        assert!(workspace
+            .hosts
+            .get(&host_id)
+            .is_some_and(|host| host.review.dispatch.is_none()));
+    }
+
+    fn review_resume_store_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "pohunek-gui-core-state-review-resume-{tag}-{}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn begin_review_from_session_resumes_a_persisted_draft_for_the_same_source() {
+        let store = ReviewStore::new(review_resume_store_dir("same-source"));
+        let host_id = HostId::new("local");
+        let mut source_session = session("s-1", None);
+        source_session.branch = Some("feature/x".to_owned());
+
+        // First "app run": open the review, add a comment, and persist it —
+        // exactly what `save_review_comment` does, but driven directly here
+        // since that method also needs an open comment editor.
+        let mut workspace = Workspace::default();
+        workspace.begin_review_from_session(host_id.clone(), &store, &source_session, "project-1");
+        let review_id = {
+            let host = workspace.hosts.get_mut(&host_id).expect("host");
+            let review = host
+                .review
+                .active_review
+                .as_mut()
+                .expect("fresh draft on first open");
+            review.add_comment(ReviewComment::new("src/lib.rs", ReviewSide::New, 1, "lgtm"));
+            store.save(review).expect("persist draft with comment");
+            review.id.clone()
+        };
+
+        // "Restart": a brand-new in-memory `Workspace` (nothing carried over
+        // except the on-disk store) opening a review for the exact same
+        // source must resume the persisted draft, comment included.
+        let mut restarted = Workspace::default();
+        restarted.begin_review_from_session(host_id.clone(), &store, &source_session, "project-1");
+        let resumed = restarted
+            .hosts
+            .get(&host_id)
+            .expect("host")
+            .review
+            .active_review
+            .as_ref()
+            .expect("resumed review");
+        assert_eq!(resumed.id, review_id);
+        assert_eq!(resumed.comments.len(), 1);
+        assert_eq!(resumed.comments[0].text, "lgtm");
+
+        // A different source (different session id) must not resume this
+        // unrelated draft — it mints its own fresh, empty one instead.
+        let mut other_session = session("s-2", None);
+        other_session.branch = Some("feature/y".to_owned());
+        let mut other = Workspace::default();
+        other.begin_review_from_session(host_id.clone(), &store, &other_session, "project-1");
+        let fresh = other
+            .hosts
+            .get(&host_id)
+            .expect("host")
+            .review
+            .active_review
+            .as_ref()
+            .expect("fresh draft for a different source");
+        assert_ne!(fresh.id, review_id);
+        assert!(fresh.comments.is_empty());
+    }
+
+    #[test]
+    fn begin_review_from_pull_request_resumes_a_persisted_draft_for_the_same_pr() {
+        let store = ReviewStore::new(review_resume_store_dir("same-pr"));
+        let host_id = HostId::new("local");
+
+        let mut workspace = Workspace::default();
+        workspace.begin_review_from_pull_request(
+            host_id.clone(),
+            &store,
+            42,
+            "project-1",
+            "feature/pr-42",
+        );
+        let review_id = {
+            let host = workspace.hosts.get_mut(&host_id).expect("host");
+            let review = host
+                .review
+                .active_review
+                .as_mut()
+                .expect("fresh draft on first open");
+            review.add_comment(ReviewComment::new("README.md", ReviewSide::Old, 3, "typo"));
+            store.save(review).expect("persist draft with comment");
+            review.id.clone()
+        };
+
+        let mut restarted = Workspace::default();
+        restarted.begin_review_from_pull_request(
+            host_id.clone(),
+            &store,
+            42,
+            "project-1",
+            "feature/pr-42",
+        );
+        let resumed = restarted
+            .hosts
+            .get(&host_id)
+            .expect("host")
+            .review
+            .active_review
+            .as_ref()
+            .expect("resumed review");
+        assert_eq!(resumed.id, review_id);
+        assert_eq!(resumed.comments.len(), 1);
+
+        // A different PR number on the same host must not resume it.
+        let mut other = Workspace::default();
+        other.begin_review_from_pull_request(
+            host_id.clone(),
+            &store,
+            43,
+            "project-1",
+            "feature/pr-43",
+        );
+        let fresh = other
+            .hosts
+            .get(&host_id)
+            .expect("host")
+            .review
+            .active_review
+            .as_ref()
+            .expect("fresh draft for a different PR");
+        assert_ne!(fresh.id, review_id);
+        assert!(fresh.comments.is_empty());
+    }
+
+    #[test]
+    fn begin_review_from_session_ignores_a_dispatched_draft_and_mints_a_fresh_one() {
+        let store = ReviewStore::new(review_resume_store_dir("dispatched-not-resumed"));
+        let host_id = HostId::new("local");
+        let mut source_session = session("s-1", None);
+        source_session.branch = Some("feature/x".to_owned());
+
+        let mut workspace = Workspace::default();
+        workspace.begin_review_from_session(host_id.clone(), &store, &source_session, "project-1");
+        let dispatched_id = {
+            let host = workspace.hosts.get_mut(&host_id).expect("host");
+            let review = host
+                .review
+                .active_review
+                .as_mut()
+                .expect("fresh draft on first open");
+            review.mark_dispatched(SessionId("s-dispatched".to_owned()));
+            store.save(review).expect("persist dispatched review");
+            review.id.clone()
+        };
+
+        let mut restarted = Workspace::default();
+        restarted.begin_review_from_session(host_id.clone(), &store, &source_session, "project-1");
+        let fresh = restarted
+            .hosts
+            .get(&host_id)
+            .expect("host")
+            .review
+            .active_review
+            .as_ref()
+            .expect("fresh draft, not the dispatched one");
+        assert_ne!(fresh.id, dispatched_id);
+        assert_eq!(fresh.status, ReviewStatus::Draft);
     }
 }

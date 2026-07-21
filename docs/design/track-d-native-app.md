@@ -3,7 +3,7 @@
 Status: **design** (pre-spike). Supersedes the terminal-renderer direction in
 `docs/ROADMAP.md` §3 Track D — see [Roadmap corrections](#10-roadmap-corrections).
 
-Last updated: 2026-06-27.
+Last updated: 2026-07-19.
 
 This document is the source of truth for *what* Track D builds and *why*. The
 roadmap (`docs/ROADMAP.md`) remains the sequencing index; where the two disagree,
@@ -249,15 +249,35 @@ Spawn `attach_command` with `{bin}`/`{host}`/`{id}` filled (D-03). Fire-and-forg
 the GUI does not own the child. Detaching/closing the terminal leaves the session
 running on its host (daemon owns the PTY).
 
-### D.6 — Diff review + comment-to-session loop (v1.1)
+### D.6 — Diff review + comment-to-session loop (v1.1) (shipped, minus gh-posting)
 
-- Diff source: worktree-vs-base for a session/worktree; `gh pr diff` for a PR.
-- Render by file/hunk (unified first; side-by-side later), inline comments
-  anchored to `file:line` (record the side — old/new — for stability).
-- Comments + review live **app-local until dispatch** (D-08). Dispatch renders the
-  review into a preset prompt and launches `session.new --input` on the **same
-  branch/worktree**; the `review→session` link is written into the new session's
-  metadata. Optionally also post via `gh pr review` / `gh pr comment`.
+- Diff source: worktree-vs-base for a session/worktree (new daemon method
+  `session.diff`, worktree-vs-`merge-base` semantics with untracked files
+  rendered as added-file diffs and truncation at a file boundary past
+  `MAX_SESSION_DIFF_BYTES`); `gh pr diff` for a PR.
+- Render by file/hunk (unified only; side-by-side deferred), inline comments
+  anchored to `file:line` (the side — old/new — is recorded for stability). One
+  parser (`crates/gui-core/src/review/diff.rs`) consumes both diff sources.
+- Comments + review live **app-local until dispatch** (D-08): one JSON file per
+  review under `~/.local/share/pohunek-gui/reviews/`, atomic write-then-rename,
+  every add/edit/delete persisted immediately. Reopening a review for the same
+  source (session or PR) resumes the most-recently-updated persisted `Draft`
+  for that exact source; a review that has already been dispatched is never
+  resumed, and a fresh empty draft is started only when no matching draft
+  exists. Dispatch renders the review into a preset prompt
+  (`~/.config/pohunek/prompts/review.tmpl`) and launches `session.new --input`
+  with `cwd` set to the source session's **same** worktree (git forbids a
+  second worktree on an already-checked-out branch, so this is `cwd`-only, not
+  a new `--branch` checkout); the dispatch modal offers an agent picker seeded
+  with the source session's own agent profile and freely overridable, and the
+  GUI warns before dispatching when the source session is currently working.
+  The `review→session` link (`review.source`, `review.dispatched_at`)
+  is written into the new session's metadata alongside the source session's
+  `link.*` keys, copied verbatim. A pull-request-sourced review has no source
+  worktree, so its dispatch action is disabled with an explanatory tooltip.
+  **Posting the review to GitHub via `gh pr review` / `gh pr comment` is
+  deferred** — out of scope for this milestone; dispatch-as-session is the only
+  output.
 
 ---
 

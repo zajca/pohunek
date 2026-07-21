@@ -52,6 +52,7 @@ use crate::worktree::{
 
 mod attach;
 mod detector;
+mod diff;
 mod hooks;
 mod input;
 mod lag;

@@ -9,7 +9,7 @@ Status reflects the **code on `main`**, verified against the tree (releases
 v0.1.0 -> v0.4.3). Where a phase/plan doc's own status header lags the code, the
 code wins and the lag is noted.
 
-Last reconciled: 2026-06-27.
+Last reconciled: 2026-07-19.
 
 ---
 
@@ -97,7 +97,8 @@ relay transport.
 > is the source of truth for Track D and supersedes this summary where they differ.
 > Key pivots since the original framing: **no embedded terminal** (attach is
 > delegated to an external terminal), **GUI = Iced** (decided), **Linux only** v1,
-> **v1 = D.1+D.3+D.4+D.5** (D.6 is v1.1).
+> **v1 = D.1+D.3+D.4+D.5** (D.6 was v1.1; D.6 has since shipped, minus the
+> optional `gh pr review` posting, which is deferred).
 
 A **pure-native Rust desktop app** (no webview, no JS) and the **primary GUI**
 going forward. It is a **control plane** — it does *not* render a terminal. It is
@@ -156,18 +157,29 @@ Suggested slices (each independently valuable):
   issues and GitHub PRs/issues; **launch an agent on an item** with a preset prompt
   (parity with `pohunek-launch-issue` / `-pr`); link sessions; surface PR
   checks/review status next to the live state badge; open/view a PR.
-- **D.6 — Diff review + comment-to-session loop (Kandev-style).** A unified diff
-  surface for a **session's worktree, a worktree, or a PR**: render the diff
-  (worktree diff vs the base branch for a session/worktree; `gh pr diff` for a PR),
-  browse it by file/hunk, and add **inline comments anchored to `file:line`**.
-  Collect the comments into a **review** and **dispatch it as a new session** — the
-  review is rendered into a preset prompt (the shared `~/.config/pohunek/prompts/`
-  convention) and launched atomically via `session new --input` on the **same
-  branch/worktree**, so the agent picks up the review and acts on it. Optionally
-  also post the review to the PR via `gh pr review` / `gh pr comment`. Comments
-  live **app-local until dispatch** (to keep the chassis free of a new surface);
-  on dispatch the **review→session link** is written into the new session's `link.*`
-  metadata, so a dispatched review is visible across surfaces. *(v1.1.)*
+- **D.6 — Diff review + comment-to-session loop (Kandev-style). Shipped, minus
+  gh-posting (see [`design/track-d-native-app.md`](design/track-d-native-app.md)
+  §6).** A unified diff surface for a **session's worktree or a PR**: render the
+  diff (worktree diff vs the base branch for a session, via the new daemon
+  method `session.diff`; `gh pr diff` for a PR), browse it by file/hunk, and add
+  **inline comments anchored to `file:line`**. Collect the comments into a
+  **review** and **dispatch it as a new session** — the review is rendered into
+  a preset prompt (`~/.config/pohunek/prompts/review.tmpl`) and launched
+  atomically via `session new --input` with `cwd` set to the **same worktree**
+  the review was of (git forbids a second worktree on an already-checked-out
+  branch), an agent picker seeded with the source session's own agent profile
+  and freely overridable, so the (possibly different) agent picks up the
+  review and acts on it in place. **Posting the review to the PR via `gh pr
+  review` / `gh pr comment` is deferred**, out of scope for this milestone.
+  Comments live **app-local until dispatch** (to keep the chassis free of a new
+  surface) as one JSON file per review, persisted immediately on every
+  add/edit/delete; reopening a review for the same source resumes the
+  most-recently-updated persisted draft for that exact source (a dispatched
+  review is never resumed), starting fresh only when none exists. On dispatch
+  the **review→session link**
+  (`review.source`, `review.dispatched_at`) is written into the new session's
+  metadata alongside the source session's `link.*` keys, so a dispatched review
+  is visible across surfaces.
 
 *Done when:* against ≥2 loopback-TCP stand-in daemons (CI for the SDK/data layer)
 the app lists both hosts' sessions, shows a state change, and **spawns the
@@ -175,10 +187,12 @@ configured `attach_command`** for a selected session (the GUI is not on the
 terminal I/O path); launching on a fixture
 issue starts exactly one session on the expected branch with the rendered prompt;
 the link persists across daemon restart and is byte-identical to a sway-script
-link; given a session/worktree/PR with changes the app renders the diff, accepts
-inline comments, and dispatching the review starts exactly one new session on the
-**same** branch with the comments delivered as the prompt and the review→session
+link; given a session/PR with changes the app renders the diff, accepts
+inline comments, and dispatching the review starts exactly one new session in the
+**same** worktree with the comments delivered as the prompt and the review→session
 link persisted; no provider token appears in any daemon log, metadata, or event.
+**All met** as of the D.6 milestone, except the optional `gh pr review` posting,
+which is deferred.
 
 ### Track B — Browser Control Center *(later / optional)*
 
@@ -220,7 +234,8 @@ changes the daemon (no gateway, no embedded assets, no daemon-side auth).
    on the Rust SDK; see [`design/track-d-native-app.md`](design/track-d-native-app.md)
    and [`phases/06`](phases/06-native-app.md). **v1:** D.1 (workspace + multi-host)
    → D.3 (session/project/worktree) → D.4 (prompts) → D.5 (Linear + PRs); attach is
-   delegated (D.2 folded in). **v1.1:** D.6 (diff review + comment-to-session loop).
+   delegated (D.2 folded in). **v1.1:** D.6 (diff review + comment-to-session
+   loop) — shipped, minus the deferred `gh pr review` posting.
 4. **Track B (later/optional)** — when mobile / from-any-device access is wanted:
    build the aggregator backend on the completed S.3 TS SDK and inherited
    `web/backend` relay core → Svelte SPA → PWA → provider parity, reusing the

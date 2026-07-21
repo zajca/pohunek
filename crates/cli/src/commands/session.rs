@@ -14,10 +14,10 @@ use std::path::PathBuf;
 #[cfg(test)]
 use protocol::Request;
 use protocol::{
-    method, AgentActivity, CwdSource, ForkCwdMode, SessionForkParams, SessionId, SessionInfo,
-    SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
-    SessionRemoveResult, SessionRenameParams, SessionState, SessionStopResult, SessionWarningKind,
-    StateSource,
+    method, AgentActivity, CwdSource, ForkCwdMode, SessionDiffParams, SessionForkParams, SessionId,
+    SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
+    SessionNewParams, SessionRemoveResult, SessionRenameParams, SessionState, SessionStopResult,
+    SessionWarningKind, StateSource,
 };
 
 use crate::client::Client;
@@ -514,6 +514,44 @@ pub(crate) async fn run_rename(
     Ok(())
 }
 
+/// Run `session diff` against the daemon for `host`.
+///
+/// The default (non-`--json`) output is the raw unified diff text on stdout,
+/// not a table: this is the reference-client parity path other tools pipe
+/// through, so stdout must stay exactly the diff. A truncation warning is
+/// printed to stderr instead, so it never corrupts a piped diff.
+///
+/// # Errors
+///
+/// Returns [`CliError`] if the daemon is unreachable, the host cannot be
+/// resolved, the daemon rejects the request (e.g. the session has no bound
+/// worktree), or the payload does not match the contract.
+pub(crate) async fn run_diff(
+    host: &str,
+    paths: &Paths,
+    target: &Target,
+    base: Option<String>,
+    json: bool,
+) -> Result<(), CliError> {
+    let mut client = Client::connect(host, paths).await?;
+    let result = client
+        .call::<method::SessionDiff>(diff_params(target, base))
+        .await?;
+
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        if result.truncated {
+            eprintln!(
+                "warning: diff for session {} was truncated to fit the size cap",
+                target.session_id
+            );
+        }
+        print!("{}", result.diff);
+    }
+    Ok(())
+}
+
 fn new_params(args: &NewArgs) -> Result<SessionNewParams, CliError> {
     Ok(SessionNewParams {
         agent: args.agent.clone(),
@@ -635,6 +673,18 @@ fn rename_params(target: &Target, name: Option<String>) -> SessionRenameParams {
 #[cfg(test)]
 fn build_rename_request(target: &Target, name: Option<String>) -> Result<Request, CliError> {
     request_with_params(method::SESSION_RENAME, &rename_params(target, name))
+}
+
+fn diff_params(target: &Target, base: Option<String>) -> SessionDiffParams {
+    SessionDiffParams {
+        session_id: SessionId(target.session_id.clone()),
+        base,
+    }
+}
+
+#[cfg(test)]
+fn build_diff_request(target: &Target, base: Option<String>) -> Result<Request, CliError> {
+    request_with_params(method::SESSION_DIFF, &diff_params(target, base))
 }
 
 fn render_new_human(info: &SessionInfo) -> String {
@@ -1585,6 +1635,32 @@ mod tests {
         assert_request(
             &request,
             method::SESSION_RENAME,
+            json!({"session_id": "s-42"}),
+        );
+    }
+
+    #[test]
+    fn diff_request_sends_session_id_and_explicit_base() {
+        let target: Target = "host-b/s-42".parse().expect("target");
+        let request = build_diff_request(&target, Some("main".to_owned())).expect("request");
+
+        assert_request(
+            &request,
+            method::SESSION_DIFF,
+            json!({"session_id": "s-42", "base": "main"}),
+        );
+    }
+
+    #[test]
+    fn diff_request_omits_base_when_left_to_daemon_default() {
+        let target: Target = "local/s-42".parse().expect("target");
+        let request = build_diff_request(&target, None).expect("request");
+
+        // No explicit `--base` means the wire body carries only the session
+        // id; the daemon resolves the default base itself.
+        assert_request(
+            &request,
+            method::SESSION_DIFF,
             json!({"session_id": "s-42"}),
         );
     }
