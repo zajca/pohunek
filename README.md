@@ -99,7 +99,8 @@ where they are doing it, and when they need you.
   terminal via a configurable `attach_command`.
 - **Agents monitor** with working/blocked/idle counts, `b` cycles through
   blocked agents; the **Inbox** modal is a cross-host triage view over durable
-  notifications and raises OS notifications only for records that need action.
+  notifications and raises OS notifications only for action-required and
+  error records.
 - **Linear and GitHub integration** (client-side: Linear GraphQL via keyring
   token, GitHub via `gh`): browse issues and PRs with named filters, then
   launch a linked agent session from a work item — the session carries
@@ -210,8 +211,9 @@ pohunek session new --agent codex \
 
 ## CLI guide
 
-Every command accepts `--host <name>` (default `local`) and `--json` for
-machine-readable output. Session targets are `<session-id>` or
+Every command accepts `--host <name>` (default `local`), and nearly all of
+them `--json` for machine-readable output (the exceptions are `attach`,
+`daemon start`, and `prompt render`). Session targets are `<session-id>` or
 `<host>/<session-id>`.
 
 | Command | What it does |
@@ -288,14 +290,17 @@ attach_command = "$TERMINAL -e sh -c 'exec {bin} attach --host {host} {id}'"
 
 [providers.linear]
 token_key = "linear-token-ref"   # keyring entry name — never a token value
+endpoint = "https://api.linear.app/graphql"
+token_timeout_ms = 5000          # required: caps keyring token lookup
 
 [providers.github]
 gh_bin = "gh"
 ```
 
 Highlights: persistent right-pane tabs (`1 Detail · 2 Linear · 3 GitHub ·
-4 Worktrees · 5 Review`), `n` starts a session, `a` starts the assistant, `i`
-opens the Inbox, `b` cycles blocked agents, `/` searches provider lists,
+4 Worktrees · 5 Review`), `n` opens the Start-session modal, `a` the
+assistant modal, `i` the Inbox, `b` cycles blocked agents, `/` searches
+provider lists,
 `shift+?` shows the full keymap. All bindings are remappable via a
 `[keybindings]` table. Wayland-only on Linux v1.
 
