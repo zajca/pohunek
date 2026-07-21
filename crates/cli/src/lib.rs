@@ -46,9 +46,9 @@ pub fn command() -> Command {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Attach this terminal to a local session. Press Ctrl-] to detach.
+    /// Attach this terminal to a local or remote session. Press Ctrl-] to detach.
     Attach {
-        /// Session target: `session-id` or `local/session-id`.
+        /// Session target: `session-id` or `<host>/<session-id>`.
         target: Target,
     },
 

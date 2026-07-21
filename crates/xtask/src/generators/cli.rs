@@ -91,9 +91,9 @@ static COMMANDS: &[CommandDescriptor] = &[
     CommandDescriptor {
         id: "attach",
         title: "pohunek attach",
-        description: "Attach this terminal to a local session. Press Ctrl-] to detach.",
+        description: "Attach this terminal to a local or remote session. Press Ctrl-] to detach.",
         usage: "pohunek attach <target>",
-        arguments: "- `<target>`: Session id or label to attach to.",
+        arguments: "- `<target>`: Session target: `session-id` or `<host>/<session-id>`.",
         intents: &["help"],
         extra_body: "",
     },
