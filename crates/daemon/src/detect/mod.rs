@@ -1298,6 +1298,62 @@ mod tests {
     }
 
     #[test]
+    fn claude_manifest_maps_live_status_spinner_to_working() {
+        let started_at = instant();
+        let mut detector_config = super::DetectorConfig::claude();
+        detector_config.detection = config().detection;
+        let mut detector = Detector::new(8, 120, started_at, detector_config);
+
+        // Captured from a live Claude Code turn: the status spinner renders above
+        // the prompt box while the prompt box (`❯`) stays visible, so the screen
+        // must resolve to working, not prompt-box idle.
+        assert_eq!(
+            detector.feed(
+                started_at,
+                "\x1b[2J\x1b[H\u{273b} Noodling\u{2026} (12s \u{b7} \u{2193} 1.2k tokens)\r\n\u{2500}\u{2500}\u{2500}\u{2500}\r\n\u{276f} \r\n\u{2500}\u{2500}\u{2500}\u{2500}\r\n  auto mode on".as_bytes(),
+            ),
+            vec![transition(AgentActivity::Working, StateSource::Screen)]
+        );
+    }
+
+    #[test]
+    fn claude_manifest_finished_status_line_resolves_prompt_box_idle() {
+        let started_at = instant();
+        let mut detector_config = super::DetectorConfig::claude();
+        detector_config.detection = config().detection;
+        let mut detector = Detector::new(8, 120, started_at, detector_config);
+
+        // A completed turn renders "✻ Cogitated for 26s" (no ellipsis, no hint
+        // parenthesis) above the prompt box; that must not match the spinner rule.
+        assert_eq!(
+            detector.feed(
+                started_at,
+                "\x1b[2J\x1b[H\u{273b} Cogitated for 26s\r\n\u{2500}\u{2500}\u{2500}\u{2500}\r\n\u{276f} \r\n\u{2500}\u{2500}\u{2500}\u{2500}\r\n  auto mode on".as_bytes(),
+            ),
+            vec![transition(AgentActivity::Idle, StateSource::Screen)]
+        );
+    }
+
+    #[test]
+    fn claude_manifest_permission_dialog_outranks_stale_spinner_line() {
+        let started_at = instant();
+        let mut detector_config = super::DetectorConfig::claude();
+        detector_config.detection = config().detection;
+        let mut detector = Detector::new(10, 120, started_at, detector_config);
+
+        // A visible approval dialog must win even when a stale spinner line is
+        // still on screen: the spinner rule excludes dialog markers, so the
+        // bash permission prompt resolves blocked.
+        assert_eq!(
+            detector.feed(
+                started_at,
+                "\x1b[2J\x1b[H\u{2733} Running\u{2026} (5s \u{b7} hooks)\r\nBash command\r\nsleep 45\r\nDo you want to proceed?\r\n\u{276f} 1. Yes\r\n  2. No\r\nesc to cancel".as_bytes(),
+            ),
+            vec![transition(AgentActivity::Blocked, StateSource::Screen)]
+        );
+    }
+
+    #[test]
     fn generic_shell_manifest_blocked_outranks_working_within_one_screen() {
         let started_at = instant();
         let mut detector = Detector::new(3, 80, started_at, config());

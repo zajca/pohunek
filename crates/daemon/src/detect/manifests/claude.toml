@@ -15,6 +15,25 @@ priority = 1100
 region = "osc_title"
 regex = ['^[\x{2800}-\x{28FF}] ']
 
+# Live status spinner rendered above the prompt box while a turn runs, e.g.
+# "✻ Noodling… (12s · ↓ 1.2k tokens)" or "✻ Herding… (3s · thinking with high
+# effort)". The prompt box (`❯`) stays visible during work in current Claude
+# Code TUIs, so without this rule every screen render matches `live_prompt_box`
+# and the published activity flaps to idle between OSC title updates. Must
+# outrank `live_prompt_box` (950) and stay below `live_blocked_form` (980).
+# Dialog markers are excluded so a visible approval prompt keeps winning as
+# blocked even if a stale spinner line is still on screen.
+[[rules]]
+id = "live_status_spinner"
+state = "working"
+priority = 960
+region = "whole_recent"
+line_regex = ['^[·✢✳✶✻✽*] \S.*… \(']
+not = { any = [
+  { contains = ["do you want to proceed?"] },
+  { contains = ["esc to cancel"] },
+] }
+
 [[rules]]
 id = "live_blocked_form"
 state = "blocked"
