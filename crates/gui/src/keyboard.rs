@@ -1832,6 +1832,7 @@ mod tests {
             review: pohunek_gui_core::ReviewTabState::default(),
             last_agent_state: None,
             last_error: None,
+            supported_agents: Vec::new(),
         }
     }
 

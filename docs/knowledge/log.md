@@ -1,5 +1,15 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-07-21)
+
+- Documented that the native GUI `Start session` and Review "Dispatch as
+  session…" agent pickers now list the selected host's `supported_agents`
+  (seeded from `host.inspect`): the base kinds `shell`/`codex`/`claude` plus
+  every resolvable host agent profile (e.g. `claude-otel`), superseding the
+  0.7.4 note that the picker only supported the three built-ins. Falls back to
+  the base kinds when the host hasn't seeded `supported_agents` yet.
+- Cross-linked agent profiles from the GUI Session Launch section.
+
 ## 0.18.3
 
 - Documented native GUI keyboard list navigation and configurable

@@ -3,7 +3,7 @@
 //! This crate intentionally has no Iced dependency. The native view layer wraps
 //! these async helpers in Iced `Task` and `Subscription` values.
 
-// Rust guideline compliant 2026-07-05
+// Rust guideline compliant 2026-07-21
 #![forbid(unsafe_code)]
 
 pub mod assistant;
@@ -261,4 +261,11 @@ pub struct HostSnapshot {
     /// Empty when the host daemon does not implement notifications; seeding is
     /// non-fatal so a host without the notification surface still connects.
     pub notifications: Vec<NotificationRecord>,
+    /// Agent kinds this host can launch, seeded from `host.inspect`.
+    ///
+    /// Contains the compiled base kinds (`shell`, `codex`, `claude`) plus any
+    /// resolvable host agent profile. Falls back to just the base kinds when
+    /// `host.inspect` fails; seeding is non-fatal so an older daemon still
+    /// connects.
+    pub supported_agents: Vec<String>,
 }

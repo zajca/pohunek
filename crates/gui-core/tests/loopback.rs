@@ -749,6 +749,7 @@ fn preview_state_updates_without_launching_session() {
             projects: Vec::new(),
             project_error: None,
             notifications: Vec::new(),
+            supported_agents: Vec::new(),
         },
     });
     let preview = PromptPreview {

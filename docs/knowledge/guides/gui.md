@@ -225,10 +225,15 @@ the session id when unset. The name is cosmetic and never changes targeting.
 ## Session Launch
 
 The native `Start session` modal creates a session on the selected host and
-project through `session.new`. Its runtime picker sends the selected base-kind
-wire string as `agent`; supported built-in choices are `shell`, `codex`, and
-`claude`. `shell` starts the daemon host's configured default shell and uses the
-same plain-shell runtime path as `pohunek session new` without `--agent`.
+project through `session.new`. Its runtime picker sends the selected wire
+string as `agent`; the options come from the selected host's `supported_agents`
+(seeded from `host.inspect`), which lists the three compiled base kinds
+(`shell`, `codex`, `claude`) plus every resolvable host agent profile (e.g.
+`claude-otel`) — see [Agent Profiles](../concepts/agent-profiles.md). If the
+snapshot hasn't loaded `supported_agents` yet (or an older daemon doesn't
+answer `host.inspect`), the picker falls back to just the three base kinds.
+`shell` starts the daemon host's configured default shell and uses the same
+plain-shell runtime path as `pohunek session new` without `--agent`.
 
 ## Assistant Launch
 
@@ -509,8 +514,9 @@ session's or pull request's review later (see above) picks the comments back
 up.
 
 Dispatch: the tray's "Dispatch as session…" action opens a modal with an
-agent picker (`shell`/`codex`/`claude`, seeded with the source session's
-current agent and freely overridable), a rendered prompt preview (or the
+agent picker (the same host `supported_agents` list as the Start modal,
+including host agent profiles, seeded with the source session's current agent
+and freely overridable), a rendered prompt preview (or the
 render error, e.g. a missing `review.tmpl`), and — when the source session's
 agent is currently `working` — a warning that dispatching now may interrupt
 it. Confirming dispatch calls `session.new` with the picked agent, `cwd` set

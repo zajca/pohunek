@@ -1,6 +1,6 @@
 //! Native Iced shell for the pohunek control plane.
 
-// Rust guideline compliant 2026-07-06
+// Rust guideline compliant 2026-07-21
 #![forbid(unsafe_code)]
 
 mod attach;
@@ -277,6 +277,42 @@ impl PohunekApp {
             },
         ))
     }
+
+    /// A minimal app for view/state unit tests: no config, no hosts, and all
+    /// forms at their defaults. Callers populate `workspace`/`ui_state`/`start`
+    /// as their test needs.
+    #[cfg(test)]
+    pub(crate) fn test_default() -> Self {
+        Self {
+            workspace: Workspace::default(),
+            config: Err("test config is intentionally absent".to_owned()),
+            keymap: keyboard::KeyMap::default(),
+            hosts: Vec::new(),
+            ui_state: UiState::default(),
+            start: StartForm::default(),
+            assistant: AssistantForm::default(),
+            prompt_editor: text_editor::Content::new(),
+            assistant_editor: text_editor::Content::new(),
+            template_recipe: None,
+            modal: ModalView::None,
+            activity_filter: None,
+            notification_filter: NotificationFilter::default(),
+            inbox_scope: NotificationScope::default(),
+            inbox_view: InboxView::default(),
+            inbox_cursor: None,
+            inbox_details_expanded: false,
+            metadata_edit: MetadataEdit::default(),
+            rename_edit: String::new(),
+            project_edit: ProjectEdit::default(),
+            selected_action: None,
+            project_filters: BTreeMap::new(),
+            last_session_click: None,
+            state_dir: None,
+            status: None,
+            notified_intents: 0,
+            blocked_cycle_index: 0,
+        }
+    }
 }
 
 fn subscription(app: &PohunekApp) -> Subscription<Message> {
@@ -310,21 +346,10 @@ mod tests {
     use crate::config::{
         non_empty_config_path, validate_http_endpoint, RawGuiConfig, RawLinearProviderConfig,
     };
-    use crate::message::AgentChoice;
     use crate::selection::{
         selected_assistant_project, selected_project_identity, selected_project_reference,
     };
     use crate::view::inbox::{parse_rfc3339_utc_seconds, SECONDS_PER_DAY};
-
-    #[test]
-    fn start_agent_choices_include_shell_runtime() {
-        assert_eq!(
-            AgentChoice::ALL,
-            [AgentChoice::Shell, AgentChoice::Codex, AgentChoice::Claude]
-        );
-        assert_eq!(AgentChoice::Shell.as_str(), "shell");
-        assert_eq!(AgentChoice::from_wire("shell"), AgentChoice::Shell);
-    }
 
     #[test]
     fn notification_timestamp_parser_handles_epoch_and_leap_day() {
@@ -392,6 +417,7 @@ mod tests {
             review: pohunek_gui_core::ReviewTabState::default(),
             last_agent_state: None,
             last_error: None,
+            supported_agents: Vec::new(),
         };
         host.sessions.insert(session.id.0.clone(), session);
 
@@ -473,6 +499,7 @@ mod tests {
             review: pohunek_gui_core::ReviewTabState::default(),
             last_agent_state: None,
             last_error: None,
+            supported_agents: Vec::new(),
         };
         host.projects.insert(project.id.clone(), project.clone());
 
@@ -560,6 +587,7 @@ mod tests {
             review: pohunek_gui_core::ReviewTabState::default(),
             last_agent_state: None,
             last_error: None,
+            supported_agents: Vec::new(),
         };
         host.projects.insert(project.id.clone(), project.clone());
         host.sessions.insert(session.id.0.clone(), session.clone());

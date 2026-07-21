@@ -26,3 +26,8 @@ knowledge bundle, prompt, snapshot, logs, or documentation. See
 Because the assistant reads knowledge from files, the launch path must verify
 that the selected profile can read the materialized bundle and snapshot before
 starting the session.
+
+Profiles are not CLI-only: `host.inspect`'s `supported_agents` list includes
+every resolvable host profile alongside the base runtimes, and the native GUI's
+Start-session and Dispatch pickers list that same set (see
+[GUI: Session Launch](../guides/gui.md#session-launch)).

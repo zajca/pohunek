@@ -32,7 +32,7 @@ use crate::attach::{attach_task, spawn_notification, spawn_open_url, window_dime
 use crate::config::AppConfig;
 use crate::keyboard;
 use crate::message::{
-    AgentChoice, AssistantForm, DiscoveryResult, InboxView, ListDirection, Message, ModalView,
+    AssistantForm, DiscoveryResult, InboxView, ListDirection, Message, ModalView,
     NotificationAction, ResolvedTemplate, StartForm, TemplateRecipe, ASSISTANT_AUTO_AGENT_LABEL,
     BLANK_TEMPLATE_LABEL,
 };
@@ -320,7 +320,7 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         Message::TemplateResolved(result) => match result {
             Ok(resolved) => {
                 app.prompt_editor = text_editor::Content::with_text(&resolved.rendered);
-                app.start.agent = AgentChoice::from_wire(&resolved.recipe.agent);
+                app.start.agent.clone_from(&resolved.recipe.agent);
                 app.template_recipe = Some(resolved.recipe);
             }
             Err(err) => app.status = Some(err),
@@ -763,8 +763,7 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         },
         Message::DispatchAgentSelected(agent) => {
             if let Ok(host_id) = selected_host_id(app) {
-                app.workspace
-                    .set_review_dispatch_agent(&host_id, agent.as_str().to_owned());
+                app.workspace.set_review_dispatch_agent(&host_id, agent);
             }
         }
         Message::ConfirmReviewDispatch => match confirm_review_dispatch_task(app) {
@@ -1333,7 +1332,7 @@ fn create_session_task(app: &PohunekApp) -> Result<Task<Message>, String> {
         ),
     };
     let params = SessionNewParams {
-        agent: app.start.agent.as_str().to_owned(),
+        agent: app.start.agent.clone(),
         name: optional_field(&app.start.name),
         cwd: None,
         cols: terminal_size.cols,
@@ -2253,6 +2252,7 @@ mod tests {
             review: pohunek_gui_core::ReviewTabState::default(),
             last_agent_state: None,
             last_error: None,
+            supported_agents: Vec::new(),
         }
     }
 

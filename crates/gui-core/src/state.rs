@@ -422,6 +422,10 @@ pub struct HostView {
     pub notifications: BTreeMap<String, NotificationRecord>,
     pub last_agent_state: Option<AgentStateEvent>,
     pub last_error: Option<String>,
+    /// Agent kinds this host can launch, seeded from `host.inspect`.
+    ///
+    /// See [`crate::HostSnapshot::supported_agents`] for the fallback contract.
+    pub supported_agents: Vec<String>,
 }
 
 impl HostView {
@@ -438,6 +442,7 @@ impl HostView {
             notifications: BTreeMap::new(),
             last_agent_state: None,
             last_error: None,
+            supported_agents: Vec::new(),
         }
     }
 }
@@ -615,6 +620,7 @@ impl Workspace {
                         notifications,
                         last_agent_state: None,
                         last_error: snapshot.project_error,
+                        supported_agents: snapshot.supported_agents,
                     },
                 );
             }
@@ -2720,6 +2726,7 @@ mod tests {
                 projects: vec![project("project-a", "/repo/current")],
                 project_error: None,
                 notifications: Vec::new(),
+                supported_agents: Vec::new(),
             },
         });
         workspace.selection = Some(Selection::Project {
@@ -3858,6 +3865,7 @@ mod tests {
             projects: Vec::new(),
             project_error: None,
             notifications: Vec::new(),
+            supported_agents: Vec::new(),
         }
     }
 

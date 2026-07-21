@@ -9,7 +9,7 @@ use pohunek_gui_core::{providers, ProviderPanel, Toast};
 use protocol::ProviderKind;
 
 use crate::keyboard::{KeyBindingHelp, KeyContext};
-use crate::message::{AgentChoice, Message, ASSISTANT_AUTO_AGENT_LABEL, BLANK_TEMPLATE_LABEL};
+use crate::message::{Message, ASSISTANT_AUTO_AGENT_LABEL, BASE_AGENT_KINDS, BLANK_TEMPLATE_LABEL};
 use crate::selection::{available_actions, selected_assistant_project, selected_host_id};
 use crate::view::inbox::notification_age_label;
 use crate::view::provider::{
@@ -48,8 +48,8 @@ pub(crate) fn start_modal_content(app: &PohunekApp) -> Element<'_, Message> {
         row![
             text("Agent").size(14),
             pick_list(
-                AgentChoice::ALL,
-                Some(app.start.agent),
+                start_agent_options(app),
+                Some(app.start.agent.clone()),
                 Message::StartAgentSelected
             ),
             text("Template").size(14),
@@ -198,6 +198,49 @@ fn keymap_section(
         );
     }
     section.into()
+}
+
+/// A host's `supported_agents` (seeded from `host.inspect`), or the compiled
+/// base kinds when the host reported none (older daemon, or not seeded yet).
+fn agent_options_for_host(host: &pohunek_gui_core::HostView) -> Vec<String> {
+    if host.supported_agents.is_empty() {
+        BASE_AGENT_KINDS
+            .iter()
+            .map(|kind| (*kind).to_owned())
+            .collect()
+    } else {
+        host.supported_agents.clone()
+    }
+}
+
+/// Agent options for the Start modal picker: the selected host's
+/// `supported_agents` (falling back to `BASE_AGENT_KINDS` when the host isn't
+/// loaded yet or reported none), always including the currently selected
+/// value so `pick_list` can render it.
+fn start_agent_options(app: &PohunekApp) -> Vec<String> {
+    let options = selected_host_id(app)
+        .ok()
+        .and_then(|host_id| app.workspace.hosts.get(&host_id))
+        .map_or_else(
+            || {
+                BASE_AGENT_KINDS
+                    .iter()
+                    .map(|kind| (*kind).to_owned())
+                    .collect()
+            },
+            agent_options_for_host,
+        );
+    with_selected_agent(options, &app.start.agent)
+}
+
+/// Prepends `selected` to `options` when it is not already present, so the
+/// `pick_list` selection is always a valid option even for a value the host
+/// hasn't reported (e.g. a stale dispatch default from a removed profile).
+fn with_selected_agent(mut options: Vec<String>, selected: &str) -> Vec<String> {
+    if !options.iter().any(|option| option == selected) {
+        options.insert(0, selected.to_owned());
+    }
+    options
 }
 
 fn assistant_agent_options(app: &PohunekApp) -> Vec<String> {
@@ -430,9 +473,9 @@ fn open_in_browser_button(url: String) -> Element<'static, Message> {
 
 /// The Review tab's "Dispatch as session…" confirmation: the source
 /// session's working-agent warning (when applicable), an agent picker
-/// (defaults to the source session's own profile, reusing the Start modal's
-/// `AgentChoice` picker/pattern), the rendered prompt preview or its render
-/// error, and the confirm action.
+/// (defaults to the source session's own profile, listing the host's
+/// `supported_agents`), the rendered prompt preview or its render error, and
+/// the confirm action.
 pub(crate) fn dispatch_review_modal_content(app: &PohunekApp) -> Element<'_, Message> {
     let Ok(host_id) = selected_host_id(app) else {
         return dialog_card(
@@ -464,8 +507,8 @@ pub(crate) fn dispatch_review_modal_content(app: &PohunekApp) -> Element<'_, Mes
         row![
             text("Agent").size(13),
             pick_list(
-                AgentChoice::ALL,
-                Some(AgentChoice::from_wire(&dispatch.agent)),
+                with_selected_agent(agent_options_for_host(host), &dispatch.agent),
+                Some(dispatch.agent.clone()),
                 Message::DispatchAgentSelected,
             ),
         ]
@@ -503,4 +546,86 @@ pub(crate) fn toast_view(toast: &Toast) -> Element<'_, Message> {
     )))
     .padding(8)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use pohunek_gui_core::{
+        ConnState, HostId, HostView, PromptState, ProviderState, ReviewTabState, Selection,
+    };
+
+    use super::*;
+
+    fn test_host(supported_agents: Vec<String>) -> HostView {
+        HostView {
+            conn: ConnState::Connected,
+            health: None,
+            sessions: BTreeMap::new(),
+            projects: BTreeMap::new(),
+            project_details: BTreeMap::new(),
+            notifications: BTreeMap::new(),
+            prompt: PromptState::default(),
+            provider: ProviderState::default(),
+            review: ReviewTabState::default(),
+            last_agent_state: None,
+            last_error: None,
+            supported_agents,
+        }
+    }
+
+    /// A test app with `host` loaded as `host_id` and selected, so
+    /// `selected_host_id` resolves it.
+    fn test_app(host_id: HostId, host: HostView) -> PohunekApp {
+        let mut app = PohunekApp::test_default();
+        app.workspace.hosts.insert(host_id.clone(), host);
+        app.ui_state.selection = Some(Selection::Host { host_id });
+        app
+    }
+
+    #[test]
+    fn start_agent_options_lists_host_supported_agents() {
+        let host_id = HostId::new("local");
+        let host = test_host(vec![
+            "shell".to_owned(),
+            "codex".to_owned(),
+            "claude".to_owned(),
+            "claude-otel".to_owned(),
+        ]);
+        let app = test_app(host_id, host);
+
+        assert_eq!(
+            start_agent_options(&app),
+            vec!["shell", "codex", "claude", "claude-otel"]
+        );
+    }
+
+    #[test]
+    fn start_agent_options_falls_back_to_base_kinds_when_host_reports_none() {
+        let host_id = HostId::new("local");
+        let host = test_host(Vec::new());
+        let app = test_app(host_id, host);
+
+        assert_eq!(start_agent_options(&app), vec!["shell", "codex", "claude"]);
+    }
+
+    #[test]
+    fn start_agent_options_prepends_selected_value_when_host_omits_it() {
+        let host_id = HostId::new("local");
+        let host = test_host(vec!["shell".to_owned(), "codex".to_owned()]);
+        let mut app = test_app(host_id, host);
+        app.start.agent = "claude-otel".to_owned();
+
+        let options = start_agent_options(&app);
+        assert_eq!(options.first(), Some(&"claude-otel".to_owned()));
+        assert!(options.contains(&"codex".to_owned()));
+    }
+
+    #[test]
+    fn start_agent_options_falls_back_when_no_host_is_selected() {
+        let app = PohunekApp::test_default();
+
+        assert_eq!(start_agent_options(&app), vec!["shell", "codex", "claude"]);
+    }
 }

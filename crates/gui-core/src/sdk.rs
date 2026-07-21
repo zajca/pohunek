@@ -510,6 +510,22 @@ pub(crate) async fn load_host_snapshot_with_options(
         Err(err) => (Vec::new(), Some(format!("project.list failed: {err}"))),
     };
     let notifications = load_host_notifications(&mut client, &config.id).await;
+    let supported_agents = match call_client::<method::HostInspect>(&mut client, ()).await {
+        Ok(caps) => caps.supported_agents,
+        Err(err) => {
+            // Non-fatal: an older daemon may not answer `host.inspect` yet, or the
+            // call may otherwise fail. Fall back to the compiled base kinds so the
+            // agent picker still has something to show.
+            tracing::event!(
+                name: "gui.host_inspect.failed",
+                tracing::Level::WARN,
+                host_id = %config.id,
+                error = %err,
+                "host.inspect failed while seeding snapshot; falling back to base agent kinds"
+            );
+            vec!["shell".to_owned(), "codex".to_owned(), "claude".to_owned()]
+        }
+    };
     Ok(HostSnapshot {
         host_id: config.id.clone(),
         health,
@@ -517,6 +533,7 @@ pub(crate) async fn load_host_snapshot_with_options(
         projects: projects.0,
         project_error: combine_seed_errors(projects.1, notifications.1),
         notifications: notifications.0,
+        supported_agents,
     })
 }
 

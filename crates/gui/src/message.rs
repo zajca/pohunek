@@ -64,34 +64,12 @@ pub(crate) struct ResolvedTemplate {
     pub(crate) recipe: TemplateRecipe,
 }
 
-/// Runtime the operator can launch from the GUI. Backed by the protocol
-/// base-kind wire strings; rendered in a `pick_list` instead of being typed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AgentChoice {
-    Shell,
-    Codex,
-    Claude,
-}
-
-impl AgentChoice {
-    /// Selectable runtimes, in display order.
-    pub(crate) const ALL: [Self; 3] = [Self::Shell, Self::Codex, Self::Claude];
-
-    /// Wire string passed verbatim to `session new --agent`.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Shell => "shell",
-            Self::Codex => "codex",
-            Self::Claude => "claude",
-        }
-    }
-}
-
-impl std::fmt::Display for AgentChoice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+/// Compiled base agent kinds, used as the picker fallback when a host's
+/// `supported_agents` (seeded from `host.inspect`) is unavailable — e.g. the
+/// snapshot has not loaded yet, or an older daemon does not answer the
+/// method. Mirrors the daemon's own base-kind list
+/// (`crates/daemon/src/capabilities.rs`).
+pub(crate) const BASE_AGENT_KINDS: [&str; 3] = ["shell", "codex", "claude"];
 
 /// State for the intent-driven "Start session" panel. The project, repo, cwd and
 /// terminal size are derived from the selected project and config rather than
@@ -99,7 +77,9 @@ impl std::fmt::Display for AgentChoice {
 /// overrides are operator-supplied.
 #[derive(Debug, Clone)]
 pub(crate) struct StartForm {
-    pub(crate) agent: AgentChoice,
+    /// Wire agent string (`session new --agent`), one of the selected host's
+    /// `supported_agents` or a `BASE_AGENT_KINDS` fallback.
+    pub(crate) agent: String,
     /// Owner-set display name to stamp on the session, shared by the manual Start
     /// modal and the provider-launch modal (only one is open at a time). Empty
     /// means an unnamed session shown by its id.
@@ -115,7 +95,7 @@ pub(crate) struct StartForm {
 impl Default for StartForm {
     fn default() -> Self {
         Self {
-            agent: AgentChoice::Codex,
+            agent: "codex".to_owned(),
             name: String::new(),
             template: None,
             show_advanced: false,
@@ -146,17 +126,6 @@ impl Default for AssistantForm {
             base_branch: String::new(),
             no_snapshot: false,
             degraded: false,
-        }
-    }
-}
-
-impl AgentChoice {
-    /// Maps a wire agent string to a selectable choice, defaulting to Codex.
-    pub(crate) fn from_wire(value: &str) -> Self {
-        match value {
-            "shell" => Self::Shell,
-            "claude" => Self::Claude,
-            _ => Self::Codex,
         }
     }
 }
@@ -240,7 +209,7 @@ pub(crate) enum Message {
     OpenAssistantModal,
     OpenKeymapModal,
     CloseModal,
-    StartAgentSelected(AgentChoice),
+    StartAgentSelected(String),
     StartTemplateSelected(String),
     TemplateResolved(Result<ResolvedTemplate, String>),
     PromptEdited(text_editor::Action),
@@ -365,8 +334,8 @@ pub(crate) enum Message {
     /// Open the "Dispatch as session…" modal for the active review.
     OpenReviewDispatchModal,
     /// Pick the agent the dispatched session will run, overriding the source
-    /// session's own profile (reuses the Start modal's `AgentChoice` picker).
-    DispatchAgentSelected(AgentChoice),
+    /// session's own profile (reuses the Start modal's agent picker).
+    DispatchAgentSelected(String),
     /// Confirm dispatching the active review as a new same-worktree session.
     ConfirmReviewDispatch,
 }
