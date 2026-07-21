@@ -1,56 +1,393 @@
-# pohunek
+<p align="center">
+  <img src="assets/pohunek_github_hero.png" alt="pohunek — multihost management daemon for coding agents. I herd. They code." />
+</p>
 
-`pohunek` is a single-user control plane for durable coding-agent sessions across
-your own machines. A Rust daemon owns PTYs and agent processes; the Rust CLI
-controls it locally over a Unix socket and remotely over a NetBird/WireGuard
-address.
+<p align="center">
+  <a href="https://github.com/zajca/pohunek/actions/workflows/ci.yml"><img src="https://github.com/zajca/pohunek/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/zajca/pohunek/releases/latest"><img src="https://img.shields.io/github/v/release/zajca/pohunek" alt="Latest release" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license" /></a>
+  <img src="https://img.shields.io/badge/rust-1.96%2B-orange.svg" alt="MSRV 1.96" />
+</p>
 
-The project is pre-1.0. Wire shapes, config files, and on-disk metadata may
-change before a stable SDK contract is published.
+**pohunek** is a single-user control plane for durable coding-agent sessions
+across your own machines. A Rust daemon (`pohunekd`) owns the PTYs and agent
+processes on each host; the CLI (`pohunek`) drives it locally over a Unix
+socket and remotely over a NetBird/WireGuard mesh; a native desktop GUI
+(`pohunek-gui`) is an optional client on top of the same protocol.
+
+Start Codex or Claude Code on any of your machines, detach, walk away, and
+come back later — from any terminal, from the GUI, or from a keyboard
+launcher. The agents keep working; pohunek keeps track of what they are doing,
+where they are doing it, and when they need you.
+
+> A *pohunek* is the farmhand boy who drives the draft animals. He does not
+> plow himself — he keeps the team moving.
+
+> **Status: pre-1.0, experimental.** Wire shapes, config files, and on-disk
+> metadata may change freely between releases. Linux-first.
+
+## Features
+
+**Durable agent sessions**
+
+- The daemon owns every PTY, so sessions survive client detach and terminal
+  crashes — attach from any terminal with `pohunek attach`, detach with
+  `Ctrl-]`, reattach later. Multiple clients can attach to one session.
+- Codex and Claude Code are first-class agents (plus plain `shell`), with
+  per-host **agent profiles** that define the program, arguments, environment,
+  and input rules for custom runtimes (e.g. `claude-otel`).
+- **Live agent state detection** — `working` / `blocked` / `idle` — derived
+  from OSC terminal titles, screen-content pattern matching, and PTY activity.
+  Detection rules are TOML manifests, so new agents can be added without
+  recompiling.
+- **Native resume**: hooks capture the agent's own session id, so a stopped
+  session resumes the original conversation instead of replaying commands.
+- **Session fork** — branch a Claude Code conversation into a new session and
+  PTY without disturbing the original.
+- **Prompt injection done right**: `session input` and `--input` use per-agent
+  framing (bracketed paste, delayed submit) so multi-line prompts actually
+  submit into Ink/TUI agents instead of being half-swallowed.
+- Rename sessions, attach arbitrary `key=value` metadata, and inspect
+  everything as JSON.
+
+**Multi-host, no central server**
+
+- Every command takes `--host <name>`; session targets accept
+  `<host>/<session-id>`. The CLI talks **directly** to each host's daemon —
+  there is no coordinator, no SaaS, no state sync.
+- Remote transport is a TCP listener bound **only** to the host's
+  NetBird/WireGuard address, never `0.0.0.0`. Reachability and encryption come
+  from the mesh; local access is an owner-only Unix socket.
+- **Tokenless discovery**: `pohunek host discover` enumerates NetBird peers
+  and probes which of them run a reachable daemon; `host inspect` queries live
+  capabilities (supported agents, worktree support) straight from the daemon.
+
+**Projects and worktree isolation**
+
+- The daemon notices when a session starts inside a git repository and records
+  a lightweight **project** (keyed by the canonical git common dir, so a repo
+  and all its worktrees collapse into one project). No filesystem scanning.
+- Start a session with `--branch` and the daemon creates a
+  **worktree-per-session** off the base branch, so two agents never share a
+  working tree by accident. Worktree ownership is recorded and checked before
+  any reuse or cleanup.
+- Per-project **actions and prompt templates**: an in-repo `.pohunek/`
+  directory shadows host-level config, so `pohunek project action <ref> <name>`
+  resolves a full launch recipe (agent, base branch, branch rule, rendered
+  prompt) for launchers, the GUI, and scripts.
+- `pohunek session diff` renders a unified diff of a session's worktree
+  against its base — including untracked files — over the wire.
+
+**Durable notifications inbox**
+
+- Agent events (approval required, agent blocked, turn completed, session
+  finished, errors) become **durable notification records** with lifecycle
+  states (`unread → read → acknowledged → archived → deleted`).
+- Fed by installed Codex/Claude hooks *and* daemon-side state projection, with
+  source-priority dedupe, a debounce window that drops notifications the agent
+  resolves itself, and resolve-on-resume so stale "blocked" entries disappear
+  when the agent starts working again.
+- `pohunek notifications list|watch --all-hosts` fans out across every
+  reachable host client-side; per-kind and per-provider policy plus retention
+  pruning are daemon-enforced.
+
+**Native desktop GUI**
+
+- `pohunek-gui` (Iced, Wayland) is a keyboard-first control plane: hosts,
+  sessions, projects, worktrees, and live agent activity in one window. It
+  deliberately embeds **no terminal** — opening a session spawns your own
+  terminal via a configurable `attach_command`.
+- **Agents monitor** with working/blocked/idle counts, `b` cycles through
+  blocked agents; the **Inbox** modal is a cross-host triage view over durable
+  notifications and raises OS notifications only for records that need action.
+- **Linear and GitHub integration** (client-side: Linear GraphQL via keyring
+  token, GitHub via `gh`): browse issues and PRs with named filters, then
+  launch a linked agent session from a work item — the session carries
+  `link.*` metadata tying it back to the issue/PR.
+- **Review tab**: browse a session's worktree diff (or a PR diff), leave
+  inline comments, and dispatch the review as a *new agent session* running in
+  the same worktree, prompt rendered from a template.
+
+**Launcher and terminal UX**
+
+- `pohunek setup` installs rofi/sway launcher scripts, default config, prompt
+  templates, and an optional sway keybinding drop-in — start or switch to any
+  session in two keystrokes.
+- Optional **attach banner**: the attach client parses the agent's byte stream
+  into its own screen model and composites a one-row status banner that works
+  even under full-screen TUIs; `Ctrl-\` opens a session menu (kill, detach,
+  new session in the same worktree, fork, rename).
+- Attach auto-reconnects after a daemon restart when the session is resumable.
+
+**Built to be driven by agents, not just humans**
+
+- Every command has `--json`; errors are structured (`class`/`code`/`msg` plus
+  a recovery hint); `subscribe` streams typed events (session lifecycle, agent
+  state, notifications) over the same protocol.
+- **Universal assistant**: `pohunek assistant "how do I …"` launches a capable
+  agent session preloaded with an offline knowledge bundle about pohunek
+  itself and a redacted live snapshot of your hosts — self-hosted support for
+  setup, project configuration, updates, and debugging.
+- **SDKs**: a Rust client crate (`pohunek-client`) and TypeScript packages
+  (`@pohunek/protocol`, `@pohunek/sdk`, `@pohunek/relay`) speak the same
+  versioned newline-delimited JSON protocol; the relay tunnels it over
+  WebSocket for browsers. TS protocol types are generated from the Rust source
+  of truth.
+
+## How it works
+
+```text
+  CLI / GUI (local)                   CLI / GUI (remote)
+       |                                   |
+       | Unix socket                       | TCP over NetBird/WireGuard
+       | ($XDG_RUNTIME_DIR, mode 0600)     | (daemon binds ONLY to the 100.x iface)
+       v                                   v
+ +-----------------------------------------------------------+
+ |                    host daemon (pohunekd)                  |
+ |                                                            |
+ |  control protocol: newline-delimited JSON                  |
+ |  attach stream:    separate raw byte connection per PTY    |
+ |                                                            |
+ |  PTYs + agents | metadata | events + notifications | mesh  |
+ +-----------------------------------------------------------+
+       |
+   Codex / Claude Code running in daemon-owned PTYs
+```
+
+Each host is authoritative for its own sessions, projects, worktrees, and
+notifications. Control traffic is newline-delimited JSON; attaching to a
+session opens a **separate raw byte connection**, so JSON stays JSON and
+terminal bytes stay bytes.
+
+Durability is tiered and honest: detach and client restarts are free; a
+**daemon restart kills live PTYs** by design, but session metadata, worktrees,
+and native agent conversations survive and can be resumed.
 
 ## Install
 
-Download the component release archive for the binary you want to install, or
-build the three binaries from a checked-out repository:
+Each release publishes per-component archives for x86_64 Linux (glibc and
+MUSL): `pohunek-cli-*`, `pohunek-daemon-*`, and `pohunek-gui-*`. Every archive
+contains the binary, license, and the offline documentation bundle under
+`docs/offline/`.
+
+Download from [Releases](https://github.com/zajca/pohunek/releases), unpack,
+and put the binaries on your `PATH`.
+
+Or build from source (Rust 1.96+):
 
 ```bash
+git clone https://github.com/zajca/pohunek.git
+cd pohunek
 cargo build --release --locked --bin pohunek --bin pohunekd --bin pohunek-gui
 ```
 
-Each component archive includes one binary, the root README, MIT license, and
-the offline documentation bundle.
-
-## Quick Start
+## Quick start
 
 ```bash
-pohunek doctor --json
+# 1. Check the environment (binaries, socket paths, writable state dirs)
+pohunek doctor
+
+# 2. Start the host daemon in the background
 pohunek daemon start --detach
-pohunek health --json
-pohunek session new --agent codex
+pohunek health
+
+# 3. Install agent hooks (native session-id capture + notifications)
+pohunek integration install
+
+# 4. Start an agent session and attach to it
+pohunek session new --agent claude --name "fix-login-bug"
 pohunek session list
-pohunek session attach <session-id>
+pohunek attach <session-id>        # Ctrl-] detaches, the agent keeps running
 ```
 
-Use `pohunek project add`, `pohunek project list`, and `pohunek project actions`
-to drive repository-aware launcher flows.
-Use `pohunek notifications list` and `pohunek notifications watch` to inspect
-the durable agent inbox.
+For an isolated feature branch, let the daemon create a dedicated worktree:
 
-## Trust Boundary
+```bash
+pohunek session new --agent codex \
+  --repo ~/Code/myapp --branch feat/retry-logic --base-branch main \
+  --input "Add retry logic to the API client, then run the tests."
+```
 
-`pohunek` is designed for one operator on machines they control. Local access is
-guarded by owner-only Unix socket and state-file permissions. Remote access is
-expected to be restricted by the user's NetBird/WireGuard private network.
+## CLI guide
 
-It is not a multi-user authorization system, hosted control plane, or shared
-tenant service.
+Every command accepts `--host <name>` (default `local`) and `--json` for
+machine-readable output. Session targets are `<session-id>` or
+`<host>/<session-id>`.
 
-## Documentation
+| Command | What it does |
+|---|---|
+| `pohunek doctor` | Environment health: binaries, socket, state dirs, NetBird, agents. |
+| `pohunek daemon start [--detach]` | Run the host daemon (foreground or background). |
+| `pohunek health` / `status` | Daemon liveness, build, and protocol version. |
+| `pohunek session new` | Start a session: `--agent`, `--name`, `--project`/`--repo`, `--branch`, `--base-branch`, `--cwd`, `--input`, `--meta k=v`. |
+| `pohunek session list` | List sessions; `--filter state=running --filter agent=codex` (ANDed), `-q` for ids only. |
+| `pohunek session inspect <target>` | Full session record: state, activity, cwd, project, branch, worktree, resume binding. |
+| `pohunek attach <target>` | Attach the current terminal; `Ctrl-]` detaches. |
+| `pohunek session input <target> <text>` | Inject a prompt with agent-correct framing. |
+| `pohunek session fork <target>` | Fork an agent conversation into a new session (Claude Code). |
+| `pohunek session diff <target> [--base <ref>]` | Unified diff of the session's worktree vs its base. |
+| `pohunek session rename / stop / rm` | Rename, stop, or evict a session. |
+| `pohunek project add / list / show / rename / rm` | Manage git-repo-aware project records. |
+| `pohunek project actions / action / prompt` | Resolve per-project launch recipes and prompt templates. |
+| `pohunek host discover / list / inspect` | Find NetBird peers running daemons and query live capabilities. |
+| `pohunek notifications list / watch` | Inspect or stream the durable inbox; `--all-hosts` fans out. |
+| `pohunek notifications read / ack / archive / delete` | Drive one record's lifecycle (`host/id` targets a specific host). |
+| `pohunek notifications policy / retention` | Per-kind/provider policy, retention pruning (`--dry-run` / `--apply`). |
+| `pohunek integration install` | Install Codex/Claude hooks for resume capture and notifications. |
+| `pohunek setup [scripts\|config\|sway]` | Install launcher scripts, default config + prompt templates, sway keybindings. |
+| `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + live snapshot. |
+| `pohunek prompt render / link` | Render provider prompt templates and work-item link metadata (used by launchers). |
 
-In release archives, the packaged offline docs live under `docs/offline/`.
-In a source checkout, start with:
+### Working across hosts
 
-- [Documentation index](docs/README.md)
-- [Architecture](docs/architecture.md)
-- [Roadmap](docs/ROADMAP.md)
-- [Offline knowledge source](docs/knowledge/)
+```bash
+pohunek host discover                          # which NetBird peers run a daemon?
+pohunek host inspect buildbox --json           # agents/worktree capabilities, live
+
+pohunek session new --host buildbox --project myapp --agent codex \
+  --branch feat/parser --input "Fix the parser fuzz failures."
+
+pohunek session list --host buildbox
+pohunek attach buildbox/s-3                    # raw PTY over the mesh
+
+pohunek notifications watch --all-hosts        # one triage stream for every machine
+```
+
+Remote session starts ask for confirmation (skip with `--yes`); project
+references resolve on the *target* host, so no filesystem path ever crosses
+the wire.
+
+### Notifications triage
+
+```bash
+pohunek notifications list --unread
+pohunek notifications ack buildbox/n-42
+pohunek notifications policy set --provider claude --kind turn_completed --enabled
+pohunek notifications retention prune --status archived --before 2026-06-01T00:00:00Z --apply
+```
+
+### Assistant
+
+```bash
+pohunek assistant "why does attach fail on my laptop?"
+pohunek assistant setup                # steer toward host setup
+pohunek assistant debug --host buildbox --no-snapshot
+```
+
+The assistant is an ordinary agent session — the same PTY, attach, and
+notification machinery — launched with a materialized offline knowledge
+bundle and a redacted snapshot of live state. No secrets enter the prompt.
+
+## GUI
+
+`pohunek-gui` reads `~/.config/pohunek/gui.toml`:
+
+```toml
+pohunek_bin = "/usr/local/bin/pohunek"
+attach_command = "$TERMINAL -e sh -c 'exec {bin} attach --host {host} {id}'"
+
+[providers.linear]
+token_key = "linear-token-ref"   # keyring entry name — never a token value
+
+[providers.github]
+gh_bin = "gh"
+```
+
+Highlights: persistent right-pane tabs (`1 Detail · 2 Linear · 3 GitHub ·
+4 Worktrees · 5 Review`), `n` starts a session, `a` starts the assistant, `i`
+opens the Inbox, `b` cycles blocked agents, `/` searches provider lists,
+`shift+?` shows the full keymap. All bindings are remappable via a
+`[keybindings]` table. Wayland-only on Linux v1.
+
+## Trust boundary
+
+pohunek is built for **one operator on machines they own**:
+
+- Local access control is owner-only socket and file permissions.
+- Remote access control is your NetBird/WireGuard network and its policies;
+  the daemon never binds a public interface.
+- There is no multi-user auth, no hosted control plane, and no tenant model —
+  by design, not omission.
+- Secrets stay out of structured state: metadata, events, notifications,
+  prompts, and logs are secret-free; provider tokens live in the OS keyring or
+  provider CLIs (`gh`). Raw terminal scrollback is the one honest exception —
+  it is stored owner-private.
+
+## Development
+
+The workspace is a Cargo monorepo (edition 2021, MSRV 1.96) plus a Bun
+workspace in `web/` for the TypeScript packages.
+
+| Crate | Role |
+|-------|------|
+| `crates/protocol` | Wire contract: envelopes, methods, events, version negotiation. |
+| `crates/client` | Rust SDK: typed errors, transports, attach helpers. |
+| `crates/daemon` | `pohunekd`: PTY ownership, session registry, detection, notifications. |
+| `crates/cli` | `pohunek`: every command over the control protocol. |
+| `crates/gui-core` | Headless GUI state + SDK bridge (no Iced; fully unit-testable). |
+| `crates/gui` | Native Iced shell wrapping `gui-core`. |
+| `crates/prompt` | Shared prompt rendering + `link.*` metadata schema (CLI, GUI, scripts). |
+| `crates/knowledge` | Knowledge-bundle primitives for the assistant and offline docs. |
+| `crates/terminal` | VT screen tracking and attach compositing. |
+| `crates/netbird` | NetBird status parsing, host resolution, bind validation. |
+| `crates/paths` / `crates/hostcheck` | XDG/socket contract; host environment probes. |
+| `crates/xtask` | Workspace automation: docs build/check, TS type generation. |
+| `web/` | `@pohunek/protocol` (generated types), `@pohunek/sdk`, `@pohunek/relay`. |
+
+Read **[AGENTS.md](AGENTS.md)** first — it is the canonical contributor guide.
+Authoritative design lives in [docs/architecture.md](docs/architecture.md);
+the protocol contract in [docs/public-api.md](docs/public-api.md).
+
+### Gates
+
+CI treats warnings as errors. Run the full set before calling anything done:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features
+cargo test --workspace --all-features
+cargo build --workspace --release
+cargo xtask docs check          # knowledge bundle: schema/drift/secrets/runbooks
+```
+
+Web workspace:
+
+```bash
+cd web
+bun install --frozen-lockfile
+bun run typecheck && bun run lint && bun test
+```
+
+A protocol change is not done until the generated TypeScript types match:
+
+```bash
+cargo xtask ts generate   # regenerate web/shared/src/generated/**
+cargo xtask ts check      # CI gate
+```
+
+### Conventions that matter here
+
+- **Rust guidelines are mandatory.** The Microsoft Pragmatic Rust Guidelines
+  are vendored at `.agents/rust-guidelines/`; read the relevant files before
+  touching any `.rs` file (`SKILL.md` is the index).
+- **Typed errors** (`thiserror`) per crate; no bare catch-alls. Library crates
+  `#![forbid(unsafe_code)]`.
+- **Config fails fast** — required values are validated at load; no silent
+  defaults. No hardcoded magic values.
+- **Secrets never enter code, logs, errors, or agent context.** Keyring
+  references only; `gh` output is redacted before it can reach an error.
+- **Protocol ripples**: touching `crates/protocol` means updating `client`,
+  `daemon`, `cli`, `gui-core`, the generated TS types, `docs/public-api.md`,
+  and the `docs/knowledge/` bundle in the same change.
+- **Tests for all new logic**; the protocol and state machines have rich
+  suites — extend them.
+
+### Release
+
+`scripts/release` bumps the workspace version, tags `vX.Y.Z`, and pushes; the
+Release workflow re-runs the gates on the tag, then builds and publishes the
+glibc and MUSL x86_64 component archives with the offline docs bundled in.
+
+## License
+
+[MIT](LICENSE)
