@@ -3542,17 +3542,16 @@ async fn procwatch_skips_agents_owned_by_another_daemon_or_session() {
     assert_eq!(skipped.active_agent, None, "foreign daemon must be skipped");
     assert_eq!(skipped.active_agent_pid, None);
     assert_eq!(skipped.cwd, root_cwd, "cwd focus must stay on the root");
-    {
-        let sessions = registry.inner.sessions.lock().await;
-        assert!(
-            sessions
-                .get(&created.id)
-                .expect("session entry")
-                .observed_agents
-                .is_empty(),
-            "a foreign-owned process must not become an observed agent"
-        );
-    }
+    let sessions = registry.inner.sessions.lock().await;
+    assert!(
+        sessions
+            .get(&created.id)
+            .expect("session entry")
+            .observed_agents
+            .is_empty(),
+        "a foreign-owned process must not become an observed agent"
+    );
+    drop(sessions);
 
     // This daemon, but another session's agent: also skipped.
     inspector.set_ownership_markers(
