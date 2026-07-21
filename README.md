@@ -12,11 +12,17 @@
 **pohunek** is a single-user control plane for durable coding-agent sessions
 across your own machines. A Rust daemon (`pohunekd`) owns the PTYs and agent
 processes on each host; the CLI (`pohunek`) drives it locally over a Unix
-socket and remotely over a NetBird/WireGuard mesh; a native desktop GUI
-(`pohunek-gui`) is an optional client on top of the same protocol.
+socket and remotely over a NetBird/WireGuard mesh.
+
+**The GUI is optional.** The daemon and its protocol are the product; every
+client — the CLI, the bundled desktop GUI (`pohunek-gui`), your own launcher —
+sits on top of the same versioned protocol. `pohunek-gui` ships as a reference
+client, not a requirement: pohunek is fully usable from the CLI alone, and the
+Rust/TypeScript SDKs exist precisely so you can **build your own GUI or client**
+tailored to how you work. See [SDKs and building your own client](#sdks-and-building-your-own-client).
 
 Start Codex or Claude Code on any of your machines, detach, walk away, and
-come back later — from any terminal, from the GUI, or from a keyboard
+come back later — from any terminal, from a GUI, or from a keyboard
 launcher. The agents keep working; pohunek keeps track of what they are doing,
 where they are doing it, and when they need you.
 
@@ -91,7 +97,7 @@ where they are doing it, and when they need you.
   reachable host client-side; per-kind and per-provider policy plus retention
   pruning are daemon-enforced.
 
-**Native desktop GUI**
+**Native desktop GUI (optional reference client)**
 
 - `pohunek-gui` (Iced, Wayland) is a keyboard-first control plane: hosts,
   sessions, projects, worktrees, and live agent activity in one window. It
@@ -129,11 +135,14 @@ where they are doing it, and when they need you.
   agent session preloaded with an offline knowledge bundle about pohunek
   itself and a redacted live snapshot of your hosts — self-hosted support for
   setup, project configuration, updates, and debugging.
-- **SDKs**: a Rust client crate (`pohunek-client`) and TypeScript packages
-  (`@pohunek/protocol`, `@pohunek/sdk`, `@pohunek/relay`) speak the same
-  versioned newline-delimited JSON protocol; the relay tunnels it over
-  WebSocket for browsers. TS protocol types are generated from the Rust source
-  of truth.
+- **SDKs — build your own GUI or client**: a Rust client crate
+  (`pohunek-client`) and TypeScript packages (`@pohunek/protocol`,
+  `@pohunek/sdk`, `@pohunek/relay`) speak the same versioned newline-delimited
+  JSON protocol the bundled GUI uses — nothing is private to `pohunek-gui`. The
+  relay tunnels the protocol over WebSocket so a browser or Electron app can
+  drive the daemon too. TS protocol types are generated from the Rust source of
+  truth. If the reference GUI does not fit your workflow, wire up your own
+  control plane on these SDKs instead of forking it.
 
 ## How it works
 
@@ -303,6 +312,118 @@ assistant modal, `i` the Inbox, `b` cycles blocked agents, `/` searches
 provider lists,
 `shift+?` shows the full keymap. All bindings are remappable via a
 `[keybindings]` table. Wayland-only on Linux v1.
+
+The bundled GUI is a **reference client**, not the only supported way in. It
+uses the same public protocol and SDKs documented below — so if it does not fit
+your workflow, the next section is your starting point for building your own.
+
+## SDKs and building your own client
+
+pohunek's real interface is its **protocol**, not any one client. `pohunek-gui`
+is just one consumer of a versioned, newline-delimited JSON protocol that every
+client speaks — and the same protocol and SDKs are available to you. You are
+encouraged to **build your own GUI, TUI, launcher, or automation** on top of
+them rather than being tied to the bundled app.
+
+Nothing the GUI does is private to the GUI: it drives hosts, sessions,
+projects, worktrees, notifications, diffs, and `subscribe` event streams
+entirely through this surface.
+
+- **Rust** — the `pohunek-client` crate: a typed `Client`, transports for local
+  Unix sockets and NetBird/WireGuard TCP, raw attach helpers, typed
+  `ClientError`s, and `subscribe` streams. It re-exports the `protocol` crate,
+  the source of truth for every request, response, and event type.
+- **TypeScript** — `@pohunek/protocol` (types generated from the Rust
+  protocol), `@pohunek/sdk` (a client over those types), and `@pohunek/relay`
+  (a WebSocket relay so browser and Electron front-ends can reach the daemon
+  through the mesh).
+- **Contract** — the wire surface is documented in
+  [`docs/public-api.md`](docs/public-api.md); TS types are regenerated from
+  Rust so the two SDKs never drift. The protocol is versioned, but pre-1.0 it
+  may still change between releases (see the status note above).
+- **Or skip a client entirely** — every CLI command supports `--json` and
+  `subscribe` streams typed events, so a shell script is a legitimate way to
+  drive pohunek.
+
+Connecting and listing sessions is the same call in both SDKs:
+
+```rust
+// Rust — `pohunek-client`
+use pohunek_client::{protocol::method::SessionList, Client};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let sock = format!("{}/pohunek/daemon.sock", std::env::var("XDG_RUNTIME_DIR")?);
+    // Local daemon over its owner-only Unix socket.
+    let mut client = Client::connect_local(&sock).await?;
+    // ...or a remote host over the NetBird/WireGuard mesh:
+    // let mut client = Client::connect("workstation", &sock).await?;
+
+    let sessions = client.call::<SessionList>(Default::default()).await?;
+    for s in sessions {
+        println!("{} {:?} {:?}", s.id.0, s.state, s.activity);
+    }
+    Ok(())
+}
+```
+
+```ts
+// TypeScript — `@pohunek/sdk`
+import { Client } from "@pohunek/sdk";
+
+const sock = `${process.env.XDG_RUNTIME_DIR}/pohunek/daemon.sock`;
+const client = await Client.connectLocal(sock);
+// ...or reach the daemon from a browser through the relay:
+// const client = await Client.connectWs("ws://<relay-host>:<port>", "workstation");
+
+const sessions = await client.call("session.list", {});
+for (const s of sessions) {
+  console.log(s.id, s.state, s.activity);
+}
+await client.close();
+```
+
+Or subscribe to the same live event stream the CLI and GUI consume — session
+lifecycle, agent state, and notifications, decoded into typed events:
+
+```rust
+// Rust — subscribe consumes the client and hands back an event stream.
+use pohunek_client::{next_request_id, protocol::{method, Request}, Client};
+use serde_json::Value;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let sock = format!("{}/pohunek/daemon.sock", std::env::var("XDG_RUNTIME_DIR")?);
+    let client = Client::connect_local(&sock).await?;
+
+    let request = Request::new(next_request_id(method::SUBSCRIBE), method::SUBSCRIBE, Value::Null);
+    let mut events = client.subscribe(&request).await?;
+    // Runs until the daemon closes the stream.
+    while let Some(ev) = events.next_event().await? {
+        // `event` is the name (e.g. "agent_state"); `payload` is the flattened JSON body.
+        println!("{}: {}", ev.event, ev.payload);
+    }
+    Ok(())
+}
+```
+
+```ts
+// TypeScript — same event stream.
+import { Client, nextRequestId } from "@pohunek/sdk";
+import { PROTOCOL_VERSION } from "@pohunek/protocol";
+
+const client = await Client.connectLocal(sock);
+const subscription = await client.subscribe({
+  v: PROTOCOL_VERSION,
+  id: nextRequestId("subscribe"),
+  method: "subscribe",
+  params: null,
+});
+
+for (let ev = await subscription.nextEvent(); ev !== null; ev = await subscription.nextEvent()) {
+  console.log(ev.event, ev);
+}
+```
 
 ## Trust boundary
 
