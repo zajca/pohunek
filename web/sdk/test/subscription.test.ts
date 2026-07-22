@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { PROTOCOL_VERSION, type ProtocolEvent } from "@pohunek/protocol";
-import { Client, ClientError, type CatchAllEvent, type Request } from "@pohunek/sdk";
+import {
+  Client,
+  ClientError,
+  connectLocal,
+  connectTcp,
+  type CatchAllEvent,
+  type Request,
+} from "@pohunek/sdk";
 import {
   errResponseLine,
   minimalSessionInfo,
@@ -177,10 +184,10 @@ async function expectClientError(promise: Promise<unknown>): Promise<ClientError
 
 async function connectClient(daemon: Awaited<ReturnType<typeof startUnixDaemon>>): Promise<Client> {
   if (daemon.endpoint.kind === "unix") {
-    return Client.connectLocal(daemon.endpoint.socketPath);
+    return connectLocal(daemon.endpoint.socketPath);
   }
   if (daemon.endpoint.kind === "memory") {
     return Client.connectTransport(daemon.endpoint.transport);
   }
-  return Client.connectTcp("build-box", { host: daemon.endpoint.host, port: daemon.endpoint.port });
+  return connectTcp("build-box", { host: daemon.endpoint.host, port: daemon.endpoint.port });
 }

@@ -7,6 +7,7 @@
 
 # Local runtime/state produced by the daemon during manual testing.
 /logs
+web/logs/
 
 # Local tool/runtime caches (per-machine; not shared)
 /.cache
@@ -15,6 +16,7 @@
 node_modules/
 web/node_modules/
 web/**/dist/
+web/frontend/test-results/
 web/**/*.tsbuildinfo
 
 # ts-rs default export directory; committed bindings live under web/shared.

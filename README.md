@@ -137,12 +137,13 @@ where they are doing it, and when they need you.
   setup, project configuration, updates, and debugging.
 - **SDKs — build your own GUI or client**: a Rust client crate
   (`pohunek-client`) and TypeScript packages (`@pohunek/protocol`,
-  `@pohunek/sdk`, `@pohunek/relay`) speak the same versioned newline-delimited
-  JSON protocol the bundled GUI uses — nothing is private to `pohunek-gui`. The
-  relay tunnels the protocol over WebSocket so a browser or Electron app can
-  drive the daemon too. TS protocol types are generated from the Rust source of
-  truth. If the reference GUI does not fit your workflow, wire up your own
-  control plane on these SDKs instead of forking it.
+  `@pohunek/sdk`, `@pohunek/backend`, `@pohunek/client-core`,
+  `@pohunek/frontend`, and `@pohunek/testkit`) speak the same versioned
+  newline-delimited JSON protocol the bundled GUI uses — nothing is private to
+  `pohunek-gui`. Browsers use the node-free `@pohunek/sdk/browser` entry through
+  the backend's WebSocket tunnels. TS protocol types are generated from the Rust
+  source of truth. If the bundled clients do not fit your workflow, wire up your
+  own control plane on these SDKs instead of forking one.
 
 ## How it works
 
@@ -317,6 +318,39 @@ The bundled GUI is a **reference client**, not the only supported way in. It
 uses the same public protocol and SDKs documented below — so if it does not fit
 your workflow, the next section is your starting point for building your own.
 
+## Web control center
+
+The optional web control center serves one Svelte SPA for host and session
+status, session lifecycle, live notifications, and in-browser terminal attach.
+`@pohunek/backend` discovers daemons through its local `pohunekd` and exposes
+the existing protocol as transparent WebSocket tunnels; it holds no
+authoritative session state, and the CLI and native GUI remain independent.
+
+The workspace is a persistent session-first shell. Its rail groups sessions by
+project, promotes blocked work into an Attention section, searches and filters
+across every host, and keeps compact host connectivity visible without making
+hosts the primary navigation. Selecting a running session attaches its terminal
+in the main pane while the rail remains available. Session metadata and stop
+actions live in an inspector drawer; new-session and Inbox flows are overlays,
+and opening a session notification marks it read and selects its terminal.
+
+Keyboard controls are available outside form fields and terminals: `Ctrl+K`
+opens the command palette, `Ctrl+B` toggles the session rail, `n` starts a
+session, `i` opens the Inbox, `b` cycles blocked sessions, `/` focuses session
+search, and `j`/`k` or the arrow keys move focus through the rail before
+`Enter` opens the focused session. `Esc` closes the active overlay. Unmodified
+shortcuts never intercept input inside the embedded terminal.
+
+For local UI development with two fixture daemons, run `bun run dev` from
+`web/`; no Rust daemon or NetBird setup is required. Bun remains the workspace
+runtime, while the development orchestrator requires `node` on `PATH` to run
+Vite's WebSocket proxy in a compatible Node child process. Set
+`POHUNEK_NODE_BIN` only when the Node executable has a nonstandard path. A
+deployed backend binds only to a NetBird address (loopback requires the explicit
+development flag; wildcard binds are rejected). The supplied systemd user unit
+and its environment file instructions are in
+`web/backend/systemd/pohunek-backend.service`.
+
 ## SDKs and building your own client
 
 pohunek's real interface is its **protocol**, not any one client. `pohunek-gui`
@@ -333,10 +367,12 @@ entirely through this surface.
   Unix sockets and NetBird/WireGuard TCP, raw attach helpers, typed
   `ClientError`s, and `subscribe` streams. It re-exports the `protocol` crate,
   the source of truth for every request, response, and event type.
-- **TypeScript** — `@pohunek/protocol` (types generated from the Rust
-  protocol), `@pohunek/sdk` (a client over those types), and `@pohunek/relay`
-  (a WebSocket relay so browser and Electron front-ends can reach the daemon
-  through the mesh).
+- **TypeScript** — `@pohunek/protocol` (types generated from the Rust protocol),
+  `@pohunek/sdk` (Bun/Node plus shared runtime), its browser-safe
+  `@pohunek/sdk/browser` entry, `@pohunek/backend` (host discovery, static SPA,
+  and transparent WebSocket tunnels), `@pohunek/client-core` (headless
+  multi-host state), `@pohunek/frontend` (the Svelte SPA), and
+  `@pohunek/testkit` (the stateful fixture daemon used by tests and dev mode).
 - **Contract** — the wire surface is documented in
   [`docs/public-api.md`](docs/public-api.md); TS types are regenerated from
   Rust so the two SDKs never drift. The protocol is versioned, but pre-1.0 it
@@ -369,18 +405,24 @@ async fn main() -> anyhow::Result<()> {
 
 ```ts
 // TypeScript — `@pohunek/sdk`
-import { Client } from "@pohunek/sdk";
+import { connectLocal } from "@pohunek/sdk";
 
 const sock = `${process.env.XDG_RUNTIME_DIR}/pohunek/daemon.sock`;
-const client = await Client.connectLocal(sock);
-// ...or reach the daemon from a browser through the relay:
-// const client = await Client.connectWs("ws://<relay-host>:<port>", "workstation");
+const client = await connectLocal(sock);
 
 const sessions = await client.call("session.list", {});
 for (const s of sessions) {
   console.log(s.id, s.state, s.activity);
 }
 await client.close();
+```
+
+Browsers use the node-free entry and reach a daemon through the backend origin:
+
+```ts
+import { Client } from "@pohunek/sdk/browser";
+
+const client = await Client.connectWs(window.location.origin, "workstation");
 ```
 
 Or subscribe to the same live event stream the CLI and GUI consume — session
@@ -409,10 +451,10 @@ async fn main() -> anyhow::Result<()> {
 
 ```ts
 // TypeScript — same event stream.
-import { Client, nextRequestId } from "@pohunek/sdk";
+import { connectLocal, nextRequestId } from "@pohunek/sdk";
 import { PROTOCOL_VERSION } from "@pohunek/protocol";
 
-const client = await Client.connectLocal(sock);
+const client = await connectLocal(sock);
 const subscription = await client.subscribe({
   v: PROTOCOL_VERSION,
   id: nextRequestId("subscribe"),
@@ -458,7 +500,7 @@ workspace in `web/` for the TypeScript packages.
 | `crates/netbird` | NetBird status parsing, host resolution, bind validation. |
 | `crates/paths` / `crates/hostcheck` | XDG/socket contract; host environment probes. |
 | `crates/xtask` | Workspace automation: docs build/check, TS type generation. |
-| `web/` | `@pohunek/protocol` (generated types), `@pohunek/sdk`, `@pohunek/relay`. |
+| `web/` | `@pohunek/protocol`, `@pohunek/sdk`, `@pohunek/backend`, `@pohunek/client-core`, `@pohunek/frontend`, `@pohunek/testkit`. |
 
 Read **[AGENTS.md](AGENTS.md)** first — it is the canonical contributor guide.
 Authoritative design lives in [docs/architecture.md](docs/architecture.md);

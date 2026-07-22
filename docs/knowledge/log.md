@@ -2,6 +2,8 @@
 
 ## Unreleased (2026-07-21)
 
+- Documented the M1 web control center, browser-safe TypeScript SDK entry,
+  backend deployment boundary, and fixture-backed development stack.
 - Documented that the native GUI `Start session` and Review "Dispatch as
   session…" agent pickers now list the selected host's `supported_agents`
   (seeded from `host.inspect`): the base kinds `shell`/`codex`/`claude` plus

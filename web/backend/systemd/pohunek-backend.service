@@ -1,0 +1,20 @@
+# Install this user unit under ~/.config/systemd/user/ and keep the referenced
+# environment file mode 0600. The environment file must provide the NetBird
+# bind host and backend port; optional backend settings are documented by
+# src/config.ts.
+[Unit]
+Description=Pohunek web control center backend
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/pohunek/backend.env
+# Adjust this installed source path if Pohunek is deployed elsewhere. Keeping
+# Bun on PATH supports the standard ~/.bun/bin installation for a user unit.
+Environment=PATH=%h/.bun/bin:/usr/local/bin:/usr/bin
+ExecStart=/usr/bin/env bun run %h/.local/share/pohunek/web/backend/src/main.ts
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

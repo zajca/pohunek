@@ -6,11 +6,16 @@ export type DaemonTarget =
   | { readonly kind: "unix"; readonly socketPath: string }
   | { readonly kind: "tcp"; readonly host: string; readonly port: number };
 
+export type DaemonTargetSource =
+  | ReadonlyMap<string, DaemonTarget>
+  | ((host: string) => DaemonTarget | undefined);
+
 export interface StartRelayOptions {
   readonly bindHost: string;
   readonly port: number;
-  readonly targets: ReadonlyMap<string, DaemonTarget>;
+  readonly targets: DaemonTargetSource;
   readonly allowLoopbackBind?: boolean;
+  readonly httpHandler?: (request: Request) => Response | Promise<Response>;
 }
 
 export interface RelayHandle {
@@ -110,18 +115,18 @@ export function startRelay(options: StartRelayOptions): Promise<RelayHandle> {
       options.allowLoopbackBind === undefined ? {} : { allowLoopback: options.allowLoopbackBind },
     );
     const bun = bunRuntime();
-    const targets = new Map(options.targets);
+    const targetForHost = targetResolver(options.targets);
 
     const server = bun.serve<RelayWebSocketData>({
       hostname: options.bindHost,
       port: options.port,
-      fetch(request, upgradeServer): Response | undefined {
+      fetch(request, upgradeServer): Response | undefined | Promise<Response | undefined> {
         const route = parseRelayRoute(request.url);
         if (route === undefined) {
-          return RESPONSE_NOT_FOUND;
+          return options.httpHandler?.(request) ?? RESPONSE_NOT_FOUND;
         }
 
-        const target = targets.get(route.host);
+        const target = targetForHost(route.host);
         if (target === undefined) {
           return RESPONSE_NOT_FOUND;
         }
@@ -444,10 +449,16 @@ function formatUrlHost(host: string): string {
   return host.includes(":") ? `[${host}]` : host;
 }
 
+function targetResolver(source: DaemonTargetSource): (host: string) => DaemonTarget | undefined {
+  return typeof source === "function"
+    ? source
+    : (host: string): DaemonTarget | undefined => source.get(host);
+}
+
 function bunRuntime(): BunRuntime {
   const runtime = (globalThis as typeof globalThis & { Bun?: BunRuntime }).Bun;
   if (runtime === undefined) {
-    throw new Error("@pohunek/relay requires the Bun runtime");
+    throw new Error("@pohunek/backend requires the Bun runtime");
   }
   return runtime;
 }

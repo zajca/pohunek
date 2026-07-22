@@ -2,7 +2,7 @@
 type: SourceMap
 id: assistant/source-map
 title: Assistant source map
-description: Existing repository paths that matter when verifying assistant behavior, CLI behavior, daemon behavior, project handling, and protocol contracts.
+description: Existing repository paths that matter when verifying assistant behavior, client behavior, daemon behavior, project handling, and protocol contracts.
 source_kind: manual
 intents: [setup, project, update, debug, help]
 ---
@@ -75,6 +75,20 @@ Launcher scripts:
 - `scripts/pohunek-launch-issue`
 - `scripts/pohunek-launch-pr`
 - `docs/knowledge/guides/launcher.md`
+
+Web control center client:
+
+- `web/sdk/src/index.browser.ts`
+- `web/backend/src/config.ts`
+- `web/backend/src/hosts.ts`
+- `web/backend/src/server.ts`
+- `web/backend/systemd/pohunek-backend.service`
+- `web/client-core/src/index.ts`
+- `web/frontend/src/App.svelte`
+- `web/scripts/dev.ts`
+- `docs/knowledge/guides/web-control-center.md`
+- `docs/design/track-b-web-control-center-plan-2026-07-22.md`
+- `docs/phases/04-browser-control-center.md`
 
 Release packaging:
 

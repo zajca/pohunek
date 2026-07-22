@@ -1,30 +1,16 @@
 import type { AttachPrelude, ProtocolError } from "@pohunek/protocol";
 import { ClientError } from "./error";
 import { decodeResponse } from "./envelope";
-import { SocketTransport } from "./transport-socket";
 import type { ConnectOptions, RawDuplex, Transport } from "./transport";
 import { WsTransport } from "./transport-ws";
 
 export type RawStream = RawDuplex;
 
-const LOCAL_HOST = "local";
 const LINE_FEED = 0x0a;
 const CARRIAGE_RETURN = 0x0d;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
-
-export async function connectRawLocal(socketPath: string, opts?: ConnectOptions): Promise<RawStream> {
-  return connectRawTransport(SocketTransport.unix(socketPath, opts));
-}
-
-export async function connectRawTcp(
-  host: string,
-  addr: { host: string; port: number },
-  opts?: ConnectOptions,
-): Promise<RawStream> {
-  return connectRawTransport(SocketTransport.tcp(host, addr, opts));
-}
 
 export async function connectRawWs(
   baseUrl: string,
@@ -45,41 +31,6 @@ export async function attachRawTransport(
 ): Promise<RawStream> {
   const raw = await connectRawTransport(transport);
   return redeemAttach(raw, streamId, remoteHost);
-}
-
-export async function attachRaw(
-  host: string,
-  socketPath: string,
-  streamId: string,
-  opts?: ConnectOptions,
-): Promise<RawStream> {
-  if (isLocalHost(host)) {
-    return attachRawLocal(socketPath, streamId, opts);
-  }
-
-  throw ClientError.hostUnreachable(
-    host,
-    "remote host resolution is not available in the TypeScript SDK core; use attachRawTcp with an explicit address",
-  );
-}
-
-export async function attachRawLocal(
-  socketPath: string,
-  streamId: string,
-  opts?: ConnectOptions,
-): Promise<RawStream> {
-  const raw = await connectRawLocal(socketPath, opts);
-  return redeemAttach(raw, streamId);
-}
-
-export async function attachRawTcp(
-  host: string,
-  addr: { host: string; port: number },
-  streamId: string,
-  opts?: ConnectOptions,
-): Promise<RawStream> {
-  const raw = await connectRawTcp(host, addr, opts);
-  return redeemAttach(raw, streamId, host);
 }
 
 export async function attachRawWs(
@@ -251,10 +202,6 @@ function noAttachResponseError(remoteHost: string | undefined): ClientError {
     return ClientError.remoteDaemonUnavailable(remoteHost);
   }
   return ClientError.framing("daemon closed the attach connection before sending any raw bytes");
-}
-
-function isLocalHost(host: string): boolean {
-  return host.length === 0 || host === LOCAL_HOST;
 }
 
 function indexOfByte(bytes: Uint8Array, needle: number): number {

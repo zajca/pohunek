@@ -1,9 +1,13 @@
 {
-  "name": "@pohunek/relay",
+  "name": "@pohunek/backend",
   "private": true,
   "type": "module",
   "dependencies": {
-    "@pohunek/protocol": "workspace:*"
+    "@pohunek/protocol": "workspace:*",
+    "@pohunek/sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "@pohunek/testkit": "workspace:*"
   },
   "exports": {
     ".": {
