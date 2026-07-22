@@ -1,61 +1,46 @@
-//! Composites a reserved banner row above a live agent screen.
+//! Composites a transient modal above a live agent screen.
 //!
-//! [`Compositor`] parses the attached PTY byte stream into its own `vt100` grid
-//! and re-renders the physical terminal itself, exactly like a terminal
-//! multiplexer. The attached agent's raw control sequences (alternate-screen
-//! switches, scroll regions, absolute cursor moves) are absorbed into the grid
-//! and never reach the physical terminal, so nothing competes with the banner.
-//!
-//! This is the crucial difference from a passthrough overlay: because the
-//! compositor is the *only* writer to the physical terminal, it can hold a
-//! stable scroll region (rows `2..=N`) and DEC origin mode for the lifetime of
-//! the attach. A full-screen TUI such as Codex or Claude Code can no longer
-//! reset those margins, because its bytes are parsed, not forwarded.
+//! [`Compositor`] shadows the attached PTY byte stream in a `vt100` grid while
+//! the client normally forwards bytes unchanged. When a modal opens, it freezes
+//! the current grid as a background, saves the physical cursor state, and draws
+//! a one-row status banner plus an overlay. The caller buffers agent bytes until
+//! [`Compositor::restore`] repaints the frozen background; replaying those bytes
+//! then returns the physical terminal to the exact agent-authored state.
 //!
 //! # Rendering model
 //!
-//! - Physical row 1 is the banner, drawn outside the scroll region with origin
-//!   mode temporarily disabled.
-//! - Physical rows `2..=N` host the agent grid, sized `(rows - 1, cols)`. With
-//!   origin mode enabled, the absolute cursor moves that `vt100` bakes into
-//!   [`rows_formatted`](vt100::Screen::rows_formatted) land at the offset
-//!   physical rows automatically.
-//! - Input modes the agent enables (application cursor, bracketed paste, mouse
-//!   reporting) are propagated to the physical terminal via
-//!   [`input_mode_formatted`](vt100::Screen::input_mode_formatted) /
-//!   [`input_mode_diff`](vt100::Screen::input_mode_diff), so keyboard, paste,
-//!   and mouse continue to reach the agent.
+//! - The shadow grid uses the full physical terminal size, preserving raw
+//!   passthrough geometry and native scrollback outside the modal.
+//! - Physical row 1 is overwritten by the banner only while the modal is open.
+//! - Physical rows `2..=N` are available to the centered overlay.
+//! - Modal drawing never changes the scroll region or alternate-screen mode.
 
-// Rust guideline compliant 2026-07-07
+// Rust guideline compliant 2026-07-22
 
 use std::fmt;
 
-/// Physical rows reserved for the banner at the top of the terminal.
+/// Physical rows occupied by the transient banner.
 ///
-/// The agent grid is the terminal height minus this. Changing it would require
-/// widening the reserved region and re-deriving the scroll-region top row.
+/// Changing this requires updating overlay geometry and banner restoration.
 pub const BANNER_ROWS: u16 = 1;
 
 /// Minimum physical rows required to host a banner plus a usable agent row.
 ///
-/// One row for the banner and at least one for the agent viewport; below this
-/// the caller should attach without a banner.
+/// One row for the banner and at least one row for modal content.
 pub const MIN_ROWS_WITH_BANNER: u16 = 2;
 
 /// No scrollback: the compositor mirrors the visible screen like a raw attach.
 const SCROLLBACK_LINES: usize = 0;
 
-// Escape sequences authored by the compositor. All physical-terminal output
-// originates here, so these are the only source of scroll-region / origin-mode
-// / cursor-visibility state on the real terminal.
+// Escape sequences authored by the compositor while the modal owns drawing.
 const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
-const ORIGIN_MODE_ON: &[u8] = b"\x1b[?6h";
 const ORIGIN_MODE_OFF: &[u8] = b"\x1b[?6l";
-const RESET_SCROLL_REGION: &[u8] = b"\x1b[r";
 const RESET_ATTRS: &[u8] = b"\x1b[m";
-const CLEAR_SCREEN: &[u8] = b"\x1b[2J";
-const CLEAR_TO_EOL: &[u8] = b"\x1b[K";
+const CLEAR_LINE: &[u8] = b"\x1b[2K";
+/// DEC save/restore preserves the agent cursor, attributes, and origin mode.
+const SAVE_CURSOR: &[u8] = b"\x1b7";
+const RESTORE_CURSOR: &[u8] = b"\x1b8";
 // Reverse video for the banner, cleared to end of line so stale text never
 // shows through when the banner shrinks.
 const BANNER_OPEN: &[u8] = b"\x1b[7m\x1b[2K";
@@ -108,7 +93,7 @@ const OVERLAY_HIGHLIGHT_ATTRS: &[u8] = b"\x1b[7m";
 ///
 /// The frame carries plain text and selection state. [`Compositor`] owns all
 /// terminal geometry, clipping, borders, and style bytes so callers cannot draw
-/// outside the reserved agent region.
+/// outside the modal content region.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct OverlayFrame {
     /// Heading rendered in the first interior row.
@@ -132,19 +117,16 @@ pub struct OverlayLine {
     pub highlighted: bool,
 }
 
-/// Composites a banner row above a live agent grid for `pohunek attach`.
+/// Composites a transient menu above a shadowed agent screen.
 ///
 /// Feed raw PTY bytes with [`Compositor::feed`], then obtain physical-terminal
 /// bytes with [`Compositor::render`]. Call [`Compositor::resize`] on window
 /// changes and [`Compositor::reset`] when detaching to restore the terminal.
 pub struct Compositor {
     parser: vt100::Parser,
+    /// Frozen physical screen from the moment the modal opened.
+    background: Option<vt100::Screen>,
     overlay: Option<OverlayFrame>,
-    /// Previous rendered screen, used for incremental diffs. `None` forces a
-    /// full repaint (first frame and after a resize).
-    prev: Option<vt100::Screen>,
-    /// Previously drawn banner text; `None` forces a banner redraw.
-    prev_banner: Option<String>,
     cols: u16,
     rows: u16,
 }
@@ -161,16 +143,15 @@ impl fmt::Debug for Compositor {
 impl Compositor {
     /// Creates a compositor for a physical terminal of `cols` by `rows`.
     ///
-    /// The agent grid is sized `(rows - 1, cols)`, reserving the top row for the
-    /// banner. `rows` is clamped to at least [`MIN_ROWS_WITH_BANNER`].
+    /// The shadow grid uses full passthrough geometry. `rows` is clamped to at
+    /// least [`MIN_ROWS_WITH_BANNER`].
     #[must_use]
     pub fn new(cols: u16, rows: u16) -> Self {
         let rows = rows.max(MIN_ROWS_WITH_BANNER);
         Self {
-            parser: vt100::Parser::new(grid_rows(rows), cols, SCROLLBACK_LINES),
+            parser: vt100::Parser::new(rows, cols, SCROLLBACK_LINES),
+            background: None,
             overlay: None,
-            prev: None,
-            prev_banner: None,
             cols,
             rows,
         }
@@ -182,156 +163,84 @@ impl Compositor {
     }
 
     /// Sets the optional overlay drawn above the live agent grid.
-    ///
-    /// Opening or closing the overlay invalidates the diff baseline so the grid
-    /// under the box is repainted on the next frame. Updating an already-open
-    /// overlay keeps the baseline intact for menu navigation.
     pub fn set_overlay(&mut self, overlay: Option<OverlayFrame>) {
-        let presence_changed = self.overlay.is_some() != overlay.is_some();
         self.overlay = overlay;
-        if presence_changed {
-            self.prev = None;
-        }
     }
 
-    /// Resizes the composited grid and forces a full repaint on the next render.
+    /// Resizes the shadow grid while no modal is open.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called while a modal background is active.
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        assert!(
+            self.background.is_none(),
+            "cannot resize the compositor while a modal is active"
+        );
         let rows = rows.max(MIN_ROWS_WITH_BANNER);
         self.cols = cols;
         self.rows = rows;
-        self.parser.screen_mut().set_size(grid_rows(rows), cols);
-        // A new geometry invalidates the diff baseline and the reserved region.
-        self.prev = None;
-        self.prev_banner = None;
+        self.parser.screen_mut().set_size(rows, cols);
     }
 
     /// The agent grid size `(rows, cols)` the daemon PTY should be sized to.
     #[must_use]
     pub fn grid_size(&self) -> (u16, u16) {
-        (grid_rows(self.rows), self.cols)
-    }
-
-    /// Returns the parsed mouse-reporting mode requested by the agent.
-    #[must_use]
-    pub fn mouse_protocol_mode(&self) -> vt100::MouseProtocolMode {
-        self.parser.screen().mouse_protocol_mode()
-    }
-
-    /// Returns the parsed mouse coordinate encoding requested by the agent.
-    #[must_use]
-    pub fn mouse_protocol_encoding(&self) -> vt100::MouseProtocolEncoding {
-        self.parser.screen().mouse_protocol_encoding()
+        (self.rows, self.cols)
     }
 
     /// Renders physical-terminal bytes that update the screen to the fed state.
     ///
     /// `banner` is the plain banner text; the compositor styles and clamps it to
-    /// the terminal width and draws it on the reserved top row. The first call
-    /// (and the first after [`Compositor::resize`]) emits a full repaint that
-    /// establishes the scroll region and origin mode; later calls emit minimal
-    /// diffs.
+    /// the terminal width and draws it on the top row. The first call freezes
+    /// the current shadow grid and saves the physical
+    /// cursor state. Later calls repaint that same background before drawing the
+    /// latest banner and overlay, clearing stale modal geometry.
     #[must_use]
     pub fn render(&mut self, banner: &str) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(HIDE_CURSOR);
-
-        let full = self.prev.is_none();
-        if full {
-            self.write_setup(&mut out);
-            // `write_setup` leaves origin mode off, so the banner addresses the
-            // physical top row directly.
-            write_banner(&mut out, banner, self.cols);
-            out.extend_from_slice(ORIGIN_MODE_ON);
-            self.write_full_grid(&mut out);
-        } else {
-            if self.prev_banner.as_deref() != Some(banner) {
-                out.extend_from_slice(ORIGIN_MODE_OFF);
-                write_banner(&mut out, banner, self.cols);
-                out.extend_from_slice(ORIGIN_MODE_ON);
-            }
-            self.write_diff_grid(&mut out);
+        if self.background.is_none() {
+            self.background = Some(self.parser.screen().clone());
+            out.extend_from_slice(SAVE_CURSOR);
+            out.extend_from_slice(ORIGIN_MODE_OFF);
         }
-
-        self.write_input_modes(&mut out, full);
+        out.extend_from_slice(HIDE_CURSOR);
+        self.write_background(&mut out);
+        write_banner(&mut out, banner, self.cols);
         if let Some(overlay) = self.overlay.as_ref() {
             self.write_overlay(&mut out, overlay);
         }
         self.write_cursor(&mut out);
-
-        self.prev_banner = Some(banner.to_owned());
-        self.prev = Some(self.parser.screen().clone());
         out
     }
 
-    /// Restores the physical terminal after detach: full screen, no banner.
+    /// Restores the frozen screen before buffered agent bytes are replayed.
     ///
-    /// Resets the scroll region and origin mode, disables any input modes the
-    /// agent enabled, restores default attributes, and shows the cursor.
+    /// Returns no bytes when no modal is active.
     #[must_use]
-    pub fn reset(&mut self) -> Vec<u8> {
+    pub fn restore(&mut self) -> Vec<u8> {
+        let Some(background) = self.background.take() else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
-        // Turn off every input mode the agent may have enabled by diffing the
-        // live screen against a pristine one.
-        let pristine = vt100::Parser::new(grid_rows(self.rows), self.cols, SCROLLBACK_LINES);
-        out.extend_from_slice(&pristine.screen().input_mode_diff(self.parser.screen()));
-        out.extend_from_slice(RESET_SCROLL_REGION);
-        out.extend_from_slice(ORIGIN_MODE_OFF);
+        write_full_grid(&mut out, &background, self.cols);
         out.extend_from_slice(RESET_ATTRS);
-        out.extend_from_slice(SHOW_CURSOR);
-        // Park the cursor on the last physical row so the shell prompt resumes
-        // below the composited area rather than over it.
-        push_move(&mut out, self.rows, 1);
-        self.prev = None;
-        self.prev_banner = None;
+        out.extend_from_slice(RESTORE_CURSOR);
+        if background.hide_cursor() {
+            out.extend_from_slice(HIDE_CURSOR);
+        } else {
+            out.extend_from_slice(SHOW_CURSOR);
+        }
+        self.overlay = None;
         out
     }
 
-    fn write_setup(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(RESET_SCROLL_REGION);
-        out.extend_from_slice(ORIGIN_MODE_OFF);
-        out.extend_from_slice(CLEAR_SCREEN);
-        // Reserve the top row: scroll region covers the agent grid only.
-        out.extend_from_slice(format!("\x1b[{};{}r", BANNER_ROWS + 1, self.rows).as_bytes());
-    }
-
-    fn write_full_grid(&self, out: &mut Vec<u8>) {
-        let screen = self.parser.screen();
-        for (index, row) in screen.rows_formatted(0, self.cols).enumerate() {
-            let grid_row = grid_row_number(index);
-            // Origin mode maps grid row 1 to the first physical row below the
-            // banner; reset attributes so `rows_formatted`'s default-attr
-            // assumption holds, then clear the line before painting it.
-            push_move(out, grid_row, 1);
-            out.extend_from_slice(RESET_ATTRS);
-            out.extend_from_slice(CLEAR_TO_EOL);
-            out.extend_from_slice(&row);
-        }
-    }
-
-    fn write_diff_grid(&self, out: &mut Vec<u8>) {
-        let screen = self.parser.screen();
-        let Some(prev) = self.prev.as_ref() else {
-            return;
-        };
-        for (index, row) in screen.rows_diff(prev, 0, self.cols).enumerate() {
-            if row.is_empty() {
-                continue;
-            }
-            let grid_row = grid_row_number(index);
-            // `rows_diff` assumes the cursor starts at grid (index, 0) with
-            // default attributes; satisfy both before emitting the diff.
-            push_move(out, grid_row, 1);
-            out.extend_from_slice(RESET_ATTRS);
-            out.extend_from_slice(&row);
-        }
-    }
-
-    fn write_input_modes(&self, out: &mut Vec<u8>, full: bool) {
-        let screen = self.parser.screen();
-        match (full, self.prev.as_ref()) {
-            (false, Some(prev)) => out.extend_from_slice(&screen.input_mode_diff(prev)),
-            _ => out.extend_from_slice(&screen.input_mode_formatted()),
-        }
+    fn write_background(&self, out: &mut Vec<u8>) {
+        let background = self
+            .background
+            .as_ref()
+            .expect("render initializes a modal background");
+        write_full_grid(out, background, self.cols);
     }
 
     fn write_overlay(&self, out: &mut Vec<u8>, overlay: &OverlayFrame) {
@@ -339,13 +248,11 @@ impl Compositor {
             return;
         };
 
-        out.extend_from_slice(ORIGIN_MODE_OFF);
         for row_offset in OVERLAY_TOP_BORDER_OFFSET..geometry.height {
             let row = geometry.row.saturating_add(row_offset);
             push_move(out, row, geometry.col);
             write_overlay_row(out, overlay, geometry, row_offset);
         }
-        out.extend_from_slice(ORIGIN_MODE_ON);
     }
 
     fn overlay_geometry(&self, overlay: &OverlayFrame) -> Option<OverlayGeometry> {
@@ -353,7 +260,7 @@ impl Compositor {
             return None;
         }
 
-        let grid_height = grid_rows(self.rows);
+        let grid_height = modal_rows(self.rows);
         let max_content_width = overlay_content_width(overlay);
         let desired_width = max_content_width
             .saturating_add(OVERLAY_HORIZONTAL_BORDER_COLUMNS)
@@ -411,10 +318,8 @@ impl Compositor {
             return;
         };
 
-        out.extend_from_slice(ORIGIN_MODE_OFF);
         push_move(out, row, col);
         out.extend_from_slice(SHOW_CURSOR);
-        out.extend_from_slice(ORIGIN_MODE_ON);
     }
 }
 
@@ -426,18 +331,25 @@ struct OverlayGeometry {
     height: u16,
 }
 
-/// Agent grid height for a physical terminal of `rows` rows.
-fn grid_rows(rows: u16) -> u16 {
+/// Modal content height below the transient banner.
+fn modal_rows(rows: u16) -> u16 {
     rows.saturating_sub(BANNER_ROWS).max(1)
 }
 
 /// One-based grid row for the zero-based `vt100` visible-row `index`.
 ///
-/// With origin mode enabled the terminal offsets this into the reserved region,
-/// so callers address the agent grid as if it were the whole screen.
 fn grid_row_number(index: usize) -> u16 {
     let index = u16::try_from(index).expect("grid row index fits in u16");
     index.saturating_add(FIRST_PHYSICAL_ROW)
+}
+
+fn write_full_grid(out: &mut Vec<u8>, screen: &vt100::Screen, cols: u16) {
+    for (index, row) in screen.rows_formatted(0, cols).enumerate() {
+        push_move(out, grid_row_number(index), FIRST_PHYSICAL_COL);
+        out.extend_from_slice(RESET_ATTRS);
+        out.extend_from_slice(CLEAR_LINE);
+        out.extend_from_slice(&row);
+    }
 }
 
 fn push_move(out: &mut Vec<u8>, row: u16, col: u16) {
@@ -656,31 +568,29 @@ mod tests {
     }
 
     #[test]
-    fn grid_size_reserves_the_banner_row() {
+    fn grid_size_matches_raw_passthrough_geometry() {
         let compositor = Compositor::new(80, 24);
 
-        assert_eq!(compositor.grid_size(), (23, 80));
+        assert_eq!(compositor.grid_size(), (24, 80));
     }
 
     #[test]
     fn rows_are_clamped_to_leave_a_usable_grid() {
         let compositor = Compositor::new(80, 1);
 
-        // One physical row is clamped up so the grid keeps at least one row.
-        assert_eq!(compositor.grid_size(), (1, 80));
+        assert_eq!(compositor.grid_size(), (2, 80));
     }
 
     #[test]
-    fn first_frame_establishes_region_origin_and_banner() {
+    fn first_frame_saves_terminal_state_and_draws_banner() {
         let mut compositor = Compositor::new(40, 10);
         compositor.feed(b"hello");
 
         let frame = render_string(&mut compositor, "[kill]");
 
-        // Scroll region reserves rows 2..=10 for the agent grid.
         assert!(
-            frame.contains("\x1b[2;10r"),
-            "first frame must reserve the banner row via a scroll region: {frame:?}"
+            frame.starts_with("\x1b7\x1b[?6l"),
+            "first frame must save the cursor before using absolute coordinates: {frame:?}"
         );
         // Banner is drawn on the physical top row with origin mode off.
         assert!(
@@ -691,20 +601,18 @@ mod tests {
             frame.contains("\x1b[1;1H\x1b[7m\x1b[2K[kill]"),
             "banner text must render reverse-video on row 1: {frame:?}"
         );
-        // Origin mode is enabled before the grid so offsets are automatic.
         assert!(
-            frame.contains("\x1b[?6h"),
-            "grid must render with origin mode enabled: {frame:?}"
+            !frame.contains("\x1b[2;10r") && !frame.contains("\x1b[?1049"),
+            "modal drawing must not change scroll margins or screen buffers: {frame:?}"
         );
-        // The fed content lands on the first grid row (grid row 1 under origin).
         assert!(
             frame.contains("\x1b[1;1H") && frame.contains("hello"),
-            "agent output must appear on the first grid row: {frame:?}"
+            "frozen agent output must be available behind the modal: {frame:?}"
         );
     }
 
     #[test]
-    fn alternate_screen_agent_output_keeps_banner_and_swallows_raw_control() {
+    fn alternate_screen_state_is_shadowed_without_reemitting_switches() {
         let mut compositor = Compositor::new(40, 10);
         // A full-screen TUI: enter the alternate screen, home the cursor, draw.
         compositor.feed(b"\x1b[?1049h\x1b[2J\x1b[1;1HTUI");
@@ -722,19 +630,18 @@ mod tests {
             frame.contains("\x1b[1;1H\x1b[7m\x1b[2Kbanner"),
             "banner must survive a full-screen TUI frame: {frame:?}"
         );
-        // The TUI content is composited into the reserved region.
         assert!(
             frame.contains("TUI"),
-            "alternate-screen content must be composited: {frame:?}"
+            "alternate-screen content must be available in the frozen background: {frame:?}"
         );
         assert!(
-            frame.contains("\x1b[2;10r"),
-            "the reserved region must be present for the TUI frame: {frame:?}"
+            !frame.contains("\x1b[2;10r"),
+            "transient modal drawing must leave scroll margins untouched: {frame:?}"
         );
     }
 
     #[test]
-    fn input_modes_are_propagated_to_the_physical_terminal() {
+    fn modal_does_not_reemit_agent_input_modes() {
         let mut compositor = Compositor::new(40, 10);
         // Application cursor keys + bracketed paste, as a TUI would enable.
         compositor.feed(b"\x1b[?1h\x1b[?2004h");
@@ -742,22 +649,21 @@ mod tests {
         let frame = render_string(&mut compositor, "b");
 
         assert!(
-            frame.contains("\x1b[?1h"),
-            "application cursor mode must reach the terminal: {frame:?}"
+            !frame.contains("\x1b[?1h"),
+            "raw passthrough already owns application cursor mode: {frame:?}"
         );
         assert!(
-            frame.contains("\x1b[?2004h"),
-            "bracketed paste must reach the terminal: {frame:?}"
+            !frame.contains("\x1b[?2004h"),
+            "raw passthrough already owns bracketed paste mode: {frame:?}"
         );
     }
 
     #[test]
-    fn second_frame_diffs_only_changed_rows_without_resetting_region() {
+    fn second_frame_keeps_the_frozen_background() {
         let mut compositor = Compositor::new(40, 6);
         compositor.feed(b"line one\r\nline two");
         let _ = compositor.render("b");
 
-        // Change only the second grid row.
         compositor.feed(b"\r\nline two changed");
         let frame = render_string(&mut compositor, "b");
 
@@ -766,17 +672,17 @@ mod tests {
             "an incremental frame must not re-establish the scroll region: {frame:?}"
         );
         assert!(
-            frame.contains("changed"),
-            "the changed row must be repainted: {frame:?}"
+            !frame.contains("changed"),
+            "agent output received during the modal must stay buffered: {frame:?}"
         );
         assert!(
-            !frame.contains("line one"),
-            "unchanged rows must not be repainted: {frame:?}"
+            frame.contains("line one"),
+            "the entry background must be repainted to clear stale overlay cells: {frame:?}"
         );
     }
 
     #[test]
-    fn banner_is_not_redrawn_when_unchanged() {
+    fn banner_is_redrawn_to_clear_agent_repaints() {
         let mut compositor = Compositor::new(40, 6);
         compositor.feed(b"x");
         let _ = compositor.render("same");
@@ -785,8 +691,8 @@ mod tests {
         let frame = render_string(&mut compositor, "same");
 
         assert!(
-            !frame.contains("\x1b[7m\x1b[2K"),
-            "an unchanged banner must not be redrawn: {frame:?}"
+            frame.contains("\x1b[7m\x1b[2Ksame"),
+            "an unchanged banner must still be restored above the modal: {frame:?}"
         );
     }
 
@@ -822,18 +728,19 @@ mod tests {
     }
 
     #[test]
-    fn resize_forces_a_full_repaint_with_the_new_region() {
+    fn resize_uses_full_passthrough_geometry_after_restore() {
         let mut compositor = Compositor::new(40, 6);
         compositor.feed(b"content");
         let _ = compositor.render("b");
+        let _ = compositor.restore();
 
         compositor.resize(50, 12);
-        assert_eq!(compositor.grid_size(), (11, 50));
+        assert_eq!(compositor.grid_size(), (12, 50));
 
         let frame = render_string(&mut compositor, "b");
         assert!(
-            frame.contains("\x1b[2;12r"),
-            "resize must re-establish the scroll region at the new height: {frame:?}"
+            !frame.contains("\x1b[2;12r"),
+            "modal rendering must not establish a scroll region: {frame:?}"
         );
         assert!(
             frame.contains("\x1b[1;1H\x1b[7m\x1b[2Kb"),
@@ -842,34 +749,30 @@ mod tests {
     }
 
     #[test]
-    fn reset_restores_region_origin_attrs_and_cursor() {
+    fn restore_repaints_background_and_restores_saved_cursor() {
         let mut compositor = Compositor::new(40, 8);
-        // Enable an input mode so reset has something to undo.
-        compositor.feed(b"\x1b[?1h");
+        compositor.feed(b"base");
         let _ = compositor.render("b");
 
-        let teardown = String::from_utf8(compositor.reset()).expect("teardown is utf8");
+        let teardown = String::from_utf8(compositor.restore()).expect("teardown is utf8");
 
         assert!(
-            teardown.contains("\x1b[?1l"),
-            "reset must disable input modes the agent enabled: {teardown:?}"
+            teardown.contains("base"),
+            "restore must repaint the frozen background: {teardown:?}"
         );
         assert!(
-            teardown.contains("\x1b[r"),
-            "reset must clear the scroll region: {teardown:?}"
+            teardown.contains("\x1b8"),
+            "restore must restore the saved cursor and origin mode: {teardown:?}"
         );
         assert!(
-            teardown.contains("\x1b[?6l"),
-            "reset must disable origin mode: {teardown:?}"
+            !teardown.contains("\x1b[r") && !teardown.contains("\x1b[?1049"),
+            "restore must not change scroll margins or screen buffers: {teardown:?}"
         );
         assert!(
             teardown.contains("\x1b[?25h"),
-            "reset must restore the cursor: {teardown:?}"
+            "restore must recover the entry cursor visibility: {teardown:?}"
         );
-        assert!(
-            teardown.contains("\x1b[8;1H"),
-            "reset must park the cursor on the last physical row: {teardown:?}"
-        );
+        assert!(compositor.restore().is_empty());
     }
 
     #[test]
@@ -963,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn grid_diff_under_the_overlay_is_overdrawn_in_the_same_frame() {
+    fn agent_output_during_modal_does_not_replace_the_overlay() {
         let mut compositor = Compositor::new(SHORT_TEST_COLS, SHORT_TEST_ROWS);
         compositor.set_overlay(Some(test_overlay()));
         let _ = compositor.render("b");
@@ -971,20 +874,14 @@ mod tests {
         compositor.feed(b"\x1b[1;1HUNDERLAY");
         let frame = render_string(&mut compositor, "b");
 
-        let grid_index = frame
-            .find("UNDERLAY")
-            .expect("changed grid row must be included in the diff frame");
-        let overlay_index = frame
-            .rfind("Menu")
-            .expect("overlay must be redrawn after the grid diff");
         assert!(
-            grid_index < overlay_index,
-            "grid diff must be emitted before overlay bytes: {frame:?}"
+            !frame.contains("UNDERLAY") && frame.contains("Menu"),
+            "the frozen background must remain visible until buffered output is replayed: {frame:?}"
         );
     }
 
     #[test]
-    fn opening_overlay_invalidates_the_diff_baseline() {
+    fn opening_overlay_repaints_the_frozen_background() {
         let mut compositor = Compositor::new(SHORT_TEST_COLS, SHORT_TEST_ROWS);
         compositor.feed(b"base");
         let _ = compositor.render("b");
@@ -993,17 +890,13 @@ mod tests {
         let frame = render_string(&mut compositor, "b");
 
         assert!(
-            frame.contains("\x1b[2;8r"),
-            "opening an overlay must force a full repaint: {frame:?}"
-        );
-        assert!(
             frame.contains("base"),
             "opening repaint must include the existing grid contents: {frame:?}"
         );
     }
 
     #[test]
-    fn updating_open_overlay_keeps_the_diff_baseline() {
+    fn updating_open_overlay_repaints_its_content() {
         let mut compositor = Compositor::new(SHORT_TEST_COLS, SHORT_TEST_ROWS);
         compositor.set_overlay(Some(test_overlay()));
         let _ = compositor.render("b");
@@ -1015,32 +908,24 @@ mod tests {
         let frame = render_string(&mut compositor, "b");
 
         assert!(
-            !frame.contains("\x1b[2;8r"),
-            "same-presence overlay updates must not force a full repaint: {frame:?}"
-        );
-        assert!(
             frame.contains("Detach"),
             "updated overlay content must still be redrawn: {frame:?}"
         );
     }
 
     #[test]
-    fn closing_overlay_invalidates_the_diff_baseline() {
+    fn restore_clears_overlay_with_the_frozen_background() {
         let mut compositor = Compositor::new(SHORT_TEST_COLS, SHORT_TEST_ROWS);
         compositor.feed(b"covered");
         compositor.set_overlay(Some(test_overlay()));
         let _ = compositor.render("b");
 
         compositor.set_overlay(None);
-        let frame = render_string(&mut compositor, "b");
+        let frame = String::from_utf8(compositor.restore()).expect("restore is utf8");
 
         assert!(
-            frame.contains("\x1b[2;8r"),
-            "closing an overlay must force a full repaint: {frame:?}"
-        );
-        assert!(
             frame.contains("covered"),
-            "closing repaint must restore covered grid contents: {frame:?}"
+            "restore must repaint content hidden by the overlay: {frame:?}"
         );
     }
 
@@ -1068,7 +953,7 @@ mod tests {
 
         assert!(
             frame.contains(&format!(
-                "\x1b[?6l{}\x1b[?25h",
+                "{}\x1b[?25h",
                 move_to(CURSOR_TEST_ROW, CURSOR_TEST_COL)
             )),
             "overlay cursor must use absolute physical coordinates and be shown: {frame:?}"

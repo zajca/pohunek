@@ -901,9 +901,6 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_TERMINAL_ARGS"; done
             // the per-host `timeout` under parallel test load (which would drop
             // a host to an error row and fail the multi-select assertion).
             ("list_timeout_seconds", "30"),
-            // `banner=true` is now consumed by `pohunek attach` itself. The rofi
-            // switcher must not spawn or arrange a second banner terminal.
-            ("banner", "true"),
             // Keep the mark-retry loop a single fast attempt: the stub swaymsg's
             // get_tree never reflects newly added marks, so verification cannot
             // succeed; one attempt keeps the test fast while still issuing the

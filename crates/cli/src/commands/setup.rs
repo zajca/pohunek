@@ -69,9 +69,9 @@ const OBSOLETE_SCRIPTS: &[&str] = &["pohunek-session-banner"];
 
 /// Default `launcher.conf` contents read by the launcher scripts and `attach`.
 /// Keys must match what `pohunek_required_config`/`pohunek_optional_config` look
-/// up, plus the banner keys read by the Rust attach path. The `terminal` value is
-/// intentionally left blank for the user to fill in (the scripts fail fast when a
-/// required value is empty).
+/// up, plus reconnect keys read by the Rust attach path. The `terminal` value is
+/// intentionally left blank for the user to fill in (the scripts fail fast when
+/// a required value is empty).
 const LAUNCHER_CONF: &str = "# pohunek launcher configuration.
 # Lines are key=value; '#' starts a comment. Edit the values below.
 
@@ -97,13 +97,6 @@ linear_cli=linear
 # Issue picker: which Linear workflow-state types are 'actionable' (space-separated:
 # triage backlog unstarted started completed canceled).
 #linear_issue_states=started unstarted
-# Attach banner: reserve the top terminal row for the kill shortcut and live
-# session state. The attach client composites the agent screen below it, so the
-# banner works even under full-screen TUI agents (Codex, Claude Code).
-#banner=false
-# Max banner/screen refresh cadence in seconds. 0 uses the built-in ~60fps frame
-# cadence; a positive value throttles repaints to a coarser refresh.
-#banner_interval_seconds=0
 # Attach reconnect: after an unexpected daemon stream close, wait for a restarted
 # daemon to resume the session and reattach. Set seconds to 0 to disable.
 #attach_reconnect_seconds=20
@@ -635,7 +628,14 @@ mod tests {
 
     #[test]
     fn launcher_conf_contains_only_host_level_launcher_keys() {
-        for removed in ["project=", "agent=", "issue_action", "pr_action"] {
+        for removed in [
+            "project=",
+            "agent=",
+            "issue_action",
+            "pr_action",
+            "banner=",
+            "banner_interval_seconds",
+        ] {
             assert!(
                 !LAUNCHER_CONF.contains(removed),
                 "launcher.conf must not contain per-project/per-action key {removed:?}"

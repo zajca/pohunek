@@ -5,24 +5,20 @@
 //!
 //! - [`ScreenTracker`] scrapes visible text and agent prompt/rule structure from
 //!   a PTY byte stream; the daemon uses it for activity detection.
-//! - [`Compositor`] re-renders the physical terminal for `pohunek attach`,
-//!   reserving a banner row above the live agent grid so a status banner works
-//!   even under full-screen TUI agents such as Codex and Claude Code.
+//! - [`Compositor`] shadows raw attach output and temporarily draws the session
+//!   menu without sacrificing native terminal scrollback between menu opens.
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-07-07
+// Rust guideline compliant 2026-07-22
 
 mod compositor;
-mod input;
 mod menu;
 mod screen;
 mod snapshot;
 
 #[doc(inline)]
 pub use compositor::{Compositor, OverlayFrame, OverlayLine, BANNER_ROWS, MIN_ROWS_WITH_BANNER};
-#[doc(inline)]
-pub use input::InputTranslator;
 #[doc(inline)]
 pub use menu::{step, MenuEffect, MenuEvent, MenuKey, MenuOutcome, MenuState};
 pub use screen::{ScreenRegion, ScreenTracker};
