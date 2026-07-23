@@ -1,0 +1,176 @@
+import type { Locator, Page } from "@playwright/test";
+import {
+  FIXTURE_LOCAL_HOST,
+  FIXTURE_LOCAL_SESSION_ID,
+  FIXTURE_PEER_HOST,
+  FIXTURE_PEER_SESSION_ID,
+} from "../../scripts/fixture-stack";
+import { expect, test } from "./fixtures";
+
+test("keeps every host in one session rail and promotes live blocked work", async ({ page, stack }) => {
+  await page.goto(stack.backend.url);
+
+  const localHost = hostMarker(page, FIXTURE_LOCAL_HOST);
+  const peerHost = hostMarker(page, FIXTURE_PEER_HOST);
+  await expect(localHost.locator("[data-connection]"))
+    .toHaveAttribute("data-connection", "connected");
+  await expect(peerHost.locator("[data-connection]"))
+    .toHaveAttribute("data-connection", "connected");
+
+  const localSession = sessionRow(page, FIXTURE_LOCAL_HOST, FIXTURE_LOCAL_SESSION_ID);
+  const peerSession = sessionRow(page, FIXTURE_PEER_HOST, FIXTURE_PEER_SESSION_ID);
+  await expect(localSession).toBeVisible();
+  await expect(peerSession).toBeVisible();
+
+  stack.local.scenario.setAgentState(FIXTURE_LOCAL_SESSION_ID, "blocked", "report");
+  const badge = localSession.locator("[data-agent-state]");
+  await expect(badge).toHaveAttribute("data-agent-state", "blocked");
+  await expect(badge).toHaveAttribute("data-state-source", "report");
+  await expect(page.getByRole("button", { name: "1 blocked" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Attention · 1" })).toBeVisible();
+  await expect(page.getByTestId("session-row").first()).toHaveAttribute(
+    "data-session-id",
+    FIXTURE_LOCAL_SESSION_ID,
+  );
+
+  await page.getByRole("searchbox", { name: "Search sessions" }).fill("fixture-peer");
+  await expect(peerSession).toBeVisible();
+  await expect(localSession).toBeHidden();
+});
+
+test("creates on the chosen host, attaches immediately, and stops from the inspector", async ({ page, stack }) => {
+  await page.goto(stack.backend.url);
+  await expect(hostMarker(page, FIXTURE_PEER_HOST).locator("[data-connection]"))
+    .toHaveAttribute("data-connection", "connected");
+
+  await page.getByRole("button", { name: "New session", exact: true }).first().click();
+  const createDialog = page.getByRole("dialog", { name: "New session" });
+  await createDialog.getByRole("combobox", { name: "Host", exact: true }).selectOption(FIXTURE_PEER_HOST);
+  const agentSelect = createDialog.getByRole("combobox", { name: "Agent", exact: true });
+  await expect(agentSelect).toBeEnabled();
+  await agentSelect.selectOption("codex");
+  await createDialog.getByRole("textbox", { name: /Name/ }).fill("Browser-created session");
+  await expect(createDialog.getByTestId("terminal-size-probe")).toBeHidden();
+  await createDialog.getByRole("button", { name: "Create and attach" }).click();
+
+  await expect(createDialog).toBeHidden();
+  await expect(page.getByRole("heading", { name: "Browser-created session" })).toBeVisible();
+  await expect(page.getByTestId("terminal-status")).toContainText("Attached");
+  await page.getByRole("button", { name: "Details" }).click();
+
+  const inspector = page.getByRole("dialog", { name: "Browser-created session" });
+  await expect(inspector.locator(":focus")).toHaveAttribute("aria-label", "Close session details");
+  await expect(page.locator('button[aria-label="Close session details"][tabindex="-1"]')).toHaveCount(1);
+  await page.keyboard.press("Shift+Tab");
+  await expect(inspector.locator(":focus")).toHaveCount(1);
+  await expect(inspector.getByTestId("session-detail")).toContainText(FIXTURE_PEER_HOST);
+  await inspector.getByRole("button", { name: "Stop session" }).click();
+  const confirmation = page.getByRole("dialog", { name: "Stop this session?" });
+  await confirmation.getByRole("button", { name: "Stop session" }).click();
+  await expect(inspector.getByTestId("session-detail")).toContainText("stopped");
+});
+
+test("keeps local work usable when a peer disconnects", async ({ page, stack }) => {
+  await page.goto(stack.backend.url);
+  const peerConnection = hostMarker(page, FIXTURE_PEER_HOST).locator("[data-connection]");
+  await expect(peerConnection).toHaveAttribute("data-connection", "connected");
+
+  await stack.peer.scenario.stopAbruptly();
+
+  await expect(peerConnection).toHaveAttribute("data-connection", "error");
+  const localSession = sessionRow(page, FIXTURE_LOCAL_HOST, FIXTURE_LOCAL_SESSION_ID);
+  await expect(localSession).toBeVisible();
+  await localSession.click();
+  await expect(page.getByTestId("terminal-status")).toContainText("Attached");
+  await expect(page.getByRole("button", { name: "New session", exact: true }).first()).toBeEnabled();
+});
+
+test("supports shell shortcuts without stealing terminal input", async ({ page, stack }) => {
+  await page.goto(stack.backend.url);
+  await expect(hostMarker(page, FIXTURE_LOCAL_HOST).locator("[data-connection]"))
+    .toHaveAttribute("data-connection", "connected");
+
+  const createDialog = page.getByRole("dialog", { name: "New session" });
+  const newSessionButton = page.getByRole("button", { name: "New session", exact: true }).first();
+  await newSessionButton.focus();
+  await page.keyboard.press("Enter");
+  await expect(createDialog).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(createDialog).toBeHidden();
+
+  await page.keyboard.press("Control+b");
+  await expect(page.getByRole("button", { name: "Show session rail" })).toBeVisible();
+  await page.keyboard.press("Control+b");
+  await expect(page.getByRole("button", { name: "Hide session rail" })).toBeVisible();
+
+  await page.keyboard.press("Control+k");
+  const palette = page.getByRole("dialog", { name: "Command palette" });
+  await expect(palette).toBeVisible();
+  await page.keyboard.press("Control+k");
+  await expect(palette).toBeHidden();
+  await page.getByRole("heading", { name: "Sessions", exact: true }).click();
+
+  await page.keyboard.press("n");
+  await expect(createDialog).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(createDialog).toBeHidden();
+
+  await page.keyboard.press("i");
+  const inbox = page.getByRole("dialog", { name: "Inbox" });
+  await expect(inbox).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(inbox).toBeHidden();
+
+  await page.keyboard.press("/");
+  await expect(page.getByRole("searchbox", { name: "Search sessions" })).toBeFocused();
+  await page.getByRole("heading", { name: "Sessions", exact: true }).click();
+
+  const initialUrl = page.url();
+  await page.keyboard.press("j");
+  await expect(page.getByTestId("session-row").first()).toBeFocused();
+  await expect(page).toHaveURL(initialUrl);
+  await expect(page.getByTestId("terminal-status")).toHaveCount(0);
+  await page.keyboard.press("k");
+  const focusedSession = page.getByTestId("session-row").last();
+  await expect(focusedSession).toBeFocused();
+  await expect(page).toHaveURL(initialUrl);
+  await expect(page.getByTestId("terminal-status")).toHaveCount(0);
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("terminal-status")).toContainText("Attached");
+  await page.getByTestId("terminal").click();
+  await page.keyboard.type("n");
+  await expect(createDialog).toBeHidden();
+});
+
+test("drops a stale persisted selection after host snapshots settle", async ({ page, stack }) => {
+  const storageKey = "pohunek.control-center.ui.v1";
+  await page.addInitScript(({ key, value }): void => {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  }, {
+    key: storageKey,
+    value: {
+      sidebarCollapsed: false,
+      selectedSession: { host: FIXTURE_LOCAL_HOST, sessionId: "s-stale-selection" },
+    },
+  });
+
+  await page.goto(stack.backend.url);
+  await expect(hostMarker(page, FIXTURE_LOCAL_HOST).locator("[data-connection]"))
+    .toHaveAttribute("data-connection", "connected");
+  await expect.poll(async () => page.evaluate((key): unknown => {
+    const stored = window.localStorage.getItem(key);
+    return stored === null ? null : JSON.parse(stored) as unknown;
+  }, storageKey)).toEqual({ sidebarCollapsed: false });
+  await expect(page).toHaveURL(`${stack.backend.url}/`);
+  await expect(page.getByTestId("terminal-status")).toHaveCount(0);
+});
+
+function hostMarker(page: Page, host: string): Locator {
+  return page.locator(`[data-testid="host-card"][data-host="${host}"]`);
+}
+
+function sessionRow(page: Page, host: string, sessionId: string): Locator {
+  return page.locator(
+    `[data-testid="session-row"][data-host="${host}"][data-session-id="${sessionId}"]`,
+  );
+}

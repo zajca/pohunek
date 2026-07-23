@@ -1,0 +1,96 @@
+import type {
+  AgentActivity,
+  HostRecord,
+  NotificationCreateParams,
+  NotificationId,
+  NotificationRecord,
+  SessionId,
+  StateSource,
+} from "@pohunek/protocol";
+
+export type ScenarioNotificationInput =
+  & NotificationCreateParams
+  & Partial<
+    Pick<
+      NotificationRecord,
+      | "id"
+      | "status"
+      | "created_at"
+      | "read_at"
+      | "acked_at"
+      | "archived_at"
+      | "deleted_at"
+      | "superseded_by"
+    >
+  >;
+
+/** A terminal size delivered to the fixture daemon over `session.resize`. */
+export interface ScenarioResize {
+  readonly cols: number;
+  readonly rows: number;
+}
+
+export interface ScenarioBackend {
+  setAgentState(sessionId: SessionId, activity: AgentActivity, source: StateSource): void;
+  removeSession(sessionId: SessionId): void;
+  createScenarioNotification(input: ScenarioNotificationInput): NotificationRecord;
+  deleteNotification(id: NotificationId): void;
+  resizes(sessionId: SessionId): ReadonlyArray<ScenarioResize>;
+  writeToPty(sessionId: SessionId, bytes: Uint8Array): number;
+  queuePtyOutput(sessionId: SessionId, bytes: Uint8Array): void;
+  setDiscoveredHosts(hosts: readonly HostRecord[]): void;
+  stopAbruptly(): Promise<void>;
+}
+
+const DEFAULT_AGENT_STATE_SOURCE = "report";
+
+export class FixtureScenario {
+  private readonly backend: ScenarioBackend;
+
+  public constructor(backend: ScenarioBackend) {
+    this.backend = backend;
+  }
+
+  public setAgentState(
+    sessionId: SessionId,
+    activity: AgentActivity,
+    source: StateSource = DEFAULT_AGENT_STATE_SOURCE,
+  ): void {
+    this.backend.setAgentState(sessionId, activity, source);
+  }
+
+  /** Removes a fixture session and emits `session_removed` to subscribers. */
+  public removeSession(sessionId: SessionId): void {
+    this.backend.removeSession(sessionId);
+  }
+
+  public createNotification(input: ScenarioNotificationInput): NotificationRecord {
+    return this.backend.createScenarioNotification(input);
+  }
+
+  /** Removes a fixture notification and emits `notification_deleted` to subscribers. */
+  public deleteNotification(id: NotificationId): void {
+    this.backend.deleteNotification(id);
+  }
+
+  /** Returns a snapshot of terminal sizes delivered for one session. */
+  public resizes(sessionId: SessionId): ReadonlyArray<ScenarioResize> {
+    return this.backend.resizes(sessionId);
+  }
+
+  public writeToPty(sessionId: SessionId, bytes: Uint8Array): number {
+    return this.backend.writeToPty(sessionId, bytes);
+  }
+
+  public queuePtyOutput(sessionId: SessionId, bytes: Uint8Array): void {
+    this.backend.queuePtyOutput(sessionId, bytes);
+  }
+
+  public setDiscoveredHosts(hosts: readonly HostRecord[]): void {
+    this.backend.setDiscoveredHosts(hosts);
+  }
+
+  public stopAbruptly(): Promise<void> {
+    return this.backend.stopAbruptly();
+  }
+}

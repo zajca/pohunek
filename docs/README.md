@@ -47,6 +47,10 @@ sessions across your own machines on a NetBird (WireGuard) network.
 
 ## Design Notes (proposals, pre-phase)
 
+- [Track B web control center plan](design/track-b-web-control-center-plan-2026-07-22.md)
+  — milestone split and reconciled decisions for the browser control center
+  (thin relay backend + browser-side aggregation in `web/client-core`).
+
 - [Universal Pohunek Assistant](design/universal-assistant.md) - one ordinary
   session-backed assistant, steered by intent and a live snapshot, for setup,
   project configuration, updates, troubleshooting, and general help.

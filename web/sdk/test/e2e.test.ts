@@ -6,11 +6,12 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "bun:test";
 import { PROTOCOL_VERSION, type ProtocolEvent } from "@pohunek/protocol";
-import { startRelay, type RelayHandle } from "@pohunek/relay";
+import { startRelay, type RelayHandle } from "@pohunek/backend";
 import {
   Client,
   attachRawLocal,
   attachRawWs,
+  connectLocal,
   type CatchAllEvent,
   type RawStream,
   type Request,
@@ -162,7 +163,7 @@ async function runSessionScenario(daemon: DaemonHarness, transport: E2eTransport
 function socketTransport(daemon: DaemonHarness): E2eTransport {
   return {
     name: "socket",
-    connectClient: (): Promise<Client> => Client.connectLocal(daemon.socketPath, connectOptions()),
+    connectClient: (): Promise<Client> => connectLocal(daemon.socketPath, connectOptions()),
     attachRaw: (streamId: string): Promise<RawStream> =>
       attachRawLocal(daemon.socketPath, streamId, connectOptions()),
     close: (): Promise<void> => Promise.resolve(),
@@ -338,7 +339,7 @@ async function waitForDaemonReady(
 async function verifyHandshake(socketPath: string): Promise<void> {
   let client: Client | undefined;
   try {
-    client = await Client.connectLocal(socketPath, connectOptions());
+    client = await connectLocal(socketPath, connectOptions());
     const version = await client.handshake();
     if (version !== PROTOCOL_VERSION) {
       throw new Error(`expected protocol version ${PROTOCOL_VERSION}, got ${version}`);

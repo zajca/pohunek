@@ -1,105 +1,87 @@
 import { pathToFileURL } from "node:url";
-import { startRelay, type DaemonTarget } from "./relay";
+import { loadBackendConfig, type BackendConfig } from "./config";
+import { BackendStartupError, startHostsPipeline, type HostsPipelineHandle } from "./hosts";
+import { errorClass, stdoutLogger, type BackendLogger } from "./log";
+import { startBackendServer, type BackendServerHandle } from "./server";
 
-const ENV_BIND_HOST = "POHUNEK_RELAY_BIND_HOST";
-const ENV_PORT = "POHUNEK_RELAY_PORT";
-const ENV_TARGETS_JSON = "POHUNEK_RELAY_TARGETS_JSON";
-const ENV_ALLOW_LOOPBACK = "POHUNEK_RELAY_ALLOW_LOOPBACK";
-const TRUE_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
-
-export async function startRelayFromEnv(env: NodeJS.ProcessEnv = process.env): Promise<void> {
-  const bindHost = requiredEnv(env, ENV_BIND_HOST);
-  const port = parsePort(requiredEnv(env, ENV_PORT));
-  const targets = parseTargets(requiredEnv(env, ENV_TARGETS_JSON));
-  const allowLoopbackBind = parseBoolean(env[ENV_ALLOW_LOOPBACK]);
-  const relay = await startRelay({ bindHost, port, targets, allowLoopbackBind });
-  console.log(`pohunek relay listening on ${relay.url}`);
+export interface BackendHandle {
+  readonly url: string;
+  readonly port: number;
+  readonly hosts: HostsPipelineHandle;
+  close(): Promise<void>;
 }
 
-function requiredEnv(env: NodeJS.ProcessEnv, name: string): string {
-  const value = env[name];
-  if (value === undefined || value.length === 0) {
-    throw new Error(`missing required environment variable ${name}`);
-  }
-  return value;
-}
+export async function startBackend(
+  config: BackendConfig,
+  logger: BackendLogger = stdoutLogger,
+): Promise<BackendHandle> {
+  const hosts = await startHostsPipeline({
+    daemonSocketPath: config.daemonSocketPath,
+    remotePort: config.remotePort,
+    discoverIntervalSeconds: config.discoverIntervalSeconds,
+    logger,
+  });
 
-function parsePort(raw: string): number {
-  const value = Number(raw);
-  if (!Number.isInteger(value) || value < 0 || value > 65_535) {
-    throw new Error(`${ENV_PORT} must be an integer port from 0 to 65535`);
-  }
-  return value;
-}
-
-function parseBoolean(raw: string | undefined): boolean {
-  return raw !== undefined && TRUE_ENV_VALUES.has(raw.toLowerCase());
-}
-
-function parseTargets(raw: string): ReadonlyMap<string, DaemonTarget> {
-  let parsed: unknown;
+  let server: BackendServerHandle;
   try {
-    parsed = JSON.parse(raw) as unknown;
+    server = await startBackendServer({
+      bindHost: config.bindHost,
+      port: config.port,
+      allowLoopbackBind: config.allowLoopbackBind,
+      staticAssetsDir: config.staticAssetsDir,
+      hosts,
+      logger,
+    });
   } catch (error: unknown) {
-    throw new Error(`${ENV_TARGETS_JSON} must be a JSON object: ${messageFromUnknown(error)}`);
+    await hosts.close();
+    throw error;
   }
 
-  if (!isRecord(parsed)) {
-    throw new Error(`${ENV_TARGETS_JSON} must be a JSON object keyed by host`);
-  }
+  logger.log({
+    level: "info",
+    event: "backend_server",
+    lifecycle: "listening",
+    status: "ok",
+  });
 
-  const targets = new Map<string, DaemonTarget>();
-  for (const [host, value] of Object.entries(parsed)) {
-    targets.set(host, parseTarget(host, value));
-  }
-  if (targets.size === 0) {
-    throw new Error(`${ENV_TARGETS_JSON} must contain at least one target`);
-  }
-  return targets;
+  return {
+    url: server.url,
+    port: server.port,
+    hosts,
+    close: async (): Promise<void> => {
+      await server.close();
+      await hosts.close();
+      logger.log({
+        level: "info",
+        event: "backend_server",
+        lifecycle: "closed",
+        status: "ok",
+      });
+    },
+  };
 }
 
-function parseTarget(host: string, value: unknown): DaemonTarget {
-  if (!isRecord(value) || typeof value["kind"] !== "string") {
-    throw new Error(`target ${host} must be an object with a kind`);
-  }
-
-  if (value["kind"] === "unix") {
-    const socketPath = value["socketPath"];
-    if (typeof socketPath !== "string" || socketPath.length === 0) {
-      throw new Error(`target ${host} unix socketPath must be a non-empty string`);
-    }
-    return { kind: "unix", socketPath };
-  }
-
-  if (value["kind"] === "tcp") {
-    const targetHost = value["host"];
-    const port = value["port"];
-    if (typeof targetHost !== "string" || targetHost.length === 0) {
-      throw new Error(`target ${host} tcp host must be a non-empty string`);
-    }
-    if (typeof port !== "number" || !Number.isInteger(port) || port < 0 || port > 65_535) {
-      throw new Error(`target ${host} tcp port must be an integer from 0 to 65535`);
-    }
-    return { kind: "tcp", host: targetHost, port };
-  }
-
-  throw new Error(`target ${host} kind must be "unix" or "tcp"`);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function messageFromUnknown(source: unknown): string {
-  if (source instanceof Error) {
-    return source.message;
-  }
-  return String(source);
+export function startBackendFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  logger: BackendLogger = stdoutLogger,
+): Promise<BackendHandle> {
+  return startBackend(loadBackendConfig(env), logger);
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  startRelayFromEnv().catch((error: unknown) => {
-    console.error(messageFromUnknown(error));
+  startBackendFromEnv().catch((error: unknown): void => {
+    stdoutLogger.log({
+      level: "error",
+      event: "backend_startup",
+      lifecycle: "failed",
+      status: "failed",
+      error_class: errorClass(error),
+    });
+    console.error(
+      error instanceof BackendStartupError
+        ? error.message
+        : `Cannot start @pohunek/backend (${errorClass(error)}). Check the backend configuration.`,
+    );
     process.exitCode = 1;
   });
 }

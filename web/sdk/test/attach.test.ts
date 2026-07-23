@@ -6,7 +6,9 @@ import {
   ClientError,
   attachRawLocal,
   attachRawTcp,
+  connectLocal,
   connectRawLocal,
+  connectTcp,
   type RawStream,
 } from "@pohunek/sdk";
 import { attachRawTransport, connectRawTransport } from "../src/attach";
@@ -241,12 +243,12 @@ async function connectRaw(daemon: MockDaemon): Promise<RawStream> {
 
 async function connectControl(daemon: MockDaemon): Promise<Client> {
   if (daemon.endpoint.kind === "unix") {
-    return Client.connectLocal(daemon.endpoint.socketPath);
+    return connectLocal(daemon.endpoint.socketPath);
   }
   if (daemon.endpoint.kind === "memory") {
     return Client.connectTransport(daemon.endpoint.transport);
   }
-  return Client.connectTcp("build-box", { host: daemon.endpoint.host, port: daemon.endpoint.port });
+  return connectTcp("build-box", { host: daemon.endpoint.host, port: daemon.endpoint.port });
 }
 
 async function readAll(raw: RawStream, byteLength: number): Promise<Uint8Array> {

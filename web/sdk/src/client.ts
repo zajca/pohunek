@@ -1,15 +1,25 @@
-import { randomUUID } from "node:crypto";
 import { PROTOCOL_VERSION, type Methods, type ProtocolError } from "@pohunek/protocol";
 import { ClientError } from "./error";
 import { decodeResponse, type Request, type Response } from "./envelope";
 import { Subscription } from "./subscription";
 import type { ConnectOptions, ControlChannel, ResolvedConnectOptions, Transport } from "./transport";
 import { resolveConnectOptions } from "./transport";
-import { SocketTransport } from "./transport-socket";
 import { WsTransport } from "./transport-ws";
 
-const RUN_TOKEN = `${randomUUID().replaceAll("-", "")}${Date.now().toString(16)}`;
+// A 128-bit prefix keeps independently started SDK clients collision-resistant.
+const RUN_TOKEN_RANDOM_BYTES = 16;
+const RUN_TOKEN = `${randomToken()}${Date.now().toString(16)}`;
 let nextSequence = 0;
+
+function randomToken(): string {
+  const bytes = new Uint8Array(RUN_TOKEN_RANDOM_BYTES);
+  globalThis.crypto.getRandomValues(bytes);
+  let token = "";
+  for (const byte of bytes) {
+    token += byte.toString(16).padStart(2, "0");
+  }
+  return token;
+}
 
 export class Client {
   private readonly channel: ControlChannel;
@@ -29,18 +39,6 @@ export class Client {
 
   public static defaultOptions(): ResolvedConnectOptions {
     return resolveConnectOptions();
-  }
-
-  public static async connectLocal(socketPath: string, opts?: ConnectOptions): Promise<Client> {
-    return Client.connectTransport(SocketTransport.unix(socketPath, opts), opts);
-  }
-
-  public static async connectTcp(
-    host: string,
-    addr: { host: string; port: number },
-    opts?: ConnectOptions,
-  ): Promise<Client> {
-    return Client.connectTransport(SocketTransport.tcp(host, addr, opts), opts, host);
   }
 
   public static async connectWs(baseUrl: string, host: string, opts?: ConnectOptions): Promise<Client> {

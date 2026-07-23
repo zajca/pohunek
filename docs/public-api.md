@@ -54,7 +54,9 @@ Raw terminal bytes are never multiplexed onto a JSON control connection. Attach
 uses a separate connection described in "Attach Stream".
 
 The TypeScript SDK also supports a WebSocket relay transport for browser and
-Bun/Node clients that cannot dial Unix sockets or daemon TCP directly. The relay
+Bun/Node clients that cannot dial Unix sockets or daemon TCP directly. Browser
+code imports the browser-safe `@pohunek/sdk/browser` entry; the root
+`@pohunek/sdk` entry additionally exposes Bun/Node socket transports. The relay
 is not a daemon protocol endpoint and does not aggregate state. It is a pure
 one-WebSocket-to-one-daemon-connection tunnel:
 
@@ -659,17 +661,20 @@ render SDK failures in the same envelope taxonomy as daemon errors.
 ## TypeScript SDK Surface
 
 The `@pohunek/sdk` package mirrors the Rust SDK surface for TypeScript clients.
-Domain types, method maps, event unions, constants, and generated protocol
-types come from `@pohunek/protocol`; the SDK owns envelopes, framing,
-transports, request/subscription orchestration, attach helpers, and structured
-client errors.
+Its browser-safe `@pohunek/sdk/browser` entry contains no `node:net` imports and
+exports only the shared runtime and WebSocket path. Domain types, method maps,
+event unions, constants, and generated protocol types come from
+`@pohunek/protocol`; the SDK owns envelopes, framing, transports,
+request/subscription orchestration, attach helpers, and structured client
+errors.
 
 Public exports:
 
 - `Client`: framed request/response and subscription client.
 - `nextRequestId(method)`: shared correlation-id generator used by SDK-backed
   TypeScript clients.
-- `SocketTransport`: direct Unix/TCP `node:net` transport for Bun/Node.
+- `SocketTransport`: direct Unix/TCP `node:net` transport for Bun/Node; exported
+  only by the root `@pohunek/sdk` entry.
 - `WsTransport`: WebSocket relay transport using the WHATWG `WebSocket` global.
 - `Transport`: pluggable transport interface with `control()` for framed
   control channels and `raw()` for unframed attach channels.
@@ -695,8 +700,10 @@ Public exports:
   control envelopes used by the runtime SDK layer.
 - `decodeResponse`, `isRequest`, `isOkResponse`, `isErrResponse`, and `isEvent`:
   envelope guards and decoders for low-level callers and tests.
-- Raw and attach helpers: `connectRawLocal`, `connectRawTcp`, `connectRawWs`,
-  `attachRaw`, `attachRawLocal`, `attachRawTcp`, `attachRawWs`.
+- Raw and attach helpers: both entries export `connectRawWs`, `attachRawWs`,
+  `connectRawTransport`, and `attachRawTransport`; the root entry additionally
+  exports `connectRawLocal`, `connectRawTcp`, `attachRaw`, `attachRawLocal`, and
+  `attachRawTcp`.
 - Re-export of every symbol from `@pohunek/protocol`, including generated domain
   types, `Methods`, `ProtocolEvent`, `EventName`, `AttachPrelude`,
   `PROTOCOL_VERSION`, `MAX_CONTROL_LINE_BYTES`, `EVENT_NAMES`, and individual
@@ -709,20 +716,20 @@ Supported runtimes:
 - Node >= 18: supports the direct Unix/TCP socket transport through `node:net`.
 - Node >= 22: supports the WebSocket relay transport through the built-in WHATWG
   `WebSocket` global.
-- Browser: supports only the WebSocket relay transport; browsers cannot dial
-  daemon Unix sockets or NetBird TCP directly.
+- Browser: import `@pohunek/sdk/browser`; it supports only the WebSocket relay
+  transport because browsers cannot dial daemon Unix sockets or NetBird TCP
+  directly.
 
 Connection APIs:
 
 - `Client.defaultOptions()`: returns resolved default timeouts.
-- `Client.connectLocal(socketPath, opts?)`: direct Unix socket.
-- `Client.connectTcp(host, {host, port}, opts?)`: direct daemon TCP address with
-  host context preserved for remote errors.
 - `Client.connectWs(baseUrl, host, opts?)`: WebSocket relay. `baseUrl` may use
   `http`, `https`, `ws`, or `wss`; the SDK connects to
   `/daemon/<host>/control` under that base URL.
 - `Client.connectTransport(transport, opts?, remoteHost?)`: injection point for
   tests and custom transports that implement `Transport`.
+- `connectLocal(socketPath, opts?)` and `connectTcp(host, {host, port}, opts?)`:
+  root-entry Bun/Node helpers for a direct Unix socket or daemon TCP address.
 - `SocketTransport.unix(socketPath, opts?)` and `SocketTransport.tcp(host,
   {host, port}, opts?)`: construct direct socket transports.
 - `WsTransport.relay(baseUrl, host, opts?)`: constructs the WebSocket relay
@@ -747,15 +754,16 @@ Request APIs:
 
 Attach APIs:
 
-- `connectRawLocal`, `connectRawTcp`, and `connectRawWs` open unframed raw byte
-  channels without writing the attach prelude.
-- `attachRaw(host, socketPath, streamId, opts?)` mirrors the Rust convenience
-  helper for local hosts (`""` or `"local"`). The TypeScript SDK core does not
-  perform NetBird host resolution; remote callers pass an explicit address to
-  `attachRawTcp` or use the WebSocket relay with `attachRawWs`.
-- `attachRawLocal`, `attachRawTcp`, and `attachRawWs` open a raw channel, write
-  exactly one attach prelude, parse a failed redemption response as
-  `ClientError`, and otherwise return the raw attach stream.
+- Root-entry `connectRawLocal` and `connectRawTcp`, plus shared `connectRawWs`,
+  open unframed raw byte channels without writing the attach prelude.
+- Root-entry `attachRaw(host, socketPath, streamId, opts?)` mirrors the Rust
+  convenience helper for local hosts (`""` or `"local"`). The TypeScript SDK
+  core does not perform NetBird host resolution; remote callers pass an
+  explicit address to `attachRawTcp` or use the WebSocket relay with
+  `attachRawWs`.
+- Root-entry `attachRawLocal` and `attachRawTcp`, plus shared `attachRawWs`, open
+  a raw channel, write exactly one attach prelude, parse a failed redemption
+  response as `ClientError`, and otherwise return the raw attach stream.
 
 SDK error mapping:
 
@@ -769,9 +777,10 @@ SDK error mapping:
 - `ClientError.toProtocolError()` returns the structured `ProtocolError` for
   CLI/API rendering, and `recoverHint()` returns the optional recovery text.
 
-The `@pohunek/relay` package exports the transport-core server used by
-`WsTransport`: `startRelay({bindHost, port, targets, allowLoopbackBind?})`,
+The `@pohunek/backend` package (renamed from `@pohunek/relay`) exports the
+transport-core server used by `WsTransport`:
+`startRelay({bindHost, port, targets, allowLoopbackBind?})`,
 `validateRelayBindAddr`, `isNetbirdIp`, `RelayBindAddrError`, and the
-`DaemonTarget`/`RelayHandle` types. The package is pre-1.0 transport
-infrastructure for Track B; auth, TLS, host discovery, aggregation, and SPA
-serving are outside this relay core.
+`DaemonTarget`/`RelayHandle` types. The package rename and its added host
+discovery, `/api/hosts`, and SPA composition do not change the WebSocket relay
+framing contract documented above: it remains a transparent 1:1 tunnel.

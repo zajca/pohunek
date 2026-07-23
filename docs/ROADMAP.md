@@ -54,11 +54,10 @@ work.
 
 ## 3. Forward tracks
 
-The big remaining direction is **client surfaces** on top of the existing chassis.
+The forward direction is **client surfaces** on top of the existing chassis.
 The chassis (daemon + control protocol) stays **provider-agnostic and
 presentation-agnostic** and gains no new network surface. Three separate tracks,
-in dependency order: **SDKs → native desktop app → (later) browser control
-center**.
+in dependency order: **SDKs → native desktop app → browser control center**.
 
 ### Track S — Public API + SDKs *(foundational, split out)*
 
@@ -80,7 +79,7 @@ Phase 4 so the desktop app and the browser app build on the same contract.
   (`web/shared`) + a runtime client with pluggable transports (TCP for Node/Bun
   → daemon direct; WebSocket for browser → backend). CI **drift check** fails if
   generated TS types diverge from the Rust source. Track B inherits
-  `web/backend` (`@pohunek/relay`) as its tested WebSocket transport core
+  `web/backend` (`@pohunek/backend`) as its tested WebSocket transport core
   instead of starting from a spec.
 
 **Stability:** no compatibility promise pre-1.0; SDK semver tracks the protocol
@@ -194,16 +193,25 @@ link persisted; no provider token appears in any daemon log, metadata, or event.
 **All met** as of the D.6 milestone, except the optional `gh pr review` posting,
 which is deferred.
 
-### Track B — Browser Control Center *(later / optional)*
+### Track B — Browser Control Center *(M1 complete; M2/M3 pending)*
 
-Phase 4 as designed ([`phases/04`](phases/04-browser-control-center.md)) — a
-standalone **TS aggregator backend** (Bun) + **Svelte 5 SPA** (xterm.js) + optional
-single-cert **mobile PWA**, with the same provider seam. Kept in the roadmap as a
-**later, optional** surface for **mobile / from-any-device** access (the one thing
-a native desktop app can't give you). It reuses **Track S** (TS SDK), inherits
-`web/backend` (`@pohunek/relay`) as the WebSocket daemon transport core, and
-keeps the **same opaque-link store + prompt-template conventions** as the desktop
-app and the sway scripts — one source of truth, multiple clients.
+Phase 4 as designed ([`phases/04`](phases/04-browser-control-center.md)),
+reconciled by the
+[Track B plan](design/track-b-web-control-center-plan-2026-07-22.md): a thin
+**Bun backend** (`@pohunek/backend` — pure relay tunnels, host discovery via
+the local daemon, SPA serving) + browser-side aggregation in
+**`@pohunek/client-core`** + a **Svelte 5 SPA** (xterm.js) + optional
+single-cert **mobile PWA**, with the same provider seam. The browser speaks
+the public protocol verbatim over the relay tunnels; the backend holds no
+protocol state. It remains an optional surface for **mobile /
+from-any-device** access (the one thing a native desktop app cannot give
+you), reusing **Track S** (TS SDK).
+
+**M1 is implemented:** Slices B + C, the notifications inbox, and the
+in-browser terminal provide the multi-host sessions workspace and live session
+lifecycle through one backend origin. **M2 is pending** for TLS and the mobile
+PWA; **M3 is pending** for Linear/GitHub providers, using the same opaque-link
+store and prompt-template conventions as the desktop app and sway scripts.
 
 Built **after** the desktop app proves the SDK and the provider seam. Nothing here
 changes the daemon (no gateway, no embedded assets, no daemon-side auth).
@@ -236,7 +244,7 @@ changes the daemon (no gateway, no embedded assets, no daemon-side auth).
    → D.3 (session/project/worktree) → D.4 (prompts) → D.5 (Linear + PRs); attach is
    delegated (D.2 folded in). **v1.1:** D.6 (diff review + comment-to-session
    loop) — shipped, minus the deferred `gh pr review` posting.
-4. **Track B (later/optional)** — when mobile / from-any-device access is wanted:
-   build the aggregator backend on the completed S.3 TS SDK and inherited
-   `web/backend` relay core → Svelte SPA → PWA → provider parity, reusing the
-   desktop app's provider seam and the shared link store.
+4. **Track B (optional)** — M1 shipped the backend, Svelte SPA, notifications
+   inbox, and in-browser terminal on the completed S.3 TS SDK. Continue with M2
+   (TLS + mobile PWA), then M3 (provider parity), reusing the desktop app's
+   provider seam and the shared link store.

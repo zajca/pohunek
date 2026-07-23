@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, type ProtocolError, type SessionInfo } from "@pohunek/protocol";
-import { Client, ClientError, type Request } from "@pohunek/sdk";
+import { Client, ClientError, connectLocal, connectTcp, type Request } from "@pohunek/sdk";
 import {
   errResponseLine,
   minimalSessionInfo,
@@ -239,7 +239,7 @@ describe("Client request/response", () => {
   });
 
   test("local daemon unreachable maps to daemon_unreachable with recovery hint", async () => {
-    const clientPromise = Client.connectLocal("/tmp/pohunek-sdk-missing-daemon.sock");
+    const clientPromise = connectLocal("/tmp/pohunek-sdk-missing-daemon.sock");
 
     const error = await expectClientError(clientPromise);
 
@@ -256,12 +256,12 @@ async function connectClient(
   opts?: { connectTimeoutMs?: number; requestTimeoutMs?: number },
 ): Promise<Client> {
   if (daemon.endpoint.kind === "unix") {
-    return Client.connectLocal(daemon.endpoint.socketPath, opts);
+    return connectLocal(daemon.endpoint.socketPath, opts);
   }
   if (daemon.endpoint.kind === "memory") {
     return Client.connectTransport(daemon.endpoint.transport, opts, host);
   }
-  return Client.connectTcp(host ?? "build-box", { host: daemon.endpoint.host, port: daemon.endpoint.port }, opts);
+  return connectTcp(host ?? "build-box", { host: daemon.endpoint.host, port: daemon.endpoint.port }, opts);
 }
 
 async function expectClientError(promise: Promise<unknown>): Promise<ClientError> {

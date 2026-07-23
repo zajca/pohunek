@@ -72,7 +72,7 @@ jobs:
           RUSTFLAGS: -D warnings
 
   web:
-    name: web SDK + relay
+    name: web SDK + control center
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -106,12 +106,31 @@ jobs:
         working-directory: web
         run: bun test
 
+      - name: Build web control center
+        working-directory: web
+        run: bun run build:frontend
+
+      - name: Install Playwright Chromium
+        working-directory: web
+        run: bunx playwright install --with-deps chromium
+
+      - name: Test web control center
+        working-directory: web
+        run: bun run test:e2e
+
       - name: Build daemon for web e2e
         run: cargo build -p pohunek-daemon
 
-      - name: Web e2e against real daemon
+      - name: SDK e2e against real daemon
         working-directory: web
         run: bun test sdk/test/e2e.test.ts
+        env:
+          POHUNEK_E2E: "1"
+          POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
+
+      - name: Backend e2e against real daemon
+        working-directory: web
+        run: bun test backend/test/real-daemon.e2e.test.ts
         env:
           POHUNEK_E2E: "1"
           POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd

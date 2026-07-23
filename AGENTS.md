@@ -51,7 +51,7 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | `crates/gui-core` | Pure, headless state + SDK bridge for the GUI (no Iced dependency; fully unit-testable). |
 | `crates/gui`      | Native Iced shell that wraps `gui-core` in `Task`/`Subscription`. |
 | `crates/xtask`    | Workspace automation (docs build/validate/check). |
-| `web/`            | Bun workspace for the TypeScript SDK packages: generated protocol types, SDK runtime, and relay core. |
+| `web/`            | Bun workspace: generated protocol types, SDK runtime, control-center backend/client core/SPA, and testkit. |
 
 Other top-level: `docs/` (architecture, roadmap, phases, knowledge source),
 `scripts/` (rofi/sway launchers, release helper).
@@ -77,7 +77,23 @@ bun install --frozen-lockfile
 bun run typecheck
 bun run lint
 bun test
+bunx playwright install --with-deps chromium  # prerequisite for browser e2e
+bun run test:e2e
 ```
+
+The real-daemon web suite is opt-in locally and mandatory in CI after building
+`pohunekd`:
+
+```bash
+POHUNEK_E2E=1 POHUNEK_DAEMON_BIN=/absolute/path/to/target/debug/pohunekd \
+  bun test sdk/test/e2e.test.ts backend/test/real-daemon.e2e.test.ts
+```
+
+For control-center development, `bun run dev` starts two fixture daemons, the
+backend, and the Vite frontend from `web/`; it does not require a Rust daemon or
+NetBird. Bun remains the workspace runtime, but `node` must be available on
+`PATH` because the orchestrator runs Vite in a Node child process for WebSocket
+proxy compatibility; `POHUNEK_NODE_BIN` overrides a nonstandard Node path.
 
 A protocol change is not done until `cargo xtask ts check` passes; regenerate
 with `cargo xtask ts generate`.

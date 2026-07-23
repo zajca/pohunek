@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { RelayBindAddrError, validateRelayBindAddr } from "@pohunek/relay";
+import { RelayBindAddrError, validateRelayBindAddr } from "@pohunek/backend";
 
 describe("validateRelayBindAddr", () => {
   test("accepts NetBird CGNAT IPv4 addresses", () => {

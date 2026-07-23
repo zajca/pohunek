@@ -5,17 +5,29 @@
   "workspaces": [
     "shared",
     "sdk",
-    "backend"
+    "backend",
+    "client-core",
+    "frontend",
+    "testkit"
   ],
   "scripts": {
-    "typecheck": "(cd shared && bun run typecheck) && (cd sdk && bun run typecheck) && (cd backend && bun run typecheck)",
-    "lint": "eslint \"**/*.ts\" --max-warnings=0",
-    "test": "bun test"
+    "dev": "bun run scripts/dev.ts",
+    "build:frontend": "cd frontend && bun run build",
+    "typecheck": "tsc --noEmit -p tsconfig.json && (cd shared && bun run typecheck) && (cd sdk && bun run typecheck) && (cd backend && bun run typecheck) && (cd testkit && bun run typecheck) && (cd client-core && bun run typecheck) && (cd frontend && bun run typecheck)",
+    "lint": "eslint \"**/*.{ts,svelte}\" --max-warnings=0",
+    "test": "bun test",
+    "test:e2e": "bun run build:frontend && bun ./node_modules/@playwright/test/cli.js test --config frontend/playwright.config.ts"
   },
   "devDependencies": {
+    "@playwright/test": "1.61.1",
+    "@pohunek/backend": "workspace:*",
+    "@pohunek/protocol": "workspace:*",
+    "@pohunek/testkit": "workspace:*",
     "@types/node": "^24.0.0",
     "eslint": "^9.0.0",
+    "eslint-plugin-svelte": "3.22.0",
     "typescript": "^5.0.0",
-    "typescript-eslint": "^8.0.0"
+    "typescript-eslint": "^8.0.0",
+    "vite": "8.1.5"
   }
 }

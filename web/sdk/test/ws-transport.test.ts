@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { describe, expect, test } from "bun:test";
 import { MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, type ProtocolError, type ProtocolEvent, type SessionInfo } from "@pohunek/protocol";
-import { startRelay, type DaemonTarget, type RelayHandle } from "@pohunek/relay";
+import { startRelay, type DaemonTarget, type RelayHandle } from "@pohunek/backend";
 import {
   Client,
   ClientError,
