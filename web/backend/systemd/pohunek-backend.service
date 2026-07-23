@@ -13,7 +13,7 @@ EnvironmentFile=%h/.config/pohunek/backend.env
 # Adjust this installed source path if Pohunek is deployed elsewhere. Keeping
 # Bun on PATH supports the standard ~/.bun/bin installation for a user unit.
 Environment=PATH=%h/.bun/bin:/usr/local/bin:/usr/bin
-ExecStart=/usr/bin/env bun run %h/.local/share/pohunek/web/backend/src/main.ts
+ExecStart=/usr/bin/env bun run %h/.local/share/pohunek/web/backend/src/entrypoint.ts
 Restart=on-failure
 
 [Install]

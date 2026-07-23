@@ -1,0 +1,15 @@
+# This template is rendered by web/release/install.sh. Do not install it directly.
+[Unit]
+Description=Pohunek web control center backend
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile="@CONFIG_FILE@"
+Environment="POHUNEK_BACKEND_STATIC_DIR=@INSTALL_DIR@/frontend"
+ExecStart="@INSTALL_DIR@/pohunek-web"
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

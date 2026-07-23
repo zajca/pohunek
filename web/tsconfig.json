@@ -4,6 +4,7 @@
     "declaration": false
   },
   "include": [
+    "release/smoke.ts",
     "scripts/**/*.ts"
   ]
 }

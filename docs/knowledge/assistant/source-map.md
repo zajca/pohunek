@@ -83,6 +83,8 @@ Web control center client:
 - `web/backend/src/hosts.ts`
 - `web/backend/src/server.ts`
 - `web/backend/systemd/pohunek-backend.service`
+- `web/backend/systemd/pohunek-backend.service.in`
+- `web/release/`
 - `web/client-core/src/index.ts`
 - `web/frontend/src/App.svelte`
 - `web/scripts/dev.ts`

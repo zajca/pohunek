@@ -1,4 +1,3 @@
-import { pathToFileURL } from "node:url";
 import { loadBackendConfig, type BackendConfig } from "./config";
 import { BackendStartupError, startHostsPipeline, type HostsPipelineHandle } from "./hosts";
 import { errorClass, stdoutLogger, type BackendLogger } from "./log";
@@ -42,6 +41,8 @@ export async function startBackend(
     event: "backend_server",
     lifecycle: "listening",
     status: "ok",
+    port: server.port,
+    url: server.url,
   });
 
   return {
@@ -68,20 +69,22 @@ export function startBackendFromEnv(
   return startBackend(loadBackendConfig(env), logger);
 }
 
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  startBackendFromEnv().catch((error: unknown): void => {
-    stdoutLogger.log({
-      level: "error",
-      event: "backend_startup",
-      lifecycle: "failed",
-      status: "failed",
-      error_class: errorClass(error),
+export function runBackend(): void {
+  void Promise.resolve()
+    .then((): Promise<BackendHandle> => startBackendFromEnv())
+    .catch((error: unknown): void => {
+      stdoutLogger.log({
+        level: "error",
+        event: "backend_startup",
+        lifecycle: "failed",
+        status: "failed",
+        error_class: errorClass(error),
+      });
+      console.error(
+        error instanceof BackendStartupError
+          ? error.message
+          : `Cannot start @pohunek/backend (${errorClass(error)}). Check the backend configuration.`,
+      );
+      process.exitCode = 1;
     });
-    console.error(
-      error instanceof BackendStartupError
-        ? error.message
-        : `Cannot start @pohunek/backend (${errorClass(error)}). Check the backend configuration.`,
-    );
-    process.exitCode = 1;
-  });
 }

@@ -90,6 +90,17 @@ wildcard binds are rejected. Use the supplied
 `POHUNEK_BACKEND_BIND_HOST` and `POHUNEK_BACKEND_PORT`; it can override the
 local daemon socket with `POHUNEK_BACKEND_DAEMON_SOCKET`.
 
+For a released Linux x86_64 deployment, download the
+`pohunek-web-*-linux-x86_64.tar.gz` release asset, unpack it, and run its
+`install.sh`. The archive contains a standalone backend executable with Bun
+embedded and the compiled SPA, so the target host does not need a Bun or source
+checkout. The installer writes a systemd user unit under the current user's XDG
+config directory and preserves an existing `backend.env`; edit that file with
+the host's NetBird address and chosen port, then run `systemctl --user
+daemon-reload` and `systemctl --user enable --now pohunek-backend.service`.
+The backend still runs on the same host as `pohunekd`, keeping Unix-socket
+discovery and the NetBird-only bind boundary intact.
+
 Browser code imports `Client` from `@pohunek/sdk/browser` and calls
 `Client.connectWs(window.location.origin, host)`. It must not dial daemon TCP or
 Unix sockets directly. The backend only tunnels the public newline-delimited
