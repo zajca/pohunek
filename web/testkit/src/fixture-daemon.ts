@@ -30,6 +30,12 @@ import {
   type NotificationStatus,
   type NotificationUpdateParams,
   type NotificationUpdateResult,
+  type ProjectAddParams,
+  type ProjectInfo,
+  type ProjectRemoveParams,
+  type ProjectShowParams,
+  type ProjectWorktree,
+  type SessionForkParams,
   type ProtocolError,
   type ProtocolEvent,
   type ProtocolVersion,
@@ -44,7 +50,10 @@ import {
   type SessionNewResult,
   type SessionResizeParams,
   type SessionResizeResult,
+  type SessionRenameParams,
+  type SessionSetMetadataParams,
   type SessionStopResult,
+  type WorktreeRemoveParams,
   type StateSource,
 } from "@pohunek/protocol";
 import { ActivePtyAttach, FixturePtyRegistry, type FixturePtyEvents, type FixturePtyOptions } from "./pty";
@@ -80,7 +89,13 @@ export interface StartFixtureDaemonOptions {
   readonly host?: FixtureHostOptions;
   readonly initialSessions?: readonly SessionInfo[];
   readonly initialNotifications?: readonly NotificationRecord[];
+  readonly initialProjects?: readonly FixtureProject[];
   readonly pty?: FixturePtyOptions;
+}
+
+export interface FixtureProject {
+  readonly project: ProjectInfo;
+  readonly worktrees?: readonly ProjectWorktree[];
 }
 
 export interface FixtureDaemonHandle {
@@ -119,6 +134,7 @@ const DEFAULT_CWD = "/tmp/pohunek-testkit";
 const FIRST_FIXTURE_PID = 42_000;
 const SESSION_ID_PREFIX = "s-testkit-";
 const NOTIFICATION_ID_PREFIX = "n-testkit-";
+const PROJECT_ID_PREFIX = "p-testkit-";
 const LINE_FEED = 0x0a;
 const CARRIAGE_RETURN = 0x0d;
 const SUPPORTED_AGENTS = ["shell", "codex", "claude"] as const;
@@ -155,6 +171,8 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
   private readonly subscribers = new Set<Socket>();
   private readonly sessions = new Map<string, SessionInfo>();
   private readonly notifications = new Map<string, NotificationRecord>();
+  private readonly projects = new Map<string, ProjectInfo>();
+  private readonly projectWorktrees = new Map<string, ProjectWorktree[]>();
   private readonly sessionResizes = new Map<string, ScenarioResize[]>();
   private endpointsValue: FixtureDaemonEndpoint[] = [];
   private discoveredHosts: HostRecord[];
@@ -181,6 +199,11 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     for (const notification of options.initialNotifications ?? []) {
       const cloned = cloneValue(notification);
       this.notifications.set(cloned.id, cloned);
+    }
+    for (const fixture of options.initialProjects ?? []) {
+      const project = cloneValue(fixture.project);
+      this.projects.set(project.id, project);
+      this.projectWorktrees.set(project.id, cloneValue([...(fixture.worktrees ?? [])]));
     }
   }
 
@@ -457,6 +480,16 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
         return this.handleSessionInspect(request);
       case "session.stop":
         return this.handleSessionStop(request);
+      case "session.rename":
+        return this.handleSessionRename(request);
+      case "session.set_metadata":
+        return this.handleSessionSetMetadata(request);
+      case "session.resume":
+        return this.handleSessionResume(request);
+      case "session.fork":
+        return this.handleSessionFork(request);
+      case "session.remove":
+        return this.handleSessionRemove(request);
       case "session.attach":
         return this.handleSessionAttach(request);
       case "session.detach":
@@ -469,6 +502,18 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
         return this.handleNotificationUpdate(request);
       case "notification.create":
         return this.handleNotificationCreate(request);
+      case "project.list":
+        return this.handleProjectList(request);
+      case "project.add":
+        return this.handleProjectAdd(request);
+      case "project.show":
+        return this.handleProjectShow(request);
+      case "project.rename":
+        return this.handleProjectRename(request);
+      case "project.remove":
+        return this.handleProjectRemove(request);
+      case "worktree.remove":
+        return this.handleWorktreeRemove(request);
       default:
         return errResponse(request.id, methodNotFound(request.method));
     }
@@ -540,6 +585,80 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     this.pty.closeSession(session.id);
     this.emitSessionEvent(EVENT_SESSION_STOPPED, session);
     return okResponse(request.id, { stopped: true } satisfies SessionStopResult);
+  }
+
+  private handleSessionRename(request: ControlRequest): ControlResponse {
+    const params = readObjectParams<SessionRenameParams>(request);
+    if (params === undefined || typeof params.session_id !== "string" || (params.name !== undefined && typeof params.name !== "string")) {
+      return errResponse(request.id, invalidParams(request.method));
+    }
+    const session = this.sessions.get(params.session_id);
+    if (session === undefined) return errResponse(request.id, sessionNotFound(params.session_id));
+    if (params.name === undefined) delete session.name;
+    else {
+      const name = params.name.trim();
+      if (name.length === 0) return errResponse(request.id, badRequest("session name must not be empty"));
+      session.name = name;
+    }
+    session.updated_at = timestamp();
+    this.emitSessionEvent(EVENT_SESSION_UPDATED, session);
+    return okResponse(request.id, { session: cloneValue(session) });
+  }
+
+  private handleSessionSetMetadata(request: ControlRequest): ControlResponse {
+    const params = readObjectParams<SessionSetMetadataParams>(request);
+    if (params === undefined || typeof params.session_id !== "string" || !isStringOrNullRecord(params.metadata)) {
+      return errResponse(request.id, invalidParams(request.method));
+    }
+    const session = this.sessions.get(params.session_id);
+    if (session === undefined) return errResponse(request.id, sessionNotFound(params.session_id));
+    const metadata = { ...(session.metadata ?? {}) };
+    for (const [key, value] of Object.entries(params.metadata)) {
+      if (value === null) delete metadata[key]; else metadata[key] = value;
+    }
+    if (Object.keys(metadata).length === 0) delete session.metadata; else session.metadata = metadata;
+    session.updated_at = timestamp();
+    this.emitSessionEvent(EVENT_SESSION_UPDATED, session);
+    return okResponse(request.id, { session: cloneValue(session) });
+  }
+
+  private handleSessionResume(request: ControlRequest): ControlResponse {
+    if (typeof request.params !== "string") return errResponse(request.id, invalidParams(request.method));
+    const session = this.sessions.get(request.params);
+    if (session === undefined) return errResponse(request.id, sessionNotFound(request.params));
+    if (session.state === "running" || session.external === true) return errResponse(request.id, badRequest("session cannot be resumed"));
+    session.state = "running";
+    delete session.exit_code;
+    session.updated_at = timestamp();
+    this.emitSessionEvent(EVENT_SESSION_UPDATED, session);
+    return okResponse(request.id, { session: cloneValue(session) });
+  }
+
+  private handleSessionFork(request: ControlRequest): ControlResponse {
+    const params = readObjectParams<SessionForkParams>(request);
+    if (params === undefined || typeof params.session_id !== "string" || params.cwd_mode !== "same" || !isPositiveInteger(params.cols) || !isPositiveInteger(params.rows)) {
+      return errResponse(request.id, invalidParams(request.method));
+    }
+    const source = this.sessions.get(params.session_id);
+    if (source === undefined) return errResponse(request.id, sessionNotFound(params.session_id));
+    if (source.external === true) return errResponse(request.id, badRequest("external sessions cannot be forked"));
+    const session = this.buildSession({ agent: source.agent, cols: params.cols, rows: params.rows, cwd: source.cwd, ...(params.name === undefined ? {} : { name: params.name }) });
+    if (source.metadata !== undefined) session.metadata = cloneValue(source.metadata);
+    this.sessions.set(session.id, session);
+    this.emitSessionEvent(EVENT_SESSION_CREATED, session);
+    return okResponse(request.id, cloneValue(session));
+  }
+
+  private handleSessionRemove(request: ControlRequest): ControlResponse {
+    if (typeof request.params !== "string") return errResponse(request.id, invalidParams(request.method));
+    const session = this.sessions.get(request.params);
+    if (session === undefined) return okResponse(request.id, { removed: false, stopped: false });
+    if (session.external === true) return errResponse(request.id, badRequest("external sessions cannot be removed"));
+    const stopped = session.state === "running" || session.state === "starting";
+    this.sessions.delete(session.id);
+    this.pty.closeSession(session.id);
+    this.emitEvent({ v: PROTOCOL_VERSION, event: EVENT_SESSION_REMOVED, session: cloneValue(session) });
+    return okResponse(request.id, { removed: true, stopped });
   }
 
   private handleSessionAttach(request: ControlRequest): ControlResponse {
@@ -649,6 +768,84 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     applyNotificationStatus(record, params.status);
     this.emitNotificationUpdated(record);
     return okResponse(request.id, { record: cloneValue(record) } satisfies NotificationUpdateResult);
+  }
+
+  private handleProjectList(request: ControlRequest): ControlResponse {
+    if (!isOptionalEmptyObject(request.params)) return errResponse(request.id, invalidParams(request.method));
+    return okResponse(request.id, Array.from(this.projects.values()).map((project) => cloneValue(project)));
+  }
+
+  private handleProjectAdd(request: ControlRequest): ControlResponse {
+    const params = readObjectParams<ProjectAddParams>(request);
+    if (params === undefined || typeof params.path !== "string" || !params.path.startsWith("/") || (params.name !== undefined && typeof params.name !== "string") || (params.base_branch !== undefined && typeof params.base_branch !== "string")) {
+      return errResponse(request.id, invalidParams(request.method));
+    }
+    const now = timestamp();
+    const id = `${PROJECT_ID_PREFIX}${this.projects.size + 1}`;
+    const project: ProjectInfo = {
+      id,
+      label: normalizedProjectLabel(params.name, params.path),
+      repo_root: params.path,
+      git_common_dir: `${params.path}/.git`,
+      ...(params.base_branch === undefined ? {} : { default_base_branch: params.base_branch }),
+      source: "manual",
+      is_bare: false,
+      added_at: now,
+      last_used_at: now,
+    };
+    this.projects.set(id, project);
+    this.projectWorktrees.set(id, [{ path: params.path, ...(params.base_branch === undefined ? {} : { branch: params.base_branch }), head: "testkit-head", bare: false, locked: false, owned: false }]);
+    return okResponse(request.id, cloneValue(project));
+  }
+
+  private handleProjectShow(request: ControlRequest): ControlResponse {
+    const params = readObjectParams<ProjectShowParams>(request);
+    if (params === undefined || typeof params.reference !== "string") return errResponse(request.id, invalidParams(request.method));
+    const project = this.projectByReference(params.reference);
+    if (project === undefined) return errResponse(request.id, badRequest("project was not found"));
+    return okResponse(request.id, { project: cloneValue(project), worktrees: cloneValue(this.projectWorktrees.get(project.id) ?? []) });
+  }
+
+  private handleProjectRename(request: ControlRequest): ControlResponse {
+    const params = readObjectParams<Methods["project.rename"]["params"]>(request);
+    if (params === undefined || typeof params.reference !== "string" || typeof params.name !== "string" || params.name.trim().length === 0) return errResponse(request.id, invalidParams(request.method));
+    const project = this.projectByReference(params.reference);
+    if (project === undefined) return errResponse(request.id, badRequest("project was not found"));
+    project.label = params.name.trim();
+    return okResponse(request.id, cloneValue(project));
+  }
+
+  private handleProjectRemove(request: ControlRequest): ControlResponse {
+    const params = readObjectParams<ProjectRemoveParams>(request);
+    if (params === undefined || typeof params.reference !== "string" || typeof params.prune_worktrees !== "boolean") return errResponse(request.id, invalidParams(request.method));
+    const project = this.projectByReference(params.reference);
+    if (project === undefined) return okResponse(request.id, { removed: false, pruned_worktrees: 0 });
+    const worktrees = this.projectWorktrees.get(project.id) ?? [];
+    const removable = params.prune_worktrees ? worktrees.filter((worktree) => worktree.owned && worktree.session_id === undefined) : [];
+    const skipped = params.prune_worktrees ? worktrees.filter((worktree) => worktree.owned && worktree.session_id !== undefined).map((worktree) => worktree.session_id as string) : [];
+    this.projects.delete(project.id);
+    this.projectWorktrees.delete(project.id);
+    return okResponse(request.id, { removed: true, pruned_worktrees: removable.length, ...(skipped.length > 0 ? { skipped_worktrees: skipped } : {}) });
+  }
+
+  private handleWorktreeRemove(request: ControlRequest): ControlResponse {
+    const params = readObjectParams<WorktreeRemoveParams>(request);
+    if (params === undefined || typeof params.path !== "string") return errResponse(request.id, invalidParams(request.method));
+    for (const [projectId, worktrees] of this.projectWorktrees) {
+      const index = worktrees.findIndex((worktree) => worktree.path === params.path);
+      if (index < 0) continue;
+      const worktree = worktrees[index];
+      if (worktree === undefined) continue;
+      if (!worktree.owned || worktree.session_id !== undefined) return errResponse(request.id, badRequest("worktree is not removable"));
+      worktrees.splice(index, 1);
+      this.projectWorktrees.set(projectId, worktrees);
+      return okResponse(request.id, { removed: true });
+    }
+    return okResponse(request.id, { removed: false });
+  }
+
+  private projectByReference(reference: string): ProjectInfo | undefined {
+    return Array.from(this.projects.values()).find((project) => project.id === reference || project.label === reference);
   }
 
   private buildSession(params: SessionNewParams): SessionInfo {
@@ -1321,6 +1518,20 @@ function isStringRecord(value: unknown): value is Record<string, string> {
     return false;
   }
   return Object.values(value).every((entry) => typeof entry === "string");
+}
+
+function isStringOrNullRecord(value: unknown): value is Record<string, string | null> {
+  return isRecord(value) && Object.values(value).every((entry) => typeof entry === "string" || entry === null);
+}
+
+function isOptionalEmptyObject(value: unknown): boolean {
+  return value === null || (isRecord(value) && Object.keys(value).length === 0);
+}
+
+function normalizedProjectLabel(name: string | undefined, path: string): string {
+  const label = name?.trim();
+  if (label !== undefined && label.length > 0) return label;
+  return path.split("/").filter((segment) => segment.length > 0).at(-1) ?? path;
 }
 
 function isNotificationSource(value: unknown): value is NotificationCreateParams["source"] {

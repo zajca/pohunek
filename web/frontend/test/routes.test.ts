@@ -18,6 +18,8 @@ describe("frontend routes", () => {
       { kind: "session", host: "dev/peer", sessionId: "session #1" },
       { kind: "terminal", host: "dev/peer", sessionId: "session #1" },
       { kind: "inbox" },
+      { kind: "projects", host: "dev/peer" },
+      { kind: "project", host: "dev/peer", reference: "project #1" },
     ];
 
     for (const route of routes) {
@@ -45,6 +47,7 @@ describe("frontend routes", () => {
     expect(overlayForRoute({ kind: "new-session", host: "dev" })).toBe("new-session");
     expect(overlayForRoute({ kind: "session", host: "dev", sessionId: "s-1" })).toBe("session-inspector");
     expect(overlayForRoute({ kind: "inbox" })).toBe("inbox");
+    expect(overlayForRoute({ kind: "projects", host: "dev" })).toBeUndefined();
     expect(overlayForRoute({ kind: "terminal", host: "dev", sessionId: "s-1" })).toBeUndefined();
     expect(sessionSelectionFromRoute({ kind: "terminal", host: "dev", sessionId: "s-1" })).toEqual({
       host: "dev",

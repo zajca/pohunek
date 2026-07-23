@@ -3,6 +3,7 @@
   import CommandPalette from "./components/CommandPalette.svelte";
   import InboxDrawer from "./components/InboxDrawer.svelte";
   import NewSessionDialog from "./components/NewSessionDialog.svelte";
+  import ProjectsScreen from "./components/ProjectsScreen.svelte";
   import SessionInspector from "./components/SessionInspector.svelte";
   import ToastRegion from "./components/ToastRegion.svelte";
   import WorkspaceShell from "./components/WorkspaceShell.svelte";
@@ -99,6 +100,32 @@
   function openInbox(): void {
     commandPaletteOpen = false;
     router.navigate({ kind: "inbox" });
+  }
+
+  function openProjects(): void {
+    const connectedHost = selectedHost ?? Object.values($hosts).find((entry) => entry.connection.kind === "connected")?.host;
+    if (connectedHost === undefined) {
+      return;
+    }
+    router.navigate({ kind: "projects", host: connectedHost });
+  }
+
+  function openProject(host: string, reference: string): void {
+    router.navigate({ kind: "project", host, reference });
+  }
+
+  function selectProjectHost(host: string): void {
+    router.navigate({ kind: "projects", host });
+  }
+
+  function backToProjects(): void {
+    if ($current.kind === "project") {
+      router.navigate({ kind: "projects", host: $current.host });
+    }
+  }
+
+  function backToWorkspace(): void {
+    router.navigate({ kind: "workspace" });
   }
 
   function openDetails(host: string, sessionId: string): void {
@@ -255,6 +282,7 @@
       {sidebarCollapsed}
       onselect={selectSession}
       onnewsession={openNewSession}
+      onprojects={openProjects}
       oninbox={openInbox}
       ondetails={openDetails}
       onclose={closeTerminal}
@@ -272,6 +300,20 @@
       selectedHost={$current.host ?? selectedHost}
       onclose={closeOverlay}
       oncreated={selectSession}
+    />
+  {/if}
+
+  {#if $current.kind === "projects" || $current.kind === "project"}
+    <ProjectsScreen
+      {workspace}
+      {hosts}
+      host={$current.host}
+      reference={$current.kind === "project" ? $current.reference : undefined}
+      onopenproject={openProject}
+      onopensession={selectSession}
+      onselecthost={selectProjectHost}
+      onworkspace={backToWorkspace}
+      onbacktoprojects={backToProjects}
     />
   {/if}
 

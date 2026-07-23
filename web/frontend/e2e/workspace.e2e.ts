@@ -38,7 +38,7 @@ test("keeps every host in one session rail and promotes live blocked work", asyn
   await expect(localSession).toBeHidden();
 });
 
-test("creates on the chosen host, attaches immediately, and stops from the inspector", async ({ page, stack }) => {
+test("creates on the chosen host, attaches immediately, and stops from the toolbar", async ({ page, stack }) => {
   await page.goto(stack.backend.url);
   await expect(hostMarker(page, FIXTURE_PEER_HOST).locator("[data-connection]"))
     .toHaveAttribute("data-connection", "connected");
@@ -64,10 +64,11 @@ test("creates on the chosen host, attaches immediately, and stops from the inspe
   await page.keyboard.press("Shift+Tab");
   await expect(inspector.locator(":focus")).toHaveCount(1);
   await expect(inspector.getByTestId("session-detail")).toContainText(FIXTURE_PEER_HOST);
-  await inspector.getByRole("button", { name: "Stop session" }).click();
+  await inspector.getByRole("button", { name: "Close session details" }).click();
+  await page.getByRole("button", { name: "Stop", exact: true }).click();
   const confirmation = page.getByRole("dialog", { name: "Stop this session?" });
   await confirmation.getByRole("button", { name: "Stop session" }).click();
-  await expect(inspector.getByTestId("session-detail")).toContainText("stopped");
+  await expect(page.getByRole("button", { name: "Resume", exact: true })).toBeVisible();
 });
 
 test("keeps local work usable when a peer disconnects", async ({ page, stack }) => {

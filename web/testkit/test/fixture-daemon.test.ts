@@ -296,6 +296,31 @@ describe("@pohunek/testkit fixture daemon", () => {
       await daemon.close();
     }
   });
+  test("models session lifecycle parity and project/worktree safeguards", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("parity") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const created = await client.call("session.new", { agent: "codex", cols: TEST_COLS, rows: TEST_ROWS });
+      expect((await client.call("session.rename", { session_id: created.id, name: "Renamed" })).session.name).toBe("Renamed");
+      expect((await client.call("session.set_metadata", { session_id: created.id, metadata: { issue: "ABC-1" } })).session.metadata).toEqual({ issue: "ABC-1" });
+      const fork = await client.call("session.fork", { session_id: created.id, cwd_mode: "same", cols: RESIZED_COLS, rows: RESIZED_ROWS });
+      expect(fork.cols).toBe(RESIZED_COLS);
+      await client.call("session.stop", created.id);
+      expect((await client.call("session.resume", created.id)).session.state).toBe("running");
+      expect(await client.call("session.remove", created.id)).toEqual({ removed: true, stopped: true });
+
+      const project = await client.call("project.add", { path: "/tmp/test-project", name: "Test project", base_branch: "main" });
+      expect((await client.call("project.show", { reference: project.id })).project.label).toBe("Test project");
+      const shown = await client.call("project.show", { reference: project.id });
+      const protectedWorktree = await expectClientError(client.call("worktree.remove", { path: shown.worktrees[0]?.path ?? "" }));
+      expect(protectedWorktree.toProtocolError().code).toBe("bad_request");
+      expect((await client.call("project.rename", { reference: project.id, name: "Renamed project" })).label).toBe("Renamed project");
+      expect((await client.call("project.remove", { reference: project.id, prune_worktrees: true })).removed).toBe(true);
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
 });
 
 function testSocketPath(label: string): string {

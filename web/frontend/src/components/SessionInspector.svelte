@@ -4,7 +4,8 @@
   import type { Readable } from "svelte/store";
   import { addErrorToast, addToast } from "../lib";
   import AgentBadge from "./AgentBadge.svelte";
-  import ConfirmDialog from "./ConfirmDialog.svelte";
+  import FormDialog from "./FormDialog.svelte";
+  import SessionLifecycleActions from "./SessionLifecycleActions.svelte";
 
   interface Props {
     open: boolean;
@@ -23,8 +24,10 @@
   let detailKey = "";
   let loading = $state(false);
   let inspectFailed = $state(false);
-  let confirmStop = $state(false);
-  let stopping = $state(false);
+  let metadataOpen = $state(false);
+  let metadataKey = $state("");
+  let metadataValue = $state("");
+  let mutating = $state(false);
   let inspectGeneration = 0;
   let actionGeneration = 0;
   let drawer = $state<HTMLDivElement>();
@@ -65,7 +68,6 @@
       inspectGeneration += 1;
       actionGeneration += 1;
       loading = false;
-      stopping = false;
       restoreFocus();
     }
   });
@@ -98,24 +100,38 @@
     }
   }
 
-  async function stopSession(): Promise<void> {
+  async function updateMetadata(value: string | null): Promise<void> {
+    const key = metadataKey.trim();
+    if (key.length === 0) {
+      addToast("error", "Metadata key must not be empty");
+      return;
+    }
+    await runMutation(async (): Promise<void> => {
+      await workspace.actions.sessionSetMetadata(host, {
+        session_id: sessionId,
+        metadata: { [key]: value },
+      });
+      metadataOpen = false;
+      metadataKey = "";
+      metadataValue = "";
+      addToast("success", value === null ? "Metadata removed" : "Metadata saved");
+      await inspect();
+    });
+  }
+
+  async function runMutation(operation: () => Promise<void>): Promise<void> {
     const generation = actionGeneration + 1;
     actionGeneration = generation;
-    stopping = true;
+    mutating = true;
     try {
-      const result = await workspace.actions.sessionStop(host, sessionId);
-      if (generation !== actionGeneration || !open) {
-        return;
-      }
-      addToast("success", result.stopped ? "Session stopped" : "Session was already stopped");
-      await inspect();
+      await operation();
     } catch (error: unknown) {
       if (generation === actionGeneration && open) {
         addErrorToast(error);
       }
     } finally {
       if (generation === actionGeneration) {
-        stopping = false;
+        mutating = false;
       }
     }
   }
@@ -244,23 +260,63 @@
         {/if}
 
         <div class="primary-actions">
-          <button
-            class="button-primary"
-            type="button"
-            disabled={detail.state !== "running" || detail.external === true}
-            onclick={() => onopenterminal(host, sessionId)}
-          >
-            Open terminal
-          </button>
-          <button
-            class="button-danger"
-            type="button"
-            disabled={stopping || detail.state === "stopped" || detail.external === true}
-            onclick={() => { confirmStop = true; }}
-          >
-            {stopping ? "Stopping…" : "Stop session"}
-          </button>
+          {#if detail.external !== true}
+            <button
+              class="button-primary"
+              type="button"
+              disabled={detail.state !== "running"}
+              onclick={() => onopenterminal(host, sessionId)}
+            >
+              Open terminal
+            </button>
+          {/if}
         </div>
+
+        {#if detail.external !== true}
+          <section class="management-actions" aria-label="Session management">
+            <h3>Manage session</h3>
+            <SessionLifecycleActions
+              {workspace}
+              entry={{ host, session: detail, attachStreamIds: [] }}
+              onfork={onopenterminal}
+              onremove={onclose}
+            />
+            <div class="metadata">
+              <h4>Metadata</h4>
+              {#each Object.entries(detail.metadata ?? {}) as [key, value] (key)}
+                <div>
+                  <code>{key}</code>
+                  <span>{value}</span>
+                  <button
+                    type="button"
+                    onclick={() => {
+                      metadataKey = key;
+                      void updateMetadata(null);
+                    }}
+                    disabled={mutating}
+                  >
+                    Clear
+                  </button>
+                </div>
+              {:else}
+                <p>No metadata.</p>
+              {/each}
+              <button
+                type="button"
+                onclick={() => {
+                  metadataKey = "";
+                  metadataValue = "";
+                  metadataOpen = true;
+                }}
+                disabled={mutating}
+              >
+                Set metadata
+              </button>
+            </div>
+          </section>
+        {:else}
+          <p class="read-only">External observed sessions are read-only.</p>
+        {/if}
 
         <details class="technical-details">
           <summary>Technical details</summary>
@@ -272,7 +328,9 @@
             <div><dt>State source</dt><dd>{detail.state_source}</dd></div>
             <div><dt>Created</dt><dd>{detail.created_at}</dd></div>
             <div><dt>Updated</dt><dd>{detail.updated_at}</dd></div>
-            {#if detail.exit_code !== undefined}<div><dt>Exit code</dt><dd>{detail.exit_code}</dd></div>{/if}
+          {#if detail.exit_code !== undefined}
+            <div><dt>Exit code</dt><dd>{detail.exit_code}</dd></div>
+          {/if}
             {#if detail.native_session_id !== undefined}
               <div><dt>Native session ID</dt><dd>{detail.native_session_id}</dd></div>
             {/if}
@@ -283,14 +341,16 @@
   </div>
 {/if}
 
-<ConfirmDialog
-  open={confirmStop}
-  title="Stop this session?"
-  message="The agent process will stop. Existing terminal views will close."
-  confirmLabel="Stop session"
-  onconfirm={() => { confirmStop = false; void stopSession(); }}
-  oncancel={() => { confirmStop = false; }}
-/>
+<FormDialog
+  open={metadataOpen}
+  title="Set metadata"
+  submitting={mutating}
+  onclose={() => { metadataOpen = false; }}
+  onsubmit={() => { void updateMetadata(metadataValue); }}
+>
+  <label>Key<input bind:value={metadataKey} /></label>
+  <label>Value<input bind:value={metadataValue} /></label>
+</FormDialog>
 
 <style>
   .drawer-backdrop {
@@ -354,6 +414,21 @@
     display: grid;
     gap: 1.25rem;
   }
+
+  .management-actions,
+  .metadata {
+    display: grid;
+    gap: 0.75rem;
+  }
+
+  .metadata > div {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) auto;
+    gap: 0.5rem;
+    align-items: center;
+  }
+
+  .read-only { color: var(--muted); }
 
   .lifecycle,
   .unknown-activity {

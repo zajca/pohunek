@@ -3,7 +3,9 @@ export type AppRoute =
   | { readonly kind: "new-session"; readonly host?: string }
   | { readonly kind: "session"; readonly host: string; readonly sessionId: string }
   | { readonly kind: "terminal"; readonly host: string; readonly sessionId: string }
-  | { readonly kind: "inbox" };
+  | { readonly kind: "inbox" }
+  | { readonly kind: "projects"; readonly host: string }
+  | { readonly kind: "project"; readonly host: string; readonly reference: string };
 
 export type RouteOverlay = "new-session" | "session-inspector" | "inbox";
 
@@ -17,6 +19,7 @@ const SESSIONS_SEGMENT = "sessions";
 const NEW_SEGMENT = "new";
 const TERMINAL_SEGMENT = "terminal";
 const INBOX_SEGMENT = "inbox";
+const PROJECTS_SEGMENT = "projects";
 
 export function routePath(route: AppRoute): string {
   switch (route.kind) {
@@ -32,6 +35,10 @@ export function routePath(route: AppRoute): string {
       return `${sessionPath(route.host, route.sessionId)}/${TERMINAL_SEGMENT}`;
     case "inbox":
       return `/${INBOX_SEGMENT}`;
+    case "projects":
+      return `/${HOSTS_SEGMENT}/${encodeRouteSegment(route.host)}/${PROJECTS_SEGMENT}`;
+    case "project":
+      return `/${HOSTS_SEGMENT}/${encodeRouteSegment(route.host)}/${PROJECTS_SEGMENT}/${encodeRouteSegment(route.reference)}`;
   }
 }
 
@@ -51,6 +58,21 @@ export function parseRoute(pathname: string): AppRoute | undefined {
     && rawSegments[1] === NEW_SEGMENT
   ) {
     return { kind: "new-session" };
+  }
+
+  if (
+    rawSegments.length >= 3
+    && rawSegments[0] === HOSTS_SEGMENT
+    && rawSegments[2] === PROJECTS_SEGMENT
+  ) {
+    const host = decodeRouteSegment(rawSegments[1]);
+    if (host === undefined) return undefined;
+    if (rawSegments.length === 3) return { kind: "projects", host };
+    if (rawSegments.length === 4) {
+      const reference = decodeRouteSegment(rawSegments[3]);
+      return reference === undefined ? undefined : { kind: "project", host, reference };
+    }
+    return undefined;
   }
 
   if (
@@ -110,6 +132,8 @@ export function overlayForRoute(route: AppRoute): RouteOverlay | undefined {
       return "session-inspector";
     case "inbox":
       return "inbox";
+    case "projects":
+    case "project":
     case "workspace":
     case "terminal":
       return undefined;

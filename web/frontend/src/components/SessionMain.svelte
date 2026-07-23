@@ -4,6 +4,7 @@
     Workspace,
   } from "@pohunek/client-core";
   import EmbeddedTerminal from "./EmbeddedTerminal.svelte";
+  import SessionLifecycleActions from "./SessionLifecycleActions.svelte";
 
   interface Props {
     workspace: Workspace;
@@ -11,9 +12,10 @@
     ondetails: (host: string, sessionId: string) => void;
     onclose: () => void;
     onnewsession: () => void;
+    onselect: (host: string, sessionId: string) => void;
   }
 
-  let { workspace, entry, ondetails, onclose, onnewsession }: Props = $props();
+  let { workspace, entry, ondetails, onclose, onnewsession, onselect }: Props = $props();
 
   const canAttach = $derived(entry?.session.state === "running" && entry.session.external !== true);
 
@@ -95,6 +97,14 @@
       </div>
       <div class="session-toolbar-actions">
         <button type="button" onclick={openDetails}>Details</button>
+        {#if entry.session.external !== true}
+          <SessionLifecycleActions
+            {workspace}
+            {entry}
+            onfork={onselect}
+            onremove={onclose}
+          />
+        {/if}
         {#if canAttach}<button type="button" onclick={onclose}>Close terminal</button>{/if}
       </div>
     </header>

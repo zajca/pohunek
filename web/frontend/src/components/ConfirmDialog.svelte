@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { Snippet } from "svelte";
   interface Props {
     open: boolean;
     title: string;
@@ -6,6 +7,7 @@
     confirmLabel?: string;
     onconfirm: () => void;
     oncancel: () => void;
+    children?: Snippet;
   }
 
   let {
@@ -15,6 +17,7 @@
     confirmLabel = "Confirm",
     onconfirm,
     oncancel,
+    children,
   }: Props = $props();
   let dialog: HTMLDialogElement;
 
@@ -34,6 +37,7 @@
 >
   <h2>{title}</h2>
   <p>{message}</p>
+  {@render children?.()}
   <div class="actions-row">
     <button type="button" onclick={oncancel}>Cancel</button>
     <button class="button-danger" type="button" onclick={onconfirm}>{confirmLabel}</button>
