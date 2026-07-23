@@ -4,6 +4,7 @@ export type {
   FixtureDaemonHandle,
   FixtureDaemonListenOptions,
   FixtureHostOptions,
+  FixtureProject,
   StartFixtureDaemonOptions,
 } from "./fixture-daemon";
 export { DEFAULT_PTY_READY_BYTES } from "./pty";

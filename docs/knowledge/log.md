@@ -2,6 +2,8 @@
 
 ## Unreleased (2026-07-21)
 
+- Documented browser session lifecycle and metadata management, the host-scoped
+  Projects screen, and daemon-authoritative worktree removal safeguards.
 - Documented the M1 web control center, browser-safe TypeScript SDK entry,
   backend deployment boundary, and fixture-backed development stack.
 - Documented that the native GUI `Start session` and Review "Dispatch as

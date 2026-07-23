@@ -26,12 +26,22 @@ context rather than the primary navigation level.
 Selecting a running session attaches its PTY directly in the main pane without
 hiding the rail. Switching sessions detaches the old view and attaches the new
 one; resize and binary terminal traffic still use the daemon-owned attach
-stream. Non-running and observe-only sessions show a summary instead. Details
-and stop actions live in a session-inspector drawer, session creation is a
-modal that measures terminal geometry invisibly and attaches after creation,
-and the Inbox is an unread-first drawer. Opening a session-backed notification
-marks it read and selects that session. A failed peer remains marked as an
-error without disabling reachable hosts.
+stream. Non-running and observe-only sessions show a summary instead. The
+terminal toolbar can rename, stop, resume, fork, or permanently remove eligible
+sessions, while the inspector edits individual metadata keys. External observed
+sessions never expose mutating controls. Removal always requires confirmation
+and warns when it will also stop a live PTY. Session creation is a modal that
+measures terminal geometry invisibly and attaches after creation, and the Inbox
+is an unread-first drawer. Opening a session-backed notification marks it read
+and selects that session. A failed peer remains marked as an error without
+disabling reachable hosts.
+
+The host-scoped Projects screen registers a repository using an explicit
+absolute path on the daemon host, lists and renames project records, and removes
+them with an optional Pohunek-owned worktree prune. Project detail shows the
+live worktrees and links their active sessions. Only an owned worktree without a
+live session exposes removal, and the browser still relies on the daemon's typed
+ownership and lifecycle safeguards as the final authority.
 
 Keyboard controls apply only outside inputs, editable content, and the embedded
 terminal. `Ctrl+K` opens the command palette, `Ctrl+B` toggles the rail, `n`

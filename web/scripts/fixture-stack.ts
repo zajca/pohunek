@@ -8,8 +8,8 @@ import {
   type BackendHandle,
   type BackendLogger,
 } from "@pohunek/backend";
-import type { HostRecord, NotificationRecord, SessionInfo } from "@pohunek/protocol";
-import { startFixtureDaemon, type FixtureDaemonHandle } from "@pohunek/testkit";
+import type { HostRecord, NotificationRecord, ProjectInfo, SessionInfo } from "@pohunek/protocol";
+import { startFixtureDaemon, type FixtureDaemonHandle, type FixtureProject } from "@pohunek/testkit";
 
 export const FIXTURE_LOOPBACK_HOST = "127.0.0.1";
 export const FIXTURE_LOCAL_HOST = "local";
@@ -17,6 +17,9 @@ export const FIXTURE_PEER_HOST = "fixture-peer";
 export const FIXTURE_LOCAL_SESSION_ID = "s-local-seed";
 export const FIXTURE_PEER_SESSION_ID = "s-peer-seed";
 export const FIXTURE_NOTIFICATION_ID = "n-local-seed";
+export const FIXTURE_EXTERNAL_SESSION_ID = "s-external-seed";
+export const FIXTURE_PROJECT_ID = "p-local-seed";
+export const FIXTURE_OWNED_WORKTREE_PATH = "/tmp/pohunek-testkit/local-worktree";
 
 const FIXTURE_ROOT_PREFIX = "pohunek-frontend-";
 const FIXTURE_LOCAL_SOCKET_FILENAME = "daemon.sock";
@@ -69,8 +72,9 @@ export async function startFixtureStack(options: FixtureStackOptions = {}): Prom
       },
       daemonVersion: FIXTURE_LOCAL_DAEMON_VERSION,
       host: { discoveredHosts: [peerHostRecord()] },
-      initialSessions: [localSession()],
+      initialSessions: [localSession(), externalSession()],
       initialNotifications: [localNotification()],
+      initialProjects: [localProject()],
     });
 
     backend = await startBackend(
@@ -148,6 +152,37 @@ function peerSession(): SessionInfo {
     activity: "idle",
     created_at: FIXTURE_TIMESTAMP,
     updated_at: FIXTURE_TIMESTAMP,
+  };
+}
+
+function externalSession(): SessionInfo {
+  return {
+    ...localSession(),
+    id: FIXTURE_EXTERNAL_SESSION_ID,
+    name: "Observed external session",
+    external: true,
+    pid: FIXTURE_LOCAL_PID + 2,
+  };
+}
+
+function localProject(): FixtureProject {
+  const project: ProjectInfo = {
+    id: FIXTURE_PROJECT_ID,
+    label: "Fixture project",
+    repo_root: "/tmp/pohunek-testkit/project",
+    git_common_dir: "/tmp/pohunek-testkit/project/.git",
+    default_base_branch: "main",
+    source: "manual",
+    is_bare: false,
+    added_at: FIXTURE_TIMESTAMP,
+    last_used_at: FIXTURE_TIMESTAMP,
+  };
+  return {
+    project,
+    worktrees: [
+      { path: project.repo_root, branch: "main", head: "fixture-head", bare: false, locked: false, owned: false },
+      { path: FIXTURE_OWNED_WORKTREE_PATH, branch: "feature/test", head: "fixture-worktree-head", bare: false, locked: false, owned: true },
+    ],
   };
 }
 

@@ -20,6 +20,7 @@
     sidebarCollapsed?: boolean;
     onselect: (host: string, sessionId: string) => void;
     onnewsession: () => void;
+    onprojects: () => void;
     oninbox: () => void;
     ondetails: (host: string, sessionId: string) => void;
     onclose: () => void;
@@ -38,6 +39,7 @@
     sidebarCollapsed = false,
     onselect,
     onnewsession,
+    onprojects,
     oninbox,
     ondetails,
     onclose,
@@ -224,6 +226,7 @@
         Inbox
         {#if unreadCount > 0}<span class="unread-count" data-testid="unread-count">{unreadCount}</span>{/if}
       </button>
+      <button type="button" onclick={onprojects}>Projects</button>
       <button class="button-primary" type="button" onclick={onnewsession}>New session</button>
     </div>
   </header>
@@ -279,6 +282,7 @@
       {ondetails}
       {onclose}
       {onnewsession}
+      onselect={onselect}
     />
   </div>
 </div>

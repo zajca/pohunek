@@ -331,8 +331,15 @@ project, promotes blocked work into an Attention section, searches and filters
 across every host, and keeps compact host connectivity visible without making
 hosts the primary navigation. Selecting a running session attaches its terminal
 in the main pane while the rail remains available. Session metadata and stop
-actions live in an inspector drawer; new-session and Inbox flows are overlays,
-and opening a session notification marks it read and selects its terminal.
+actions live in an inspector drawer; the terminal toolbar can rename, stop,
+resume, fork, or permanently remove eligible sessions. Observed external
+sessions remain read-only. New-session and Inbox flows are overlays, and opening
+a session notification marks it read and selects its terminal.
+
+A host-scoped Projects screen registers repositories by absolute daemon-host
+path, renames or removes project records, shows live worktrees, and removes an
+eligible Pohunek-owned worktree after explicit confirmation. The daemon remains
+authoritative for worktree ownership, live-session, and pruning safeguards.
 
 Keyboard controls are available outside form fields and terminals: `Ctrl+K`
 opens the command palette, `Ctrl+B` toggles the session rail, `n` starts a

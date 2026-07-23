@@ -346,6 +346,33 @@ describe("@pohunek/client-core", () => {
       await relay.close();
     }
   });
+  test("dispatches typed session and project parity actions and reconciles their events", async () => {
+    const daemon = await startTcpFixture({});
+    const relay = await relayFor(new Map([["parity", tcpTarget(daemon)]]));
+    const workspace = workspaceFor(relay, [host("parity")]);
+    try {
+      await waitFor(() => connectionKind(workspace, "parity") === "connected");
+      const created = await workspace.actions.sessionNew("parity", { agent: "codex", cols: TEST_COLS, rows: TEST_ROWS });
+      await workspace.actions.sessionRename("parity", { session_id: created.id, name: "Renamed" });
+      await workspace.actions.sessionSetMetadata("parity", { session_id: created.id, metadata: { work_item: "ABC-1" } });
+      const fork = await workspace.actions.sessionFork("parity", { session_id: created.id, cwd_mode: "same", cols: RESIZED_COLS, rows: RESIZED_ROWS });
+      await waitFor(() => workspace.sessions.snapshot()[hostResourceKey("parity", fork.id)] !== undefined);
+      await workspace.actions.sessionStop("parity", created.id);
+      await workspace.actions.sessionResume("parity", created.id);
+      await workspace.actions.sessionRemove("parity", created.id);
+      await waitFor(() => workspace.sessions.snapshot()[hostResourceKey("parity", created.id)] === undefined);
+
+      const project = await workspace.actions.projectAdd("parity", { path: "/tmp/project", name: "Project" });
+      expect((await workspace.actions.projectList("parity", {})).some((item) => item.id === project.id)).toBe(true);
+      await workspace.actions.projectRename("parity", { reference: project.id, name: "Renamed project" });
+      expect((await workspace.actions.projectShow("parity", { reference: project.id })).project.label).toBe("Renamed project");
+      expect((await workspace.actions.projectRemove("parity", { reference: project.id, prune_worktrees: false })).removed).toBe(true);
+    } finally {
+      await workspace.close();
+      await relay.close();
+      await daemon.close();
+    }
+  });
 });
 
 interface StartTcpFixtureOptions {
