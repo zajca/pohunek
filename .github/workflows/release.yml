@@ -2,10 +2,9 @@ name: Release
 
 # Triggered by pushing a `vX.Y.Z` tag (created by `scripts/release`). First runs
 # the full quality gate (fmt/clippy/test) on the tagged commit, and only if that
-# passes builds the `pohunek` (CLI), `pohunekd` (daemon), and `pohunek-gui`
-# binaries for each target on a native runner, packages them into separate
-# component tarballs with sha256 checksums, and attaches everything to a GitHub
-# Release for that tag.
+# passes builds the native component binaries and the self-contained web control
+# center for Linux x86_64, packages them with sha256 checksums, and attaches
+# everything to a GitHub Release for that tag.
 #
 # A tag push does NOT run the CI workflow (CI runs on branch pushes and PRs), so
 # the gate is duplicated here: no binary is published from a commit that fails
@@ -16,7 +15,7 @@ on:
       - "v[0-9]+.[0-9]+.[0-9]+"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -66,10 +65,108 @@ jobs:
       - name: docs check
         run: cargo xtask docs check
 
+  web-gate:
+    name: web typecheck + lint + test + e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-web
+
+      - name: Install web dependencies
+        working-directory: web
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck web
+        working-directory: web
+        run: bun run typecheck
+
+      - name: Lint web
+        working-directory: web
+        run: bun run lint
+
+      - name: Test web
+        working-directory: web
+        run: bun test
+
+      - name: Build web control center
+        working-directory: web
+        run: bun run build:frontend
+
+      - name: Install Playwright Chromium
+        working-directory: web
+        run: bunx playwright install --with-deps chromium
+
+      - name: Test web control center
+        working-directory: web
+        run: bun run test:e2e
+
+      - name: Build daemon for web e2e
+        run: cargo build -p pohunek-daemon
+
+      - name: SDK e2e against real daemon
+        working-directory: web
+        run: bun test sdk/test/e2e.test.ts
+        env:
+          POHUNEK_E2E: "1"
+          POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
+
+      - name: Backend e2e against real daemon
+        working-directory: web
+        run: bun test backend/test/real-daemon.e2e.test.ts
+        env:
+          POHUNEK_E2E: "1"
+          POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
+
+  web-release:
+    name: Build web control center for Linux x86_64
+    needs: [gate, docs-gate, web-gate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+
+      - name: Install web dependencies
+        working-directory: web
+        run: bun install --frozen-lockfile
+
+      - name: Build and package web control center
+        id: package
+        working-directory: web
+        shell: bash
+        run: bash release/package.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          files: |
+            web/${{ steps.package.outputs.archive }}
+            web/${{ steps.package.outputs.checksum }}
+
   build:
     name: Build ${{ matrix.component }} for ${{ matrix.target }}
-    needs: [gate, docs-gate]
+    needs: [gate, docs-gate, web-gate]
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:

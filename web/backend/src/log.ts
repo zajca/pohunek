@@ -5,6 +5,8 @@ export interface BackendLogEvent {
   readonly event: string;
   readonly method?: string;
   readonly host?: string;
+  readonly port?: number;
+  readonly url?: string;
   readonly duration_ms?: number;
   readonly status?: number | string;
   readonly lifecycle?: string;

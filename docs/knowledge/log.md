@@ -6,6 +6,8 @@
   Projects screen, and daemon-authoritative worktree removal safeguards.
 - Documented the M1 web control center, browser-safe TypeScript SDK entry,
   backend deployment boundary, and fixture-backed development stack.
+- Documented the self-contained Linux x86_64 web release archive and its
+  systemd user-service installation flow.
 - Documented that the native GUI `Start session` and Review "Dispatch as
   session…" agent pickers now list the selected host's `supported_agents`
   (seeded from `host.inspect`): the base kinds `shell`/`codex`/`claude` plus

@@ -181,6 +181,13 @@ MUSL): `pohunek-cli-*`, `pohunek-daemon-*`, and `pohunek-gui-*`. Every archive
 contains the binary, license, and the offline documentation bundle under
 `docs/offline/`.
 
+Releases also publish `pohunek-web-*-linux-x86_64.tar.gz`: a standalone web
+control-center backend with Bun embedded, its compiled SPA, and a user-service
+installer. It runs beside a compatible local `pohunekd`; unpack it, run
+`./install.sh`, configure the required NetBird bind address and port in
+`~/.config/pohunek/backend.env`, then enable `pohunek-backend.service`. See the
+archive's `README.md` for the complete commands.
+
 Download from [Releases](https://github.com/zajca/pohunek/releases), unpack,
 and put the binaries on your `PATH`.
 
@@ -569,7 +576,8 @@ cargo xtask ts check      # CI gate
 
 `scripts/release` bumps the workspace version, tags `vX.Y.Z`, and pushes; the
 Release workflow re-runs the gates on the tag, then builds and publishes the
-glibc and MUSL x86_64 component archives with the offline docs bundled in.
+glibc and MUSL x86_64 component archives with the offline docs bundled in, plus
+a self-contained Linux x86_64 web-control-center archive.
 
 ## License
 
