@@ -41,7 +41,13 @@ focuses search, and `j`/`k` or the arrow keys move focus through session rows.
 valid session selection and rail state persist locally; a selection that is not
 present after the initial session snapshots settle is discarded.
 
-TLS/mobile PWA support and provider integration are later milestones.
+On mobile and short touch viewports, the rail is an accessible off-canvas
+drawer and the terminal expands to the available visual viewport. A touch
+toolbar focuses the software keyboard and sends Escape, Tab, Control-C, arrow
+keys, or one-shot Control and Alt combinations directly to the attached PTY.
+The layout uses full-viewport overlays, 44-pixel touch targets, safe-area
+insets, and portrait and landscape breakpoints. TLS and installable PWA support,
+as well as provider integration, remain later milestones.
 
 The TypeScript surfaces are:
 

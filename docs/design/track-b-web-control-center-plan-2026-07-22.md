@@ -137,10 +137,12 @@ is shown with an error marker, it never poisons the workspace.
 - **M1 — backend + client-core + SPA (Slices B + C + notifications).**
   Specified end-to-end in `NEXT.md` (2026-07-22). Done when the Phase 4
   Slice B and C checks pass against ≥2 fixture daemons in CI, plus the
-  notifications inbox, plus env-gated real-daemon e2e.
+  notifications inbox, plus env-gated real-daemon e2e. A responsive mobile
+  browser layout and touch terminal controls landed as an M1 follow-up.
 - **M2 — Slice D: TLS + mobile PWA.** HTTPS/`wss://` with one operator-provided
   cert, web app manifest + service worker, install flow verified on a mobile
-  browser; plain-HTTP desktop path unchanged. Includes a mobile layout pass.
+  browser; the existing responsive browser and plain-HTTP desktop paths remain
+  unchanged.
 - **M3 — Slice E: providers (Linear + GitHub).** Backend provider seam and
   `/api/providers/*` endpoints; browse issues/PRs; launch-on-item via
   `session.new` with rendered prompt templates (`~/.config/pohunek/prompts/`,

@@ -207,12 +207,36 @@ kbd {
   background: #0f1116;
 }
 
+.session-rail-container {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.session-rail-container > .session-rail {
+  width: 100%;
+  height: 100%;
+}
+
 .rail-heading {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 0.5rem;
   padding: 0.85rem 0.8rem 0.65rem;
+}
+
+.rail-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.rail-close-button {
+  width: 2.2rem;
+  padding-inline: 0;
+  color: var(--muted);
+  background: transparent;
 }
 
 .rail-heading h1 {
@@ -560,6 +584,17 @@ kbd {
   flex-direction: column;
   overflow: hidden;
   background: #090b0f;
+}
+
+.session-main-container {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.session-main-container > .session-main {
+  width: 100%;
+  height: 100%;
 }
 
 .session-toolbar {
@@ -1222,5 +1257,250 @@ dialog::backdrop {
 
   .session-summary dl {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 768px), (pointer: coarse) and (max-height: 500px) {
+  html,
+  body,
+  #app,
+  .app-shell,
+  .workspace-layer {
+    width: 100%;
+    max-width: 100%;
+    min-height: 100%;
+    overflow: hidden;
+  }
+
+  .workspace-layer,
+  .workspace-shell {
+    height: 100vh;
+    height: 100dvh;
+  }
+
+  .workspace-shell,
+  .workspace-shell.workspace-sidebar-collapsed {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: calc(3.5rem + env(safe-area-inset-top)) minmax(0, 1fr);
+    width: 100%;
+    max-width: 100vw;
+  }
+
+  .workspace-topbar {
+    grid-column: 1;
+    min-height: calc(3.5rem + env(safe-area-inset-top));
+    padding:
+      env(safe-area-inset-top)
+      max(0.5rem, env(safe-area-inset-right))
+      0
+      max(0.5rem, env(safe-area-inset-left));
+  }
+
+  .workspace-topbar button,
+  .session-rail button,
+  .session-toolbar button,
+  .terminal-status-line button,
+  .app-header a {
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+  }
+
+  .workspace-topbar .icon-button {
+    width: 2.75rem;
+  }
+
+  .workspace-actions {
+    min-width: 0;
+    gap: 0.25rem;
+  }
+
+  .workspace-actions > button {
+    display: inline-flex;
+  }
+
+  .workspace-actions .command-button,
+  .workspace-actions .attention-button {
+    display: none;
+  }
+
+  .session-rail-container.mobile-rail {
+    position: fixed;
+    z-index: 42;
+    inset: 0 auto 0 0;
+    width: min(22rem, calc(100vw - 2.75rem));
+    max-width: 100%;
+    height: 100vh;
+    height: 100dvh;
+    padding-left: env(safe-area-inset-left);
+    overflow: hidden;
+    visibility: hidden;
+    background: #0f1116;
+    box-shadow: 1rem 0 3rem rgb(0 0 0 / 45%);
+    transform: translateX(-105%);
+    transition:
+      transform 160ms ease-out,
+      visibility 0s linear 160ms;
+  }
+
+  .session-rail-container.mobile-rail.mobile-rail-open {
+    visibility: visible;
+    transform: translateX(0);
+    transition-delay: 0s;
+  }
+
+  .mobile-rail .session-rail {
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+    border-right: 0;
+  }
+
+  .mobile-rail-backdrop {
+    position: fixed;
+    z-index: 41;
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
+    height: 100dvh;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: rgb(0 0 0 / 62%);
+  }
+
+  .rail-heading {
+    min-height: 3.75rem;
+  }
+
+  .rail-tools input {
+    min-height: 2.75rem;
+  }
+
+  .session-filters button {
+    min-height: 2.75rem;
+    padding-inline: 0.7rem;
+  }
+
+  .session-item {
+    min-height: 3.25rem;
+  }
+
+  .host-strip {
+    min-height: calc(2.75rem + env(safe-area-inset-bottom));
+    padding-bottom: max(0.45rem, env(safe-area-inset-bottom));
+  }
+
+  .session-main-container {
+    grid-column: 1;
+    grid-row: 2;
+    width: 100%;
+    max-width: 100vw;
+    height: 100%;
+  }
+
+  .session-toolbar {
+    min-width: 0;
+    padding-right: max(0.65rem, env(safe-area-inset-right));
+    padding-left: max(0.65rem, env(safe-area-inset-left));
+  }
+
+  .session-identity,
+  .session-title-line {
+    min-width: 0;
+  }
+
+  .session-toolbar-actions {
+    flex: 0 0 auto;
+  }
+
+  .embedded-terminal {
+    max-width: 100vw;
+    padding-right: max(0.35rem, env(safe-area-inset-right));
+    padding-bottom: max(0.35rem, env(safe-area-inset-bottom));
+    padding-left: max(0.35rem, env(safe-area-inset-left));
+  }
+
+  .app-shell .drawer {
+    inset: 0 !important;
+    width: 100vw !important;
+    max-width: none !important;
+    padding:
+      max(1rem, env(safe-area-inset-top))
+      max(1rem, env(safe-area-inset-right))
+      max(1rem, env(safe-area-inset-bottom))
+      max(1rem, env(safe-area-inset-left)) !important;
+    border-left: 0 !important;
+  }
+
+  dialog.new-session-dialog {
+    width: 100vw !important;
+    max-width: none !important;
+    height: 100vh;
+    height: 100dvh;
+    max-height: none !important;
+    margin: 0;
+    padding:
+      max(1rem, env(safe-area-inset-top))
+      max(1rem, env(safe-area-inset-right))
+      max(1rem, env(safe-area-inset-bottom))
+      max(1rem, env(safe-area-inset-left));
+    border: 0;
+    border-radius: 0;
+  }
+
+  dialog.command-palette {
+    width: 100vw !important;
+    max-width: none !important;
+    max-height: min(75vh, 42rem) !important;
+    max-height: min(75dvh, 42rem) !important;
+    margin: auto 0 0;
+    padding-bottom: env(safe-area-inset-bottom);
+    border-radius: 0.85rem 0.85rem 0 0;
+  }
+
+  .toast-region {
+    right: max(0.5rem, env(safe-area-inset-right));
+    bottom: max(0.5rem, env(safe-area-inset-bottom));
+    width: min(26rem, calc(100vw - 1rem));
+  }
+
+  .app-header {
+    min-height: calc(3.5rem + env(safe-area-inset-top));
+    flex-direction: row;
+    align-items: center;
+    padding:
+      env(safe-area-inset-top)
+      max(0.75rem, env(safe-area-inset-right))
+      0
+      max(0.75rem, env(safe-area-inset-left));
+  }
+}
+
+@media (max-width: 480px) {
+  .workspace-actions > button:not(.button-primary) {
+    display: inline-flex;
+  }
+
+  .workspace-actions .command-button,
+  .workspace-actions .attention-button {
+    display: none;
+  }
+
+  .workspace-actions .button-primary {
+    width: 2.75rem;
+    padding-inline: 0;
+  }
+
+  .session-toolbar {
+    min-height: 4.25rem;
+  }
+
+  .session-identity p {
+    max-width: calc(100vw - 8rem);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-rail-container.mobile-rail {
+    transition: none;
   }
 }

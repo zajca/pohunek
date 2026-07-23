@@ -8,6 +8,13 @@
   import { Terminal, type IDisposable } from "@xterm/xterm";
   import { onMount } from "svelte";
   import { addErrorToast } from "../lib";
+  import { canRetryTerminal } from "../lib/terminal-connection";
+  import {
+    encodeTerminalToolbarKey,
+    type TerminalModifiers,
+    type TerminalToolbarKey,
+  } from "../lib/terminal-keys";
+  import MobileTerminalToolbar from "./MobileTerminalToolbar.svelte";
 
   interface Props {
     workspace: Workspace;
@@ -17,10 +24,14 @@
 
   const RESIZE_DEBOUNCE_MS = 140;
   const RESIZE_MAX_WAIT_MS = 500;
+  /** Keeps the status, touch controls, and a useful terminal area above a tall software keyboard. */
+  const MIN_MOBILE_TERMINAL_HEIGHT_PX = 120;
+  const MOBILE_TERMINAL_MEDIA_QUERY = "(pointer: coarse), (max-width: 760px)";
   const encoder = new TextEncoder();
 
   let { workspace, host, sessionId }: Props = $props();
   let terminalElement: HTMLDivElement;
+  let embeddedElement: HTMLDivElement;
   let terminal: Terminal | undefined;
   let status = $state("Attaching…");
   let failed = $state(false);
@@ -32,7 +43,9 @@
   let pendingResize: { readonly cols: number; readonly rows: number } | undefined;
   let teardownTask: Promise<void> | undefined;
   let closing = false;
-  let connecting = false;
+  let connecting = $state(false);
+  const toolbarAttached = $derived(status === "Attached");
+  const retryEnabled = $derived(canRetryTerminal({ failed, connecting, closing }));
 
   onMount((): (() => void) => {
     terminal = new Terminal({
@@ -68,11 +81,41 @@
       webglAddon = undefined;
     }
 
-    const resizeObserver = new ResizeObserver((): void => {
-      fitAddon.fit();
-    });
+    let fitFrame: number | undefined;
+    const scheduleFit = (): void => {
+      if (fitFrame !== undefined) {
+        cancelAnimationFrame(fitFrame);
+      }
+      fitFrame = requestAnimationFrame((): void => {
+        fitFrame = undefined;
+        if (!closing) {
+          fitAddon.fit();
+        }
+      });
+    };
+    const mobileMedia = window.matchMedia(MOBILE_TERMINAL_MEDIA_QUERY);
+    const visualViewport = window.visualViewport;
+    const syncVisualViewport = (): void => {
+      if (!mobileMedia.matches || visualViewport === null || visualViewport === undefined) {
+        embeddedElement.style.removeProperty("max-height");
+        scheduleFit();
+        return;
+      }
+      const terminalTop = embeddedElement.getBoundingClientRect().top;
+      const viewportBottom = visualViewport.offsetTop + visualViewport.height;
+      const availableHeight = Math.max(
+        MIN_MOBILE_TERMINAL_HEIGHT_PX,
+        Math.floor(viewportBottom - terminalTop),
+      );
+      embeddedElement.style.maxHeight = `${availableHeight}px`;
+      scheduleFit();
+    };
+    const resizeObserver = new ResizeObserver(scheduleFit);
     resizeObserver.observe(terminalElement);
-    fitAddon.fit();
+    visualViewport?.addEventListener("resize", syncVisualViewport);
+    visualViewport?.addEventListener("scroll", syncVisualViewport);
+    mobileMedia.addEventListener("change", syncVisualViewport);
+    syncVisualViewport();
 
     const inputSubscription = activeTerminal.onData((data): void => {
       const activeWriter = writer;
@@ -98,6 +141,12 @@
       closing = true;
       window.removeEventListener("beforeunload", beforeUnload);
       resizeObserver.disconnect();
+      visualViewport?.removeEventListener("resize", syncVisualViewport);
+      visualViewport?.removeEventListener("scroll", syncVisualViewport);
+      mobileMedia.removeEventListener("change", syncVisualViewport);
+      if (fitFrame !== undefined) {
+        cancelAnimationFrame(fitFrame);
+      }
       inputSubscription.dispose();
       resizeSubscription.dispose();
       webglContextLoss?.dispose();
@@ -142,8 +191,16 @@
   }
 
   async function retry(): Promise<void> {
-    await closeAttachment(false);
-    teardownTask = undefined;
+    if (!retryEnabled) {
+      return;
+    }
+    connecting = true;
+    try {
+      await closeAttachment(false);
+      teardownTask = undefined;
+    } finally {
+      connecting = false;
+    }
     const activeTerminal = terminal;
     if (activeTerminal !== undefined && !closing) {
       void connect(activeTerminal);
@@ -255,14 +312,31 @@
       }
     }
   }
+
+  function focusTerminal(): void {
+    terminal?.focus();
+  }
+
+  function sendToolbarKey(key: TerminalToolbarKey, modifiers: TerminalModifiers): void {
+    const activeWriter = writer;
+    if (activeWriter === undefined || status !== "Attached") {
+      return;
+    }
+    const data = encodeTerminalToolbarKey(key, modifiers);
+    void activeWriter.write(data).catch((error: unknown): void => {
+      if (!closing) {
+        addErrorToast(error);
+      }
+    });
+  }
 </script>
 
-<div class="embedded-terminal">
+<div class="embedded-terminal" bind:this={embeddedElement}>
   <div class="terminal-status-line" data-testid="terminal-status" role="status" aria-live="polite">
     <span class:status-attached={status === "Attached"} class="terminal-status-dot" aria-hidden="true"></span>
     <span>{status}</span>
     {#if failed}
-      <button type="button" onclick={() => void retry()}>Retry</button>
+      <button type="button" disabled={!retryEnabled} onclick={() => void retry()}>Retry</button>
     {/if}
   </div>
   <div
@@ -271,4 +345,9 @@
     data-testid="terminal"
     aria-label={`Terminal for ${sessionId} on ${host}`}
   ></div>
+  <MobileTerminalToolbar
+    attached={toolbarAttached}
+    onfocus={focusTerminal}
+    onsend={sendToolbarKey}
+  />
 </div>

@@ -16,6 +16,7 @@
     collapsed?: boolean;
     onselect: (host: string, sessionId: string) => void;
     onnewsession: () => void;
+    onclose?: (() => void) | undefined;
   }
 
   type SessionFilter = "all" | "blocked" | "working" | "idle" | "finished";
@@ -34,6 +35,7 @@
     collapsed = false,
     onselect,
     onnewsession,
+    onclose,
   }: Props = $props();
   let query = $state("");
   let filter: SessionFilter = $state("all");
@@ -179,10 +181,24 @@
         <h1>Sessions</h1>
       </div>
     {/if}
-    <button class="rail-new-button" type="button" onclick={onnewsession} aria-label="New session" title="New session">
-      <span aria-hidden="true">+</span>
-      {#if !collapsed}<span>New</span>{/if}
-    </button>
+    <div class="rail-heading-actions">
+      <button class="rail-new-button" type="button" onclick={onnewsession} aria-label="New session" title="New session">
+        <span aria-hidden="true">+</span>
+        {#if !collapsed}<span>New</span>{/if}
+      </button>
+      {#if onclose !== undefined}
+        <!-- svelte-ignore a11y_autofocus (modal navigation must receive focus when mounted) -->
+        <button
+          class="rail-close-button"
+          type="button"
+          autofocus
+          onclick={onclose}
+          aria-label="Close session navigation"
+        >
+          <span aria-hidden="true">×</span>
+        </button>
+      {/if}
+    </div>
   </div>
 
   {#if !collapsed}

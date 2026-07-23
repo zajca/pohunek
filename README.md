@@ -341,6 +341,14 @@ search, and `j`/`k` or the arrow keys move focus through the rail before
 `Enter` opens the focused session. `Esc` closes the active overlay. Unmodified
 shortcuts never intercept input inside the embedded terminal.
 
+On mobile and short touch viewports, the session rail becomes an off-canvas
+drawer so the terminal owns the screen. The terminal follows the visual
+viewport when the software keyboard opens and provides a touch toolbar for
+keyboard focus, Escape, Tab, one-shot Control and Alt modifiers, Control-C,
+and the arrow keys. Mobile overlays use the full viewport, controls provide
+44-pixel touch targets, and safe-area insets are respected in portrait and
+landscape orientations.
+
 For local UI development with two fixture daemons, run `bun run dev` from
 `web/`; no Rust daemon or NetBird setup is required. Bun remains the workspace
 runtime, while the development orchestrator requires `node` on `PATH` to run
