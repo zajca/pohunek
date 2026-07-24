@@ -2,9 +2,9 @@ use std::time::Duration;
 
 use protocol::ProtocolError;
 
+use super::LaunchCommand;
 use super::{AgentAdapter, InputRules, LaunchOpts};
 use crate::detect::Manifest;
-use crate::pty::PtyCommand;
 use crate::session::ShellCommand;
 
 /// Generic shell PTY adapter.
@@ -16,7 +16,7 @@ impl AgentAdapter for ShellAdapter {
         "shell"
     }
 
-    fn launch(&self, opts: &LaunchOpts) -> Result<PtyCommand, ProtocolError> {
+    fn launch(&self, opts: &LaunchOpts) -> Result<LaunchCommand, ProtocolError> {
         ShellCommand::default().launch(opts)
     }
 

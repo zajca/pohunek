@@ -2,20 +2,33 @@
 
 use std::collections::BTreeMap;
 
+use pohunek_worker_protocol::{
+    read_frame, Dimensions, FrameKind, Initialize, InitializeLimits,
+    LaunchIdentity as WorkerLaunchIdentity, SecretEnv, SessionId as WorkerSessionId, StopPolicy,
+    StreamId, StreamMode, TransactionId, Version,
+};
+
 use super::{
     build_pty_command, debug, detect_at, event, launch_adapter_for, plan_initial_input_delivery,
-    runtime_error, spawn_error_to_protocol, timestamp_now, warn, watch, AgentKind, Arc,
-    CancellationToken, CwdSource, DetectedProject, DetectorConfig, InputRules, LaunchOpts,
-    Manifest, Notify, PathBuf, ProjectRecord, ProtocolError, PtyCommand, PtyHandle, ResolvedAgent,
-    ResumeSnapshot, SessionEntry, SessionId, SessionInfo, SessionNewParams, SessionRegistry,
-    SessionState, SessionWarning, ShellCommand, StateSource, WorktreeRequest,
+    runtime_error, timestamp_now, warn, watch, AgentKind, Arc, CancellationToken, CwdSource,
+    DesiredState, DetectedProject, DetectorConfig, InputRules, LaunchCommand, LaunchOpts, Manifest,
+    Notify, PathBuf, ProjectRecord, ProtocolError, ResolvedAgent, ResumeBinding, ResumeSnapshot,
+    RuntimeHandle, RuntimeRecord, RuntimeState, SessionEntry, SessionId, SessionInfo,
+    SessionNewParams, SessionRecord, SessionRefKind, SessionRegistry, SessionRuntime, SessionState,
+    SessionTransaction, SessionWarning, ShellCommand, StateSource, TransactionKind, Worker,
+    WorkerLaunchMode, WorktreeRequest, DEFAULT_WORKER_SUBSCRIBER_BYTES,
+    DEFAULT_WORKER_TERMINAL_RETENTION, DEFAULT_WORKER_WRITE_DEDUP_ENTRIES,
+    SESSION_RECORD_SCHEMA_VERSION, WORKER_CONNECT_RETRY,
 };
+use crate::store::StoredInputRules;
 
 /// Everything needed to spawn and register one PTY-backed session, shared by
 /// first launch (`create`) and resume (`resume_binding`).
 #[derive(Debug)]
 pub(super) struct PtySessionSpec {
     pub(super) id: SessionId,
+    /// Lifecycle operation that owns this runtime launch.
+    pub(super) registration: PtyRegistration,
     /// Owner-set display name, frozen at creation and restored on resume. `None`
     /// shows the session by id.
     pub(super) name: Option<String>,
@@ -36,7 +49,7 @@ pub(super) struct PtySessionSpec {
     pub(super) cwd: PathBuf,
     pub(super) cols: u16,
     pub(super) rows: u16,
-    pub(super) command: PtyCommand,
+    pub(super) command: LaunchCommand,
     /// Native id when relaunching a captured session (`None` on first launch).
     pub(super) native_session_id: Option<String>,
     /// Native transcript path when relaunching a path-resuming captured session.
@@ -57,9 +70,29 @@ pub(super) struct PtySessionSpec {
     pub(super) warnings: Vec<SessionWarning>,
 }
 
+/// Durable lifecycle context for a PTY runtime launch.
+#[derive(Debug, Clone)]
+pub(super) enum PtyRegistration {
+    /// First runtime of a newly-created logical session.
+    Create,
+    /// Explicit provider-native recovery of an existing logical session.
+    Recover {
+        /// Stable transaction identifier persisted before worker replacement.
+        transaction_id: String,
+        /// Worker generation being replaced, when known.
+        previous_worker_id: Option<String>,
+        /// Runtime generation being replaced, when known.
+        previous_runtime_id: Option<String>,
+        /// Original logical-session creation time.
+        created_at: String,
+        /// Cancels reconnect attempts owned by the superseded runtime.
+        runtime_watch_cancel: CancellationToken,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LaunchCommandPlan {
-    pub(super) command: PtyCommand,
+    pub(super) command: LaunchCommand,
     pub(super) pending_initial_input: Option<String>,
 }
 
@@ -261,10 +294,6 @@ impl SessionRegistry {
     /// whereas an **implicit** non-git `--cwd` is the normal plain-shell case.
     /// Returns the record and, when detection ran, the [`DetectedProject`] (the
     /// in-place path needs its `checkout_path`/`is_linked_worktree`).
-    #[expect(
-        clippy::map_err_ignore,
-        reason = "spawn_blocking JoinError has no meaningful source to surface in ProtocolError"
-    )]
     async fn resolve_project(
         &self,
         params: &SessionNewParams,
@@ -310,15 +339,13 @@ impl SessionRegistry {
             Ok((Some(record), Some(detected)))
         })
         .await
-        .map_err(|_| runtime_error("project_resolve_failed", "project resolution task panicked"))?
+        .map_err(|_join_error| {
+            runtime_error("project_resolve_failed", "project resolution task panicked")
+        })?
     }
 
     /// Bind (or reuse) a worktree for `(session, repo, branch)` on a blocking
     /// thread. Errors when worktree binding is not configured.
-    #[expect(
-        clippy::map_err_ignore,
-        reason = "spawn_blocking JoinError has no meaningful source to surface in ProtocolError"
-    )]
     async fn bind_worktree(
         &self,
         session_id: &str,
@@ -344,16 +371,14 @@ impl SessionRegistry {
         };
         tokio::task::spawn_blocking(move || manager.bind(&request))
             .await
-            .map_err(|_| runtime_error("worktree_bind_failed", "worktree bind task panicked"))?
+            .map_err(|_join_error| {
+                runtime_error("worktree_bind_failed", "worktree bind task panicked")
+            })?
     }
 
     /// Spawn a PTY for `spec.command`, register the session, and start its
     /// detector and exit watcher. Shared by `create` (first launch) and
     /// `resume_binding` (relaunch after a daemon restart).
-    #[expect(
-        clippy::map_err_ignore,
-        reason = "spawn_blocking JoinError has no meaningful source to surface in ProtocolError"
-    )]
     #[expect(
         clippy::too_many_lines,
         reason = "session registration assembles one protocol snapshot plus task handles"
@@ -364,6 +389,7 @@ impl SessionRegistry {
     ) -> Result<SessionInfo, ProtocolError> {
         let PtySessionSpec {
             id,
+            registration,
             name,
             agent,
             agent_base,
@@ -385,23 +411,158 @@ impl SessionRegistry {
             warnings,
         } = spec;
 
-        let history_limit_bytes = self.inner.config.output_history_limit_bytes;
-        // Keep the program name for diagnostics: a spawn failure should name what
-        // could not be launched (see `spawn_error_to_protocol`).
-        let program = command.program.clone();
-        let pty =
-            tokio::task::spawn_blocking(move || PtyHandle::spawn(command, history_limit_bytes))
-                .await
-                .map_err(|_| runtime_error("spawn_failed", "PTY spawn task panicked"))?
-                .map_err(|err| spawn_error_to_protocol(err, &program))?;
-        let detector_output = pty.subscribe_output();
+        let created_at = match &registration {
+            PtyRegistration::Create => timestamp_now(),
+            PtyRegistration::Recover { created_at, .. } => created_at.clone(),
+        };
+        let (
+            transaction_id,
+            transaction_kind,
+            previous_worker_id,
+            previous_runtime_id,
+            replace_worker,
+        ) = match &registration {
+            PtyRegistration::Create => (
+                format!("create-{}", id.0),
+                TransactionKind::Create,
+                None,
+                None,
+                false,
+            ),
+            PtyRegistration::Recover {
+                transaction_id,
+                previous_worker_id,
+                previous_runtime_id,
+                ..
+            } => (
+                transaction_id.clone(),
+                TransactionKind::Recover,
+                previous_worker_id.clone(),
+                previous_runtime_id.clone(),
+                true,
+            ),
+        };
+        let preparing_runtime = SessionRuntime {
+            state: RuntimeState::Starting,
+            worker_id: None,
+            runtime_id: None,
+            started_at: None,
+            last_connected_at: None,
+            loss_reason: None,
+        };
+        let preparing_info = SessionInfo {
+            id: id.clone(),
+            external: Some(false),
+            name: name.clone(),
+            agent: agent.clone(),
+            agent_base,
+            cwd: cwd.clone(),
+            cwd_source: Some(CwdSource::Launch),
+            pid: 0,
+            runtime: Some(preparing_runtime),
+            cols,
+            rows,
+            state: SessionState::Starting,
+            state_source: StateSource::Process,
+            activity: None,
+            active_agent: None,
+            active_agent_base: None,
+            active_agent_pid: None,
+            active_agent_session_id: None,
+            active_agent_session_path: None,
+            native_session_id: native_session_id.clone(),
+            native_session_path: native_session_path.clone(),
+            project_id: project_id.clone(),
+            project_label: None,
+            is_linked_worktree,
+            repo: repo.clone(),
+            branch: branch.clone(),
+            worktree_path: worktree_path.clone(),
+            metadata: metadata.clone(),
+            warnings: warnings.clone(),
+            created_at: created_at.clone(),
+            updated_at: created_at.clone(),
+            exit_code: None,
+        };
+        self.write_session_record(SessionRecord {
+            schema_version: SESSION_RECORD_SCHEMA_VERSION,
+            session_id: id.0.clone(),
+            desired_state: DesiredState::Running,
+            transaction: Some(SessionTransaction {
+                id: transaction_id.clone(),
+                kind: transaction_kind,
+                phase: "preparing".to_owned(),
+                previous_worker_id: previous_worker_id.clone(),
+                previous_runtime_id: previous_runtime_id.clone(),
+            }),
+            info: preparing_info,
+            recovery: Some(ResumeBinding {
+                session_id: id.0.clone(),
+                name: name.clone(),
+                agent: agent.clone(),
+                agent_base,
+                cwd: cwd.clone(),
+                cols,
+                rows,
+                native_session_id: native_session_id.clone(),
+                native_session_path: native_session_path.clone(),
+                project_id: project_id.clone(),
+                is_linked_worktree,
+                metadata: metadata.clone(),
+                program: snapshot.program.clone(),
+                args: snapshot.args.clone(),
+                input_rules: StoredInputRules::from(input_rules),
+                resume_mode: snapshot.resume.map(|template| template.mode),
+                ref_kind: snapshot.resume.map(|template| template.ref_kind),
+                resumable: snapshot.resume.is_some(),
+            }),
+            runtime: RuntimeRecord {
+                state: RuntimeState::Starting,
+                worker_id: None,
+                runtime_id: None,
+                unit_name: Some(format!("pohunek-session@{}.service", id.0)),
+                reason: None,
+            },
+        })
+        .await?;
+        if let PtyRegistration::Recover {
+            runtime_watch_cancel,
+            ..
+        } = &registration
+        {
+            runtime_watch_cancel.cancel();
+            tokio::task::yield_now().await;
+        }
+
+        let started = match self
+            .start_runtime(
+                &id,
+                &agent,
+                agent_base,
+                snapshot.resume.map(|template| template.ref_kind),
+                command,
+                &transaction_id,
+                replace_worker,
+                previous_worker_id.as_deref(),
+            )
+            .await
+        {
+            Ok(started) => started,
+            Err(error) => {
+                if matches!(registration, PtyRegistration::Create) {
+                    self.delete_session_record(&id).await?;
+                }
+                return Err(error);
+            }
+        };
         let detector_cancel = CancellationToken::new();
         let procwatch_cancel = CancellationToken::new();
+        let runtime_watch_cancel = CancellationToken::new();
         let procwatch_rescan = Arc::new(Notify::new());
         let (detector_resize, detector_resize_rx) = watch::channel((rows, cols));
         let default_detector_config = DetectorConfig::for_profile(agent_base, manifest_override);
         let (detector_config, detector_config_rx) = watch::channel(default_detector_config.clone());
-        let root_pid = pty.pid();
+        let root_pid = started.root_pid;
 
         let now = timestamp_now();
         let info = SessionInfo {
@@ -412,7 +573,8 @@ impl SessionRegistry {
             agent_base,
             cwd,
             cwd_source: Some(CwdSource::Launch),
-            pid: pty.pid(),
+            pid: started.root_pid,
+            runtime: started.runtime_info,
             cols,
             rows,
             state: SessionState::Running,
@@ -434,23 +596,25 @@ impl SessionRegistry {
             worktree_path,
             metadata,
             warnings,
-            created_at: now.clone(),
+            created_at,
             updated_at: now,
             exit_code: None,
         };
 
-        {
+        let committed = {
             let mut sessions = self.inner.sessions.lock().await;
             sessions.insert(
                 id.clone(),
                 SessionEntry {
                     info: info.clone(),
-                    pty: pty.clone(),
+                    runtime: started.handle.clone(),
+                    desired_state: DesiredState::Running,
                     detector_cancel: detector_cancel.clone(),
                     detector_resize,
                     detector_config,
                     default_detector_config,
                     procwatch_cancel: procwatch_cancel.clone(),
+                    runtime_watch_cancel: runtime_watch_cancel.clone(),
                     procwatch_rescan: Arc::clone(&procwatch_rescan),
                     stopping: false,
                     input_rules,
@@ -459,22 +623,256 @@ impl SessionRegistry {
                     last_agent_report: None,
                     observed_agents: Vec::new(),
                 },
-            )
+            );
+            let entry = sessions
+                .get(&id)
+                .expect("session was inserted immediately above");
+            Self::session_record(&id, entry, DesiredState::Running, None)
         };
 
-        self.emit(event::SESSION_CREATED, &info);
+        self.write_session_record(committed).await?;
+        match registration {
+            PtyRegistration::Create => self.emit(event::SESSION_CREATED, &info),
+            PtyRegistration::Recover {
+                previous_runtime_id,
+                ..
+            } => self.emit_native_recovered(&info, previous_runtime_id),
+        }
         self.spawn_detector(
             id.clone(),
-            detector_output,
+            started.detector_output,
             (rows, cols),
             detector_cancel,
             detector_resize_rx,
             detector_config_rx,
         );
         self.spawn_procwatch(id.clone(), root_pid, procwatch_cancel, procwatch_rescan);
-        self.spawn_exit_watcher(id, pty);
+        match started.handle {
+            RuntimeHandle::Worker(worker) => {
+                self.spawn_worker_exit_watcher(id, worker, runtime_watch_cancel);
+            }
+            RuntimeHandle::Unavailable(state) => {
+                return Err(super::unavailable_runtime_error(&id, state));
+            }
+        }
         Ok(info)
     }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "runtime activation needs the persisted launch and replacement identity fields"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "systemd activation, private negotiation, initialization, and stream opening are one transaction"
+    )]
+    async fn start_runtime(
+        &self,
+        id: &SessionId,
+        agent: &str,
+        agent_base: AgentKind,
+        reference_kind: Option<SessionRefKind>,
+        command: LaunchCommand,
+        transaction_id: &str,
+        replace_worker: bool,
+        previous_worker_id: Option<&str>,
+    ) -> Result<StartedRuntime, ProtocolError> {
+        let Some(worker_root) = self.inner.config.worker_runtime_root.as_ref() else {
+            return Err(runtime_error(
+                "worker_backend_required",
+                "session launch requires a durable worker runtime root",
+            ));
+        };
+        let launch_mode = if replace_worker {
+            WorkerLaunchMode::Replace
+        } else {
+            WorkerLaunchMode::Start
+        };
+        self.inner
+            .launcher
+            .launch(&id.0, launch_mode)
+            .await
+            .map_err(|error| {
+                runtime_error(
+                    "worker_manager_unavailable",
+                    format!("failed to activate session worker {}: {error}", id.0),
+                )
+            })?;
+
+        let socket_path = worker_root
+            .join(&id.0)
+            .join(pohunek_paths::WORKER_SOCKET_NAME);
+        let deadline = tokio::time::Instant::now() + self.inner.config.worker_connect_deadline;
+        let worker = loop {
+            match Worker::connect(&socket_path, &id.0, self.daemon_instance_id()).await {
+                Ok(worker) => {
+                    let worker_id = worker.worker_id().await;
+                    let still_previous = replace_worker
+                        && previous_worker_id
+                            .is_some_and(|previous| worker_id.as_str() == previous);
+                    if !still_previous {
+                        break worker;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(runtime_error(
+                            "worker_replacement_failed",
+                            format!(
+                                "session worker {} did not advance to a new worker generation",
+                                id.0
+                            ),
+                        ));
+                    }
+                    debug!(
+                        session_id = %id.0,
+                        "waiting for replacement worker generation"
+                    );
+                    tokio::time::sleep(WORKER_CONNECT_RETRY).await;
+                }
+                Err(error) if tokio::time::Instant::now() < deadline => {
+                    debug!(
+                        session_id = %id.0,
+                        error = %error,
+                        "worker bootstrap socket not ready yet"
+                    );
+                    tokio::time::sleep(WORKER_CONNECT_RETRY).await;
+                }
+                Err(error) => {
+                    return Err(runtime_error(
+                        "worker_connect_failed",
+                        format!("failed to connect to session worker {}: {error}", id.0),
+                    ));
+                }
+            }
+        };
+
+        let worker_id = worker.worker_id().await;
+        let dimensions = Dimensions::new(command.cols, command.rows)
+            .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
+        let output_history_bytes = u64::try_from(self.inner.config.output_history_limit_bytes)
+            .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
+        let retention_ms = u64::try_from(DEFAULT_WORKER_TERMINAL_RETENTION.as_millis())
+            .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
+        let limits = InitializeLimits::new(
+            output_history_bytes,
+            DEFAULT_WORKER_SUBSCRIBER_BYTES,
+            DEFAULT_WORKER_WRITE_DEDUP_ENTRIES,
+            retention_ms,
+        )
+        .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
+        let stop_grace_ms = u64::try_from(self.inner.config.stop_grace.as_millis())
+            .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
+        let stop_policy = StopPolicy::new(stop_grace_ms)
+            .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
+        let environment = SecretEnv::new(command.env.iter().cloned().collect())
+            .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
+        let transaction_id = TransactionId::new(transaction_id)
+            .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
+        let worker_session_id = WorkerSessionId::new(&id.0)
+            .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
+        let runtime_id = worker
+            .initialize(Initialize {
+                session_id: worker_session_id,
+                transaction_id,
+                expected_worker_id: worker_id.clone(),
+                launch: WorkerLaunchIdentity {
+                    agent: agent.to_owned(),
+                    agent_base: super::agent_kind_label(agent_base).to_owned(),
+                    reference_kind: reference_kind.map(|kind| match kind {
+                        SessionRefKind::Id => "id".to_owned(),
+                        SessionRefKind::Path => "path".to_owned(),
+                    }),
+                },
+                executable: PathBuf::from(&command.program),
+                arguments: command.args,
+                cwd: command.cwd,
+                dimensions,
+                environment,
+                limits,
+                stop_policy,
+                hook_protocol_version: Version::new(1)
+                    .expect("worker hook protocol version is nonzero"),
+                public_protocol_version: protocol::PROTOCOL_VERSION.get(),
+            })
+            .await
+            .map_err(super::worker_error_to_protocol)?;
+        let snapshot = worker
+            .inspect()
+            .await
+            .map_err(super::worker_error_to_protocol)?;
+        let child = snapshot.child_process.ok_or_else(|| {
+            runtime_error(
+                "worker_initialize_failed",
+                format!("worker {} did not report a child process", id.0),
+            )
+        })?;
+        let detector_output = open_detector_output(&worker, id).await?;
+        let connected_at = timestamp_now();
+        Ok(StartedRuntime {
+            handle: RuntimeHandle::Worker(worker),
+            detector_output,
+            root_pid: child.pid,
+            runtime_info: Some(SessionRuntime {
+                state: RuntimeState::Live,
+                worker_id: Some(worker_id.to_string()),
+                runtime_id: Some(runtime_id.to_string()),
+                started_at: Some(connected_at.clone()),
+                last_connected_at: Some(connected_at),
+                loss_reason: None,
+            }),
+        })
+    }
+}
+
+struct StartedRuntime {
+    handle: RuntimeHandle,
+    detector_output: tokio::sync::broadcast::Receiver<Vec<u8>>,
+    root_pid: u32,
+    runtime_info: Option<SessionRuntime>,
+}
+
+pub(super) async fn open_detector_output(
+    worker: &Worker,
+    id: &SessionId,
+) -> Result<tokio::sync::broadcast::Receiver<Vec<u8>>, ProtocolError> {
+    let stream_id = StreamId::new(format!("detector-{}", id.0))
+        .map_err(|error| runtime_error("worker_detector_failed", error.to_string()))?;
+    let data = worker
+        .open_data(stream_id, StreamMode::Detector, None)
+        .await
+        .map_err(super::worker_error_to_protocol)?;
+    let (output, receiver) = tokio::sync::broadcast::channel(256);
+    tokio::spawn(async move {
+        let mut stream = data.stream;
+        loop {
+            match read_frame(&mut stream).await {
+                Ok(Some(frame)) => {
+                    let (header, payload) = frame.into_parts();
+                    match header.kind {
+                        FrameKind::Replay { .. }
+                        | FrameKind::Output { .. }
+                        | FrameKind::TerminalSnapshot { .. } => {
+                            let _ = output.send(payload);
+                        }
+                        FrameKind::Gap { .. }
+                        | FrameKind::InputAck { .. }
+                        | FrameKind::Exit { .. }
+                        | FrameKind::Error { .. }
+                        | FrameKind::Close { .. } => {}
+                        FrameKind::Open { .. } | FrameKind::Input { .. } => {
+                            warn!("worker detector received an invalid server frame");
+                            break;
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    warn!(error = %error, "worker detector data stream failed");
+                    break;
+                }
+            }
+        }
+    });
+    Ok(receiver)
 }
 
 pub(super) fn build_launch_command(

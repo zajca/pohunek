@@ -32,6 +32,12 @@ pub const ENV_SESSION_ID: &str = "POHUNEK_SESSION_ID";
 /// from a stale value left by a previous daemon process (different instance →
 /// allow). Regenerated on every daemon start; never persisted.
 pub const ENV_DAEMON_ID: &str = "POHUNEK_DAEMON_ID";
+/// Stable worker identity inherited by every process in a managed PTY.
+pub const ENV_WORKER_ID: &str = "POHUNEK_WORKER_ID";
+/// Owner-private worker endpoint used by durable identity hooks.
+pub const ENV_WORKER_SOCKET_PATH: &str = "POHUNEK_WORKER_SOCKET_PATH";
+/// Private worker-hook protocol version injected at runtime.
+pub const ENV_WORKER_PROTOCOL_VERSION: &str = "POHUNEK_WORKER_PROTOCOL_VERSION";
 /// Wire protocol version the hook must stamp on its request envelope.
 ///
 /// Injected (rather than baked into the asset) so the hook never hardcodes the

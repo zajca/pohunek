@@ -37,6 +37,7 @@ import type {
   ProjectRenameParams,
   ProjectShowParams,
   ProjectShowResult,
+  RuntimeInventoryResult,
   SessionAttachParams,
   SessionAttachResult,
   SessionDetachParams,
@@ -108,6 +109,7 @@ export interface Methods {
   "session.report_native_id": { params: SessionReportNativeIdParams; output: SessionReportNativeIdResult };
   "session.resize": { params: SessionResizeParams; output: SessionResizeResult };
   "session.resume": { params: SessionId; output: SessionResumeResult };
+  "session.runtime_inventory": { params: null; output: RuntimeInventoryResult };
   "session.set_metadata": { params: SessionSetMetadataParams; output: SessionSetMetadataResult };
   "session.stop": { params: SessionId; output: SessionStopResult };
   "subscribe": { params: null; output: JsonValue };

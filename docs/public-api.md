@@ -151,9 +151,10 @@ All params and result type names below refer to structs exported by
 | `session.list` | `SessionListParams` or `null` | `Vec<SessionInfo>` | Lists sessions; filters use AND semantics. |
 | `session.inspect` | `SessionId` | `SessionInfo` | `SessionId` is a JSON string, e.g. `"s-1"`. |
 | `session.stop` | `SessionId` | `SessionStopResult` | Stops a live session (the entry stays in `list`). |
-| `session.resume` | `SessionId` | `SessionResumeResult` | Relaunches a terminal session from captured native resume metadata, reusing the same session id. Live sessions return `session_not_terminal`; terminal sessions without native metadata return `not_resumable` or `agent_not_resumable`. |
+| `session.resume` | `SessionId` | `SessionResumeResult` | Explicitly recovers a terminal or lost logical session from captured native recovery metadata, reusing the logical session id but creating a new worker and runtime generation. Live, reconnecting, conflicting, or incompatible runtimes are rejected; sessions without native metadata return `not_resumable` or `agent_not_resumable`. Daemon restart never calls this method automatically. |
 | `session.fork` | `SessionForkParams` | `SessionForkResult` | Forks a native agent conversation into a new pohunek session id and PTY, using the source session's cwd/worktree for `cwd_mode: "same"`. Live sources are allowed. Unknown ids return `session_not_found`; external sessions return `session_external_read_only`; sources without launch-agent native metadata return `not_resumable` or `agent_not_resumable`; Codex-backed sessions return `agent_fork_unsupported`. A successful fork emits `session_created`. |
 | `session.remove` | `SessionId` | `SessionRemoveResult` | Evicts a session from the registry, stopping it first if still live. Unknown id is `session_not_found`. |
+| `session.runtime_inventory` | `null` | `RuntimeInventoryResult` | Returns the durable-worker runtime inventory captured at startup reconciliation: one `RuntimeInventoryEntry` per discovered worker with its runtime slot, claimed session id, worker/runtime ids, and classification (`managed`, `orphaned`, `conflict`, `incompatible`, or `identity_mismatch`). Read-only operator diagnostic; it never mutates or kills a worker. |
 | `session.attach` | `SessionAttachParams` | `SessionAttachResult` | Mints a one-shot attach stream id. |
 | `session.detach` | `SessionDetachParams` | `SessionDetachResult` | Cancels an active attach stream. Unknown streams return `detached: false`. |
 | `session.resize` | `SessionResizeParams` | `SessionResizeResult` | Resizes the PTY on the control connection. |
@@ -232,6 +233,13 @@ Important fields:
   `osc7`. `procwatch` is authoritative; `osc7` is an immediate hint that the
   next procwatch tick can overwrite if the focus process disagrees.
 - `pid`: root process id, or the observed external agent process id.
+- `runtime`: optional durable runtime object. It is absent for observed external
+  sessions and peers predating worker-backed sessions. `runtime.state` is
+  `starting`, `live`, `reconnecting`, `terminal`, `lost`, `conflict`, or
+  `incompatible`; `worker_id` identifies the PTY owner and `runtime_id`
+  identifies the PTY generation. `started_at`, `last_connected_at`, and
+  `loss_reason` are optional. Daemon reconnection preserves both identities;
+  explicit native recovery changes them.
 - `cols`, `rows`: current PTY size. External sessions have no PTY and report
   `0x0`.
 - `state`: `starting`, `running`, `stopped`, `done`, or `failed`.
@@ -259,6 +267,22 @@ Important fields:
 - `exit_code`: optional process exit code.
 
 ### Active-Agent Hook Payloads
+
+Managed PTY children inherit these reserved environment values:
+
+- `POHUNEK_ENV=1`
+- `POHUNEK_SESSION_ID`
+- `POHUNEK_WORKER_ID`
+- `POHUNEK_WORKER_SOCKET_PATH`
+- `POHUNEK_WORKER_PROTOCOL_VERSION`
+- `POHUNEK_SOCKET_PATH` for daemon-targeted notification delivery
+
+Identity hooks prefer the owner-private worker endpoint so an accepted launch
+or active identity is retained while the daemon is unavailable. Notification
+hooks continue to use the public daemon socket; notifications produced during a
+daemon outage are not durable. `POHUNEK_DAEMON_ID` remains additive compatibility
+data but is not the stable runtime identity and must not be used for
+self-feedback decisions by new clients.
 
 `session.report_agent` accepts the nested agent `source`, `agent`, optional
 `activity`, optional `seq`, optional `pid`, and optional active native metadata.
@@ -507,10 +531,15 @@ The daemon then writes these events:
 
 | Event | Payload | Meaning |
 |---|---|---|
-| `session_created` | `{session: SessionInfo}` | A session was created, forked, or explicitly resumed into a new live PTY. |
+| `session_created` | `{session: SessionInfo}` | A new logical session was created or forked. Daemon reconnection and native recovery use their dedicated runtime events. |
 | `session_updated` | `{session: SessionInfo}` | Session metadata, active-agent report/release, cwd/worktree/project association, state, resize, resume binding, or terminal state changed. |
 | `session_stopped` | `{session: SessionInfo}` | A user-requested stop completed. |
 | `session_removed` | `{session: SessionInfo}` | A session was evicted from the registry; clients drop it from their view. |
+| `session_runtime_reconnected` | `{session: SessionInfo}` | A replacement daemon adopted the same worker and runtime generation. This is not a new session and does not imply provider-native recovery. |
+| `session_runtime_lost` | `{session: SessionInfo}` | The worker or host runtime is gone. The logical record remains visible and may support explicit recovery. |
+| `session_runtime_conflict` | `{session: SessionInfo}` | Runtime discovery found duplicate, mismatched, or otherwise ambiguous live identity. The daemon quarantines the conflict and does not kill a worker automatically. |
+| `session_runtime_discovered` | `{entry: RuntimeInventoryEntry}` | Startup reconciliation classified a discovered durable worker that is not a plainly managed runtime (orphaned, conflicting, incompatible, or identity-mismatched). Emitted once per non-managed discovery so operators can inspect quarantined runtimes. |
+| `session_native_recovered` | `{session: SessionInfo, previous_runtime_id?: string, runtime_id?: string}` | Explicit provider-native recovery created a new worker and runtime generation for the same logical session. `previous_runtime_id` can be absent for a one-time migrated legacy session; production worker recovery includes the new `runtime_id`. |
 | `agent_state` | `{session_id: SessionId, activity: AgentActivity, source: StateSource}` | Agent activity changed. `source` may be `report` when a hook report supplied explicit active-agent state. |
 | `attach_opened` | `{session_id: SessionId, stream_id: string}` | A pending attach token was redeemed and a raw stream opened. |
 | `attach_closed` | `{session_id: SessionId, stream_id: string}` | A raw attach stream ended or was detached. |
@@ -581,9 +610,12 @@ Attach stream rules:
 - After successful redemption, bytes are opaque. Clients must not assume UTF-8.
 - `session.detach` cancels an active stream by `stream_id`; closing the raw
   socket also ends the attach.
-- `session.attach` may include `origin_session_id` and `origin_daemon_id`. When
-  both identify the same daemon-owned session the client is already running
-  inside, the daemon rejects the attach with `daemon/attach_self_feedback`.
+- `session.attach` may include `origin_session_id`, `origin_worker_id`, and the
+  additive legacy `origin_daemon_id`. New clients read the stable worker id from
+  their managed PTY environment. When the session and worker identify the
+  target runtime the client is already running inside, the daemon rejects the
+  attach with `daemon/attach_self_feedback`; this remains correct after daemon
+  replacement.
 - On the WebSocket relay transport, the attach prelude is sent as the first
   bytes on the `/daemon/<host>/attach` binary WebSocket. After redemption, every
   binary frame remains opaque PTY data.

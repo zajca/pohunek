@@ -102,6 +102,12 @@ enum Commands {
         action: IntegrationAction,
     },
 
+    /// Safely cross the one-time daemon-owned to worker-owned PTY boundary.
+    Migration {
+        #[command(subcommand)]
+        action: MigrationAction,
+    },
+
     /// Set up the sway/rofi launcher integration on this machine.
     ///
     /// With no subcommand, runs the full setup (scripts + config + sway
@@ -585,6 +591,19 @@ enum IntegrationAction {
 }
 
 #[derive(Debug, Subcommand)]
+enum MigrationAction {
+    /// Snapshot legacy sessions and refuse replacement while live PTYs exist.
+    Preflight {
+        /// Record informed consent to import live legacy sessions as runtime-lost.
+        #[arg(long)]
+        accept_runtime_loss: bool,
+        /// Emit the sanitized migration manifest as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum SetupAction {
     /// Materialize the launcher scripts into the data dir's `bin/`.
     Scripts {
@@ -798,6 +817,9 @@ impl Commands {
             }
             Commands::Session { action } => action.wants_json(),
             Commands::Integration { action } => action.wants_json(),
+            Commands::Migration { action } => match action {
+                MigrationAction::Preflight { json, .. } => *json,
+            },
             Commands::Setup { action, json } => {
                 action.as_ref().map_or(*json, SetupAction::wants_json)
             }
@@ -824,6 +846,7 @@ impl Commands {
             | Commands::Session { .. }
             | Commands::Subscribe { .. }
             | Commands::Integration { .. }
+            | Commands::Migration { .. }
             | Commands::Setup { .. }
             | Commands::Host { .. }
             | Commands::Prompt { .. }
@@ -1145,6 +1168,20 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             match action {
                 IntegrationAction::Install { agent, json } => {
                     commands::integration::run_install(&paths, agent, json).await?;
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Migration { action } => {
+            let paths = Paths::resolve()?;
+            let host = effective_host(&global_host, None);
+            match action {
+                MigrationAction::Preflight {
+                    accept_runtime_loss,
+                    json,
+                } => {
+                    commands::migration::run_preflight(&host, &paths, accept_runtime_loss, json)
+                        .await?;
                 }
             }
             Ok(ExitCode::SUCCESS)

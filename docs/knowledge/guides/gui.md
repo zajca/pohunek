@@ -13,8 +13,11 @@ intents: [setup, debug, help]
 projects, worktrees, and agent state through the Rust SDK. It does not embed a
 terminal: opening a live session delegates to the user's terminal by spawning the
 configured `attach_command`. Opening a terminal session first calls
-`session.resume` when native resume metadata is present, then attaches to the
-relaunched PTY.
+`session.resume` only when explicit native recovery is available, then attaches
+to the new PTY generation. After a daemon restart, the GUI reconnects and
+attaches to the existing worker/runtime instead of calling `session.resume`.
+Lost, conflicting, and incompatible runtimes remain visible with degraded
+actions rather than disappearing.
 
 Use this guide when the user asks to configure or debug the GUI.
 

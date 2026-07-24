@@ -16,23 +16,29 @@ export type SessionAttachParams = {
    * Set by the CLI from `POHUNEK_SESSION_ID` (see
    * [`ENV_SESSION_ID`](crate::ENV_SESSION_ID)): a process running inside a
    * session's own PTY carries that session's id here. Paired with
-   * [`Self::origin_daemon_id`], it lets the daemon reject an attach that would
-   * pipe a PTY's output back into its own input (an infinite loop). Sent for
-   * every transport (the loop is reachable even over a same-host loopback TCP
-   * attach); the daemon-id pairing prevents a false positive against a
-   * different daemon that reuses the same id string. Additive: an older daemon
-   * ignores it; an older CLI omits it.
+   * [`Self::origin_worker_id`], it lets the daemon reject an attach that would
+   * pipe a PTY's output back into its own input (an infinite loop), including
+   * after daemon replacement. Sent for every transport because the loop is
+   * reachable even over a same-host loopback TCP attach. Additive: an older
+   * daemon ignores it; an older CLI omits it.
    */
   origin_session_id?: SessionId;
   /**
    * Daemon instance the [`Self::origin_session_id`] belongs to, from
    * `POHUNEK_DAEMON_ID` (see [`ENV_DAEMON_ID`](crate::ENV_DAEMON_ID)).
    *
-   * The daemon rejects the attach as self-feeding only when **both** the
-   * session id matches the target **and** this equals its own live instance id.
-   * That scopes the guard to the exact PTY the client sits inside: a colliding
-   * id on another daemon, or a stale value from a previous daemon process, has
-   * a different instance id and is correctly allowed. Additive.
+   * Worker-backed sessions ignore this value for self-feedback protection.
+   * It remains an additive compatibility fallback only for the isolated
+   * workerless test runtime.
    */
   origin_daemon_id?: string;
+  /**
+   * Stable worker identity inherited from the originating managed PTY.
+   *
+   * A daemon restart changes its instance ID but does not change the worker
+   * that owns the PTY. New peers use this field with
+   * [`Self::origin_session_id`] for the self-feedback guard. This stable pair
+   * is authoritative for production sessions.
+   */
+  origin_worker_id?: string;
 };

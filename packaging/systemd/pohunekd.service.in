@@ -1,0 +1,15 @@
+[Unit]
+Description=Pohunek host control plane
+Documentation=https://github.com/zajca/zremoteng
+After=network.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=@BIN_DIR@/pohunekd
+Restart=on-failure
+RestartSec=5s
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

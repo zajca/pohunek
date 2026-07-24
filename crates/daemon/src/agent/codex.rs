@@ -2,9 +2,9 @@ use std::time::Duration;
 
 use protocol::ProtocolError;
 
+use super::LaunchCommand;
 use super::{launch_command, AgentAdapter, InputRules, LaunchOpts};
 use crate::detect::Manifest;
-use crate::pty::PtyCommand;
 
 /// Delay after bracketed paste before submitting Codex input.
 ///
@@ -23,7 +23,7 @@ impl AgentAdapter for CodexAdapter {
         "codex"
     }
 
-    fn launch(&self, opts: &LaunchOpts) -> Result<PtyCommand, ProtocolError> {
+    fn launch(&self, opts: &LaunchOpts) -> Result<LaunchCommand, ProtocolError> {
         launch_command("codex", Vec::new(), opts)
     }
 

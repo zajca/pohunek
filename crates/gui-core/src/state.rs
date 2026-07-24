@@ -1,6 +1,6 @@
 //! Headless workspace state machine and derived views for `gui-core`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use protocol::{
@@ -257,6 +257,14 @@ pub enum HostEvent {
     SessionUpdated(SessionInfo),
     SessionStopped(SessionInfo),
     SessionRemoved(SessionInfo),
+    /// The replacement daemon adopted the same PTY runtime generation.
+    RuntimeReconnected(SessionInfo),
+    /// The worker-backed PTY runtime is no longer available.
+    RuntimeLost(SessionInfo),
+    /// More than one worker claims the logical session.
+    RuntimeConflict(SessionInfo),
+    /// Explicit provider-native recovery created a different PTY generation.
+    NativeRecovered(SessionInfo),
     /// A durable notification record was created on the host.
     NotificationCreated(NotificationRecord),
     /// A durable notification record changed lifecycle status or content.
@@ -264,6 +272,16 @@ pub enum HostEvent {
     /// A durable notification record was hard-deleted on the host.
     NotificationDeleted(NotificationId),
     Other(Event),
+}
+
+/// Relationship between the current PTY generation and the previous one seen
+/// by the GUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeContinuity {
+    /// The daemon reconnected to the exact same worker/runtime generation.
+    Reconnected,
+    /// Explicit recovery replaced the PTY with a new runtime generation.
+    Recovered,
 }
 
 /// Per-host connection state for the headless workspace model.
@@ -454,11 +472,25 @@ pub struct Workspace {
     pub selection: Option<Selection>,
     pub notification_intents: Vec<NotificationIntent>,
     pub toasts: Vec<Toast>,
+    runtime_continuity: BTreeMap<(HostId, String), RuntimeContinuity>,
+    reconnecting_hosts: BTreeSet<HostId>,
     next_intent_id: u64,
     next_provider_request_id: u64,
 }
 
 impl Workspace {
+    /// Return how the current runtime relates to the prior observed generation.
+    #[must_use]
+    pub fn runtime_continuity(
+        &self,
+        host_id: &HostId,
+        session_id: &SessionId,
+    ) -> Option<RuntimeContinuity> {
+        self.runtime_continuity
+            .get(&(host_id.clone(), session_id.0.clone()))
+            .copied()
+    }
+
     fn next_provider_request_id(&mut self) -> ProviderRequestId {
         self.next_provider_request_id = self.next_provider_request_id.saturating_add(1);
         ProviderRequestId(self.next_provider_request_id)
@@ -557,6 +589,13 @@ impl Workspace {
     pub fn apply(&mut self, event: DomainEvent) {
         match event {
             DomainEvent::HostConnecting { host_id } => {
+                if self
+                    .hosts
+                    .get(&host_id)
+                    .is_some_and(|host| !host.sessions.is_empty())
+                {
+                    self.reconnecting_hosts.insert(host_id.clone());
+                }
                 self.hosts
                     .entry(host_id)
                     .and_modify(|host| {
@@ -567,12 +606,30 @@ impl Workspace {
             }
             DomainEvent::HostSnapshotLoaded { snapshot } => {
                 let host_id = snapshot.host_id.clone();
-                let sessions = snapshot
+                let prior_sessions = self
+                    .hosts
+                    .get(&host_id)
+                    .map_or_else(BTreeMap::new, |host| host.sessions.clone());
+                let reconnecting = self.reconnecting_hosts.remove(&host_id);
+                let sessions: BTreeMap<String, SessionInfo> = snapshot
                     .sessions
                     .iter()
                     .cloned()
                     .map(|session| (session.id.0.clone(), session))
                     .collect();
+                for (session_id, session) in &sessions {
+                    let Some(previous) = prior_sessions.get(session_id) else {
+                        continue;
+                    };
+                    let key = (host_id.clone(), session_id.clone());
+                    if runtime_generation_changed(previous, session) {
+                        self.runtime_continuity
+                            .insert(key, RuntimeContinuity::Recovered);
+                    } else if reconnecting && same_runtime_generation(previous, session) {
+                        self.runtime_continuity
+                            .insert(key, RuntimeContinuity::Reconnected);
+                    }
+                }
                 let projects = snapshot
                     .projects
                     .iter()
@@ -650,6 +707,7 @@ impl Workspace {
                     &mut self.notification_intents,
                     &mut self.toasts,
                     &mut self.next_intent_id,
+                    &mut self.runtime_continuity,
                 );
             }
             DomainEvent::HostDisconnected { host_id, error } => {
@@ -715,6 +773,7 @@ impl Workspace {
                     return;
                 };
                 host.sessions.remove(&session_id.0);
+                self.runtime_continuity.remove(&(host_id, session_id.0));
             }
             DomainEvent::SessionMetadataUpdated { host_id, result } => {
                 let Some(host) = self.host_mut_if_known(&host_id, "session metadata result") else {
@@ -2115,6 +2174,7 @@ fn apply_host_event(
     notifications: &mut Vec<NotificationIntent>,
     toasts: &mut Vec<Toast>,
     next_intent_id: &mut u64,
+    runtime_continuity: &mut BTreeMap<(HostId, String), RuntimeContinuity>,
 ) {
     match event {
         HostEvent::AgentState(state) => {
@@ -2127,10 +2187,38 @@ fn apply_host_event(
         HostEvent::SessionCreated(session)
         | HostEvent::SessionUpdated(session)
         | HostEvent::SessionStopped(session) => {
+            if host
+                .sessions
+                .get(&session.id.0)
+                .is_some_and(|previous| runtime_generation_changed(previous, &session))
+            {
+                runtime_continuity.insert(
+                    (host_id.clone(), session.id.0.clone()),
+                    RuntimeContinuity::Recovered,
+                );
+            }
             host.sessions.insert(session.id.0.clone(), session);
         }
         HostEvent::SessionRemoved(session) => {
             host.sessions.remove(&session.id.0);
+            runtime_continuity.remove(&(host_id.clone(), session.id.0));
+        }
+        HostEvent::RuntimeReconnected(session) => {
+            runtime_continuity.insert(
+                (host_id.clone(), session.id.0.clone()),
+                RuntimeContinuity::Reconnected,
+            );
+            host.sessions.insert(session.id.0.clone(), session);
+        }
+        HostEvent::NativeRecovered(session) => {
+            runtime_continuity.insert(
+                (host_id.clone(), session.id.0.clone()),
+                RuntimeContinuity::Recovered,
+            );
+            host.sessions.insert(session.id.0.clone(), session);
+        }
+        HostEvent::RuntimeLost(session) | HostEvent::RuntimeConflict(session) => {
+            host.sessions.insert(session.id.0.clone(), session);
         }
         HostEvent::NotificationCreated(record) => {
             // A freshly created durable notification is the single source of OS
@@ -2149,6 +2237,34 @@ fn apply_host_event(
         }
         HostEvent::Other(_) => {}
     }
+}
+
+fn same_runtime_generation(previous: &SessionInfo, current: &SessionInfo) -> bool {
+    previous
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.runtime_id.as_deref())
+        .zip(
+            current
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.runtime_id.as_deref()),
+        )
+        .is_some_and(|(previous_id, current_id)| previous_id == current_id)
+}
+
+fn runtime_generation_changed(previous: &SessionInfo, current: &SessionInfo) -> bool {
+    previous
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.runtime_id.as_deref())
+        .zip(
+            current
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.runtime_id.as_deref()),
+        )
+        .is_some_and(|(previous_id, current_id)| previous_id != current_id)
 }
 
 /// Store or replace a notification record, dropping it when the daemon reports a
@@ -3183,6 +3299,25 @@ mod tests {
     }
 
     #[test]
+    fn runtime_reconnect_event_parses_from_subscription_line() {
+        let expected = session_with_runtime("s-runtime", "runtime-1");
+        let event = Event::new(
+            event::SESSION_RUNTIME_RECONNECTED,
+            serde_json::json!({ "session": expected }),
+        );
+        let line = serde_json::to_string(&event).expect("line");
+
+        let message = parse_event_message(&HostId::new("local"), &line).expect("parse");
+        match message {
+            DomainEvent::HostEvent {
+                event: HostEvent::RuntimeReconnected(parsed),
+                ..
+            } => assert_eq!(parsed.id, SessionId("s-runtime".to_owned())),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
     fn workspace_stores_notifications_per_host() {
         let mut workspace = Workspace::default();
         // Events only apply to hosts already known through the connect path; a
@@ -3325,6 +3460,88 @@ mod tests {
         // Seeding never emits OS intents; otherwise the periodic reconcile tick
         // would re-notify every still-unread record on every reload.
         assert_eq!(workspace.notification_intents.len(), intents_after_live);
+    }
+
+    #[test]
+    fn reconnect_snapshot_distinguishes_same_runtime_from_recovery() {
+        let host_id = HostId::new("local");
+        let mut workspace = Workspace::default();
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
+            snapshot: snapshot(
+                "local",
+                vec![session_with_runtime("s-runtime", "runtime-1")],
+            ),
+        });
+
+        workspace.apply(DomainEvent::HostConnecting {
+            host_id: host_id.clone(),
+        });
+        workspace.apply(DomainEvent::HostSubscribed {
+            host_id: host_id.clone(),
+        });
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
+            snapshot: snapshot(
+                "local",
+                vec![session_with_runtime("s-runtime", "runtime-1")],
+            ),
+        });
+        assert_eq!(
+            workspace.runtime_continuity(&host_id, &SessionId("s-runtime".to_owned())),
+            Some(RuntimeContinuity::Reconnected)
+        );
+
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
+            snapshot: snapshot(
+                "local",
+                vec![session_with_runtime("s-runtime", "runtime-2")],
+            ),
+        });
+        assert_eq!(
+            workspace.runtime_continuity(&host_id, &SessionId("s-runtime".to_owned())),
+            Some(RuntimeContinuity::Recovered)
+        );
+    }
+
+    #[test]
+    fn runtime_events_update_session_and_continuity() {
+        let host_id = HostId::new("local");
+        let session_id = SessionId("s-runtime".to_owned());
+        let mut workspace = Workspace::default();
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
+            snapshot: snapshot(
+                "local",
+                vec![session_with_runtime("s-runtime", "runtime-1")],
+            ),
+        });
+
+        let mut lost = session_with_runtime("s-runtime", "runtime-1");
+        let runtime = lost.runtime.as_mut().expect("runtime");
+        runtime.state = protocol::RuntimeState::Lost;
+        runtime.loss_reason = Some("worker_missing".to_owned());
+        workspace.apply(DomainEvent::HostEvent {
+            host_id: host_id.clone(),
+            event: HostEvent::RuntimeLost(lost),
+        });
+        assert_eq!(
+            workspace
+                .hosts
+                .get(&host_id)
+                .expect("host")
+                .sessions
+                .get(&session_id.0)
+                .and_then(|session| session.runtime.as_ref())
+                .map(|runtime| runtime.state),
+            Some(protocol::RuntimeState::Lost)
+        );
+
+        workspace.apply(DomainEvent::HostEvent {
+            host_id: host_id.clone(),
+            event: HostEvent::NativeRecovered(session_with_runtime("s-runtime", "runtime-2")),
+        });
+        assert_eq!(
+            workspace.runtime_continuity(&host_id, &session_id),
+            Some(RuntimeContinuity::Recovered)
+        );
     }
 
     #[test]
@@ -3902,7 +4119,21 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_owned(),
             updated_at: "2026-01-01T00:00:00Z".to_owned(),
             exit_code: None,
+            runtime: None,
         }
+    }
+
+    fn session_with_runtime(id: &str, runtime_id: &str) -> SessionInfo {
+        let mut session = session(id, None);
+        session.runtime = Some(protocol::SessionRuntime {
+            state: protocol::RuntimeState::Live,
+            worker_id: Some(format!("worker-{runtime_id}")),
+            runtime_id: Some(runtime_id.to_owned()),
+            started_at: Some("2026-01-01T00:00:00Z".to_owned()),
+            last_connected_at: Some("2026-01-01T00:00:01Z".to_owned()),
+            loss_reason: None,
+        });
+        session
     }
 
     fn project(id: &str, repo_root: &str) -> ProjectInfo {

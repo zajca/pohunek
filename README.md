@@ -10,9 +10,10 @@
 </p>
 
 **pohunek** is a single-user control plane for durable coding-agent sessions
-across your own machines. A Rust daemon (`pohunekd`) owns the PTYs and agent
-processes on each host; the CLI (`pohunek`) drives it locally over a Unix
-socket and remotely over a NetBird/WireGuard mesh.
+across your own machines. A Rust daemon (`pohunekd`) owns logical session state
+and the public API on each host; one isolated `pohunek-sessiond` worker owns
+each live PTY and agent process. The CLI (`pohunek`) drives the daemon locally
+over a Unix socket and remotely over a NetBird/WireGuard mesh.
 
 **The GUI is optional.** The daemon and its protocol are the product; every
 client — the CLI, the bundled desktop GUI (`pohunek-gui`), your own launcher —
@@ -36,9 +37,10 @@ where they are doing it, and when they need you.
 
 **Durable agent sessions**
 
-- The daemon owns every PTY, so sessions survive client detach and terminal
-  crashes — attach from any terminal with `pohunek attach`, detach with
-  `Ctrl-]`, reattach later. Multiple clients can attach to one session.
+- A dedicated worker owns every PTY, so sessions survive client detach,
+  terminal crashes, daemon restart, daemon failure, and daemon binary upgrade.
+  Attach from any terminal with `pohunek attach`, detach with `Ctrl-]`, and
+  reattach later. Multiple clients can attach to one session.
 - Codex and Claude Code are first-class agents (plus plain `shell`), with
   per-host **agent profiles** that define the program, arguments, environment,
   and input rules for custom runtimes (e.g. `claude-otel`).
@@ -46,8 +48,10 @@ where they are doing it, and when they need you.
   from OSC terminal titles, screen-content pattern matching, and PTY activity.
   Detection rules are TOML manifests, so new agents can be added without
   recompiling.
-- **Native resume**: hooks capture the agent's own session id, so a stopped
-  session resumes the original conversation instead of replaying commands.
+- **Native recovery**: hooks capture the launch agent's own session id, so a
+  lost or terminal runtime can be recovered explicitly. Recovery creates a new
+  PTY generation; ordinary daemon restart reconnects to the existing worker and
+  never invokes provider-native resume.
 - **Session fork** — branch a Claude Code conversation into a new session and
   PTY without disturbing the original.
 - **Prompt injection done right**: `session input` and `--input` use per-agent
@@ -124,7 +128,9 @@ where they are doing it, and when they need you.
   into its own screen model and composites a one-row status banner that works
   even under full-screen TUIs; `Ctrl-\` opens a session menu (kill, detach,
   new session in the same worktree, fork, rename).
-- Attach auto-reconnects after a daemon restart when the session is resumable.
+- Attach auto-reconnects after a daemon restart to the same worker, PTY, child
+  PID, and runtime generation. A changed runtime generation is shown as
+  explicit native recovery, not seamless continuation.
 
 **Built to be driven by agents, not just humans**
 
@@ -155,14 +161,17 @@ where they are doing it, and when they need you.
        v                                   v
  +-----------------------------------------------------------+
  |                    host daemon (pohunekd)                  |
- |                                                            |
- |  control protocol: newline-delimited JSON                  |
- |  attach stream:    separate raw byte connection per PTY    |
- |                                                            |
- |  PTYs + agents | metadata | events + notifications | mesh  |
+ |  public protocol | logical state | reconciliation | mesh   |
  +-----------------------------------------------------------+
        |
-   Codex / Claude Code running in daemon-owned PTYs
+       | owner-private local worker protocol
+       v
+ +-----------------------------------------------------------+
+ | pohunek-session@s-42.service (one worker per live session) |
+ | PTY master | child process | output ring | terminal state  |
+ +-----------------------------------------------------------+
+       |
+   Codex / Claude Code running in worker-owned PTYs
 ```
 
 Each host is authoritative for its own sessions, projects, worktrees, and
@@ -170,16 +179,19 @@ notifications. Control traffic is newline-delimited JSON; attaching to a
 session opens a **separate raw byte connection**, so JSON stays JSON and
 terminal bytes stay bytes.
 
-Durability is tiered and honest: detach and client restarts are free; a
-**daemon restart kills live PTYs** by design, but session metadata, worktrees,
-and native agent conversations survive and can be resumed.
+Durability is tiered and explicit: detach, client restart, daemon restart,
+daemon crash, and daemon binary upgrade preserve the same live PTY and child
+PID. A host reboot, user-manager shutdown, or worker failure loses that runtime
+generation; the logical session remains visible as `runtime.state=lost` and may
+be recovered explicitly when it has valid native recovery metadata.
 
 ## Install
 
 Each release publishes per-component archives for x86_64 Linux (glibc and
 MUSL): `pohunek-cli-*`, `pohunek-daemon-*`, and `pohunek-gui-*`. Every archive
-contains the binary, license, and the offline documentation bundle under
-`docs/offline/`.
+contains its license and offline documentation under `docs/offline/`. Daemon
+archives contain `pohunekd`, `pohunek-sessiond`, the daemon service, the
+per-session worker template, the worker slice, and the installer.
 
 Releases also publish `pohunek-web-*-linux-x86_64.tar.gz`: a standalone web
 control-center backend with Bun embedded, its compiled SPA, and a user-service
@@ -191,12 +203,22 @@ archive's `README.md` for the complete commands.
 Download from [Releases](https://github.com/zajca/pohunek/releases), unpack,
 and put the binaries on your `PATH`.
 
+For the daemon component, run the included installer so the worker binary and
+all systemd user units are installed together. The first upgrade from a legacy
+daemon-owned PTY release refuses live sessions by default because those open
+PTYs cannot be transferred. Let them finish; use `--accept-runtime-loss` only
+after reviewing the affected ids and knowingly accepting the destructive
+boundary. See the
+[migration guide](docs/migrations/durable-session-workers.md) and
+[operations runbook](docs/runbooks/durable-session-workers.md).
+
 Or build from source (Rust 1.96+):
 
 ```bash
 git clone https://github.com/zajca/pohunek.git
 cd pohunek
-cargo build --release --locked --bin pohunek --bin pohunekd --bin pohunek-gui
+cargo build --release --locked \
+  --bin pohunek --bin pohunekd --bin pohunek-sessiond --bin pohunek-gui
 ```
 
 ## Quick start
@@ -240,7 +262,7 @@ them `--json` for machine-readable output (the exceptions are `attach`,
 | `pohunek health` / `status` | Daemon liveness, build, and protocol version. |
 | `pohunek session new` | Start a session: `--agent`, `--name`, `--project`/`--repo`, `--branch`, `--base-branch`, `--cwd`, `--input`, `--meta k=v`. |
 | `pohunek session list` | List sessions; `--filter state=running --filter agent=codex` (ANDed), `-q` for ids only. |
-| `pohunek session inspect <target>` | Full session record: state, activity, cwd, project, branch, worktree, resume binding. |
+| `pohunek session inspect <target>` | Full logical session record: agent state, runtime state and generation, cwd, project, branch, worktree, recovery binding. |
 | `pohunek attach <target>` | Attach the current terminal; `Ctrl-]` detaches. |
 | `pohunek session input <target> <text>` | Inject a prompt with agent-correct framing. |
 | `pohunek session fork <target>` | Fork an agent conversation into a new session (Claude Code). |
@@ -512,7 +534,9 @@ workspace in `web/` for the TypeScript packages.
 |-------|------|
 | `crates/protocol` | Wire contract: envelopes, methods, events, version negotiation. |
 | `crates/client` | Rust SDK: typed errors, transports, attach helpers. |
-| `crates/daemon` | `pohunekd`: PTY ownership, session registry, detection, notifications. |
+| `crates/daemon` | `pohunekd`: public control plane, logical session registry, reconciliation, detection, notifications. |
+| `crates/worker-protocol` | Versioned owner-private daemon-to-worker protocol and framing. |
+| `crates/session-worker` | `pohunek-sessiond`: one durable PTY runtime owner per live session. |
 | `crates/cli` | `pohunek`: every command over the control protocol. |
 | `crates/gui-core` | Headless GUI state + SDK bridge (no Iced; fully unit-testable). |
 | `crates/gui` | Native Iced shell wrapping `gui-core`. |

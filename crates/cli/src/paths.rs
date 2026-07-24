@@ -68,6 +68,14 @@ impl Paths {
     pub(crate) fn sway_config_dir(&self) -> PathBuf {
         self.config_home.join(pohunek_paths::SWAY_CONFIG_DIR)
     }
+
+    /// One-time legacy-to-worker migration manifest.
+    #[must_use]
+    pub(crate) fn worker_migration_manifest(&self) -> PathBuf {
+        self.data_dir
+            .join("migrations")
+            .join("durable-session-workers.json")
+    }
 }
 
 fn path_error(err: pohunek_paths::PathError) -> CliError {

@@ -2,9 +2,11 @@
 
 use super::{
     debug, event, event_payload, session_not_found, session_not_running, AtomicU64, AttachEvent,
-    CancellationToken, ErrorClass, Event, Ordering, ProtocolError, PtyHandle, SessionAttachParams,
-    SessionId, SessionRegistry, SessionState, SystemTime, UNIX_EPOCH,
+    CancellationToken, ErrorClass, Event, Ordering, ProtocolError, RuntimeHandle,
+    SessionAttachParams, SessionId, SessionRegistry, SessionState, SystemTime, UNIX_EPOCH,
 };
+use crate::runtime::DataStream;
+use pohunek_worker_protocol::{StreamId, StreamMode};
 
 #[derive(Debug, Clone)]
 pub(super) struct PendingAttach {
@@ -19,30 +21,37 @@ pub(super) struct ActiveAttach {
 }
 
 /// Redeemed raw attach stream state for the API bridge.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RedeemedAttach {
     /// One-shot stream id that was redeemed.
     pub stream_id: String,
     /// Session being attached.
     pub session_id: SessionId,
-    /// PTY handle backing the session.
-    pub pty: PtyHandle,
+    /// Runtime stream backing the public bridge.
+    pub runtime: RedeemedRuntime,
     /// Cancellation signal fired by `session.detach` or session exit.
     pub cancel: CancellationToken,
+}
+
+/// Runtime-specific stream already authorized for one public attach.
+#[derive(Debug)]
+pub enum RedeemedRuntime {
+    /// Framed stream connected directly to the durable worker.
+    Worker(DataStream),
 }
 
 impl SessionRegistry {
     /// Mint a one-shot raw attach stream token for a running session.
     ///
     /// Rejects a *self-feeding* attach: when the client reports (via the
-    /// `POHUNEK_SESSION_ID` / `POHUNEK_DAEMON_ID` it inherited from a PTY) that it
-    /// is running inside this very session of this very daemon, its stdout is the
+    /// `POHUNEK_SESSION_ID` / `POHUNEK_WORKER_ID` it inherited from a PTY) that it
+    /// is running inside this very session worker, its stdout is the
     /// session's own PTY slave, so streaming the PTY's output to it would be
     /// written straight back into the PTY as input and re-read as output — an
     /// infinite, log-flooding loop. Both the session id **and** the daemon
-    /// instance id must match: a colliding id on a different daemon, or a stale
-    /// value from a previous daemon process, has a different instance id and is
-    /// correctly allowed. The existence/running check runs first so a stale origin
+    /// worker id must match. The daemon instance id is not an ownership
+    /// identity and therefore cannot weaken self-feedback protection after a
+    /// restart. The existence/running check runs first so a stale origin
     /// pointing at a gone/stopped session yields the truthful `session_not_found`/
     /// `session_not_running` rather than a misleading self-feedback error.
     pub async fn attach(
@@ -52,18 +61,25 @@ impl SessionRegistry {
         let id = &params.session_id;
         self.prune_expired_pending_attaches().await;
         self.ensure_not_external(id).await?;
-        {
+        let target_worker_id = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
             if entry.info.state != SessionState::Running {
                 return Err(session_not_running(id));
             }
-        }
+            entry
+                .info
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.worker_id.clone())
+        };
 
         // The session exists and is running; only now is a self-feed possible.
-        if params.origin_session_id.as_ref() == Some(id)
-            && params.origin_daemon_id.as_deref() == Some(self.daemon_instance_id())
-        {
+        let same_origin_session = params.origin_session_id.as_ref() == Some(id);
+        let same_worker = target_worker_id
+            .as_deref()
+            .is_some_and(|worker| params.origin_worker_id.as_deref() == Some(worker));
+        if same_origin_session && same_worker {
             return Err(attach_self_feedback(id));
         }
 
@@ -93,7 +109,7 @@ impl SessionRegistry {
             return Err(attach_token_error("attach_expired", stream_id));
         }
 
-        let pty = {
+        let runtime = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions
                 .get(&pending.session_id)
@@ -101,7 +117,22 @@ impl SessionRegistry {
             if entry.info.state != SessionState::Running {
                 return Err(session_not_running(&pending.session_id));
             }
-            entry.pty.clone()
+            entry.runtime.clone()
+        };
+        let runtime = match runtime {
+            RuntimeHandle::Worker(worker) => {
+                let private_stream_id = StreamId::new(stream_id).map_err(|error| {
+                    super::runtime_error("worker_attach_invalid", error.to_string())
+                })?;
+                let data = worker
+                    .open_data(private_stream_id, StreamMode::Attach, None)
+                    .await
+                    .map_err(super::worker_error_to_protocol)?;
+                RedeemedRuntime::Worker(data)
+            }
+            RuntimeHandle::Unavailable(state) => {
+                return Err(super::unavailable_runtime_error(&pending.session_id, state));
+            }
         };
 
         let cancel = CancellationToken::new();
@@ -126,7 +157,7 @@ impl SessionRegistry {
         Ok(RedeemedAttach {
             stream_id: stream_id.to_owned(),
             session_id: pending.session_id,
-            pty,
+            runtime,
             cancel,
         })
     }
@@ -236,7 +267,7 @@ fn attach_token_error(code: &'static str, stream_id: &str) -> ProtocolError {
 /// before 1970 (an RTC-less boot before NTP). Used to scope the
 /// self-feeding-attach guard to this instance's own PTYs and to keep a stale
 /// `POHUNEK_DAEMON_ID` from a previous daemon from matching (see
-/// [`SessionAttachParams::origin_daemon_id`]); a residual collision only
+/// [`SessionAttachParams::origin_worker_id`]); a residual collision only
 /// false-rejects an attach (never lets a loop through) and the lag-warn throttle
 /// still bounds any such loop's log output. Not a secret.
 pub(super) fn generate_daemon_instance_id() -> String {

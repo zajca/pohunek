@@ -12,9 +12,9 @@ intents: [setup, update, debug, help]
 The optional web control center is a client surface over the existing public
 protocol. One `@pohunek/backend` origin serves the Svelte SPA, reports hosts at
 `GET /api/hosts`, and exposes a transparent control or attach WebSocket per
-daemon. The backend is not authoritative: each daemon still owns its sessions,
-PTYs, events, and notifications, and the CLI and native GUI keep working when
-the backend is down.
+daemon. The backend is not authoritative: each daemon still owns its logical
+sessions, events, and notifications, while per-session workers own live PTYs.
+The CLI and native GUI keep working when the backend is down.
 
 The control center uses one persistent, session-first workspace shell. The
 session rail combines every host, groups normal work by project, and promotes
@@ -25,8 +25,11 @@ context rather than the primary navigation level.
 
 Selecting a running session attaches its PTY directly in the main pane without
 hiding the rail. Switching sessions detaches the old view and attaches the new
-one; resize and binary terminal traffic still use the daemon-owned attach
-stream. Non-running and observe-only sessions show a summary instead. The
+one; resize and binary terminal traffic still use the daemon attach proxy.
+After daemon replacement the browser must compare `runtime_id`: the same
+generation may reconnect and repaint, while a changed generation is explicit
+native recovery. Lost, conflicting, incompatible, and observe-only sessions
+show a summary instead. The
 terminal toolbar can rename, stop, resume, fork, or permanently remove eligible
 sessions, while the inspector edits individual metadata keys. External observed
 sessions never expose mutating controls. Removal always requires confirmation

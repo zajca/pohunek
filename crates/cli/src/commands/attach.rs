@@ -17,7 +17,7 @@ use protocol::{
     event, method, ForkCwdMode, Request, SessionAttachParams, SessionAttachResult,
     SessionDetachParams, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
     SessionNewParams, SessionNewResult, SessionRenameParams, SessionRenameResult,
-    SessionResizeParams, SessionState, ENV_DAEMON_ID, ENV_SESSION_ID,
+    SessionResizeParams, SessionState, ENV_DAEMON_ID, ENV_SESSION_ID, ENV_WORKER_ID,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
@@ -90,10 +90,10 @@ const MENU_BACKSPACE_DEL: u8 = 0x7f;
 const MENU_BACKSPACE_CTRL_H: u8 = 0x08;
 /// Default grace window for reattaching after a daemon restart.
 ///
-/// Long enough for systemd to restart `pohunekd` and for `load_and_resume` to
-/// relaunch captured sessions, but short enough that a non-resumable shell does
-/// not leave a dead attach terminal hanging indefinitely. Operators can override
-/// it in `launcher.conf`; zero disables reconnect.
+/// Long enough for systemd to restart `pohunekd`, reconcile the durable session
+/// worker, and restore the attach route, but short enough that a lost runtime
+/// does not leave a dead attach terminal hanging indefinitely. Operators can
+/// override it in `launcher.conf`; zero disables reconnect.
 const DEFAULT_ATTACH_RECONNECT_WINDOW: Duration = Duration::from_secs(20);
 /// Poll interval while waiting for a daemon restart/resume after attach EOF.
 ///
@@ -414,7 +414,7 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
     // every transport: the loop is reachable even over a same-host loopback TCP
     // attach, and the daemon-id pairing prevents a false positive against a
     // different daemon that reuses the same session-id string.
-    let (origin_session_id, origin_daemon_id) = self_feedback_origin();
+    let (origin_session_id, origin_daemon_id, origin_worker_id) = self_feedback_origin();
     let banner_config = AttachBannerConfig::load(paths)?;
 
     loop {
@@ -424,6 +424,7 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
             target,
             origin_session_id.clone(),
             origin_daemon_id.clone(),
+            origin_worker_id.clone(),
             banner_config.clone(),
         )
         .await?;
@@ -442,9 +443,15 @@ async fn run_attach_once(
     target: &Target,
     origin_session_id: Option<SessionId>,
     origin_daemon_id: Option<String>,
+    origin_worker_id: Option<String>,
     banner_config: AttachBannerConfig,
 ) -> Result<AttachStreamEnd, CliError> {
-    let attach_request = build_attach_request(target, origin_session_id, origin_daemon_id)?;
+    let attach_request = build_attach_request(
+        target,
+        origin_session_id,
+        origin_daemon_id,
+        origin_worker_id,
+    )?;
     let mut client = Client::connect(host, paths).await?;
     let result = client.request(&attach_request).await?;
     let attach: SessionAttachResult = serde_json::from_value(result)?;
@@ -609,6 +616,7 @@ fn build_attach_request(
     target: &Target,
     origin_session_id: Option<SessionId>,
     origin_daemon_id: Option<String>,
+    origin_worker_id: Option<String>,
 ) -> Result<Request, CliError> {
     request_with_params(
         method::SESSION_ATTACH,
@@ -616,6 +624,7 @@ fn build_attach_request(
             session_id: SessionId(target.session_id.clone()),
             origin_session_id,
             origin_daemon_id,
+            origin_worker_id,
         },
     )
 }
@@ -630,10 +639,11 @@ fn build_attach_request(
 /// compares them against its OWN live instance, so a remote/loopback attach to a
 /// *different* daemon (which reuses the same id string) is not falsely rejected,
 /// while a same-host loopback to this daemon is correctly caught.
-fn self_feedback_origin() -> (Option<SessionId>, Option<String>) {
+fn self_feedback_origin() -> (Option<SessionId>, Option<String>, Option<String>) {
     self_feedback_origin_from(
         std::env::var(ENV_SESSION_ID).ok(),
         std::env::var(ENV_DAEMON_ID).ok(),
+        std::env::var(ENV_WORKER_ID).ok(),
     )
 }
 
@@ -642,10 +652,12 @@ fn self_feedback_origin() -> (Option<SessionId>, Option<String>) {
 fn self_feedback_origin_from(
     raw_session_id: Option<String>,
     raw_daemon_id: Option<String>,
-) -> (Option<SessionId>, Option<String>) {
+    raw_worker_id: Option<String>,
+) -> (Option<SessionId>, Option<String>, Option<String>) {
     let session_id = raw_session_id.filter(|id| !id.is_empty()).map(SessionId);
     let daemon_id = raw_daemon_id.filter(|id| !id.is_empty());
-    (session_id, daemon_id)
+    let worker_id = raw_worker_id.filter(|id| !id.is_empty());
+    (session_id, daemon_id, worker_id)
 }
 
 fn build_detach_request(stream_id: &str) -> Result<Request, CliError> {
@@ -1979,7 +1991,7 @@ mod tests {
     #[test]
     fn attach_request_sends_session_id() {
         let target: Target = "local/s-42".parse().expect("target");
-        let request = build_attach_request(&target, None, None).expect("request");
+        let request = build_attach_request(&target, None, None, None).expect("request");
 
         assert_request(
             &request,
@@ -1997,6 +2009,7 @@ mod tests {
             &target,
             Some(SessionId("s-42".to_owned())),
             Some("daemon-xyz".to_owned()),
+            Some("worker-xyz".to_owned()),
         )
         .expect("request");
 
@@ -2006,32 +2019,45 @@ mod tests {
             json!({
                 "session_id": "s-42",
                 "origin_session_id": "s-42",
-                "origin_daemon_id": "daemon-xyz"
+                "origin_daemon_id": "daemon-xyz",
+                "origin_worker_id": "worker-xyz"
             }),
         );
     }
 
     #[test]
-    fn self_feedback_origin_reports_session_and_daemon_when_present() {
+    fn self_feedback_origin_reports_stable_worker_when_present() {
         // Inside a session's PTY: report both so the daemon can pin the loop.
         assert_eq!(
-            self_feedback_origin_from(Some("s-7".to_owned()), Some("daemon-1".to_owned())),
+            self_feedback_origin_from(
+                Some("s-7".to_owned()),
+                Some("daemon-1".to_owned()),
+                Some("worker-1".to_owned())
+            ),
             (
                 Some(SessionId("s-7".to_owned())),
-                Some("daemon-1".to_owned())
+                Some("daemon-1".to_owned()),
+                Some("worker-1".to_owned())
             )
         );
         // Not inside any session (env unset or empty): nothing to report.
-        assert_eq!(self_feedback_origin_from(None, None), (None, None));
         assert_eq!(
-            self_feedback_origin_from(Some(String::new()), Some(String::new())),
-            (None, None)
+            self_feedback_origin_from(None, None, None),
+            (None, None, None)
+        );
+        assert_eq!(
+            self_feedback_origin_from(
+                Some(String::new()),
+                Some(String::new()),
+                Some(String::new())
+            ),
+            (None, None, None)
         );
         // A session id without a daemon id cannot be pinned to an instance; it is
         // still forwarded, and the daemon declines to reject without a daemon id.
         assert_eq!(
-            self_feedback_origin_from(Some("s-7".to_owned()), None),
-            (Some(SessionId("s-7".to_owned())), None)
+            self_feedback_origin_from(Some("s-7".to_owned()), None, None),
+            (Some(SessionId("s-7".to_owned())), None, None)
         );
     }
 
@@ -2069,7 +2095,7 @@ mod tests {
         // Remote is now supported: the attach request carries only the session
         // id; the host selects the transport, it never enters the request body.
         let remote: Target = "host-b/s-42".parse().expect("target");
-        let request = build_attach_request(&remote, None, None).expect("request");
+        let request = build_attach_request(&remote, None, None, None).expect("request");
 
         assert_request(
             &request,

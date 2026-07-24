@@ -25,8 +25,8 @@ use protocol::{
     NotificationUpdateParams, NotificationUpdateResult, Request, Response, SessionAttachParams,
     SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId, SessionInfo,
     SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
-    SessionReportAgentParams, SessionReportAgentResult, SessionResizeParams, SessionResizeResult,
-    SessionState, SessionStopResult, StateSource, PROTOCOL_VERSION,
+    SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult, SessionResizeParams,
+    SessionResizeResult, SessionState, SessionStopResult, StateSource, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -37,6 +37,8 @@ use tokio_util::codec::{Framed, LinesCodec};
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo};
 use pohunek_daemon::events::{spawn_drain, EventLog};
 use pohunek_daemon::notifications::NotificationService;
+use pohunek_daemon::procwatch::LinuxInspector;
+use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use pohunek_daemon::store::{ResumeBinding, Store, WorktreeBinding};
 
@@ -70,17 +72,25 @@ impl PathGuard {
     /// is installed on the host (claude/codex may well be on the developer's
     /// PATH).
     ///
-    /// The rest of the suite runs concurrently and resolves a few tools through
-    /// PATH (`git`, `python3`, `sh`); the isolated dir is seeded with symlinks to
-    /// those, resolved from the current PATH, so replacing PATH cannot starve a
-    /// sibling test of them. PATH is restored on drop; `PATH_LOCK` serializes this
-    /// against the other PATH-mutating tests.
+    /// `PATH` is a process-wide environment variable (`std::env::set_var` has no
+    /// thread/task scoping), so while it is replaced here every OTHER concurrent
+    /// test's `fork`/`exec` of a worker-backed session's shell inherits this same
+    /// isolated `PATH` — `PATH_LOCK` only serializes this swap against other
+    /// PATH-*mutating* tests, not against ordinary session creation happening
+    /// elsewhere in the suite. The rest of the suite resolves a handful of tools
+    /// through PATH (`git`, `python3`, `sh` for stub agents; `sleep`/`stty` inside
+    /// worker-backed shell test commands such as `"sleep 30"` or `"stty -echo"`);
+    /// the isolated dir is seeded with symlinks to all of those, resolved from the
+    /// current PATH, so replacing PATH cannot starve a sibling test of them (a
+    /// missing `sleep` here previously surfaced as a sibling's shell exiting with
+    /// code 127 and its session flipping to `Failed` mid-test). PATH is restored
+    /// on drop.
     async fn isolated_without_agents(tag: &str) -> Self {
         let guard = PATH_LOCK.lock().await;
         let old_path = std::env::var_os("PATH");
         let dir = temp_dir(tag);
         if let Some(old_path) = &old_path {
-            for tool in ["git", "python3", "sh"] {
+            for tool in ["git", "python3", "sh", "sleep", "stty"] {
                 if let Some(real) = which_in(old_path, tool) {
                     let _ = std::os::unix::fs::symlink(&real, dir.join(tool));
                 }
@@ -215,27 +225,39 @@ async fn spawn_server(
     (tx, handle)
 }
 
-/// Spawn the control server owning an explicit, pre-built registry.
-///
-/// Used by the resume round-trip test, which needs a handle to the registry to
-/// call `load_and_resume` after a simulated restart.
-async fn spawn_server_owned(
+/// Build a `SessionRegistry` wired to a real `SubprocessWorkerLauncher` (the
+/// built `pohunek-sessiond`), rooted under a unique per-call worker home, so
+/// `session.new` can actually launch a durable worker instead of failing with
+/// `worker_backend_required`.
+fn worker_backed_registry(
     socket: &std::path::Path,
-    registry: SessionRegistry,
-) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
-    let state = DaemonState::new(HealthInfo::new("0.0.0"), registry);
-    let server = ControlServer::bind_with_state(socket, state)
-        .await
-        .expect("server binds");
-    let (tx, rx) = oneshot::channel();
-    let handle = tokio::spawn(async move {
-        server
-            .serve(async move {
-                let _ = rx.await;
-            })
-            .await;
-    });
-    (tx, handle)
+    mut config: SessionRegistryConfig,
+) -> SessionRegistry {
+    let worker_home = std::env::temp_dir().join(format!(
+        "pw-h-{}-{}",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let worker_environment = SubprocessWorkerEnvironment {
+        runtime_home: worker_home.join("runtime"),
+        state_home: worker_home.join("state"),
+        data_home: worker_home.join("data"),
+        config_home: worker_home.join("config"),
+        cache_home: worker_home.join("cache"),
+        daemon_socket: socket.to_path_buf(),
+    };
+    config.socket_path = Some(socket.to_path_buf());
+    config.worker_runtime_root = Some(worker_environment.runtime_home.join("pohunek/workers"));
+    config.worker_state_root = Some(worker_environment.state_home.join("pohunek/workers"));
+    let launcher = Arc::new(SubprocessWorkerLauncher::new(
+        worker_binary(),
+        worker_environment,
+    ));
+    SessionRegistry::new_with_launcher_and_inspector(
+        config,
+        launcher,
+        Arc::new(LinuxInspector::new()),
+    )
 }
 
 /// Spawn the control server with a custom shell command.
@@ -245,7 +267,7 @@ async fn spawn_server_with_config(
     config: SessionRegistryConfig,
 ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     let event_log_dir = config.event_log_dir.clone();
-    let registry = SessionRegistry::new(config);
+    let registry = worker_backed_registry(socket, config);
     let notifications = NotificationService::open(&notification_data_dir(socket))
         .expect("notification service opens");
     if let Some(event_log_dir) = event_log_dir {
@@ -275,6 +297,25 @@ async fn spawn_server_with_config(
             .await;
     });
     (tx, handle)
+}
+
+fn worker_binary() -> PathBuf {
+    if let Some(path) = std::env::var_os("POHUNEK_WORKER_BIN") {
+        return PathBuf::from(path);
+    }
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("daemon crate is inside workspace")
+        .to_path_buf();
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| workspace.join("target"), PathBuf::from);
+    let binary = target.join("debug/pohunek-sessiond");
+    assert!(
+        binary.is_file(),
+        "build the real worker first with `cargo build -p pohunek-session-worker --bin pohunek-sessiond`, or set POHUNEK_WORKER_BIN"
+    );
+    binary
 }
 
 fn notification_data_dir(socket: &std::path::Path) -> PathBuf {
@@ -497,6 +538,7 @@ async fn attach_session(
             session_id: id.clone(),
             origin_session_id: None,
             origin_daemon_id: None,
+            origin_worker_id: None,
         })
         .expect("serialize attach params"),
     );
@@ -963,113 +1005,6 @@ async fn wait_for_persisted_resume_and_worktree(
     );
 }
 
-/// End-to-end: a stub agent installs (simulated) its hook by reporting a native
-/// id on launch; the binding survives a simulated daemon kill + registry
-/// rebuild against the same state dir; the relaunched stub receives the resume
-/// argv. Exercised for both Claude (`--resume <id>`) and Codex (`resume <id>`).
-async fn assert_resume_round_trip(
-    agent: AgentKind,
-    bin_name: &str,
-    native_id: &str,
-    expected_resume_argv: &str,
-) {
-    let bin_dir = temp_dir(&format!("{bin_name}-resume-bin"));
-    let cwd = temp_dir(&format!("{bin_name}-resume-cwd"));
-    let state_dir = temp_dir(&format!("{bin_name}-resume-state"));
-    let store_path = state_dir.join("metadata.jsonl");
-    let argv_log = temp_dir(&format!("{bin_name}-resume-argv")).join("argv.log");
-    let reporter_py = temp_dir(&format!("{bin_name}-resume-reporter")).join("reporter.py");
-    write_executable(&reporter_py, STUB_REPORTER_PY);
-    write_executable(
-        &bin_dir.join(bin_name),
-        &stub_agent_script(&argv_log, &reporter_py, bin_name, native_id),
-    );
-
-    let socket = temp_socket(&format!("{bin_name}-resume"));
-    let make_config = || SessionRegistryConfig {
-        socket_path: Some(socket.clone()),
-        store_path: Some(store_path.clone()),
-        stop_grace: Duration::from_millis(50),
-        ..SessionRegistryConfig::default()
-    };
-
-    // Hold the PATH override across both the create and resume phases so the
-    // stub binary resolves at launch and at resume.
-    let _path = PathGuard::prepend(&bin_dir).await;
-
-    // --- Create phase: launch the agent; its hook reports a native id. ---
-    let registry = SessionRegistry::new(make_config());
-    let (shutdown, handle) = spawn_server_owned(&socket, registry).await;
-    let mut control = connect(&socket).await;
-    let created: SessionInfo = serde_json::from_value(ok_payload(
-        create_session_with_agent(&mut control, agent, cwd.clone()).await,
-    ))
-    .expect("stub session info");
-    assert_eq!(created.agent, agent_name(agent));
-
-    // The stub fires the report RPC (proving the handshake env reached it); wait
-    // until the daemon records the native id on the session.
-    let captured = wait_for_native_id(&mut control, &created.id, native_id).await;
-    assert_eq!(captured.native_session_id.as_deref(), Some(native_id));
-
-    drop(control);
-    let _ = shutdown.send(());
-    let _ = handle.await;
-
-    // --- The binding survived the kill: persisted to the resume store. ---
-    assert!(
-        store_path.is_file(),
-        "resume store must persist across the daemon kill"
-    );
-
-    // --- Restart: rebuild a fresh registry against the SAME state dir. ---
-    let registry = SessionRegistry::new(make_config());
-    let (shutdown, handle) = spawn_server_owned(&socket, registry.clone()).await;
-    registry.load_and_resume().await;
-
-    // The relaunched stub logged the resume argv built by the M6 builder.
-    let logged = read_file_until(&argv_log, expected_resume_argv.as_bytes()).await;
-    assert!(
-        logged
-            .windows(expected_resume_argv.len())
-            .any(|window| window == expected_resume_argv.as_bytes()),
-        "resumed stub did not receive resume argv {expected_resume_argv:?}; argv log: {}",
-        String::from_utf8_lossy(&logged)
-    );
-
-    let stop_req = Request::new(
-        "session-stop-resume",
-        method::SESSION_STOP,
-        serde_json::to_value(&created.id).expect("serialize id"),
-    );
-    let mut cleanup = connect(&socket).await;
-    let _ = exchange(&mut cleanup, &stop_req).await;
-    let _ = shutdown.send(());
-    let _ = handle.await;
-}
-
-#[tokio::test]
-async fn claude_session_captures_native_id_and_resumes_after_restart() {
-    assert_resume_round_trip(
-        AgentKind::Claude,
-        "claude",
-        "native-claude-1",
-        "--resume native-claude-1",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn codex_session_captures_native_id_and_resumes_after_restart() {
-    assert_resume_round_trip(
-        AgentKind::Codex,
-        "codex",
-        "native-codex-1",
-        "resume native-codex-1",
-    )
-    .await;
-}
-
 #[tokio::test]
 async fn health_returns_versions() {
     let socket = temp_socket("health");
@@ -1199,20 +1134,26 @@ async fn session_list_with_malformed_filter_returns_typed_error() {
 
 #[tokio::test]
 async fn attach_reporting_its_own_session_as_origin_is_rejected_over_the_socket() {
-    // End-to-end: the CLI sets `origin_session_id`/`origin_daemon_id` from the
+    // End-to-end: the CLI sets `origin_session_id`/`origin_worker_id` from the
     // PTY env when it runs inside a session. An attach whose origin matches the
-    // target session AND this daemon instance would loop the PTY's output into its
+    // target session AND its durable worker would loop the PTY's output into its
     // own input, so the daemon must reject it at the wire boundary with a typed,
     // stable error — proving the handler threads the origin through to the guard
-    // (not just the unit path). Own the registry so the test knows the instance id
-    // the CLI would have inherited via POHUNEK_DAEMON_ID.
+    // (not just the unit path). `origin_worker_id` (not `origin_daemon_id`) is
+    // authoritative for worker-backed sessions (see
+    // `SessionAttachParams::origin_worker_id`), so the test reads the created
+    // session's own worker id back off the wire to build the self-feeding request.
     let socket = temp_socket("attach-self-feedback");
-    let registry = SessionRegistry::new(SessionRegistryConfig::default());
-    let daemon_id = registry.daemon_instance_id().to_owned();
-    let (shutdown, handle) = spawn_server_owned(&socket, registry).await;
+    let (shutdown, handle) =
+        spawn_server_with_config(&socket, "0.0.0", SessionRegistryConfig::default()).await;
     let mut control = connect(&socket).await;
 
     let created = create_session(&mut control).await;
+    let worker_id = created
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.worker_id.clone())
+        .expect("worker-backed session reports a worker id");
 
     let self_attach = Request::new(
         "attach-self",
@@ -1220,7 +1161,7 @@ async fn attach_reporting_its_own_session_as_origin_is_rejected_over_the_socket(
         serde_json::json!({
             "session_id": created.id,
             "origin_session_id": created.id,
-            "origin_daemon_id": daemon_id,
+            "origin_worker_id": worker_id,
         }),
     );
     match exchange(&mut control, &self_attach).await {
@@ -1237,21 +1178,21 @@ async fn attach_reporting_its_own_session_as_origin_is_rejected_over_the_socket(
         }
     }
 
-    // Same session id reported from a DIFFERENT daemon instance (a colliding id or
-    // a stale env from a prior process): no loop, so it must be accepted.
-    let other_daemon = Request::new(
-        "attach-other-daemon",
+    // Same session id reported from a DIFFERENT worker (a colliding id or a stale
+    // env from a prior process): no loop, so it must be accepted.
+    let other_worker = Request::new(
+        "attach-other-worker",
         method::SESSION_ATTACH,
         serde_json::json!({
             "session_id": created.id,
             "origin_session_id": created.id,
-            "origin_daemon_id": "some-other-daemon",
+            "origin_worker_id": "some-other-worker",
         }),
     );
-    let ok = ok_payload(exchange(&mut control, &other_daemon).await);
+    let ok = ok_payload(exchange(&mut control, &other_worker).await);
     assert!(
         ok.get("stream_id").and_then(Value::as_str).is_some(),
-        "a matching id on a different daemon instance must still attach: {ok:?}"
+        "a matching session id on a different worker must still attach: {ok:?}"
     );
 
     // An attach from a different terminal (no origin reported) still works.
@@ -1306,6 +1247,31 @@ async fn session_new_for_missing_agent_binary_returns_typed_error() {
     let _ = handle.await;
 }
 
+/// Block until `socket` genuinely refuses connections, bounded by a timeout.
+///
+/// The daemon's own stale-socket recovery (`recover_stale_socket`) decides
+/// "stale vs. live" by trying to connect: a refused connection means no
+/// listener is behind the path. Dropping a `std::os::unix::net::UnixListener`
+/// closes its file descriptor, but under heavy parallel load the kernel can
+/// take a small, nonzero amount of time to fully tear down the listening
+/// socket's backlog; a `connect()` racing that teardown can transiently
+/// succeed, which the daemon then (correctly, if misleadingly) reports as "a
+/// live daemon is already listening". Waiting here for a genuine refusal
+/// before invoking the daemon's own recovery path removes that race without
+/// touching the daemon's connect-based liveness check itself.
+async fn wait_until_connect_refused(socket: &Path) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if UnixStream::connect(socket).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("dropped listener never stopped accepting connections");
+}
+
 #[tokio::test]
 async fn stale_socket_is_recovered_on_bind() {
     let socket = temp_socket("stale");
@@ -1313,6 +1279,10 @@ async fn stale_socket_is_recovered_on_bind() {
     let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind stale");
     drop(listener);
     assert!(socket.exists(), "stale socket file should exist");
+    // See `wait_until_connect_refused`: give the kernel a moment to fully tear
+    // down the just-dropped listener before asserting on stale-socket recovery,
+    // so this test exercises genuine staleness rather than racing the teardown.
+    wait_until_connect_refused(&socket).await;
 
     // Binding again must succeed by removing the stale socket.
     let (shutdown, handle) = spawn_server(&socket, "0.0.0").await;
@@ -1539,7 +1509,8 @@ async fn codex_stub_session_publishes_blocked_and_receives_bracketed_input() {
     );
 
     let socket = temp_socket("codex-stub");
-    let (shutdown, handle) = spawn_server(&socket, "0.0.0").await;
+    let (shutdown, handle) =
+        spawn_server_with_config(&socket, "0.0.0", SessionRegistryConfig::default()).await;
 
     let mut subscriber = connect(&socket).await;
     let subscribe_req = Request::new("subscribe-codex-stub", method::SUBSCRIBE, Value::Null);
@@ -1603,7 +1574,8 @@ async fn claude_stub_session_publishes_screen_blocked_and_receives_plain_input()
     );
 
     let socket = temp_socket("claude-stub");
-    let (shutdown, handle) = spawn_server(&socket, "0.0.0").await;
+    let (shutdown, handle) =
+        spawn_server_with_config(&socket, "0.0.0", SessionRegistryConfig::default()).await;
 
     let mut subscriber = connect(&socket).await;
     let subscribe_req = Request::new("subscribe-claude-stub", method::SUBSCRIBE, Value::Null);
@@ -2738,15 +2710,29 @@ async fn two_sessions_on_one_repo_get_distinct_worktrees() {
     );
 
     for id in [&alpha.id, &beta.id] {
-        let stop_req = Request::new(
-            "session-stop-worktree",
-            method::SESSION_STOP,
+        let remove_req = Request::new(
+            "session-remove-worktree",
+            method::SESSION_REMOVE,
             serde_json::to_value(id).expect("serialize id"),
         );
-        let _: SessionStopResult =
-            serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
-                .expect("stop result");
+        let removed: SessionRemoveResult =
+            serde_json::from_value(ok_payload(exchange(&mut control, &remove_req).await))
+                .expect("remove result");
+        assert!(removed.removed);
     }
+    assert!(
+        !alpha_path.exists(),
+        "session.remove removes its owned worktree"
+    );
+    assert!(
+        !beta_path.exists(),
+        "session.remove removes its owned worktree"
+    );
+    let cleaned_store = std::fs::read_to_string(&store_path).expect("read cleaned metadata store");
+    assert!(
+        !cleaned_store.contains("\"kind\":\"worktree\""),
+        "session.remove drops exact worktree ownership bindings: {cleaned_store}"
+    );
 
     let _ = shutdown.send(());
     let _ = handle.await;
@@ -2769,9 +2755,7 @@ async fn event_log_records_lifecycle_and_never_terminal_bytes() {
         event_log_dir: Some(events_dir.clone()),
         ..SessionRegistryConfig::default()
     };
-    let registry = SessionRegistry::new(config);
-    registry.spawn_event_log().expect("start event log");
-    let (shutdown, handle) = spawn_server_owned(&socket, registry).await;
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut control = connect(&socket).await;
     let created = create_session(&mut control).await;
@@ -2856,17 +2840,13 @@ async fn event_log_records_notification_control_events() {
     let _ = handle.await;
 }
 
-/// Milestone-9 checkpoint (unified store survives a restart): a worktree-bound
-/// stub agent records BOTH a worktree binding and a resume binding in one
-/// metadata file; after a simulated daemon kill + registry rebuild against the
-/// same data dir, both bindings survive, the session relaunches via its resume
-/// argv, and its worktree metadata (`repo/branch/worktree_path`) is restored.
+/// A worktree-bound session records its worktree and explicit native-recovery
+/// metadata in the same atomic store.
 #[tokio::test]
-async fn worktree_session_resumes_with_metadata_after_restart() {
+async fn worktree_session_persists_recovery_and_worktree_metadata() {
     let agent = AgentKind::Claude;
     let bin_name = "claude";
     let native_id = "native-claude-wt-1";
-    let expected_resume_argv = "--resume native-claude-wt-1";
 
     let repo = init_git_repo("wt-resume-repo");
     let bin_dir = temp_dir("wt-resume-bin");
@@ -2882,8 +2862,7 @@ async fn worktree_session_resumes_with_metadata_after_restart() {
     );
 
     let socket = temp_socket("wt-resume");
-    let make_config = || SessionRegistryConfig {
-        socket_path: Some(socket.clone()),
+    let config = SessionRegistryConfig {
         store_path: Some(store_path.clone()),
         worktree_root: Some(worktree_root.clone()),
         stop_grace: Duration::from_millis(50),
@@ -2893,8 +2872,7 @@ async fn worktree_session_resumes_with_metadata_after_restart() {
     let _path = PathGuard::prepend(&bin_dir).await;
 
     // --- Create phase: a worktree-bound stub agent reports its native id. ---
-    let registry = SessionRegistry::new(make_config());
-    let (shutdown, handle) = spawn_server_owned(&socket, registry).await;
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
     let mut control = connect(&socket).await;
     let created: SessionInfo = serde_json::from_value(ok_payload(
         create_worktree_session(&mut control, agent, repo.clone(), "feat/x").await,
@@ -2907,11 +2885,8 @@ async fn worktree_session_resumes_with_metadata_after_restart() {
     let captured = wait_for_native_id(&mut control, &created.id, native_id).await;
     assert_eq!(captured.native_session_id.as_deref(), Some(native_id));
 
-    drop(control);
-    let _ = shutdown.send(());
-    let _ = handle.await;
-
-    // --- Both records survived the kill in ONE unified metadata file. ---
+    // Both records coexist in one unified metadata file while recovery remains
+    // eligible.
     let store = Store::new(store_path.clone());
     let (resume_before, worktrees_before) =
         wait_for_persisted_resume_and_worktree(&store, &created.id).await;
@@ -2927,37 +2902,6 @@ async fn worktree_session_resumes_with_metadata_after_restart() {
     );
     assert_eq!(resume_before[0].session_id, created.id.0);
     assert_eq!(worktrees_before[0].session_id, created.id.0);
-    let repository = worktrees_before[0].repository.clone();
-
-    // --- Restart: rebuild a fresh registry against the SAME data dir. ---
-    let registry = SessionRegistry::new(make_config());
-    let (shutdown, handle) = spawn_server_owned(&socket, registry.clone()).await;
-    registry.load_and_resume().await;
-
-    // The relaunched stub logged the resume argv built by the M6 builder.
-    let logged = read_file_until(&argv_log, expected_resume_argv.as_bytes()).await;
-    assert!(
-        logged
-            .windows(expected_resume_argv.len())
-            .any(|window| window == expected_resume_argv.as_bytes()),
-        "resumed stub did not receive resume argv {expected_resume_argv:?}; argv log: {}",
-        String::from_utf8_lossy(&logged)
-    );
-
-    // The resumed session restored its worktree metadata from the unified store.
-    let mut control = connect(&socket).await;
-    let resumed = wait_for_state(&mut control, &created.id, SessionState::Running).await;
-    assert_eq!(
-        resumed.worktree_path.as_deref(),
-        Some(worktree_path.as_path())
-    );
-    assert_eq!(resumed.branch.as_deref(), Some("feat/x"));
-    assert_eq!(resumed.repo.as_deref(), Some(repository.as_path()));
-    assert_eq!(resumed.native_session_id.as_deref(), Some(native_id));
-
-    // Both bindings still present after the restart.
-    assert_eq!(store.load_resume().expect("resume after").len(), 1);
-    assert_eq!(store.load_worktrees().expect("worktrees after").len(), 1);
 
     let stop_req = Request::new(
         "session-stop-wt-resume",

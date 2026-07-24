@@ -19,6 +19,14 @@ Start with structured inspection:
 4. Run `pohunek host inspect local --json` to inspect local capabilities and
    available runtimes.
 
+On a worker-aware Linux installation, the daemon archive installs three
+systemd user units: `pohunekd.service`, the
+`pohunek-session@.service` template, and `pohunek-sessions.slice`. The daemon
+and worker units are siblings; restarting the daemon must not stop worker units.
+Use the archive installer so its absolute binary paths are substituted
+consistently. For first-install migration and runtime diagnosis, see
+[durable session workers](../runbooks/debug-session-runtime.md).
+
 Setup assets are installed through `pohunek setup`. The subcommands split the
 work into launcher scripts, config templates, and sway integration:
 

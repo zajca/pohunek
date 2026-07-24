@@ -12,8 +12,10 @@
 //! fail-closed bind.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
@@ -31,6 +33,8 @@ use tokio_util::codec::{Framed, LinesCodec};
 
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo, RemoteServer};
 use pohunek_daemon::error::DaemonError;
+use pohunek_daemon::procwatch::LinuxInspector;
+use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -77,16 +81,39 @@ fn shell_config() -> SessionRegistryConfig {
 async fn spawn_dual_servers(
     tag: &str,
     version: &str,
-    config: SessionRegistryConfig,
+    mut config: SessionRegistryConfig,
 ) -> (
     SocketAddr,
     PathBuf,
     oneshot::Sender<()>,
     tokio::task::JoinHandle<()>,
 ) {
-    let state = DaemonState::new(HealthInfo::new(version), SessionRegistry::new(config));
-
     let socket = temp_socket(tag);
+    let worker_home = std::env::temp_dir().join(format!(
+        "pw-r-{}-{}",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let worker_environment = SubprocessWorkerEnvironment {
+        runtime_home: worker_home.join("runtime"),
+        state_home: worker_home.join("state"),
+        data_home: worker_home.join("data"),
+        config_home: worker_home.join("config"),
+        cache_home: worker_home.join("cache"),
+        daemon_socket: socket.clone(),
+    };
+    config.socket_path = Some(socket.clone());
+    config.worker_runtime_root = Some(worker_environment.runtime_home.join("pohunek/workers"));
+    config.worker_state_root = Some(worker_environment.state_home.join("pohunek/workers"));
+    let registry = SessionRegistry::new_with_launcher_and_inspector(
+        config,
+        Arc::new(SubprocessWorkerLauncher::new(
+            worker_binary(),
+            worker_environment,
+        )),
+        Arc::new(LinuxInspector::new()),
+    );
+    let state = DaemonState::new(HealthInfo::new(version), registry);
     let unix = ControlServer::bind_with_state(&socket, state.clone())
         .await
         .expect("unix server binds");
@@ -109,6 +136,25 @@ async fn spawn_dual_servers(
         tokio::join!(unix_serve, remote_serve);
     });
     (addr, socket, tx, handle)
+}
+
+fn worker_binary() -> PathBuf {
+    if let Some(path) = std::env::var_os("POHUNEK_WORKER_BIN") {
+        return PathBuf::from(path);
+    }
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("daemon crate is inside workspace")
+        .to_path_buf();
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| workspace.join("target"), PathBuf::from);
+    let binary = target.join("debug/pohunek-sessiond");
+    assert!(
+        binary.is_file(),
+        "build the real worker first with `cargo build -p pohunek-session-worker --bin pohunek-sessiond`, or set POHUNEK_WORKER_BIN"
+    );
+    binary
 }
 
 /// Fan one shutdown receiver out to two, mirroring the daemon binary's wiring.
@@ -250,6 +296,7 @@ where
             session_id: id.clone(),
             origin_session_id: None,
             origin_daemon_id: None,
+            origin_worker_id: None,
         })
         .expect("serialize attach params"),
     );

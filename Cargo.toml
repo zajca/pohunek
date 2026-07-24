@@ -1,7 +1,8 @@
 # pohunek Cargo workspace.
 #
-# Single-user, CLI-first tool: a daemon owns PTYs running coding agents; a CLI
-# controls it over a local Unix socket using newline-delimited JSON.
+# Single-user, CLI-first tool: durable per-session workers own PTYs running
+# coding agents; a daemon controls them and serves a local newline-delimited
+# JSON API to clients.
 #
 # Layout and crate choices are summarized in AGENTS.md and the architecture
 # documents under docs/.
@@ -16,6 +17,8 @@ members = [
     "crates/netbird",
     "crates/prompt",
     "crates/terminal",
+    "crates/worker-protocol",
+    "crates/session-worker",
     "crates/client",
     "crates/gui-core",
     "crates/daemon",
@@ -40,6 +43,8 @@ pohunek-paths = { path = "crates/paths" }
 pohunek-prompt = { path = "crates/prompt" }
 pohunek-protocol = { path = "crates/protocol" }
 pohunek-terminal = { path = "crates/terminal" }
+pohunek-worker-protocol = { path = "crates/worker-protocol" }
+pohunek-session-worker = { path = "crates/session-worker" }
 iced = { version = "0.14", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -66,6 +71,7 @@ libc = "0.2"
 time = { version = "0.3", features = ["formatting"] }
 vt100 = "0.16.2"
 portable-pty = "0.9"
+zbus = { version = "5.16", default-features = false, features = ["tokio"] }
 pulldown-cmark = "0.12"
 
 # Single source of truth for the released version. Every crate opts in via

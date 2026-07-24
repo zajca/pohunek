@@ -7,12 +7,16 @@ use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
 use pohunek_client::Client;
 use pohunek_daemon::api::{DaemonState, HealthInfo, RemoteServer};
+use pohunek_daemon::procwatch::LinuxInspector;
+use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
+use pohunek_daemon::store::Store;
 use pohunek_gui_core::assistant::{self, AssistantPaths, Intent, LaunchParams};
 use pohunek_gui_core::{
     add_project, dispatch_review, host_subscription_stream, inspect_session,
@@ -663,7 +667,6 @@ async fn remote_prompt_resolution_uses_target_daemon_config_not_operator_filesys
         Some(remote_config_dir),
         None,
         None,
-        false,
     )
     .await;
     let host = HostConfig::tcp("remote-host", daemon.addr);
@@ -774,10 +777,10 @@ async fn launch_from_rendered_preset_creates_one_session_with_rendered_input() {
     let bin_dir = temp_dir("gui-core-m3-launch-bin");
     let record_dir = temp_dir("gui-core-m3-launch-record");
     let prompt_out = record_dir.join("prompt.txt");
-    let _prompt_out = EnvGuard::set("POHUNEK_TEST_PROMPT_OUT", &prompt_out);
+    let _prompt_out = EnvGuard::set("GUI_TEST_PROMPT_OUT", &prompt_out);
     write_executable(
         &bin_dir.join("codex"),
-        "#!/bin/sh\nprintf '%s' \"${1:-}\" > \"$POHUNEK_TEST_PROMPT_OUT\"\n/bin/sleep 30\n",
+        "#!/bin/sh\nprintf '%s' \"${1:-}\" > \"$GUI_TEST_PROMPT_OUT\"\n/bin/sleep 30\n",
     );
     let _path = PathGuard::prepend(&bin_dir);
 
@@ -871,10 +874,10 @@ async fn assistant_launch_creates_project_session_with_opening_prompt() {
     let bin_dir = temp_dir("gui-core-assistant-bin");
     let record_dir = temp_dir("gui-core-assistant-record");
     let prompt_out = record_dir.join("prompt.txt");
-    let _prompt_out = EnvGuard::set("POHUNEK_TEST_PROMPT_OUT", &prompt_out);
+    let _prompt_out = EnvGuard::set("GUI_TEST_PROMPT_OUT", &prompt_out);
     write_executable(
         &bin_dir.join("codex"),
-        "#!/bin/sh\nprintf '%s' \"${1:-}\" > \"$POHUNEK_TEST_PROMPT_OUT\"\n/bin/sleep 30\n",
+        "#!/bin/sh\nprintf '%s' \"${1:-}\" > \"$GUI_TEST_PROMPT_OUT\"\n/bin/sleep 30\n",
     );
     let _path = PathGuard::prepend(&bin_dir);
 
@@ -943,28 +946,24 @@ async fn assistant_launch_creates_project_session_with_opening_prompt() {
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
-    reason = "keeps the linked launch and restart persistence flow in one end-to-end assertion"
+    reason = "keeps the linked launch and metadata-persistence flow in one end-to-end assertion"
 )]
 async fn provider_launch_linear_issue_creates_one_linked_session_and_persists_metadata() {
     let _path_lock = PATH_LOCK.lock().await;
     let bin_dir = temp_dir("gui-core-m4-linear-bin");
     let record_dir = temp_dir("gui-core-m4-linear-record");
     let prompt_out = record_dir.join("prompt.txt");
-    let _prompt_out = EnvGuard::set("POHUNEK_TEST_PROMPT_OUT", &prompt_out);
+    let _prompt_out = EnvGuard::set("GUI_TEST_PROMPT_OUT", &prompt_out);
     write_executable(
         &bin_dir.join("codex"),
-        "#!/bin/sh\nprintf '%s' \"${1:-}\" > \"$POHUNEK_TEST_PROMPT_OUT\"\n/bin/sleep 30\n",
+        "#!/bin/sh\nprintf '%s' \"${1:-}\" > \"$GUI_TEST_PROMPT_OUT\"\n/bin/sleep 30\n",
     );
     let _path = PathGuard::prepend(&bin_dir);
 
     let store_path = temp_dir("gui-core-m4-linear-store").join("metadata.jsonl");
-    let daemon = LoopbackDaemon::spawn_with_store_path(
-        "m4-linear",
-        "0.4.0-linear",
-        store_path.clone(),
-        false,
-    )
-    .await;
+    let daemon =
+        LoopbackDaemon::spawn_with_store_path("m4-linear", "0.4.0-linear", store_path.clone())
+            .await;
     let host = HostConfig::tcp("host-linear", daemon.addr);
     let repo = init_git_repo("gui-core-m4-linear-repo");
     write_provider_action_fixture(
@@ -1047,29 +1046,19 @@ async fn provider_launch_linear_issue_creates_one_linked_session_and_persists_me
     report_native_id(&host, &launched.session.id, "codex", "native-linear-1").await;
     let captured = wait_for_native_id_tcp(&host, &launched.session.id, "native-linear-1").await;
     assert_eq!(captured.metadata, launched.session.metadata);
-
-    daemon.shutdown().await;
-    let restarted = LoopbackDaemon::spawn_with_store_path(
-        "m4-linear-restart",
-        "0.4.0-linear",
-        store_path,
-        true,
-    )
-    .await;
-    let restarted_host = HostConfig::tcp("host-linear-restart", restarted.addr);
-    let resumed = wait_for_session_with_metadata(
-        &restarted_host,
-        &launched.session.id,
-        &launched.session.metadata,
-    )
-    .await;
+    let persisted = Store::new(store_path)
+        .load_sessions()
+        .expect("load logical sessions")
+        .into_iter()
+        .find(|record| record.session_id == launched.session.id.0)
+        .expect("linked session record");
     assert_eq!(
-        session_link_metadata(&resumed),
+        session_link_metadata(&persisted.info),
         session_link_metadata(&launched.session)
     );
 
-    stop_session(&restarted_host, &launched.session.id).await;
-    restarted.shutdown().await;
+    stop_session(&host, &launched.session.id).await;
+    daemon.shutdown().await;
 }
 
 #[tokio::test]
@@ -1078,10 +1067,10 @@ async fn provider_launch_github_pr_creates_one_linked_session_with_rendered_inpu
     let bin_dir = temp_dir("gui-core-m4-github-bin");
     let record_dir = temp_dir("gui-core-m4-github-record");
     let prompt_out = record_dir.join("prompt.txt");
-    let _prompt_out = EnvGuard::set("POHUNEK_TEST_PROMPT_OUT", &prompt_out);
+    let _prompt_out = EnvGuard::set("GUI_TEST_PROMPT_OUT", &prompt_out);
     write_executable(
         &bin_dir.join("claude"),
-        "#!/bin/sh\nprintf '%s' \"${1:-}\" > \"$POHUNEK_TEST_PROMPT_OUT\"\n/bin/sleep 30\n",
+        "#!/bin/sh\nprintf '%s' \"${1:-}\" > \"$GUI_TEST_PROMPT_OUT\"\n/bin/sleep 30\n",
     );
     let _path = PathGuard::prepend(&bin_dir);
 
@@ -1485,7 +1474,7 @@ async fn review_dispatch_creates_one_session_in_the_same_worktree_with_copied_li
     let _xdg = install_review_template("gui-core-review-dispatch-config-home");
 
     // Plain no-op `codex` for the *source* session: it takes no `input`, so
-    // it must not touch `POHUNEK_TEST_PROMPT_OUT` at all. If it shared the
+    // it must not touch `GUI_TEST_PROMPT_OUT` at all. If it shared the
     // recording script installed below, its own (empty) invocation could win
     // a race against the dispatched session's write to the same file.
     let sleep_bin_dir = temp_dir("gui-core-review-dispatch-sleep-bin");
@@ -1514,10 +1503,10 @@ async fn review_dispatch_creates_one_session_in_the_same_worktree_with_copied_li
     let record_bin_dir = temp_dir("gui-core-review-dispatch-record-bin");
     let record_dir = temp_dir("gui-core-review-dispatch-record");
     let prompt_out = record_dir.join("prompt.txt");
-    let _prompt_out = EnvGuard::set("POHUNEK_TEST_PROMPT_OUT", &prompt_out);
+    let _prompt_out = EnvGuard::set("GUI_TEST_PROMPT_OUT", &prompt_out);
     write_executable(
         &record_bin_dir.join("codex"),
-        "#!/bin/sh\nprintf '%s' \"${1:-}\" > \"$POHUNEK_TEST_PROMPT_OUT\"\n/bin/sleep 30\n",
+        "#!/bin/sh\nprintf '%s' \"${1:-}\" > \"$GUI_TEST_PROMPT_OUT\"\n/bin/sleep 30\n",
     );
     let _record_path = PathGuard::prepend(&record_bin_dir);
 
@@ -1937,16 +1926,11 @@ struct LoopbackDaemon {
 
 impl LoopbackDaemon {
     async fn spawn(tag: &str, version: &str) -> Self {
-        Self::spawn_with_config(tag, version, None, None, None, false).await
+        Self::spawn_with_config(tag, version, None, None, None).await
     }
 
-    async fn spawn_with_store_path(
-        tag: &str,
-        version: &str,
-        store_path: PathBuf,
-        load_resume: bool,
-    ) -> Self {
-        Self::spawn_with_config(tag, version, None, None, Some(store_path), load_resume).await
+    async fn spawn_with_store_path(tag: &str, version: &str, store_path: PathBuf) -> Self {
+        Self::spawn_with_config(tag, version, None, None, Some(store_path)).await
     }
 
     async fn spawn_with_config(
@@ -1955,7 +1939,6 @@ impl LoopbackDaemon {
         config_dir: Option<PathBuf>,
         shell_command: Option<pohunek_daemon::session::ShellCommand>,
         store_path: Option<PathBuf>,
-        load_resume: bool,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1973,10 +1956,7 @@ impl LoopbackDaemon {
         if let Some(shell_command) = shell_command {
             config.shell_command = shell_command;
         }
-        let sessions = SessionRegistry::new(config);
-        if load_resume {
-            sessions.load_and_resume().await;
-        }
+        let sessions = worker_backed_registry(config);
         let state = DaemonState::new(HealthInfo::new(version), sessions);
         let server = RemoteServer::from_listener(listener, state);
         let (shutdown, rx) = oneshot::channel();
@@ -2000,6 +1980,66 @@ impl LoopbackDaemon {
         let _ = self.shutdown.send(());
         let _ = self.handle.await;
     }
+}
+
+/// Build a `SessionRegistry` wired to a real `SubprocessWorkerLauncher` (the
+/// built `pohunek-sessiond`), rooted under a unique per-call worker home, so
+/// `session.new` can actually launch a durable worker instead of failing with
+/// `worker_backend_required`. Mirrors `worker_backed_registry` in
+/// `crates/daemon/tests/health_socket.rs`.
+///
+/// The worker home MUST use a short, tag-independent prefix rather than the
+/// descriptive `temp_dir(tag)` helper: the worker's control socket path is
+/// `<runtime_home>/pohunek/workers/<session_id>/control.sock`, and a
+/// nanosecond-stamped, test-name-embedding prefix pushes that path past the
+/// `SUN_LEN` (108-byte) limit on Unix domain socket paths, which surfaces as
+/// a `worker_connect_failed` protocol error instead of a clean session.
+fn worker_backed_registry(mut config: SessionRegistryConfig) -> SessionRegistry {
+    let worker_home = std::env::temp_dir().join(format!(
+        "pw-g-{}-{}",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let worker_environment = SubprocessWorkerEnvironment {
+        runtime_home: worker_home.join("runtime"),
+        state_home: worker_home.join("state"),
+        data_home: worker_home.join("data"),
+        config_home: worker_home.join("config"),
+        cache_home: worker_home.join("cache"),
+        daemon_socket: worker_home.join("daemon.sock"),
+    };
+    config.worker_runtime_root = Some(worker_environment.runtime_home.join("pohunek/workers"));
+    config.worker_state_root = Some(worker_environment.state_home.join("pohunek/workers"));
+    let launcher = Arc::new(SubprocessWorkerLauncher::new(
+        worker_binary(),
+        worker_environment,
+    ));
+    SessionRegistry::new_with_launcher_and_inspector(
+        config,
+        launcher,
+        Arc::new(LinuxInspector::new()),
+    )
+}
+
+/// Locate the built `pohunek-sessiond` worker binary, mirroring
+/// `worker_binary` in `crates/daemon/tests/health_socket.rs`.
+fn worker_binary() -> PathBuf {
+    if let Some(path) = std::env::var_os("POHUNEK_WORKER_BIN") {
+        return PathBuf::from(path);
+    }
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("gui-core crate is inside workspace")
+        .to_path_buf();
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| workspace.join("target"), PathBuf::from);
+    let binary = target.join("debug/pohunek-sessiond");
+    assert!(
+        binary.is_file(),
+        "build the real worker first with `cargo build -p pohunek-session-worker --bin pohunek-sessiond`, or set POHUNEK_WORKER_BIN"
+    );
+    binary
 }
 
 struct NotificationListErrorDaemon {
@@ -2084,7 +2124,16 @@ fn notification_error_response(request: &Request) -> Response {
 fn test_connection_options() -> ConnectionOptions {
     ConnectionOptions {
         connect_timeout: Duration::from_millis(100),
-        request_timeout: Duration::from_millis(500),
+        // `session.new` now launches a real `pohunek-sessiond` subprocess (see
+        // `worker_backed_registry`): it forks/execs the worker binary, which
+        // creates its runtime/state directories, binds its own control
+        // socket, and completes a handshake before the daemon can reply. That
+        // is well over an order of magnitude slower than the old in-process
+        // stub launcher, so single-shot request call sites (e.g.
+        // `assistant::launch_with_options`, `dispatch_review`) need a much
+        // longer budget than the reconciliation-loop call sites, which retry
+        // on timeout via `backoff_initial`/`backoff_max`.
+        request_timeout: Duration::from_secs(15),
         reconcile_interval: Duration::from_millis(100),
         backoff_initial: Duration::from_millis(10),
         backoff_max: Duration::from_millis(50),
@@ -2347,32 +2396,6 @@ async fn wait_for_native_id_tcp(host: &HostConfig, id: &SessionId, native_id: &s
         }
         let now = tokio::time::Instant::now();
         assert!(now < deadline, "native id was not captured before deadline");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-async fn wait_for_session_with_metadata(
-    host: &HostConfig,
-    id: &SessionId,
-    metadata: &std::collections::BTreeMap<String, String>,
-) -> SessionInfo {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let sessions = load_host_snapshot(host)
-            .await
-            .expect("snapshot while waiting for resumed session")
-            .sessions;
-        if let Some(session) = sessions
-            .into_iter()
-            .find(|session| session.id == *id && session.metadata == *metadata)
-        {
-            return session;
-        }
-        let now = tokio::time::Instant::now();
-        assert!(
-            now < deadline,
-            "resumed session metadata was not visible before deadline"
-        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }

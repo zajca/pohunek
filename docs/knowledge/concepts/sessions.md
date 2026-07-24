@@ -2,15 +2,17 @@
 type: Concept
 id: concept/sessions
 title: Sessions
-description: Pohunek sessions are daemon-owned PTY processes controlled by the CLI and addressed locally or through a host-qualified target.
+description: Pohunek sessions are durable logical records backed by isolated PTY workers and controlled through a restartable daemon.
 source_kind: manual
 intents: [debug, help, project]
 ---
 
 # Sessions
 
-A session is a daemon-owned PTY process running an agent in a working directory.
-The CLI controls sessions through the daemon: start with `pohunek session new`,
+A session is a durable logical record running an agent in a worker-owned PTY.
+`pohunekd` owns the public API, metadata, and logical lifecycle; one isolated
+`pohunek-sessiond` worker owns the live PTY generation and child process. The
+CLI controls sessions through the daemon: start with `pohunek session new`,
 inspect with `pohunek session inspect`, list with `pohunek session list`, send
 input with `pohunek session input`, stop with `pohunek session stop`, and attach
 with `pohunek attach`.
@@ -36,9 +38,10 @@ A session can carry an optional owner-set display name. Set it at creation with
 `pohunek session new --name <NAME>`, and change or clear it later with
 `pohunek session rename <target> <NAME>` (or `--clear`). The name is cosmetic:
 it shows in `pohunek session list`, `session inspect`, and the GUI, but never
-affects targeting or resume — a session is still addressed by its id. The daemon
-trims the name and rejects a control character or an over-long one. The name is
-captured in the resume binding, so it survives a daemon restart.
+affects targeting or recovery — a session is still addressed by its id. The
+daemon trims the name and rejects a control character or an over-long one. The
+name is stored in the logical session record, so it survives daemon and worker
+loss.
 
 The assistant feature reuses this session lifecycle. Its opening prompt is just
 initial input to a normal session, so session warnings and applied-input status
@@ -142,6 +145,21 @@ the new cwd is inside another registered active worktree, `worktree_path`,
 known worktree, `worktree_path` is cleared while git `repo`/`branch` metadata is
 kept when detection still finds a repository.
 
+Every managed `SessionInfo` has a `runtime` object distinct from its agent
+`state` and `activity`. Runtime state is one of `starting`, `live`,
+`reconnecting`, `terminal`, `lost`, `conflict`, or `incompatible`. `worker_id`
+identifies the PTY owner and `runtime_id` identifies one PTY generation. A
+daemon restart preserves both ids. Explicit native recovery preserves the
+logical session id but changes the worker and runtime ids.
+
+`lost` means the worker or host runtime is gone and the PTY cannot be
+reattached. `conflict` means discovery found ambiguous or mismatched live
+identity; Pohunek quarantines it and does not kill a worker automatically.
+`incompatible` means the worker is alive but has no compatible private protocol
+version, so the daemon leaves it running. Attach, input, and resize are not
+available in these degraded states, but list and inspect retain the logical
+record and diagnostic `loss_reason`.
+
 External observer mode is opt-in with `POHUNEK_OBSERVE_EXTERNAL_AGENTS=1` (or
 `SessionRegistryConfig.observe_external_agents = true`) and defaults off because
 it watches provider transcript trees under the operator's Claude/Codex homes.
@@ -154,29 +172,36 @@ resume operations are rejected with `session_external_read_only`. The observer
 removes the entry when the external process exits, including `kill -9` via the
 pidfd-backed exit path.
 
-Detach and client restarts do not stop a session because the daemon owns the PTY.
-A daemon restart is different: the live PTY and process are gone, and only
-sessions with captured native agent resume metadata can be relaunched. When an
-attached terminal sees that unexpected stream close, `pohunek attach` waits for
-the restarted daemon to resume the same session id and reconnects if it becomes
-running again. Native resume metadata is accepted only from the session's own
-agent profile or base kind, so a nested different agent cannot overwrite the
-parent session's resume binding. Nested active-agent reports are therefore
-runtime evidence only: they can expose the currently active agent and active
-native metadata while the nested process runs, but they never populate or replace
-`native_session_id` / `native_session_path` for the parent session. Procwatch can
-auto-report a matching nested agent even when hooks are missing, and auto-release
-clears stale active fields when the backing process exits or an unbound claim
-exceeds the active-agent claim TTL. Both explicit release and auto-release
-restore the parent session's default detector identity.
+Detach and client restarts do not stop a session because its worker owns the
+PTY. A daemon restart, daemon `SIGKILL`, or daemon binary upgrade closes client
+and controller sockets, but the worker keeps the same PTY and process group,
+continues draining bounded output, and accepts the replacement daemon after
+reconciliation. `pohunek attach` reconnects to the same runtime id. Reconnection
+emits `session_runtime_reconnected`; it does not emit `session_created`, report
+child exit, or invoke native resume.
 
-An in-memory terminal session (`stopped`, `done`, or `failed`) that still carries
-captured native resume metadata can be explicitly relaunched with `session.resume`.
-The daemon reuses the same pohunek session id and rebuilds the agent's native
-resume argv from the frozen launch profile. The GUI's "Open in terminal" action
-uses this before attaching, so a finished resumable session opens as a live PTY
-instead of flashing a terminal that immediately exits. A removed session is gone
-and cannot be resumed.
+Native recovery metadata is accepted only from the immutable launch agent
+process, so a nested different or same-provider agent cannot overwrite the
+parent session's recovery reference. Managed children inherit the stable
+`POHUNEK_SESSION_ID`, `POHUNEK_WORKER_ID`,
+`POHUNEK_WORKER_SOCKET_PATH`, and worker hook protocol version. Identity hooks
+prefer the worker endpoint so accepted state survives daemon outage. Nested
+active-agent reports remain runtime evidence only: they can expose the active
+agent and active native metadata while that process runs, but never populate or
+replace `native_session_id` / `native_session_path` for the parent session.
+Procwatch can auto-report a matching nested agent when hooks are missing, and
+auto-release clears stale active fields when the backing process exits or an
+unbound claim exceeds the active-agent claim TTL.
+
+A terminal or `runtime.state=lost` session that still carries captured native
+recovery metadata can be explicitly recovered with `session.resume`. The daemon
+reuses the logical pohunek session id and frozen launch profile but creates a
+new worker, runtime id, PTY, and child PID. Clients receive
+`session_native_recovered` (including the previous and new runtime IDs when
+known) and must show that generation change rather than
+present it as reconnection. Recovery is rejected for live, reconnecting,
+conflicting, or incompatible runtimes and is never automatic. A removed session
+is gone and cannot be recovered.
 
 `session.fork` creates a new pohunek session id and PTY from the source session's
 native agent conversation. The source may still be live; fork does not require a

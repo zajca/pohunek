@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use protocol::{AgentKind, ProjectSource};
+use protocol::{AgentKind, ProjectSource, RuntimeState, SessionInfo};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -372,15 +372,106 @@ pub enum ProjectResolution {
     Ambiguous(Vec<ProjectRecord>),
 }
 
+/// Desired durable outcome for one logical session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesiredState {
+    /// A worker runtime should be live.
+    Running,
+    /// The current runtime should be terminal.
+    Stopped,
+    /// The runtime and logical record should be removed.
+    Removed,
+}
+
+/// Durable lifecycle operation that reconciliation must finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransactionKind {
+    /// Initial worker creation.
+    Create,
+    /// Explicit runtime stop.
+    Stop,
+    /// Explicit provider-native recovery.
+    Recover,
+    /// Logical session removal.
+    Remove,
+}
+
+/// One in-progress idempotent lifecycle transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTransaction {
+    /// Stable operation identifier used for deduplication.
+    pub id: String,
+    /// Operation being completed.
+    pub kind: TransactionKind,
+    /// Stable implementation phase.
+    pub phase: String,
+    /// Worker replaced by a recovery transaction, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_worker_id: Option<String>,
+    /// Runtime generation replaced by a recovery transaction, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_runtime_id: Option<String>,
+}
+
+/// Last durable binding between a logical session and its worker runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeRecord {
+    /// Current worker availability.
+    pub state: RuntimeState,
+    /// Stable worker identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    /// Stable PTY generation identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
+    /// systemd user unit name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_name: Option<String>,
+    /// Machine-readable loss or conflict reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Durable logical session authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRecord {
+    /// On-disk record schema.
+    pub schema_version: u32,
+    /// Stable logical session identifier.
+    pub session_id: String,
+    /// Desired lifecycle outcome.
+    pub desired_state: DesiredState,
+    /// In-progress operation, when reconciliation has work to finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction: Option<SessionTransaction>,
+    /// Sanitized client-facing logical snapshot.
+    pub info: SessionInfo,
+    /// Structural native-recovery snapshot without profile environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<ResumeBinding>,
+    /// Last durable worker binding.
+    pub runtime: RuntimeRecord,
+}
+
 /// A single line of the unified store, internally tagged by `kind` so both
 /// record kinds coexist in one file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Record {
+    Session(Box<SessionRecord>),
     Resume(ResumeBinding),
     Worktree(WorktreeBinding),
     Project(ProjectRecord),
 }
+
+type StoreRecords = (
+    Vec<ResumeBinding>,
+    Vec<WorktreeBinding>,
+    Vec<ProjectRecord>,
+    Vec<SessionRecord>,
+);
 
 /// File-backed unified metadata store.
 ///
@@ -424,6 +515,45 @@ impl Store {
         Ok(self.read_all()?.2)
     }
 
+    /// Loads every durable logical session.
+    pub fn load_sessions(&self) -> io::Result<Vec<SessionRecord>> {
+        Ok(self.read_all()?.3)
+    }
+
+    /// Upserts one logical session and preserves every other record kind.
+    pub fn record_session(&self, record: &SessionRecord) -> io::Result<()> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (resume, worktrees, projects, mut sessions) = self.read_all()?;
+        if let Some(existing) = sessions
+            .iter_mut()
+            .find(|existing| existing.session_id == record.session_id)
+        {
+            *existing = record.clone();
+        } else {
+            sessions.push(record.clone());
+        }
+        self.write_all(&resume, &worktrees, &projects, &sessions)
+    }
+
+    /// Removes one logical session and preserves every other record kind.
+    pub fn remove_session(&self, session_id: &str) -> io::Result<bool> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (resume, worktrees, projects, mut sessions) = self.read_all()?;
+        let before = sessions.len();
+        sessions.retain(|record| record.session_id != session_id);
+        let removed = before != sessions.len();
+        if removed {
+            self.write_all(&resume, &worktrees, &projects, &sessions)?;
+        }
+        Ok(removed)
+    }
+
     /// Upsert a resume binding (keyed by `session_id`), preserving every worktree
     /// record, and rewrite the file atomically.
     pub fn record_resume(&self, binding: &ResumeBinding) -> io::Result<()> {
@@ -431,7 +561,7 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (mut resume, worktrees, projects) = self.read_all()?;
+        let (mut resume, worktrees, projects, sessions) = self.read_all()?;
         if let Some(existing) = resume
             .iter_mut()
             .find(|existing| existing.session_id == binding.session_id)
@@ -440,7 +570,7 @@ impl Store {
         } else {
             resume.push(binding.clone());
         }
-        self.write_all(&resume, &worktrees, &projects)
+        self.write_all(&resume, &worktrees, &projects, &sessions)
     }
 
     /// Remove a resume binding by session id, preserving every worktree record. A
@@ -450,13 +580,13 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (mut resume, worktrees, projects) = self.read_all()?;
+        let (mut resume, worktrees, projects, sessions) = self.read_all()?;
         let before = resume.len();
         resume.retain(|binding| binding.session_id != session_id);
         if resume.len() == before {
             return Ok(());
         }
-        self.write_all(&resume, &worktrees, &projects)
+        self.write_all(&resume, &worktrees, &projects, &sessions)
     }
 
     /// Find the active worktree binding for a `(session_id, repository,
@@ -497,7 +627,7 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, mut worktrees, projects) = self.read_all()?;
+        let (resume, mut worktrees, projects, sessions) = self.read_all()?;
         if let Some(existing) = worktrees.iter_mut().find(|existing| {
             existing.session_id == binding.session_id
                 && existing.repository == binding.repository
@@ -507,7 +637,7 @@ impl Store {
         } else {
             worktrees.push(binding.clone());
         }
-        self.write_all(&resume, &worktrees, &projects)
+        self.write_all(&resume, &worktrees, &projects, &sessions)
     }
 
     /// Remove every worktree binding owned by `session_id`, preserving every
@@ -517,12 +647,12 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, mut worktrees, projects) = self.read_all()?;
+        let (resume, mut worktrees, projects, sessions) = self.read_all()?;
         let before = worktrees.len();
         worktrees.retain(|binding| binding.session_id != session_id);
         let removed = before - worktrees.len();
         if removed > 0 {
-            self.write_all(&resume, &worktrees, &projects)?;
+            self.write_all(&resume, &worktrees, &projects, &sessions)?;
         }
         Ok(removed)
     }
@@ -553,7 +683,7 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, worktrees, mut projects) = self.read_all()?;
+        let (resume, worktrees, mut projects, sessions) = self.read_all()?;
         let pos = projects
             .iter()
             .position(|existing| existing.git_common_dir == git_common_dir);
@@ -565,7 +695,7 @@ impl Store {
             Some(index) => projects[index] = updated.clone(),
             None => projects.push(updated.clone()),
         }
-        self.write_all(&resume, &worktrees, &projects)?;
+        self.write_all(&resume, &worktrees, &projects, &sessions)?;
         Ok(Some(updated))
     }
 
@@ -585,7 +715,7 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, worktrees, mut projects) = self.read_all()?;
+        let (resume, worktrees, mut projects, sessions) = self.read_all()?;
         if let Some(existing) = projects
             .iter_mut()
             .find(|existing| existing.git_common_dir == record.git_common_dir)
@@ -594,7 +724,7 @@ impl Store {
         } else {
             projects.push(record.clone());
         }
-        self.write_all(&resume, &worktrees, &projects)
+        self.write_all(&resume, &worktrees, &projects, &sessions)
     }
 
     /// Remove the project keyed by `git_common_dir`, preserving every resume and
@@ -606,12 +736,12 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, worktrees, mut projects) = self.read_all()?;
+        let (resume, worktrees, mut projects, sessions) = self.read_all()?;
         let before = projects.len();
         projects.retain(|project| project.git_common_dir != git_common_dir);
         let removed = projects.len() != before;
         if removed {
-            self.write_all(&resume, &worktrees, &projects)?;
+            self.write_all(&resume, &worktrees, &projects, &sessions)?;
         }
         Ok(removed)
     }
@@ -639,21 +769,22 @@ impl Store {
     /// Read and partition every record. A missing file yields three empty lists;
     /// malformed lines are skipped (a corrupt line must not block loading the
     /// rest).
-    fn read_all(
-        &self,
-    ) -> io::Result<(Vec<ResumeBinding>, Vec<WorktreeBinding>, Vec<ProjectRecord>)> {
+    fn read_all(&self) -> io::Result<StoreRecords> {
+        reject_symlink(&self.path)?;
         let content = match fs::read_to_string(&self.path) {
             Ok(content) => content,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Ok((Vec::new(), Vec::new(), Vec::new()))
+                return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()))
             }
             Err(err) => return Err(err),
         };
         let mut resume = Vec::new();
         let mut worktrees = Vec::new();
         let mut projects = Vec::new();
+        let mut sessions = Vec::new();
         for line in content.lines().filter(|line| !line.trim().is_empty()) {
             match serde_json::from_str::<Record>(line) {
+                Ok(Record::Session(record)) => sessions.push(*record),
                 Ok(Record::Resume(binding)) => resume.push(binding),
                 Ok(Record::Worktree(binding)) => worktrees.push(binding),
                 Ok(Record::Project(record)) => projects.push(record),
@@ -668,7 +799,7 @@ impl Store {
                 }
             }
         }
-        Ok((resume, worktrees, projects))
+        Ok((resume, worktrees, projects, sessions))
     }
 
     /// Serialize all records (resume, then worktree, then project) to a temp file
@@ -678,6 +809,7 @@ impl Store {
         resume: &[ResumeBinding],
         worktrees: &[WorktreeBinding],
         projects: &[ProjectRecord],
+        sessions: &[SessionRecord],
     ) -> io::Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
@@ -692,10 +824,21 @@ impl Store {
         for record in projects {
             append_line(&mut body, &Record::Project(record.clone()))?;
         }
+        for record in sessions {
+            append_line(&mut body, &Record::Session(Box::new(record.clone())))?;
+        }
 
         let tmp = self.temp_path();
-        write_owner_private(&tmp, body.as_bytes())?;
-        fs::rename(&tmp, &self.path)
+        let result = (|| {
+            write_owner_private(&tmp, body.as_bytes())?;
+            reject_symlink(&self.path)?;
+            fs::rename(&tmp, &self.path)?;
+            sync_parent_directory(&self.path)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        result
     }
 
     fn temp_path(&self) -> PathBuf {
@@ -726,8 +869,25 @@ fn write_owner_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = owner_private_replace_options().open(path)?;
     set_owner_private_file_permissions(path)?;
     file.write_all(bytes)?;
-    file.flush()?;
+    file.sync_all()
+}
+
+/// Persist the directory entry created by the atomic rename.
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    fs::File::open(parent_directory(path))?.sync_all()
+}
+
+/// Directory handles are not portably openable outside Unix.
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> io::Result<()> {
     Ok(())
+}
+
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 fn owner_private_replace_options() -> fs::OpenOptions {
@@ -736,9 +896,23 @@ fn owner_private_replace_options() -> fs::OpenOptions {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(OWNER_PRIVATE_FILE_MODE)
+        options
+            .mode(OWNER_PRIVATE_FILE_MODE)
+            .custom_flags(libc::O_NOFOLLOW);
     };
     options
+}
+
+fn reject_symlink(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing symlink metadata-store path: {}", path.display()),
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(unix)]
@@ -1092,6 +1266,44 @@ mod tests {
         assert_eq!(fs::read(&path).expect("read"), b"new");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn store_rejects_symlink_target_without_touching_referent() {
+        use std::os::unix::fs::symlink;
+
+        let path = temp_store_path("symlink-store");
+        let referent = path.with_file_name("referent");
+        fs::write(&referent, b"keep").expect("write referent");
+        symlink(&referent, &path).expect("create store symlink");
+        let store = Store::new(path);
+
+        let error = store
+            .record_resume(&resume("s-1", "native-1"))
+            .expect_err("store symlink must be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(referent).expect("read referent"), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_rejects_symlink_temporary_file_without_touching_referent() {
+        use std::os::unix::fs::symlink;
+
+        let path = temp_store_path("symlink-temp");
+        let store = Store::new(path.clone());
+        let referent = path.with_file_name("temp-referent");
+        fs::write(&referent, b"keep").expect("write referent");
+        symlink(&referent, store.temp_path()).expect("create temp symlink");
+
+        store
+            .record_resume(&resume("s-1", "native-1"))
+            .expect_err("temporary symlink must be rejected");
+
+        assert_eq!(fs::read(referent).expect("read referent"), b"keep");
+        assert!(!path.exists(), "failed write must not create the store");
+    }
+
     // --- projects (milestone: projects M2) -----------------------------------
 
     #[test]
@@ -1389,6 +1601,18 @@ mod tests {
             store.load_resume().expect("r").len(),
             1,
             "the corrupt line must not block loading the resume binding"
+        );
+    }
+
+    #[test]
+    fn durable_atomic_write_resolves_parent_for_absolute_and_relative_store_paths() {
+        assert_eq!(
+            super::parent_directory(Path::new("/var/lib/pohunek/metadata.jsonl")),
+            Path::new("/var/lib/pohunek")
+        );
+        assert_eq!(
+            super::parent_directory(Path::new("metadata.jsonl")),
+            Path::new(".")
         );
     }
 }

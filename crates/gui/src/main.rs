@@ -401,6 +401,7 @@ mod tests {
             created_at: "2026-06-29T00:00:00Z".to_owned(),
             updated_at: "2026-06-29T00:00:00Z".to_owned(),
             exit_code: None,
+            runtime: None,
         }
     }
 
@@ -459,6 +460,15 @@ mod tests {
         let host_id = HostId::new("local");
         let stopped = test_session("s-1", protocol::SessionState::Stopped);
         let running = test_session("s-2", protocol::SessionState::Running);
+        let mut lost = test_session("s-3", protocol::SessionState::Running);
+        lost.runtime = Some(protocol::SessionRuntime {
+            state: protocol::RuntimeState::Lost,
+            worker_id: Some("worker-old".to_owned()),
+            runtime_id: Some("runtime-old".to_owned()),
+            started_at: None,
+            last_connected_at: None,
+            loss_reason: Some("worker_unavailable".to_owned()),
+        });
 
         assert!(session_requires_resume_before_attach(
             &app_with_session(&host_id, stopped.clone()),
@@ -469,6 +479,11 @@ mod tests {
             &app_with_session(&host_id, running.clone()),
             &host_id,
             &running.id
+        ));
+        assert!(session_requires_resume_before_attach(
+            &app_with_session(&host_id, lost.clone()),
+            &host_id,
+            &lost.id
         ));
     }
 

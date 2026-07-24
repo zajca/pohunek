@@ -4,6 +4,7 @@ import type { AgentActivity } from "./AgentActivity";
 import type { AgentKind } from "./AgentKind";
 import type { CwdSource } from "./CwdSource";
 import type { SessionId } from "./SessionId";
+import type { SessionRuntime } from "./SessionRuntime";
 import type { SessionState } from "./SessionState";
 import type { SessionWarning } from "./SessionWarning";
 import type { StateSource } from "./StateSource";
@@ -67,6 +68,13 @@ export type SessionNewResult = {
    * Operating-system process id of the session root process.
    */
   pid: number;
+  /**
+   * Durable worker runtime information.
+   *
+   * `None` means the peer predates worker-backed sessions or this is an
+   * observe-only external process.
+   */
+  runtime?: SessionRuntime;
   /**
    * Current terminal width in columns.
    */

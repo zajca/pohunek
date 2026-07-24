@@ -17,6 +17,7 @@ Start here:
 - [Web control center](guides/web-control-center.md) covers the browser client,
   backend trust boundary, development stack, and TypeScript package surfaces.
 - [Debug daemon](runbooks/debug-daemon.md),
+  [debug session runtime](runbooks/debug-session-runtime.md),
   [debug launcher](runbooks/debug-launcher.md), and
   [update after release](runbooks/update-after-release.md) are operational
   runbooks.

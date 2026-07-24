@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { expect, test } from "bun:test";
 import { PROTOCOL_VERSION, type ProtocolEvent } from "@pohunek/protocol";
 import { startRelay, type RelayHandle } from "@pohunek/backend";
+import { startDurableWorkerFixture } from "@pohunek/testkit";
 import {
   Client,
   attachRawLocal,
@@ -225,6 +226,14 @@ async function startDaemon(): Promise<DaemonHarness> {
   await Promise.all(Object.values(dirs).map((dir) => mkdir(dir, { recursive: true })));
 
   const daemonBin = daemonBinaryPath();
+  const worker = await startDurableWorkerFixture({
+    daemonBin,
+    runtimeDir: dirs.runtime,
+    dataDir: dirs.data,
+    stateDir: dirs.state,
+    configDir: dirs.config,
+    sessionId: "s-1",
+  });
   const stdoutChunks: string[] = [];
   const stderrChunks: string[] = [];
   let exitStatus: ExitStatus | undefined;
@@ -246,6 +255,7 @@ async function startDaemon(): Promise<DaemonHarness> {
       // isolated empty HOME, which swallow the probe command and make the
       // attach round-trip non-deterministic.
       SHELL: "/bin/sh",
+      POHUNEK_WORKER_UNIT_TEMPLATE: worker.unitTemplate,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -276,6 +286,7 @@ async function startDaemon(): Promise<DaemonHarness> {
     await waitForDaemonReady(socketPath, () => exitStatus, () => spawnError, logs);
   } catch (error: unknown) {
     await stopChild(child, exitPromise, () => exitStatus, { allowAlreadyExited: true }).catch(() => undefined);
+    await worker.stop();
     await rm(tempRoot, { recursive: true, force: true });
     throw error;
   }
@@ -286,6 +297,7 @@ async function startDaemon(): Promise<DaemonHarness> {
     ...logs(),
     stop: async (): Promise<void> => {
       const status = await stopChild(child, exitPromise, () => exitStatus, { allowAlreadyExited: false });
+      await worker.stop();
       await rm(tempRoot, { recursive: true, force: true });
       if (status.code !== 0 || status.signal !== null) {
         throw new Error(

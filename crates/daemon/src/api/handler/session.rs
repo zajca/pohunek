@@ -50,6 +50,16 @@ pub(super) async fn handle_session_list(request: &Request, sessions: &SessionReg
     ok_value(request, &list)
 }
 
+pub(super) async fn handle_session_runtime_inventory(
+    request: &Request,
+    sessions: &SessionRegistry,
+) -> Response {
+    if let Err(err) = parse_optional_params::<()>(request) {
+        return Response::err(request.id.clone(), err);
+    }
+    ok_value(request, &sessions.runtime_inventory().await)
+}
+
 pub(super) async fn handle_session_inspect(
     request: &Request,
     sessions: &SessionRegistry,

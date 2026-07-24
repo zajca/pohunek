@@ -247,26 +247,32 @@ pub struct SessionAttachParams {
     /// Set by the CLI from `POHUNEK_SESSION_ID` (see
     /// [`ENV_SESSION_ID`](crate::ENV_SESSION_ID)): a process running inside a
     /// session's own PTY carries that session's id here. Paired with
-    /// [`Self::origin_daemon_id`], it lets the daemon reject an attach that would
-    /// pipe a PTY's output back into its own input (an infinite loop). Sent for
-    /// every transport (the loop is reachable even over a same-host loopback TCP
-    /// attach); the daemon-id pairing prevents a false positive against a
-    /// different daemon that reuses the same id string. Additive: an older daemon
-    /// ignores it; an older CLI omits it.
+    /// [`Self::origin_worker_id`], it lets the daemon reject an attach that would
+    /// pipe a PTY's output back into its own input (an infinite loop), including
+    /// after daemon replacement. Sent for every transport because the loop is
+    /// reachable even over a same-host loopback TCP attach. Additive: an older
+    /// daemon ignores it; an older CLI omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub origin_session_id: Option<SessionId>,
     /// Daemon instance the [`Self::origin_session_id`] belongs to, from
     /// `POHUNEK_DAEMON_ID` (see [`ENV_DAEMON_ID`](crate::ENV_DAEMON_ID)).
     ///
-    /// The daemon rejects the attach as self-feeding only when **both** the
-    /// session id matches the target **and** this equals its own live instance id.
-    /// That scopes the guard to the exact PTY the client sits inside: a colliding
-    /// id on another daemon, or a stale value from a previous daemon process, has
-    /// a different instance id and is correctly allowed. Additive.
+    /// Worker-backed sessions ignore this value for self-feedback protection.
+    /// It remains an additive compatibility fallback only for the isolated
+    /// workerless test runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub origin_daemon_id: Option<String>,
+    /// Stable worker identity inherited from the originating managed PTY.
+    ///
+    /// A daemon restart changes its instance ID but does not change the worker
+    /// that owns the PTY. New peers use this field with
+    /// [`Self::origin_session_id`] for the self-feedback guard. This stable pair
+    /// is authoritative for production sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub origin_worker_id: Option<String>,
 }
 
 /// Result returned by `session.attach`.
@@ -472,6 +478,136 @@ pub enum SessionState {
     Failed,
 }
 
+/// Availability of the PTY runtime backing a logical session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "RuntimeState.ts"))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeState {
+    /// A worker unit is being initialized.
+    Starting,
+    /// The existing worker and PTY are connected.
+    Live,
+    /// The daemon is reconnecting to a known worker.
+    Reconnecting,
+    /// The worker observed a terminal child outcome.
+    Terminal,
+    /// The worker or host was lost and the PTY no longer exists.
+    Lost,
+    /// More than one runtime identity claims the logical session.
+    Conflict,
+    /// The live worker has no compatible private protocol version.
+    Incompatible,
+}
+
+/// Discovery classification for one independently surviving worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "RuntimeInventoryStatus.ts"))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeInventoryStatus {
+    /// The worker is the unique authenticated runtime for its logical session.
+    Managed,
+    /// The worker has no matching logical session and is deliberately left alive.
+    Orphaned,
+    /// Multiple authenticated workers claim the same logical session.
+    Conflict,
+    /// The worker speaks no compatible private protocol version.
+    Incompatible,
+    /// The runtime-directory, logical-record, and worker identities disagree.
+    IdentityMismatch,
+}
+
+/// Public, read-only inventory entry for one discovered worker endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "RuntimeInventoryEntry.ts"))]
+pub struct RuntimeInventoryEntry {
+    /// Owner-private runtime-directory name containing the worker socket.
+    pub runtime_slot: String,
+    /// Session identity authenticated through the worker protocol, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub claimed_session_id: Option<String>,
+    /// Stable worker identity, when negotiation and inspection succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub worker_id: Option<String>,
+    /// Current PTY generation identity, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub runtime_id: Option<String>,
+    /// Fail-closed discovery classification.
+    pub status: RuntimeInventoryStatus,
+    /// Stable machine-readable explanation for non-managed entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub reason: Option<String>,
+}
+
+/// Result of `session.runtime_inventory`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "RuntimeInventoryResult.ts"))]
+pub struct RuntimeInventoryResult {
+    /// Authenticated endpoints and quarantined discovery failures.
+    pub entries: Vec<RuntimeInventoryEntry>,
+}
+
+/// Event payload emitted when discovery quarantines a worker endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "RuntimeInventoryEvent.ts"))]
+pub struct RuntimeInventoryEvent {
+    /// Newly classified worker endpoint.
+    pub entry: RuntimeInventoryEntry,
+}
+
+/// Runtime generation attached to a logical session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionRuntime.ts"))]
+pub struct SessionRuntime {
+    /// Current runtime availability.
+    pub state: RuntimeState,
+    /// Stable owner of the PTY, when one is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub worker_id: Option<String>,
+    /// PTY generation identity, when one is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub runtime_id: Option<String>,
+    /// Timestamp at which this runtime generation started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub started_at: Option<String>,
+    /// Timestamp of the latest successful daemon connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub last_connected_at: Option<String>,
+    /// Stable machine-readable reason when the runtime is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub loss_reason: Option<String>,
+}
+
+impl RuntimeState {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Live => "live",
+            Self::Reconnecting => "reconnecting",
+            Self::Terminal => "terminal",
+            Self::Lost => "lost",
+            Self::Conflict => "conflict",
+            Self::Incompatible => "incompatible",
+        }
+    }
+}
+
 impl SessionState {
     /// Returns the stable wire string.
     #[must_use]
@@ -576,6 +712,13 @@ pub struct SessionInfo {
     pub cwd_source: Option<CwdSource>,
     /// Operating-system process id of the session root process.
     pub pid: u32,
+    /// Durable worker runtime information.
+    ///
+    /// `None` means the peer predates worker-backed sessions or this is an
+    /// observe-only external process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub runtime: Option<SessionRuntime>,
     /// Current terminal width in columns.
     pub cols: u16,
     /// Current terminal height in rows.
@@ -692,6 +835,30 @@ pub struct SessionInfo {
 pub struct SessionEvent {
     /// Session summary carried by the lifecycle event.
     pub session: SessionInfo,
+}
+
+/// Payload for `session_native_recovered`.
+///
+/// Native recovery preserves the logical session while replacing its PTY
+/// runtime generation. The previous runtime may be absent for a session
+/// imported from the one-time legacy migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "SessionNativeRecoveredEvent.ts")
+)]
+pub struct SessionNativeRecoveredEvent {
+    /// Recovered logical session and its new runtime.
+    pub session: SessionInfo,
+    /// Runtime generation replaced by the explicit recovery, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub previous_runtime_id: Option<String>,
+    /// Newly-created runtime generation, when the active backend exposes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub runtime_id: Option<String>,
 }
 
 /// Payload for an `agent_state` event.
@@ -897,6 +1064,7 @@ mod tests {
             cwd: PathBuf::from("/workspace"),
             cwd_source: Some(CwdSource::Launch),
             pid: 4242,
+            runtime: None,
             cols: 80,
             rows: 24,
             state: SessionState::Running,
@@ -1032,6 +1200,7 @@ mod tests {
             session_id: SessionId("s-1".to_owned()),
             origin_session_id: None,
             origin_daemon_id: None,
+            origin_worker_id: None,
         };
         let value = serde_json::to_value(&bare).expect("serialize");
         assert_eq!(value, serde_json::json!({ "session_id": "s-1" }));
@@ -1047,6 +1216,7 @@ mod tests {
             session_id: SessionId("s-1".to_owned()),
             origin_session_id: Some(SessionId("s-1".to_owned())),
             origin_daemon_id: Some("daemon-abc".to_owned()),
+            origin_worker_id: Some("worker-abc".to_owned()),
         };
         let value = serde_json::to_value(&with_origin).expect("serialize");
         assert_eq!(
@@ -1055,6 +1225,7 @@ mod tests {
                 "session_id": "s-1",
                 "origin_session_id": "s-1",
                 "origin_daemon_id": "daemon-abc",
+                "origin_worker_id": "worker-abc",
             })
         );
         let parsed: SessionAttachParams = serde_json::from_value(value).expect("parse");
@@ -1073,6 +1244,23 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&typed).expect("typed json string"),
             serde_json::to_string(&legacy).expect("legacy json string")
+        );
+    }
+
+    #[test]
+    fn native_recovered_event_round_trips_runtime_generations() {
+        let payload = SessionNativeRecoveredEvent {
+            session: session("s-1"),
+            previous_runtime_id: Some("runtime-old".to_owned()),
+            runtime_id: Some("runtime-new".to_owned()),
+        };
+        let value = serde_json::to_value(&payload).expect("serialize recovery event");
+        assert_eq!(value["previous_runtime_id"], "runtime-old");
+        assert_eq!(value["runtime_id"], "runtime-new");
+        assert_eq!(
+            serde_json::from_value::<SessionNativeRecoveredEvent>(value)
+                .expect("parse recovery event"),
+            payload
         );
     }
 

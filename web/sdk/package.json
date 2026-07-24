@@ -6,7 +6,8 @@
     "@pohunek/protocol": "workspace:*"
   },
   "devDependencies": {
-    "@pohunek/backend": "workspace:*"
+    "@pohunek/backend": "workspace:*",
+    "@pohunek/testkit": "workspace:*"
   },
   "exports": {
     ".": {

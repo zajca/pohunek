@@ -13,7 +13,9 @@ The Universal Pohunek Assistant is designed as one capable coding-agent session,
 not as a separate runtime or a set of specialized agents. The launch command
 materializes a version-matched knowledge bundle, writes a redacted live snapshot,
 builds a short navigational prompt, and starts a normal PTY-backed session with
-initial input.
+initial input. Like every managed live session, that PTY belongs to its isolated
+`pohunek-sessiond` worker; restarting the public daemon reconnects to the same
+assistant runtime rather than relaunching it.
 
 Knowledge delivery is pull-by-file. The prompt points the agent at this bundle,
 the snapshot file, and the [source map](../assistant/source-map.md); it does not

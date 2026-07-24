@@ -177,6 +177,9 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::SUBSCRIBE => Response::ok(request.id.clone(), json!({ "subscribed": true })),
         method::SESSION_NEW => session::handle_session_new(request, &state.sessions).await,
         method::SESSION_LIST => session::handle_session_list(request, &state.sessions).await,
+        method::SESSION_RUNTIME_INVENTORY => {
+            session::handle_session_runtime_inventory(request, &state.sessions).await
+        }
         method::SESSION_INSPECT => session::handle_session_inspect(request, &state.sessions).await,
         method::SESSION_STOP => session::handle_session_stop(request, &state.sessions).await,
         method::SESSION_RESUME => session::handle_session_resume(request, &state.sessions).await,
@@ -293,6 +296,7 @@ mod tests {
             cwd: path.clone(),
             cwd_source: Some(protocol::CwdSource::Launch),
             pid: 0,
+            runtime: None,
             cols: 80,
             rows: 24,
             state,

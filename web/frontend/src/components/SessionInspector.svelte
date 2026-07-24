@@ -1,5 +1,10 @@
 <script lang="ts">
-  import { hostResourceKey, type SessionsSnapshot, type Workspace } from "@pohunek/client-core";
+  import {
+    hostResourceKey,
+    type RuntimeContinuity,
+    type SessionsSnapshot,
+    type Workspace,
+  } from "@pohunek/client-core";
   import { onDestroy, tick } from "svelte";
   import type { Readable } from "svelte/store";
   import { addErrorToast, addToast } from "../lib";
@@ -22,6 +27,7 @@
   let { open, workspace, sessions, host, sessionId, onclose, onopenterminal }: Props = $props();
   let detail: Detail | undefined = $state();
   let detailKey = "";
+  let runtimeContinuity: RuntimeContinuity = $state("initial");
   let loading = $state(false);
   let inspectFailed = $state(false);
   let metadataOpen = $state(false);
@@ -40,6 +46,7 @@
     if (live !== undefined) {
       detail = live.session;
       detailKey = hostResourceKey(host, sessionId);
+      runtimeContinuity = live.runtimeContinuity;
     }
   });
 
@@ -238,6 +245,22 @@
           {/if}
           <span class={`lifecycle lifecycle-${detail.state}`}>{detail.state}</span>
         </div>
+        {#if detail.runtime !== undefined}
+          <div
+            class={`runtime-state runtime-${detail.runtime.state}`}
+            data-testid="runtime-state"
+            data-runtime-continuity={runtimeContinuity}
+          >
+            <strong>Runtime {detail.runtime.state}</strong>
+            {#if runtimeContinuity === "recovered"}
+              <span>A new PTY generation replaced the previous runtime.</span>
+            {:else if runtimeContinuity === "reconnected"}
+              <span>The daemon reconnected to the same PTY generation.</span>
+            {:else if detail.runtime.loss_reason !== undefined}
+              <span>{detail.runtime.loss_reason}</span>
+            {/if}
+          </div>
+        {/if}
 
         <dl>
           <div><dt>Project</dt><dd>{detail.project_label ?? detail.project_id ?? "No project"}</dd></div>
@@ -264,7 +287,10 @@
             <button
               class="button-primary"
               type="button"
-              disabled={detail.state !== "running"}
+              disabled={detail.state !== "running"
+                || (detail.runtime !== undefined
+                  && detail.runtime.state !== "live"
+                  && detail.runtime.state !== "reconnecting")}
               onclick={() => onopenterminal(host, sessionId)}
             >
               Open terminal
@@ -277,7 +303,7 @@
             <h3>Manage session</h3>
             <SessionLifecycleActions
               {workspace}
-              entry={{ host, session: detail, attachStreamIds: [] }}
+              entry={{ host, session: detail, attachStreamIds: [], runtimeContinuity }}
               onfork={onopenterminal}
               onremove={onclose}
             />
@@ -326,6 +352,15 @@
             <div><dt>Working directory</dt><dd>{detail.cwd}</dd></div>
             <div><dt>Terminal</dt><dd>{detail.cols} × {detail.rows}</dd></div>
             <div><dt>State source</dt><dd>{detail.state_source}</dd></div>
+            {#if detail.runtime !== undefined}
+              <div><dt>Runtime state</dt><dd>{detail.runtime.state}</dd></div>
+              {#if detail.runtime.runtime_id !== undefined}
+                <div><dt>Runtime ID</dt><dd>{detail.runtime.runtime_id}</dd></div>
+              {/if}
+              {#if detail.runtime.worker_id !== undefined}
+                <div><dt>Worker ID</dt><dd>{detail.runtime.worker_id}</dd></div>
+              {/if}
+            {/if}
             <div><dt>Created</dt><dd>{detail.created_at}</dd></div>
             <div><dt>Updated</dt><dd>{detail.updated_at}</dd></div>
           {#if detail.exit_code !== undefined}
@@ -413,6 +448,21 @@
   .operational {
     display: grid;
     gap: 1.25rem;
+  }
+
+  .runtime-state {
+    display: grid;
+    gap: 0.25rem;
+    padding: 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    background: var(--surface);
+  }
+
+  .runtime-lost,
+  .runtime-conflict,
+  .runtime-incompatible {
+    border-color: var(--danger);
   }
 
   .management-actions,

@@ -62,6 +62,7 @@
       },
       "devDependencies": {
         "@pohunek/backend": "workspace:*",
+        "@pohunek/testkit": "workspace:*",
       },
     },
     "shared": {

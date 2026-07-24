@@ -96,6 +96,10 @@ Release packaging:
 
 - `.github/workflows/release.yml`
 - `README.md`
+- `packaging/install-daemon.sh`
+- `packaging/systemd/pohunekd.service.in`
+- `packaging/systemd/pohunek-session@.service.in`
+- `packaging/systemd/pohunek-sessions.slice`
 - `scripts/release`
 
 Daemon, sessions, integrations, and project state:
@@ -109,6 +113,8 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/session/hooks.rs`
 - `crates/daemon/src/session/detector.rs`
 - `crates/daemon/src/session/procwatch.rs`
+- `crates/daemon/src/runtime/`
+- `crates/daemon/src/notify.rs`
 - `crates/daemon/src/external/mod.rs`
 - `crates/daemon/tests/procwatch.rs`
 - `crates/daemon/src/procwatch/mod.rs`
@@ -134,6 +140,8 @@ Daemon, sessions, integrations, and project state:
 
 Agent runtime and profile resolution:
 
+- `crates/session-worker/`
+- `crates/worker-protocol/`
 - `crates/daemon/src/agent/mod.rs`
 - `crates/daemon/src/agent/profile.rs`
 - `crates/daemon/src/agent/codex.rs`
@@ -177,4 +185,7 @@ Design inputs:
 
 - `docs/design/universal-assistant.md`
 - `docs/design/universal-assistant-plan.md`
+- `docs/design/durable-session-workers-rfc.md`
+- `docs/migrations/durable-session-workers.md`
+- `docs/runbooks/durable-session-workers.md`
 - `docs/public-api.md`

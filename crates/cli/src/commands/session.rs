@@ -1118,6 +1118,7 @@ mod tests {
             created_at: "2026-06-17T10:00:00Z".to_owned(),
             updated_at: "2026-06-17T10:01:00Z".to_owned(),
             exit_code: None,
+            runtime: None,
         }
     }
 

@@ -27,11 +27,11 @@ use pohunek_daemon::lock::InstanceLock;
 use pohunek_daemon::notifications::{
     AttentionCoordinator, NotificationProjector, NotificationService, NOTIFICATIONS_SUBDIR,
 };
+use pohunek_daemon::runtime::{UnitTemplate, DEFAULT_WORKER_UNIT_TEMPLATE};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use pohunek_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
 
-/// File name of the unified metadata store (resume + worktree bindings) under
-/// the data dir.
+/// File name of the unified logical-session metadata store under the data dir.
 const STORE_NAME: &str = "metadata.jsonl";
 
 /// Subdirectory under the data dir holding per-session git worktrees.
@@ -39,9 +39,13 @@ const WORKTREES_SUBDIR: &str = "worktrees";
 
 /// Subdirectory under the data dir holding the append-only event log.
 const EVENTS_SUBDIR: &str = "events";
+/// Per-session worker socket root under the owner-private runtime directory.
+const WORKERS_SUBDIR: &str = pohunek_paths::WORKERS_SUBDIR;
 
 /// Env var enabling opt-in observation of agents outside pohunek-owned PTYs.
 const OBSERVE_EXTERNAL_AGENTS_ENV: &str = "POHUNEK_OBSERVE_EXTERNAL_AGENTS";
+/// Optional worker template override for isolated systemd integration tests.
+const WORKER_UNIT_TEMPLATE_ENV: &str = "POHUNEK_WORKER_UNIT_TEMPLATE";
 
 /// Maximum time to let event-log drains flush on daemon shutdown.
 ///
@@ -53,7 +57,9 @@ const EVENT_LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    match run().await {
+    // The startup future is large (reconciliation, listeners, event logs); box
+    // it so it lives on the heap instead of inflating the `main` task frame.
+    match Box::pin(run()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             // Logging may not be initialized yet (e.g. missing env), so also
@@ -80,18 +86,20 @@ async fn run() -> Result<(), DaemonError> {
 
     // 3. Ensure the runtime dir exists (0700) before taking the lock in it.
     //    The control server enforces the same on bind, but the lock lives there
-    //    too and is acquired first. The data dir holds the resume-binding store.
+    //    too and is acquired first. The data dir holds logical session state.
     ensure_private_dir(&paths.runtime_dir)?;
     ensure_private_dir(&paths.data_dir)?;
+    ensure_private_dir(&paths.runtime_dir.join(WORKERS_SUBDIR))?;
+    ensure_private_dir(&paths.state_dir.join(WORKERS_SUBDIR))?;
 
     // 4. Single-instance lock: a second daemon refuses to start.
     let _lock = InstanceLock::acquire(&paths.lock)?;
     info!(lock = %paths.lock.display(), "acquired single-instance lock");
 
     // 5. Build the session registry with the hook-handshake socket path, the
-    //    unified metadata store (resume + worktree bindings in one file), the
+    //    unified metadata store (logical sessions and related bindings), the
     //    worktrees root, and the event-log directory, so spawned agents can
-    //    report their native id, captured sessions survive a restart, a
+    //    report native identity, logical sessions survive a restart, a
     //    repo+branch session binds a dedicated worktree, and the lifecycle is
     //    recorded to the append-only event log.
     let config = SessionRegistryConfig {
@@ -106,17 +114,20 @@ async fn run() -> Result<(), DaemonError> {
         // Part C: host agent profiles live under <config_dir>/agents.
         agents_dir: Some(paths.config_dir.join("agents")),
         observe_external_agents: env_bool(OBSERVE_EXTERNAL_AGENTS_ENV)?,
+        worker_runtime_root: Some(paths.runtime_dir.join(WORKERS_SUBDIR)),
+        worker_state_root: Some(paths.state_dir.join(WORKERS_SUBDIR)),
+        worker_unit_template: worker_unit_template()?,
         ..SessionRegistryConfig::default()
     };
-    let sessions = SessionRegistry::new(config);
+    let sessions = SessionRegistry::new_production(config).map_err(DaemonError::Reconcile)?;
     let notifications =
         NotificationService::open(&paths.data_dir).map_err(|source| DaemonError::Directory {
             path: paths.data_dir.join(NOTIFICATIONS_SUBDIR),
             source: std::io::Error::other(source),
         })?;
 
-    // 6. Start the append-only event log before anything emits, so the resume
-    //    events from `load_and_resume` below are captured too. The log drains
+    // 6. Start the append-only event log before anything emits, so worker
+    //    reconciliation events are captured too. The log drains
     //    both session and notification control-plane events into one file.
     let event_logs = spawn_event_logs(
         &paths.data_dir.join(EVENTS_SUBDIR),
@@ -137,7 +148,14 @@ async fn run() -> Result<(), DaemonError> {
     );
     sessions.spawn_agent_state_hooks();
 
-    // 7. Bind the control socket (stale-socket recovery + 0600).
+    // 7. Adopt exact surviving worker runtimes before exposing the public API.
+    //    Reconciliation never invokes provider-native resume.
+    sessions
+        .reconcile_workers()
+        .await
+        .map_err(DaemonError::Reconcile)?;
+
+    // 8. Bind the control socket (stale-socket recovery + 0600).
     let health = HealthInfo::new(DAEMON_VERSION);
     let discovery = DiscoveryCache::default();
     let state = DaemonState::new_with_discovery(health, sessions.clone(), discovery.clone())
@@ -145,12 +163,6 @@ async fn run() -> Result<(), DaemonError> {
         .with_attention_coordinator(attention_coordinator.clone());
     let server = ControlServer::bind_with_state(&paths.socket, state).await?;
     info!(socket = %server.socket_path().display(), "ready; serving control protocol");
-
-    // 8. A daemon restart kills live PTYs by design; relaunch the sessions whose
-    //    native id was captured. The socket is already bound, so a resumed
-    //    agent's hook can re-report. Best-effort: per-session failures are
-    //    logged, never fatal.
-    sessions.load_and_resume().await;
 
     // 9. Optionally bind a NetBird TCP control listener alongside the Unix
     //    socket. NetBird absent / not logged in / no self IP => stay local-only.
@@ -162,6 +174,10 @@ async fn run() -> Result<(), DaemonError> {
     .with_notifications(notifications.clone())
     .with_attention_coordinator(attention_coordinator.clone());
     let remote_server = bind_remote_server(remote_state).await;
+
+    // Reconciliation and every required local listener are ready. A manual
+    // foreground launch has no NOTIFY_SOCKET and this is a no-op.
+    pohunek_daemon::notify::ready()?;
 
     // 10. Serve both transports under ONE shutdown signal. A small task awaits
     //     the OS signal once and fans it out to each server via a oneshot so they
@@ -224,6 +240,16 @@ fn env_bool(var: &str) -> Result<bool, DaemonError> {
             expected: "true/false, 1/0, yes/no, or on/off",
         }),
     }
+}
+
+fn worker_unit_template() -> Result<UnitTemplate, DaemonError> {
+    let value = std::env::var(WORKER_UNIT_TEMPLATE_ENV)
+        .unwrap_or_else(|_| DEFAULT_WORKER_UNIT_TEMPLATE.to_owned());
+    UnitTemplate::parse(&value).map_err(|_template_error| DaemonError::InvalidEnv {
+        var: WORKER_UNIT_TEMPLATE_ENV.to_owned(),
+        value,
+        expected: "an ASCII systemd template like pohunek-session@.service",
+    })
 }
 
 #[derive(Debug)]

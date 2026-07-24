@@ -2,6 +2,9 @@
 
 ## Unreleased (2026-07-21)
 
+- Documented durable per-session PTY workers, daemon restart reconciliation,
+  runtime state and events, explicit native recovery, systemd diagnostics, and
+  the one-time legacy migration boundary.
 - Documented browser session lifecycle and metadata management, the host-scoped
   Projects screen, and daemon-authoritative worktree removal safeguards.
 - Documented the M1 web control center, browser-safe TypeScript SDK entry,

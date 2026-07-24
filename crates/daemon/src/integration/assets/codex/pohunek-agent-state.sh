@@ -24,9 +24,8 @@ case "$action" in
 esac
 
 [ "${POHUNEK_ENV:-}" = "1" ] || exit 0
-[ -n "${POHUNEK_SOCKET_PATH:-}" ] || exit 0
+[ -n "${POHUNEK_WORKER_SOCKET_PATH:-}" ] || [ -n "${POHUNEK_SOCKET_PATH:-}" ] || exit 0
 [ -n "${POHUNEK_SESSION_ID:-}" ] || exit 0
-[ -n "${POHUNEK_PROTOCOL_VERSION:-}" ] || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
 
 # `|| exit 0` on the heredoc command itself (NOT a trailing `exit 0`, which
@@ -40,26 +39,31 @@ import json
 import os
 import socket
 import time
+from datetime import datetime, timedelta, timezone
 
 agent = "codex"
 TIMESTAMP_MS_FACTOR = 1000
 SOCKET_TIMEOUT_SECS = 0.5
 RESPONSE_BYTES = 4096
 MIN_AGENT_PID = 1
+IDENTITY_TTL_SECS = 30
 
 session_id = os.environ.get("POHUNEK_SESSION_ID")
 socket_path = os.environ.get("POHUNEK_SOCKET_PATH")
+worker_socket_path = os.environ.get("POHUNEK_WORKER_SOCKET_PATH")
 protocol_raw = os.environ.get("POHUNEK_PROTOCOL_VERSION")
 hook_input_file = os.environ.get("POHUNEK_HOOK_INPUT_FILE")
 agent_pid_raw = os.environ.get("POHUNEK_AGENT_PID")
 
-if not session_id or not socket_path or not protocol_raw:
+if not session_id or (not worker_socket_path and (not socket_path or not protocol_raw)):
     raise SystemExit(0)
 
-try:
-    protocol_version = int(protocol_raw)
-except ValueError:
-    raise SystemExit(0)
+protocol_version = None
+if not worker_socket_path:
+    try:
+        protocol_version = int(protocol_raw)
+    except ValueError:
+        raise SystemExit(0)
 
 try:
     parsed_agent_pid = int(agent_pid_raw) if agent_pid_raw else None
@@ -88,6 +92,50 @@ if not native_session_id:
 timestamp_ms = int(time.time() * TIMESTAMP_MS_FACTOR)
 
 
+def process_start_identity(pid):
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+            stat = handle.read()
+        fields = stat[stat.rfind(")") + 2:].split()
+        return int(fields[19])
+    except Exception:
+        return None
+
+
+def send_worker_identity():
+    if not worker_socket_path or agent_pid is None:
+        return
+    start_identity = process_start_identity(agent_pid)
+    if start_identity is None:
+        return
+    reference_kind = os.environ.get("POHUNEK_NATIVE_REFERENCE_KIND")
+    native_reference = transcript_path if reference_kind == "path" else native_session_id
+    request = {
+        "type": "identity_report",
+        "provider": agent,
+        "pid": agent_pid,
+        "start_identity": start_identity,
+        "sequence": timestamp_ms,
+        "expires_at": (
+            datetime.now(timezone.utc) + timedelta(seconds=IDENTITY_TTL_SECS)
+        ).isoformat().replace("+00:00", "Z"),
+        "reference_kind": reference_kind,
+        "native_reference": native_reference if reference_kind in ("id", "path") else None,
+    }
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(SOCKET_TIMEOUT_SECS)
+        client.connect(worker_socket_path)
+        client.sendall((json.dumps(request) + "\n").encode())
+        try:
+            client.recv(RESPONSE_BYTES)
+        except Exception:
+            pass
+        client.close()
+    except Exception:
+        pass
+
+
 def send_request(method, params, suffix):
     request = {
         "v": protocol_version,
@@ -108,6 +156,10 @@ def send_request(method, params, suffix):
     except Exception:
         pass
 
+
+if worker_socket_path:
+    send_worker_identity()
+    raise SystemExit(0)
 
 report_agent_params = {
     "session_id": session_id,

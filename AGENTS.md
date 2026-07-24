@@ -7,10 +7,12 @@ convention, update this file in the same change.
 ## What pohunek is
 
 `pohunek` is a **single-user control plane for durable coding-agent sessions**
-across the operator's own machines. A Rust daemon (`pohunekd`) owns PTYs and
-agent processes on each host; the Rust CLI (`pohunek`) drives it locally over a
-Unix socket and remotely over a NetBird/WireGuard address. A native Iced GUI
-(`pohunek-gui`) is an optional client.
+across the operator's own machines. A Rust daemon (`pohunekd`) owns the logical
+session registry and public API on each host; one isolated
+`pohunek-sessiond` worker owns each live PTY and agent process. The Rust CLI
+(`pohunek`) drives the daemon locally over a Unix socket and remotely over a
+NetBird/WireGuard address. A native Iced GUI (`pohunek-gui`) is an optional
+client.
 
 It is pre-1.0 and experimental: wire shapes, config files, and on-disk metadata
 may change freely. **Do not add backward-compatibility shims** unless asked.
@@ -40,7 +42,9 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 |-------|------|
 | `crates/protocol` | Shared control-protocol envelopes + version negotiation. The wire contract. |
 | `crates/client`   | SDK client: typed errors, daemon transport. |
-| `crates/daemon`   | Host daemon (`pohunekd`): owns PTYs, serves the protocol, session detection/hooks. |
+| `crates/daemon`   | Host control plane (`pohunekd`): logical registry, worker reconciliation, public protocol, detection/hooks. |
+| `crates/worker-protocol` | Private versioned daemon-to-worker protocol and framing. |
+| `crates/session-worker` | Durable per-session PTY owner (`pohunek-sessiond`). |
 | `crates/cli`      | CLI (`pohunek`): commands over the local protocol. |
 | `crates/prompt`   | Shared prompt rendering for provider launch flows. |
 | `crates/knowledge`| Knowledge-bundle primitives for the assistant and offline docs. |

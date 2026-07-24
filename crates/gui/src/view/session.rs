@@ -3,7 +3,8 @@
 use iced::widget::{button, column, row, text, text_input};
 use iced::{Center, Element};
 use pohunek_gui_core::{
-    session_link_metadata, session_metadata_rows, HostId, SessionLinkKind, SessionLinkProvider,
+    session_link_metadata, session_metadata_rows, HostId, RuntimeContinuity, SessionLinkKind,
+    SessionLinkProvider,
 };
 use protocol::{CwdSource, SessionInfo};
 
@@ -39,6 +40,21 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
                 .push(text(origin_label(session)).size(14))
                 .push(text(format!("state: {}", session.state.as_str())).size(14))
                 .push(text(format!("activity: {activity}")).size(14));
+            if let Some(runtime) = &session.runtime {
+                detail = detail.push(text(format!("runtime: {}", runtime.state.as_str())).size(14));
+                if let Some(continuity) = app.workspace.runtime_continuity(host_id, &session.id) {
+                    detail = detail.push(text(runtime_continuity_label(continuity)).size(14));
+                }
+                if let Some(reason) = &runtime.loss_reason {
+                    detail = detail.push(text(format!("runtime reason: {reason}")).size(14));
+                }
+                if let Some(runtime_id) = &runtime.runtime_id {
+                    detail = detail.push(text(format!("runtime id: {runtime_id}")).size(14));
+                }
+                if let Some(worker_id) = &runtime.worker_id {
+                    detail = detail.push(text(format!("worker id: {worker_id}")).size(14));
+                }
+            }
             if let Some(project) = session
                 .project_label
                 .as_ref()
@@ -158,6 +174,13 @@ fn origin_label(session: &SessionInfo) -> &'static str {
         "origin: external (read-only)"
     } else {
         "origin: managed"
+    }
+}
+
+fn runtime_continuity_label(continuity: RuntimeContinuity) -> &'static str {
+    match continuity {
+        RuntimeContinuity::Reconnected => "runtime continuity: reconnected to the same PTY",
+        RuntimeContinuity::Recovered => "runtime continuity: recovered into a new PTY generation",
     }
 }
 

@@ -51,7 +51,8 @@ pub use error::{ErrorClass, ProtocolError};
 #[doc(inline)]
 pub use integration::{
     IntegrationInstallParams, IntegrationInstallReport, IntegrationInstallResult, ENV_DAEMON_ID,
-    ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
+    ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH, ENV_WORKER_ID,
+    ENV_WORKER_PROTOCOL_VERSION, ENV_WORKER_SOCKET_PATH,
 };
 #[doc(inline)]
 pub use limits::{MAX_CONTROL_LINE_BYTES, MAX_SESSION_DIFF_BYTES};
@@ -78,15 +79,16 @@ pub use project::{
 #[doc(inline)]
 pub use session::{
     AgentActivity, AgentKind, AgentStateEvent, AttachEvent, AttachHeader, CwdSource, ForkCwdMode,
-    SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult,
-    SessionDiffParams, SessionDiffResult, SessionEvent, SessionForkParams, SessionForkResult,
-    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter,
-    SessionListParams, SessionNewParams, SessionNewResult, SessionReleaseAgentParams,
-    SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams, SessionRenameResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeResult,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
-    SessionWarning, SessionWarningKind,
+    RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryResult, RuntimeInventoryStatus,
+    RuntimeState, SessionAttachParams, SessionAttachResult, SessionDetachParams,
+    SessionDetachResult, SessionDiffParams, SessionDiffResult, SessionEvent, SessionForkParams,
+    SessionForkResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
+    SessionListFilter, SessionListParams, SessionNativeRecoveredEvent, SessionNewParams,
+    SessionNewResult, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    SessionRenameParams, SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionResumeResult, SessionRuntime, SessionSetMetadataParams,
+    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWarning, SessionWarningKind,
 };
 #[doc(inline)]
 pub use version::{negotiate, ProtocolVersion, PROTOCOL_VERSION};
@@ -149,6 +151,11 @@ pub mod event {
         SESSION_UPDATED, "session_updated", crate::SessionEvent, "SessionEvent";
         SESSION_STOPPED, "session_stopped", crate::SessionEvent, "SessionEvent";
         SESSION_REMOVED, "session_removed", crate::SessionEvent, "SessionEvent";
+        SESSION_RUNTIME_RECONNECTED, "session_runtime_reconnected", crate::SessionEvent, "SessionEvent";
+        SESSION_RUNTIME_LOST, "session_runtime_lost", crate::SessionEvent, "SessionEvent";
+        SESSION_RUNTIME_CONFLICT, "session_runtime_conflict", crate::SessionEvent, "SessionEvent";
+        SESSION_RUNTIME_DISCOVERED, "session_runtime_discovered", crate::RuntimeInventoryEvent, "RuntimeInventoryEvent";
+        SESSION_NATIVE_RECOVERED, "session_native_recovered", crate::SessionNativeRecoveredEvent, "SessionNativeRecoveredEvent";
     );
 
     #[cfg(test)]

@@ -1,0 +1,15 @@
+[Unit]
+Description=Pohunek runtime worker for session %i
+Documentation=https://github.com/zajca/zremoteng
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=@LIBEXEC_DIR@/pohunek-sessiond --session-id %i
+Restart=no
+KillMode=control-group
+SendSIGHUP=yes
+Slice=pohunek-sessions.slice
+TimeoutStartSec=45s
+TimeoutStopSec=30s
+

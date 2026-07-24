@@ -22,6 +22,7 @@ export type {
   HostDataState,
   ReducedSession,
   ReducerEvent,
+  RuntimeContinuity,
 } from "./reducer";
 export { hostResourceKey } from "./stores";
 export type {

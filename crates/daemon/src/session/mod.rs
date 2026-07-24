@@ -1,9 +1,7 @@
-//! In-memory session registry and supervisor.
+//! Logical session registry and durable-worker supervisor.
 //!
-//! Runtime session state lives in memory: each live session owns a PTY handle and
-//! has a watcher task that records process exit. The resumable subset of a
-//! session's public info, including owner-controlled metadata, is persisted via
-//! the resume binding store.
+//! Production sessions delegate PTY ownership to per-session workers. The
+//! daemon retains logical metadata and reconstructible semantic observers.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -13,12 +11,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::{
     event, AgentActivity, AgentKind, AgentStateEvent, AttachEvent, CwdSource, ErrorClass, Event,
-    ProjectRemoveResult, ProtocolError, SessionAttachParams, SessionEvent, SessionForkParams,
-    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionNewParams,
+    ProjectRemoveResult, ProtocolError, RuntimeInventoryEntry, RuntimeInventoryResult,
+    RuntimeState, SessionAttachParams, SessionEvent, SessionForkParams, SessionId, SessionInfo,
+    SessionInputParams, SessionInputResult, SessionNativeRecoveredEvent, SessionNewParams,
     SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
     SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionSetMetadataResult, SessionState, SessionStopResult,
-    SessionWarning, StateSource, WorktreeRemoveResult, PROTOCOL_VERSION,
+    SessionReportNativeIdResult, SessionRuntime, SessionSetMetadataResult, SessionState,
+    SessionStopResult, SessionWarning, StateSource, WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, watch, Mutex, Notify};
@@ -29,8 +28,8 @@ use tracing::{debug, info, warn};
 use crate::agent::{
     adapter_for, agent_fork_unsupported, agent_not_resumable, base_resume_template,
     build_pty_command, default_program, fork_pty_command_from_template, launch_adapter_for,
-    resume_pty_command_from_template, AgentAdapter, InputRules, LaunchOpts, ProfileRegistry,
-    ResolvedAgent, ResumeTemplate, SessionRef, SessionRefKind,
+    resume_pty_command_from_template, AgentAdapter, InputRules, LaunchCommand, LaunchOpts,
+    ProfileRegistry, ResolvedAgent, ResumeTemplate, SessionRef, SessionRefKind,
 };
 use crate::detect::{identify_agent, ActivityTransition, Detector, DetectorConfig, Manifest};
 use crate::external::{
@@ -43,8 +42,13 @@ use crate::integration::{
 use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessInspector};
 use crate::project::detect::{project_id, DetectedProject};
 use crate::project::{detect_at, ProjectManager};
-use crate::pty::{PtyCommand, PtyError, PtyExit, PtyHandle};
-use crate::store::{ProjectRecord, ResumeBinding, Store, WorktreeStatus};
+use crate::runtime::{
+    SystemdWorkerLauncher, Worker, WorkerError, WorkerLaunchMode, WorkerLauncher,
+};
+use crate::store::{
+    DesiredState, ProjectRecord, ResumeBinding, RuntimeRecord, SessionRecord, SessionTransaction,
+    Store, TransactionKind, WorktreeStatus,
+};
 use crate::time::now_rfc3339;
 use crate::worktree::{
     canonical_or_original, run_hook, HookContext, HookEvent, WorktreeManager, WorktreeRequest,
@@ -57,10 +61,11 @@ mod hooks;
 mod input;
 mod lag;
 mod procwatch;
+mod reconcile;
 mod resume;
 mod target;
 
-pub use attach::RedeemedAttach;
+pub use attach::{RedeemedAttach, RedeemedRuntime};
 
 use attach::{generate_daemon_instance_id, ActiveAttach, PendingAttach};
 use hooks::SessionHookRequest;
@@ -74,6 +79,19 @@ use resume::ResumeSnapshot;
 use target::{build_launch_command, LaunchCommandPlan, PtySessionSpec, TargetResolution};
 
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
+/// Maximum time to wait for a newly activated worker bootstrap socket.
+const DEFAULT_WORKER_CONNECT_DEADLINE: Duration = Duration::from_secs(10);
+/// Initial retry interval while a systemd worker binds its bootstrap socket.
+const WORKER_CONNECT_RETRY: Duration = Duration::from_millis(100);
+/// Per-subscriber worker output queue. It absorbs repaint bursts without
+/// duplicating the larger raw-history budget for every subscriber.
+const DEFAULT_WORKER_SUBSCRIBER_BYTES: u64 = 1_000_000;
+/// Number of completed input plans retained by a worker for deduplication.
+const DEFAULT_WORKER_WRITE_DEDUP_ENTRIES: u32 = 4_096;
+/// Final runtime retention while no daemon is present.
+const DEFAULT_WORKER_TERMINAL_RETENTION: Duration = Duration::from_hours(24);
+/// Initial durable logical-session record schema.
+const SESSION_RECORD_SCHEMA_VERSION: u32 = 1;
 /// Bound on how long a graceful shutdown waits for the event-log drain to flush
 /// its backlog, so a wedged log write can never hang shutdown.
 const EVENT_LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
@@ -165,7 +183,7 @@ impl AgentAdapter for ShellCommand {
         "shell"
     }
 
-    fn launch(&self, opts: &LaunchOpts) -> Result<PtyCommand, ProtocolError> {
+    fn launch(&self, opts: &LaunchOpts) -> Result<LaunchCommand, ProtocolError> {
         crate::agent::build_pty_command(&self.program, self.args.clone(), opts)
     }
 
@@ -244,6 +262,17 @@ pub struct SessionRegistryConfig {
     pub active_agent_claim_ttl: Duration,
     /// Whether to observe same-user agents started outside pohunek-owned PTYs.
     pub observe_external_agents: bool,
+    /// Root containing fixed per-session worker sockets.
+    ///
+    /// Production and tests both require this path; there is no daemon-owned
+    /// PTY fallback.
+    pub worker_runtime_root: Option<PathBuf>,
+    /// Root containing durable per-worker journals.
+    pub worker_state_root: Option<PathBuf>,
+    /// Bound on worker unit activation and socket negotiation.
+    pub worker_connect_deadline: Duration,
+    /// Validated systemd template used for worker instance names.
+    pub worker_unit_template: crate::runtime::UnitTemplate,
 }
 
 impl Default for SessionRegistryConfig {
@@ -266,6 +295,10 @@ impl Default for SessionRegistryConfig {
             procwatch_poll: DEFAULT_PROCWATCH_POLL,
             active_agent_claim_ttl: DEFAULT_ACTIVE_AGENT_CLAIM_TTL,
             observe_external_agents: false,
+            worker_runtime_root: None,
+            worker_state_root: None,
+            worker_connect_deadline: DEFAULT_WORKER_CONNECT_DEADLINE,
+            worker_unit_template: crate::runtime::UnitTemplate::default(),
         }
     }
 }
@@ -279,10 +312,13 @@ pub struct SessionRegistry {
 #[derive(Debug)]
 struct SessionRegistryInner {
     sessions: Mutex<HashMap<SessionId, SessionEntry>>,
+    runtime_inventory: Mutex<Vec<RuntimeInventoryEntry>>,
     pending_attaches: Mutex<HashMap<String, PendingAttach>>,
     active_attaches: Mutex<HashMap<String, ActiveAttach>>,
     next_id: AtomicU64,
     next_stream_id: AtomicU64,
+    next_write_id: AtomicU64,
+    next_resize_sequence: AtomicU64,
     /// Set when daemon process shutdown starts. Natural PTY exits observed after
     /// this point are treated as restart fallout, not terminal session state.
     daemon_shutdown_started: AtomicBool,
@@ -292,6 +328,7 @@ struct SessionRegistryInner {
     /// (see [`SessionRegistry::attach`]). Regenerated each start; never persisted.
     daemon_instance_id: String,
     config: SessionRegistryConfig,
+    launcher: Arc<dyn WorkerLauncher>,
     /// Resolves the free-string `agent` name to a base kind + optional host-profile
     /// overrides (Part C). Built from `config.agents_dir` at construction.
     profiles: ProfileRegistry,
@@ -306,6 +343,9 @@ struct SessionRegistryInner {
     /// wins with the freshest size. Held across the (blocking) store I/O instead
     /// of the sessions lock, keeping that hot lock free of file writes.
     persist_lock: Mutex<()>,
+    /// Serializes explicit native recovery so repeated requests cannot replace
+    /// the same runtime generation twice.
+    recovery_lock: Mutex<()>,
     /// Per-session worktree binder, present when worktree binding is configured.
     /// Shared into `spawn_blocking` for the (blocking) git subprocesses.
     worktree: Option<Arc<WorktreeManager>>,
@@ -339,12 +379,14 @@ struct SessionRegistryInner {
 #[derive(Debug, Clone)]
 struct SessionEntry {
     info: SessionInfo,
-    pty: PtyHandle,
+    runtime: RuntimeHandle,
+    desired_state: DesiredState,
     detector_cancel: CancellationToken,
     detector_resize: watch::Sender<(u16, u16)>,
     detector_config: watch::Sender<DetectorConfig>,
     default_detector_config: DetectorConfig,
     procwatch_cancel: CancellationToken,
+    runtime_watch_cancel: CancellationToken,
     procwatch_rescan: Arc<Notify>,
     stopping: bool,
     /// Resolved input-framing rules (base-kind defaults, profile-overridden), used
@@ -357,6 +399,13 @@ struct SessionEntry {
     active_agent: Option<ActiveAgentReport>,
     last_agent_report: Option<ActiveAgentReport>,
     observed_agents: Vec<ObservedAgent>,
+}
+
+/// Runtime transport selected for one logical session.
+#[derive(Debug, Clone)]
+enum RuntimeHandle {
+    Worker(Worker),
+    Unavailable(RuntimeState),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,6 +426,12 @@ struct ObservedAgent {
     cwd: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimeExit {
+    exit_code: Option<i32>,
+    success: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CwdAssociation {
     project_id: Option<String>,
@@ -393,10 +448,168 @@ impl Default for SessionRegistry {
 }
 
 impl SessionRegistry {
-    /// Create a new empty registry with the supplied runtime config.
+    /// Returns the latest fail-closed durable-worker discovery inventory.
+    pub async fn runtime_inventory(&self) -> RuntimeInventoryResult {
+        RuntimeInventoryResult {
+            entries: self.inner.runtime_inventory.lock().await.clone(),
+        }
+    }
+
+    async fn write_session_record(&self, record: SessionRecord) -> Result<(), ProtocolError> {
+        let Some(store) = self.inner.store.clone() else {
+            return Ok(());
+        };
+        let session_id = record.session_id.clone();
+        tokio::task::spawn_blocking(move || store.record_session(&record))
+            .await
+            .map_err(|_join_error| {
+                runtime_error(
+                    "session_store_failed",
+                    format!("session record write task panicked for {session_id}"),
+                )
+            })?
+            .map_err(|error| {
+                runtime_error(
+                    "session_store_failed",
+                    format!("failed to write session record {session_id}: {error}"),
+                )
+            })
+    }
+
+    async fn delete_session_record(&self, id: &SessionId) -> Result<(), ProtocolError> {
+        let Some(store) = self.inner.store.clone() else {
+            return Ok(());
+        };
+        let session_id = id.0.clone();
+        tokio::task::spawn_blocking(move || store.remove_session(&session_id))
+            .await
+            .map_err(|_join_error| {
+                runtime_error(
+                    "session_store_failed",
+                    format!("session record removal task panicked for {}", id.0),
+                )
+            })?
+            .map(|_| ())
+            .map_err(|error| {
+                runtime_error(
+                    "session_store_failed",
+                    format!("failed to remove session record {}: {error}", id.0),
+                )
+            })
+    }
+
+    async fn cleanup_owned_worktrees_for_removal(
+        &self,
+        id: &SessionId,
+    ) -> Result<Vec<SessionWarning>, ProtocolError> {
+        let Some(worktree) = self.inner.worktree.clone() else {
+            return Ok(Vec::new());
+        };
+        let session_id = id.0.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut warnings = Vec::new();
+            worktree.cleanup_session(&session_id, &mut warnings)?;
+            Ok(warnings)
+        })
+        .await
+        .map_err(|_join_error| {
+            runtime_error(
+                "worktree_cleanup_failed",
+                format!("worktree cleanup task panicked for {}", id.0),
+            )
+        })?
+    }
+
+    fn session_record(
+        id: &SessionId,
+        entry: &SessionEntry,
+        desired_state: DesiredState,
+        transaction: Option<SessionTransaction>,
+    ) -> SessionRecord {
+        let runtime = entry.info.runtime.as_ref().map_or(
+            RuntimeRecord {
+                state: RuntimeState::Live,
+                worker_id: None,
+                runtime_id: None,
+                unit_name: None,
+                reason: None,
+            },
+            |runtime| RuntimeRecord {
+                state: runtime.state,
+                worker_id: runtime.worker_id.clone(),
+                runtime_id: runtime.runtime_id.clone(),
+                unit_name: Some(format!("pohunek-session@{}.service", id.0)),
+                reason: runtime.loss_reason.clone(),
+            },
+        );
+        SessionRecord {
+            schema_version: SESSION_RECORD_SCHEMA_VERSION,
+            session_id: id.0.clone(),
+            desired_state,
+            transaction,
+            info: entry.info.clone(),
+            recovery: Some(Self::resume_binding_from_entry(id, entry)),
+            runtime,
+        }
+    }
+
+    /// Create a registry.
+    ///
+    /// Production callers must use [`Self::new_production`]. Unit tests inject
+    /// the real worker server through a test-only launcher; no constructor
+    /// falls back to daemon-owned PTYs.
     #[must_use]
     pub fn new(config: SessionRegistryConfig) -> Self {
-        Self::new_with_inspector(config, Arc::new(crate::procwatch::LinuxInspector::new()))
+        #[cfg(test)]
+        {
+            let mut config = config;
+            let (runtime_root, state_root) = test_worker_roots(&config);
+            config.worker_runtime_root = Some(runtime_root.clone());
+            config.worker_state_root = Some(state_root.clone());
+            let launcher = Arc::new(crate::runtime::InProcessWorkerLauncher::new(
+                runtime_root,
+                state_root,
+            ));
+            Self::new_with_launcher_and_inspector(
+                config,
+                launcher,
+                Arc::new(crate::procwatch::LinuxInspector::new()),
+            )
+        }
+        #[cfg(not(test))]
+        {
+            let launcher = Arc::new(SystemdWorkerLauncher::new(
+                config.worker_unit_template.clone(),
+            ));
+            Self::new_with_launcher_and_inspector(
+                config,
+                launcher,
+                Arc::new(crate::procwatch::LinuxInspector::new()),
+            )
+        }
+    }
+
+    /// Create a production registry with a mandatory durable-worker backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns `worker_backend_required` when the per-session worker runtime
+    /// root is absent. Production never falls back to daemon-owned PTYs.
+    pub fn new_production(config: SessionRegistryConfig) -> Result<Self, ProtocolError> {
+        if config.worker_runtime_root.is_none() || config.worker_state_root.is_none() {
+            return Err(runtime_error(
+                "worker_backend_required",
+                "production session registry requires durable worker runtime and state roots",
+            ));
+        }
+        let launcher = Arc::new(SystemdWorkerLauncher::new(
+            config.worker_unit_template.clone(),
+        ));
+        Ok(Self::new_with_launcher_and_inspector(
+            config,
+            launcher,
+            Arc::new(crate::procwatch::LinuxInspector::new()),
+        ))
     }
 
     /// Create a registry with an injected process inspector.
@@ -407,6 +620,37 @@ impl SessionRegistry {
     #[must_use]
     pub fn new_with_inspector(
         config: SessionRegistryConfig,
+        inspector: Arc<dyn ProcessInspector>,
+    ) -> Self {
+        #[cfg(test)]
+        {
+            let mut config = config;
+            let (runtime_root, state_root) = test_worker_roots(&config);
+            config.worker_runtime_root = Some(runtime_root.clone());
+            config.worker_state_root = Some(state_root.clone());
+            let launcher = Arc::new(crate::runtime::InProcessWorkerLauncher::new(
+                runtime_root,
+                state_root,
+            ));
+            Self::new_with_launcher_and_inspector(config, launcher, inspector)
+        }
+        #[cfg(not(test))]
+        {
+            let launcher = Arc::new(SystemdWorkerLauncher::new(
+                config.worker_unit_template.clone(),
+            ));
+            Self::new_with_launcher_and_inspector(config, launcher, inspector)
+        }
+    }
+
+    /// Creates a registry with explicit worker and process-observer backends.
+    ///
+    /// Integration tests use this surface with a separate-process worker
+    /// launcher. Production uses [`Self::new_production`].
+    #[must_use]
+    pub fn new_with_launcher_and_inspector(
+        config: SessionRegistryConfig,
+        launcher: Arc<dyn WorkerLauncher>,
         inspector: Arc<dyn ProcessInspector>,
     ) -> Self {
         let external = ExternalSessions::new();
@@ -443,17 +687,22 @@ impl SessionRegistry {
         let registry = Self {
             inner: Arc::new(SessionRegistryInner {
                 sessions: Mutex::new(HashMap::new()),
+                runtime_inventory: Mutex::new(Vec::new()),
                 pending_attaches: Mutex::new(HashMap::new()),
                 active_attaches: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(1),
                 next_stream_id: AtomicU64::new(1),
+                next_write_id: AtomicU64::new(1),
+                next_resize_sequence: AtomicU64::new(1),
                 daemon_shutdown_started: AtomicBool::new(false),
                 daemon_instance_id: generate_daemon_instance_id(),
                 config,
+                launcher,
                 profiles,
                 events,
                 store,
                 persist_lock: Mutex::new(()),
+                recovery_lock: Mutex::new(()),
                 worktree,
                 projects,
                 event_log_shutdown: CancellationToken::new(),
@@ -493,28 +742,57 @@ impl SessionRegistry {
         &self.inner.profiles
     }
 
-    /// This daemon process instance's opaque id, injected into every session PTY
-    /// as `POHUNEK_DAEMON_ID` and matched against the attach origin by the
-    /// self-feeding-attach guard (see [`Self::attach`]). Exposed so a client (and
-    /// tests) can correlate an origin to this instance.
+    /// This daemon process instance's opaque controller id.
+    ///
+    /// Durable workers use it for controller leases and expose it for
+    /// diagnostics. The self-feeding attach guard uses the stable worker id,
+    /// because daemon instance ids intentionally change across restarts.
     #[must_use]
     pub fn daemon_instance_id(&self) -> &str {
         &self.inner.daemon_instance_id
     }
 
+    fn allocate_session_id(&self) -> Result<SessionId, ProtocolError> {
+        let number = self
+            .inner
+            .next_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_exhausted_value| {
+                runtime_error(
+                    "session_id_exhausted",
+                    "the numeric session-id space is exhausted",
+                )
+            })?;
+        Ok(SessionId(format!("s-{number}")))
+    }
+
+    fn advance_session_sequence(&self, id: &SessionId) {
+        let Some(number) =
+            id.0.strip_prefix("s-")
+                .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return;
+        };
+        self.inner
+            .next_id
+            .fetch_max(number.saturating_add(1), Ordering::Relaxed);
+    }
+
     /// Mark that the daemon process is shutting down.
     ///
-    /// After this point, background PTY exit watchers may observe child exits
-    /// caused by the daemon closing its PTY handles or by a service manager
-    /// terminating the process tree. Those exits must not clear resume bindings:
-    /// the next daemon instance needs them for startup resume.
+    /// Production worker runtimes remain alive and are reconciled by the next
+    /// daemon. The workerless test harness can still observe synthetic PTY exits
+    /// while its daemon shuts down; those observations must not rewrite logical
+    /// lifecycle state.
     pub fn begin_daemon_shutdown(&self) {
         let already_started = self
             .inner
             .daemon_shutdown_started
             .swap(true, Ordering::Relaxed);
         if !already_started {
-            info!("daemon shutdown started; preserving restart-resume bindings");
+            info!("daemon shutdown started; preserving durable worker runtimes");
         }
         self.inner.external.shutdown();
     }
@@ -788,10 +1066,7 @@ impl SessionRegistry {
             })?,
         };
 
-        let id = SessionId(format!(
-            "s-{}",
-            self.inner.next_id.fetch_add(1, Ordering::Relaxed)
-        ));
+        let id = self.allocate_session_id()?;
 
         let TargetResolution {
             launch_cwd,
@@ -867,6 +1142,7 @@ impl SessionRegistry {
             let info = self
                 .register_pty_session(PtySessionSpec {
                     id: id.clone(),
+                    registration: target::PtyRegistration::Create,
                     name: validate_session_name(params.name.as_deref())?,
                     agent: resolved.name.clone(),
                     agent_base: base,
@@ -941,32 +1217,29 @@ impl SessionRegistry {
         if grace.is_zero() {
             return;
         }
-        let mut output = {
+        let runtime = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(session_id) else {
                 return;
             };
-            // Atomic snapshot + subscribe: if the agent has already emitted
-            // output it is up, so inject immediately; otherwise wait for the
-            // first live chunk.
-            let (history, receiver) = entry.pty.attach_snapshot_and_subscribe();
-            if !history.is_empty() {
-                return;
-            }
-            receiver
+            entry.runtime.clone()
         };
-        let _ = tokio::time::timeout(grace, async {
-            loop {
-                match output.recv().await {
-                    // A live chunk arrived, or the channel closed: stop waiting.
-                    Ok(_) | Err(broadcast::error::RecvError::Closed) => break,
-                    // A lag means we missed chunks but the agent is producing output;
-                    // keep waiting for the next recv.
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                }
+
+        match runtime {
+            RuntimeHandle::Worker(worker) => {
+                let _ = tokio::time::timeout(grace, async {
+                    loop {
+                        match worker.inspect().await {
+                            Ok(snapshot) if snapshot.next_offset > 0 => break,
+                            Ok(_) => tokio::time::sleep(WORKER_CONNECT_RETRY).await,
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .await;
             }
-        })
-        .await;
+            RuntimeHandle::Unavailable(_) => {}
+        }
     }
 
     /// Roll back a session whose initial `--input` injection failed: stop the
@@ -1500,18 +1773,34 @@ impl SessionRegistry {
             ));
         }
 
-        let pty = {
+        let runtime = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
             if entry.info.state != SessionState::Running {
                 return Err(session_not_running(id));
             }
-            entry.pty.clone()
+            entry.runtime.clone()
         };
 
-        pty.resize(cols, rows)
-            .await
-            .map_err(pty_error_to_protocol)?;
+        match runtime {
+            RuntimeHandle::Worker(worker) => {
+                let sequence = self
+                    .inner
+                    .next_resize_sequence
+                    .fetch_add(1, Ordering::Relaxed);
+                let source_id = pohunek_worker_protocol::StreamId::new("daemon-resize")
+                    .map_err(|error| runtime_error("worker_resize_invalid", error.to_string()))?;
+                let dimensions = pohunek_worker_protocol::Dimensions::new(cols, rows)
+                    .map_err(|error| runtime_error("worker_resize_invalid", error.to_string()))?;
+                worker
+                    .resize(source_id, sequence, dimensions)
+                    .await
+                    .map_err(worker_error_to_protocol)?;
+            }
+            RuntimeHandle::Unavailable(state) => {
+                return Err(unavailable_runtime_error(id, state));
+            }
+        }
 
         let (info, detector_resize, has_native) = {
             let mut sessions = self.inner.sessions.lock().await;
@@ -1550,8 +1839,26 @@ impl SessionRegistry {
 
     /// Stop a running session.
     pub async fn stop(&self, id: &SessionId) -> Result<SessionStopResult, ProtocolError> {
+        self.stop_with_intent(id, DesiredState::Stopped, TransactionKind::Stop)
+            .await
+    }
+
+    async fn stop_with_intent(
+        &self,
+        id: &SessionId,
+        desired_state: DesiredState,
+        transaction_kind: TransactionKind,
+    ) -> Result<SessionStopResult, ProtocolError> {
         self.ensure_not_external(id).await?;
-        let (pty, detector_cancel, procwatch_cancel) = {
+        let sequence = self.inner.next_write_id.fetch_add(1, Ordering::Relaxed);
+        let operation = match transaction_kind {
+            TransactionKind::Stop => "stop",
+            TransactionKind::Remove => "remove",
+            TransactionKind::Create => "create",
+            TransactionKind::Recover => "recover",
+        };
+        let transaction_id = format!("{operation}-{sequence}");
+        let (runtime, detector_cancel, procwatch_cancel, runtime_watch_cancel, durable_intent) = {
             let mut sessions = self.inner.sessions.lock().await;
             let entry = sessions
                 .get_mut(id)
@@ -1561,28 +1868,68 @@ impl SessionRegistry {
             }
 
             entry.stopping = true;
+            entry.desired_state = desired_state;
             (
-                entry.pty.clone(),
+                entry.runtime.clone(),
                 entry.detector_cancel.clone(),
                 entry.procwatch_cancel.clone(),
+                entry.runtime_watch_cancel.clone(),
+                Self::session_record(
+                    id,
+                    entry,
+                    desired_state,
+                    Some(SessionTransaction {
+                        id: transaction_id.clone(),
+                        kind: transaction_kind,
+                        phase: "requested".to_owned(),
+                        previous_worker_id: None,
+                        previous_runtime_id: None,
+                    }),
+                ),
             )
         };
+        if let Err(error) = self.write_session_record(durable_intent).await {
+            self.clear_stopping(id).await;
+            return Err(error);
+        }
 
         detector_cancel.cancel();
         procwatch_cancel.cancel();
         self.remove_pending_attaches_for_session(id).await;
         self.cancel_session_attaches(id).await;
 
-        let exit = match pty.shutdown(self.inner.config.stop_grace).await {
-            Ok(exit) => exit,
-            Err(err) => {
+        let exit = match runtime {
+            RuntimeHandle::Worker(worker) => {
+                let transaction = pohunek_worker_protocol::TransactionId::new(transaction_id)
+                    .map_err(|error| runtime_error("worker_stop_invalid", error.to_string()))?;
+                let status = match worker.stop(transaction).await {
+                    Ok(Some(status)) => status,
+                    Ok(None) => {
+                        self.clear_stopping(id).await;
+                        return Err(runtime_error(
+                            "worker_stop_incomplete",
+                            format!("worker for {} did not return a terminal outcome", id.0),
+                        ));
+                    }
+                    Err(error) => {
+                        self.clear_stopping(id).await;
+                        return Err(worker_error_to_protocol(error));
+                    }
+                };
+                RuntimeExit {
+                    exit_code: status.code,
+                    success: status.code == Some(0) && status.signal.is_none(),
+                }
+            }
+            RuntimeHandle::Unavailable(state) => {
                 self.clear_stopping(id).await;
-                return Err(pty_error_to_protocol(err));
+                return Err(unavailable_runtime_error(id, state));
             }
         };
+        runtime_watch_cancel.cancel();
         self.record_exit(id, exit, true).await;
         // `stop` is the user-owned terminal transition and must be the final
-        // word on restart-resume eligibility. A concurrent exit watcher can race
+        // word on native-recovery eligibility. A concurrent exit watcher can race
         // through `record_exit` first, making our later `record_exit(..., true)`
         // take its idempotent early-return path; this extra persist is
         // intentionally idempotent and guarantees the binding is gone when
@@ -1614,10 +1961,43 @@ impl SessionRegistry {
         };
 
         let stopped = if was_live {
-            self.stop(id).await?.stopped
+            self.stop_with_intent(id, DesiredState::Removed, TransactionKind::Remove)
+                .await?
+                .stopped
         } else {
+            let removal_intent = {
+                let mut sessions = self.inner.sessions.lock().await;
+                let entry = sessions
+                    .get_mut(id)
+                    .ok_or_else(|| session_not_found(&id.0))?;
+                entry.desired_state = DesiredState::Removed;
+                Self::session_record(
+                    id,
+                    entry,
+                    DesiredState::Removed,
+                    Some(SessionTransaction {
+                        id: format!(
+                            "remove-{}",
+                            self.inner.next_write_id.fetch_add(1, Ordering::Relaxed)
+                        ),
+                        kind: TransactionKind::Remove,
+                        phase: "requested".to_owned(),
+                        previous_worker_id: None,
+                        previous_runtime_id: None,
+                    }),
+                )
+            };
+            self.write_session_record(removal_intent).await?;
             false
         };
+
+        let cleanup_warnings = self.cleanup_owned_worktrees_for_removal(id).await?;
+        if !cleanup_warnings.is_empty() {
+            let mut sessions = self.inner.sessions.lock().await;
+            if let Some(entry) = sessions.get_mut(id) {
+                entry.info.warnings.extend(cleanup_warnings);
+            }
+        }
 
         let info = {
             let mut sessions = self.inner.sessions.lock().await;
@@ -1637,6 +2017,7 @@ impl SessionRegistry {
         // lingering resume binding (idempotent for a session that already dropped
         // its binding on exit or stop).
         self.persist_resume_binding(id).await;
+        self.delete_session_record(id).await?;
         self.emit(event::SESSION_REMOVED, &info);
         Ok(SessionRemoveResult {
             removed: true,
@@ -1666,34 +2047,168 @@ impl SessionRegistry {
         }
     }
 
-    fn spawn_exit_watcher(&self, id: SessionId, pty: PtyHandle) {
+    fn spawn_worker_exit_watcher(
+        &self,
+        id: SessionId,
+        initial_worker: Worker,
+        cancel: CancellationToken,
+    ) {
         let registry = self.clone();
         tokio::spawn(async move {
-            match pty.wait_exit().await {
-                Ok(exit) => {
-                    if let Err(err) = pty.join_reader_thread().await {
-                        warn!(session_id = %id.0, error = %err, "failed to join PTY reader thread");
+            let socket_path = initial_worker.socket_path().to_path_buf();
+            let mut worker = initial_worker;
+            loop {
+                let inspected = tokio::select! {
+                    () = cancel.cancelled() => return,
+                    inspected = worker.inspect() => inspected,
+                };
+                match inspected {
+                    Ok(snapshot) => {
+                        if snapshot.phase == pohunek_worker_protocol::RuntimePhase::Exited {
+                            let exit = snapshot.exit.map_or(
+                                RuntimeExit {
+                                    exit_code: None,
+                                    success: false,
+                                },
+                                |status| RuntimeExit {
+                                    exit_code: status.code,
+                                    success: status.code == Some(0) && status.signal.is_none(),
+                                },
+                            );
+                            registry.record_exit(&id, exit, false).await;
+                            break;
+                        }
                     }
-                    registry.record_exit(&id, exit, false).await;
+                    Err(error) => {
+                        registry.mark_worker_reconnecting(&id, &error).await;
+                        let reconnect_deadline = tokio::time::Instant::now()
+                            + registry.inner.config.worker_connect_deadline;
+                        loop {
+                            if cancel.is_cancelled() {
+                                return;
+                            }
+                            if registry
+                                .inner
+                                .daemon_shutdown_started
+                                .load(Ordering::Relaxed)
+                            {
+                                return;
+                            }
+                            let connected = tokio::select! {
+                                () = cancel.cancelled() => return,
+                                connected = Worker::connect(
+                                    &socket_path,
+                                    &id.0,
+                                    registry.daemon_instance_id(),
+                                ) => connected,
+                            };
+                            match connected {
+                                Ok(reconnected) => {
+                                    registry
+                                        .adopt_reconnected_worker(&id, reconnected.clone())
+                                        .await;
+                                    worker = reconnected;
+                                    break;
+                                }
+                                Err(reconnect_error) => {
+                                    if tokio::time::Instant::now() >= reconnect_deadline {
+                                        registry.mark_worker_lost(&id, &reconnect_error).await;
+                                        return;
+                                    }
+                                    debug!(
+                                        session_id = %id.0,
+                                        error = %reconnect_error,
+                                        "session worker is not reconnectable yet"
+                                    );
+                                    tokio::select! {
+                                        () = cancel.cancelled() => return,
+                                        () = tokio::time::sleep(WORKER_CONNECT_RETRY) => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                Err(err) => {
-                    warn!(session_id = %id.0, error = %err, "failed while waiting for PTY exit");
-                    registry
-                        .record_exit(
-                            &id,
-                            PtyExit {
-                                exit_code: None,
-                                success: false,
-                            },
-                            false,
-                        )
-                        .await;
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    () = tokio::time::sleep(WORKER_CONNECT_RETRY) => {}
                 }
             }
         });
     }
 
-    async fn record_exit(&self, id: &SessionId, exit: PtyExit, stopped_by_user: bool) {
+    async fn mark_worker_reconnecting(&self, id: &SessionId, error: &WorkerError) {
+        let mut sessions = self.inner.sessions.lock().await;
+        let Some(entry) = sessions.get_mut(id) else {
+            return;
+        };
+        if let Some(runtime) = entry.info.runtime.as_mut() {
+            runtime.state = RuntimeState::Reconnecting;
+            runtime.loss_reason = Some("worker_connection_lost".to_owned());
+        }
+        entry.info.updated_at = timestamp_now();
+        drop(sessions);
+        warn!(
+            session_id = %id.0,
+            error = %error,
+            "worker control connection lost; runtime remains alive while reconnecting"
+        );
+    }
+
+    async fn mark_worker_lost(&self, id: &SessionId, error: &WorkerError) {
+        let record = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get_mut(id) else {
+                return;
+            };
+            entry.runtime = RuntimeHandle::Unavailable(RuntimeState::Lost);
+            if let Some(runtime) = entry.info.runtime.as_mut() {
+                runtime.state = RuntimeState::Lost;
+                runtime.loss_reason = Some("worker_process_lost".to_owned());
+            }
+            entry.info.updated_at = timestamp_now();
+            let info = entry.info.clone();
+            let record = Self::session_record(id, entry, entry.desired_state, None);
+            (info, record)
+        };
+        if let Err(store_error) = self.write_session_record(record.1).await {
+            warn!(
+                session_id = %id.0,
+                error = %store_error,
+                "failed to persist lost worker classification"
+            );
+        }
+        warn!(
+            session_id = %id.0,
+            error = %error,
+            "session worker could not be reconnected; PTY runtime is lost"
+        );
+        self.emit(event::SESSION_RUNTIME_LOST, &record.0);
+    }
+
+    async fn adopt_reconnected_worker(&self, id: &SessionId, worker: Worker) {
+        let worker_id = worker.worker_id().await.to_string();
+        let runtime_id = worker.runtime_id().await.map(|value| value.to_string());
+        let updated = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get_mut(id) else {
+                return;
+            };
+            entry.runtime = RuntimeHandle::Worker(worker);
+            if let Some(runtime) = entry.info.runtime.as_mut() {
+                runtime.state = RuntimeState::Live;
+                runtime.worker_id = Some(worker_id);
+                runtime.runtime_id = runtime_id;
+                runtime.last_connected_at = Some(timestamp_now());
+                runtime.loss_reason = None;
+            }
+            entry.info.updated_at = timestamp_now();
+            entry.info.clone()
+        };
+        self.emit(event::SESSION_RUNTIME_RECONNECTED, &updated);
+    }
+
+    async fn record_exit(&self, id: &SessionId, exit: RuntimeExit, stopped_by_user: bool) {
         let updated = {
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(id) else {
@@ -1745,6 +2260,10 @@ impl SessionRegistry {
             entry.info.active_agent_session_path = None;
             entry.observed_agents.clear();
             entry.info.exit_code = exit.exit_code;
+            if let Some(runtime) = entry.info.runtime.as_mut() {
+                runtime.state = RuntimeState::Terminal;
+                runtime.loss_reason = None;
+            }
             entry.info.updated_at = timestamp_now();
             entry.detector_cancel.cancel();
             entry.procwatch_cancel.cancel();
@@ -1753,7 +2272,8 @@ impl SessionRegistry {
             } else {
                 event::SESSION_UPDATED
             };
-            (event, entry.info.clone(), stop_reason)
+            let record = Self::session_record(id, entry, entry.desired_state, None);
+            (event, entry.info.clone(), stop_reason, record)
         };
 
         self.cancel_session_attaches(id).await;
@@ -1773,6 +2293,13 @@ impl SessionRegistry {
         // `persist_resume_binding` re-reads it as terminal and removes its
         // binding (serialized against any racing resize/capture write).
         self.persist_resume_binding(id).await;
+        if let Err(error) = self.write_session_record(updated.3).await {
+            warn!(
+                session_id = %id.0,
+                error = %error,
+                "failed to persist terminal session outcome"
+            );
+        }
         self.emit(updated.0, &updated.1);
     }
 
@@ -1992,6 +2519,22 @@ impl SessionRegistry {
         );
         let _ = self.inner.events.send(event);
     }
+
+    fn emit_native_recovered(&self, info: &SessionInfo, previous_runtime_id: Option<String>) {
+        let runtime_id = info
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.runtime_id.clone());
+        let event = Event::new(
+            event::SESSION_NATIVE_RECOVERED,
+            event_payload(SessionNativeRecoveredEvent {
+                session: info.clone(),
+                previous_runtime_id,
+                runtime_id,
+            }),
+        );
+        let _ = self.inner.events.send(event);
+    }
 }
 
 fn event_payload<T>(payload: T) -> Value
@@ -2046,6 +2589,7 @@ fn external_session_info(
         cwd,
         cwd_source: Some(CwdSource::Procwatch),
         pid: fact.pid,
+        runtime: None,
         cols: EXTERNAL_TERMINAL_COLS,
         rows: EXTERNAL_TERMINAL_ROWS,
         state: SessionState::Running,
@@ -2388,36 +2932,37 @@ fn session_external_read_only(id: &SessionId) -> ProtocolError {
 
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "used directly as a `.map_err` function pointer, which requires owning the error"
+    reason = "map_err adapters receive WorkerError by value and immediately render it"
 )]
-fn pty_error_to_protocol(err: PtyError) -> ProtocolError {
-    let code = match err {
-        PtyError::Allocate(_) => "pty_alloc_failed",
-        PtyError::Spawn { .. } | PtyError::MissingPid => "spawn_failed",
-        PtyError::Io(_) | PtyError::Poisoned | PtyError::ThreadPanicked | PtyError::ExitTimeout => {
-            "pty_error"
-        }
-    };
-    ProtocolError::new(ErrorClass::Runtime, code, err.to_string(), None)
+fn worker_error_to_protocol(err: WorkerError) -> ProtocolError {
+    runtime_error("worker_operation_failed", err.to_string())
 }
 
-/// Map a PTY *spawn* failure to a typed protocol error, upgrading a missing-binary
-/// (ENOENT) failure to the precise `agent_binary_missing` diagnostic naming the
-/// program. Agent launches resolve the binary on `PATH` first (so claude/codex
-/// surface `agent_binary_missing` before spawn), but a shell session — or a binary
-/// removed between resolution and spawn — only fails here; this gives those the
-/// same clear, recoverable diagnostic instead of a generic `spawn_failed`.
-fn spawn_error_to_protocol(err: PtyError, program: &str) -> ProtocolError {
-    if matches!(
-        err,
-        PtyError::Spawn {
-            not_found: true,
-            ..
-        }
-    ) {
-        return ProtocolError::agent_binary_missing(program);
+fn unavailable_runtime_error(id: &SessionId, state: RuntimeState) -> ProtocolError {
+    let code = match state {
+        RuntimeState::Lost => "session_runtime_lost",
+        RuntimeState::Conflict => "session_runtime_conflict",
+        RuntimeState::Incompatible => "worker_protocol_incompatible",
+        RuntimeState::Starting | RuntimeState::Reconnecting => "session_runtime_reconnecting",
+        RuntimeState::Terminal => "session_not_running",
+        RuntimeState::Live => "worker_operation_failed",
+    };
+    runtime_error(
+        code,
+        format!("session {} runtime is {}", id.0, runtime_state_label(state)),
+    )
+}
+
+fn runtime_state_label(state: RuntimeState) -> &'static str {
+    match state {
+        RuntimeState::Starting => "starting",
+        RuntimeState::Live => "live",
+        RuntimeState::Reconnecting => "reconnecting",
+        RuntimeState::Terminal => "terminal",
+        RuntimeState::Lost => "lost",
+        RuntimeState::Conflict => "conflict",
+        RuntimeState::Incompatible => "incompatible",
     }
-    pty_error_to_protocol(err)
 }
 
 fn runtime_error(code: impl Into<String>, msg: impl Into<String>) -> ProtocolError {
@@ -2434,6 +2979,50 @@ fn current_time_millis() -> u64 {
         .unwrap_or_default()
         .as_millis();
     u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+fn test_worker_roots(config: &SessionRegistryConfig) -> (PathBuf, PathBuf) {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    // State root (journals) has no path-length limit, so it can keep sharing
+    // the metadata store's temp directory when the caller did not override
+    // it explicitly.
+    let state_base = config.store_path.as_ref().map_or_else(
+        || {
+            std::env::temp_dir().join(format!(
+                "pohunek-daemon-worker-test-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ))
+        },
+        |store| {
+            store
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("worker-test")
+        },
+    );
+
+    // The runtime root holds the worker's Unix domain socket
+    // (`<runtime_root>/<session_id>/control.sock`), whose path is bound by
+    // `SUN_LEN` (108 bytes on Linux/BSD). The metadata store's temp
+    // directory embeds a test tag plus a 19-digit nanosecond timestamp and
+    // routinely overflows that budget for longer tags, so -- unlike the
+    // state root -- the default runtime root always uses a short, unique
+    // path directly under `temp_dir()`, independent of `store_path`.
+    let runtime_root = config.worker_runtime_root.clone().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!(
+            "pw-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    });
+    let state_root = config
+        .worker_state_root
+        .clone()
+        .unwrap_or_else(|| state_base.join("state"));
+    (runtime_root, state_root)
 }
 
 #[cfg(test)]

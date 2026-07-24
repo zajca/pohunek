@@ -1,8 +1,8 @@
 use protocol::ProtocolError;
 
+use super::LaunchCommand;
 use super::{launch_command, AgentAdapter, InputRules, LaunchOpts, DEFAULT_CLAUDE_SUBMIT_DELAY};
 use crate::detect::Manifest;
-use crate::pty::PtyCommand;
 
 /// Claude Code PTY/TUI adapter.
 #[derive(Debug, Clone, Copy, Default)]
@@ -13,7 +13,7 @@ impl AgentAdapter for ClaudeAdapter {
         "claude"
     }
 
-    fn launch(&self, opts: &LaunchOpts) -> Result<PtyCommand, ProtocolError> {
+    fn launch(&self, opts: &LaunchOpts) -> Result<LaunchCommand, ProtocolError> {
         launch_command("claude", Vec::new(), opts)
     }
 

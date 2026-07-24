@@ -991,6 +991,57 @@ mod tests {
         )
     }
 
+    fn run_worker_state_asset(agent: &str, action: &str, input: &Value) -> Value {
+        let asset_path = state_asset(agent);
+        let temp = temp_dir(&format!("{agent}-worker-state-run"));
+        let worker_socket = temp.join("worker.sock");
+        let listener = UnixListener::bind(&worker_socket).expect("bind worker hook socket");
+        let capture = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept worker hook");
+            let mut raw = Vec::new();
+            let mut byte = [0_u8; 1];
+            while stream.read(&mut byte).expect("read worker hook") == 1 {
+                raw.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            write_hook_response(&mut stream);
+            serde_json::from_slice::<Value>(&raw).expect("worker hook JSON")
+        });
+
+        let mut child = Command::new("sh")
+            .arg(asset_path)
+            .arg(action)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("TMPDIR", &temp)
+            .env(ENV_FLAG, "1")
+            .env("POHUNEK_WORKER_SOCKET_PATH", &worker_socket)
+            .env("POHUNEK_NATIVE_REFERENCE_KIND", "id")
+            .env(ENV_SOCKET_PATH, temp.join("missing-daemon.sock"))
+            .env(ENV_SESSION_ID, "session-123")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn worker state hook");
+        child
+            .stdin
+            .take()
+            .expect("hook stdin")
+            .write_all(input.to_string().as_bytes())
+            .expect("write hook stdin");
+        let output = child.wait_with_output().expect("wait for worker hook");
+        assert!(
+            output.status.success(),
+            "{agent} worker hook failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty(), "worker hook must be silent");
+        capture.join().expect("worker hook capture")
+    }
+
     fn run_notification_asset(
         agent: &str,
         args: &[&str],
@@ -1485,6 +1536,38 @@ mod tests {
             let native = &requests[1];
             assert_eq!(native["method"], json!(method::SESSION_REPORT_NATIVE_ID));
         }
+    }
+
+    #[test]
+    fn state_hooks_prefer_worker_identity_protocol_and_release_active_claims() {
+        for agent in ["claude", "codex"] {
+            let native = format!("{agent}-native");
+            let report = run_worker_state_asset(
+                agent,
+                STATE_SESSION_ACTION,
+                &json!({
+                    "session_id": native,
+                    "transcript_path": format!("/tmp/{agent}.jsonl"),
+                }),
+            );
+            assert_eq!(report["type"], "identity_report");
+            assert_eq!(report["provider"], agent);
+            assert_eq!(report["reference_kind"], "id");
+            assert_eq!(report["native_reference"], native);
+            assert!(report["pid"].as_u64().is_some());
+            assert!(report["start_identity"].as_u64().is_some());
+            assert!(report["sequence"].as_u64().is_some());
+            assert!(report["expires_at"].as_str().is_some());
+        }
+
+        let release = run_worker_state_asset(
+            "claude",
+            STATE_RELEASE_ACTION,
+            &json!({"session_id": "claude-native"}),
+        );
+        assert_eq!(release["type"], "identity_release");
+        assert_eq!(release["provider"], "claude");
+        assert!(release.get("native_reference").is_none());
     }
 
     #[test]
