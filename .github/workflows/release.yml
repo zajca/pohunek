@@ -43,6 +43,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features
 
+      # Daemon integration tests spawn the real durable worker by path
+      # (`target/debug/pohunek-sessiond`), which `cargo test` does not build.
+      - name: Build session worker for daemon tests
+        run: cargo build -p pohunek-session-worker --bin pohunek-sessiond
+
       - name: Test
         run: cargo test --workspace --all-features
 
@@ -112,8 +117,10 @@ jobs:
         working-directory: web
         run: bun run test:e2e
 
-      - name: Build daemon for web e2e
-        run: cargo build -p pohunek-daemon
+      # The real daemon used by these suites spawns `pohunek-sessiond` by path,
+      # so both binaries must be present in target/debug.
+      - name: Build daemon and session worker for web e2e
+        run: cargo build -p pohunek-daemon -p pohunek-session-worker
 
       - name: SDK e2e against real daemon
         working-directory: web
