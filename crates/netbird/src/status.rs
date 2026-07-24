@@ -220,6 +220,31 @@ pub fn run_status() -> Result<NetbirdStatus, NetbirdError> {
     run_status_with_program(NETBIRD_PROGRAM)
 }
 
+/// Asynchronously run `netbird status --json` and parse its output.
+///
+/// The spawned command is killed if this future is dropped. Daemons can thus
+/// stop a pending status probe during shutdown instead of waiting for an
+/// unresponsive external `NetBird` CLI.
+///
+/// # Errors
+///
+/// Returns the same errors as [`run_status`].
+pub async fn run_status_async() -> Result<NetbirdStatus, NetbirdError> {
+    run_status_async_with_program(NETBIRD_PROGRAM).await
+}
+
+async fn run_status_async_with_program(program: &str) -> Result<NetbirdStatus, NetbirdError> {
+    let output = tokio::process::Command::new(program)
+        .args(NETBIRD_STATUS_ARGS)
+        // The daemon may cancel this future while shutting down. Killing the
+        // child prevents an unresponsive CLI from extending that shutdown.
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|err| command_error(program, &err))?;
+    status_from_output(&output)
+}
+
 /// Like [`run_status`] but with an explicit program name.
 ///
 /// Useful for tests (pass a non-existent program to deterministically hit
@@ -228,13 +253,21 @@ pub fn run_status_with_program(program: &str) -> Result<NetbirdStatus, NetbirdEr
     let output = Command::new(program)
         .args(NETBIRD_STATUS_ARGS)
         .output()
-        .map_err(|err| match err.kind() {
-            std::io::ErrorKind::NotFound => NetbirdError::CliMissing,
-            _ => NetbirdError::StateUnavailable(format!("failed to run `{program} status`: {err}")),
-        })?;
+        .map_err(|err| command_error(program, &err))?;
 
+    status_from_output(&output)
+}
+
+fn command_error(program: &str, err: &std::io::Error) -> NetbirdError {
+    match err.kind() {
+        std::io::ErrorKind::NotFound => NetbirdError::CliMissing,
+        _ => NetbirdError::StateUnavailable(format!("failed to run `{program} status`: {err}")),
+    }
+}
+
+fn status_from_output(output: &std::process::Output) -> Result<NetbirdStatus, NetbirdError> {
     if !output.status.success() {
-        return Err(NetbirdError::StateUnavailable(non_zero_detail(&output)));
+        return Err(NetbirdError::StateUnavailable(non_zero_detail(output)));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -430,6 +463,14 @@ mod tests {
     #[test]
     fn missing_program_is_cli_missing() {
         let err = run_status_with_program("definitely-not-a-real-binary-xyz").unwrap_err();
+        assert!(matches!(err, NetbirdError::CliMissing));
+    }
+
+    #[tokio::test]
+    async fn async_missing_program_is_cli_missing() {
+        let err = run_status_async_with_program("definitely-not-a-real-binary-xyz")
+            .await
+            .expect_err("missing CLI returns an error");
         assert!(matches!(err, NetbirdError::CliMissing));
     }
 

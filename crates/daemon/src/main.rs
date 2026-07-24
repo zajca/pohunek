@@ -6,19 +6,19 @@
 //!
 //! Milestone 11: when `NetBird` is available and reports a self IP, additionally
 //! bind a TCP control listener on that `NetBird` address and serve it alongside the
-//! local Unix socket under one shutdown. `NetBird` being absent or its local state
-//! being unavailable is not an error: the daemon stays local-only and logs why.
+//! local Unix socket under one shutdown. `NetBird` being temporarily unavailable
+//! is not an error: the daemon stays local-only while retrying the remote listener.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo, RemoteServer};
 use pohunek_daemon::discovery::DiscoveryCache;
@@ -66,6 +66,20 @@ const WORKER_BINARY_NAME: &str = "pohunek-sessiond";
 /// daemon indefinitely while still giving buffered audit/debug events a chance
 /// to reach disk.
 const EVENT_LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Initial delay between attempts to enable the optional remote listener.
+///
+/// `NetBird` can report incomplete state while its local daemon and interface are
+/// starting. Five seconds avoids repeatedly spawning the CLI while making a
+/// newly ready host discoverable without an operator restart.
+const REMOTE_BIND_INITIAL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Longest delay between remote-listener retry attempts.
+///
+/// A local-only daemon is valid when `NetBird` is not logged in, so retries back
+/// off to avoid continuously spawning its CLI and filling logs. Five minutes
+/// still recovers reasonably quickly after a delayed login or interface setup.
+const REMOTE_BIND_MAX_RETRY_INTERVAL: Duration = Duration::from_mins(5);
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -176,8 +190,8 @@ async fn run() -> Result<(), DaemonError> {
     let server = ControlServer::bind_with_state(&paths.socket, state).await?;
     info!(socket = %server.socket_path().display(), "ready; serving control protocol");
 
-    // 9. Optionally bind a NetBird TCP control listener alongside the Unix
-    //    socket. NetBird absent / not logged in / no self IP => stay local-only.
+    // 9. Keep attempting to bind a NetBird TCP control listener alongside the
+    //    Unix socket. NetBird may become ready after this daemon starts.
     let remote_state = DaemonState::new_with_discovery(
         HealthInfo::new(DAEMON_VERSION),
         sessions.clone(),
@@ -185,38 +199,36 @@ async fn run() -> Result<(), DaemonError> {
     )
     .with_notifications(notifications.clone())
     .with_attention_coordinator(attention_coordinator.clone());
-    let remote_server = bind_remote_server(remote_state).await;
+    let remote_port = match netbird::remote_port() {
+        Ok(port) => Some(port),
+        Err(err) => {
+            warn!(reason = %err, "invalid remote port configuration; remote listener disabled");
+            None
+        }
+    };
 
     // Reconciliation and every required local listener are ready. A manual
     // foreground launch has no NOTIFY_SOCKET and this is a no-op.
     pohunek_daemon::notify::ready()?;
 
     // 10. Serve both transports under ONE shutdown signal. A small task awaits
-    //     the OS signal once and fans it out to each server via a oneshot so they
-    //     stop together.
-    let (unix_tx, unix_rx) = oneshot::channel::<()>();
-    let (remote_tx, remote_rx) = oneshot::channel::<()>();
+    //     the OS signal once and cancels each server, including a remote
+    //     supervisor that is waiting to retry its bind.
+    let shutdown = CancellationToken::new();
     let shutdown_sessions = sessions.clone();
+    let shutdown_token = shutdown.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
         shutdown_sessions.begin_daemon_shutdown();
-        let _ = unix_tx.send(());
-        let _ = remote_tx.send(());
+        shutdown_token.cancel();
     });
 
+    let unix_shutdown = shutdown.clone();
     let unix_serve = server.serve(async move {
-        let _ = unix_rx.await;
+        unix_shutdown.cancelled().await;
     });
-    if let Some(remote) = remote_server {
-        let remote_serve = remote.serve(async move {
-            let _ = remote_rx.await;
-        });
-        tokio::join!(unix_serve, remote_serve);
-    } else {
-        // Drop the unused remote receiver so the fan-out send is a no-op.
-        drop(remote_rx);
-        unix_serve.await;
-    }
+    let remote_serve = serve_remote(remote_state, remote_port, shutdown);
+    tokio::join!(unix_serve, remote_serve);
 
     // 11. Flush the append-only event log before exit so events buffered at
     //     shutdown are not lost (bounded so a wedged write cannot hang exit).
@@ -407,48 +419,122 @@ async fn shutdown_event_logs(drains: EventLogDrains) {
     }
 }
 
-/// Bind the optional `NetBird` TCP control listener.
+/// Repeatedly bind and serve the optional `NetBird` TCP control listener.
+///
+/// A `NetBird` daemon may start after `pohunekd`, or temporarily emit an
+/// incomplete status snapshot while it initializes. Retrying keeps the local
+/// control plane available immediately while allowing remote discovery to
+/// recover without an operator restart.
+async fn serve_remote_with_retry<F, Fut>(
+    mut bind: F,
+    shutdown: CancellationToken,
+    retry_interval: Duration,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = RemoteBind>,
+{
+    let mut retry_interval = retry_interval;
+    loop {
+        let attempt = tokio::select! {
+            () = shutdown.cancelled() => return,
+            attempt = bind() => attempt,
+        };
+        match attempt {
+            RemoteBind::Bound(remote) => {
+                remote
+                    .serve(async move {
+                        shutdown.cancelled().await;
+                    })
+                    .await;
+                return;
+            }
+            RemoteBind::Disabled => {
+                shutdown.cancelled().await;
+                return;
+            }
+            RemoteBind::Retry => {}
+        }
+
+        debug!(
+            retry_after_secs = retry_interval.as_secs(),
+            "remote control listener unavailable; retrying after delay"
+        );
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            () = tokio::time::sleep(retry_interval) => {}
+        }
+        retry_interval = next_retry_interval(retry_interval);
+    }
+}
+
+/// Increase a retry delay without exceeding the local-only polling ceiling.
+#[must_use]
+fn next_retry_interval(current: Duration) -> Duration {
+    current
+        .saturating_mul(2)
+        .min(REMOTE_BIND_MAX_RETRY_INTERVAL)
+}
+
+/// Serve the remote transport when its port configuration is valid.
+async fn serve_remote(state: DaemonState, port: Option<u16>, shutdown: CancellationToken) {
+    if let Some(port) = port {
+        serve_remote_with_retry(
+            || bind_remote_server(state.clone(), port),
+            shutdown,
+            REMOTE_BIND_INITIAL_RETRY_INTERVAL,
+        )
+        .await;
+    } else {
+        shutdown.cancelled().await;
+    }
+}
+
+/// Bind the optional `NetBird` TCP control listener once.
 ///
 /// Queries `NetBird` state, decides the bind address from it ([`remote_bind_addr`])
-/// and the resolved remote port, and binds a [`RemoteServer`] when an address
-/// resolves. Returns `None` (daemon stays local-only) when `NetBird` is
-/// unavailable, reports no self IP, the remote port is misconfigured, or the bind
-/// itself fails. Every local-only path logs the reason; a bind failure is logged
-/// but never fatal, so the local control plane always comes up.
-async fn bind_remote_server(state: DaemonState) -> Option<RemoteServer> {
-    let status = match netbird::run_status() {
+/// and the configured remote port, and binds a [`RemoteServer`] when an address
+/// resolves. Missing `NetBird` CLI disables the remote listener; unavailable
+/// state, a missing self IP, and bind failures are retried by the caller.
+async fn bind_remote_server(state: DaemonState, port: u16) -> RemoteBind {
+    let status = match netbird::run_status_async().await {
         Ok(status) => status,
+        Err(netbird::NetbirdError::CliMissing) => {
+            info!("NetBird CLI missing; remote control listener disabled");
+            return RemoteBind::Disabled;
+        }
         Err(err) => {
             info!(reason = %err, "NetBird state unavailable; serving local-only");
-            return None;
-        }
-    };
-
-    let port = match netbird::remote_port() {
-        Ok(port) => port,
-        Err(err) => {
-            warn!(reason = %err, "invalid remote port configuration; serving local-only");
-            return None;
+            return RemoteBind::Retry;
         }
     };
 
     let Some(addr) = remote_bind_addr(&status, port) else {
         info!("NetBird present but no self IP resolved; serving local-only");
-        return None;
+        return RemoteBind::Retry;
     };
 
     match RemoteServer::bind(addr, state).await {
         Ok(remote) => {
             info!(addr = %remote.local_addr(), "serving control protocol over NetBird");
-            Some(remote)
+            RemoteBind::Bound(remote)
         }
         Err(err) => {
             // Fail-closed validation or an OS bind error: log and stay local-only
             // rather than aborting the whole daemon.
             warn!(reason = %err, "remote control listener not bound; serving local-only");
-            None
+            RemoteBind::Retry
         }
     }
+}
+
+/// Result of one remote-listener bind attempt.
+enum RemoteBind {
+    /// The listener is bound and ready to serve.
+    Bound(RemoteServer),
+    /// The condition may recover without restarting the daemon.
+    Retry,
+    /// The configuration cannot enable remote transport during this run.
+    Disabled,
 }
 
 /// Decide the remote TCP bind address from parsed `NetBird` state.
@@ -503,7 +589,23 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::remote_bind_addr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_util::sync::CancellationToken;
+
+    use pohunek_daemon::api::{DaemonState, HealthInfo};
+    use pohunek_daemon::session::SessionRegistry;
+    use protocol::{method, Request, Response};
+    use serde_json::Value;
+
+    use super::{
+        next_retry_interval, remote_bind_addr, serve_remote_with_retry, RemoteBind,
+        REMOTE_BIND_MAX_RETRY_INTERVAL,
+    };
 
     /// A remote bind port distinct from the production default, so the test
     /// asserts the helper threads the passed-in port rather than a constant.
@@ -534,5 +636,108 @@ mod tests {
         let addr = remote_bind_addr(&status, TEST_PORT).expect("self IP resolves to a bind addr");
         assert_eq!(addr.ip().to_string(), "100.92.10.20");
         assert_eq!(addr.port(), TEST_PORT);
+    }
+
+    #[test]
+    fn remote_retry_interval_caps_at_configured_maximum() {
+        assert_eq!(
+            next_retry_interval(REMOTE_BIND_MAX_RETRY_INTERVAL),
+            REMOTE_BIND_MAX_RETRY_INTERVAL
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_supervisor_retries_after_transient_bind_failures() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let bind_attempts = Arc::clone(&attempts);
+        let shutdown = CancellationToken::new();
+        let supervisor_shutdown = shutdown.clone();
+        let retry_interval = Duration::from_secs(1);
+
+        let supervisor = tokio::spawn(serve_remote_with_retry(
+            move || {
+                bind_attempts.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(RemoteBind::Retry)
+            },
+            supervisor_shutdown,
+            retry_interval,
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+
+        tokio::time::advance(retry_interval).await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+
+        shutdown.cancel();
+        supervisor
+            .await
+            .expect("remote supervisor exits after shutdown");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_supervisor_serves_after_a_transient_bind_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback remote listener");
+        let addr = listener
+            .local_addr()
+            .expect("read loopback listener address");
+        let state = DaemonState::new(HealthInfo::new("test"), SessionRegistry::default());
+        let mut remote = Some(pohunek_daemon::api::RemoteServer::from_listener(
+            listener, state,
+        ));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let bind_attempts = Arc::clone(&attempts);
+        let shutdown = CancellationToken::new();
+        let supervisor_shutdown = shutdown.clone();
+        let retry_interval = Duration::from_secs(1);
+
+        let supervisor = tokio::spawn(serve_remote_with_retry(
+            move || {
+                let attempt = bind_attempts.fetch_add(1, Ordering::Relaxed);
+                let result = if attempt == 0 {
+                    RemoteBind::Retry
+                } else {
+                    RemoteBind::Bound(remote.take().expect("only one successful bind"))
+                };
+                std::future::ready(result)
+            },
+            supervisor_shutdown,
+            retry_interval,
+        ));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(retry_interval).await;
+        tokio::task::yield_now().await;
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .expect("remote listener accepts a connection after retry");
+        let request =
+            serde_json::to_string(&Request::new("health", method::DAEMON_HEALTH, Value::Null))
+                .expect("serialize remote health request");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write remote health request");
+        stream
+            .write_all(b"\n")
+            .await
+            .expect("terminate remote health request");
+        let mut response = [0_u8; 1024];
+        let read = stream
+            .read(&mut response)
+            .await
+            .expect("read remote health response");
+        let response = std::str::from_utf8(&response[..read]).expect("health response is UTF-8");
+        let response: Response = serde_json::from_str(response).expect("parse health response");
+        assert!(matches!(response, Response::Ok { .. }));
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+
+        shutdown.cancel();
+        supervisor
+            .await
+            .expect("remote supervisor exits after shutdown");
     }
 }
