@@ -3,6 +3,7 @@ import type {
   ProtocolVersion,
   SessionInfo,
 } from "@pohunek/protocol";
+import type { RuntimeContinuity } from "./reducer";
 
 export type HostReachability =
   | "reachable_daemon"
@@ -31,6 +32,7 @@ export interface HostedSession {
   readonly host: string;
   readonly session: SessionInfo;
   readonly attachStreamIds: readonly string[];
+  readonly runtimeContinuity: RuntimeContinuity;
 }
 
 export interface HostedNotification {

@@ -30,6 +30,8 @@ pub struct Paths {
     pub lock: PathBuf,
     /// The structured-log directory.
     pub log_dir: PathBuf,
+    /// The user state directory containing logs and durable worker journals.
+    pub state_dir: PathBuf,
     /// The user data directory (state.db / events / worktrees in later milestones).
     pub data_dir: PathBuf,
     /// The user cache directory.
@@ -59,6 +61,7 @@ impl Paths {
             socket: base.socket,
             lock: base.lock,
             log_dir: base.log_dir,
+            state_dir: base.state_dir,
             data_dir: base.data_dir,
             cache_dir: base.cache_dir,
             config_home: base.config_home,

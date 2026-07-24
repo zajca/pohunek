@@ -164,6 +164,20 @@
     return entry.session.activity ?? "Activity unknown";
   }
 
+  function runtimeLabel(entry: HostedSession): string | undefined {
+    const runtime = entry.session.runtime;
+    if (runtime === undefined) {
+      return undefined;
+    }
+    if (entry.runtimeContinuity === "recovered") {
+      return "recovered runtime";
+    }
+    if (runtime.state !== "live") {
+      return `runtime ${runtime.state}`;
+    }
+    return undefined;
+  }
+
   function isSelected(entry: HostedSession): boolean {
     return entry.host === selectedHost && entry.session.id === selectedSessionId;
   }
@@ -255,7 +269,7 @@
                   data-session-id={entry.session.id}
                   aria-current={isSelected(entry) ? "page" : undefined}
                   tabindex={railTabIndex(entry)}
-                  aria-label={`${sessionLabel(entry)}, ${activityLabel(entry)}, ${entry.host}`}
+                  aria-label={`${sessionLabel(entry)}, ${activityLabel(entry)}, ${runtimeLabel(entry) ?? "runtime live"}, ${entry.host}`}
                   title={collapsed ? `${sessionLabel(entry)} · ${entry.host}` : undefined}
                   onclick={() => select(entry)}
                 >
@@ -283,6 +297,14 @@
                         {activityLabel(entry)}
                       </span>
                       <span class="lifecycle-label">{entry.session.state}</span>
+                      {#if runtimeLabel(entry) !== undefined}
+                        <span
+                          class={`runtime-label runtime-${entry.session.runtime?.state ?? "unknown"}`}
+                          data-runtime-continuity={entry.runtimeContinuity}
+                        >
+                          {runtimeLabel(entry)}
+                        </span>
+                      {/if}
                     </span>
                   {/if}
                 </button>

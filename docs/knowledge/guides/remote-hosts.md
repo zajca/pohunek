@@ -31,6 +31,12 @@ renders per-host successes and structured per-host errors. The matching watch
 command with `--all-hosts` opens one subscription per reachable host and streams
 notification create, update, and delete events as they arrive.
 
+A remote daemon outage does not imply that its sessions stopped. Per-session
+workers continue on that host, but clients cannot attach until the replacement
+daemon completes reconciliation and becomes ready. After reconnection, inspect
+`runtime.state`, `worker_id`, and `runtime_id`; `live` with the same runtime id
+is continuity, while `lost` means the remote PTY generation is gone.
+
 Policy and retention commands can also fan out with `--all-hosts`:
 `pohunek notifications policy get --all-hosts`, policy set with `--all-hosts`,
 and retention prune with `--all-hosts`. Single-record actions use the target

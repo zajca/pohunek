@@ -278,6 +278,12 @@ pub(crate) fn parse_event_message(host_id: &HostId, line: &str) -> Result<Domain
         event::SESSION_UPDATED => HostEvent::SessionUpdated(parse_session_event(&raw)?),
         event::SESSION_STOPPED => HostEvent::SessionStopped(parse_session_event(&raw)?),
         event::SESSION_REMOVED => HostEvent::SessionRemoved(parse_session_event(&raw)?),
+        event::SESSION_RUNTIME_RECONNECTED => {
+            HostEvent::RuntimeReconnected(parse_session_event(&raw)?)
+        }
+        event::SESSION_RUNTIME_LOST => HostEvent::RuntimeLost(parse_session_event(&raw)?),
+        event::SESSION_RUNTIME_CONFLICT => HostEvent::RuntimeConflict(parse_session_event(&raw)?),
+        event::SESSION_NATIVE_RECOVERED => HostEvent::NativeRecovered(parse_session_event(&raw)?),
         event::NOTIFICATION_CREATED => {
             HostEvent::NotificationCreated(parse_notification_created(&raw)?)
         }

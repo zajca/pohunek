@@ -43,8 +43,8 @@ Key consequences of that scope, decided explicitly:
   each host (locally over a Unix socket, remotely over NetBird).
 - Make each host authoritative for its own PTYs, agent processes, state, logs,
   and worktrees.
-- Support durable detach and reattach by letting a background daemon own PTYs and
-  process lifecycle.
+- Support durable detach and reattach by giving every live session a dedicated
+  worker whose PTY and child lifecycle is independent of the restartable daemon.
 - Use real PTY/TUI agent sessions for both Codex and Claude Code, with agent
   state derived from OSC terminal titles first, screen-content pattern matching
   as fallback, and PTY activity for the working signal. Hooks capture only the
@@ -76,26 +76,28 @@ Key consequences of that scope, decided explicitly:
        | ($XDG_RUNTIME_DIR, mode 0600)     | (daemon binds ONLY to 100.x iface)
        v                                   v
  +-----------------------------------------------------------+
- |                     host daemon (Rust)                    |
- |                                                           |
- |  control protocol: newline-delimited JSON (serde)         |
- |  attach stream:    separate raw byte connection per PTY   |
- |                                                           |
- |  +-----------+  +-----------+  +-----------+  +---------+  |
- |  | PTY +     |  | metadata  |  | event log |  | NetBird |  |
- |  | agents    |  | (files)   |  | + logs    |  | discovery|  |
- |  +-----------+  +-----------+  +-----------+  +---------+  |
+ |               host control plane (pohunekd)               |
+ | public protocol | logical state | events | reconciliation  |
  +-----------------------------------------------------------+
        |
-   Codex / Claude Code running in daemon-owned PTYs
+       | private owner-only Unix protocol
+       v
+ +-----------------------------------------------------------+
+ | pohunek-session@s-42.service (one worker per live session) |
+ | PTY master | child handle | output ring | terminal tracker |
+ +-----------------------------------------------------------+
        |
-   agent hooks/notifications --> daemon control socket (state)
+   Codex / Claude Code running in worker-owned PTYs
+       |
+   identity hooks --> worker; notifications --> daemon
 ```
 
-The daemon is the authority for live work on its host. There is no shared mesh
-state and no central coordinator. A remote host is reached by connecting the CLI
-directly to that host's daemon over the NetBird network using the same protocol
-the local CLI uses over the Unix socket.
+The host-local pohunek service is authoritative for live work. `pohunekd` is the
+logical-session authority and public control plane; a `pohunek-sessiond` worker
+is authoritative for one live PTY generation. There is no shared mesh state and
+no central coordinator. A remote host is reached by connecting the CLI directly
+to that host's daemon over NetBird using the same public protocol as the local
+Unix socket. Workers are never remotely addressable.
 
 ## Host Daemon
 
@@ -103,21 +105,24 @@ The host daemon is the local control plane for one machine, written in Rust.
 
 Core responsibilities:
 
-- Own OS PTYs, agent processes, and session lifecycle.
-- Keep sessions alive when foreground clients disconnect.
+- Own logical session intent, metadata, durable transactions, and the public
+  session lifecycle.
+- Discover, validate, and reconcile per-session runtime workers before
+  advertising readiness.
 - Track session metadata, project records, worktree bindings, agent type, and
   runtime state.
 - Store local metadata in one file-based store (JSON-lines today; an embedded
   SQLite store is a deferred optimization — see "Configuration, State, and Log
   Storage").
 - Write structured logs and append session-lifecycle events to a local event log.
-- Record and use native agent session IDs for resume.
+- Record immutable launch-native references for explicit recovery.
 - Serve two listeners with one protocol:
   - a **Unix socket** for local clients;
   - a **TCP listener bound to the NetBird interface** for remote clients.
 
-The daemon must not depend on libghostty. It owns PTYs through the OS and streams
-terminal bytes to whichever client is attached.
+The daemon must not depend on libghostty and never owns or receives a PTY file
+descriptor. It proxies attach, input, resize, inspect, and stop operations to
+the worker that owns the runtime.
 
 Daemon startup loads configuration and session metadata before accepting
 commands. Missing or invalid required configuration fails startup with a clear
@@ -125,11 +130,39 @@ error rather than falling back to unsafe defaults.
 
 ### Concurrency and supervision
 
-- The daemon uses Tokio. Each session is isolated so a panicking or crashing
-  session cannot take down the daemon or other sessions.
-- The daemon is expected to run as a **systemd user service** (Linux-first). A
-  stale Unix socket from a previous run is detected and replaced on startup, and
-  a single-instance lock prevents two daemons owning the same state directory.
+- The daemon uses Tokio. Each runtime is isolated in
+  `pohunek-session@<session-id>.service`, so one worker failure cannot terminate
+  the daemon or any other session.
+- `pohunekd.service` and worker units are siblings. Workers are grouped under
+  `pohunek-sessions.slice`, use `Restart=no`, and have no `PartOf`, `BindsTo`,
+  or other stop-propagation dependency on the daemon.
+- A stale public Unix socket is detected and replaced on daemon startup, and a
+  single-instance lock prevents two daemons controlling the same state
+  directory. The daemon sends systemd `READY=1` only after store load, worker
+  discovery, reconciliation, and public socket bind.
+
+## Durable Session Workers
+
+Every live logical session has one opaque `worker_id` and one `runtime_id`.
+The worker owns the PTY master, root child handle, reader and reaper, bounded raw
+output ring, terminal tracker, input deduplication, resize sequencing, and final
+outcome. The daemon owns the stable session id, launch snapshot, project and
+worktree association, native recovery reference, desired state, and lifecycle
+transaction.
+
+Disconnecting or killing `pohunekd` releases only the private controller lease.
+The worker continues draining output and running the unchanged child. A
+replacement daemon enumerates worker units, journals, and sockets, validates
+the systemd `MainPID` and process start identity, negotiates the private
+protocol, acquires the one-controller lease, calls `Inspect`, and reconstructs
+detector and procwatch state. It does not invoke native resume.
+
+The private worker protocol is local-only and owner-private. It uses bounded
+newline-delimited JSON for control requests and binary-safe framed data
+connections for output and attach traffic. A worker accepts one leased daemon
+controller and one-use, short-lived data tokens. The daemon and worker support
+the current and immediately preceding worker protocol versions; an incompatible
+worker remains alive and is exposed as `runtime.state=incompatible`.
 
 ## Transport and Control Protocol
 
@@ -185,12 +218,12 @@ adapter boundary.
 
 Runtime responsibilities:
 
-- Start agent subprocesses inside daemon-owned PTYs.
+- Start one agent subprocess inside each worker-owned PTY.
 - Preserve actual terminal interaction for attached clients.
-- Allow clients to detach without killing agents.
+- Allow clients and the daemon to disconnect without killing agents.
 - Track `idle`, `working`, `blocked`, `done`, and `failed` states.
-- Store native agent session IDs and prefer native resume over replaying
-  commands.
+- Store a validated immutable native recovery reference without using it for
+  normal daemon reconnection.
 - Bind each session to host, project, repository, worktree, branch, agent type,
   logs, events, and resume metadata.
 
@@ -227,20 +260,22 @@ version.
 
 Hooks have two separate roles:
 
-- **Native resume binding.** A launch-agent `SessionStart` hook posts the
-  agent's session ID / transcript path to the daemon socket, fire-and-forget.
-  The daemon accepts this binding only when the reported agent matches the
-  session's immutable launch profile or base kind. This keeps resume tied to the
-  original session identity.
+- **Native recovery binding.** A launch-agent `SessionStart` hook prefers the
+  worker socket and posts the agent's session ID or transcript path. The worker
+  validates process ancestry and accepts this binding only for the designated
+  immutable launch agent; it journals the accepted value before forwarding it
+  to the daemon. This keeps recovery tied to the original launch identity and
+  retains the claim across daemon outage.
 - **Nested active-agent reporting.** Shell sessions inherit the pohunek hook
   environment, so Codex or Claude Code started inside a shell PTY can report its
-  active runtime identity back to the parent session. This sets
+  active runtime identity through the worker. This sets
   `active_agent`, `active_agent_base`, and optional active native metadata, but
   it does not change the shell session's launch `agent` / `agent_base` and does
   not overwrite `native_session_id` / `native_session_path`.
 
 Live state remains detector-first: OSC, screen, PTY activity, and process state
-continue to drive normal activity transitions. A nested active-agent report is
+continue to drive normal activity transitions. Notification hooks still target
+the daemon and may be missed during daemon outage. A nested active-agent report is
 explicit hook evidence and uses the `report` state source when it supplies
 activity. While such a report is current, the detector can temporarily switch to
 the active agent's manifest so Codex/Claude UI patterns are interpreted
@@ -313,25 +348,29 @@ session and its project); the daemon checks ownership before reusing or cleaning
 up a worktree, and `project rm --prune-worktrees` removes only the worktrees
 pohunek itself created — never the main checkout or worktrees it did not create.
 
-## State and Resume Model
+## State and Recovery Model
 
 Durability tiers (honest about limits):
 
-1. **Client detach:** PTY and process continue because the daemon owns them.
+1. **Client detach:** PTY and process continue because the worker owns them.
 2. **Client restart:** session list, metadata, and layout restore; reattach to
    live PTYs.
-3. **Daemon restart:** live PTYs and arbitrary processes do **not** survive.
-   Session metadata, worktrees, and resumable agent conversations remain, and
-   sessions can be resumed via native agent session IDs. A daemon upgrade is a
-   session-killing event by design; document this in operator workflow.
-4. **Host restart:** worktrees, metadata, and resumable agent conversations
-   remain; live processes do not.
+3. **Daemon restart or crash:** the same worker, PTY, process group, child PID,
+   and runtime ID continue. Existing public sockets close; clients reconnect
+   after the replacement daemon completes reconciliation.
+4. **Worker loss or host restart:** the PTY generation is gone. The logical
+   record remains visible with `runtime.state=lost`; recovery is explicit and
+   creates a new worker, runtime ID, PTY, and child PID.
 
-Resume safety rules:
+Recovery safety rules:
 
 - Never snapshot environment secrets.
-- Prefer native agent resume IDs over replaying shell commands.
-- Require explicit approval before auto-running any custom resume command.
+- Never run native recovery solely because the daemon disconnected or could not
+  negotiate with a worker.
+- Reject recovery for a live, reconnecting, conflicting, or incompatible
+  runtime.
+- Preserve the logical session id and metadata while visibly changing the
+  runtime generation.
 
 ## Configuration, State, and Log Storage
 
@@ -346,20 +385,30 @@ Runtime state under the user data directory:
 
 ```text
 ~/.local/share/pohunek/
-  metadata.jsonl           # one store, three record kinds (JSON lines, 0600)
+  metadata.jsonl           # logical sessions, worktrees, and projects (0600)
   events/                  # local append-only event log (audit/debug, not replicated)
   worktrees/               # managed git worktrees
+```
+
+Ephemeral owner-private sockets under the user runtime directory:
+
+```text
+$XDG_RUNTIME_DIR/pohunek/
+  daemon.sock
+  daemon.lock
+  workers/<session-id>/control.sock
 ```
 
 Structured logs under the user state directory:
 
 ```text
 ~/.local/state/pohunek/logs/
+~/.local/state/pohunek/workers/<session-id>/<worker-id>.json
 ```
 
 The metadata store is a **single** owner-private JSON-lines file whose lines are
-internally tagged by `kind` — `resume` (sessions + resume metadata), `worktree`
-(worktree bindings), and `project` (known repositories) — sharing one
+internally tagged by `kind` — `session` (logical intent, launch and runtime
+binding), `worktree`, and `project` — sharing one
 serialization lock and one atomic temp+rename write path, so a write of one
 record kind can never corrupt or drop another and any single update is
 crash-atomic. The event log is the local audit/debug trail. None of these is
@@ -373,6 +422,12 @@ Secrets are never written to the metadata stores, the event log, or session
 metadata. They
 stay in the OS keychain, provider CLIs (`gh`, etc.), the SSH/agent environment,
 or explicit local environment files that are not committed.
+
+The worker journal contains runtime identity, process identity, dimensions,
+phase, terminal outcome, sanitized identity claims, and output offsets. It does
+not contain environment values, prompts, input bytes, terminal bytes, rendered
+screens, tokens, or notification bodies. Live output history and terminal
+screens remain bounded in worker memory.
 
 ## Security Model (Single-User Scope)
 
@@ -405,10 +460,14 @@ to the control plane.
 Structured logs under `~/.local/state/pohunek/logs/`, redacting secrets and
 sensitive terminal content. Useful signals:
 
-- Daemon startup/shutdown and single-instance/socket recovery.
+- Daemon startup/shutdown, reconciliation, and single-instance/socket recovery.
+- Worker bootstrap, controller lease, runtime identity, output-gap, child-exit,
+  terminal acknowledgement, and shutdown outcomes.
 - Control request summaries (with `request_id`) and response status.
-- Session start, attach, detach, stop, process exit, resume attempts.
-- PTY allocation, resize, and stream errors.
+- Session start, attach, detach, stop, process exit, daemon reconnection, worker
+  loss/conflict, and explicit native recovery.
+- PTY allocation, resize, stream errors, worker protocol versions, and
+  controller reconnect latency.
 - NetBird discovery runs and candidate/capability results.
 - Agent state transitions with their `source`.
 - Latency for CLI commands, attach, discovery, and remote connections.
@@ -436,14 +495,18 @@ Core tests:
   version negotiation.
 - Session lifecycle with controlled PTY programs: start, attach, detach, resize,
   reattach, process exit, stop.
+- Graceful daemon restart and `SIGKILL` preserve worker PID, child PID, PTY,
+  runtime ID, output continuity, input, resize, detection, and stop behavior.
+- Worker loss affects only one session and becomes an explicit lost runtime;
+  duplicate or mismatched workers become conflicts without automatic killing.
 - Separate attach-stream connection: raw bytes survive arbitrary content; control
   actions work while attached.
 - Agent state mapping from hook signals (with deterministic fixtures), including
   the `blocked` case; heuristic fallback.
-- Resume via native session IDs for Codex and Claude Code where installed.
+- Explicit recovery via native session IDs creates a new runtime generation.
 - Worktree binding, ownership checks, and conflict handling.
-- Metadata-store round-trip and restart survival (a single consistent write-path
-  for resume + worktree records; SQLite schema/migration deferred with the store).
+- Session transaction, worker-journal, reconciliation, and metadata-store
+  round-trip coverage across create, stop, remove, recovery, and restart.
 - CLI table and `--json` output.
 
 Integration tests:
@@ -459,8 +522,12 @@ Integration tests:
 
 - **PTY/TUI state detection.** Mitigation: prefer agent hooks over scraping; mark
   state `source`; validate the `blocked` signal empirically.
-- **Daemon restart kills live processes.** Mitigation: documented durability
-  tiers, native resume IDs, approval-gated custom resume.
+- **Worker loss destroys one PTY generation.** Mitigation: one isolated
+  non-restarting worker per session, durable logical records, explicit lost
+  state, and optional operator-triggered native recovery.
+- **Ambiguous runtime identity.** Mitigation: validate systemd PID plus process
+  start identity and journal fields; quarantine conflicts and never
+  automatically kill an ambiguous live worker.
 - **NetBird local state format drift.** Mitigation: defensive parsing + recorded
   fixtures; shell out to the documented `status --json` rather than internals.
 - **Daemon as a network server on NetBird.** Mitigation: bind only to the NetBird

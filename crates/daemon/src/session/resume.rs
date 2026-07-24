@@ -1,8 +1,8 @@
-//! Resume-binding persistence and relaunch after a daemon restart.
+//! Native recovery metadata and explicit provider-native relaunch.
 
 use super::{
     agent_fork_unsupported, agent_not_resumable, base_resume_template, default_program,
-    fork_pty_command_from_template, info, input_rules_for_agent, is_terminal,
+    fork_pty_command_from_template, input_rules_for_agent, is_terminal,
     resume_pty_command_from_template, runtime_error, session_not_found, validate_session_name,
     warn, LaunchOpts, Ordering, PathBuf, ProtocolError, PtySessionSpec, ResumeBinding,
     ResumeTemplate, SessionEntry, SessionForkParams, SessionId, SessionInfo, SessionRef,
@@ -43,7 +43,9 @@ impl SessionRegistry {
     /// resurrected (it re-reads as terminal and removes instead). Only the brief
     /// snapshot holds the sessions lock; the blocking store I/O runs under
     /// `persist_lock` alone. Best-effort: an unconfigured store or a failed
-    /// write is non-fatal and only impairs restart-resume, surfaced via a warn.
+    /// write is non-fatal and only impairs legacy recovery metadata, surfaced
+    /// via a warning. Durable logical session records use the fail-closed store
+    /// path separately.
     pub(super) async fn persist_resume_binding(&self, id: &SessionId) {
         let Some(store) = &self.inner.store else {
             return;
@@ -84,98 +86,92 @@ impl SessionRegistry {
         }
     }
 
-    /// Load the resume-binding store and relaunch each resumable session.
-    ///
-    /// Called once at daemon startup. A daemon restart kills all live PTYs by
-    /// design (see `docs/plan-phase-1.md` "Resume Model"); only sessions whose
-    /// native id was captured are persisted, so only those come back here. A
-    /// per-session resume failure is logged and skipped, never fatal.
-    pub async fn load_and_resume(&self) {
-        let Some(store) = &self.inner.store else {
-            return;
-        };
-        let store = Arc::clone(store);
-        let bindings = match tokio::task::spawn_blocking(move || store.load_resume())
-            .await
-            .unwrap_or_else(join_error_to_io)
-        {
-            Ok(bindings) => bindings,
-            Err(err) => {
-                warn!(error = %err, "failed to load resume-binding store; skipping resume");
-                return;
-            }
-        };
-        if bindings.is_empty() {
-            return;
-        }
-
-        info!(
-            count = bindings.len(),
-            "resuming sessions after daemon restart"
-        );
-        for binding in bindings {
-            let session_id = binding.session_id.clone();
-            let agent = binding.agent.clone();
-            match self.resume_binding(binding).await {
-                Ok(info) => {
-                    info!(session_id = %info.id.0, ?agent, "resumed session via native id");
-                }
-                Err(err) => {
-                    // A structurally-corrupt binding (a malformed/absent native
-                    // ref) can never resume regardless of environment, so prune
-                    // it to self-heal instead of retrying it on every restart.
-                    // `agent_binary_missing` is left in place: it may be a
-                    // transient PATH gap at startup that resolves on a later run.
-                    if matches!(
-                        err.code.as_str(),
-                        "invalid_session_ref" | "not_resumable" | "agent_not_resumable"
-                    ) {
-                        // Prune via the serialized persist path: the failed
-                        // resume registered no live session, so this re-reads the
-                        // id as absent and removes its binding. Routing it here
-                        // (instead of a direct store.remove) keeps persist_lock
-                        // the single serialization point for all binding writes.
-                        self.persist_resume_binding(&SessionId(session_id.clone()))
-                            .await;
-                        warn!(session_id = %session_id, error = %err, "dropping unresumable binding");
-                    } else {
-                        warn!(session_id = %session_id, error = %err, "failed to resume session");
-                    }
-                }
-            }
-        }
-    }
-
     /// Relaunch a terminal session from its in-memory resume metadata.
     ///
     /// A plain attach requires a live PTY. When a resumable agent exits normally,
     /// the daemon keeps the terminal session entry visible in memory with its
     /// captured native reference, so an explicit user action can relaunch it with
-    /// the same pohunek session id. This path intentionally does not auto-resume
-    /// sessions that were removed from memory by a daemon restart; startup resume
-    /// continues to use the persisted binding store.
+    /// the same pohunek session id. Lost durable logical sessions are also
+    /// eligible. Daemon startup never invokes this operation; only an explicit
+    /// `session.resume` request creates the new worker and runtime generation.
     ///
     /// # Errors
     ///
-    /// Returns `session_not_found` for an unknown id, `session_not_terminal` for a
-    /// still-live session, `not_resumable` when the terminal entry lacks the
-    /// native reference required by its frozen resume template, or any PTY launch
-    /// error from the relaunch.
+    /// Returns `session_not_found` for an unknown id,
+    /// `session_runtime_not_recoverable` unless the runtime is terminal or lost,
+    /// `not_resumable` when the entry lacks the native reference required by its
+    /// frozen resume template, or any worker launch error from recovery.
     pub async fn resume(&self, id: &SessionId) -> Result<SessionInfo, ProtocolError> {
+        let _recovery = self.inner.recovery_lock.lock().await;
         self.ensure_not_external(id).await?;
-        let binding = {
+        let (binding, registration) = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
-            if !is_terminal(entry.info.state) {
+            let runtime_state = entry.info.runtime.as_ref().map(|runtime| runtime.state);
+            let eligible = matches!(
+                runtime_state,
+                Some(protocol::RuntimeState::Terminal | protocol::RuntimeState::Lost)
+            ) || (runtime_state.is_none() && is_terminal(entry.info.state));
+            if !eligible {
+                let state = runtime_state.map_or_else(
+                    || format!("{:?}", entry.info.state).to_lowercase(),
+                    |state| format!("{state:?}").to_lowercase(),
+                );
                 return Err(runtime_error(
-                    "session_not_terminal",
-                    format!("session is not terminal: {}", id.0),
+                    "session_runtime_not_recoverable",
+                    format!(
+                        "session {} runtime is {state}; native recovery requires terminal or lost",
+                        id.0
+                    ),
                 ));
             }
-            Self::resume_binding_from_entry(id, entry)
+            (
+                Self::resume_binding_from_entry(id, entry),
+                super::target::PtyRegistration::Recover {
+                    transaction_id: format!(
+                        "recover-{}",
+                        self.inner.next_write_id.fetch_add(1, Ordering::Relaxed)
+                    ),
+                    previous_worker_id: entry
+                        .info
+                        .runtime
+                        .as_ref()
+                        .and_then(|runtime| runtime.worker_id.clone()),
+                    previous_runtime_id: entry
+                        .info
+                        .runtime
+                        .as_ref()
+                        .and_then(|runtime| runtime.runtime_id.clone()),
+                    created_at: entry.info.created_at.clone(),
+                    runtime_watch_cancel: entry.runtime_watch_cancel.clone(),
+                },
+            )
         };
 
-        let info = self.resume_binding(binding).await?;
+        let info = match self
+            .resume_binding_with_registration(binding, registration)
+            .await
+        {
+            Ok(info) => info,
+            Err(error) => {
+                let restored = {
+                    let sessions = self.inner.sessions.lock().await;
+                    sessions
+                        .get(id)
+                        .map(|entry| Self::session_record(id, entry, entry.desired_state, None))
+                };
+                if let Some(record) = restored {
+                    if let Err(store_error) = self.write_session_record(record).await {
+                        warn!(
+                            session_id = %id.0,
+                            error = %store_error,
+                            "failed to roll back native recovery transaction"
+                        );
+                    }
+                }
+                return Err(error);
+            }
+        };
         self.persist_resume_binding(&info.id).await;
         Ok(info)
     }
@@ -217,10 +213,7 @@ impl SessionRegistry {
             return Err(agent_fork_unsupported(&binding.agent));
         }
 
-        let id = SessionId(format!(
-            "s-{}",
-            self.inner.next_id.fetch_add(1, Ordering::Relaxed)
-        ));
+        let id = self.allocate_session_id()?;
         let has_snapshot = !binding.program.is_empty();
         let program = if has_snapshot {
             binding.program.clone()
@@ -275,6 +268,7 @@ impl SessionRegistry {
         let info = self
             .register_pty_session(PtySessionSpec {
                 id,
+                registration: super::target::PtyRegistration::Create,
                 name: validate_session_name(params.name.as_deref())?,
                 agent: binding.agent,
                 agent_base: binding.agent_base,
@@ -300,7 +294,7 @@ impl SessionRegistry {
         Ok(info)
     }
 
-    fn resume_binding_from_entry(id: &SessionId, entry: &SessionEntry) -> ResumeBinding {
+    pub(super) fn resume_binding_from_entry(id: &SessionId, entry: &SessionEntry) -> ResumeBinding {
         ResumeBinding {
             session_id: id.0.clone(),
             name: entry.info.name.clone(),
@@ -331,9 +325,20 @@ impl SessionRegistry {
     }
 
     /// Relaunch one session from its stored resume binding, reusing its id.
+    #[cfg(test)]
     pub(super) async fn resume_binding(
         &self,
         binding: ResumeBinding,
+    ) -> Result<SessionInfo, ProtocolError> {
+        self.resume_binding_with_registration(binding, super::target::PtyRegistration::Create)
+            .await
+    }
+
+    /// Relaunch one session under the supplied durable lifecycle operation.
+    async fn resume_binding_with_registration(
+        &self,
+        binding: ResumeBinding,
+        registration: super::target::PtyRegistration,
     ) -> Result<SessionInfo, ProtocolError> {
         // The resume mechanics come from the frozen structural snapshot (C.4). An
         // explicit `(resume_mode, ref_kind)` pair drives the argv; a legacy binding
@@ -430,6 +435,7 @@ impl SessionRegistry {
         let is_linked_worktree = binding.is_linked_worktree;
         self.register_pty_session(PtySessionSpec {
             id,
+            registration,
             name: binding.name,
             agent: binding.agent,
             agent_base: binding.agent_base,
@@ -493,21 +499,7 @@ impl SessionRegistry {
     /// Advance the session-id counter past a restored `s-<N>` id so a freshly
     /// created session never collides with a resumed one.
     fn bump_next_id_past(&self, id: &SessionId) {
-        let Some(n) = id.0.strip_prefix("s-").and_then(|n| n.parse::<u64>().ok()) else {
-            return;
-        };
-        let mut current = self.inner.next_id.load(Ordering::Relaxed);
-        while current <= n {
-            match self.inner.next_id.compare_exchange_weak(
-                current,
-                n + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
-        }
+        self.advance_session_sequence(id);
     }
 }
 

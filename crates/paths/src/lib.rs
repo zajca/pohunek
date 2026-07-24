@@ -25,6 +25,10 @@ pub const SWAY_CONFIG_DIR: &str = "sway";
 pub const KNOWLEDGE_CACHE_SUBDIR: &str = "knowledge";
 /// Assistant runtime subdirectory under the app runtime directory.
 pub const ASSISTANT_RUNTIME_SUBDIR: &str = "assistant";
+/// Per-session worker subdirectory under runtime and state directories.
+pub const WORKERS_SUBDIR: &str = "workers";
+/// Worker control socket filename.
+pub const WORKER_SOCKET_NAME: &str = "control.sock";
 
 /// XDG environment variable carrying the runtime base directory.
 pub const XDG_RUNTIME_DIR: &str = "XDG_RUNTIME_DIR";
@@ -66,6 +70,8 @@ pub struct BasePaths {
     pub lock: PathBuf,
     /// Structured log directory.
     pub log_dir: PathBuf,
+    /// Application state directory.
+    pub state_dir: PathBuf,
     /// User data directory.
     pub data_dir: PathBuf,
     /// User cache directory.
@@ -89,7 +95,8 @@ impl BasePaths {
         let socket = runtime_dir.join(SOCKET_NAME);
         let lock = runtime_dir.join(LOCK_NAME);
         let data_dir = data_home()?.join(APP_DIR);
-        let log_dir = state_home()?.join(APP_DIR).join(LOGS_SUBDIR);
+        let state_dir = state_home()?.join(APP_DIR);
+        let log_dir = state_dir.join(LOGS_SUBDIR);
         let cache_dir = cache_home()?.join(APP_DIR);
         let config_home = config_home()?;
         let config_dir = config_home.join(APP_DIR);
@@ -99,6 +106,7 @@ impl BasePaths {
             socket,
             lock,
             log_dir,
+            state_dir,
             data_dir,
             cache_dir,
             config_home,
@@ -129,6 +137,44 @@ impl BasePaths {
     pub fn assistant_runtime_dir(&self, launch_or_session_id: &str) -> Option<PathBuf> {
         valid_runtime_id(launch_or_session_id)
             .map(|id| self.runtime_dir.join(ASSISTANT_RUNTIME_SUBDIR).join(id))
+    }
+
+    /// Returns the owner-private root for live worker sockets.
+    #[must_use]
+    pub fn worker_runtime_root(&self) -> PathBuf {
+        self.runtime_dir.join(WORKERS_SUBDIR)
+    }
+
+    /// Returns the owner-private root for durable worker journals.
+    #[must_use]
+    pub fn worker_state_root(&self) -> PathBuf {
+        self.state_dir.join(WORKERS_SUBDIR)
+    }
+
+    /// Resolves one managed session's worker runtime directory.
+    #[must_use]
+    pub fn worker_runtime_dir(&self, session_id: &str) -> Option<PathBuf> {
+        valid_worker_session_id(session_id).map(|id| self.worker_runtime_root().join(id))
+    }
+
+    /// Resolves one managed session's worker control socket.
+    #[must_use]
+    pub fn worker_socket(&self, session_id: &str) -> Option<PathBuf> {
+        self.worker_runtime_dir(session_id)
+            .map(|dir| dir.join(WORKER_SOCKET_NAME))
+    }
+
+    /// Resolves one worker's durable journal path.
+    #[must_use]
+    pub fn worker_journal(&self, session_id: &str, worker_id: &str) -> Option<PathBuf> {
+        let session_id = valid_worker_session_id(session_id)?;
+        let worker_id = valid_worker_id(worker_id)?;
+        Some(
+            self.worker_state_root()
+                .join(session_id)
+                .join(worker_id)
+                .with_extension("json"),
+        )
     }
 }
 
@@ -242,6 +288,33 @@ pub fn valid_runtime_id(id: &str) -> Option<&Path> {
     }
 }
 
+/// Validates a managed worker session ID.
+///
+/// Worker units are instantiated only for the daemon-issued `s-<number>` ID
+/// space. Restricting the grammar keeps paths and systemd instance names
+/// interchangeable without escaping.
+#[must_use]
+pub fn valid_worker_session_id(id: &str) -> Option<&str> {
+    let suffix = id.strip_prefix("s-")?;
+    (!suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())).then_some(id)
+}
+
+/// Validates an opaque worker ID used as a filename.
+///
+/// IDs use a conservative ASCII grammar and are bounded so they remain one
+/// safe path component on every supported Linux filesystem.
+#[must_use]
+pub fn valid_worker_id(id: &str) -> Option<&str> {
+    const MAX_WORKER_ID_BYTES: usize = 96;
+
+    (!id.is_empty()
+        && id.len() <= MAX_WORKER_ID_BYTES
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+    .then_some(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +390,7 @@ mod tests {
             paths.log_dir,
             base.join("state").join(APP_DIR).join(LOGS_SUBDIR)
         );
+        assert_eq!(paths.state_dir, base.join("state").join(APP_DIR));
         assert_eq!(paths.data_dir, base.join("data").join(APP_DIR));
         assert_eq!(paths.cache_dir, base.join("cache").join(APP_DIR));
         assert_eq!(paths.config_home, base.join("cfg"));
@@ -385,6 +459,42 @@ mod tests {
         );
         for id in ["", ".", "..", "nested/id", "/absolute"] {
             assert_eq!(paths.assistant_runtime_dir(id), None, "id: {id}");
+        }
+    }
+
+    #[test]
+    fn worker_paths_accept_only_managed_safe_ids() {
+        let _env = EnvGuard::acquire();
+        let base = tmp_base("worker-paths");
+        set_all_present(&base);
+        let paths = BasePaths::resolve().expect("resolve paths");
+
+        assert_eq!(
+            paths.worker_socket("s-42"),
+            Some(
+                base.join("run")
+                    .join(APP_DIR)
+                    .join(WORKERS_SUBDIR)
+                    .join("s-42")
+                    .join(WORKER_SOCKET_NAME)
+            )
+        );
+        assert_eq!(
+            paths.worker_journal("s-42", "w-runtime_1"),
+            Some(
+                base.join("state")
+                    .join(APP_DIR)
+                    .join(WORKERS_SUBDIR)
+                    .join("s-42")
+                    .join("w-runtime_1.json")
+            )
+        );
+
+        for invalid in ["", "42", "s-", "s-a", "../s-1", "s-1/other"] {
+            assert_eq!(paths.worker_socket(invalid), None);
+        }
+        for invalid in ["", "../worker", "worker/name", "worker.name"] {
+            assert_eq!(paths.worker_journal("s-42", invalid), None);
         }
     }
 }

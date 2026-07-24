@@ -30,6 +30,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use futures::{SinkExt, StreamExt};
+use pohunek_worker_protocol::{
+    read_frame, write_frame, DataFrame, FrameHeader, FrameKind, WriteId,
+};
 use protocol::{Event, Response, MAX_CONTROL_LINE_BYTES};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
@@ -40,7 +43,7 @@ use tracing::{error, info, warn};
 use netbird::validate_netbird_bind_addr;
 
 use crate::error::DaemonError;
-use crate::session::{RedeemedAttach, SessionRegistry};
+use crate::session::{RedeemedAttach, RedeemedRuntime, SessionRegistry};
 
 use handler::Dispatch;
 pub use handler::{handle_request, DaemonState, HealthInfo};
@@ -355,7 +358,7 @@ async fn run_attach_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let attach = match registry.redeem_attach(&stream_id).await {
+    let mut attach = match registry.redeem_attach(&stream_id).await {
         Ok(attach) => attach,
         Err(err) => {
             let response = Response::err(stream_id, err);
@@ -369,108 +372,157 @@ where
 
     let parts = framed.into_parts();
     let mut stream = parts.io;
-    if !parts.read_buf.is_empty() {
-        if let Err(err) = attach.pty.write_user_input(parts.read_buf.to_vec()).await {
-            warn!(
-                stream_id = %attach.stream_id,
-                session_id = %attach.session_id.0,
-                error = %err,
-                "failed to write buffered attach input to PTY"
-            );
-            registry.finish_attach(&attach.stream_id).await;
-            return Ok(());
-        }
-    }
-
-    let bridge_result = run_attach_bridge(&mut stream, &attach).await;
+    let bridge_result = run_attach_bridge(&mut stream, &mut attach, parts.read_buf.to_vec()).await;
     registry.finish_attach(&attach.stream_id).await;
     bridge_result
 }
 
-async fn run_attach_bridge<S>(stream: &mut S, attach: &RedeemedAttach) -> Result<(), io::Error>
+async fn run_attach_bridge<S>(
+    stream: &mut S,
+    attach: &mut RedeemedAttach,
+    initial_input: Vec<u8>,
+) -> Result<(), io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // Atomically snapshot recent output and subscribe to live output so the new
-    // client sees every byte exactly once across the handoff.
-    let (replay, mut output) = attach.pty.attach_snapshot_and_subscribe();
-    // TODO(milestone 6): skip/trim replay in alternate-screen mode like herdr —
-    // a TUI repaints itself on attach, so raw history replay is noisy. Needs the
-    // detector's vt100 alt-screen state, which lands in milestone 6.
-    if !replay.is_empty() {
-        stream.write_all(&replay).await?;
-        stream.flush().await?;
+    let attach_stream_id = attach.stream_id.clone();
+    let session_id = attach.session_id.clone();
+    let cancel = attach.cancel.clone();
+    match &mut attach.runtime {
+        RedeemedRuntime::Worker(data) => {
+            run_worker_attach_bridge(
+                stream,
+                &attach_stream_id,
+                &session_id,
+                &cancel,
+                data,
+                initial_input,
+            )
+            .await
+        }
     }
-    let exit_pty = attach.pty.clone();
-    let wait_exit = exit_pty.wait_exit();
-    tokio::pin!(wait_exit);
-    let mut input = [0_u8; 8192];
+}
+
+async fn run_worker_attach_bridge<S>(
+    stream: &mut S,
+    attach_stream_id: &str,
+    session_id: &protocol::SessionId,
+    cancel: &tokio_util::sync::CancellationToken,
+    data: &mut crate::runtime::DataStream,
+    initial_input: Vec<u8>,
+) -> Result<(), io::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let version = data.version;
+    let stream_id = data.stream_id.clone();
+    let runtime_id = data.runtime_id.clone();
+    let (mut worker_read, mut worker_write) = tokio::io::split(&mut data.stream);
+    let mut write_sequence = 1_u64;
+    if !initial_input.is_empty() {
+        send_worker_attach_input(
+            &mut worker_write,
+            version,
+            &stream_id,
+            &runtime_id,
+            write_sequence,
+            initial_input,
+        )
+        .await?;
+        write_sequence = write_sequence.saturating_add(1);
+    }
+    let mut input = [0_u8; 8 * 1024];
 
     loop {
         tokio::select! {
-            chunk = output.recv() => match chunk {
-                Ok(chunk) => {
-                    let write = stream.write_all(&chunk);
-                    tokio::pin!(write);
-                    tokio::select! {
-                        result = &mut write => {
-                            result?;
-                        }
-                        () = attach.cancel.cancelled() => break,
-                        exit = &mut wait_exit => {
-                            if let Err(err) = exit {
-                                warn!(
-                                    stream_id = %attach.stream_id,
-                                    session_id = %attach.session_id.0,
-                                    error = %err,
-                                    "attach bridge stopped while waiting for PTY exit"
-                                );
-                            }
-                            break;
-                        }
+            frame = read_frame(&mut worker_read) => {
+                let Some(frame) = frame.map_err(io::Error::other)? else {
+                    break;
+                };
+                let (header, payload) = frame.into_parts();
+                if header.stream_id != stream_id || header.runtime_id != runtime_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "worker attach frame identity mismatch",
+                    ));
+                }
+                match header.kind {
+                    FrameKind::Replay { .. }
+                    | FrameKind::Output { .. }
+                    | FrameKind::TerminalSnapshot { .. } => {
+                        stream.write_all(&payload).await?;
+                    }
+                    FrameKind::Gap { .. } | FrameKind::InputAck { .. } => {}
+                    FrameKind::Exit { .. } | FrameKind::Close { .. } => break,
+                    FrameKind::Error { error } => {
+                        warn!(
+                            stream_id = attach_stream_id,
+                            session_id = %session_id.0,
+                            code = ?error.code,
+                            "worker attach stream reported an error"
+                        );
+                        break;
+                    }
+                    FrameKind::Open { .. } | FrameKind::Input { .. } => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "worker sent an invalid attach frame",
+                        ));
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!(
-                        stream_id = %attach.stream_id,
-                        session_id = %attach.session_id.0,
-                        skipped,
-                        "attach output subscriber lagged; PTY bytes were dropped"
-                    );
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
-            },
-            read = stream.read(&mut input) => {
-                let n = read?;
-                if n == 0 {
-                    break;
-                }
-                if let Err(err) = attach.pty.write_user_input(input[..n].to_vec()).await {
-                    warn!(
-                        stream_id = %attach.stream_id,
-                        session_id = %attach.session_id.0,
-                        error = %err,
-                        "failed to write attach input to PTY"
-                    );
-                    break;
-                }
-            },
-            () = attach.cancel.cancelled() => break,
-            exit = &mut wait_exit => {
-                if let Err(err) = exit {
-                    warn!(
-                        stream_id = %attach.stream_id,
-                        session_id = %attach.session_id.0,
-                        error = %err,
-                        "attach bridge stopped while waiting for PTY exit"
-                    );
-                }
-                break;
             }
+            read = stream.read(&mut input) => {
+                let count = read?;
+                if count == 0 {
+                    break;
+                }
+                send_worker_attach_input(
+                    &mut worker_write,
+                    version,
+                    &stream_id,
+                    &runtime_id,
+                    write_sequence,
+                    input[..count].to_vec(),
+                )
+                .await?;
+                write_sequence = write_sequence.saturating_add(1);
+            }
+            () = cancel.cancelled() => break,
         }
     }
-
     Ok(())
+}
+
+async fn send_worker_attach_input<W>(
+    writer: &mut W,
+    version: pohunek_worker_protocol::Version,
+    stream_id: &pohunek_worker_protocol::StreamId,
+    runtime_id: &pohunek_worker_protocol::RuntimeId,
+    sequence: u64,
+    bytes: Vec<u8>,
+) -> Result<(), io::Error>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    // Raw attach input uses stream-scoped monotonic write IDs (RFC §13.1). The
+    // per-bridge `sequence` restarts at 1 for every attach stream, so it must be
+    // salted with the stream identity; otherwise a reattach or a second
+    // concurrent attach to the same session reuses `attach-1` with different
+    // content, and the worker's per-runtime input dedup rejects it as a reused
+    // write id with conflicting content, closing the stream.
+    let write_id = WriteId::new(format!("attach-{stream_id}-{sequence}"))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let frame = DataFrame::new(
+        FrameHeader {
+            version,
+            stream_id: stream_id.clone(),
+            runtime_id: runtime_id.clone(),
+            kind: FrameKind::Input { write_id },
+        },
+        bytes,
+    )
+    .map_err(io::Error::other)?;
+    write_frame(writer, &frame).await.map_err(io::Error::other)
 }
 
 /// Stream control-plane events to a subscribed client until it disconnects.

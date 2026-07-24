@@ -708,6 +708,7 @@ mod tests {
             cwd: std::path::PathBuf::from("/workspace/project"),
             cwd_source: Some(protocol::CwdSource::Launch),
             pid: 1234,
+            runtime: None,
             cols: 120,
             rows: 40,
             state,

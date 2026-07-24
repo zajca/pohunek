@@ -24,6 +24,20 @@
 
   const session = $derived(entry.session);
   const writable = $derived(session.external !== true);
+  const canStop = $derived(
+    session.runtime === undefined
+      ? session.state === "running" || session.state === "starting"
+      : session.runtime.state === "starting"
+        || session.runtime.state === "live"
+        || session.runtime.state === "reconnecting",
+  );
+  const canRecover = $derived(
+    session.runtime?.state === "lost"
+      || session.runtime?.state === "terminal"
+      || session.state === "done"
+      || session.state === "failed"
+      || session.state === "stopped",
+  );
 
   function openRename(): void {
     nameDraft = session.name ?? "";
@@ -122,10 +136,14 @@
     {#if session.name !== undefined}
       <button type="button" onclick={() => void clearName()} disabled={pending}>Clear name</button>
     {/if}
-    {#if session.state === "running" || session.state === "starting"}
+    {#if canStop}
       <button type="button" onclick={() => { confirmStop = true; }} disabled={pending}>Stop</button>
-    {:else}
+    {:else if canRecover}
       <button type="button" onclick={() => void resume()} disabled={pending}>Resume</button>
+    {:else}
+      <button type="button" disabled title="Resolve the runtime conflict or incompatibility before recovery">
+        Resume unavailable
+      </button>
     {/if}
     <button type="button" onclick={openFork} disabled={pending}>Fork</button>
     <button class="button-danger" type="button" onclick={() => { confirmRemove = true; }} disabled={pending}>

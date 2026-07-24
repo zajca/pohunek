@@ -68,6 +68,7 @@ mod tests {
             socket: root.join("runtime").join("daemon.sock"),
             lock: root.join("runtime").join("daemon.lock"),
             log_dir: root.join("logs"),
+            state_dir: root.join("state"),
             data_dir: root.join("data"),
             cache_dir: root.join("cache"),
             config_home: root.join("config"),

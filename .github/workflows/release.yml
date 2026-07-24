@@ -224,7 +224,7 @@ jobs:
       - name: Build release binaries
         run: >
           cargo build --release --locked --target ${{ matrix.target }}
-          --bin pohunek --bin pohunekd --bin pohunek-gui
+          --bin pohunek --bin pohunekd --bin pohunek-sessiond --bin pohunek-gui
 
       - name: Build docs artifacts
         run: cargo xtask docs site
@@ -240,6 +240,15 @@ jobs:
           mkdir -p "${staging}"
           bindir="target/${{ matrix.target }}/release"
           cp "${bindir}/${{ matrix.binary }}" "${staging}/"
+          if [ "${{ matrix.component }}" = "daemon" ]; then
+            cp "${bindir}/pohunek" "${staging}/"
+            cp "${bindir}/pohunek-sessiond" "${staging}/"
+            mkdir -p "${staging}/packaging/systemd"
+            cp packaging/install-daemon.sh "${staging}/packaging/"
+            cp packaging/systemd/pohunekd.service.in "${staging}/packaging/systemd/"
+            cp packaging/systemd/pohunek-session@.service.in "${staging}/packaging/systemd/"
+            cp packaging/systemd/pohunek-sessions.slice "${staging}/packaging/systemd/"
+          fi
           mkdir -p "${staging}/docs"
           cp -R target/pohunek-docs/offline "${staging}/docs/offline"
           cp target/pohunek-docs/manifest.json "${staging}/docs/manifest.json"

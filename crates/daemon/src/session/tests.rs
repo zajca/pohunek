@@ -6,11 +6,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    AgentActivity, AgentKind, CwdSource, Event, ForkCwdMode, ProjectSource, SessionAttachParams,
-    SessionForkParams, SessionId, SessionInfo, SessionNewParams, SessionReleaseAgentParams,
-    SessionReportAgentParams, SessionReportNativeIdParams, SessionState, StateSource,
+    AgentActivity, AgentKind, CwdSource, Event, ForkCwdMode, ProjectSource, RuntimeState,
+    SessionAttachParams, SessionForkParams, SessionId, SessionInfo, SessionNativeRecoveredEvent,
+    SessionNewParams, SessionReleaseAgentParams, SessionReportAgentParams,
+    SessionReportNativeIdParams, SessionRuntime, SessionState, StateSource,
 };
 
+use crate::agent::LaunchCommand;
 use crate::agent::{InputRules, ResumeMode, SessionRefKind};
 use crate::detect::{ActivityTransition, DetectorConfig, ManifestRegion, MatchContext};
 use crate::external::TranscriptIndex;
@@ -19,9 +21,10 @@ use crate::integration::{
 };
 use crate::procwatch::{ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessInspector};
 use crate::project::detect::project_id;
-use crate::pty::{PtyCommand, PtyExit};
 
-use super::{SessionRegistry, SessionRegistryConfig, ShellCommand, MAX_SESSION_NAME_BYTES};
+use super::{
+    RuntimeExit, SessionRegistry, SessionRegistryConfig, ShellCommand, MAX_SESSION_NAME_BYTES,
+};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -39,6 +42,41 @@ fn params() -> SessionNewParams {
         input: None,
         metadata: BTreeMap::new(),
     }
+}
+
+#[test]
+fn production_registry_rejects_missing_durable_worker_backend() {
+    let error = SessionRegistry::new_production(SessionRegistryConfig::default())
+        .expect_err("production registry must fail closed without worker runtime root");
+    assert_eq!(error.code, "worker_backend_required");
+
+    let configured = SessionRegistryConfig {
+        worker_runtime_root: Some(PathBuf::from("/run/user/1000/pohunek/workers")),
+        worker_state_root: Some(PathBuf::from("/home/user/.local/state/pohunek/workers")),
+        ..SessionRegistryConfig::default()
+    };
+    SessionRegistry::new_production(configured).expect("configured production registry");
+}
+
+#[tokio::test]
+async fn exhausted_session_id_sequence_fails_without_wrapping_to_zero() {
+    let registry = SessionRegistry::new(SessionRegistryConfig::default());
+    registry.inner.next_id.store(u64::MAX, Ordering::Relaxed);
+
+    let error = registry
+        .create(params())
+        .await
+        .expect_err("exhausted session-id sequence");
+
+    assert_eq!(error.code, "session_id_exhausted");
+    assert_eq!(registry.inner.next_id.load(Ordering::Relaxed), u64::MAX);
+    assert!(
+        registry
+            .inspect(&SessionId("s-0".to_owned()))
+            .await
+            .is_err(),
+        "overflow must never allocate s-0"
+    );
 }
 
 fn metadata(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -61,6 +99,7 @@ fn attach_params(id: &SessionId) -> SessionAttachParams {
         session_id: id.clone(),
         origin_session_id: None,
         origin_daemon_id: None,
+        origin_worker_id: None,
     }
 }
 
@@ -299,8 +338,8 @@ fn title_activity(config: &DetectorConfig, title: &str) -> Option<AgentActivity>
         .map(|matched| matched.activity)
 }
 
-fn pty_command<'a>(program: &str, args: impl IntoIterator<Item = &'a str>) -> PtyCommand {
-    PtyCommand {
+fn pty_command<'a>(program: &str, args: impl IntoIterator<Item = &'a str>) -> LaunchCommand {
+    LaunchCommand {
         program: program.to_owned(),
         args: args.into_iter().map(str::to_owned).collect(),
         env: Vec::new(),
@@ -2314,18 +2353,24 @@ async fn attach_from_inside_the_same_session_is_rejected() {
     });
     let created = registry.create(params()).await.expect("create session");
     let daemon_id = registry.daemon_instance_id().to_owned();
+    let worker_id = created
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.worker_id.clone())
+        .expect("created session has a durable worker id");
 
-    let self_feed = |session: &SessionId, daemon: Option<&str>| SessionAttachParams {
+    let self_feed = |session: &SessionId, worker: Option<&str>| SessionAttachParams {
         session_id: session.clone(),
         origin_session_id: Some(session.clone()),
-        origin_daemon_id: daemon.map(str::to_owned),
+        origin_daemon_id: Some(daemon_id.clone()),
+        origin_worker_id: worker.map(str::to_owned),
     };
 
-    // Origin id AND daemon id both match this instance: the client is inside
-    // this session's own PTY, so attaching would loop its output into its own
-    // input. Reject it.
+    // Origin id AND worker id both match this session's own worker: the
+    // client is inside this session's own PTY, so attaching would loop its
+    // output into its own input. Reject it.
     let err = registry
-        .attach(&self_feed(&created.id, Some(&daemon_id)))
+        .attach(&self_feed(&created.id, Some(&worker_id)))
         .await
         .expect_err("self-feeding attach must be rejected");
     assert_eq!(err.code, "attach_self_feedback");
@@ -2340,24 +2385,40 @@ async fn attach_from_inside_the_same_session_is_rejected() {
         "a rejected self-feeding attach must not leave a pending token"
     );
 
-    // Same session id but a DIFFERENT daemon instance (a colliding id on
-    // another daemon, or a stale value from a previous process): no loop, so
-    // it must be allowed, not falsely rejected.
-    registry
-        .attach(&self_feed(&created.id, Some("some-other-daemon")))
+    // Matching session id and worker id, but a stale/foreign daemon instance
+    // id: the daemon instance id is not an ownership identity (e.g. it
+    // changes across a daemon restart while the worker id stays stable), so
+    // it must not weaken the worker-id-based guard.
+    let err = registry
+        .attach(&SessionAttachParams {
+            session_id: created.id.clone(),
+            origin_session_id: Some(created.id.clone()),
+            origin_daemon_id: Some("some-other-daemon".to_owned()),
+            origin_worker_id: Some(worker_id.clone()),
+        })
         .await
-        .expect("matching id on a different daemon instance is allowed");
-    // Origin id without any daemon id cannot be pinned to this instance.
+        .expect_err("a stale daemon id must not weaken the worker-id-based guard");
+    assert_eq!(err.code, "attach_self_feedback");
+
+    // Same session id but a DIFFERENT worker id (a colliding id on another
+    // worker, or a stale value from a previous generation): no loop, so it
+    // must be allowed, not falsely rejected.
+    registry
+        .attach(&self_feed(&created.id, Some("some-other-worker")))
+        .await
+        .expect("matching session id with a different worker id is allowed");
+    // Origin id without any worker id cannot be pinned to this session's worker.
     registry
         .attach(&self_feed(&created.id, None))
         .await
-        .expect("origin id without a daemon id is allowed");
+        .expect("origin id without a worker id is allowed");
     // A different session's terminal (this daemon) is a legitimate origin.
     registry
         .attach(&SessionAttachParams {
             session_id: created.id.clone(),
             origin_session_id: Some(SessionId("s-other".to_owned())),
             origin_daemon_id: Some(daemon_id.clone()),
+            origin_worker_id: Some(worker_id.clone()),
         })
         .await
         .expect("attach from a different session's terminal is allowed");
@@ -4444,7 +4505,7 @@ async fn stopping_a_session_drops_its_resume_binding() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn process_exit_after_daemon_shutdown_starts_keeps_resume_binding() {
+async fn legacy_harness_exit_during_daemon_shutdown_keeps_recovery_binding() {
     let store_path = temp_store_path("shutdown-keeps-binding");
     let agents_dir = temp_resumable_agents_dir("shutdown-keeps-binding");
     let registry = SessionRegistry::new(SessionRegistryConfig {
@@ -4480,7 +4541,7 @@ async fn process_exit_after_daemon_shutdown_starts_keeps_resume_binding() {
     registry
         .record_exit(
             &created.id,
-            PtyExit {
+            RuntimeExit {
                 exit_code: None,
                 success: false,
             },
@@ -4497,7 +4558,7 @@ async fn process_exit_after_daemon_shutdown_starts_keeps_resume_binding() {
     assert_eq!(
         persisted.len(),
         1,
-        "a PTY exit observed during daemon shutdown must keep the restart-resume binding"
+        "a synthetic harness exit during daemon shutdown must keep recovery metadata"
     );
     assert_eq!(persisted[0].session_id, created.id.0);
     assert_eq!(
@@ -4508,7 +4569,7 @@ async fn process_exit_after_daemon_shutdown_starts_keeps_resume_binding() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn terminal_session_can_be_explicitly_resumed_with_same_id() {
+async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_is_idempotent() {
     let store_path = temp_store_path("manual-resume");
     let marker = temp_dir("manual-resume-marker").join("argv.txt");
     let agents_dir = temp_agent_that_exits_then_resumes("manual-resume", &marker);
@@ -4539,12 +4600,27 @@ async fn terminal_session_can_be_explicitly_resumed_with_same_id() {
         .await
         .expect("session exits");
     assert_eq!(done.state, SessionState::Done);
+    let original_created_at = done.created_at.clone();
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&created.id).expect("terminal entry");
+    entry.info.runtime = Some(SessionRuntime {
+        state: RuntimeState::Lost,
+        worker_id: Some("worker-before-recovery".to_owned()),
+        runtime_id: Some("runtime-before-recovery".to_owned()),
+        started_at: Some(original_created_at.clone()),
+        last_connected_at: None,
+        loss_reason: Some("test_runtime_lost".to_owned()),
+    });
+    entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Lost);
+    drop(sessions);
+    let mut events = registry.subscribe();
 
     let resumed = registry
         .resume(&created.id)
         .await
         .expect("resume terminal session");
     assert_eq!(resumed.id, created.id);
+    assert_eq!(resumed.created_at, original_created_at);
     assert_eq!(resumed.state, SessionState::Running);
     assert_eq!(resumed.native_session_id.as_deref(), Some("native-manual"));
 
@@ -4554,7 +4630,173 @@ async fn terminal_session_can_be_explicitly_resumed_with_same_id() {
         "resume argv must target the captured native id: {argv:?}"
     );
 
+    let event = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let event = events.recv().await.expect("receive recovery event");
+            if event.event == protocol::event::SESSION_NATIVE_RECOVERED {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("session_native_recovered event");
+    let recovered_event: SessionNativeRecoveredEvent =
+        serde_json::from_value(event.payload).expect("recovery event payload");
+    assert_eq!(recovered_event.session.id, created.id);
+    assert_eq!(
+        recovered_event.previous_runtime_id.as_deref(),
+        Some("runtime-before-recovery")
+    );
+    // The durable-worker backend always mints a fresh runtime generation on
+    // `initialize`, including for explicit native recovery, so the recovered
+    // event must carry a *new* id distinct from the replaced generation.
+    assert_ne!(
+        recovered_event.runtime_id.as_deref(),
+        Some("runtime-before-recovery"),
+        "native recovery must mint a new worker runtime, not reuse the previous one"
+    );
+    assert!(
+        recovered_event.runtime_id.is_some(),
+        "native recovery must mint a fresh durable-worker runtime id"
+    );
+
+    let repeated = registry
+        .resume(&created.id)
+        .await
+        .expect_err("live recovered session is not recoverable again");
+    assert_eq!(repeated.code, "session_runtime_not_recoverable");
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect after repeated recovery")
+            .pid,
+        resumed.pid
+    );
+
     let _ = registry.stop(&created.id).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_native_recovery_accepts_terminal_runtime() {
+    let marker = temp_dir("terminal-recovery-marker").join("argv.txt");
+    let agents_dir = temp_agent_that_exits_then_resumes("terminal-recovery", &marker);
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        agents_dir: Some(agents_dir),
+        socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(resumable_params())
+        .await
+        .expect("create session");
+    assert!(
+        registry
+            .report_native_id(SessionReportNativeIdParams {
+                session_id: created.id.clone(),
+                agent: "claude".to_owned(),
+                native_session_id: "native-terminal".to_owned(),
+                transcript_path: None,
+            })
+            .await
+            .recorded
+    );
+    let terminal = registry
+        .wait_for_exit(&created.id, Duration::from_secs(2))
+        .await
+        .expect("session exits");
+    assert_eq!(terminal.state, SessionState::Done);
+
+    let recovered = registry
+        .resume(&created.id)
+        .await
+        .expect("terminal runtime is eligible for native recovery");
+    assert_eq!(recovered.id, created.id);
+    assert_eq!(recovered.created_at, created.created_at);
+    assert_eq!(recovered.state, SessionState::Running);
+    assert!(wait_for_file_contains(&marker, "native-terminal")
+        .await
+        .contains("--resume"));
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_native_recovery_rejects_nonterminal_runtime_states() {
+    let agents_dir = temp_resumable_agents_dir("recovery-preconditions");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        agents_dir: Some(agents_dir),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(resumable_params())
+        .await
+        .expect("create resumable session");
+
+    for state in [
+        RuntimeState::Starting,
+        RuntimeState::Live,
+        RuntimeState::Reconnecting,
+        RuntimeState::Conflict,
+        RuntimeState::Incompatible,
+    ] {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("live entry");
+        entry.info.runtime = Some(SessionRuntime {
+            state,
+            worker_id: Some("worker-live".to_owned()),
+            runtime_id: Some("runtime-live".to_owned()),
+            started_at: None,
+            last_connected_at: None,
+            loss_reason: None,
+        });
+        drop(sessions);
+        let error = registry
+            .resume(&created.id)
+            .await
+            .expect_err("nonterminal runtime must reject native recovery");
+        assert_eq!(
+            error.code, "session_runtime_not_recoverable",
+            "unexpected error for {state:?}"
+        );
+    }
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn native_recovered_event_carries_previous_and_new_runtime_ids() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let mut session = registry.create(params()).await.expect("create session");
+    session.runtime = Some(SessionRuntime {
+        state: RuntimeState::Live,
+        worker_id: Some("worker-new".to_owned()),
+        runtime_id: Some("runtime-new".to_owned()),
+        started_at: Some(session.created_at.clone()),
+        last_connected_at: Some(session.updated_at.clone()),
+        loss_reason: None,
+    });
+    let mut events = registry.subscribe();
+
+    registry.emit_native_recovered(&session, Some("runtime-old".to_owned()));
+
+    let event = events.recv().await.expect("native recovery event");
+    assert_eq!(event.event, protocol::event::SESSION_NATIVE_RECOVERED);
+    let payload: SessionNativeRecoveredEvent =
+        serde_json::from_value(event.payload).expect("recovery payload");
+    assert_eq!(payload.session.id, session.id);
+    assert_eq!(payload.previous_runtime_id.as_deref(), Some("runtime-old"));
+    assert_eq!(payload.runtime_id.as_deref(), Some("runtime-new"));
+
+    let _ = registry.stop(&session.id).await;
 }
 
 #[tokio::test]
@@ -4728,8 +4970,8 @@ async fn resize_without_captured_native_id_persists_no_binding() {
     });
 
     let created = registry.create(params()).await.expect("create session");
-    // No native id captured yet: resizing must not fabricate a binding that
-    // load_and_resume would later reject as unresumable.
+    // No native id captured yet: resizing must not fabricate an unusable
+    // recovery binding.
     registry
         .resize(&created.id, 100, 30)
         .await
@@ -4744,103 +4986,6 @@ async fn resize_without_captured_native_id_persists_no_binding() {
     );
 
     let _ = registry.stop(&created.id).await;
-}
-
-#[tokio::test]
-async fn load_and_resume_prunes_structurally_unresumable_bindings() {
-    let store_path = temp_store_path("prune-corrupt");
-    // A hand-corrupted binding with no native id or path can never resume.
-    let store = crate::store::Store::new(store_path.clone());
-    store
-        .record_resume(&crate::store::ResumeBinding {
-            session_id: "s-corrupt".to_owned(),
-            name: None,
-            agent: "claude".to_owned(),
-            agent_base: AgentKind::Claude,
-            cwd: PathBuf::from("/tmp"),
-            cols: 80,
-            rows: 24,
-            native_session_id: None,
-            native_session_path: None,
-            project_id: None,
-            is_linked_worktree: None,
-            metadata: BTreeMap::new(),
-            program: String::new(),
-            args: Vec::new(),
-            input_rules: crate::store::StoredInputRules::default(),
-            resume_mode: None,
-            ref_kind: None,
-            resumable: false,
-        })
-        .expect("seed corrupt binding");
-
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        store_path: Some(store_path.clone()),
-        ..SessionRegistryConfig::default()
-    });
-    registry.load_and_resume().await;
-
-    assert!(
-        crate::store::Store::new(store_path)
-            .load_resume()
-            .expect("load")
-            .is_empty(),
-        "an unresumable binding must be pruned, not retried forever"
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn load_and_resume_uses_frozen_profile_args() {
-    let store_path = temp_store_path("resume-args");
-    let dir = temp_dir("resume-args-runtime");
-    let script = dir.join("resume-agent");
-    let marker = dir.join("argv.txt");
-    write_executable(
-        &script,
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nsleep 30\n",
-            marker.display()
-        ),
-    );
-    let store = crate::store::Store::new(store_path.clone());
-    store
-        .record_resume(&crate::store::ResumeBinding {
-            session_id: "s-44".to_owned(),
-            name: None,
-            agent: "profiled".to_owned(),
-            agent_base: AgentKind::Claude,
-            cwd: dir.clone(),
-            cols: 80,
-            rows: 24,
-            native_session_id: Some("native-44".to_owned()),
-            native_session_path: None,
-            project_id: None,
-            is_linked_worktree: None,
-            metadata: BTreeMap::new(),
-            program: script.display().to_string(),
-            args: vec!["--model".to_owned(), "sonnet".to_owned()],
-            input_rules: crate::store::StoredInputRules::default(),
-            resume_mode: Some(ResumeMode::Flag),
-            ref_kind: Some(SessionRefKind::Id),
-            resumable: true,
-        })
-        .expect("seed resume binding");
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        store_path: Some(store_path),
-        ..SessionRegistryConfig::default()
-    });
-
-    registry.load_and_resume().await;
-
-    let argv = wait_for_file_contains(&marker, "native-44").await;
-    assert_eq!(
-        argv.lines().collect::<Vec<_>>(),
-        vec!["--model", "sonnet", "--resume", "native-44"],
-        "resume relaunch must preserve frozen profile args before resume argv"
-    );
-
-    let _ = registry.stop(&SessionId("s-44".to_owned())).await;
 }
 
 #[cfg(unix)]
@@ -4948,7 +5093,7 @@ async fn resume_binding_persists_project_context_for_restart() {
     // binding, not re-detected. So the binding must carry `project_id` /
     // `is_linked_worktree` captured from the live session — verified here by
     // round-tripping through the store (record on native-id capture, read back
-    // via load_resume), which is exactly what `load_and_resume` reads at start.
+    // as explicit native-recovery metadata).
     let store = temp_store_path("resume-project-ctx");
     let worktree_root = store.parent().expect("store parent").join("worktrees");
     let agents_dir = temp_resumable_agents_dir("resume-project-ctx");

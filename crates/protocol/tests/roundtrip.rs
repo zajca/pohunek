@@ -57,6 +57,7 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         cwd: PathBuf::from("/workspace/project"),
         cwd_source: Some(CwdSource::Launch),
         pid: 4242,
+        runtime: None,
         cols: 120,
         rows: 40,
         state: SessionState::Running,
@@ -1660,6 +1661,7 @@ fn session_attach_params_json_shape_roundtrips() {
         session_id: SessionId("s-42".to_owned()),
         origin_session_id: None,
         origin_daemon_id: None,
+        origin_worker_id: None,
     };
 
     // The origin is omitted from the wire when absent, so the on-the-wire shape

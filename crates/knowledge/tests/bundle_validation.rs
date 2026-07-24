@@ -71,8 +71,8 @@ fn committed_docs_knowledge_bundle_passes_validation() {
     let report = validate_bundle(repo_knowledge_dir()).expect("docs/knowledge should validate");
 
     assert_eq!(report.schema_version, CONCEPT_SCHEMA_VERSION);
-    assert_eq!(report.files_checked, 21);
-    assert_eq!(report.concepts.len(), 19);
+    assert_eq!(report.files_checked, 22);
+    assert_eq!(report.concepts.len(), 20);
 }
 
 #[test]

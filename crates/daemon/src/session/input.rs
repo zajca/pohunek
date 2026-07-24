@@ -1,9 +1,14 @@
 //! User/initial input framing and PTY delivery.
 
+use pohunek_worker_protocol::{
+    InputFragment as WorkerInputFragment, InputPlan as WorkerInputPlan, SecretBytes, WriteId,
+};
+
 use super::{
-    adapter_for, pty_error_to_protocol, session_not_found, session_not_running, warn, AgentKind,
-    Duration, InputRules, LaunchCommandPlan, ProtocolError, PtyCommand, ResolvedAgent, SessionId,
-    SessionInputParams, SessionInputResult, SessionRegistry, SessionRegistryConfig, SessionState,
+    adapter_for, session_not_found, session_not_running, unavailable_runtime_error,
+    worker_error_to_protocol, AgentKind, Duration, InputRules, LaunchCommand, LaunchCommandPlan,
+    Ordering, ProtocolError, ResolvedAgent, RuntimeHandle, SessionId, SessionInputParams,
+    SessionInputResult, SessionRegistry, SessionRegistryConfig, SessionState,
 };
 
 pub(super) const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
@@ -33,7 +38,7 @@ impl SessionRegistry {
         text: &str,
     ) -> Result<(), ProtocolError> {
         self.ensure_not_external(session_id).await?;
-        let (pty, rules) = {
+        let (runtime, rules) = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions
                 .get(session_id)
@@ -41,22 +46,38 @@ impl SessionRegistry {
             if entry.info.state != SessionState::Running {
                 return Err(session_not_running(session_id));
             }
-            (entry.pty.clone(), entry.input_rules)
+            (entry.runtime.clone(), entry.input_rules)
         };
 
         let writes = build_input_writes(text, rules);
-        pty.write_user_input(writes.immediate)
-            .await
-            .map_err(pty_error_to_protocol)?;
-
-        if let Some((delay, bytes)) = writes.delayed_submit {
-            let delayed_pty = pty.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(delay).await;
-                if let Err(err) = delayed_pty.write_user_input(bytes).await {
-                    warn!(error = %err, "failed to write delayed agent submit byte");
+        match runtime {
+            RuntimeHandle::Worker(worker) => {
+                let sequence = self.inner.next_write_id.fetch_add(1, Ordering::Relaxed);
+                let write_id = WriteId::new(format!("input-{sequence}")).map_err(|error| {
+                    super::runtime_error("worker_input_invalid", error.to_string())
+                })?;
+                let mut fragments = Vec::with_capacity(2);
+                let delay_after_ms = writes.delayed_submit.as_ref().map_or(0, |(delay, _)| {
+                    u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
+                });
+                fragments.push(WorkerInputFragment {
+                    bytes: SecretBytes::new(writes.immediate),
+                    delay_after_ms,
+                });
+                if let Some((_delay, bytes)) = writes.delayed_submit {
+                    fragments.push(WorkerInputFragment {
+                        bytes: SecretBytes::new(bytes),
+                        delay_after_ms: 0,
+                    });
                 }
-            });
+                let plan = WorkerInputPlan::new(write_id, fragments).map_err(|error| {
+                    super::runtime_error("worker_input_invalid", error.to_string())
+                })?;
+                worker.write(plan).await.map_err(worker_error_to_protocol)?;
+            }
+            RuntimeHandle::Unavailable(state) => {
+                return Err(unavailable_runtime_error(session_id, state));
+            }
         }
 
         Ok(())
@@ -65,7 +86,7 @@ impl SessionRegistry {
 
 pub(super) fn plan_initial_input_delivery(
     resolved: &ResolvedAgent,
-    mut command: PtyCommand,
+    mut command: LaunchCommand,
     initial_input: Option<String>,
 ) -> LaunchCommandPlan {
     if resolved.profile.is_none() && prompt_arg_supported(resolved.base) {

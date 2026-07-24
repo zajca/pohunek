@@ -201,6 +201,18 @@ fn session_tree_row(
     session: &SessionInfo,
 ) -> Element<'static, Message> {
     let provider_status = linked_pr_status_label(host, session);
+    let runtime_status = session.runtime.as_ref().map_or("", |runtime| {
+        if runtime.state == protocol::RuntimeState::Live {
+            ""
+        } else {
+            runtime.state.as_str()
+        }
+    });
+    let runtime_status = if runtime_status.is_empty() {
+        String::new()
+    } else {
+        format!("  runtime:{runtime_status}")
+    };
     let selected = session_is_selected(app, host_id, &session.id);
     let origin = if session.external == Some(true) {
         "  external"
@@ -209,9 +221,12 @@ fn session_tree_row(
     };
     // Lead with the display name when set; otherwise fall back to the id.
     let label = match &session.name {
-        Some(name) => format!("{name}  {}{origin}{provider_status}", session.agent),
+        Some(name) => format!(
+            "{name}  {}{origin}{provider_status}{runtime_status}",
+            session.agent
+        ),
         None => format!(
-            "{}  {}{origin}{provider_status}",
+            "{}  {}{origin}{provider_status}{runtime_status}",
             session.id.0, session.agent
         ),
     };

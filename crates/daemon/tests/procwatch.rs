@@ -6,10 +6,12 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use pohunek_daemon::procwatch::{LinuxInspector, ProcessInspector};
+use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use protocol::{
     AgentKind, CwdSource, SessionAttachParams, SessionId, SessionInfo, SessionInputParams,
@@ -25,9 +27,13 @@ const TEST_ROWS: u16 = 24;
 const TEST_PROCWATCH_POLL: Duration = Duration::from_secs(2);
 /// Upper bound for the initial process-discovery wait.
 ///
-/// The watcher ticks immediately after spawn; this timeout leaves room for PTY
-/// startup on loaded CI while still bounding a broken descendant walk.
-const OBSERVE_TIMEOUT: Duration = Duration::from_secs(4);
+/// The watcher ticks immediately after spawn; this timeout leaves room for
+/// subprocess-worker spawn plus PTY startup on a heavily loaded parallel test
+/// run while still bounding a broken descendant walk. It is a liveness bound
+/// only (the event-driven `EXIT_EVENT_TIMEOUT` below is what proves pidfd-driven
+/// behavior), so a generous value costs nothing on success and only absorbs
+/// scheduling latency when the whole workspace runs concurrently.
+const OBSERVE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Upper bound for pidfd-driven release after `kill -9`.
 ///
 /// This is below [`TEST_PROCWATCH_POLL`], so success demonstrates event-driven
@@ -36,7 +42,11 @@ const EXIT_EVENT_TIMEOUT: Duration = Duration::from_millis(900);
 /// Poll interval for the cwd-tracking integration test.
 const CWD_PROCWATCH_POLL: Duration = Duration::from_millis(150);
 /// Upper bound for observing a shell `cd` through procwatch.
-const CWD_UPDATE_TIMEOUT: Duration = Duration::from_millis(350);
+///
+/// A liveness bound: procwatch reflects the new cwd on its next poll, so this
+/// only needs to exceed a poll interval plus scheduling latency. Kept generous
+/// so a heavily loaded parallel test run cannot starve the poll tick.
+const CWD_UPDATE_TIMEOUT: Duration = Duration::from_secs(4);
 /// Lightweight inspect polling cadence while waiting for cwd updates.
 const CWD_WAIT_POLL: Duration = Duration::from_millis(20);
 /// Poll interval for the external observer integration test.
@@ -47,6 +57,112 @@ const EXTERNAL_OBSERVE_TIMEOUT: Duration = Duration::from_secs(2);
 const EXTERNAL_WAIT_POLL: Duration = Duration::from_millis(20);
 
 static EXTERNAL_ENV_LOCK: Mutex<()> = Mutex::new(());
+static POHUNEK_ENV_LOCK: Mutex<()> = Mutex::new(());
+static WORKER_HOME_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Clears `POHUNEK_DAEMON_ID`/`POHUNEK_SESSION_ID` for the scope of spawning a
+/// worker-backed test session.
+///
+/// `cargo test` may itself run inside a real pohunek-managed session (e.g. a
+/// dev loop invoked from within this very repo's own pohunek session), which
+/// sets both on this process's environment. `SubprocessWorkerLauncher::launch`
+/// (`crates/daemon/src/runtime/launcher.rs`) spawns the worker subprocess
+/// without scrubbing the ambient environment, so those stale markers would
+/// otherwise leak all the way down into the freshly spawned worker and the
+/// PTY child it forks — stamping the test's own fake agent with a foreign
+/// daemon id that `is_foreign_owned_agent`
+/// (`crates/daemon/src/session/procwatch.rs`) then correctly refuses to
+/// adopt, so it never surfaces as this test's observed agent. Clearing both
+/// vars before `registry.create` breaks the leak at its source; mirrors this
+/// file's existing `ExternalEnvGuard` pattern for `CLAUDE_CONFIG_DIR`/
+/// `CODEX_HOME`.
+struct PohunekEnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    daemon_id: Option<std::ffi::OsString>,
+    session_id: Option<std::ffi::OsString>,
+}
+
+impl PohunekEnvGuard {
+    fn clear() -> Self {
+        let lock = POHUNEK_ENV_LOCK.lock().expect("pohunek env lock");
+        let daemon_id = std::env::var_os(ENV_DAEMON_ID);
+        let session_id = std::env::var_os(ENV_SESSION_ID);
+        std::env::remove_var(ENV_DAEMON_ID);
+        std::env::remove_var(ENV_SESSION_ID);
+        Self {
+            _lock: lock,
+            daemon_id,
+            session_id,
+        }
+    }
+}
+
+impl Drop for PohunekEnvGuard {
+    fn drop(&mut self) {
+        restore_env(ENV_DAEMON_ID, self.daemon_id.clone());
+        restore_env(ENV_SESSION_ID, self.session_id.clone());
+    }
+}
+
+/// Build a `SessionRegistry` wired to a real `SubprocessWorkerLauncher` (the
+/// built `pohunek-sessiond`), rooted under a unique per-call worker home, so
+/// `registry.create` can actually launch a durable worker instead of failing
+/// with `worker_backend_required`.
+///
+/// This file drives `SessionRegistry` directly with no `ControlServer`
+/// (unlike `health_socket.rs`'s integration tests), so the worker's
+/// `--daemon-socket-path` points at an unbound placeholder path: harmless,
+/// since it is only used for the worker's own best-effort hook handshake,
+/// which none of these tests exercise. The worker child inherits this
+/// process's real `PATH`, so `sh`/`sleep`/`stty` resolve normally; this file
+/// never narrows `PATH` (unlike `health_socket.rs`'s `PathGuard`), so there is
+/// no PATH-isolation race to guard against here.
+fn worker_backed_registry(mut config: SessionRegistryConfig) -> SessionRegistry {
+    let worker_home = std::env::temp_dir().join(format!(
+        "pw-p-{}-{}",
+        std::process::id(),
+        WORKER_HOME_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let worker_environment = SubprocessWorkerEnvironment {
+        runtime_home: worker_home.join("runtime"),
+        state_home: worker_home.join("state"),
+        data_home: worker_home.join("data"),
+        config_home: worker_home.join("config"),
+        cache_home: worker_home.join("cache"),
+        daemon_socket: worker_home.join("daemon.sock"),
+    };
+    config.worker_runtime_root = Some(worker_environment.runtime_home.join("pohunek/workers"));
+    config.worker_state_root = Some(worker_environment.state_home.join("pohunek/workers"));
+    let launcher = Arc::new(SubprocessWorkerLauncher::new(
+        worker_binary(),
+        worker_environment,
+    ));
+    SessionRegistry::new_with_launcher_and_inspector(
+        config,
+        launcher,
+        Arc::new(LinuxInspector::new()),
+    )
+}
+
+/// Locate the real `pohunek-sessiond` worker binary built alongside this test.
+fn worker_binary() -> PathBuf {
+    if let Some(path) = std::env::var_os("POHUNEK_WORKER_BIN") {
+        return PathBuf::from(path);
+    }
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("daemon crate is inside workspace")
+        .to_path_buf();
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| workspace.join("target"), PathBuf::from);
+    let binary = target.join("debug/pohunek-sessiond");
+    assert!(
+        binary.is_file(),
+        "build the real worker first with `cargo build -p pohunek-session-worker --bin pohunek-sessiond`, or set POHUNEK_WORKER_BIN"
+    );
+    binary
+}
 
 #[tokio::test]
 async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
@@ -63,28 +179,31 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
         fake_codex.display(),
         pid_file.display()
     );
-    let registry = SessionRegistry::new(SessionRegistryConfig {
+    let registry = worker_backed_registry(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", script.as_str()]),
         stop_grace: Duration::from_millis(50),
         procwatch_poll: TEST_PROCWATCH_POLL,
         ..SessionRegistryConfig::default()
     });
-    let created = registry
-        .create(SessionNewParams {
-            name: Some("procwatch-real-child".to_owned()),
-            agent: "shell".to_owned(),
-            cwd: Some(dir.clone()),
-            cols: TEST_COLS,
-            rows: TEST_ROWS,
-            project: None,
-            repo: None,
-            branch: None,
-            base_branch: None,
-            input: None,
-            metadata: BTreeMap::new(),
-        })
-        .await
-        .expect("create shell session");
+    let created = {
+        let _env = PohunekEnvGuard::clear();
+        registry
+            .create(SessionNewParams {
+                name: Some("procwatch-real-child".to_owned()),
+                agent: "shell".to_owned(),
+                cwd: Some(dir.clone()),
+                cols: TEST_COLS,
+                rows: TEST_ROWS,
+                project: None,
+                repo: None,
+                branch: None,
+                base_branch: None,
+                input: None,
+                metadata: BTreeMap::new(),
+            })
+            .await
+            .expect("create shell session")
+    };
     let child_pid = wait_for_pid_file(&pid_file).await;
 
     let observed =
@@ -108,7 +227,7 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
 async fn procwatch_updates_cwd_after_shell_cd() {
     let start_dir = temp_dir("procwatch-cwd-start");
     let target_dir = temp_dir("procwatch-cwd-target");
-    let registry = SessionRegistry::new(SessionRegistryConfig {
+    let registry = worker_backed_registry(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<String>()),
         stop_grace: Duration::from_millis(50),
         procwatch_poll: CWD_PROCWATCH_POLL,
@@ -198,6 +317,7 @@ async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
             session_id: observed.id.clone(),
             origin_session_id: None,
             origin_daemon_id: None,
+            origin_worker_id: None,
         })
         .await
         .expect_err("external sessions cannot be attached");

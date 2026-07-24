@@ -11,7 +11,6 @@ use protocol::{ErrorClass, ProtocolError};
 use serde::{Deserialize, Serialize};
 
 use crate::detect::Manifest;
-use crate::pty::PtyCommand;
 
 mod claude;
 mod codex;
@@ -43,6 +42,23 @@ pub struct LaunchOpts {
     pub rows: u16,
     /// Extra environment variables for the child process.
     pub env_extra: Vec<(String, String)>,
+}
+
+/// Sanitized process launch plan passed to a durable worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchCommand {
+    /// Program path or name.
+    pub program: String,
+    /// Program arguments.
+    pub args: Vec<String>,
+    /// Extra environment variables to add or override for the child process.
+    pub env: Vec<(String, String)>,
+    /// Working directory.
+    pub cwd: PathBuf,
+    /// Initial terminal width in columns.
+    pub cols: u16,
+    /// Initial terminal height in rows.
+    pub rows: u16,
 }
 
 /// Input framing rules for programmatic prompt injection.
@@ -236,7 +252,7 @@ pub trait AgentAdapter: std::fmt::Debug + Send + Sync {
     /// Stable adapter id.
     fn id(&self) -> &str;
     /// Build the PTY launch command, resolving the executable from `PATH`.
-    fn launch(&self, opts: &LaunchOpts) -> Result<PtyCommand, ProtocolError>;
+    fn launch(&self, opts: &LaunchOpts) -> Result<LaunchCommand, ProtocolError>;
     /// Programmatic input injection rules.
     fn input_rules(&self) -> InputRules;
     /// Agent-specific activity manifest.
@@ -247,7 +263,7 @@ fn launch_command(
     program: &str,
     args: Vec<String>,
     opts: &LaunchOpts,
-) -> Result<PtyCommand, ProtocolError> {
+) -> Result<LaunchCommand, ProtocolError> {
     build_pty_command(program, args, opts)
 }
 
@@ -281,8 +297,8 @@ pub fn build_pty_command(
     program: &str,
     args: Vec<String>,
     opts: &LaunchOpts,
-) -> Result<PtyCommand, ProtocolError> {
-    Ok(PtyCommand {
+) -> Result<LaunchCommand, ProtocolError> {
+    Ok(LaunchCommand {
         program: resolve_binary(program)?,
         args,
         env: opts.env_extra.clone(),
@@ -306,7 +322,7 @@ pub(crate) fn resume_pty_command_from_template(
     template: ResumeTemplate,
     session_ref: &SessionRef,
     opts: &LaunchOpts,
-) -> Result<PtyCommand, ProtocolError> {
+) -> Result<LaunchCommand, ProtocolError> {
     let mut args = frozen_args;
     args.extend(template.mode.argv(session_ref.value()));
     build_pty_command(program, args, opts)
@@ -320,7 +336,7 @@ pub(crate) fn fork_pty_command_from_template(
     template: ResumeTemplate,
     session_ref: &SessionRef,
     opts: &LaunchOpts,
-) -> Result<PtyCommand, ProtocolError> {
+) -> Result<LaunchCommand, ProtocolError> {
     let mut args = frozen_args;
     let fork_args = template
         .mode

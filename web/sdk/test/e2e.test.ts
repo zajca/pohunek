@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { expect, test } from "bun:test";
 import { PROTOCOL_VERSION, type ProtocolEvent } from "@pohunek/protocol";
 import { startRelay, type RelayHandle } from "@pohunek/backend";
+import { startDurableWorkerFixture } from "@pohunek/testkit";
 import {
   Client,
   attachRawLocal,
@@ -225,6 +226,7 @@ async function startDaemon(): Promise<DaemonHarness> {
   await Promise.all(Object.values(dirs).map((dir) => mkdir(dir, { recursive: true })));
 
   const daemonBin = daemonBinaryPath();
+  const worker = await startDurableWorkerFixture({ daemonBin });
   const stdoutChunks: string[] = [];
   const stderrChunks: string[] = [];
   let exitStatus: ExitStatus | undefined;
@@ -246,6 +248,7 @@ async function startDaemon(): Promise<DaemonHarness> {
       // isolated empty HOME, which swallow the probe command and make the
       // attach round-trip non-deterministic.
       SHELL: "/bin/sh",
+      ...worker.env,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

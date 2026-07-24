@@ -24,6 +24,13 @@ The assistant must:
 - Treat hooks as executable code requiring explicit review.
 - Avoid weakening owner-only profile checks, name guards, path containment, or
   remote safety gates.
+- Treat worker control sockets and journals as owner-private runtime authority.
+  Never proxy a worker endpoint over NetBird, unlink a failed socket without
+  proving unit inactivity and exact identity, or edit worker/runtime ids by
+  hand.
+- Never copy worker journal or structured-log diagnostics into shared reports
+  without review. Journals intentionally omit prompt, input, terminal, and
+  environment bytes; preserve that boundary when adding diagnostics.
 - Treat `notification.create` like every other control method: it is guarded by
   the owner-only daemon socket, not by per-session authentication. Any same-user
   process that can reach the socket can create notifications and influence

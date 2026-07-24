@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "pohunek terminal screen model: vt100-backed grid scraping and an attach compositor."
 
 [dependencies]
+serde = { workspace = true }
 vt100 = { workspace = true }
 
 [lints]

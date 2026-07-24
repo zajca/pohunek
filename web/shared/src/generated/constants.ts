@@ -12,7 +12,12 @@ export const EVENT_NOTIFICATION_CREATED = "notification_created" as const;
 export const EVENT_NOTIFICATION_DELETED = "notification_deleted" as const;
 export const EVENT_NOTIFICATION_UPDATED = "notification_updated" as const;
 export const EVENT_SESSION_CREATED = "session_created" as const;
+export const EVENT_SESSION_NATIVE_RECOVERED = "session_native_recovered" as const;
 export const EVENT_SESSION_REMOVED = "session_removed" as const;
+export const EVENT_SESSION_RUNTIME_CONFLICT = "session_runtime_conflict" as const;
+export const EVENT_SESSION_RUNTIME_DISCOVERED = "session_runtime_discovered" as const;
+export const EVENT_SESSION_RUNTIME_LOST = "session_runtime_lost" as const;
+export const EVENT_SESSION_RUNTIME_RECONNECTED = "session_runtime_reconnected" as const;
 export const EVENT_SESSION_STOPPED = "session_stopped" as const;
 export const EVENT_SESSION_UPDATED = "session_updated" as const;
 
@@ -24,7 +29,12 @@ export const EVENT_NAMES = [
   EVENT_NOTIFICATION_DELETED,
   EVENT_NOTIFICATION_UPDATED,
   EVENT_SESSION_CREATED,
+  EVENT_SESSION_NATIVE_RECOVERED,
   EVENT_SESSION_REMOVED,
+  EVENT_SESSION_RUNTIME_CONFLICT,
+  EVENT_SESSION_RUNTIME_DISCOVERED,
+  EVENT_SESSION_RUNTIME_LOST,
+  EVENT_SESSION_RUNTIME_RECONNECTED,
   EVENT_SESSION_STOPPED,
   EVENT_SESSION_UPDATED,
 ] as const;

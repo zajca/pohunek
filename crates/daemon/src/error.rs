@@ -80,6 +80,10 @@ pub enum DaemonError {
         reason: String,
     },
 
+    /// Durable logical sessions could not be loaded for startup reconciliation.
+    #[error("session worker reconciliation failed: {0}")]
+    Reconcile(#[source] protocol::ProtocolError),
+
     /// Generic I/O error not tied to a specific resource above.
     #[error("io error: {0}")]
     Io(#[from] io::Error),

@@ -61,7 +61,13 @@ pub(crate) fn session_requires_resume_before_attach(
         .hosts
         .get(host_id)
         .and_then(|host| host.sessions.get(&session_id.0))
-        .is_some_and(|session| session.state.is_terminal())
+        .is_some_and(|session| {
+            session.state.is_terminal()
+                || session
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.state == protocol::RuntimeState::Lost)
+        })
 }
 
 pub(crate) fn spawn_notification(command: &str, intent: &NotificationIntent) -> Result<(), String> {

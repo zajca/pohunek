@@ -17,6 +17,7 @@ mod compositor;
 mod input;
 mod menu;
 mod screen;
+mod snapshot;
 
 #[doc(inline)]
 pub use compositor::{Compositor, OverlayFrame, OverlayLine, BANNER_ROWS, MIN_ROWS_WITH_BANNER};
@@ -25,4 +26,5 @@ pub use input::InputTranslator;
 #[doc(inline)]
 pub use menu::{step, MenuEffect, MenuEvent, MenuKey, MenuOutcome, MenuState};
 pub use screen::{ScreenRegion, ScreenTracker};
+pub use snapshot::{TerminalSnapshot, TerminalTracker};
 pub use vt100::{MouseProtocolEncoding, MouseProtocolMode};

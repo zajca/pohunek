@@ -21,6 +21,7 @@ import {
   type Request,
   type Subscription,
 } from "@pohunek/sdk/browser";
+import { startDurableWorkerFixture } from "@pohunek/testkit";
 
 const E2E_ENABLED = process.env["POHUNEK_E2E"] === "1";
 
@@ -262,6 +263,7 @@ async function startDaemon(): Promise<DaemonHarness> {
   await writeFile(join(dirs.bin, "netbird"), NETBIRD_FIXTURE_SCRIPT, { mode: 0o700 });
 
   const daemonBin = daemonBinaryPath();
+  const worker = await startDurableWorkerFixture({ daemonBin });
   const stdoutChunks: string[] = [];
   const stderrChunks: string[] = [];
   let exitStatus: ExitStatus | undefined;
@@ -281,6 +283,7 @@ async function startDaemon(): Promise<DaemonHarness> {
       // shell agent still uses the explicit absolute path below.
       PATH: dirs.bin,
       SHELL: "/bin/sh",
+      ...worker.env,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

@@ -74,7 +74,7 @@ pub use state::{
     GitHubPullRequestStatusKey, HostEvent, HostView, LinearProviderState, NotificationFilter,
     NotificationIntent, NotificationRow, NotificationScope, PromptState, ProviderOperation,
     ProviderPanel, ProviderRequestId, ProviderState, ReviewCommentEditor, ReviewDiffStatus,
-    ReviewDispatchModal, ReviewLineTarget, ReviewTabState, Toast, Workspace,
+    ReviewDispatchModal, ReviewLineTarget, ReviewTabState, RuntimeContinuity, Toast, Workspace,
 };
 #[doc(inline)]
 pub use ui_state::{

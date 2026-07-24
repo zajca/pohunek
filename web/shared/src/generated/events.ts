@@ -7,7 +7,9 @@ import type {
   NotificationDeletedEvent,
   NotificationUpdatedEvent,
   ProtocolVersion,
+  RuntimeInventoryEvent,
   SessionEvent,
+  SessionNativeRecoveredEvent,
 } from "./index";
 
 export type ProtocolEvent =
@@ -18,7 +20,12 @@ export type ProtocolEvent =
   | ({ v: ProtocolVersion; event: "notification_deleted"; id?: string } & NotificationDeletedEvent)
   | ({ v: ProtocolVersion; event: "notification_updated"; id?: string } & NotificationUpdatedEvent)
   | ({ v: ProtocolVersion; event: "session_created"; id?: string } & SessionEvent)
+  | ({ v: ProtocolVersion; event: "session_native_recovered"; id?: string } & SessionNativeRecoveredEvent)
   | ({ v: ProtocolVersion; event: "session_removed"; id?: string } & SessionEvent)
+  | ({ v: ProtocolVersion; event: "session_runtime_conflict"; id?: string } & SessionEvent)
+  | ({ v: ProtocolVersion; event: "session_runtime_discovered"; id?: string } & RuntimeInventoryEvent)
+  | ({ v: ProtocolVersion; event: "session_runtime_lost"; id?: string } & SessionEvent)
+  | ({ v: ProtocolVersion; event: "session_runtime_reconnected"; id?: string } & SessionEvent)
   | ({ v: ProtocolVersion; event: "session_stopped"; id?: string } & SessionEvent)
   | ({ v: ProtocolVersion; event: "session_updated"; id?: string } & SessionEvent)
 ;

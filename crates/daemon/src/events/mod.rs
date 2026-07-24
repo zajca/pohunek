@@ -8,9 +8,9 @@
 //!
 //! The log **never contains secrets and never contains raw terminal bytes**: it
 //! records only the structured control-plane events, whose payloads carry bounded
-//! daemon metadata. PTY output flows on a *separate* broadcast channel
-//! (`PtyHandle::subscribe_output`) that this log never taps, so terminal bytes
-//! are out of reach by construction.
+//! daemon metadata. PTY output flows on separate authenticated worker data
+//! streams that this log never opens, so terminal bytes are out of reach by
+//! construction.
 //!
 //! Unlike the (deferred) `state.db`, this log is **not rebuildable**, so it is
 //! append-only: each event is appended and flushed, never rewritten.

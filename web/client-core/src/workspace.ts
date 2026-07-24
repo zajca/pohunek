@@ -250,7 +250,7 @@ export class PohunekWorkspace implements Workspace, ActionCaller, OptimisticNoti
     notifications: Parameters<typeof hostDataFromSnapshot>[1],
   ): void {
     const previous = this.hostData.get(host);
-    this.hostData.set(host, hostDataFromSnapshot(sessions, notifications));
+    this.hostData.set(host, hostDataFromSnapshot(sessions, notifications, previous));
     const ids = new Set([
       ...Object.keys(previous?.notifications ?? {}),
       ...notifications.map((notification) => notification.id),
@@ -331,6 +331,7 @@ export class PohunekWorkspace implements Workspace, ActionCaller, OptimisticNoti
           host,
           session: reduced.session,
           attachStreamIds: reduced.attachStreamIds,
+          runtimeContinuity: reduced.runtimeContinuity,
         };
       }
       for (const [id, notification] of Object.entries(state.notifications)) {

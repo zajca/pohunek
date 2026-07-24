@@ -1,0 +1,9 @@
+[Unit]
+Description=Pohunek durable session workers
+Documentation=https://github.com/zajca/zremoteng
+
+[Slice]
+CPUAccounting=yes
+MemoryAccounting=yes
+TasksAccounting=yes
+

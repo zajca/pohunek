@@ -13,6 +13,7 @@ import {
 } from "@pohunek/testkit";
 import createBackendHostsSource, {
   createWorkspace,
+  hostDataFromSnapshot,
   hostResourceKey,
   reduceHostEvent,
   type HostDescriptor,
@@ -166,6 +167,69 @@ describe("@pohunek/client-core", () => {
       await relay.close();
       await daemon.close();
     }
+  });
+
+  test("reconnect keeps the same runtime generation and marks a changed generation as recovery", async () => {
+    const live = session("s-runtime", "runtime-1");
+    let daemon = await startTcpFixture({ initialSessions: [live] });
+    const address = requireTcpAddress(daemon);
+    const relay = await relayFor(new Map([
+      ["runtime", { kind: "tcp", host: address.host, port: address.port }],
+    ]));
+    const workspace = workspaceFor(relay, [host("runtime")]);
+    const key = hostResourceKey("runtime", live.id);
+
+    try {
+      await waitFor(() => connectionKind(workspace, "runtime") === "connected");
+      expect(workspace.sessions.snapshot()[key]?.runtimeContinuity).toBe("initial");
+
+      await daemon.stopAbruptly();
+      await waitFor(() => connectionKind(workspace, "runtime") === "error");
+      daemon = await startTcpFixture({
+        port: address.port,
+        initialSessions: [session("s-runtime", "runtime-1")],
+      });
+
+      await waitFor(() => workspace.sessions.snapshot()[key]?.runtimeContinuity === "reconnected");
+      expect(workspace.sessions.snapshot()[key]?.session.runtime?.runtime_id).toBe("runtime-1");
+
+      const recovered = hostDataFromSnapshot(
+        [session("s-runtime", "runtime-2")],
+        [],
+        hostDataFromSnapshot([session("s-runtime", "runtime-1")], []),
+      );
+      expect(recovered.sessions["s-runtime"]?.runtimeContinuity).toBe("recovered");
+      expect(recovered.sessions["s-runtime"]?.session.runtime?.runtime_id).toBe("runtime-2");
+    } finally {
+      await workspace.close();
+      await relay.close();
+      await daemon.close();
+    }
+  });
+
+  test("reduces runtime lifecycle events without losing the logical session", () => {
+    const initial = hostDataFromSnapshot([session("s-runtime", "runtime-1")], []);
+    const lost = reduceHostEvent(initial, {
+      v: PROTOCOL_VERSION,
+      event: "session_runtime_lost",
+      session: {
+        ...session("s-runtime", "runtime-1"),
+        runtime: {
+          ...session("s-runtime", "runtime-1").runtime!,
+          state: "lost",
+          loss_reason: "worker_missing",
+        },
+      },
+    });
+    expect(lost.sessions["s-runtime"]?.session.runtime?.state).toBe("lost");
+
+    const recovered = reduceHostEvent(lost, {
+      v: PROTOCOL_VERSION,
+      event: "session_native_recovered",
+      session: session("s-runtime", "runtime-2"),
+    });
+    expect(recovered.sessions["s-runtime"]?.runtimeContinuity).toBe("recovered");
+    expect(recovered.sessions["s-runtime"]?.session.runtime?.runtime_id).toBe("runtime-2");
   });
 
   test("reduces every live session, attach, agent, and notification transition", async () => {
@@ -429,7 +493,7 @@ function host(name: string): HostDescriptor {
   };
 }
 
-function session(id: string): SessionInfo {
+function session(id: string, runtimeId?: string): SessionInfo {
   return {
     id,
     agent: "codex",
@@ -444,6 +508,15 @@ function session(id: string): SessionInfo {
     activity: "idle",
     created_at: "2026-07-22T12:00:00Z",
     updated_at: "2026-07-22T12:00:00Z",
+    ...(runtimeId === undefined ? {} : {
+      runtime: {
+        state: "live",
+        worker_id: `worker-${runtimeId}`,
+        runtime_id: runtimeId,
+        started_at: "2026-07-22T12:00:00Z",
+        last_connected_at: "2026-07-22T12:00:00Z",
+      },
+    }),
   };
 }
 

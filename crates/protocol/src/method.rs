@@ -18,10 +18,10 @@ use crate::{
     NotificationUpdateResult, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
     ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams, ProjectPromptParams,
     ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
-    ProjectShowParams, ProjectShowResult, SessionAttachParams, SessionAttachResult,
-    SessionDetachParams, SessionDetachResult, SessionDiffParams, SessionDiffResult,
-    SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult,
+    ProjectShowParams, ProjectShowResult, RuntimeInventoryResult, SessionAttachParams,
+    SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionDiffParams,
+    SessionDiffResult, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
+    SessionInputParams, SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult,
     SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams,
     SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
     SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
@@ -146,6 +146,15 @@ method_table!(
     Vec<SessionInfo>,
     "SessionListParams",
     "SessionInfo[]";
+
+    /// List authenticated and quarantined durable worker endpoints.
+    SessionRuntimeInventory,
+    SESSION_RUNTIME_INVENTORY,
+    "session.runtime_inventory",
+    (),
+    RuntimeInventoryResult,
+    "null",
+    "RuntimeInventoryResult";
 
     /// Inspect one session.
     SessionInspect,

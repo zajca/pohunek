@@ -8,7 +8,16 @@ import type {
 export interface ReducedSession {
   readonly session: SessionInfo;
   readonly attachStreamIds: readonly string[];
+  /**
+   * How the current runtime generation relates to the last observed snapshot.
+   *
+   * A reconnect keeps the PTY generation. Recovery replaces it and must remain
+   * visible to the operator instead of looking like seamless continuity.
+   */
+  readonly runtimeContinuity: RuntimeContinuity;
 }
+
+export type RuntimeContinuity = "initial" | "reconnected" | "recovered";
 
 export interface HostDataState {
   readonly sessions: Readonly<Record<string, ReducedSession>>;
@@ -24,12 +33,15 @@ export function emptyHostDataState(): HostDataState {
 export function hostDataFromSnapshot(
   sessions: readonly SessionInfo[],
   notifications: readonly NotificationRecord[],
+  previous?: HostDataState,
 ): HostDataState {
   const sessionRecords: Record<string, ReducedSession> = {};
   for (const session of sessions) {
+    const prior = previous?.sessions[session.id];
     sessionRecords[session.id] = {
       session: structuredClone(session),
       attachStreamIds: [],
+      runtimeContinuity: snapshotRuntimeContinuity(prior, session),
     };
   }
 
@@ -44,6 +56,15 @@ export function hostDataFromSnapshot(
 
 export function reduceHostEvent(state: HostDataState, event: ReducerEvent): HostDataState {
   if (isEventName(event, "session_created") || isEventName(event, "session_updated") || isEventName(event, "session_stopped")) {
+    return upsertSession(state, event.session);
+  }
+  if (isEventName(event, "session_runtime_reconnected")) {
+    return upsertSession(state, event.session, "reconnected");
+  }
+  if (isEventName(event, "session_native_recovered")) {
+    return upsertSession(state, event.session, "recovered");
+  }
+  if (isEventName(event, "session_runtime_lost") || isEventName(event, "session_runtime_conflict")) {
     return upsertSession(state, event.session);
   }
   if (isEventName(event, "session_removed")) {
@@ -67,7 +88,11 @@ export function reduceHostEvent(state: HostDataState, event: ReducerEvent): Host
   return state;
 }
 
-function upsertSession(state: HostDataState, session: SessionInfo): HostDataState {
+function upsertSession(
+  state: HostDataState,
+  session: SessionInfo,
+  runtimeContinuity?: RuntimeContinuity,
+): HostDataState {
   const existing = state.sessions[session.id];
   return {
     ...state,
@@ -76,9 +101,35 @@ function upsertSession(state: HostDataState, session: SessionInfo): HostDataStat
       [session.id]: {
         session: structuredClone(session),
         attachStreamIds: existing?.attachStreamIds ?? [],
+        runtimeContinuity: runtimeContinuity
+          ?? changedRuntimeContinuity(existing, session)
+          ?? existing?.runtimeContinuity
+          ?? "initial",
       },
     },
   };
+}
+
+function snapshotRuntimeContinuity(
+  previous: ReducedSession | undefined,
+  session: SessionInfo,
+): RuntimeContinuity {
+  if (previous === undefined) {
+    return "initial";
+  }
+  return changedRuntimeContinuity(previous, session) ?? "reconnected";
+}
+
+function changedRuntimeContinuity(
+  previous: ReducedSession | undefined,
+  session: SessionInfo,
+): RuntimeContinuity | undefined {
+  const priorId = previous?.session.runtime?.runtime_id;
+  const nextId = session.runtime?.runtime_id;
+  if (priorId !== undefined && nextId !== undefined && priorId !== nextId) {
+    return "recovered";
+  }
+  return undefined;
 }
 
 function removeSession(state: HostDataState, sessionId: string): HostDataState {

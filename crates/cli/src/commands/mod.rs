@@ -17,6 +17,7 @@ pub(crate) mod health;
 pub(crate) mod host;
 pub(crate) mod host_fanout;
 pub(crate) mod integration;
+pub(crate) mod migration;
 pub(crate) mod notifications;
 pub(crate) mod project;
 pub(crate) mod prompt;
