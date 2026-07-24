@@ -17,7 +17,9 @@ iced = { workspace = true, default-features = false, features = [
     "tiny-skia",
     "crisp",
     "web-colors",
-    "thread-pool",
+    # The Linux theme subscription reaches zbus, which is configured for Tokio
+    # elsewhere in this workspace. Its executor must provide a Tokio reactor.
+    "tokio",
     "linux-theme-detection",
     "wayland",
 ] }
