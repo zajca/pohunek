@@ -753,6 +753,13 @@ impl SessionRegistry {
     }
 
     fn allocate_session_id(&self) -> Result<SessionId, ProtocolError> {
+        // `fetch_update` is renamed to `try_update` on nightly but the new name
+        // does not exist on our stable MSRV, so `#[expect]` would be unfulfilled
+        // on stable; `#[allow]` is the only override that is clean on both.
+        #[allow(
+            deprecated,
+            reason = "fetch_update -> try_update rename is nightly-only; try_update is not on stable MSRV"
+        )]
         let number = self
             .inner
             .next_id

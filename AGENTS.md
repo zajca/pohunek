@@ -68,6 +68,7 @@ considering work done; they mirror CI exactly:
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features   # must be clean under -D warnings
+cargo build -p pohunek-session-worker --bin pohunek-sessiond  # daemon tests spawn it by path
 cargo test --workspace --all-features
 cargo build --workspace --release                        # release profile must build
 cargo xtask docs check                                   # schema/drift/source-map/secrets/runbooks

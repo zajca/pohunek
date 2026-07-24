@@ -23,6 +23,7 @@ Run from the workspace root. `clippy` and `docs check` run under `-D warnings`
 ```bash
 cargo fmt --all --check
 RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --all-features
+cargo build -p pohunek-session-worker --bin pohunek-sessiond   # daemon socket tests spawn it by path
 cargo test --workspace --all-features
 cargo build --workspace --release
 RUSTFLAGS="-D warnings" cargo xtask docs check
