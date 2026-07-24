@@ -87,9 +87,11 @@ bun run test:e2e
 ```
 
 The real-daemon web suite is opt-in locally and mandatory in CI after building
-`pohunekd`:
+both `pohunekd` and `pohunek-sessiond` (the suite runs the daemon in subprocess
+worker mode, which spawns `pohunek-sessiond` from beside `pohunekd`):
 
 ```bash
+cargo build -p pohunek-daemon -p pohunek-session-worker
 POHUNEK_E2E=1 POHUNEK_DAEMON_BIN=/absolute/path/to/target/debug/pohunekd \
   bun test sdk/test/e2e.test.ts backend/test/real-daemon.e2e.test.ts
 ```

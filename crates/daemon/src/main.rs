@@ -27,7 +27,10 @@ use pohunek_daemon::lock::InstanceLock;
 use pohunek_daemon::notifications::{
     AttentionCoordinator, NotificationProjector, NotificationService, NOTIFICATIONS_SUBDIR,
 };
-use pohunek_daemon::runtime::{UnitTemplate, DEFAULT_WORKER_UNIT_TEMPLATE};
+use pohunek_daemon::runtime::{
+    SubprocessWorkerEnvironment, SubprocessWorkerLauncher, UnitTemplate, WorkerLauncher,
+    DEFAULT_WORKER_UNIT_TEMPLATE,
+};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use pohunek_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
 
@@ -46,6 +49,15 @@ const WORKERS_SUBDIR: &str = pohunek_paths::WORKERS_SUBDIR;
 const OBSERVE_EXTERNAL_AGENTS_ENV: &str = "POHUNEK_OBSERVE_EXTERNAL_AGENTS";
 /// Optional worker template override for isolated systemd integration tests.
 const WORKER_UNIT_TEMPLATE_ENV: &str = "POHUNEK_WORKER_UNIT_TEMPLATE";
+/// Selects how the daemon activates durable session workers: `systemd` (default)
+/// or `subprocess`. `subprocess` spawns `pohunek-sessiond` as a direct child, for
+/// headless environments (CI, containers) with no systemd user manager.
+const WORKER_LAUNCHER_ENV: &str = "POHUNEK_WORKER_LAUNCHER";
+/// Overrides the durable worker binary path used by the subprocess launcher.
+/// When unset, the daemon uses the `pohunek-sessiond` co-located next to itself.
+const WORKER_BIN_ENV: &str = "POHUNEK_WORKER_BIN";
+/// Durable worker binary name, expected next to the daemon executable.
+const WORKER_BINARY_NAME: &str = "pohunek-sessiond";
 
 /// Maximum time to let event-log drains flush on daemon shutdown.
 ///
@@ -119,7 +131,7 @@ async fn run() -> Result<(), DaemonError> {
         worker_unit_template: worker_unit_template()?,
         ..SessionRegistryConfig::default()
     };
-    let sessions = SessionRegistry::new_production(config).map_err(DaemonError::Reconcile)?;
+    let sessions = build_session_registry(config, &paths)?;
     let notifications =
         NotificationService::open(&paths.data_dir).map_err(|source| DaemonError::Directory {
             path: paths.data_dir.join(NOTIFICATIONS_SUBDIR),
@@ -250,6 +262,112 @@ fn worker_unit_template() -> Result<UnitTemplate, DaemonError> {
         value,
         expected: "an ASCII systemd template like pohunek-session@.service",
     })
+}
+
+/// Durable worker activation backend selected by [`WORKER_LAUNCHER_ENV`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerLauncherMode {
+    /// Native systemd user-manager units (production default).
+    Systemd,
+    /// Direct child `pohunek-sessiond` processes (headless / CI).
+    Subprocess,
+}
+
+/// Builds the session registry with the durable-worker launcher selected by
+/// [`WORKER_LAUNCHER_ENV`]: the systemd user manager by default, or a direct
+/// `pohunek-sessiond` child process for headless environments (CI, containers)
+/// that have no systemd user manager or session D-Bus.
+fn build_session_registry(
+    config: SessionRegistryConfig,
+    paths: &Paths,
+) -> Result<SessionRegistry, DaemonError> {
+    match worker_launcher_mode()? {
+        WorkerLauncherMode::Systemd => {
+            SessionRegistry::new_production(config).map_err(DaemonError::Reconcile)
+        }
+        WorkerLauncherMode::Subprocess => Ok(SessionRegistry::new_with_launcher_and_inspector(
+            config,
+            subprocess_worker_launcher(paths)?,
+            Arc::new(pohunek_daemon::procwatch::LinuxInspector::new()),
+        )),
+    }
+}
+
+fn worker_launcher_mode() -> Result<WorkerLauncherMode, DaemonError> {
+    let Some(value) = std::env::var_os(WORKER_LAUNCHER_ENV) else {
+        return Ok(WorkerLauncherMode::Systemd);
+    };
+    match value
+        .to_str()
+        .map(|raw| raw.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("" | "systemd") => Ok(WorkerLauncherMode::Systemd),
+        Some("subprocess") => Ok(WorkerLauncherMode::Subprocess),
+        Some(other) => Err(DaemonError::InvalidEnv {
+            var: WORKER_LAUNCHER_ENV.to_owned(),
+            value: other.to_owned(),
+            expected: "systemd or subprocess",
+        }),
+        None => Err(DaemonError::InvalidEnv {
+            var: WORKER_LAUNCHER_ENV.to_owned(),
+            value: "<non-utf8>".to_owned(),
+            expected: "systemd or subprocess",
+        }),
+    }
+}
+
+/// Builds a subprocess launcher rooted in the daemon's own XDG base directories,
+/// so a spawned worker resolves the exact runtime/state paths the daemon expects.
+fn subprocess_worker_launcher(paths: &Paths) -> Result<Arc<dyn WorkerLauncher>, DaemonError> {
+    let environment = SubprocessWorkerEnvironment {
+        runtime_home: xdg_base(&paths.runtime_dir)?,
+        state_home: xdg_base(&paths.state_dir)?,
+        data_home: xdg_base(&paths.data_dir)?,
+        config_home: paths.config_home.clone(),
+        cache_home: xdg_base(&paths.cache_dir)?,
+        daemon_socket: paths.socket.clone(),
+    };
+    Ok(Arc::new(SubprocessWorkerLauncher::new(
+        resolve_worker_binary()?,
+        environment,
+    )))
+}
+
+/// Resolves the durable worker binary: [`WORKER_BIN_ENV`] when set, otherwise the
+/// `pohunek-sessiond` co-located next to the running daemon executable.
+fn resolve_worker_binary() -> Result<std::path::PathBuf, DaemonError> {
+    if let Some(path) = std::env::var_os(WORKER_BIN_ENV) {
+        return Ok(std::path::PathBuf::from(path));
+    }
+    let exe = std::env::current_exe()?;
+    exe.parent()
+        .map(|dir| dir.join(WORKER_BINARY_NAME))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "daemon executable has no parent directory to locate the worker binary",
+            )
+            .into()
+        })
+}
+
+/// Recovers the XDG base directory that produced a `<base>/pohunek` daemon path,
+/// so the worker (which re-appends `pohunek/...`) lands on the same tree.
+fn xdg_base(app_scoped_dir: &std::path::Path) -> Result<std::path::PathBuf, DaemonError> {
+    app_scoped_dir
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "daemon path {} has no XDG base parent",
+                    app_scoped_dir.display()
+                ),
+            )
+            .into()
+        })
 }
 
 #[derive(Debug)]

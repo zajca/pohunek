@@ -263,14 +263,7 @@ async function startDaemon(): Promise<DaemonHarness> {
   await writeFile(join(dirs.bin, "netbird"), NETBIRD_FIXTURE_SCRIPT, { mode: 0o700 });
 
   const daemonBin = daemonBinaryPath();
-  const worker = await startDurableWorkerFixture({
-    daemonBin,
-    runtimeDir: dirs.runtime,
-    dataDir: dirs.data,
-    stateDir: dirs.state,
-    configDir: dirs.config,
-    sessionId: "s-1",
-  });
+  const worker = await startDurableWorkerFixture({ daemonBin });
   const stdoutChunks: string[] = [];
   const stderrChunks: string[] = [];
   let exitStatus: ExitStatus | undefined;
@@ -290,7 +283,7 @@ async function startDaemon(): Promise<DaemonHarness> {
       // shell agent still uses the explicit absolute path below.
       PATH: dirs.bin,
       SHELL: "/bin/sh",
-      POHUNEK_WORKER_UNIT_TEMPLATE: worker.unitTemplate,
+      ...worker.env,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -321,7 +314,6 @@ async function startDaemon(): Promise<DaemonHarness> {
     await waitForDaemonSocket(socketPath, () => exitStatus, () => spawnError, logs);
   } catch (error: unknown) {
     await stopChild(child, exitPromise, () => exitStatus).catch(() => undefined);
-    await worker.stop();
     await rm(tempRoot, { recursive: true, force: true });
     throw error;
   }
@@ -332,7 +324,6 @@ async function startDaemon(): Promise<DaemonHarness> {
     ...logs(),
     stop: async (): Promise<void> => {
       const status = await stopChild(child, exitPromise, () => exitStatus);
-      await worker.stop();
       await rm(tempRoot, { recursive: true, force: true });
       if (status.code !== 0 || status.signal !== null) {
         throw new Error(
