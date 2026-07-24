@@ -31,23 +31,15 @@ the launcher UI. The launcher ultimately depends on the same daemon, project,
 session, and action surfaces described in [sessions](../concepts/sessions.md)
 and [projects](../concepts/projects.md).
 
-`launcher.conf` includes attach banner keys. When `banner=true`, the attach
-client reserves the top terminal row for a status banner and Ctrl-\ opens the
-session menu. The menu owns kill confirmation (`k` then `y`), detach (`d`), new
-session in the same worktree (`n`), fork (`f`), and rename (`r`). The client
-composites the agent screen below the banner. Unlike the previous scroll-region
-overlay, the client now parses the agent byte stream into its own screen model
-and re-renders the terminal itself, so the banner works even under full-screen
-TUI agents such as Codex and Claude Code: their cursor modes, scroll margins,
-and repaint timing stay inside the parsed grid and never fight the banner.
-Because the client composites the whole screen while the banner is on, the
-terminal's native scrollback is unavailable during attach; mouse reporting still
-works because physical coordinates are translated to the agent grid below the
-banner. Leave `banner=false` (the default) to keep plain passthrough with native
-scrollback. `banner_interval_seconds` caps the refresh cadence: `0` uses the
-built-in ~60fps frame cadence, and a positive value throttles repaints to a
-coarser refresh. The rofi/sway switcher only opens marked attach terminals; it
-does not create a separate banner window.
+Attach uses raw terminal passthrough by default, preserving the terminal's
+native scrollback. Ctrl-\ temporarily freezes the visible agent screen and opens
+a session menu together with a one-row status banner. The menu owns kill
+confirmation (`k` then `y`), detach (`d`), new session in the same worktree
+(`n`), fork (`f`), and rename (`r`). Agent output received while the menu is
+open is buffered; closing the menu restores the frozen screen, replays that raw
+output, and resumes passthrough without losing terminal modes or scroll margins.
+The rofi/sway switcher only opens marked attach terminals; it does not create a
+separate banner window. There are no banner settings in `launcher.conf`.
 
 Attach terminals automatically retry after an unexpected daemon stream close.
 `attach_reconnect_seconds` controls the retry window, and

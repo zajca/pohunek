@@ -10,9 +10,7 @@ use std::os::fd::RawFd;
 use std::path::Path;
 use std::time::Duration;
 
-use pohunek_terminal::{
-    step, Compositor, InputTranslator, MenuEffect, MenuEvent, MenuKey, MenuOutcome, MenuState,
-};
+use pohunek_terminal::{step, Compositor, MenuEffect, MenuEvent, MenuKey, MenuOutcome, MenuState};
 use protocol::{
     event, method, ForkCwdMode, Request, SessionAttachParams, SessionAttachResult,
     SessionDetachParams, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
@@ -23,7 +21,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{self, Instant};
+use tokio::time;
 
 use crate::client::{attach_raw, Client, RawStream};
 use crate::commands::{request_id, request_with_params};
@@ -33,16 +31,12 @@ use crate::target::Target;
 
 const DETACH_BYTE: u8 = 0x1d;
 const IO_BUFFER_BYTES: usize = 8192;
-// Default frame-coalescing cadence for the attach compositor.
-//
-// Agent output arrives in bursts of PTY chunks; rendering after every chunk
-// wastes work, while too coarse a cadence makes the screen feel laggy. ~60 fps
-// is imperceptible latency yet collapses a burst into a single repaint. Used
-// when `banner_interval_seconds` is zero (the default); a positive config value
-// overrides it to a coarser refresh.
-const DEFAULT_FRAME_INTERVAL: Duration = Duration::from_millis(16);
-// Config default: zero means "use DEFAULT_FRAME_INTERVAL" for the compositor.
-const DEFAULT_BANNER_REPAINT_INTERVAL: Duration = Duration::ZERO;
+/// Maximum agent output retained while the attach menu is open.
+///
+/// Four MiB covers sustained repaint bursts while preventing an unattended
+/// modal from growing memory without bound. Reaching the cap closes the modal
+/// and resumes raw passthrough without dropping bytes.
+const MAX_MODAL_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 // Two rows are not enough for a banner plus a usable agent viewport.
 const MIN_ROWS_WITH_BANNER: u16 = 3;
 const BANNER_MENU_LABEL: &str = "[menu:Ctrl-\\]";
@@ -118,17 +112,13 @@ impl Default for AttachReconnectConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct AttachBannerConfig {
-    enabled: bool,
-    repaint_interval: Duration,
+struct AttachConfig {
     reconnect: AttachReconnectConfig,
 }
 
-impl AttachBannerConfig {
-    fn disabled() -> Self {
+impl AttachConfig {
+    fn defaults() -> Self {
         Self {
-            enabled: false,
-            repaint_interval: DEFAULT_BANNER_REPAINT_INTERVAL,
             reconnect: AttachReconnectConfig::default(),
         }
     }
@@ -136,11 +126,11 @@ impl AttachBannerConfig {
     fn load_from_config_dir(config_dir: &Path) -> Result<Self, CliError> {
         let path = config_dir.join("launcher.conf");
         if !path.try_exists()? {
-            return Ok(Self::disabled());
+            return Ok(Self::defaults());
         }
 
         let contents = std::fs::read_to_string(&path)?;
-        let mut config = Self::disabled();
+        let mut config = Self::defaults();
         for (number, raw) in contents.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -154,15 +144,6 @@ impl AttachBannerConfig {
                 )));
             };
             match key.trim() {
-                "banner" => config.enabled = parse_bool(value.trim(), &path, number + 1)?,
-                "banner_interval_seconds" => {
-                    config.repaint_interval = parse_nonnegative_duration_seconds(
-                        "banner_interval_seconds",
-                        value.trim(),
-                        &path,
-                        number + 1,
-                    )?;
-                }
                 "attach_reconnect_seconds" => {
                     config.reconnect.window = parse_nonnegative_duration_seconds(
                         "attach_reconnect_seconds",
@@ -195,7 +176,7 @@ impl AttachBannerConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct AttachBannerSnapshot {
+struct AttachStatusSnapshot {
     host: String,
     id: String,
     name: String,
@@ -205,28 +186,28 @@ struct AttachBannerSnapshot {
     activity: String,
 }
 
-/// Live attach-banner state driving the [`Compositor`].
+/// Transient attach-modal state driving the [`Compositor`].
 ///
-/// Holds the compositor that owns physical-terminal output, the latest session
-/// snapshot rendered into the banner text, the terminal width used to lay that
-/// text out, and the maximum repaint cadence.
+/// Agent bytes are forwarded directly while `active` is false. While the modal
+/// is active they are buffered until the frozen physical screen is restored.
 #[derive(Debug)]
-struct BannerState {
+struct ModalState {
     compositor: Compositor,
-    snapshot: AttachBannerSnapshot,
+    snapshot: AttachStatusSnapshot,
     cols: u16,
-    frame_interval: Duration,
+    pending_output: Vec<u8>,
+    active: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BannerInputAction {
+enum MenuShortcutAction {
     OpenMenu,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BannerInputMatch {
+struct MenuShortcutMatch {
     start: usize,
-    action: BannerInputAction,
+    action: MenuShortcutAction,
 }
 
 #[derive(Debug)]
@@ -296,23 +277,22 @@ struct MenuEffectContext<'a> {
     menu_task: &'a mut Option<MenuTask>,
     generation: u64,
     control: &'a AttachControlContext,
-    banner: Option<&'a BannerState>,
+    modal: Option<&'a ModalState>,
 }
 
 #[derive(Debug)]
-struct StdinInputContext<'a, W> {
+struct StdinInputContext<'a, W, O> {
     socket_write: &'a mut W,
+    stdout: &'a mut O,
     client: &'a mut Client,
     stream_id: &'a str,
     terminal: &'a mut Option<RawTerminal>,
-    banner: &'a mut Option<BannerState>,
-    frame_deadline: &'a mut Option<Instant>,
-    input_translator: &'a mut Option<InputTranslator>,
+    modal: &'a mut Option<ModalState>,
     menu: &'a mut MenuRuntime,
     control: &'a AttachControlContext,
 }
 
-impl AttachBannerSnapshot {
+impl AttachStatusSnapshot {
     fn unknown(host: &str, id: &str) -> Self {
         Self {
             host: host.to_owned(),
@@ -415,7 +395,7 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
     // attach, and the daemon-id pairing prevents a false positive against a
     // different daemon that reuses the same session-id string.
     let (origin_session_id, origin_daemon_id, origin_worker_id) = self_feedback_origin();
-    let banner_config = AttachBannerConfig::load(paths)?;
+    let attach_config = AttachConfig::load(paths)?;
 
     loop {
         let end = run_attach_once(
@@ -425,13 +405,12 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
             origin_session_id.clone(),
             origin_daemon_id.clone(),
             origin_worker_id.clone(),
-            banner_config.clone(),
         )
         .await?;
-        if end != AttachStreamEnd::StreamClosed || banner_config.reconnect.window.is_zero() {
+        if end != AttachStreamEnd::StreamClosed || attach_config.reconnect.window.is_zero() {
             return Ok(());
         }
-        if !wait_for_attach_reconnect(host, paths, target, &banner_config.reconnect).await? {
+        if !wait_for_attach_reconnect(host, paths, target, &attach_config.reconnect).await? {
             return Ok(());
         }
     }
@@ -444,7 +423,6 @@ async fn run_attach_once(
     origin_session_id: Option<SessionId>,
     origin_daemon_id: Option<String>,
     origin_worker_id: Option<String>,
-    banner_config: AttachBannerConfig,
 ) -> Result<AttachStreamEnd, CliError> {
     let attach_request = build_attach_request(
         target,
@@ -469,7 +447,6 @@ async fn run_attach_once(
                 host,
                 paths,
                 target,
-                banner_config,
             ))
             .await
         }
@@ -481,7 +458,6 @@ async fn run_attach_once(
                 host,
                 paths,
                 target,
-                banner_config,
             ))
             .await
         }
@@ -509,40 +485,36 @@ async fn attach_over_stream<S>(
     host: &str,
     paths: &Paths,
     target: &Target,
-    banner_config: AttachBannerConfig,
 ) -> Result<AttachStreamEnd, CliError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let terminal_size = terminal_size(libc::STDOUT_FILENO);
-    let banner_terminal_size = banner_terminal_size(&banner_config, terminal_size);
-    let banner_enabled = banner_terminal_size.is_some();
-
-    if let Some((cols, rows)) =
-        terminal_size.and_then(|size| effective_attach_size(size, banner_enabled))
-    {
+    if let Some((cols, rows)) = terminal_size {
         if let Ok(request) = build_resize_request(target, cols, rows) {
             let _ = client.request(&request).await;
         }
     }
 
-    let (banner, banner_updates) = if let Some((cols, rows)) = banner_terminal_size {
+    let (modal, status_updates) = if let Some((cols, rows)) =
+        terminal_size.filter(|&(_, rows)| rows >= MIN_ROWS_WITH_BANNER)
+    {
         let snapshot = load_initial_banner_snapshot(&mut client, host, &target.session_id).await;
-        // Best-effort live snapshot updates: the banner reflects state/activity
-        // changes while the subscription holds. If the update client cannot
-        // connect or its stream drops, the banner keeps showing the last known
-        // snapshot rather than tearing down the attach.
+        // Best-effort live status updates keep the transient modal current. A
+        // dropped subscription leaves the last snapshot available without
+        // interrupting raw terminal passthrough.
         let updates = spawn_banner_updates(
             host.to_owned(),
             paths.clone(),
             target.session_id.clone(),
             snapshot.clone(),
         );
-        let state = BannerState {
+        let state = ModalState {
             compositor: Compositor::new(cols, rows),
             snapshot,
             cols,
-            frame_interval: effective_frame_interval(banner_config.repaint_interval),
+            pending_output: Vec::new(),
+            active: false,
         };
         (Some(state), Some(updates))
     } else {
@@ -558,44 +530,18 @@ where
             paths: paths.clone(),
             target: target.clone(),
         },
-        banner,
-        banner_updates,
+        modal,
+        status_updates,
     )
     .await
-}
-
-/// Terminal size to render the banner at, or `None` when it should be skipped.
-///
-/// The banner needs an enabled config and a terminal tall enough to keep a
-/// usable agent viewport below the reserved row.
-fn banner_terminal_size(
-    config: &AttachBannerConfig,
-    terminal_size: Option<(u16, u16)>,
-) -> Option<(u16, u16)> {
-    if !config.enabled {
-        return None;
-    }
-    terminal_size.filter(|&(_, rows)| rows >= MIN_ROWS_WITH_BANNER)
-}
-
-/// Resolves the compositor frame cadence from the configured repaint interval.
-///
-/// Zero (the default) selects [`DEFAULT_FRAME_INTERVAL`]; a positive value
-/// throttles repaints to a coarser refresh.
-fn effective_frame_interval(configured: Duration) -> Duration {
-    if configured.is_zero() {
-        DEFAULT_FRAME_INTERVAL
-    } else {
-        configured
-    }
 }
 
 async fn load_initial_banner_snapshot(
     client: &mut Client,
     host: &str,
     session_id: &str,
-) -> AttachBannerSnapshot {
-    let mut snapshot = AttachBannerSnapshot::unknown(&banner_host_label(host), session_id);
+) -> AttachStatusSnapshot {
+    let mut snapshot = AttachStatusSnapshot::unknown(&banner_host_label(host), session_id);
     let Ok(request) =
         request_with_params(method::SESSION_INSPECT, &SessionId(session_id.to_owned()))
     else {
@@ -734,18 +680,7 @@ fn build_menu_fork_request(target: &Target, cols: u16, rows: u16) -> Result<Requ
     )
 }
 
-fn effective_attach_size((cols, rows): (u16, u16), banner_enabled: bool) -> Option<(u16, u16)> {
-    if !banner_enabled {
-        return Some((cols, rows));
-    }
-    if rows < MIN_ROWS_WITH_BANNER {
-        None
-    } else {
-        Some((cols, rows - 1))
-    }
-}
-
-fn render_banner_text(cols: u16, snapshot: &AttachBannerSnapshot) -> String {
+fn render_banner_text(cols: u16, snapshot: &AttachStatusSnapshot) -> String {
     let max_cols = usize::from(cols);
     let mut text = truncate_banner_text(BANNER_MENU_LABEL, cols);
     let priority_segments = [
@@ -804,57 +739,6 @@ fn truncate_banner_text(text: &str, cols: u16) -> String {
     text.chars().take(usize::from(cols)).collect()
 }
 
-fn translate_banner_input(
-    input: &[u8],
-    compositor: &Compositor,
-    translator: &mut InputTranslator,
-) -> Vec<u8> {
-    translator.set_mouse_protocol(
-        compositor.mouse_protocol_mode(),
-        compositor.mouse_protocol_encoding(),
-    );
-    translator.push(input)
-}
-
-async fn write_banner_input<W>(
-    writer: &mut W,
-    input: &[u8],
-    compositor: &Compositor,
-    translator: &mut InputTranslator,
-) -> Result<(), CliError>
-where
-    W: AsyncWrite + Unpin,
-{
-    let translated = translate_banner_input(input, compositor, translator);
-    writer.write_all(&translated).await?;
-    Ok(())
-}
-
-async fn write_stdin_input<W>(
-    writer: &mut W,
-    input: &[u8],
-    banner: Option<&BannerState>,
-    input_translator: &mut Option<InputTranslator>,
-) -> Result<(), CliError>
-where
-    W: AsyncWrite + Unpin,
-{
-    if let Some(banner) = banner {
-        write_banner_input(
-            writer,
-            input,
-            &banner.compositor,
-            input_translator
-                .as_mut()
-                .expect("banner attach constructs an input translator"),
-        )
-        .await
-    } else {
-        writer.write_all(input).await?;
-        Ok(())
-    }
-}
-
 fn banner_host_label(host: &str) -> String {
     if host.is_empty() {
         "local".to_owned()
@@ -867,8 +751,8 @@ fn spawn_banner_updates(
     host: String,
     paths: Paths,
     session_id: String,
-    initial: AttachBannerSnapshot,
-) -> mpsc::UnboundedReceiver<AttachBannerSnapshot> {
+    initial: AttachStatusSnapshot,
+) -> mpsc::UnboundedReceiver<AttachStatusSnapshot> {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut snapshot = initial;
@@ -907,30 +791,45 @@ fn spawn_banner_updates(
     rx
 }
 
-/// Renders one compositor frame from the current snapshot to `writer`.
-async fn paint_banner<W>(writer: &mut W, banner: &mut BannerState) -> Result<(), CliError>
+/// Renders the active modal and its status banner.
+async fn paint_modal<W>(writer: &mut W, modal: &mut ModalState) -> Result<(), CliError>
 where
     W: AsyncWrite + Unpin,
 {
-    let text = render_banner_text(banner.cols, &banner.snapshot);
-    let frame = banner.compositor.render(&text);
+    if !modal.active {
+        return Ok(());
+    }
+    let text = render_banner_text(modal.cols, &modal.snapshot);
+    let frame = modal.compositor.render(&text);
     writer.write_all(&frame).await?;
     writer.flush().await?;
     Ok(())
 }
 
-/// Restores the physical terminal on teardown when a banner is active.
-async fn teardown_banner<W>(
-    writer: &mut W,
-    banner: Option<&mut BannerState>,
-) -> Result<(), CliError>
+/// Restores passthrough and replays output received while the modal was open.
+async fn close_modal<W>(writer: &mut W, modal: Option<&mut ModalState>) -> Result<(), CliError>
 where
     W: AsyncWrite + Unpin,
 {
-    if let Some(banner) = banner {
-        let frame = banner.compositor.reset();
-        writer.write_all(&frame).await?;
-        writer.flush().await?;
+    let Some(modal) = modal.filter(|modal| modal.active) else {
+        return Ok(());
+    };
+    writer.write_all(&modal.compositor.restore()).await?;
+    writer.write_all(&modal.pending_output).await?;
+    writer.flush().await?;
+    modal.pending_output.clear();
+    modal.active = false;
+    Ok(())
+}
+
+/// Opens the modal and paints its frozen background immediately.
+async fn open_modal<W>(writer: &mut W, modal: Option<&mut ModalState>) -> Result<(), CliError>
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Some(modal) = modal {
+        modal.active = true;
+        paint_modal(writer, modal).await?;
     }
     Ok(())
 }
@@ -940,22 +839,11 @@ where
 /// Kept as a named future so the `select!` arm stays a single line and the loop
 /// body fits its line budget.
 async fn recv_banner_update(
-    updates: &mut Option<mpsc::UnboundedReceiver<AttachBannerSnapshot>>,
-) -> Option<AttachBannerSnapshot> {
+    updates: &mut Option<mpsc::UnboundedReceiver<AttachStatusSnapshot>>,
+) -> Option<AttachStatusSnapshot> {
     match updates.as_mut() {
         Some(updates) => updates.recv().await,
         None => None,
-    }
-}
-
-/// Waits until the pending frame deadline, or forever when none is scheduled.
-///
-/// Lets the select loop coalesce a burst of agent output into a single repaint:
-/// the first byte arms a deadline, and this branch fires once it elapses.
-async fn wait_for_frame_deadline(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => time::sleep_until(deadline).await,
-        None => std::future::pending().await,
     }
 }
 
@@ -1112,21 +1000,25 @@ fn handle_menu_input_chunk_with_decoder(
     MenuInputOutcome { effects, changed }
 }
 
-fn arm_frame_deadline(banner: &BannerState, frame_deadline: &mut Option<Instant>) {
-    if frame_deadline.is_none() {
-        *frame_deadline = Some(Instant::now() + banner.frame_interval);
-    }
-}
-
-fn sync_menu_overlay(
+async fn sync_menu_view<W>(
     menu_state: &MenuState,
-    banner: &mut Option<BannerState>,
-    frame_deadline: &mut Option<Instant>,
-) {
-    if let Some(banner) = banner.as_mut() {
-        banner.compositor.set_overlay(menu_state.to_overlay_frame());
-        arm_frame_deadline(banner, frame_deadline);
+    modal: &mut Option<ModalState>,
+    stdout: &mut W,
+) -> Result<(), CliError>
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Some(modal) = modal.as_mut() {
+        modal.compositor.set_overlay(menu_state.to_overlay_frame());
+        if *menu_state == MenuState::Closed {
+            close_modal(stdout, Some(modal)).await?;
+        } else if modal.active {
+            paint_modal(stdout, modal).await?;
+        } else {
+            open_modal(stdout, Some(modal)).await?;
+        }
     }
+    Ok(())
 }
 
 fn next_menu_generation(generation: u64) -> u64 {
@@ -1136,8 +1028,8 @@ fn next_menu_generation(generation: u64) -> u64 {
 async fn handle_socket_output<W>(
     input: &[u8],
     stdout: &mut W,
-    banner: &mut Option<BannerState>,
-    frame_deadline: &mut Option<Instant>,
+    modal: &mut Option<ModalState>,
+    menu: &mut MenuRuntime,
 ) -> Result<Option<AttachStreamEnd>, CliError>
 where
     W: AsyncWrite + Unpin,
@@ -1145,10 +1037,22 @@ where
     if input.is_empty() {
         return Ok(Some(AttachStreamEnd::StreamClosed));
     }
-    if let Some(banner) = banner.as_mut() {
-        banner.compositor.feed(input);
-        if frame_deadline.is_none() {
-            *frame_deadline = Some(Instant::now() + banner.frame_interval);
+    if let Some(modal) = modal.as_mut() {
+        modal.compositor.feed(input);
+        if modal.active {
+            if modal.pending_output.len().saturating_add(input.len()) > MAX_MODAL_BUFFER_BYTES {
+                close_modal(stdout, Some(modal)).await?;
+                if let Some(state) = menu.state.as_mut() {
+                    *state = MenuState::Closed;
+                }
+                stdout.write_all(input).await?;
+                stdout.flush().await?;
+            } else {
+                modal.pending_output.extend_from_slice(input);
+            }
+        } else {
+            stdout.write_all(input).await?;
+            stdout.flush().await?;
         }
     } else {
         stdout.write_all(input).await?;
@@ -1157,33 +1061,20 @@ where
     Ok(None)
 }
 
-fn handle_banner_update(
-    update: Option<AttachBannerSnapshot>,
-    banner: &mut Option<BannerState>,
-    banner_updates: &mut Option<mpsc::UnboundedReceiver<AttachBannerSnapshot>>,
-    frame_deadline: &mut Option<Instant>,
-) {
+fn handle_status_update(
+    update: Option<AttachStatusSnapshot>,
+    modal: &mut Option<ModalState>,
+    status_updates: &mut Option<mpsc::UnboundedReceiver<AttachStatusSnapshot>>,
+) -> bool {
     if let Some(snapshot) = update {
-        if let Some(banner) = banner.as_mut() {
-            banner.snapshot = snapshot;
-            if frame_deadline.is_none() {
-                *frame_deadline = Some(Instant::now() + banner.frame_interval);
-            }
+        if let Some(modal) = modal.as_mut() {
+            modal.snapshot = snapshot;
+            return modal.active;
         }
     } else {
-        *banner_updates = None;
+        *status_updates = None;
     }
-}
-
-fn parse_bool(value: &str, path: &Path, number: usize) -> Result<bool, CliError> {
-    match value {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        other => Err(config_error(format!(
-            "{}:{number}: invalid boolean value {other:?}; expected true or false",
-            path.display()
-        ))),
-    }
+    false
 }
 
 fn parse_positive_duration_seconds(
@@ -1235,37 +1126,43 @@ fn config_error(message: String) -> CliError {
     ))
 }
 
-/// Applies a window-size change to the compositor and the daemon PTY.
+/// Applies a window-size change to the shadow grid and daemon PTY.
 ///
-/// Reads the current terminal size, resizes the banner compositor (which forces
-/// a full repaint), and sends the daemon the effective agent-grid size. Returns
-/// whether a banner is active, so the caller can schedule an immediate repaint.
-async fn apply_terminal_resize(
+/// An open modal is closed first because its background uses the old geometry.
+async fn apply_terminal_resize<W>(
     client: &mut Client,
     target: &Target,
-    banner: &mut Option<BannerState>,
-) -> bool {
+    modal: &mut Option<ModalState>,
+    menu: &mut MenuRuntime,
+    stdout: &mut W,
+) -> Result<(), CliError>
+where
+    W: AsyncWrite + Unpin,
+{
     let Some((cols, rows)) = terminal_size(libc::STDOUT_FILENO) else {
-        return false;
+        return Ok(());
     };
-    if let Some(banner) = banner.as_mut() {
-        banner.cols = cols;
-        banner.compositor.resize(cols, rows);
+    close_modal(stdout, modal.as_mut()).await?;
+    if let Some(state) = menu.state.as_mut() {
+        *state = MenuState::Closed;
     }
-    let effective_size =
-        effective_attach_size((cols, rows), banner.is_some()).unwrap_or((cols, rows));
-    if let Ok(request) = build_resize_request(target, effective_size.0, effective_size.1) {
+    if let Some(modal) = modal.as_mut() {
+        modal.cols = cols;
+        modal.compositor.resize(cols, rows);
+    }
+    if let Ok(request) = build_resize_request(target, cols, rows) {
         let _ = client.request(&request).await;
     }
-    banner.is_some()
+    Ok(())
 }
 
-async fn handle_stdin_input<W>(
+async fn handle_stdin_input<W, O>(
     input: &[u8],
-    ctx: StdinInputContext<'_, W>,
+    ctx: StdinInputContext<'_, W, O>,
 ) -> Result<Option<AttachStreamEnd>, CliError>
 where
     W: AsyncWrite + Unpin,
+    O: AsyncWrite + Unpin,
 {
     if let Some(end) = handle_detach_input(
         input,
@@ -1287,7 +1184,7 @@ where
     {
         let outcome = handle_menu_input_chunk_with_decoder(state, &mut ctx.menu.decoder, input);
         if outcome.changed {
-            sync_menu_overlay(state, ctx.banner, ctx.frame_deadline);
+            sync_menu_view(state, ctx.modal, ctx.stdout).await?;
         }
         return handle_menu_effects(
             outcome.effects,
@@ -1298,34 +1195,27 @@ where
                 menu_task: &mut ctx.menu.task,
                 generation: ctx.menu.generation,
                 control: ctx.control,
-                banner: ctx.banner.as_ref(),
+                modal: ctx.modal.as_ref(),
             },
         )
         .await;
     }
 
-    if let Some(action) =
-        handle_banner_input_action(input, ctx.socket_write, ctx.banner.is_some()).await?
+    if let Some(action) = handle_menu_shortcut(input, ctx.socket_write, ctx.modal.is_some()).await?
     {
         match action {
-            BannerInputAction::OpenMenu => {
+            MenuShortcutAction::OpenMenu => {
                 ctx.menu.generation = next_menu_generation(ctx.menu.generation);
                 if let Some(state) = ctx.menu.state.as_mut() {
                     *state = MenuState::open_root();
-                    sync_menu_overlay(state, ctx.banner, ctx.frame_deadline);
+                    sync_menu_view(state, ctx.modal, ctx.stdout).await?;
                 }
             }
         }
         return Ok(None);
     }
 
-    write_stdin_input(
-        ctx.socket_write,
-        input,
-        ctx.banner.as_ref(),
-        ctx.input_translator,
-    )
-    .await?;
+    ctx.socket_write.write_all(input).await?;
     ctx.socket_write.flush().await?;
     Ok(None)
 }
@@ -1341,8 +1231,8 @@ async fn forward_attached_stream<S>(
     mut client: Client,
     stream_id: String,
     control: AttachControlContext,
-    mut banner: Option<BannerState>,
-    mut banner_updates: Option<mpsc::UnboundedReceiver<AttachBannerSnapshot>>,
+    mut modal: Option<ModalState>,
+    mut status_updates: Option<mpsc::UnboundedReceiver<AttachStatusSnapshot>>,
 ) -> Result<AttachStreamEnd, CliError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1354,15 +1244,9 @@ where
     let mut stdout = tokio::io::stdout();
     let mut stdin_buf = [0_u8; IO_BUFFER_BYTES];
     let mut socket_buf = [0_u8; IO_BUFFER_BYTES];
-    let mut input_translator = banner.as_ref().map(|_| InputTranslator::new());
-    let mut menu = MenuRuntime::new(banner.is_some());
-    let mut frame_deadline: Option<Instant> = None;
+    let mut menu = MenuRuntime::new(modal.is_some());
 
     let outcome: Result<AttachStreamEnd, CliError> = async {
-        if let Some(banner) = banner.as_mut() {
-            paint_banner(&mut stdout, banner).await?;
-        }
-
         loop {
             tokio::select! {
                 read = socket_read.read(&mut socket_buf) => {
@@ -1370,8 +1254,8 @@ where
                     if let Some(end) = handle_socket_output(
                         &socket_buf[..bytes_read],
                         &mut stdout,
-                        &mut banner,
-                        &mut frame_deadline,
+                        &mut modal,
+                        &mut menu,
                     )
                     .await?
                     {
@@ -1388,12 +1272,11 @@ where
                         &stdin_buf[..bytes_read],
                         StdinInputContext {
                             socket_write: &mut socket_write,
+                            stdout: &mut stdout,
                             client: &mut client,
                             stream_id: &stream_id,
                             terminal: &mut terminal,
-                            banner: &mut banner,
-                            frame_deadline: &mut frame_deadline,
-                            input_translator: &mut input_translator,
+                            modal: &mut modal,
                             menu: &mut menu,
                             control: &control,
                         },
@@ -1407,23 +1290,24 @@ where
                     if resized.is_none() {
                         continue;
                     }
-                    // Repaint at once so the resized grid and region are correct.
-                    if apply_terminal_resize(&mut client, &control.target, &mut banner).await {
-                        frame_deadline = Some(Instant::now());
-                    }
+                    apply_terminal_resize(
+                        &mut client,
+                        &control.target,
+                        &mut modal,
+                        &mut menu,
+                        &mut stdout,
+                    ).await?;
                 }
-                update = recv_banner_update(&mut banner_updates), if banner_updates.is_some() => {
-                    handle_banner_update(
+                update = recv_banner_update(&mut status_updates), if status_updates.is_some() => {
+                    if handle_status_update(
                         update,
-                        &mut banner,
-                        &mut banner_updates,
-                        &mut frame_deadline,
-                    );
-                }
-                () = wait_for_frame_deadline(frame_deadline), if frame_deadline.is_some() => {
-                    frame_deadline = None;
-                    if let Some(banner) = banner.as_mut() {
-                        paint_banner(&mut stdout, banner).await?;
+                        &mut modal,
+                        &mut status_updates,
+                    ) {
+                        paint_modal(
+                            &mut stdout,
+                            modal.as_mut().expect("active modal state exists"),
+                        ).await?;
                     }
                 }
                 task = wait_for_menu_task(&mut menu.task), if menu.task.is_some() => {
@@ -1432,10 +1316,10 @@ where
                         &control.target,
                         &mut menu.task,
                         &mut menu.state,
-                        &mut banner,
-                        &mut frame_deadline,
+                        &mut modal,
                         &mut terminal,
-                    ) {
+                        &mut stdout,
+                    ).await? {
                         return Ok(end);
                     }
                 }
@@ -1446,7 +1330,7 @@ where
 
     // Best-effort restore; do not mask the loop's real outcome with a teardown
     // write error.
-    let _ = teardown_banner(&mut stdout, banner.as_mut()).await;
+    let _ = close_modal(&mut stdout, modal.as_mut()).await;
     outcome
 }
 
@@ -1565,8 +1449,8 @@ async fn handle_menu_effects(
                 }
             }
             MenuEffect::RunNewSession => {
-                if let (None, Some(banner)) = (ctx.menu_task.as_ref(), ctx.banner) {
-                    let (rows, cols) = banner.compositor.grid_size();
+                if let (None, Some(modal)) = (ctx.menu_task.as_ref(), ctx.modal) {
+                    let (rows, cols) = modal.compositor.grid_size();
                     *ctx.menu_task = Some(spawn_menu_task(
                         ctx.generation,
                         MenuTaskAction::NewSession,
@@ -1576,8 +1460,8 @@ async fn handle_menu_effects(
                 }
             }
             MenuEffect::RunFork => {
-                if let (None, Some(banner)) = (ctx.menu_task.as_ref(), ctx.banner) {
-                    let (rows, cols) = banner.compositor.grid_size();
+                if let (None, Some(modal)) = (ctx.menu_task.as_ref(), ctx.modal) {
+                    let (rows, cols) = modal.compositor.grid_size();
                     *ctx.menu_task = Some(spawn_menu_task(
                         ctx.generation,
                         MenuTaskAction::Fork,
@@ -1602,29 +1486,34 @@ async fn handle_menu_effects(
     Ok(None)
 }
 
-fn handle_menu_task_result(
+async fn handle_menu_task_result<W>(
     result: Option<MenuTaskResult>,
     target: &Target,
     menu_task: &mut Option<MenuTask>,
     menu_state: &mut Option<MenuState>,
-    banner: &mut Option<BannerState>,
-    frame_deadline: &mut Option<Instant>,
+    modal: &mut Option<ModalState>,
     terminal: &mut Option<RawTerminal>,
-) -> Option<AttachStreamEnd> {
-    let result = result?;
+    stdout: &mut W,
+) -> Result<Option<AttachStreamEnd>, CliError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let Some(result) = result else {
+        return Ok(None);
+    };
     *menu_task = None;
     if result.action == MenuTaskAction::Kill && result.outcome.is_ok() {
         terminal.take();
-        return Some(AttachStreamEnd::SessionStopped);
+        return Ok(Some(AttachStreamEnd::SessionStopped));
     }
 
     let Some(state) = menu_state.as_mut() else {
         log_abandoned_menu_task_result(target, &result);
-        return None;
+        return Ok(None);
     };
     if *state == MenuState::Closed {
         log_abandoned_menu_task_result(target, &result);
-        return None;
+        return Ok(None);
     }
 
     let event = menu_event_from_task_outcome(result.outcome);
@@ -1632,13 +1521,13 @@ fn handle_menu_task_result(
     let (next, effects) = step(before.clone(), event);
     *state = next;
     if *state != before {
-        sync_menu_overlay(state, banner, frame_deadline);
+        sync_menu_view(state, modal, stdout).await?;
     }
     debug_assert!(
         effects.is_empty(),
         "RPC completion events must not request new menu effects"
     );
-    None
+    Ok(None)
 }
 
 fn menu_event_from_task_outcome(outcome: Result<MenuOutcome, String>) -> MenuEvent {
@@ -1813,19 +1702,19 @@ where
     Ok(Some(AttachStreamEnd::Detached))
 }
 
-async fn handle_banner_input_action<W>(
+async fn handle_menu_shortcut<W>(
     input: &[u8],
     socket_write: &mut W,
-    banner_active: bool,
-) -> Result<Option<BannerInputAction>, CliError>
+    menu_available: bool,
+) -> Result<Option<MenuShortcutAction>, CliError>
 where
     W: AsyncWrite + Unpin,
 {
-    // The menu shortcut only exists while the banner is shown.
-    if !banner_active {
+    // Non-interactive or extremely short terminals cannot render the modal.
+    if !menu_available {
         return Ok(None);
     }
-    let Some(input_match) = find_banner_input_action(input) else {
+    let Some(input_match) = find_menu_shortcut(input) else {
         return Ok(None);
     };
 
@@ -1846,16 +1735,16 @@ fn build_stop_request(target: &Target) -> Result<Request, CliError> {
     request_with_params(method::SESSION_STOP, &SessionId(target.session_id.clone()))
 }
 
-fn parse_banner_input_action(input: &[u8]) -> Option<BannerInputAction> {
+fn parse_menu_shortcut(input: &[u8]) -> Option<MenuShortcutAction> {
     input
         .contains(&BANNER_MENU_BYTE)
-        .then_some(BannerInputAction::OpenMenu)
+        .then_some(MenuShortcutAction::OpenMenu)
 }
 
-fn find_banner_input_action(input: &[u8]) -> Option<BannerInputMatch> {
+fn find_menu_shortcut(input: &[u8]) -> Option<MenuShortcutMatch> {
     let start = input.iter().position(|byte| *byte == BANNER_MENU_BYTE)?;
-    let action = parse_banner_input_action(&input[start..=start])?;
-    Some(BannerInputMatch { start, action })
+    let action = parse_menu_shortcut(&input[start..=start])?;
+    Some(MenuShortcutMatch { start, action })
 }
 
 #[derive(Debug)]
@@ -2123,7 +2012,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_banner_config_reads_launcher_conf_from_override_dir() {
+    fn attach_config_reads_reconnect_values() {
         let root = std::env::temp_dir().join(format!(
             "pohunek-attach-banner-config-{}",
             std::process::id()
@@ -2132,89 +2021,17 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create config dir");
         std::fs::write(
             root.join("launcher.conf"),
-            "banner=true\n\
-             banner_interval_seconds=0.25\n\
-             attach_reconnect_seconds=12\n\
+            "attach_reconnect_seconds=12\n\
              attach_reconnect_interval_seconds=0.75\n",
         )
         .expect("write config");
 
-        let config = AttachBannerConfig::load_from_config_dir(&root).expect("load config");
+        let config = AttachConfig::load_from_config_dir(&root).expect("load config");
 
-        assert!(config.enabled, "banner=true should request attach banner");
-        assert_eq!(
-            config.repaint_interval,
-            std::time::Duration::from_millis(250)
-        );
         assert_eq!(config.reconnect.window, std::time::Duration::from_secs(12));
         assert_eq!(
             config.reconnect.interval,
             std::time::Duration::from_millis(750)
-        );
-    }
-
-    #[test]
-    fn attach_banner_config_disables_idle_repaint_by_default() {
-        let root = std::env::temp_dir().join(format!(
-            "pohunek-attach-banner-default-repaint-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create config dir");
-        std::fs::write(root.join("launcher.conf"), "banner=true\n").expect("write config");
-
-        let config = AttachBannerConfig::load_from_config_dir(&root).expect("load config");
-
-        assert!(config.enabled, "banner=true should request attach banner");
-        assert_eq!(
-            config.repaint_interval,
-            std::time::Duration::ZERO,
-            "banner should draw initially without automatic repainting by default"
-        );
-    }
-
-    #[test]
-    fn banner_terminal_size_requires_enabled_config_and_room_for_a_viewport() {
-        let enabled = AttachBannerConfig {
-            enabled: true,
-            repaint_interval: std::time::Duration::ZERO,
-            reconnect: AttachReconnectConfig::default(),
-        };
-        let disabled = AttachBannerConfig::disabled();
-
-        assert_eq!(
-            banner_terminal_size(&enabled, Some((120, 40))),
-            Some((120, 40)),
-            "an enabled banner uses the full terminal size"
-        );
-        assert_eq!(
-            banner_terminal_size(&enabled, Some((120, 2))),
-            None,
-            "a terminal too short for a usable viewport skips the banner"
-        );
-        assert_eq!(
-            banner_terminal_size(&enabled, None),
-            None,
-            "a missing terminal size skips the banner"
-        );
-        assert_eq!(
-            banner_terminal_size(&disabled, Some((120, 40))),
-            None,
-            "a disabled config never shows the banner"
-        );
-    }
-
-    #[test]
-    fn effective_frame_interval_defaults_zero_to_the_frame_cadence() {
-        assert_eq!(
-            effective_frame_interval(std::time::Duration::ZERO),
-            DEFAULT_FRAME_INTERVAL,
-            "zero selects the built-in frame cadence"
-        );
-        assert_eq!(
-            effective_frame_interval(std::time::Duration::from_millis(200)),
-            std::time::Duration::from_millis(200),
-            "a positive value throttles repaints to a coarser refresh"
         );
     }
 
@@ -2246,15 +2063,8 @@ mod tests {
     }
 
     #[test]
-    fn attach_banner_reserves_one_terminal_row_for_daemon_resize() {
-        assert_eq!(effective_attach_size((120, 40), true), Some((120, 39)));
-        assert_eq!(effective_attach_size((120, 40), false), Some((120, 40)));
-        assert_eq!(effective_attach_size((120, 2), true), None);
-    }
-
-    #[test]
     fn attach_banner_text_prioritizes_live_state_and_menu_shortcut() {
-        let mut snapshot = AttachBannerSnapshot::unknown("local", "s-42");
+        let mut snapshot = AttachStatusSnapshot::unknown("local", "s-42");
         snapshot.update_from_session_value(&json!({
             "id": "s-42",
             "name": "review branch",
@@ -2276,7 +2086,7 @@ mod tests {
 
     #[test]
     fn attach_banner_narrow_width_keeps_live_state_visible() {
-        let mut snapshot = AttachBannerSnapshot::unknown("local", "s-37");
+        let mut snapshot = AttachStatusSnapshot::unknown("local", "s-37");
         snapshot.update_from_session_value(&json!({
             "id": "s-37",
             "name": "debug s31",
@@ -2298,28 +2108,28 @@ mod tests {
     }
 
     #[test]
-    fn attach_banner_menu_shortcut_is_parsed_from_input() {
+    fn attach_menu_shortcut_is_parsed_from_input() {
         assert_eq!(
-            parse_banner_input_action(&[BANNER_MENU_BYTE]),
-            Some(BannerInputAction::OpenMenu),
+            parse_menu_shortcut(&[BANNER_MENU_BYTE]),
+            Some(MenuShortcutAction::OpenMenu),
             "the Ctrl-\\ byte must map to the open-menu action"
         );
     }
 
     #[test]
-    fn attach_banner_menu_trigger_splits_prefix_and_drops_suffix() {
+    fn attach_menu_trigger_splits_prefix_and_drops_suffix() {
         let input = b"echo prefix\x1ctail dropped";
-        let input_match = find_banner_input_action(input).expect("menu trigger");
+        let input_match = find_menu_shortcut(input).expect("menu trigger");
 
         assert_eq!(input_match.start, "echo prefix".len());
-        assert_eq!(input_match.action, BannerInputAction::OpenMenu);
+        assert_eq!(input_match.action, MenuShortcutAction::OpenMenu);
     }
 
     #[test]
-    fn attach_banner_non_menu_input_is_forwarded() {
+    fn attach_non_menu_input_is_forwarded() {
         let input = b"\x1b[<64;7;1M";
 
-        assert_eq!(parse_banner_input_action(input), None);
+        assert_eq!(parse_menu_shortcut(input), None);
     }
 
     #[test]
@@ -2375,9 +2185,9 @@ mod tests {
         let mut menu_state = Some(MenuState::Busy {
             label: "Starting session".to_owned(),
         });
-        let mut banner = None;
-        let mut frame_deadline = None;
+        let mut modal = None;
         let mut terminal = None;
+        let mut stdout = Vec::new();
         let target: Target = "host-a/s-42".parse().expect("target");
 
         let end = handle_menu_task_result(
@@ -2391,10 +2201,12 @@ mod tests {
             &target,
             &mut menu_task,
             &mut menu_state,
-            &mut banner,
-            &mut frame_deadline,
+            &mut modal,
             &mut terminal,
-        );
+            &mut stdout,
+        )
+        .await
+        .expect("handle task result");
 
         assert_eq!(end, None);
         assert_eq!(
@@ -2414,9 +2226,9 @@ mod tests {
         let generation = FIRST_MENU_GENERATION;
         let mut menu_task = Some(placeholder_menu_task(generation, MenuTaskAction::Kill));
         let mut menu_state = Some(MenuState::Closed);
-        let mut banner = None;
-        let mut frame_deadline = None;
+        let mut modal = None;
         let mut terminal = None;
+        let mut stdout = Vec::new();
         let target: Target = "host-a/s-42".parse().expect("target");
 
         let end = handle_menu_task_result(
@@ -2428,10 +2240,12 @@ mod tests {
             &target,
             &mut menu_task,
             &mut menu_state,
-            &mut banner,
-            &mut frame_deadline,
+            &mut modal,
             &mut terminal,
-        );
+            &mut stdout,
+        )
+        .await
+        .expect("handle task result");
 
         assert_eq!(end, None);
         assert_eq!(menu_state, Some(MenuState::Closed));
@@ -2446,9 +2260,9 @@ mod tests {
         let generation = FIRST_MENU_GENERATION;
         let mut menu_task = Some(placeholder_menu_task(generation, MenuTaskAction::Fork));
         let mut menu_state = Some(MenuState::open_root());
-        let mut banner = None;
-        let mut frame_deadline = None;
+        let mut modal = None;
         let mut terminal = None;
+        let mut stdout = Vec::new();
         let target: Target = "host-a/s-42".parse().expect("target");
 
         let end = handle_menu_task_result(
@@ -2462,10 +2276,12 @@ mod tests {
             &target,
             &mut menu_task,
             &mut menu_state,
-            &mut banner,
-            &mut frame_deadline,
+            &mut modal,
             &mut terminal,
-        );
+            &mut stdout,
+        )
+        .await
+        .expect("handle task result");
 
         assert_eq!(end, None);
         assert_eq!(
@@ -2547,25 +2363,93 @@ mod tests {
         );
     }
 
-    #[test]
-    fn attach_banner_mouse_input_is_translated_to_agent_grid() {
-        let mut compositor = Compositor::new(80, 24);
-        compositor.feed(b"\x1b[?1000h\x1b[?1006h");
-        let mut translator = InputTranslator::new();
+    #[tokio::test]
+    async fn attach_modal_buffers_and_replays_agent_output() {
+        let mut modal = Some(ModalState {
+            compositor: Compositor::new(80, 24),
+            snapshot: AttachStatusSnapshot::unknown("local", "s-42"),
+            cols: 80,
+            pending_output: Vec::new(),
+            active: false,
+        });
+        let mut stdout = Vec::new();
+        let mut menu = MenuRuntime::new(true);
 
-        assert_eq!(
-            translate_banner_input(b"\x1b[<64;7;2M", &compositor, &mut translator),
-            b"\x1b[<64;7;1M"
+        handle_socket_output(b"before", &mut stdout, &mut modal, &mut menu)
+            .await
+            .expect("forward passthrough output");
+        assert_eq!(stdout, b"before");
+
+        {
+            let state = modal.as_mut().expect("modal state");
+            state
+                .compositor
+                .set_overlay(MenuState::open_root().to_overlay_frame());
+            open_modal(&mut stdout, Some(state))
+                .await
+                .expect("open modal");
+        };
+        stdout.clear();
+
+        let during = b"\x1b[?1049h\x1b[2;20r\x1b[?1006hduring";
+        handle_socket_output(during, &mut stdout, &mut modal, &mut menu)
+            .await
+            .expect("buffer modal output");
+        assert!(
+            stdout.is_empty(),
+            "agent output must stay hidden during modal"
         );
-        assert_eq!(
-            translate_banner_input(b"\x1b[<64;7;1M", &compositor, &mut translator),
-            b""
+
+        let state = modal.as_mut().expect("modal state");
+        close_modal(&mut stdout, Some(state))
+            .await
+            .expect("close modal");
+        assert!(
+            stdout.ends_with(during),
+            "buffered screen, margin, and mouse modes must replay byte-for-byte"
         );
+        assert!(state.pending_output.is_empty());
+        assert!(!state.active);
+    }
+
+    #[tokio::test]
+    async fn attach_modal_buffer_cap_resumes_passthrough_without_dropping_input() {
+        let mut modal = Some(ModalState {
+            compositor: Compositor::new(80, 24),
+            snapshot: AttachStatusSnapshot::unknown("local", "s-42"),
+            cols: 80,
+            pending_output: Vec::new(),
+            active: false,
+        });
+        let mut stdout = Vec::new();
+        let mut menu = MenuRuntime::new(true);
+        *menu.state.as_mut().expect("menu state") = MenuState::open_root();
+        {
+            let state = modal.as_mut().expect("modal state");
+            state
+                .compositor
+                .set_overlay(MenuState::open_root().to_overlay_frame());
+            open_modal(&mut stdout, Some(state))
+                .await
+                .expect("open modal");
+            state.pending_output.resize(MAX_MODAL_BUFFER_BYTES, b'x');
+        };
+        stdout.clear();
+
+        handle_socket_output(b"latest", &mut stdout, &mut modal, &mut menu)
+            .await
+            .expect("resume passthrough at buffer cap");
+
+        assert!(stdout.ends_with(b"latest"));
+        assert_eq!(menu.state, Some(MenuState::Closed));
+        let state = modal.as_ref().expect("modal state");
+        assert!(!state.active);
+        assert!(state.pending_output.is_empty());
     }
 
     #[test]
     fn attach_banner_snapshot_updates_from_inspect_and_event_payloads() {
-        let mut snapshot = AttachBannerSnapshot::unknown("local", "s-42");
+        let mut snapshot = AttachStatusSnapshot::unknown("local", "s-42");
 
         snapshot.update_from_session_value(&json!({
             "id": "s-42",
@@ -2616,7 +2500,7 @@ mod tests {
 
     #[test]
     fn attach_banner_snapshot_falls_back_to_ids_for_missing_display_labels() {
-        let mut snapshot = AttachBannerSnapshot::unknown("local", "s-42");
+        let mut snapshot = AttachStatusSnapshot::unknown("local", "s-42");
 
         snapshot.update_from_session_value(&json!({
             "id": "s-42",

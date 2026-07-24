@@ -5,7 +5,7 @@
 
 use std::future::Future;
 #[cfg(unix)]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -569,10 +569,7 @@ async fn invalid_json_error_is_typed() {
 #[cfg(unix)]
 #[tokio::test]
 async fn command_runner_uses_fake_gh_script_for_provider_commands() {
-    let dir = std::env::temp_dir().join(format!(
-        "pohunek-gui-core-gh-provider-{}",
-        std::process::id()
-    ));
+    let dir = fake_gh_dir("gh-provider");
     let script = dir.join("gh");
     let repo = dir.join("repo");
     let seen_cwd = dir.join("seen-cwd");
@@ -637,10 +634,7 @@ esac
 #[cfg(unix)]
 #[tokio::test]
 async fn command_runner_fake_gh_error_path_is_typed() {
-    let dir = std::env::temp_dir().join(format!(
-        "pohunek-gui-core-gh-provider-error-{}",
-        std::process::id()
-    ));
+    let dir = fake_gh_dir("gh-provider-error");
     let script = dir.join("gh");
     write_fake_gh(
         &script,
@@ -683,18 +677,36 @@ async fn command_runner_missing_gh_is_typed() {
 
 #[cfg(unix)]
 fn write_fake_gh(path: &Path, body: &str) {
+    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
 
     std::fs::create_dir_all(path.parent().expect("fake gh path has parent"))
         .expect("create fake gh dir");
     let tmp_path = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&tmp_path, body).expect("write temporary fake gh script");
+    let mut file = std::fs::File::create(&tmp_path).expect("create temporary fake gh script");
+    file.write_all(body.as_bytes())
+        .expect("write temporary fake gh script");
+    file.sync_all().expect("sync temporary fake gh script");
+    drop(file);
     let mut permissions = std::fs::metadata(&tmp_path)
         .expect("fake gh metadata")
         .permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&tmp_path, permissions).expect("chmod fake gh script");
     std::fs::rename(&tmp_path, path).expect("install fake gh script");
+}
+
+/// Creates a unique temporary directory for one fake GitHub CLI fixture.
+#[cfg(unix)]
+fn fake_gh_dir(name: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the Unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "pohunek-gui-core-{name}-{}-{nanos}",
+        std::process::id()
+    ))
 }
 
 #[cfg(unix)]

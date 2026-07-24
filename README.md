@@ -124,10 +124,10 @@ where they are doing it, and when they need you.
 - `pohunek setup` installs rofi/sway launcher scripts, default config, prompt
   templates, and an optional sway keybinding drop-in — start or switch to any
   session in two keystrokes.
-- Optional **attach banner**: the attach client parses the agent's byte stream
-  into its own screen model and composites a one-row status banner that works
-  even under full-screen TUIs; `Ctrl-\` opens a session menu (kill, detach,
-  new session in the same worktree, fork, rename).
+- **Attach session menu**: raw terminal passthrough preserves native scrollback;
+  `Ctrl-\` temporarily shows a one-row status banner with a composited menu
+  (kill, detach, new session in the same worktree, fork, rename), then restores
+  the agent screen and raw passthrough when the menu closes.
 - Attach auto-reconnects after a daemon restart to the same worker, PTY, child
   PID, and runtime generation. A changed runtime generation is shown as
   explicit native recovery, not seamless continuation.
