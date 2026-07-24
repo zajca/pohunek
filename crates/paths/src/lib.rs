@@ -290,13 +290,18 @@ pub fn valid_runtime_id(id: &str) -> Option<&Path> {
 
 /// Validates a managed worker session ID.
 ///
-/// Worker units are instantiated only for the daemon-issued `s-<number>` ID
-/// space. Restricting the grammar keeps paths and systemd instance names
+/// Worker units are instantiated only for daemon-issued numeric or ULID session
+/// IDs. Restricting the grammar keeps paths and systemd instance names
 /// interchangeable without escaping.
 #[must_use]
 pub fn valid_worker_session_id(id: &str) -> Option<&str> {
     let suffix = id.strip_prefix("s-")?;
-    (!suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())).then_some(id)
+    let numeric = !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit());
+    let ulid = suffix.len() == 26 && suffix.bytes().all(|byte| {
+        byte.is_ascii_digit()
+            || matches!(byte, b'A'..=b'H' | b'J'..=b'K' | b'M' | b'N' | b'P'..=b'T' | b'V'..=b'Z')
+    });
+    (numeric || ulid).then_some(id)
 }
 
 /// Validates an opaque worker ID used as a filename.
@@ -489,8 +494,20 @@ mod tests {
                     .join("w-runtime_1.json")
             )
         );
+        assert!(paths
+            .worker_socket("s-01KYAPVPFVHD56Z69B9CX3XWN2")
+            .is_some());
 
-        for invalid in ["", "42", "s-", "s-a", "../s-1", "s-1/other"] {
+        for invalid in [
+            "",
+            "42",
+            "s-",
+            "s-a",
+            "s-01kyapvpfvhd56z69b9cx3xwn2",
+            "s-01KYAPVPFVHD56Z69B9CX3XWNI",
+            "../s-1",
+            "s-1/other",
+        ] {
             assert_eq!(paths.worker_socket(invalid), None);
         }
         for invalid in ["", "../worker", "worker/name", "worker.name"] {

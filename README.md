@@ -167,7 +167,7 @@ where they are doing it, and when they need you.
        | owner-private local worker protocol
        v
  +-----------------------------------------------------------+
- | pohunek-session@s-42.service (one worker per live session) |
+ | pohunek-session@s-01J00000000000000000000000.service (one worker per live session) |
  | PTY master | child process | output ring | terminal state  |
  +-----------------------------------------------------------+
        |
@@ -289,7 +289,7 @@ pohunek session new --host buildbox --project myapp --agent codex \
   --branch feat/parser --input "Fix the parser fuzz failures."
 
 pohunek session list --host buildbox
-pohunek attach buildbox/s-3                    # raw PTY over the mesh
+pohunek attach buildbox/s-01J00000000000000000000000 # raw PTY over the mesh
 
 pohunek notifications watch --all-hosts        # one triage stream for every machine
 ```

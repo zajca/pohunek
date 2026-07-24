@@ -122,13 +122,6 @@ impl SessionRegistry {
         *self.inner.runtime_inventory.lock().await = inventory;
 
         for record in records {
-            // Advance the allocator past every reconciled record, regardless of
-            // its runtime outcome. A lost or conflicting record with no live
-            // worker still occupies its session ID, so a freshly created session
-            // must not reuse it. `advance_session_sequence` is a monotonic
-            // `fetch_max`, so the per-record calls in `reconcile_record` remain
-            // safe and idempotent.
-            self.advance_session_sequence(&SessionId(record.session_id.clone()));
             let candidates = discovered.remove(&record.session_id).unwrap_or_default();
             match candidates.as_slice() {
                 [candidate] if candidate.slot == record.session_id => {
@@ -289,7 +282,6 @@ impl SessionRegistry {
         candidate: Option<(Worker, InspectSnapshot)>,
     ) {
         let id = SessionId(record.session_id.clone());
-        self.advance_session_sequence(&id);
         let Some((worker, snapshot)) = candidate else {
             self.insert_unavailable_record(record, RuntimeState::Lost, "worker_unavailable")
                 .await;
@@ -1750,7 +1742,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_registry_allocates_after_highest_persisted_session_id() {
+    async fn replacement_registry_allocates_a_new_ulid_session_id() {
         let root = temp_root();
         let store_path = root.join("data/metadata.jsonl");
         let mut record = identity_record();
@@ -1789,7 +1781,17 @@ mod tests {
             .await
             .expect("create after daemon replacement");
 
-        assert_eq!(created.id, SessionId("s-92".to_owned()));
+        assert_ne!(created.id, SessionId("s-91".to_owned()));
+        assert!(
+            created.id.0.starts_with("s-"),
+            "session id must retain its public prefix: {}",
+            created.id.0
+        );
+        assert!(
+            ulid::Ulid::from_string(&created.id.0[2..]).is_ok(),
+            "session id must have a valid ULID suffix: {}",
+            created.id.0
+        );
         replacement
             .stop(&created.id)
             .await

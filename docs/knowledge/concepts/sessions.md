@@ -34,6 +34,10 @@ Session targets are host-aware. A bare session id targets the local host; a
 the existing confirmation behavior: non-local starts require explicit approval,
 and JSON/non-interactive remote starts require `--yes`.
 
+Daemon-issued session IDs use the `s-<ULID>` form. They are time-sortable opaque
+identifiers, not sequence numbers; clients must preserve and display them
+verbatim rather than deriving ordering or lifecycle meaning from their values.
+
 A session can carry an optional owner-set display name. Set it at creation with
 `pohunek session new --name <NAME>`, and change or clear it later with
 `pohunek session rename <target> <NAME>` (or `--clear`). The name is cosmetic:

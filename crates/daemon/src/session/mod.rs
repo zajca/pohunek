@@ -24,6 +24,7 @@ use tokio::sync::{broadcast, mpsc, watch, Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+use ulid::Ulid;
 
 use crate::agent::{
     adapter_for, agent_fork_unsupported, agent_not_resumable, base_resume_template,
@@ -315,7 +316,6 @@ struct SessionRegistryInner {
     runtime_inventory: Mutex<Vec<RuntimeInventoryEntry>>,
     pending_attaches: Mutex<HashMap<String, PendingAttach>>,
     active_attaches: Mutex<HashMap<String, ActiveAttach>>,
-    next_id: AtomicU64,
     next_stream_id: AtomicU64,
     next_write_id: AtomicU64,
     next_resize_sequence: AtomicU64,
@@ -690,7 +690,6 @@ impl SessionRegistry {
                 runtime_inventory: Mutex::new(Vec::new()),
                 pending_attaches: Mutex::new(HashMap::new()),
                 active_attaches: Mutex::new(HashMap::new()),
-                next_id: AtomicU64::new(1),
                 next_stream_id: AtomicU64::new(1),
                 next_write_id: AtomicU64::new(1),
                 next_resize_sequence: AtomicU64::new(1),
@@ -752,39 +751,10 @@ impl SessionRegistry {
         &self.inner.daemon_instance_id
     }
 
-    fn allocate_session_id(&self) -> Result<SessionId, ProtocolError> {
-        // `fetch_update` is renamed to `try_update` on nightly but the new name
-        // does not exist on our stable MSRV, so `#[expect]` would be unfulfilled
-        // on stable; `#[allow]` is the only override that is clean on both.
-        #[allow(
-            deprecated,
-            reason = "fetch_update -> try_update rename is nightly-only; try_update is not on stable MSRV"
-        )]
-        let number = self
-            .inner
-            .next_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_exhausted_value| {
-                runtime_error(
-                    "session_id_exhausted",
-                    "the numeric session-id space is exhausted",
-                )
-            })?;
-        Ok(SessionId(format!("s-{number}")))
-    }
-
-    fn advance_session_sequence(&self, id: &SessionId) {
-        let Some(number) =
-            id.0.strip_prefix("s-")
-                .and_then(|value| value.parse::<u64>().ok())
-        else {
-            return;
-        };
-        self.inner
-            .next_id
-            .fetch_max(number.saturating_add(1), Ordering::Relaxed);
+    fn allocate_session_id() -> SessionId {
+        // A ULID keeps identifiers time-sortable while its 80 random bits avoid
+        // reusing a retained durable worker slot after metadata removal.
+        SessionId(format!("s-{}", Ulid::new()))
     }
 
     /// Mark that the daemon process is shutting down.
@@ -1073,7 +1043,7 @@ impl SessionRegistry {
             })?,
         };
 
-        let id = self.allocate_session_id()?;
+        let id = Self::allocate_session_id();
 
         let TargetResolution {
             launch_cwd,

@@ -224,6 +224,11 @@ mod tests {
     #[test]
     fn cli_requires_safe_managed_session_id() {
         Cli::parse(["--session-id".to_owned(), "s-42".to_owned()]).expect("valid session");
+        Cli::parse([
+            "--session-id".to_owned(),
+            "s-01KYAPVPFVHD56Z69B9CX3XWN2".to_owned(),
+        ])
+        .expect("valid ULID session");
         Cli::parse(["--session-id".to_owned(), "../bad".to_owned()])
             .expect_err("path-like session must fail");
     }

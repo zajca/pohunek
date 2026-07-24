@@ -213,7 +213,7 @@ impl SessionRegistry {
             return Err(agent_fork_unsupported(&binding.agent));
         }
 
-        let id = self.allocate_session_id()?;
+        let id = Self::allocate_session_id();
         let has_snapshot = !binding.program.is_empty();
         let program = if has_snapshot {
             binding.program.clone()
@@ -357,7 +357,6 @@ impl SessionRegistry {
         let session_ref = session_ref_from_binding(template, &binding)?;
 
         let id = SessionId(binding.session_id.clone());
-        self.bump_next_id_past(&id);
 
         // A legacy binding carries no snapshot program; fall back to the base kind's
         // default so it still relaunches. `program`/`input_rules` are frozen
@@ -494,12 +493,6 @@ impl SessionRegistry {
                 (None, None, None)
             }
         }
-    }
-
-    /// Advance the session-id counter past a restored `s-<N>` id so a freshly
-    /// created session never collides with a resumed one.
-    fn bump_next_id_past(&self, id: &SessionId) {
-        self.advance_session_sequence(id);
     }
 }
 

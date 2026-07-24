@@ -58,25 +58,19 @@ fn production_registry_rejects_missing_durable_worker_backend() {
     SessionRegistry::new_production(configured).expect("configured production registry");
 }
 
-#[tokio::test]
-async fn exhausted_session_id_sequence_fails_without_wrapping_to_zero() {
-    let registry = SessionRegistry::new(SessionRegistryConfig::default());
-    registry.inner.next_id.store(u64::MAX, Ordering::Relaxed);
+#[test]
+fn allocated_session_ids_are_prefixed_ulids() {
+    let first = SessionRegistry::allocate_session_id();
+    let second = SessionRegistry::allocate_session_id();
 
-    let error = registry
-        .create(params())
-        .await
-        .expect_err("exhausted session-id sequence");
-
-    assert_eq!(error.code, "session_id_exhausted");
-    assert_eq!(registry.inner.next_id.load(Ordering::Relaxed), u64::MAX);
-    assert!(
-        registry
-            .inspect(&SessionId("s-0".to_owned()))
-            .await
-            .is_err(),
-        "overflow must never allocate s-0"
+    assert_ne!(
+        first, second,
+        "separate allocations must not reuse a worker slot"
     );
+    for id in [first, second] {
+        let suffix = id.0.strip_prefix("s-").expect("session id prefix");
+        ulid::Ulid::from_string(suffix).expect("valid session ULID");
+    }
 }
 
 fn metadata(entries: &[(&str, &str)]) -> BTreeMap<String, String> {

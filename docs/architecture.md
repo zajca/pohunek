@@ -83,7 +83,7 @@ Key consequences of that scope, decided explicitly:
        | private owner-only Unix protocol
        v
  +-----------------------------------------------------------+
- | pohunek-session@s-42.service (one worker per live session) |
+ | pohunek-session@s-01J00000000000000000000000.service (one worker per live session) |
  | PTY master | child handle | output ring | terminal tracker |
  +-----------------------------------------------------------+
        |

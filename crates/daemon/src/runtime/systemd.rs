@@ -186,7 +186,18 @@ mod tests {
             unit_name(&template, "s-42").expect("valid unit"),
             "pohunek-session@s-42.service"
         );
-        for invalid in ["", "s-", "s-a", "../s-1", "external-1"] {
+        assert_eq!(
+            unit_name(&template, "s-01KYAPVPFVHD56Z69B9CX3XWN2").expect("valid ULID unit"),
+            "pohunek-session@s-01KYAPVPFVHD56Z69B9CX3XWN2.service"
+        );
+        for invalid in [
+            "",
+            "s-",
+            "s-a",
+            "s-01kyapvpfvhd56z69b9cx3xwn2",
+            "../s-1",
+            "external-1",
+        ] {
             assert!(matches!(
                 unit_name(&template, invalid),
                 Err(UnitsError::InvalidSession(value)) if value == invalid

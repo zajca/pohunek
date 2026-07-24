@@ -73,6 +73,8 @@ vt100 = "0.16.2"
 portable-pty = "0.9"
 zbus = { version = "5.16", default-features = false, features = ["tokio"] }
 pulldown-cmark = "0.12"
+# Session identifiers need durable, globally collision-resistant generation.
+ulid = "1"
 
 # Single source of truth for the released version. Every crate opts in via
 # `version.workspace = true`, so `scripts/release` only bumps it here.
