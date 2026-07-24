@@ -36,7 +36,7 @@ describe("web release installer", () => {
 
       const unit = await readFile(unitFile, "utf8");
       expect(unit).toContain(`ExecStart="${installDir}/pohunek-web"`);
-      expect(unit).toContain(`EnvironmentFile="${configFile}"`);
+      expect(unit).toContain(`EnvironmentFile=${configFile.replaceAll(" ", "\\x20")}`);
 
       await writeFile(configFile, "POHUNEK_BACKEND_BIND_HOST=100.64.0.1\n", { mode: 0o644 });
       await writeFile(join(installDir, "frontend", "stale.js"), "stale");

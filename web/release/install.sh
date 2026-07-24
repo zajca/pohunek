@@ -68,6 +68,13 @@ escape_systemd_value() {
     -e 's/\$/$$/g'
 }
 
+escape_systemd_file_path() {
+  sed \
+    -e 's/\\/\\\\/g' \
+    -e 's/ /\\x20/g' \
+    -e 's/%/%%/g'
+}
+
 escape_sed_replacement() {
   sed 's/[&|\\]/\\&/g'
 }
@@ -76,7 +83,7 @@ readonly_escaped_install_dir=$(
   printf '%s' "$readonly_install_dir" | escape_systemd_value | escape_sed_replacement
 )
 readonly_escaped_config_file=$(
-  printf '%s' "$readonly_config_file" | escape_systemd_value | escape_sed_replacement
+  printf '%s' "$readonly_config_file" | escape_systemd_file_path | escape_sed_replacement
 )
 unit_temp=$(mktemp "$readonly_unit_dir/.pohunek-backend.service.XXXXXX")
 sed \

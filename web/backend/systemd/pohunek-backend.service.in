@@ -6,7 +6,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile="@CONFIG_FILE@"
+EnvironmentFile=@CONFIG_FILE@
 Environment="POHUNEK_BACKEND_STATIC_DIR=@INSTALL_DIR@/frontend"
 ExecStart="@INSTALL_DIR@/pohunek-web"
 Restart=on-failure
