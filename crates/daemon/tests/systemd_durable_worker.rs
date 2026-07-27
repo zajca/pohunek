@@ -23,6 +23,14 @@ use tokio::net::UnixStream;
 
 const CONNECT_ATTEMPTS: usize = 300;
 const CONNECT_DELAY: Duration = Duration::from_millis(50);
+/// Allows a debug-built worker to forward the full incident-sized replay.
+const ATTACH_READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// Incident-sized retained replay that previously exceeded one worker frame.
+const REPLAY_BURST_BYTES: usize = 2_655_396;
+/// Marker emitted immediately after the incident-sized replay.
+const REPLAY_BURST_MARKER: &[u8] = b"replay-burst-complete";
+/// Retains the complete burst plus subsequent counter and interaction output.
+const REPLAY_HISTORY_BYTES: u64 = 3_000_000;
 
 #[tokio::test]
 #[ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a real systemd user manager"]
@@ -136,6 +144,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
     assert_eq!(child_tty(child_pid), pty_device);
     let mut before_outage_attach = fixture.open_attach(&fixture.session_id).await;
     let before_outage_bytes = read_until_counter(&mut before_outage_attach, 5).await;
+    assert_complete_replay_burst(&before_outage_bytes);
     let last_counter = extract_counters(&before_outage_bytes)
         .into_iter()
         .max()
@@ -161,6 +170,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
     assert_eq!(child_tty(child_pid), pty_device);
     let mut after_outage_attach = fixture.open_attach(&fixture.session_id).await;
     let after_outage_bytes = read_until_counter(&mut after_outage_attach, last_counter + 4).await;
+    assert_complete_replay_burst(&after_outage_bytes);
     let missing = extract_counters(&after_outage_bytes)
         .into_iter()
         .filter(|counter| *counter > last_counter)
@@ -469,11 +479,15 @@ impl Fixture {
             executable: PathBuf::from("/bin/sh"),
             arguments: vec![
                 "-c".to_owned(),
-                "printf '\\033]0;working\\007'; \
+                format!(
+                    "printf '\\033]0;working\\007'; \
+                 head -c {REPLAY_BURST_BYTES} /dev/zero | tr '\\000' 'R'; \
+                 printf '\\n{}\\n'; \
                  (n=0; while :; do n=$((n+1)); printf 'counter:%04d\\n' \"$n\"; \
                  sleep 0.1; done) & \
-                 while IFS= read -r line; do printf 'input:%s\\n' \"$line\"; done"
-                    .to_owned(),
+                 while IFS= read -r line; do printf 'input:%s\\n' \"$line\"; done",
+                    std::str::from_utf8(REPLAY_BURST_MARKER).expect("replay marker is UTF-8")
+                ),
             ],
             cwd: self.root.clone(),
             dimensions: Dimensions::new(80, 24).expect("dimensions"),
@@ -482,7 +496,7 @@ impl Fixture {
                 if session_id == self.isolation_session_id {
                     128
                 } else {
-                    1_000_000
+                    REPLAY_HISTORY_BYTES
                 },
                 100_000,
                 128,
@@ -785,7 +799,7 @@ fn child_tty(child_pid: u32) -> PathBuf {
 }
 
 async fn read_until_counter(stream: &mut UnixStream, target: u64) -> Vec<u8> {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(ATTACH_READ_TIMEOUT, async {
         let mut output = Vec::new();
         let mut buffer = [0_u8; 4096];
         loop {
@@ -805,7 +819,7 @@ async fn read_until_counter(stream: &mut UnixStream, target: u64) -> Vec<u8> {
 }
 
 async fn read_until_marker(stream: &mut UnixStream, marker: &[u8]) -> Vec<u8> {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(ATTACH_READ_TIMEOUT, async {
         let mut output = Vec::new();
         let mut buffer = [0_u8; 4096];
         loop {
@@ -819,6 +833,37 @@ async fn read_until_marker(stream: &mut UnixStream, marker: &[u8]) -> Vec<u8> {
     })
     .await
     .expect("marker arrives before timeout")
+}
+
+fn assert_complete_replay_burst(bytes: &[u8]) {
+    let marker_start = bytes
+        .windows(REPLAY_BURST_MARKER.len())
+        .position(|window| window == REPLAY_BURST_MARKER)
+        .expect("fresh attach must replay the completion marker");
+    let after_marker = marker_start + REPLAY_BURST_MARKER.len();
+    assert!(
+        !bytes[after_marker..]
+            .windows(REPLAY_BURST_MARKER.len())
+            .any(|window| window == REPLAY_BURST_MARKER),
+        "fresh attach must replay the burst marker exactly once"
+    );
+    let replay_end = bytes[..marker_start]
+        .iter()
+        .rposition(|byte| !matches!(*byte, b'\r' | b'\n'))
+        .map_or(0, |index| index + 1);
+    let replay_start = replay_end
+        .checked_sub(REPLAY_BURST_BYTES)
+        .expect("fresh attach replay must contain the full burst");
+    assert!(
+        bytes[replay_start..replay_end]
+            .iter()
+            .all(|byte| *byte == b'R'),
+        "fresh attach must replay every retained burst byte in order"
+    );
+    assert!(
+        replay_start == 0 || bytes[replay_start - 1] != b'R',
+        "fresh attach must not duplicate the retained burst"
+    );
 }
 
 fn extract_counters(bytes: &[u8]) -> Vec<u64> {

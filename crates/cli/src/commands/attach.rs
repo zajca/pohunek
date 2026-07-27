@@ -13,13 +13,13 @@ use std::time::Duration;
 use pohunek_terminal::{step, Compositor, MenuEffect, MenuEvent, MenuKey, MenuOutcome, MenuState};
 use protocol::{
     event, method, ForkCwdMode, Request, SessionAttachParams, SessionAttachResult,
-    SessionDetachParams, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
-    SessionNewParams, SessionNewResult, SessionRenameParams, SessionRenameResult,
+    SessionDetachParams, SessionDetachResult, SessionForkParams, SessionForkResult, SessionId,
+    SessionInfo, SessionNewParams, SessionNewResult, SessionRenameParams, SessionRenameResult,
     SessionResizeParams, SessionState, ENV_DAEMON_ID, ENV_SESSION_ID, ENV_WORKER_ID,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time;
 
@@ -89,17 +89,24 @@ const MENU_BACKSPACE_CTRL_H: u8 = 0x08;
 /// does not leave a dead attach terminal hanging indefinitely. Operators can
 /// override it in `launcher.conf`; zero disables reconnect.
 const DEFAULT_ATTACH_RECONNECT_WINDOW: Duration = Duration::from_secs(20);
-/// Poll interval while waiting for a daemon restart/resume after attach EOF.
+/// Base delay for attach retry backoff and runtime-readiness polling.
 ///
 /// A half-second cadence keeps reconnect responsive without turning a restart
 /// outage into a tight socket-dial loop. Operators can override it in
 /// `launcher.conf`.
 const DEFAULT_ATTACH_RECONNECT_INTERVAL: Duration = Duration::from_millis(500);
+/// Maximum automatic attach attempts after one unexpected stream closure.
+///
+/// Three attempts cover a normal daemon replacement without letting a
+/// deterministic stream failure reopen control and subscription sockets
+/// indefinitely. Operators can override the cap in `launcher.conf`.
+const DEFAULT_ATTACH_RECONNECT_MAX_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AttachReconnectConfig {
     window: Duration,
     interval: Duration,
+    max_attempts: usize,
 }
 
 impl Default for AttachReconnectConfig {
@@ -107,6 +114,48 @@ impl Default for AttachReconnectConfig {
         Self {
             window: DEFAULT_ATTACH_RECONNECT_WINDOW,
             interval: DEFAULT_ATTACH_RECONNECT_INTERVAL,
+            max_attempts: DEFAULT_ATTACH_RECONNECT_MAX_ATTEMPTS,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct AttachReconnectBudget {
+    deadline: Option<time::Instant>,
+    attempts: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachReconnectPermit {
+    Retry {
+        deadline: time::Instant,
+        attempt: usize,
+    },
+    Disabled,
+    WindowExpired,
+    AttemptsExhausted,
+}
+
+impl AttachReconnectBudget {
+    fn next(
+        &mut self,
+        config: &AttachReconnectConfig,
+        now: time::Instant,
+    ) -> AttachReconnectPermit {
+        if config.window.is_zero() {
+            return AttachReconnectPermit::Disabled;
+        }
+        let deadline = *self.deadline.get_or_insert_with(|| now + config.window);
+        if now >= deadline {
+            return AttachReconnectPermit::WindowExpired;
+        }
+        if self.attempts >= config.max_attempts {
+            return AttachReconnectPermit::AttemptsExhausted;
+        }
+        self.attempts += 1;
+        AttachReconnectPermit::Retry {
+            deadline,
+            attempt: self.attempts,
         }
     }
 }
@@ -155,6 +204,14 @@ impl AttachConfig {
                 "attach_reconnect_interval_seconds" => {
                     config.reconnect.interval = parse_positive_duration_seconds(
                         "attach_reconnect_interval_seconds",
+                        value.trim(),
+                        &path,
+                        number + 1,
+                    )?;
+                }
+                "attach_reconnect_max_attempts" => {
+                    config.reconnect.max_attempts = parse_positive_usize(
+                        "attach_reconnect_max_attempts",
                         value.trim(),
                         &path,
                         number + 1,
@@ -267,6 +324,13 @@ struct AttachControlContext {
     host: String,
     paths: Paths,
     target: Target,
+}
+
+#[derive(Debug)]
+struct BannerUpdates {
+    receiver: mpsc::UnboundedReceiver<AttachStatusSnapshot>,
+    cancel: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
 }
 
 #[derive(Debug)]
@@ -396,6 +460,7 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
     // different daemon that reuses the same session-id string.
     let (origin_session_id, origin_daemon_id, origin_worker_id) = self_feedback_origin();
     let attach_config = AttachConfig::load(paths)?;
+    let mut reconnect = AttachReconnectBudget::default();
 
     loop {
         let end = run_attach_once(
@@ -407,11 +472,40 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
             origin_worker_id.clone(),
         )
         .await?;
-        if end != AttachStreamEnd::StreamClosed || attach_config.reconnect.window.is_zero() {
+        if end != AttachStreamEnd::StreamClosed {
             return Ok(());
         }
-        if !wait_for_attach_reconnect(host, paths, target, &attach_config.reconnect).await? {
-            return Ok(());
+        match reconnect.next(&attach_config.reconnect, time::Instant::now()) {
+            AttachReconnectPermit::Retry { deadline, attempt } => {
+                if !wait_for_attach_reconnect(
+                    host,
+                    paths,
+                    target,
+                    &attach_config.reconnect,
+                    deadline,
+                    attempt,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+            }
+            AttachReconnectPermit::Disabled => return Ok(()),
+            AttachReconnectPermit::WindowExpired => {
+                eprintln!(
+                    "[pohunek] attach reconnect window expired for session {}",
+                    target.session_id
+                );
+                return Ok(());
+            }
+            AttachReconnectPermit::AttemptsExhausted => {
+                eprintln!(
+                    "[pohunek] attach stream closed after {} automatic reattach attempts for \
+                     session {}; giving up",
+                    attach_config.reconnect.max_attempts, target.session_id
+                );
+                return Ok(());
+            }
         }
     }
 }
@@ -752,43 +846,97 @@ fn spawn_banner_updates(
     paths: Paths,
     session_id: String,
     initial: AttachStatusSnapshot,
-) -> mpsc::UnboundedReceiver<AttachStatusSnapshot> {
+) -> BannerUpdates {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        let mut snapshot = initial;
-        let Ok(mut client) = Client::connect(&host, &paths).await else {
-            return;
-        };
-
-        if let Ok(request) =
-            request_with_params(method::SESSION_INSPECT, &SessionId(session_id.clone()))
-        {
-            if let Ok(info) = client.request(&request).await {
-                snapshot.update_from_session_value(&info);
-                let _ = tx.send(snapshot.clone());
-            }
-        }
-
-        let request = Request::new(
-            request_id(method::SUBSCRIBE),
-            method::SUBSCRIBE,
-            serde_json::Value::Null,
-        );
-        let Ok(mut subscription) = client.into_sdk().subscribe(&request).await else {
-            return;
-        };
-        while let Ok(Some(line)) = subscription.next_line().await {
-            let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-            let before = snapshot.clone();
-            snapshot.update_from_event_value(&event);
-            if snapshot != before {
-                let _ = tx.send(snapshot.clone());
-            }
+    let (cancel_tx, mut cancel_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        tokio::select! {
+            _ = &mut cancel_rx => {}
+            () = run_banner_updates(host, paths, session_id, initial, tx) => {}
         }
     });
-    rx
+    BannerUpdates {
+        receiver: rx,
+        cancel: Some(cancel_tx),
+        task,
+    }
+}
+
+async fn run_banner_updates(
+    host: String,
+    paths: Paths,
+    session_id: String,
+    mut snapshot: AttachStatusSnapshot,
+    tx: mpsc::UnboundedSender<AttachStatusSnapshot>,
+) {
+    let Ok(mut client) = Client::connect(&host, &paths).await else {
+        return;
+    };
+
+    if let Ok(request) =
+        request_with_params(method::SESSION_INSPECT, &SessionId(session_id.clone()))
+    {
+        if let Ok(info) = client.request(&request).await {
+            snapshot.update_from_session_value(&info);
+            if tx.send(snapshot.clone()).is_err() {
+                return;
+            }
+        }
+    }
+
+    let request = Request::new(
+        request_id(method::SUBSCRIBE),
+        method::SUBSCRIBE,
+        serde_json::Value::Null,
+    );
+    let Ok(mut subscription) = client.into_sdk().subscribe(&request).await else {
+        return;
+    };
+    while let Ok(Some(line)) = subscription.next_line().await {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let before = snapshot.clone();
+        snapshot.update_from_event_value(&event);
+        if snapshot != before && tx.send(snapshot.clone()).is_err() {
+            return;
+        }
+    }
+}
+
+impl BannerUpdates {
+    async fn shutdown(mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        let _ = self.task.await;
+    }
+}
+
+async fn shutdown_banner_updates(updates: &mut Option<BannerUpdates>) {
+    if let Some(updates) = updates.take() {
+        updates.shutdown().await;
+    }
+}
+
+async fn prepare_attach_terminal(
+    updates: &mut Option<BannerUpdates>,
+) -> Result<(Option<RawTerminal>, tokio::signal::unix::Signal), CliError> {
+    let terminal = match RawTerminal::enable(libc::STDIN_FILENO) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            shutdown_banner_updates(updates).await;
+            return Err(error);
+        }
+    };
+    let winch = match signal(SignalKind::window_change()) {
+        Ok(winch) => winch,
+        Err(error) => {
+            shutdown_banner_updates(updates).await;
+            return Err(CliError::Io(error));
+        }
+    };
+    Ok((terminal, winch))
 }
 
 /// Renders the active modal and its status banner.
@@ -838,11 +986,9 @@ where
 ///
 /// Kept as a named future so the `select!` arm stays a single line and the loop
 /// body fits its line budget.
-async fn recv_banner_update(
-    updates: &mut Option<mpsc::UnboundedReceiver<AttachStatusSnapshot>>,
-) -> Option<AttachStatusSnapshot> {
+async fn recv_banner_update(updates: &mut Option<BannerUpdates>) -> Option<AttachStatusSnapshot> {
     match updates.as_mut() {
-        Some(updates) => updates.recv().await,
+        Some(updates) => updates.receiver.recv().await,
         None => None,
     }
 }
@@ -1061,18 +1207,10 @@ where
     Ok(None)
 }
 
-fn handle_status_update(
-    update: Option<AttachStatusSnapshot>,
-    modal: &mut Option<ModalState>,
-    status_updates: &mut Option<mpsc::UnboundedReceiver<AttachStatusSnapshot>>,
-) -> bool {
-    if let Some(snapshot) = update {
-        if let Some(modal) = modal.as_mut() {
-            modal.snapshot = snapshot;
-            return modal.active;
-        }
-    } else {
-        *status_updates = None;
+fn handle_status_update(snapshot: AttachStatusSnapshot, modal: &mut Option<ModalState>) -> bool {
+    if let Some(modal) = modal.as_mut() {
+        modal.snapshot = snapshot;
+        return modal.active;
     }
     false
 }
@@ -1117,6 +1255,27 @@ fn parse_nonnegative_duration_seconds(
         )));
     }
     Ok(Duration::from_secs_f64(seconds))
+}
+
+fn parse_positive_usize(
+    key: &str,
+    value: &str,
+    path: &Path,
+    number: usize,
+) -> Result<usize, CliError> {
+    let count = value.parse::<usize>().map_err(|err| {
+        config_error(format!(
+            "{}:{number}: invalid positive integer value {value:?}: {err}",
+            path.display()
+        ))
+    })?;
+    if count == 0 {
+        return Err(config_error(format!(
+            "{}:{number}: {key} must be greater than zero",
+            path.display()
+        )));
+    }
+    Ok(count)
 }
 
 fn config_error(message: String) -> CliError {
@@ -1232,14 +1391,13 @@ async fn forward_attached_stream<S>(
     stream_id: String,
     control: AttachControlContext,
     mut modal: Option<ModalState>,
-    mut status_updates: Option<mpsc::UnboundedReceiver<AttachStatusSnapshot>>,
+    mut status_updates: Option<BannerUpdates>,
 ) -> Result<AttachStreamEnd, CliError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut terminal = RawTerminal::enable(libc::STDIN_FILENO)?;
+    let (mut terminal, mut winch) = prepare_attach_terminal(&mut status_updates).await?;
     let (mut socket_read, mut socket_write) = tokio::io::split(stream);
-    let mut winch = signal(SignalKind::window_change())?;
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let mut stdin_buf = [0_u8; IO_BUFFER_BYTES];
@@ -1299,15 +1457,15 @@ where
                     ).await?;
                 }
                 update = recv_banner_update(&mut status_updates), if status_updates.is_some() => {
-                    if handle_status_update(
-                        update,
-                        &mut modal,
-                        &mut status_updates,
-                    ) {
-                        paint_modal(
-                            &mut stdout,
-                            modal.as_mut().expect("active modal state exists"),
-                        ).await?;
+                    if let Some(update) = update {
+                        if handle_status_update(update, &mut modal) {
+                            paint_modal(
+                                &mut stdout,
+                                modal.as_mut().expect("active modal state exists"),
+                            ).await?;
+                        }
+                    } else {
+                        shutdown_banner_updates(&mut status_updates).await;
                     }
                 }
                 task = wait_for_menu_task(&mut menu.task), if menu.task.is_some() => {
@@ -1331,7 +1489,31 @@ where
     // Best-effort restore; do not mask the loop's real outcome with a teardown
     // write error.
     let _ = close_modal(&mut stdout, modal.as_mut()).await;
+    shutdown_banner_updates(&mut status_updates).await;
+    finish_attach_outcome(&mut client, &stream_id, outcome).await
+}
+
+async fn finish_attach_outcome(
+    client: &mut Client,
+    stream_id: &str,
+    outcome: Result<AttachStreamEnd, CliError>,
+) -> Result<AttachStreamEnd, CliError> {
+    if !matches!(outcome, Ok(AttachStreamEnd::StreamClosed)) {
+        return outcome;
+    }
+    // The raw stream cannot carry a typed terminal failure. Ask the daemon once
+    // through the still-open control connection. A daemon replacement may have
+    // closed that connection too, so only a typed result overrides reconnect.
+    if let Ok(detach) = send_detach(client, stream_id).await {
+        if let Some(error) = stream_error_from_detach(detach) {
+            return Err(error);
+        }
+    }
     outcome
+}
+
+fn stream_error_from_detach(detach: SessionDetachResult) -> Option<CliError> {
+    detach.error.map(CliError::Protocol)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1347,13 +1529,24 @@ async fn wait_for_attach_reconnect(
     paths: &Paths,
     target: &Target,
     config: &AttachReconnectConfig,
+    deadline: time::Instant,
+    attempt: usize,
 ) -> Result<bool, CliError> {
-    let deadline = time::Instant::now() + config.window;
+    let now = time::Instant::now();
+    if now >= deadline {
+        return Ok(false);
+    }
+    let delay = reconnect_attempt_delay(config.interval, attempt, deadline - now);
     eprintln!(
-        "[pohunek] attach stream closed; waiting up to {:.1}s for session {} to resume",
-        config.window.as_secs_f64(),
-        target.session_id
+        "[pohunek] attach stream closed; retrying session {} in {:.1}s \
+         (attempt {} of {}, {:.1}s window remaining)",
+        target.session_id,
+        delay.as_secs_f64(),
+        attempt,
+        config.max_attempts,
+        (deadline - now).as_secs_f64()
     );
+    time::sleep(delay).await;
 
     loop {
         match probe_attach_reconnect(host, paths, target).await {
@@ -1373,13 +1566,18 @@ async fn wait_for_attach_reconnect(
         let now = time::Instant::now();
         if now >= deadline {
             eprintln!(
-                "[pohunek] session {} did not resume before reconnect timeout",
+                "[pohunek] attach reconnect window expired for session {}",
                 target.session_id
             );
             return Ok(false);
         }
         time::sleep(std::cmp::min(config.interval, deadline - now)).await;
     }
+}
+
+fn reconnect_attempt_delay(interval: Duration, attempt: usize, remaining: Duration) -> Duration {
+    let factor = u32::try_from(attempt).unwrap_or(u32::MAX);
+    std::cmp::min(interval.saturating_mul(factor), remaining)
 }
 
 async fn probe_attach_reconnect(
@@ -1580,10 +1778,13 @@ fn log_abandoned_menu_task_result(target: &Target, result: &MenuTaskResult) {
     }
 }
 
-async fn send_detach(client: &mut Client, stream_id: &str) -> Result<(), CliError> {
+async fn send_detach(
+    client: &mut Client,
+    stream_id: &str,
+) -> Result<SessionDetachResult, CliError> {
     let request = build_detach_request(stream_id)?;
-    let _ = client.request(&request).await?;
-    Ok(())
+    let value = client.request(&request).await?;
+    Ok(serde_json::from_value(value)?)
 }
 
 async fn send_menu_new_session(
@@ -1856,9 +2057,177 @@ fn terminal_size(fd: RawFd) -> Option<(u16, u16)> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use protocol::Response;
     use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::net::{UnixListener, UnixStream};
 
     use super::*;
+
+    static NEXT_BANNER_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug)]
+    struct BannerConnectionControl {
+        release_event: oneshot::Sender<()>,
+        closed: oneshot::Receiver<()>,
+    }
+
+    #[derive(Debug)]
+    struct BannerTestDaemon {
+        paths: Paths,
+        controls: mpsc::UnboundedReceiver<BannerConnectionControl>,
+        active: Arc<AtomicUsize>,
+        task: JoinHandle<()>,
+        socket: PathBuf,
+    }
+
+    impl Drop for BannerTestDaemon {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+
+    fn banner_test_paths(socket: PathBuf) -> Paths {
+        let root = socket
+            .parent()
+            .expect("test socket has a parent")
+            .to_path_buf();
+        Paths {
+            runtime_dir: root.clone(),
+            socket,
+            data_dir: root.join("data"),
+            log_dir: root.join("logs"),
+            cache_dir: root.join("cache"),
+            config_home: root.join("config-home"),
+            config_dir: root.join("config"),
+        }
+    }
+
+    fn spawn_banner_test_daemon(connection_count: usize) -> BannerTestDaemon {
+        let id = NEXT_BANNER_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
+        let socket = std::env::temp_dir().join(format!(
+            "pohunek-cli-banner-{}-{id}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).expect("bind banner test daemon");
+        let (controls_tx, controls) = mpsc::unbounded_channel();
+        let active = Arc::new(AtomicUsize::new(0));
+        let task_active = Arc::clone(&active);
+        let task = tokio::spawn(async move {
+            let mut connections = Vec::with_capacity(connection_count);
+            for _ in 0..connection_count {
+                let (stream, _) = listener.accept().await.expect("accept banner client");
+                let tx = controls_tx.clone();
+                let active = Arc::clone(&task_active);
+                connections.push(tokio::spawn(async move {
+                    handle_banner_test_connection(stream, tx, active).await;
+                }));
+            }
+            drop(controls_tx);
+            for connection in connections {
+                connection.await.expect("banner connection task");
+            }
+        });
+
+        BannerTestDaemon {
+            paths: banner_test_paths(socket.clone()),
+            controls,
+            active,
+            task,
+            socket,
+        }
+    }
+
+    async fn handle_banner_test_connection(
+        stream: UnixStream,
+        controls: mpsc::UnboundedSender<BannerConnectionControl>,
+        active: Arc<AtomicUsize>,
+    ) {
+        let mut stream = BufReader::new(stream);
+        let inspect = read_banner_test_request(&mut stream).await;
+        write_banner_test_response(
+            &mut stream,
+            &inspect,
+            json!({
+                "id": "s-42",
+                "name": "test",
+                "agent": "claude",
+                "state": "running",
+                "activity": "idle"
+            }),
+        )
+        .await;
+        let subscribe = read_banner_test_request(&mut stream).await;
+        write_banner_test_response(&mut stream, &subscribe, json!({"subscribed": true})).await;
+
+        let (release_event, release_rx) = oneshot::channel();
+        let (closed_tx, closed) = oneshot::channel();
+        active.fetch_add(1, Ordering::SeqCst);
+        controls
+            .send(BannerConnectionControl {
+                release_event,
+                closed,
+            })
+            .expect("send banner connection control");
+
+        let mut eof = String::new();
+        tokio::select! {
+            _ = release_rx => {
+                let event = serde_json::to_string(&json!({
+                    "v": 1,
+                    "event": event::AGENT_STATE,
+                    "session_id": "s-42",
+                    "activity": "working"
+                }))
+                .expect("serialize banner event");
+                let _ = stream.get_mut().write_all(event.as_bytes()).await;
+                let _ = stream.get_mut().write_all(b"\n").await;
+                let _ = stream.get_mut().flush().await;
+                let _ = stream.read_line(&mut eof).await;
+            }
+            _ = stream.read_line(&mut eof) => {}
+        }
+        active.fetch_sub(1, Ordering::SeqCst);
+        let _ = closed_tx.send(());
+    }
+
+    async fn read_banner_test_request(stream: &mut BufReader<UnixStream>) -> Request {
+        let mut line = String::new();
+        stream
+            .read_line(&mut line)
+            .await
+            .expect("read banner request");
+        serde_json::from_str(&line).expect("decode banner request")
+    }
+
+    async fn write_banner_test_response(
+        stream: &mut BufReader<UnixStream>,
+        request: &Request,
+        value: serde_json::Value,
+    ) {
+        let line = serde_json::to_string(&Response::ok(request.id.clone(), value))
+            .expect("serialize banner response");
+        stream
+            .get_mut()
+            .write_all(line.as_bytes())
+            .await
+            .expect("write banner response");
+        stream
+            .get_mut()
+            .write_all(b"\n")
+            .await
+            .expect("write banner response newline");
+        stream
+            .get_mut()
+            .flush()
+            .await
+            .expect("flush banner response");
+    }
 
     #[expect(
         clippy::needless_pass_by_value,
@@ -2022,7 +2391,8 @@ mod tests {
         std::fs::write(
             root.join("launcher.conf"),
             "attach_reconnect_seconds=12\n\
-             attach_reconnect_interval_seconds=0.75\n",
+             attach_reconnect_interval_seconds=0.75\n\
+             attach_reconnect_max_attempts=7\n",
         )
         .expect("write config");
 
@@ -2032,6 +2402,106 @@ mod tests {
         assert_eq!(
             config.reconnect.interval,
             std::time::Duration::from_millis(750)
+        );
+        assert_eq!(config.reconnect.max_attempts, 7);
+    }
+
+    #[test]
+    fn attach_config_rejects_zero_reconnect_attempts() {
+        let root = std::env::temp_dir().join(format!(
+            "pohunek-attach-reconnect-attempts-config-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create config dir");
+        std::fs::write(
+            root.join("launcher.conf"),
+            "attach_reconnect_max_attempts=0\n",
+        )
+        .expect("write config");
+
+        let err = AttachConfig::load_from_config_dir(&root)
+            .expect_err("zero reconnect attempts must fail configuration validation");
+
+        assert!(
+            err.to_string().contains("must be greater than zero"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn attach_reconnect_budget_keeps_one_deadline_and_caps_attempts() {
+        let config = AttachReconnectConfig {
+            window: Duration::from_secs(20),
+            interval: Duration::from_millis(500),
+            max_attempts: 3,
+        };
+        let now = time::Instant::now();
+        let mut budget = AttachReconnectBudget::default();
+
+        let first = budget.next(&config, now);
+        let deadline = match first {
+            AttachReconnectPermit::Retry {
+                deadline,
+                attempt: 1,
+            } => deadline,
+            other => panic!("expected first retry permit, got {other:?}"),
+        };
+        assert_eq!(
+            budget.next(&config, now + Duration::from_secs(1)),
+            AttachReconnectPermit::Retry {
+                deadline,
+                attempt: 2
+            }
+        );
+        assert_eq!(
+            budget.next(&config, now + Duration::from_secs(2)),
+            AttachReconnectPermit::Retry {
+                deadline,
+                attempt: 3
+            }
+        );
+        assert_eq!(
+            budget.next(&config, now + Duration::from_secs(3)),
+            AttachReconnectPermit::AttemptsExhausted
+        );
+    }
+
+    #[test]
+    fn attach_reconnect_budget_expires_original_window() {
+        let config = AttachReconnectConfig {
+            window: Duration::from_secs(2),
+            interval: Duration::from_millis(500),
+            max_attempts: 10,
+        };
+        let now = time::Instant::now();
+        let mut budget = AttachReconnectBudget::default();
+        assert!(matches!(
+            budget.next(&config, now),
+            AttachReconnectPermit::Retry { attempt: 1, .. }
+        ));
+
+        assert_eq!(
+            budget.next(&config, now + config.window),
+            AttachReconnectPermit::WindowExpired
+        );
+    }
+
+    #[test]
+    fn attach_reconnect_delay_backs_off_and_stays_within_window() {
+        let interval = Duration::from_millis(500);
+
+        assert_eq!(
+            reconnect_attempt_delay(interval, 1, Duration::from_secs(20)),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            reconnect_attempt_delay(interval, 3, Duration::from_secs(20)),
+            Duration::from_millis(1_500)
+        );
+        assert_eq!(
+            reconnect_attempt_delay(interval, 3, Duration::from_millis(800)),
+            Duration::from_millis(800)
         );
     }
 
@@ -2060,6 +2530,102 @@ mod tests {
             reconnect_decision_from_error(&CliError::Protocol(missing)),
             AttachReconnectDecision::Retry
         );
+    }
+
+    #[test]
+    fn detach_stream_error_is_typed_and_not_reconnectable() {
+        let source = protocol::ProtocolError::new(
+            protocol::ErrorClass::Transport,
+            "worker_stream_failed",
+            "worker data payload exceeded the frame limit",
+            None,
+        );
+        let err = stream_error_from_detach(SessionDetachResult {
+            detached: false,
+            error: Some(source.clone()),
+        })
+        .expect("stream failure must surface");
+
+        assert!(matches!(
+            &err,
+            CliError::Protocol(protocol_error) if protocol_error == &source
+        ));
+        assert_eq!(
+            reconnect_decision_from_error(&err),
+            AttachReconnectDecision::Fail
+        );
+    }
+
+    #[tokio::test]
+    async fn banner_shutdown_returns_subscription_connections_to_baseline() {
+        const ATTEMPTS: usize = 3;
+        let mut daemon = spawn_banner_test_daemon(ATTEMPTS);
+
+        for _ in 0..ATTEMPTS {
+            let updates = spawn_banner_updates(
+                "local".to_owned(),
+                daemon.paths.clone(),
+                "s-42".to_owned(),
+                AttachStatusSnapshot::unknown("local", "s-42"),
+            );
+            let control = time::timeout(Duration::from_secs(2), daemon.controls.recv())
+                .await
+                .expect("banner subscription established promptly")
+                .expect("banner daemon control remains open");
+            assert_eq!(daemon.active.load(Ordering::SeqCst), 1);
+
+            updates.shutdown().await;
+            time::timeout(Duration::from_secs(2), control.closed)
+                .await
+                .expect("banner connection closes after shutdown")
+                .expect("banner connection reports close");
+            assert_eq!(daemon.active.load(Ordering::SeqCst), 0);
+        }
+
+        time::timeout(Duration::from_secs(2), &mut daemon.task)
+            .await
+            .expect("banner daemon exits after all attempts")
+            .expect("banner daemon task succeeds");
+    }
+
+    #[tokio::test]
+    async fn dropping_banner_receiver_terminates_subscription_task() {
+        let mut daemon = spawn_banner_test_daemon(1);
+        let updates = spawn_banner_updates(
+            "local".to_owned(),
+            daemon.paths.clone(),
+            "s-42".to_owned(),
+            AttachStatusSnapshot::unknown("local", "s-42"),
+        );
+        let control = time::timeout(Duration::from_secs(2), daemon.controls.recv())
+            .await
+            .expect("banner subscription established promptly")
+            .expect("banner daemon control remains open");
+        let BannerUpdates {
+            receiver,
+            cancel,
+            task,
+        } = updates;
+        drop(receiver);
+        control
+            .release_event
+            .send(())
+            .expect("release banner event");
+
+        time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("dropped receiver terminates banner task")
+            .expect("banner task exits normally");
+        drop(cancel);
+        time::timeout(Duration::from_secs(2), control.closed)
+            .await
+            .expect("banner connection closes after receiver drop")
+            .expect("banner connection reports close");
+        assert_eq!(daemon.active.load(Ordering::SeqCst), 0);
+        time::timeout(Duration::from_secs(2), &mut daemon.task)
+            .await
+            .expect("banner daemon exits")
+            .expect("banner daemon task succeeds");
     }
 
     #[test]

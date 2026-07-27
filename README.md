@@ -129,8 +129,10 @@ where they are doing it, and when they need you.
   (kill, detach, new session in the same worktree, fork, rename), then restores
   the agent screen and raw passthrough when the menu closes.
 - Attach auto-reconnects after a daemon restart to the same worker, PTY, child
-  PID, and runtime generation. A changed runtime generation is shown as
-  explicit native recovery, not seamless continuation.
+  PID, and runtime generation. Retries use a minimum interval and consecutive
+  attempt cap, while typed worker-stream failures stop immediately. A changed
+  runtime generation is shown as explicit native recovery, not seamless
+  continuation.
 
 **Built to be driven by agents, not just humans**
 

@@ -1,6 +1,6 @@
 //! Serves the private daemon-worker Unix protocol.
 
-// Rust guideline compliant 2026-07-24
+// Rust guideline compliant 2026-07-27
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -38,7 +38,7 @@ use crate::journal::{
 };
 use crate::{
     Command, ControllerLease, Exit, InputFragment, InputPlan, Journal, LeaseError, LeaseOwner,
-    OutputEvent, ProcessIdentity, PtyOwner, WorkerConfig, WorkerError,
+    OutputChunk, OutputEvent, ProcessIdentity, PtyOwner, WorkerConfig, WorkerError,
 };
 
 /// Number of worker events buffered per control connection.
@@ -731,8 +731,7 @@ async fn initialize_request(
     effective_config
         .validate()
         .map_err(|error| control_error(ControlCode::InvalidRequest, error, false))?;
-    let pty = PtyOwner::spawn(command, history_bytes, subscriber_bytes, dedup_entries)
-        .map_err(|error| control_error(ControlCode::RuntimeFault, error, false))?;
+    let pty = spawn_pty(command, &effective_config)?;
     let child_process = wire_identity(pty.identity())?;
     let live = {
         let mut state = shared.state.lock().await;
@@ -763,6 +762,16 @@ async fn initialize_request(
         runtime_id,
         child_process,
     })
+}
+
+fn spawn_pty(command: Command, config: &WorkerConfig) -> Result<PtyOwner, ControlError> {
+    PtyOwner::spawn(
+        command,
+        config.history_bytes,
+        config.subscriber_bytes,
+        config.input_dedup_entries,
+    )
+    .map_err(|error| control_error(ControlCode::RuntimeFault, error, false))
 }
 
 async fn open_data_request(
@@ -995,7 +1004,7 @@ fn spawn_runtime_monitors(shared: Arc<Shared>, pty: PtyOwner, runtime_id: Runtim
         if let Ok(mut subscriber) = output_pty.subscribe_output(Some(0)) {
             while let Some(event) = subscriber.recv().await {
                 match event {
-                    OutputEvent::Replay(_) => {}
+                    OutputEvent::Replay(_) | OutputEvent::TerminalSnapshot(_) => {}
                     OutputEvent::Output(chunk) => {
                         output_shared.emit(EventKind::OutputAdvanced {
                             runtime_id: output_runtime.clone(),
@@ -1004,10 +1013,10 @@ fn spawn_runtime_monitors(shared: Arc<Shared>, pty: PtyOwner, runtime_id: Runtim
                             ),
                         });
                     }
-                    OutputEvent::Gap { terminal, .. } => {
+                    OutputEvent::Gap { watermark, .. } => {
                         output_shared.emit(EventKind::TerminalChanged {
                             runtime_id: output_runtime.clone(),
-                            watermark: terminal.watermark,
+                            watermark,
                         });
                     }
                     OutputEvent::Exit { next_offset } => {
@@ -1181,6 +1190,7 @@ async fn serve_data(
                     version,
                     &stream_id,
                     &runtime_id,
+                    shared.config.data_payload_bytes,
                     output,
                 ).await?;
             }
@@ -1228,6 +1238,7 @@ async fn write_output_event<W>(
     version: Version,
     stream_id: &StreamId,
     runtime_id: &RuntimeId,
+    payload_limit: usize,
     output: OutputEvent,
 ) -> Result<(), WorkerError>
 where
@@ -1236,32 +1247,30 @@ where
     match output {
         OutputEvent::Replay(chunk) if chunk.bytes.is_empty() => Ok(()),
         OutputEvent::Replay(chunk) => {
-            write_data_frame(
+            write_output_chunks(
                 writer,
                 version,
                 stream_id,
                 runtime_id,
-                FrameKind::Replay {
-                    offset: chunk.offset,
-                },
-                chunk.bytes,
+                payload_limit,
+                chunk,
+                true,
             )
             .await
         }
         OutputEvent::Output(chunk) => {
-            write_data_frame(
+            write_output_chunks(
                 writer,
                 version,
                 stream_id,
                 runtime_id,
-                FrameKind::Output {
-                    offset: chunk.offset,
-                },
-                chunk.bytes,
+                payload_limit,
+                chunk,
+                false,
             )
             .await
         }
-        OutputEvent::Gap { missing, terminal } => {
+        OutputEvent::Gap { missing, watermark } => {
             write_data_frame(
                 writer,
                 version,
@@ -1270,21 +1279,22 @@ where
                 FrameKind::Gap {
                     missing_start: missing.start,
                     missing_end: missing.end,
-                    watermark: terminal.watermark,
+                    watermark,
                 },
                 Vec::new(),
             )
-            .await?;
-            let ansi = terminal.ansi.clone();
-            write_data_frame(
+            .await
+        }
+        OutputEvent::TerminalSnapshot(chunk) => {
+            let snapshot = wire_terminal(chunk.terminal())?;
+            write_terminal_chunks(
                 writer,
                 version,
                 stream_id,
                 runtime_id,
-                FrameKind::TerminalSnapshot {
-                    snapshot: wire_terminal(terminal)?,
-                },
-                ansi,
+                payload_limit,
+                &snapshot,
+                &chunk.bytes,
             )
             .await
         }
@@ -1302,6 +1312,65 @@ where
             .await
         }
     }
+}
+
+async fn write_output_chunks<W>(
+    writer: &mut W,
+    version: Version,
+    stream_id: &StreamId,
+    runtime_id: &RuntimeId,
+    payload_limit: usize,
+    chunk: OutputChunk,
+    replay: bool,
+) -> Result<(), WorkerError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    let mut chunk_offset = chunk.offset;
+    for bytes in chunk.bytes.chunks(payload_limit) {
+        let kind = if replay {
+            FrameKind::Replay {
+                offset: chunk_offset,
+            }
+        } else {
+            FrameKind::Output {
+                offset: chunk_offset,
+            }
+        };
+        write_data_frame(writer, version, stream_id, runtime_id, kind, bytes.to_vec()).await?;
+        chunk_offset = chunk_offset
+            .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            .ok_or_else(|| WorkerError::Protocol("output frame offset overflowed".to_owned()))?;
+    }
+    Ok(())
+}
+
+async fn write_terminal_chunks<W>(
+    writer: &mut W,
+    version: Version,
+    stream_id: &StreamId,
+    runtime_id: &RuntimeId,
+    payload_limit: usize,
+    snapshot: &WireTerminalSnapshot,
+    ansi: &[u8],
+) -> Result<(), WorkerError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    for bytes in ansi.chunks(payload_limit) {
+        write_data_frame(
+            writer,
+            version,
+            stream_id,
+            runtime_id,
+            FrameKind::TerminalSnapshot {
+                snapshot: snapshot.clone(),
+            },
+            bytes.to_vec(),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn write_data_frame<W>(
@@ -1621,7 +1690,7 @@ fn journal_identity(identity: &ProcessIdentity) -> ChildIdentity {
     }
 }
 
-fn wire_terminal(snapshot: crate::TerminalSnapshot) -> Result<WireTerminalSnapshot, WorkerError> {
+fn wire_terminal(snapshot: &crate::TerminalSnapshot) -> Result<WireTerminalSnapshot, WorkerError> {
     let dimensions = Dimensions::new(snapshot.cols, snapshot.rows)
         .map_err(|error| WorkerError::Protocol(error.to_string()))?;
     Ok(WireTerminalSnapshot {
@@ -1633,8 +1702,8 @@ fn wire_terminal(snapshot: crate::TerminalSnapshot) -> Result<WireTerminalSnapsh
             visible: snapshot.cursor_visible,
         },
         alternate_screen: snapshot.alternate_screen,
-        title: snapshot.title,
-        progress: snapshot.progress,
+        title: snapshot.title.clone(),
+        progress: snapshot.progress.clone(),
         visible_lines: snapshot.visible_text.lines().map(str::to_owned).collect(),
     })
 }
@@ -2008,8 +2077,18 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_stat, random_value, signal_number, PrefixStream};
+    use super::{
+        parse_stat, random_value, signal_number, write_output_chunks, write_terminal_chunks,
+        PrefixStream, WireTerminalSnapshot,
+    };
+    use pohunek_worker_protocol::{
+        self as protocol, Cursor, Dimensions, FrameKind, RuntimeId, StreamId, CURRENT_VERSION,
+        MAX_DATA_PAYLOAD_BYTES,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Extra bytes force exactly one partial frame after a full wire payload.
+    const OVERSIZED_PAYLOAD_EXTRA: usize = 257;
 
     #[test]
     fn proc_stat_parser_handles_spaces_and_parentheses_in_name() {
@@ -2047,5 +2126,105 @@ mod tests {
         let mut output = [0_u8; 3];
         stream.read_exact(&mut output).await.expect("read");
         assert_eq!(&output, b"abc");
+    }
+
+    #[tokio::test]
+    async fn oversized_replay_is_framed_with_exact_contiguous_offsets() {
+        let payload = (0..MAX_DATA_PAYLOAD_BYTES + OVERSIZED_PAYLOAD_EXTRA)
+            .map(|index| u8::try_from(index % 251).expect("value fits u8"))
+            .collect::<Vec<_>>();
+        let stream_id = StreamId::new("stream-1").expect("valid stream");
+        let runtime_id = RuntimeId::new("runtime-1").expect("valid runtime");
+        let (mut reader, mut writer) = tokio::io::duplex(payload.len() * 2);
+
+        write_output_chunks(
+            &mut writer,
+            CURRENT_VERSION,
+            &stream_id,
+            &runtime_id,
+            MAX_DATA_PAYLOAD_BYTES,
+            crate::OutputChunk {
+                offset: 41,
+                bytes: payload.clone(),
+            },
+            true,
+        )
+        .await
+        .expect("write bounded replay");
+
+        let mut expected_offset = 41_u64;
+        let mut replay = Vec::with_capacity(payload.len());
+        while replay.len() < payload.len() {
+            let frame = protocol::read_frame(&mut reader)
+                .await
+                .expect("read replay frame")
+                .expect("replay frame");
+            let (header, bytes) = frame.into_parts();
+            assert_eq!(
+                header.kind,
+                FrameKind::Replay {
+                    offset: expected_offset
+                }
+            );
+            assert!(bytes.len() <= MAX_DATA_PAYLOAD_BYTES);
+            expected_offset += u64::try_from(bytes.len()).expect("frame length fits u64");
+            replay.extend_from_slice(&bytes);
+        }
+
+        assert_eq!(replay, payload);
+    }
+
+    #[tokio::test]
+    async fn oversized_terminal_repaint_is_framed_without_byte_changes() {
+        let ansi = (0..MAX_DATA_PAYLOAD_BYTES + OVERSIZED_PAYLOAD_EXTRA)
+            .map(|index| u8::try_from(index % 251).expect("value fits u8"))
+            .collect::<Vec<_>>();
+        let snapshot = WireTerminalSnapshot {
+            watermark: 42,
+            dimensions: Dimensions::new(10, 2).expect("valid dimensions"),
+            cursor: Cursor {
+                column: 0,
+                row: 0,
+                visible: true,
+            },
+            alternate_screen: false,
+            title: None,
+            progress: None,
+            visible_lines: vec!["bounded repaint".to_owned()],
+        };
+        let stream_id = StreamId::new("stream-1").expect("valid stream");
+        let runtime_id = RuntimeId::new("runtime-1").expect("valid runtime");
+        let (mut reader, mut writer) = tokio::io::duplex(ansi.len() * 2);
+
+        write_terminal_chunks(
+            &mut writer,
+            CURRENT_VERSION,
+            &stream_id,
+            &runtime_id,
+            MAX_DATA_PAYLOAD_BYTES,
+            &snapshot,
+            &ansi,
+        )
+        .await
+        .expect("write bounded terminal repaint");
+
+        let mut repaint = Vec::with_capacity(ansi.len());
+        while repaint.len() < ansi.len() {
+            let frame = protocol::read_frame(&mut reader)
+                .await
+                .expect("read terminal snapshot frame")
+                .expect("terminal snapshot frame");
+            let (header, bytes) = frame.into_parts();
+            assert!(matches!(
+                header.kind,
+                FrameKind::TerminalSnapshot {
+                    snapshot: ref framed
+                } if framed == &snapshot
+            ));
+            assert!(bytes.len() <= MAX_DATA_PAYLOAD_BYTES);
+            repaint.extend_from_slice(&bytes);
+        }
+
+        assert_eq!(repaint, ansi);
     }
 }

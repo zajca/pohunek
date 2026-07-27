@@ -527,14 +527,28 @@ async fn connect_unix(
 ) -> Result<UnixStream, ClientError> {
     match tokio::time::timeout(connect_timeout, UnixStream::connect(socket_path)).await {
         Ok(Ok(stream)) => Ok(stream),
-        Ok(Err(source)) => Err(ClientError::DaemonUnreachable {
-            socket: socket_path.to_path_buf(),
-            source,
-        }),
+        Ok(Err(source)) => Err(map_unix_connect_error(socket_path, source)),
         Err(_elapsed) => Err(ClientError::DaemonUnreachable {
             socket: socket_path.to_path_buf(),
             source: timeout_error("daemon socket connect", connect_timeout),
         }),
+    }
+}
+
+fn map_unix_connect_error(socket_path: &Path, source: io::Error) -> ClientError {
+    match source.raw_os_error() {
+        Some(libc::EMFILE) => ClientError::ClientFileDescriptorsExhausted {
+            socket: socket_path.to_path_buf(),
+            source,
+        },
+        Some(libc::ENFILE) => ClientError::SystemFileDescriptorsExhausted {
+            socket: socket_path.to_path_buf(),
+            source,
+        },
+        _ => ClientError::DaemonUnreachable {
+            socket: socket_path.to_path_buf(),
+            source,
+        },
     }
 }
 
@@ -649,5 +663,52 @@ fn response_id_mismatch_error(
         None => ClientError::Framing(format!(
             "response id mismatch: expected '{expected}', got '{actual}'"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_connect_emfile_is_client_descriptor_exhaustion() {
+        let socket = Path::new("/run/pohunek/daemon.sock");
+        let err = map_unix_connect_error(socket, io::Error::from_raw_os_error(libc::EMFILE));
+
+        assert!(matches!(
+            err,
+            ClientError::ClientFileDescriptorsExhausted {
+                socket: path,
+                source
+            } if path == socket && source.raw_os_error() == Some(libc::EMFILE)
+        ));
+    }
+
+    #[test]
+    fn unix_connect_enfile_is_system_descriptor_exhaustion() {
+        let socket = Path::new("/run/pohunek/daemon.sock");
+        let err = map_unix_connect_error(socket, io::Error::from_raw_os_error(libc::ENFILE));
+
+        assert!(matches!(
+            err,
+            ClientError::SystemFileDescriptorsExhausted {
+                socket: path,
+                source
+            } if path == socket && source.raw_os_error() == Some(libc::ENFILE)
+        ));
+    }
+
+    #[test]
+    fn other_unix_connect_errors_remain_daemon_unreachable() {
+        let socket = Path::new("/run/pohunek/daemon.sock");
+        let err = map_unix_connect_error(socket, io::Error::from_raw_os_error(libc::ENOENT));
+
+        assert!(matches!(
+            err,
+            ClientError::DaemonUnreachable {
+                socket: path,
+                source
+            } if path == socket && source.raw_os_error() == Some(libc::ENOENT)
+        ));
     }
 }

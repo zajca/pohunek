@@ -97,10 +97,12 @@ linear_cli=linear
 # Issue picker: which Linear workflow-state types are 'actionable' (space-separated:
 # triage backlog unstarted started completed canceled).
 #linear_issue_states=started unstarted
-# Attach reconnect: after an unexpected daemon stream close, wait for a restarted
-# daemon to resume the session and reattach. Set seconds to 0 to disable.
+# Attach reconnect: after an unexpected stream close, retry with one shared time
+# window, linear backoff from the interval, and a bounded number of attempts.
+# Set seconds to 0 to disable.
 #attach_reconnect_seconds=20
 #attach_reconnect_interval_seconds=0.5
+#attach_reconnect_max_attempts=3
 #mark_retry_count=20
 #mark_retry_interval_seconds=0.1
 ";
@@ -644,6 +646,7 @@ mod tests {
         assert!(LAUNCHER_CONF.contains("host=local"));
         assert!(LAUNCHER_CONF.contains("terminal="));
         assert!(LAUNCHER_CONF.contains("linear_cli=linear"));
+        assert!(LAUNCHER_CONF.contains("attach_reconnect_max_attempts=3"));
     }
 
     #[test]

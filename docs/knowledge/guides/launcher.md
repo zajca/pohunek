@@ -43,11 +43,14 @@ separate banner window. There are no banner settings in `launcher.conf`.
 
 Attach terminals automatically retry after an unexpected daemon stream close.
 `attach_reconnect_seconds` controls the retry window, and
-`attach_reconnect_interval_seconds` controls the poll interval. The replacement
-daemon reconciles with the existing per-session worker, so Codex, Claude, and
-plain shell sessions retain the same PTY, child PID, and runtime id. A lost
-worker cannot be reconstructed by retrying attach; inspect `runtime.state` and
-use explicit native recovery only when supported. Set
+`attach_reconnect_interval_seconds` controls the minimum delay between attempts.
+`attach_reconnect_max_attempts` caps consecutive attempts within that window,
+including failures where inspect still reports a running session. The
+replacement daemon reconciles with the existing per-session worker, so Codex,
+Claude, and plain shell sessions retain the same PTY, child PID, and runtime id.
+A typed worker-stream failure is surfaced once and is not retried. A lost worker
+cannot be reconstructed by retrying attach; inspect `runtime.state` and use
+explicit native recovery only when supported. Set
 `attach_reconnect_seconds=0` to disable retry behavior.
 
 ## Work-item Links

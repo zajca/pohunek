@@ -8,7 +8,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::envelope::StateSource;
+use crate::{envelope::StateSource, ProtocolError};
 
 /// The kind of agent backing a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -436,6 +436,13 @@ pub struct SessionDetachParams {
 pub struct SessionDetachResult {
     /// Whether an active attach stream was detached.
     pub detached: bool,
+    /// Stream-local failure recorded before the raw connection closed.
+    ///
+    /// Clients should surface this error instead of treating the closure as a
+    /// transient daemon or runtime replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub error: Option<ProtocolError>,
 }
 
 /// Parameters for `session.resize`.

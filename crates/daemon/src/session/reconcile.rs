@@ -90,20 +90,26 @@ impl SessionRegistry {
                     "legacy migration import task panicked",
                 )
             })??;
-        let records = tokio::task::spawn_blocking(move || store.load_sessions())
-            .await
-            .map_err(|_join_error| {
-                runtime_error(
-                    "session_reconcile_failed",
-                    "logical-session store load task panicked",
-                )
-            })?
-            .map_err(|error| {
-                runtime_error(
-                    "session_reconcile_failed",
-                    format!("failed to load logical sessions: {error}"),
-                )
-            })?;
+        let (records, resume_bindings) = tokio::task::spawn_blocking(move || {
+            Ok::<_, std::io::Error>((store.load_sessions()?, store.load_resume()?))
+        })
+        .await
+        .map_err(|_join_error| {
+            runtime_error(
+                "session_reconcile_failed",
+                "logical-session store load task panicked",
+            )
+        })?
+        .map_err(|error| {
+            runtime_error(
+                "session_reconcile_failed",
+                format!("failed to load logical sessions: {error}"),
+            )
+        })?;
+        let mut resume_bindings = resume_bindings
+            .into_iter()
+            .map(|binding| (binding.session_id.clone(), binding))
+            .collect::<HashMap<_, _>>();
 
         let (mut discovered, inventory) = self.discover_workers(&records).await;
         let mut journals = self.discover_worker_journals().await;
@@ -121,7 +127,14 @@ impl SessionRegistry {
         }
         *self.inner.runtime_inventory.lock().await = inventory;
 
-        for record in records {
+        for mut record in records {
+            if let Some(binding) = resume_bindings.remove(&record.session_id) {
+                if let Err(reason) = merge_persisted_recovery(&mut record, binding) {
+                    self.insert_unavailable_record(record, RuntimeState::Conflict, reason)
+                        .await;
+                    continue;
+                }
+            }
             let candidates = discovered.remove(&record.session_id).unwrap_or_default();
             match candidates.as_slice() {
                 [candidate] if candidate.slot == record.session_id => {
@@ -808,6 +821,86 @@ impl SessionRegistry {
     }
 }
 
+fn merge_persisted_recovery(
+    record: &mut SessionRecord,
+    binding: crate::store::ResumeBinding,
+) -> Result<(), &'static str> {
+    if binding.agent != record.info.agent || binding.agent_base != record.info.agent_base {
+        return Err("resume_binding_agent_mismatch");
+    }
+    if let Some(recovery) = record.recovery.as_ref() {
+        if recovery.agent != binding.agent
+            || recovery.agent_base != binding.agent_base
+            || recovery.ref_kind != binding.ref_kind
+        {
+            return Err("resume_binding_shape_mismatch");
+        }
+    }
+
+    let kind = binding.ref_kind.or_else(|| {
+        record
+            .recovery
+            .as_ref()
+            .and_then(|recovery| recovery.ref_kind)
+    });
+    let (native_id, native_path) = match (
+        kind,
+        binding.native_session_id.as_deref(),
+        binding.native_session_path.as_deref(),
+    ) {
+        (Some(SessionRefKind::Id) | None, Some(native), None) => (
+            Some(
+                validate_native_reference(SessionRefKind::Id, native)
+                    .ok_or("resume_binding_reference_invalid")?,
+            ),
+            None,
+        ),
+        (Some(SessionRefKind::Path) | None, None, Some(native)) => (
+            None,
+            Some(
+                validate_native_reference(SessionRefKind::Path, native)
+                    .ok_or("resume_binding_reference_invalid")?,
+            ),
+        ),
+        (_, None, None) => return Ok(()),
+        _ => return Err("resume_binding_reference_kind_mismatch"),
+    };
+
+    if record
+        .info
+        .native_session_id
+        .as_ref()
+        .is_some_and(|existing| Some(existing) != native_id.as_ref())
+        || record
+            .info
+            .native_session_path
+            .as_ref()
+            .is_some_and(|existing| Some(existing) != native_path.as_ref())
+    {
+        return Err("resume_binding_reference_mismatch");
+    }
+    if let Some(recovery) = record.recovery.as_ref() {
+        if recovery
+            .native_session_id
+            .as_ref()
+            .is_some_and(|existing| Some(existing) != native_id.as_ref())
+            || recovery
+                .native_session_path
+                .as_ref()
+                .is_some_and(|existing| Some(existing) != native_path.as_ref())
+        {
+            return Err("resume_binding_reference_mismatch");
+        }
+    }
+
+    record.info.native_session_id.clone_from(&native_id);
+    record.info.native_session_path.clone_from(&native_path);
+    let recovery = record.recovery.get_or_insert(binding);
+    recovery.native_session_id = native_id;
+    recovery.native_session_path = native_path;
+    Ok(())
+}
+
 fn import_worker_identities(
     record: &mut SessionRecord,
     snapshot: &pohunek_worker_protocol::InspectSnapshot,
@@ -1359,14 +1452,14 @@ mod tests {
         TransactionId, Version, WorkerId,
     };
     use protocol::{
-        AgentKind, CwdSource, RuntimeInventoryStatus, RuntimeState, SessionId, SessionInfo,
-        SessionNewParams, SessionRuntime, SessionState, StateSource,
+        AgentKind, CwdSource, ForkCwdMode, RuntimeInventoryStatus, RuntimeState, SessionForkParams,
+        SessionId, SessionInfo, SessionNewParams, SessionRuntime, SessionState, StateSource,
     };
     use sha2::{Digest, Sha256};
     use tokio::net::UnixListener;
 
     use super::{import_legacy_manifest, import_worker_identities, SessionRegistry};
-    use crate::agent::{InputRules, SessionRefKind};
+    use crate::agent::{InputRules, ResumeMode, SessionRefKind};
     use crate::session::SessionRegistryConfig;
     use crate::store::{
         DesiredState, ResumeBinding, RuntimeRecord, SessionRecord, Store, StoredInputRules,
@@ -1523,7 +1616,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "restart continuity test keeps original and replacement registry assertions together"
     )]
-    async fn replacement_registry_commits_preparing_record_after_live_journal() {
+    async fn replacement_registry_preserves_native_recovery_and_fork_binding() {
         let root = temp_root();
         let runtime_root = root.join("runtime/workers");
         let session_id = "s-91";
@@ -1560,9 +1653,9 @@ mod tests {
                 transaction_id: TransactionId::new("create-restart-test").expect("transaction id"),
                 expected_worker_id: wire_worker_id.clone(),
                 launch: LaunchIdentity {
-                    agent: "shell".to_owned(),
-                    agent_base: "shell".to_owned(),
-                    reference_kind: None,
+                    agent: "claude".to_owned(),
+                    agent_base: "claude".to_owned(),
+                    reference_kind: Some("id".to_owned()),
                 },
                 executable: PathBuf::from("/bin/sh"),
                 arguments: vec!["-c".to_owned(), "printf ready; sleep 30".to_owned()],
@@ -1584,8 +1677,8 @@ mod tests {
             id: SessionId(session_id.to_owned()),
             external: Some(false),
             name: Some("restart continuity".to_owned()),
-            agent: "shell".to_owned(),
-            agent_base: AgentKind::Shell,
+            agent: "claude".to_owned(),
+            agent_base: AgentKind::Claude,
             cwd: root.clone(),
             cwd_source: Some(CwdSource::Launch),
             pid: child_pid,
@@ -1622,7 +1715,31 @@ mod tests {
             exit_code: None,
         };
         let store_path = root.join("data/metadata.jsonl");
-        Store::new(store_path.clone())
+        let store = Store::new(store_path.clone());
+        let stale_recovery = ResumeBinding {
+            session_id: session_id.to_owned(),
+            name: Some("restart continuity".to_owned()),
+            agent: "claude".to_owned(),
+            agent_base: AgentKind::Claude,
+            cwd: root.clone(),
+            cols: 80,
+            rows: 24,
+            native_session_id: None,
+            native_session_path: None,
+            project_id: None,
+            is_linked_worktree: None,
+            metadata: BTreeMap::new(),
+            program: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), "printf ready; sleep 30".to_owned()],
+            input_rules: StoredInputRules::from(InputRules {
+                bracketed_paste: false,
+                submit_delay: Duration::ZERO,
+            }),
+            resume_mode: Some(ResumeMode::Flag),
+            ref_kind: Some(SessionRefKind::Id),
+            resumable: true,
+        };
+        store
             .record_session(&SessionRecord {
                 schema_version: 1,
                 session_id: session_id.to_owned(),
@@ -1647,29 +1764,7 @@ mod tests {
                     }),
                     ..info
                 },
-                recovery: Some(ResumeBinding {
-                    session_id: session_id.to_owned(),
-                    name: Some("restart continuity".to_owned()),
-                    agent: "shell".to_owned(),
-                    agent_base: AgentKind::Shell,
-                    cwd: root.clone(),
-                    cols: 80,
-                    rows: 24,
-                    native_session_id: None,
-                    native_session_path: None,
-                    project_id: None,
-                    is_linked_worktree: None,
-                    metadata: BTreeMap::new(),
-                    program: "/bin/sh".to_owned(),
-                    args: vec!["-c".to_owned(), "printf ready; sleep 30".to_owned()],
-                    input_rules: StoredInputRules::from(InputRules {
-                        bracketed_paste: false,
-                        submit_delay: Duration::ZERO,
-                    }),
-                    resume_mode: None,
-                    ref_kind: None,
-                    resumable: false,
-                }),
+                recovery: Some(stale_recovery.clone()),
                 runtime: RuntimeRecord {
                     state: RuntimeState::Starting,
                     worker_id: None,
@@ -1679,6 +1774,11 @@ mod tests {
                 },
             })
             .expect("persist logical record");
+        let mut reported_recovery = stale_recovery;
+        reported_recovery.native_session_id = Some("native-restart-test".to_owned());
+        store
+            .record_resume(&reported_recovery)
+            .expect("persist native recovery binding");
         drop(first_controller);
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1703,6 +1803,11 @@ mod tests {
                 .and_then(|runtime| runtime.runtime_id.as_deref()),
             Some(runtime_id.as_str())
         );
+        assert_eq!(
+            adopted.native_session_id.as_deref(),
+            Some("native-restart-test"),
+            "replacement daemon must merge the latest persisted native binding"
+        );
         let committed = Store::new(root.join("data/metadata.jsonl"))
             .load_sessions()
             .expect("load committed record")
@@ -1711,6 +1816,14 @@ mod tests {
             .expect("committed logical record");
         assert_eq!(committed.transaction, None);
         assert_eq!(committed.runtime.state, RuntimeState::Live);
+        assert_eq!(
+            committed
+                .recovery
+                .as_ref()
+                .and_then(|binding| binding.native_session_id.as_deref()),
+            Some("native-restart-test"),
+            "reconciliation must commit the merged fork binding"
+        );
         let self_attach = replacement
             .attach(&protocol::SessionAttachParams {
                 session_id: SessionId(session_id.to_owned()),
@@ -1734,6 +1847,25 @@ mod tests {
             .resize(&SessionId(session_id.to_owned()), 100, 30)
             .await
             .expect("worker-backed resize after adoption");
+        let forked = replacement
+            .fork(SessionForkParams {
+                session_id: SessionId(session_id.to_owned()),
+                name: Some("restart recovery fork".to_owned()),
+                cwd_mode: ForkCwdMode::Same,
+                cols: 100,
+                rows: 30,
+            })
+            .await
+            .expect("fork adopted session from preserved native binding");
+        assert_ne!(forked.id, SessionId(session_id.to_owned()));
+        assert_eq!(
+            forked.native_session_id.as_deref(),
+            Some("native-restart-test")
+        );
+        replacement
+            .stop(&forked.id)
+            .await
+            .expect("stop recovery fork");
         replacement
             .stop(&SessionId(session_id.to_owned()))
             .await

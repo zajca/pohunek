@@ -1,8 +1,10 @@
 //! Defines validated worker runtime policy.
 
-// Rust guideline compliant 2026-07-23
+// Rust guideline compliant 2026-07-27
 
 use std::time::Duration;
+
+use pohunek_worker_protocol::MAX_DATA_PAYLOAD_BYTES;
 
 /// Default bootstrap window before an uninitialized worker exits.
 pub(crate) const DEFAULT_INITIALIZE_DEADLINE: Duration = Duration::from_secs(30);
@@ -27,8 +29,6 @@ pub(crate) const DEFAULT_TERMINAL_RETENTION: Duration = Duration::from_hours(24)
 const MAX_HISTORY_BYTES: usize = 256 * 1024 * 1024;
 /// Hard cap preventing one subscriber from consuming excessive output memory.
 const MAX_SUBSCRIBER_BYTES: usize = 64 * 1024 * 1024;
-/// Hard cap for one private data frame.
-const MAX_DATA_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 /// Hard cap for a private control line.
 const MAX_CONTROL_LINE_BYTES: usize = 1024 * 1024;
 /// Hard cap for retained completed input plans.
@@ -177,6 +177,7 @@ fn validate_duration(field: &'static str, value: Duration) -> Result<(), ConfigE
 #[cfg(test)]
 mod tests {
     use super::{ConfigError, WorkerConfig};
+    use pohunek_worker_protocol::MAX_DATA_PAYLOAD_BYTES;
     use std::time::Duration;
 
     #[test]
@@ -213,5 +214,22 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn data_payload_cannot_exceed_wire_limit() {
+        let config = WorkerConfig {
+            data_payload_bytes: MAX_DATA_PAYLOAD_BYTES + 1,
+            ..WorkerConfig::new()
+        };
+
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::Bytes {
+                field: "data_payload_bytes",
+                actual: MAX_DATA_PAYLOAD_BYTES + 1,
+                maximum: MAX_DATA_PAYLOAD_BYTES,
+            })
+        );
     }
 }

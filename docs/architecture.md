@@ -164,6 +164,11 @@ controller and one-use, short-lived data tokens. The daemon and worker support
 the current and immediately preceding worker protocol versions; an incompatible
 worker remains alive and is exposed as `runtime.state=incompatible`.
 
+Retained replay and terminal repaint payloads are split into contiguous frames
+bounded by the negotiated worker data payload. History capacity is independent
+of the per-frame allocation limit: increasing retained history must never
+require one proportionally large frame.
+
 ## Transport and Control Protocol
 
 There is one logical protocol exposed over two transports:
@@ -209,6 +214,12 @@ This keeps JSON as JSON and bytes as bytes, is trivial to debug, and maps cleanl
 onto both the Unix socket and the NetBird TCP transport. Multiple clients may
 attach to one session; resize policy when sizes differ is defined by the daemon
 (last attach wins, with explicit resize control available).
+
+If the private worker stream reports a typed failure, the daemon closes the raw
+pipe and retains that sanitized failure in a short-lived bounded result mailbox.
+The client consumes it once through `session.detach` and stops reconnecting that
+deterministic failure. Raw PTY bytes therefore remain unframed without losing
+the worker's root cause.
 
 ## PTY/TUI Agent Runtime
 

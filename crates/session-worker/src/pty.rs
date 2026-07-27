@@ -1,6 +1,6 @@
 //! Owns one PTY master and its managed process identity.
 
-// Rust guideline compliant 2026-07-24
+// Rust guideline compliant 2026-07-27
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -621,7 +621,10 @@ mod tests {
                     observed.extend_from_slice(&chunk.bytes);
                 }
                 OutputEvent::Exit { .. } => break,
-                OutputEvent::Gap { terminal, .. } => observed = terminal.ansi,
+                OutputEvent::Gap { .. } => observed.clear(),
+                OutputEvent::TerminalSnapshot(chunk) => {
+                    observed.extend_from_slice(&chunk.bytes);
+                }
             }
         }
         assert!(
