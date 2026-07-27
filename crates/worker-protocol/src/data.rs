@@ -5,7 +5,7 @@
 //! Lengths are checked before allocation. Async helpers tolerate arbitrary
 //! partial reads and writes.
 
-// Rust guideline compliant 2026-06-26
+// Rust guideline compliant 2026-07-27
 
 use std::fmt::{Debug, Formatter};
 use std::io::ErrorKind;
@@ -118,6 +118,9 @@ pub enum FrameKind {
         offset: u64,
     },
     /// Carries structured state and an ANSI repaint payload.
+    ///
+    /// A repaint may span multiple frames with identical snapshot metadata.
+    /// Receivers preserve the payload order of frames for the same snapshot.
     TerminalSnapshot {
         /// Complete terminal state.
         snapshot: TerminalSnapshot,

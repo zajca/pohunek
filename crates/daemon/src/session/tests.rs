@@ -2333,9 +2333,84 @@ async fn attach_tokens_are_one_shot_and_expired_tokens_are_pruned() {
         .expect_err("stream id is one-shot");
     assert_eq!(second_redeem.code, "attach_not_found");
 
-    registry.finish_attach(&redeemed.stream_id).await;
+    registry.finish_attach(&redeemed.stream_id, None).await;
     let stopped = registry.stop(&created.id).await.expect("stop session");
     assert!(stopped.stopped);
+}
+
+#[tokio::test]
+async fn failed_attach_results_are_bounded_and_consumed_once() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        attach_result_capacity: 2,
+        ..SessionRegistryConfig::default()
+    });
+    for stream_id in ["a-oldest", "a-middle", "a-newest"] {
+        registry
+            .finish_attach(
+                stream_id,
+                Some(protocol::ProtocolError::new(
+                    protocol::ErrorClass::Runtime,
+                    "worker_runtime_fault",
+                    format!("failure for {stream_id}"),
+                    None,
+                )),
+            )
+            .await;
+    }
+
+    assert_eq!(
+        registry.inner.recent_attach_failures.lock().await.len(),
+        2,
+        "failed attach mailbox must never exceed its configured capacity"
+    );
+    let evicted = registry.detach("a-oldest").await;
+    assert!(!evicted.detached);
+    assert_eq!(evicted.error, None, "oldest result must be evicted first");
+
+    let first = registry.detach("a-middle").await;
+    assert!(!first.detached);
+    assert_eq!(
+        first.error.as_ref().map(|error| error.code.as_str()),
+        Some("worker_runtime_fault")
+    );
+    let consumed = registry.detach("a-middle").await;
+    assert_eq!(
+        consumed.error, None,
+        "a failed attach outcome is returned at most once"
+    );
+}
+
+#[tokio::test]
+async fn failed_attach_results_expire_before_lookup() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        attach_result_ttl: Duration::from_millis(1),
+        ..SessionRegistryConfig::default()
+    });
+    registry
+        .finish_attach(
+            "a-expired",
+            Some(protocol::ProtocolError::new(
+                protocol::ErrorClass::Runtime,
+                "worker_attach_stream_failed",
+                "expired failure",
+                None,
+            )),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let result = registry.detach("a-expired").await;
+    assert!(!result.detached);
+    assert_eq!(result.error, None);
+    assert!(
+        registry
+            .inner
+            .recent_attach_failures
+            .lock()
+            .await
+            .is_empty(),
+        "lookup must prune expired attach outcomes"
+    );
 }
 
 #[tokio::test]

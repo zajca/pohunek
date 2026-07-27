@@ -1701,13 +1701,39 @@ fn session_detach_params_json_shape_roundtrips() {
 
 #[test]
 fn session_detach_result_json_shape_roundtrips() {
-    let result = SessionDetachResult { detached: true };
+    let result = SessionDetachResult {
+        detached: true,
+        error: None,
+    };
 
     let value = serde_json::to_value(&result).expect("serialize detach result");
     assert_eq!(value, json!({ "detached": true }));
 
     let back = line_roundtrip(&result);
     assert_eq!(back, result);
+
+    let failed = SessionDetachResult {
+        detached: false,
+        error: Some(ProtocolError::new(
+            ErrorClass::Runtime,
+            "worker_attach_stream_failed",
+            "worker attach stream failed",
+            None,
+        )),
+    };
+    let value = serde_json::to_value(&failed).expect("serialize failed detach result");
+    assert_eq!(
+        value,
+        json!({
+            "detached": false,
+            "error": {
+                "class": "runtime",
+                "code": "worker_attach_stream_failed",
+                "msg": "worker attach stream failed"
+            }
+        })
+    );
+    assert_eq!(line_roundtrip(&failed), failed);
 }
 
 #[test]

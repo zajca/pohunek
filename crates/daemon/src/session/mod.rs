@@ -80,6 +80,16 @@ use resume::ResumeSnapshot;
 use target::{build_launch_command, LaunchCommandPlan, PtySessionSpec, TargetResolution};
 
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
+/// Time to retain a failed raw attach outcome for one control-plane lookup.
+///
+/// Clients query the outcome immediately after observing raw EOF. One minute
+/// tolerates scheduler stalls without retaining stale stream errors indefinitely.
+const DEFAULT_ATTACH_RESULT_TTL: Duration = Duration::from_mins(1);
+/// Maximum number of failed raw attach outcomes retained between EOF and detach.
+///
+/// Attach failures are exceptional and consumed once. This bound prevents a
+/// disconnected or malicious client from accumulating daemon memory.
+const DEFAULT_ATTACH_RESULT_CAPACITY: usize = 128;
 /// Maximum time to wait for a newly activated worker bootstrap socket.
 const DEFAULT_WORKER_CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 /// Initial retry interval while a systemd worker binds its bootstrap socket.
@@ -209,6 +219,10 @@ pub struct SessionRegistryConfig {
     pub stop_grace: Duration,
     /// How long a one-shot attach token may remain pending before redemption.
     pub attach_token_ttl: Duration,
+    /// How long a failed attach outcome remains available to `session.detach`.
+    pub attach_result_ttl: Duration,
+    /// Maximum failed attach outcomes retained for one-shot retrieval.
+    pub attach_result_capacity: usize,
     /// Per-session cap on the raw-output history buffer replayed on attach.
     pub output_history_limit_bytes: usize,
     /// Delay before sending Claude Code's Ink submit byte as a separate write.
@@ -282,6 +296,8 @@ impl Default for SessionRegistryConfig {
             shell_command: ShellCommand::default(),
             stop_grace: Duration::from_millis(500),
             attach_token_ttl: DEFAULT_ATTACH_TOKEN_TTL,
+            attach_result_ttl: DEFAULT_ATTACH_RESULT_TTL,
+            attach_result_capacity: DEFAULT_ATTACH_RESULT_CAPACITY,
             output_history_limit_bytes: DEFAULT_OUTPUT_HISTORY_LIMIT_BYTES,
             claude_submit_delay: crate::agent::DEFAULT_CLAUDE_SUBMIT_DELAY,
             initial_input_startup_grace: DEFAULT_INITIAL_INPUT_STARTUP_GRACE,
@@ -316,6 +332,7 @@ struct SessionRegistryInner {
     runtime_inventory: Mutex<Vec<RuntimeInventoryEntry>>,
     pending_attaches: Mutex<HashMap<String, PendingAttach>>,
     active_attaches: Mutex<HashMap<String, ActiveAttach>>,
+    recent_attach_failures: Mutex<VecDeque<attach::RecentAttachFailure>>,
     next_stream_id: AtomicU64,
     next_write_id: AtomicU64,
     next_resize_sequence: AtomicU64,
@@ -690,6 +707,7 @@ impl SessionRegistry {
                 runtime_inventory: Mutex::new(Vec::new()),
                 pending_attaches: Mutex::new(HashMap::new()),
                 active_attaches: Mutex::new(HashMap::new()),
+                recent_attach_failures: Mutex::new(VecDeque::new()),
                 next_stream_id: AtomicU64::new(1),
                 next_write_id: AtomicU64::new(1),
                 next_resize_sequence: AtomicU64::new(1),

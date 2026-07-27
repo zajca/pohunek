@@ -34,7 +34,7 @@ pub use journal::{
 pub use lease::{ControllerLease, LeaseError, LeaseOwner};
 #[doc(inline)]
 pub use output::{
-    OutputChunk, OutputEvent, OutputHub, OutputSnapshot, OutputSubscriber, RingError,
+    OutputChunk, OutputEvent, OutputHub, OutputSnapshot, OutputSubscriber, RingError, TerminalChunk,
 };
 #[doc(inline)]
 pub use pohunek_terminal::TerminalSnapshot;

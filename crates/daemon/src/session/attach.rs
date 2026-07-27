@@ -20,6 +20,13 @@ pub(super) struct ActiveAttach {
     pub(super) cancel: CancellationToken,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct RecentAttachFailure {
+    pub(super) stream_id: String,
+    pub(super) error: ProtocolError,
+    pub(super) finished_at: tokio::time::Instant,
+}
+
 /// Redeemed raw attach stream state for the API bridge.
 #[derive(Debug)]
 pub struct RedeemedAttach {
@@ -180,11 +187,16 @@ impl SessionRegistry {
         } else {
             false
         };
-        protocol::SessionDetachResult { detached }
+        let error = if detached {
+            None
+        } else {
+            self.take_attach_failure(stream_id).await
+        };
+        protocol::SessionDetachResult { detached, error }
     }
 
     /// Deregister a raw attach stream after its bridge exits.
-    pub async fn finish_attach(&self, stream_id: &str) {
+    pub async fn finish_attach(&self, stream_id: &str, error: Option<ProtocolError>) {
         let active = {
             let mut active_attaches = self.inner.active_attaches.lock().await;
             active_attaches.remove(stream_id)
@@ -192,6 +204,9 @@ impl SessionRegistry {
 
         if let Some(active) = active {
             self.emit_attach(event::ATTACH_CLOSED, &active.session_id, stream_id);
+        }
+        if let Some(error) = error {
+            self.store_attach_failure(stream_id, error).await;
         }
     }
 
@@ -211,6 +226,34 @@ impl SessionRegistry {
         pending_attaches.retain(|_, pending| pending.expires_at > now);
     }
 
+    async fn store_attach_failure(&self, stream_id: &str, error: ProtocolError) {
+        let capacity = self.inner.config.attach_result_capacity;
+        if capacity == 0 {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        let mut failures = self.inner.recent_attach_failures.lock().await;
+        prune_attach_failures(&mut failures, now, self.inner.config.attach_result_ttl);
+        while failures.len() >= capacity {
+            failures.pop_front();
+        }
+        failures.push_back(RecentAttachFailure {
+            stream_id: stream_id.to_owned(),
+            error,
+            finished_at: now,
+        });
+    }
+
+    async fn take_attach_failure(&self, stream_id: &str) -> Option<ProtocolError> {
+        let now = tokio::time::Instant::now();
+        let mut failures = self.inner.recent_attach_failures.lock().await;
+        prune_attach_failures(&mut failures, now, self.inner.config.attach_result_ttl);
+        let position = failures
+            .iter()
+            .position(|failure| failure.stream_id == stream_id)?;
+        failures.remove(position).map(|failure| failure.error)
+    }
+
     pub(super) async fn remove_pending_attaches_for_session(&self, id: &SessionId) {
         let mut pending_attaches = self.inner.pending_attaches.lock().await;
         pending_attaches.retain(|_, pending| pending.session_id != *id);
@@ -226,6 +269,14 @@ impl SessionRegistry {
         );
         let _ = self.inner.events.send(event);
     }
+}
+
+fn prune_attach_failures(
+    failures: &mut std::collections::VecDeque<RecentAttachFailure>,
+    now: tokio::time::Instant,
+    ttl: std::time::Duration,
+) {
+    failures.retain(|failure| now.saturating_duration_since(failure.finished_at) < ttl);
 }
 
 /// Raised when the attaching client reports (via `POHUNEK_SESSION_ID` +

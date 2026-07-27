@@ -182,7 +182,9 @@ and controller sockets, but the worker keeps the same PTY and process group,
 continues draining bounded output, and accepts the replacement daemon after
 reconciliation. `pohunek attach` reconnects to the same runtime id. Reconnection
 emits `session_runtime_reconnected`; it does not emit `session_created`, report
-child exit, or invoke native resume.
+child exit, or invoke native resume. Retained raw output and terminal repaint
+data are replayed as bounded contiguous worker frames, so the configured history
+capacity can exceed one frame without making the live session unattachable.
 
 Native recovery metadata is accepted only from the immutable launch agent
 process, so a nested different or same-provider agent cannot overwrite the
@@ -193,6 +195,9 @@ prefer the worker endpoint so accepted state survives daemon outage. Nested
 active-agent reports remain runtime evidence only: they can expose the active
 agent and active native metadata while that process runs, but never populate or
 replace `native_session_id` / `native_session_path` for the parent session.
+Startup reconciliation merges the worker's immutable launch identity into the
+persisted session and recovery binding; it does not replace an already captured
+native reference with an empty worker field.
 Procwatch can auto-report a matching nested agent when hooks are missing, and
 auto-release clears stale active fields when the backing process exits or an
 unbound claim exceeds the active-agent claim TTL.
