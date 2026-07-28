@@ -1,6 +1,6 @@
 //! Serves the private daemon-worker Unix protocol.
 
-// Rust guideline compliant 2026-07-27
+// Rust guideline compliant 2026-07-28
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -22,7 +22,7 @@ use protocol::{
     Initialize, InspectSnapshot, LeaseChallenge, LeaseId, ProcessIdentity as WireProcessIdentity,
     ReportedLaunchIdentity, RequestKind, ResponseKind, RuntimeId, RuntimePhase as WireRuntimePhase,
     RuntimeScope, SessionId, StreamId, StreamMode, TerminalSnapshot as WireTerminalSnapshot,
-    TokenClaims, TokenVault, TransactionId, Version, WorkerId, WriteAck, SUPPORTED_RANGE,
+    TokenClaims, TokenVault, TransactionId, Version, WorkerId, WriteAck, WriteId, SUPPORTED_RANGE,
 };
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
@@ -47,6 +47,10 @@ const EVENT_BUFFER: usize = 256;
 const DATA_TOKEN_CAPACITY: usize = 4_096;
 /// Entropy bytes used for opaque worker credentials and runtime IDs.
 const RANDOM_BYTES: usize = 16;
+/// Prefix shared by daemon-generated control input identifiers.
+const CONTROL_INPUT_PREFIX: &str = "input-";
+/// Prefix shared by stream-scoped raw attach input identifiers.
+const ATTACH_INPUT_PREFIX: &str = "attach-";
 /// Environment variables inherited from the systemd worker but never the child.
 const WORKER_ONLY_ENV: [&str; 5] = [
     "NOTIFY_SOCKET",
@@ -828,6 +832,13 @@ async fn write_request(
     let pty = scoped_pty(shared, connection, scope).await?;
     let byte_len = u64::try_from(plan.byte_len()).unwrap_or(u64::MAX);
     let (write_id, fragments) = plan.into_parts();
+    let producer_id = connection
+        .owner
+        .as_ref()
+        .ok_or_else(identity_mismatch)?
+        .daemon_id
+        .clone();
+    let lease_id = connection.lease_id.as_ref().ok_or_else(identity_mismatch)?;
     let local = InputPlan {
         write_id: write_id.to_string(),
         fragments: fragments
@@ -838,10 +849,15 @@ async fn write_request(
             })
             .collect(),
     };
-    pty.input()
-        .execute(local)
-        .await
-        .map_err(input_control_error)?;
+    match control_input_id(&write_id, lease_id.as_str())? {
+        ControlInputId::Namespaced { sequence } => {
+            pty.input()
+                .execute_control(lease_id.as_str(), sequence, local)
+                .await
+        }
+        ControlInputId::Legacy => pty.input().execute_legacy(&producer_id, local).await,
+    }
+    .map_err(input_control_error)?;
     Ok(ResponseKind::WriteCompleted {
         acknowledgement: WriteAck {
             write_id,
@@ -1164,6 +1180,7 @@ async fn serve_data(
     let version = header.version;
     let stream_id = header.stream_id;
     let runtime_id = header.runtime_id;
+    let mut next_input_sequence = 1_u64;
 
     loop {
         tokio::select! {
@@ -1195,28 +1212,66 @@ async fn serve_data(
                 ).await?;
             }
             input = protocol::read_frame(&mut read_half), if mode == StreamMode::Attach => {
-                let input = input
-                    .map_err(|error| WorkerError::Protocol(error.to_string()))?
-                    .ok_or_else(|| WorkerError::Protocol("attach data stream closed".to_owned()))?;
+                let input = match input {
+                    Ok(Some(input)) => input,
+                    Ok(None) => return Ok(()),
+                    Err(error) => {
+                        return write_data_error(
+                            &mut write_half,
+                            version,
+                            &stream_id,
+                            &runtime_id,
+                            control_error(ControlCode::InvalidRequest, error, false),
+                        ).await;
+                    }
+                };
                 let (input_header, bytes) = input.into_parts();
                 let FrameKind::Input { write_id } = input_header.kind else {
-                    return Err(WorkerError::Protocol(
-                        "attach data stream received a non-input frame".to_owned(),
-                    ));
+                    return write_data_error(
+                        &mut write_half,
+                        version,
+                        &stream_id,
+                        &runtime_id,
+                        control_error_message(
+                            ControlCode::InvalidRequest,
+                            "attach data stream received a non-input frame",
+                            false,
+                        ),
+                    ).await;
                 };
                 if input_header.runtime_id != runtime_id || input_header.stream_id != stream_id {
-                    return Err(WorkerError::Protocol(
-                        "attach input scope does not match stream".to_owned(),
-                    ));
+                    return write_data_error(
+                        &mut write_half,
+                        version,
+                        &stream_id,
+                        &runtime_id,
+                        identity_mismatch(),
+                    ).await;
+                }
+                if let Err(error) =
+                    validate_attach_write_id(&write_id, &stream_id, next_input_sequence)
+                {
+                    return write_data_error(
+                        &mut write_half,
+                        version,
+                        &stream_id,
+                        &runtime_id,
+                        error,
+                    ).await;
                 }
                 let byte_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                pty.input().execute(InputPlan {
-                    write_id: write_id.to_string(),
-                    fragments: vec![InputFragment {
+                if let Err(error) = pty.input().execute_stream(vec![InputFragment {
                         bytes,
                         delay_after: Duration::ZERO,
-                    }],
-                }).await.map_err(|error| WorkerError::Protocol(error.to_string()))?;
+                    }]).await {
+                    return write_data_error(
+                        &mut write_half,
+                        version,
+                        &stream_id,
+                        &runtime_id,
+                        input_control_error(error),
+                    ).await;
+                }
                 write_data_frame(
                     &mut write_half,
                     version,
@@ -1228,9 +1283,46 @@ async fn serve_data(
                     },
                     Vec::new(),
                 ).await?;
+                next_input_sequence = match next_input_sequence.checked_add(1) {
+                    Some(sequence) => sequence,
+                    None => {
+                        return write_data_error(
+                            &mut write_half,
+                            version,
+                            &stream_id,
+                            &runtime_id,
+                            control_error_message(
+                                ControlCode::InvalidRequest,
+                                "attach input sequence was exhausted",
+                                false,
+                            ),
+                        ).await;
+                    }
+                };
             }
         }
     }
+}
+
+async fn write_data_error<W>(
+    writer: &mut W,
+    version: Version,
+    stream_id: &StreamId,
+    runtime_id: &RuntimeId,
+    error: ControlError,
+) -> Result<(), WorkerError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    write_data_frame(
+        writer,
+        version,
+        stream_id,
+        runtime_id,
+        FrameKind::Error { error },
+        Vec::new(),
+    )
+    .await
 }
 
 async fn write_output_event<W>(
@@ -1766,6 +1858,66 @@ fn input_control_error(error: crate::InputError) -> ControlError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlInputId {
+    Namespaced { sequence: u64 },
+    Legacy,
+}
+
+fn control_input_id(write_id: &WriteId, lease_id: &str) -> Result<ControlInputId, ControlError> {
+    let value = write_id
+        .as_str()
+        .strip_prefix(CONTROL_INPUT_PREFIX)
+        .ok_or_else(|| invalid_control_write_id(write_id))?;
+    let Some((namespace, sequence)) = value.rsplit_once('-') else {
+        // Older daemons emitted `input-N` and could deliver two freshly
+        // allocated IDs out of order. Preserve their bounded conservative
+        // deduplication rather than applying the namespaced monotonic invariant.
+        let sequence = value
+            .parse::<u64>()
+            .map_err(|_error| invalid_control_write_id(write_id))?;
+        if sequence == 0 {
+            return Err(invalid_control_write_id(write_id));
+        }
+        return Ok(ControlInputId::Legacy);
+    };
+    if namespace != lease_id {
+        return Err(identity_mismatch());
+    }
+    let sequence = sequence
+        .parse::<u64>()
+        .map_err(|_error| invalid_control_write_id(write_id))?;
+    if sequence == 0 {
+        return Err(invalid_control_write_id(write_id));
+    }
+    Ok(ControlInputId::Namespaced { sequence })
+}
+
+fn validate_attach_write_id(
+    write_id: &WriteId,
+    stream_id: &StreamId,
+    sequence: u64,
+) -> Result<(), ControlError> {
+    let expected = format!("{ATTACH_INPUT_PREFIX}{stream_id}-{sequence}");
+    if write_id.as_str() == expected {
+        Ok(())
+    } else {
+        Err(control_error_message(
+            ControlCode::InvalidRequest,
+            "attach input id is not the next stream-scoped sequence",
+            false,
+        ))
+    }
+}
+
+fn invalid_control_write_id(write_id: &WriteId) -> ControlError {
+    control_error_message(
+        ControlCode::InvalidRequest,
+        &format!("control input id `{write_id}` is not lease-scoped and monotonic"),
+        false,
+    )
+}
+
 fn identity_mismatch() -> ControlError {
     control_error_message(
         ControlCode::IdentityMismatch,
@@ -2078,12 +2230,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_stat, random_value, signal_number, write_output_chunks, write_terminal_chunks,
-        PrefixStream, WireTerminalSnapshot,
+        control_input_id, parse_stat, random_value, signal_number, validate_attach_write_id,
+        write_data_error, write_output_chunks, write_terminal_chunks, ControlInputId, PrefixStream,
+        WireTerminalSnapshot,
     };
     use pohunek_worker_protocol::{
-        self as protocol, Cursor, Dimensions, FrameKind, RuntimeId, StreamId, CURRENT_VERSION,
-        MAX_DATA_PAYLOAD_BYTES,
+        self as protocol, ControlCode, ControlError, Cursor, Dimensions, FrameKind, RuntimeId,
+        StreamId, WriteId, CURRENT_VERSION, MAX_DATA_PAYLOAD_BYTES,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -2117,6 +2270,39 @@ mod tests {
         assert_eq!(signal_number("unknown"), None);
     }
 
+    #[test]
+    fn control_input_ids_are_scoped_to_the_active_lease() {
+        let namespaced = WriteId::new("input-lease-a-42").expect("namespaced input id");
+        assert_eq!(
+            control_input_id(&namespaced, "lease-a").expect("matching lease"),
+            ControlInputId::Namespaced { sequence: 42 }
+        );
+        let mismatch = control_input_id(&namespaced, "lease-b").expect_err("old lease mismatch");
+        assert_eq!(mismatch.code, ControlCode::IdentityMismatch);
+
+        let legacy = WriteId::new("input-17").expect("legacy input id");
+        assert_eq!(
+            control_input_id(&legacy, "lease-a").expect("legacy compatibility"),
+            ControlInputId::Legacy
+        );
+    }
+
+    #[test]
+    fn attach_input_ids_remain_monotonic_past_dedup_capacity() {
+        let stream_id = StreamId::new("a-8192").expect("stream id");
+        for sequence in 1..=8_192 {
+            let write_id =
+                WriteId::new(format!("attach-{stream_id}-{sequence}")).expect("attach input id");
+            validate_attach_write_id(&write_id, &stream_id, sequence)
+                .expect("next attach sequence");
+        }
+
+        let duplicate = WriteId::new(format!("attach-{stream_id}-8192")).expect("duplicate id");
+        let error =
+            validate_attach_write_id(&duplicate, &stream_id, 8_193).expect_err("old sequence");
+        assert_eq!(error.code, ControlCode::InvalidRequest);
+    }
+
     #[tokio::test]
     async fn prefix_stream_replays_consumed_classifier_byte() {
         let (left, mut right) = tokio::io::duplex(16);
@@ -2126,6 +2312,36 @@ mod tests {
         let mut output = [0_u8; 3];
         stream.read_exact(&mut output).await.expect("read");
         assert_eq!(&output, b"abc");
+    }
+
+    #[tokio::test]
+    async fn data_stream_failure_is_emitted_as_a_typed_error_frame() {
+        let stream_id = StreamId::new("a-error").expect("stream id");
+        let runtime_id = RuntimeId::new("runtime-error").expect("runtime id");
+        let (mut reader, mut writer) = tokio::io::duplex(4_096);
+        let expected = ControlError {
+            code: ControlCode::RuntimeFault,
+            message: "PTY input write failed".to_owned(),
+            retryable: true,
+        };
+
+        write_data_error(
+            &mut writer,
+            CURRENT_VERSION,
+            &stream_id,
+            &runtime_id,
+            expected.clone(),
+        )
+        .await
+        .expect("write typed stream error");
+        let frame = protocol::read_frame(&mut reader)
+            .await
+            .expect("read error frame")
+            .expect("error frame");
+
+        assert_eq!(frame.header().stream_id, stream_id);
+        assert_eq!(frame.header().runtime_id, runtime_id);
+        assert_eq!(frame.header().kind, FrameKind::Error { error: expected });
     }
 
     #[tokio::test]

@@ -7,15 +7,18 @@ use std::sync::Arc;
 use pohunek_worker_protocol::{
     write_frame, Capability, ControlCode, ControlMessage, ControlReader, ControlRequest,
     ControlResponse, ControlWriter, DaemonId, DataFrame, Dimensions, ExitStatus, FrameHeader,
-    FrameKind, Initialize, InputPlan, InspectSnapshot, LeaseId, RequestId, RequestKind,
-    ResizeRequest, ResponseKind, RuntimeId, RuntimeScope, SessionId, StopRequest, StreamId,
-    StreamMode, TransactionId, Version, WorkerId, SUPPORTED_RANGE,
+    FrameKind, Initialize, InputFragment, InputPlan, InspectSnapshot, LeaseId, RequestId,
+    RequestKind, ResizeRequest, ResponseKind, RuntimeId, RuntimeScope, SessionId, StopRequest,
+    StreamId, StreamMode, TransactionId, Version, WorkerId, WriteId, SUPPORTED_RANGE,
 };
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
-// Rust guideline compliant 2026-07-23
+// Rust guideline compliant 2026-07-28
+
+/// Prefix for daemon-generated, producer-scoped control input identifiers.
+const INPUT_WRITE_ID_PREFIX: &str = "input";
 
 /// Errors raised while controlling a durable worker.
 #[derive(Debug, thiserror::Error)]
@@ -67,6 +70,7 @@ struct Inner {
     worker_id: WorkerId,
     runtime_id: Option<RuntimeId>,
     lease_id: LeaseId,
+    next_write_sequence: u64,
 }
 
 /// One authenticated framed worker data stream.
@@ -225,7 +229,7 @@ impl Worker {
             ControlRequest {
                 request_id,
                 kind: RequestKind::AcquireController {
-                    daemon_instance_id: daemon_id,
+                    daemon_instance_id: daemon_id.clone(),
                     challenge,
                     requested_capabilities,
                 },
@@ -246,6 +250,7 @@ impl Worker {
                 worker_id,
                 runtime_id,
                 lease_id,
+                next_write_sequence: 1,
             })),
             socket_path,
             request_sequence: Arc::new(AtomicU64::new(1)),
@@ -317,14 +322,29 @@ impl Worker {
         }
     }
 
-    /// Executes one deduplicated input plan.
+    /// Executes one lease-scoped deduplicated input plan.
+    ///
+    /// The sequence is allocated while the control mutex is held, so one daemon
+    /// lease reaches the worker monotonically. Reconnecting acquires a new lease
+    /// and therefore starts a new sequence namespace. This client intentionally
+    /// does not retry an ambiguous exchange: it has no private reconnect path,
+    /// and the public input request has no stable idempotency key. A future
+    /// retry implementation must retain and resend the same generated plan
+    /// rather than invoke this method again.
     ///
     /// # Errors
     ///
     /// Returns [`WorkerError`] for unavailable runtime or worker rejection.
-    pub async fn write(&self, plan: InputPlan) -> Result<u64, WorkerError> {
+    pub async fn write(&self, fragments: Vec<InputFragment>) -> Result<u64, WorkerError> {
         let mut inner = self.inner.lock().await;
         let scope = scope(&inner)?;
+        let sequence = inner.next_write_sequence;
+        inner.next_write_sequence = sequence.checked_add(1).ok_or_else(|| {
+            WorkerError::Protocol("worker input sequence was exhausted".to_owned())
+        })?;
+        let write_id = input_write_id(&inner.lease_id, sequence)?;
+        let plan = InputPlan::new(write_id, fragments)
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?;
         let response = request_locked(
             &mut inner,
             self.next_request_id("write")?,
@@ -500,6 +520,11 @@ fn scope(inner: &Inner) -> Result<RuntimeScope, WorkerError> {
     })
 }
 
+fn input_write_id(lease_id: &LeaseId, sequence: u64) -> Result<WriteId, WorkerError> {
+    WriteId::new(format!("{INPUT_WRITE_ID_PREFIX}-{lease_id}-{sequence}"))
+        .map_err(|error| WorkerError::Protocol(error.to_string()))
+}
+
 async fn request_locked(
     inner: &mut Inner,
     request_id: RequestId,
@@ -564,5 +589,22 @@ mod tests {
     #[test]
     fn current_protocol_is_in_supported_range() {
         assert!(SUPPORTED_RANGE.contains(pohunek_worker_protocol::CURRENT_VERSION));
+    }
+
+    #[test]
+    fn replacement_lease_restarts_input_sequence_in_a_fresh_namespace() {
+        let first = LeaseId::new("lease-a").expect("first lease");
+        let replacement = LeaseId::new("lease-b").expect("replacement lease");
+
+        assert_eq!(
+            input_write_id(&first, 1).expect("first input").as_str(),
+            "input-lease-a-1"
+        );
+        assert_eq!(
+            input_write_id(&replacement, 1)
+                .expect("replacement input")
+                .as_str(),
+            "input-lease-b-1"
+        );
     }
 }

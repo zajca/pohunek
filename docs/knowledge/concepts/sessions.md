@@ -185,6 +185,10 @@ emits `session_runtime_reconnected`; it does not emit `session_created`, report
 child exit, or invoke native resume. Retained raw output and terminal repaint
 data are replayed as bounded contiguous worker frames, so the configured history
 capacity can exceed one frame without making the live session unattachable.
+Interactive attach input is ordered by a stream-scoped sequence and does not
+consume the worker's bounded control-input deduplication capacity. A typed
+worker stream failure is retained by the daemon for the attaching CLI, which
+surfaces it instead of repeatedly treating it as an ordinary reconnect.
 
 Native recovery metadata is accepted only from the immutable launch agent
 process, so a nested different or same-provider agent cannot overwrite the

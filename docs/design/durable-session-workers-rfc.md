@@ -880,33 +880,45 @@ continuation.
 
 ### 13.1 Deduplicated input plans
 
-Every daemon-generated input operation has a `write_id` unique within the
-runtime. For public `session.input`, it is derived from the runtime ID and
-public request ID so retrying the same request produces the same value.
+Every daemon-generated control input operation has a `write_id` containing the
+controller-lease namespace and a sequence allocated while the worker client's
+control mutex is held. Requests from one lease therefore reach a worker in
+strictly increasing sequence order.
 
 `WritePlan` contains ordered byte fragments and configured delays. The worker,
 not the daemon, performs delayed TUI framing such as bracketed paste and a later
 submit byte. Therefore a daemon crash between fragments does not leave a new
 daemon guessing which fragments were written.
 
-The worker keeps a bounded map of in-progress and completed write IDs:
+The worker keeps a bounded map of in-progress and completed write IDs plus an
+exact high watermark for the active controller lease:
 
 - first receipt starts the plan;
 - a duplicate while in progress joins the same result;
 - a duplicate after completion returns the prior acknowledgement;
 - reuse of a write ID with different content is rejected;
+- an unretained ID at or below the lease watermark returns
+  `write_outcome_unknown`;
+- an ID above the watermark is provably fresh and cannot be rejected by a
+  probabilistic membership test;
 - completion is acknowledged only after every fragment is written and flushed.
 
-The dedup map lives for the worker lifetime and therefore survives daemon
-restart. Its capacity and retention are configured and bounded. Eviction never
-causes an automatic retry; an expired ambiguous write returns
-`write_outcome_unknown`.
+The dedup map and watermark rotate with the validated controller `lease_id`.
+This includes a reconnect by the same daemon instance: the new lease may safely
+restart its sequence at one. Requests carrying an old lease are rejected before
+input handling, so an old namespace cannot recur after rotation. The capacity
+remains configured and bounded. Older daemons emitted unordered `input-N`
+identifiers; the worker retains their previous bounded conservative
+deduplication behavior for rollback compatibility.
 
-Raw attach input is chunked by the daemon into write plans with stream-scoped
-monotonic IDs. The daemon does not retry a raw chunk after losing its worker
-connection. This gives at-most-once retry behavior: a final chunk may be lost
-during simultaneous connection failure, but it is never duplicated by
-reconnection.
+Raw attach input uses stream-scoped monotonic IDs on one ordered framed
+connection. The worker validates the next sequence and executes the bytes
+through the shared PTY write serializer without inserting them into the
+lifetime control dedup map. The daemon does not retry a raw chunk after losing
+its worker connection. This gives at-most-once retry behavior: a final chunk may
+be lost during simultaneous connection failure, but it is never duplicated by
+reconnection. A stream-local input failure is sent as a typed `Error` frame
+before close when the connection remains writable.
 
 ### 13.2 Resize
 

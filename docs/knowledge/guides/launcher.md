@@ -41,6 +41,12 @@ output, and resumes passthrough without losing terminal modes or scroll margins.
 The rofi/sway switcher only opens marked attach terminals; it does not create a
 separate banner window. There are no banner settings in `launcher.conf`.
 
+Whenever an attach attempt ends — detach, session stop, typed failure,
+unexpected EOF, or reconnect — the CLI restores normal terminal output modes
+after replaying any buffered menu output. This disables mouse and focus
+reporting, bracketed paste, alternate-screen state, and TUI cursor/scroll modes
+before returning control to the parent shell.
+
 Attach terminals automatically retry after an unexpected daemon stream close.
 `attach_reconnect_seconds` controls the retry window, and
 `attach_reconnect_interval_seconds` controls the minimum delay between attempts.

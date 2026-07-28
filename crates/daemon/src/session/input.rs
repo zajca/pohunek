@@ -1,14 +1,12 @@
 //! User/initial input framing and PTY delivery.
 
-use pohunek_worker_protocol::{
-    InputFragment as WorkerInputFragment, InputPlan as WorkerInputPlan, SecretBytes, WriteId,
-};
+use pohunek_worker_protocol::{InputFragment as WorkerInputFragment, SecretBytes};
 
 use super::{
     adapter_for, session_not_found, session_not_running, unavailable_runtime_error,
     worker_error_to_protocol, AgentKind, Duration, InputRules, LaunchCommand, LaunchCommandPlan,
-    Ordering, ProtocolError, ResolvedAgent, RuntimeHandle, SessionId, SessionInputParams,
-    SessionInputResult, SessionRegistry, SessionRegistryConfig, SessionState,
+    ProtocolError, ResolvedAgent, RuntimeHandle, SessionId, SessionInputParams, SessionInputResult,
+    SessionRegistry, SessionRegistryConfig, SessionState,
 };
 
 pub(super) const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
@@ -52,10 +50,6 @@ impl SessionRegistry {
         let writes = build_input_writes(text, rules);
         match runtime {
             RuntimeHandle::Worker(worker) => {
-                let sequence = self.inner.next_write_id.fetch_add(1, Ordering::Relaxed);
-                let write_id = WriteId::new(format!("input-{sequence}")).map_err(|error| {
-                    super::runtime_error("worker_input_invalid", error.to_string())
-                })?;
                 let mut fragments = Vec::with_capacity(2);
                 let delay_after_ms = writes.delayed_submit.as_ref().map_or(0, |(delay, _)| {
                     u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
@@ -70,10 +64,10 @@ impl SessionRegistry {
                         delay_after_ms: 0,
                     });
                 }
-                let plan = WorkerInputPlan::new(write_id, fragments).map_err(|error| {
-                    super::runtime_error("worker_input_invalid", error.to_string())
-                })?;
-                worker.write(plan).await.map_err(worker_error_to_protocol)?;
+                worker
+                    .write(fragments)
+                    .await
+                    .map_err(worker_error_to_protocol)?;
             }
             RuntimeHandle::Unavailable(state) => {
                 return Err(unavailable_runtime_error(session_id, state));

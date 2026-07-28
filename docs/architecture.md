@@ -169,6 +169,13 @@ bounded by the negotiated worker data payload. History capacity is independent
 of the per-frame allocation limit: increasing retained history must never
 require one proportionally large frame.
 
+Control input uses a bounded exact recent-result map and a monotonic watermark
+scoped to the active controller lease. A reconnect acquires a fresh lease and
+can safely restart its sequence. Raw attach input instead uses the ordered
+stream's monotonic sequence and never consumes lifetime dedup capacity. This
+keeps retries conservative without allowing a probabilistic structure to reject
+fresh interactive input.
+
 ## Transport and Control Protocol
 
 There is one logical protocol exposed over two transports:

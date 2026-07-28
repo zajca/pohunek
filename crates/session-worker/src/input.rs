@@ -1,6 +1,6 @@
-//! Executes ordered PTY input plans with bounded deduplication.
+//! Executes ordered PTY input with bounded exact control deduplication.
 
-// Rust guideline compliant 2026-07-23
+// Rust guideline compliant 2026-07-28
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{Debug, Formatter};
@@ -11,11 +11,10 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use tokio::sync::{watch, Mutex as AsyncMutex};
 
-/// Number of bits retained for conservative evicted-write detection.
+/// Bits retained only for protocol-v2 unordered input compatibility.
 ///
-/// False positives return `OutcomeUnknown`, which is safe because the worker
-/// does not duplicate input. The fixed memory prevents unbounded lifetime state.
-const EVICTED_FILTER_WORDS: usize = 256;
+/// New lease-scoped monotonic control input never consults this filter.
+const LEGACY_EVICTED_FILTER_WORDS: usize = 256;
 
 /// One ordered write-plan fragment.
 #[derive(Clone, PartialEq, Eq)]
@@ -76,7 +75,7 @@ pub enum InputError {
         /// Conflicting write ID.
         write_id: String,
     },
-    /// A previously evicted write may already have completed.
+    /// A write at or below the lease watermark is no longer retained.
     #[error("write outcome is unknown for expired id `{write_id}`")]
     OutcomeUnknown {
         /// Ambiguous write ID.
@@ -103,6 +102,8 @@ impl Debug for WriteCoordinator {
         let state = lock(&self.state);
         f.debug_struct("WriteCoordinator")
             .field("retained_entries", &state.entries.len())
+            .field("namespace_id", &state.namespace_id)
+            .field("high_watermark", &state.high_watermark)
             .field("capacity", &state.capacity)
             .finish_non_exhaustive()
     }
@@ -124,24 +125,36 @@ impl WriteCoordinator {
             state: Arc::new(Mutex::new(DedupState {
                 entries: HashMap::new(),
                 completed: VecDeque::new(),
-                evicted: EvictedFilter::new(),
+                namespace_id: None,
+                mode: None,
+                high_watermark: 0,
+                legacy_evicted: EvictedFilter::new(),
                 capacity,
             })),
         })
     }
 
-    /// Executes or joins an idempotent write plan.
+    /// Executes or joins an idempotent control write plan.
     ///
     /// Completion is published only after all fragments are flushed. Plans are
-    /// globally serialized so their delayed fragments cannot interleave.
+    /// globally serialized so their delayed fragments cannot interleave. The
+    /// lease sequence must increase in request order. A changed lease starts a
+    /// fresh namespace because the previous lease is rejected before input
+    /// handling.
     ///
     /// # Errors
     ///
     /// Returns [`InputError`] for conflicting, ambiguous, or failed writes.
-    pub async fn execute(&self, plan: InputPlan) -> Result<(), InputError> {
+    pub async fn execute_control(
+        &self,
+        namespace_id: &str,
+        sequence: u64,
+        plan: InputPlan,
+    ) -> Result<(), InputError> {
         let fingerprint = fingerprint(&plan);
         let action = {
             let mut state = lock(&self.state);
+            state.select_namespace(namespace_id, DedupMode::Monotonic);
             match state.entries.get(&plan.write_id) {
                 Some(entry) if entry.fingerprint != fingerprint => {
                     return Err(InputError::Conflict {
@@ -149,7 +162,65 @@ impl WriteCoordinator {
                     });
                 }
                 Some(entry) => Action::Join(entry.result.clone()),
-                None if state.evicted.might_contain(&plan.write_id) => {
+                None if sequence <= state.high_watermark => {
+                    return Err(InputError::OutcomeUnknown {
+                        write_id: plan.write_id,
+                    });
+                }
+                None => {
+                    state.high_watermark = sequence;
+                    let (result_tx, result_rx) = watch::channel(None);
+                    state.entries.insert(
+                        plan.write_id.clone(),
+                        DedupEntry {
+                            fingerprint,
+                            result: result_rx,
+                        },
+                    );
+                    Action::Execute(result_tx)
+                }
+            }
+        };
+
+        match action {
+            Action::Join(receiver) => wait_result(receiver).await,
+            Action::Execute(sender) => {
+                let result = self.execute_once(&plan.fragments).await;
+                let stored = result.as_ref().copied().map_err(StoredError::from_input);
+                self.complete(&plan.write_id);
+                let _ = sender.send(Some(stored));
+                result
+            }
+        }
+    }
+
+    /// Executes a protocol-v2 input plan with its original bounded semantics.
+    ///
+    /// Version-two daemons allocated IDs before entering the per-worker request
+    /// mutex, so two fresh IDs could arrive out of order. This compatibility
+    /// path therefore cannot use a high watermark. New daemon clients never use
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InputError`] for conflicting, ambiguous, or failed writes.
+    pub async fn execute_legacy(
+        &self,
+        namespace_id: &str,
+        plan: InputPlan,
+    ) -> Result<(), InputError> {
+        let fingerprint = fingerprint(&plan);
+        let action = {
+            let mut state = lock(&self.state);
+            state.select_namespace(namespace_id, DedupMode::Legacy);
+            match state.entries.get(&plan.write_id) {
+                Some(entry) if entry.fingerprint != fingerprint => {
+                    return Err(InputError::Conflict {
+                        write_id: plan.write_id,
+                    });
+                }
+                Some(entry) => Action::Join(entry.result.clone()),
+                None if state.legacy_evicted.might_contain(&plan.write_id) => {
                     return Err(InputError::OutcomeUnknown {
                         write_id: plan.write_id,
                     });
@@ -171,7 +242,7 @@ impl WriteCoordinator {
         match action {
             Action::Join(receiver) => wait_result(receiver).await,
             Action::Execute(sender) => {
-                let result = self.execute_once(&plan).await;
+                let result = self.execute_once(&plan.fragments).await;
                 let stored = result.as_ref().copied().map_err(StoredError::from_input);
                 self.complete(&plan.write_id);
                 let _ = sender.send(Some(stored));
@@ -180,9 +251,23 @@ impl WriteCoordinator {
         }
     }
 
-    async fn execute_once(&self, plan: &InputPlan) -> Result<(), InputError> {
+    /// Executes input ordered by one attach stream.
+    ///
+    /// The stream server validates strictly increasing stream-scoped sequence
+    /// identifiers before calling this method. Framed stream delivery is
+    /// ordered and never replayed by the daemon, so lifetime deduplication would
+    /// add ambiguity without adding retry safety.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InputError`] when the PTY writer fails.
+    pub async fn execute_stream(&self, fragments: Vec<InputFragment>) -> Result<(), InputError> {
+        self.execute_once(&fragments).await
+    }
+
+    async fn execute_once(&self, fragments: &[InputFragment]) -> Result<(), InputError> {
         let _execution = self.execution.lock().await;
-        for fragment in &plan.fragments {
+        for fragment in fragments {
             let bytes = fragment.bytes.clone();
             let writer = Arc::clone(&self.writer);
             tokio::task::spawn_blocking(move || {
@@ -208,7 +293,9 @@ impl WriteCoordinator {
                 break;
             };
             state.entries.remove(&evicted_id);
-            state.evicted.insert(&evicted_id);
+            if state.mode == Some(DedupMode::Legacy) {
+                state.legacy_evicted.insert(&evicted_id);
+            }
         }
     }
 }
@@ -223,8 +310,31 @@ enum Action {
 struct DedupState {
     entries: HashMap<String, DedupEntry>,
     completed: VecDeque<String>,
-    evicted: EvictedFilter,
+    namespace_id: Option<String>,
+    mode: Option<DedupMode>,
+    high_watermark: u64,
+    legacy_evicted: EvictedFilter,
     capacity: usize,
+}
+
+impl DedupState {
+    fn select_namespace(&mut self, namespace_id: &str, mode: DedupMode) {
+        if self.namespace_id.as_deref() == Some(namespace_id) && self.mode == Some(mode) {
+            return;
+        }
+        self.entries.clear();
+        self.completed.clear();
+        self.namespace_id = Some(namespace_id.to_owned());
+        self.mode = Some(mode);
+        self.high_watermark = 0;
+        self.legacy_evicted.clear();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DedupMode {
+    Monotonic,
+    Legacy,
 }
 
 #[derive(Debug)]
@@ -288,7 +398,7 @@ fn fingerprint(plan: &InputPlan) -> [u8; 32] {
 
 #[derive(Clone, PartialEq, Eq)]
 struct EvictedFilter {
-    words: [u64; EVICTED_FILTER_WORDS],
+    words: [u64; LEGACY_EVICTED_FILTER_WORDS],
 }
 
 impl Debug for EvictedFilter {
@@ -300,8 +410,12 @@ impl Debug for EvictedFilter {
 impl EvictedFilter {
     fn new() -> Self {
         Self {
-            words: [0; EVICTED_FILTER_WORDS],
+            words: [0; LEGACY_EVICTED_FILTER_WORDS],
         }
+    }
+
+    fn clear(&mut self) {
+        self.words.fill(0);
     }
 
     fn insert(&mut self, write_id: &str) {
@@ -319,7 +433,7 @@ impl EvictedFilter {
 
 fn filter_indices(write_id: &str) -> [usize; 3] {
     let digest: [u8; 32] = Sha256::digest(write_id.as_bytes()).into();
-    let bit_count = EVICTED_FILTER_WORDS * 64;
+    let bit_count = LEGACY_EVICTED_FILTER_WORDS * 64;
     [0, 8, 16].map(|offset| {
         let value = u64::from_be_bytes(
             digest[offset..offset + 8]
@@ -346,6 +460,7 @@ mod tests {
     use std::time::Duration;
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    const PRODUCER: &str = "daemon-a";
 
     fn output_file(tag: &str) -> (PathBuf, fs::File) {
         let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -389,8 +504,14 @@ mod tests {
             ],
         };
 
-        coordinator.execute(operation.clone()).await.expect("first");
-        coordinator.execute(operation).await.expect("duplicate");
+        coordinator
+            .execute_control(PRODUCER, 1, operation.clone())
+            .await
+            .expect("first");
+        coordinator
+            .execute_control(PRODUCER, 1, operation)
+            .await
+            .expect("duplicate");
 
         assert_eq!(fs::read(&path).expect("read"), b"first-second");
         fs::remove_file(path).expect("cleanup");
@@ -409,8 +530,8 @@ mod tests {
         };
 
         let (first, second) = tokio::join!(
-            coordinator.execute(operation.clone()),
-            coordinator.execute(operation)
+            coordinator.execute_control(PRODUCER, 1, operation.clone()),
+            coordinator.execute_control(PRODUCER, 1, operation)
         );
         first.expect("first");
         second.expect("second");
@@ -424,12 +545,14 @@ mod tests {
         let (path, writer) = output_file("conflict");
         let coordinator = WriteCoordinator::new(writer, 8).expect("coordinator");
         coordinator
-            .execute(plan("write-1", b"a"))
+            .execute_control(PRODUCER, 1, plan("write-1", b"a"))
             .await
             .expect("first");
 
         assert!(matches!(
-            coordinator.execute(plan("write-1", b"b")).await,
+            coordinator
+                .execute_control(PRODUCER, 1, plan("write-1", b"b"))
+                .await,
             Err(InputError::Conflict { .. })
         ));
         assert_eq!(fs::read(&path).expect("read"), b"a");
@@ -441,19 +564,79 @@ mod tests {
         let (path, writer) = output_file("evicted");
         let coordinator = WriteCoordinator::new(writer, 1).expect("coordinator");
         coordinator
-            .execute(plan("write-1", b"a"))
+            .execute_control(PRODUCER, 1, plan("write-1", b"a"))
             .await
             .expect("first");
         coordinator
-            .execute(plan("write-2", b"b"))
+            .execute_control(PRODUCER, 2, plan("write-2", b"b"))
             .await
             .expect("second");
 
         assert!(matches!(
-            coordinator.execute(plan("write-1", b"a")).await,
+            coordinator
+                .execute_control(PRODUCER, 1, plan("write-1", b"a"))
+                .await,
             Err(InputError::OutcomeUnknown { .. })
         ));
         assert_eq!(fs::read(&path).expect("read"), b"ab");
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn same_daemon_new_lease_restarts_sequence_in_fresh_namespace() {
+        let (path, writer) = output_file("lease-rotation");
+        let coordinator = WriteCoordinator::new(writer, 1).expect("coordinator");
+        coordinator
+            .execute_control("lease-a", 1, plan("input-lease-a-1", b"a"))
+            .await
+            .expect("first lease");
+        coordinator
+            .execute_control("lease-b", 1, plan("input-lease-b-1", b"b"))
+            .await
+            .expect("same daemon replacement lease");
+
+        assert_eq!(fs::read(&path).expect("read"), b"ab");
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn legacy_fresh_ids_may_arrive_out_of_order() {
+        let (path, writer) = output_file("legacy-out-of-order");
+        let coordinator = WriteCoordinator::new(writer, 8).expect("coordinator");
+        coordinator
+            .execute_legacy(PRODUCER, plan("input-2", b"two"))
+            .await
+            .expect("higher legacy id");
+        coordinator
+            .execute_legacy(PRODUCER, plan("input-1", b"one"))
+            .await
+            .expect("lower fresh legacy id");
+
+        assert_eq!(fs::read(&path).expect("read"), b"twoone");
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn ordered_attach_input_exceeds_control_dedup_capacity() {
+        const ATTACH_INPUTS: usize = 8_192;
+
+        let (path, writer) = output_file("attach-volume");
+        let coordinator = WriteCoordinator::new(writer, 1).expect("coordinator");
+        for row in 0..ATTACH_INPUTS {
+            let report = format!("\x1b[<35;1;{}M", row % 80 + 1);
+            coordinator
+                .execute_stream(vec![InputFragment {
+                    bytes: report.into_bytes(),
+                    delay_after: Duration::ZERO,
+                }])
+                .await
+                .expect("ordered attach input");
+        }
+
+        assert!(
+            fs::metadata(&path).expect("metadata").len()
+                > u64::try_from(ATTACH_INPUTS).expect("input count fits u64")
+        );
         fs::remove_file(path).expect("cleanup");
     }
 
