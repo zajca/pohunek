@@ -256,6 +256,9 @@ pub struct SessionRegistryConfig {
     /// Directory for the append-only event log (`<data_dir>/events`). `None`
     /// disables event logging. Started via [`SessionRegistry::spawn_event_log`].
     pub event_log_dir: Option<PathBuf>,
+    /// Directory containing bounded structured logs. When set, removing a
+    /// stopped session also removes its owner-private worker log family.
+    pub log_dir: Option<PathBuf>,
     /// Host config directory (`<config_dir>` = `$XDG_CONFIG_HOME/pohunek` or
     /// `~/.config/pohunek`). The host-default layer for templates/actions/prompts
     /// (Part A), lifecycle hooks (Part B), and agent profiles (Part C). `None`
@@ -306,6 +309,7 @@ impl Default for SessionRegistryConfig {
             worktree_root: None,
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
             event_log_dir: None,
+            log_dir: None,
             config_dir: None,
             agents_dir: None,
             detector_lag_warn_interval: DEFAULT_DETECTOR_LAG_WARN_INTERVAL,
@@ -513,6 +517,30 @@ impl SessionRegistry {
                     format!("failed to remove session record {}: {error}", id.0),
                 )
             })
+    }
+
+    async fn delete_session_logs(&self, id: &SessionId) -> Result<(), ProtocolError> {
+        let Some(log_dir) = self.inner.config.log_dir.clone() else {
+            return Ok(());
+        };
+        let session_id = id.0.clone();
+        tokio::task::spawn_blocking(move || {
+            let files = pohunek_logging::config::worker_files(&session_id)?;
+            pohunek_logging::remove_family(&log_dir, &files)
+        })
+        .await
+        .map_err(|_join_error| {
+            runtime_error(
+                "session_log_cleanup_failed",
+                format!("session log cleanup task panicked for {}", id.0),
+            )
+        })?
+        .map_err(|error| {
+            runtime_error(
+                "session_log_cleanup_failed",
+                format!("failed to clean worker logs for {}: {error}", id.0),
+            )
+        })
     }
 
     async fn cleanup_owned_worktrees_for_removal(
@@ -1993,6 +2021,11 @@ impl SessionRegistry {
                 entry.info.warnings.extend(cleanup_warnings);
             }
         }
+
+        // The PTY has stopped above, so cleanup removes the accumulated family.
+        // A retained terminal worker may still emit a final control diagnostic,
+        // but the shared writer keeps any such file within the same hard cap.
+        self.delete_session_logs(id).await?;
 
         let info = {
             let mut sessions = self.inner.sessions.lock().await;

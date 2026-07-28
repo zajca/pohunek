@@ -3284,6 +3284,7 @@ dependencies = [
  "pohunek-client",
  "pohunek-hostcheck",
  "pohunek-knowledge",
+ "pohunek-logging",
  "pohunek-netbird",
  "pohunek-paths",
  "pohunek-protocol",
@@ -3366,6 +3367,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pohunek-logging"
+version = "0.28.3"
+
+[[package]]
 name = "pohunek-netbird"
 version = "0.28.3"
 dependencies = [
@@ -3406,6 +3411,7 @@ version = "0.28.3"
 dependencies = [
  "libc",
  "nix 0.29.0",
+ "pohunek-logging",
  "pohunek-paths",
  "pohunek-terminal",
  "pohunek-worker-protocol",

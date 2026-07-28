@@ -49,6 +49,14 @@ pub enum DaemonError {
         source: io::Error,
     },
 
+    /// Bounded structured logging could not be initialized.
+    #[error("failed to initialize bounded structured logging: {0}")]
+    Logging(#[from] pohunek_logging::Error),
+
+    /// The global tracing subscriber was already initialized.
+    #[error("failed to install structured logging subscriber: {0}")]
+    LoggingSubscriber(String),
+
     /// Failed to bind, configure, or operate the Unix socket.
     #[error("socket error at {path}: {source}")]
     Socket {

@@ -15,6 +15,7 @@ name = "pohunek-sessiond"
 path = "src/main.rs"
 
 [dependencies]
+pohunek-logging = { workspace = true }
 pohunek-paths = { workspace = true }
 pohunek-terminal = { workspace = true }
 pohunek-worker-protocol = { path = "../worker-protocol" }

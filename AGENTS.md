@@ -52,6 +52,7 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | `crates/netbird`  | NetBird status parsing, host resolution, bind-address validation. |
 | `crates/paths`    | Shared XDG path and local socket contract for daemon, CLI, and GUI clients. |
 | `crates/hostcheck`| Host environment probes shared by `doctor` and the daemon's `doctor` RPC. |
+| `crates/logging` | Process-safe size rotation and retention for daemon and per-session worker logs. |
 | `crates/gui-core` | Pure, headless state + SDK bridge for the GUI (no Iced dependency; fully unit-testable). |
 | `crates/gui`      | Native Iced shell that wraps `gui-core` in `Task`/`Subscription`. |
 | `crates/xtask`    | Workspace automation (docs build/validate/check). |

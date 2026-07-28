@@ -29,6 +29,9 @@ pub enum WorkerError {
         /// Underlying I/O error.
         source: std::io::Error,
     },
+    /// Bounded structured logging could not be initialized.
+    #[error("failed to initialize bounded worker logging: {0}")]
+    Logging(#[from] pohunek_logging::Error),
     /// The private Unix endpoint failed.
     #[error("worker socket operation failed for {}: {source}", path.display())]
     Socket {

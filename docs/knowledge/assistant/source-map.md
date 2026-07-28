@@ -137,6 +137,8 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/notifications/projector.rs`
 - `crates/daemon/src/paths.rs`
 - `crates/daemon/src/logging.rs`
+- `crates/logging/src/config.rs`
+- `crates/logging/src/lib.rs`
 
 Agent runtime and profile resolution:
 

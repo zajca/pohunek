@@ -27,7 +27,9 @@ Start with public, non-destructive inspection:
    pohunek-session@<session-id>.service`.
 5. Inspect daemon and worker structured logs under
    `~/.local/state/pohunek/logs/`. Do not copy prompt, input, or raw terminal
-   content into reports.
+   content into reports. `pohunekd.jsonl` plus seven rotations retain at most
+   256 MiB; `pohunek-session-<session-id>.jsonl` plus three rotations retain at
+   most 16 MiB across all worker generations for that session.
 
 Interpret runtime states as follows:
 

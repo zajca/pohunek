@@ -421,8 +421,23 @@ Structured logs under the user state directory:
 
 ```text
 ~/.local/state/pohunek/logs/
+  pohunekd.jsonl[.1-.7]                 # 32 MiB each, 256 MiB daemon cap
+  pohunek-session-<session-id>.jsonl    # active worker log
+  pohunek-session-<session-id>.jsonl[.1-.3]
+                                         # 4 MiB each, 16 MiB per-session cap
 ~/.local/state/pohunek/workers/<session-id>/<worker-id>.json
 ```
+
+Daemon and session-worker logs rotate before a complete JSON event would exceed
+the per-file limit. All worker generations for one logical session serialize
+through one owner-private file lock and share the 16 MiB family cap. Removing a
+session first stops its worker and then removes that session's regular log
+files. Startup pruning removes owned oversized rotations and the daemon's
+legacy `pohunekd.log.YYYY-MM-DD` files, but never follows or deletes symlinks.
+An individual event larger than one file is replaced by a small valid JSON
+warning (or dropped when even that warning cannot fit), never partially
+written. There is intentionally no machine-wide cap across simultaneously live
+sessions; each live session has an independent bounded diagnostic history.
 
 The metadata store is a **single** owner-private JSON-lines file whose lines are
 internally tagged by `kind` — `session` (logical intent, launch and runtime
@@ -475,8 +490,9 @@ to the control plane.
 
 ## Observability
 
-Structured logs under `~/.local/state/pohunek/logs/`, redacting secrets and
-sensitive terminal content. Useful signals:
+Structured logs under `~/.local/state/pohunek/logs/` use the bounded retention
+described in "Persistence and Local Data" and redact secrets and sensitive
+terminal content. Useful signals:
 
 - Daemon startup/shutdown, reconciliation, and single-instance/socket recovery.
 - Worker bootstrap, controller lease, runtime identity, output-gap, child-exit,

@@ -5,7 +5,6 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -131,29 +130,12 @@ fn init_logging(
     log_dir: &Path,
     session_id: &str,
 ) -> Result<tracing_appender::non_blocking::WorkerGuard, WorkerError> {
-    fs::create_dir_all(log_dir).map_err(|source| WorkerError::Filesystem {
-        path: log_dir.to_path_buf(),
-        source,
-    })?;
-    fs::set_permissions(
+    let writer = pohunek_logging::Writer::open(
         log_dir,
-        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
-    )
-    .map_err(|source| WorkerError::Filesystem {
-        path: log_dir.to_path_buf(),
-        source,
-    })?;
-    let path = log_dir.join(format!("pohunek-session-{session_id}.jsonl"));
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|source| WorkerError::Filesystem {
-            path: path.clone(),
-            source,
-        })?;
-    let (writer, guard) = tracing_appender::non_blocking(file);
+        pohunek_logging::config::worker_files(session_id)?,
+        pohunek_logging::config::worker_policy()?,
+    )?;
+    let (writer, guard) = tracing_appender::non_blocking(writer);
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()

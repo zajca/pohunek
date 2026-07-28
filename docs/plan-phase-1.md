@@ -306,7 +306,8 @@ is the (non-rebuildable) audit/debug trail.
 ## Logging and Observability
 
 - `tracing` JSON logs under `~/.local/state/pohunek/logs/`, redacting secrets
-  and terminal content.
+  and terminal content. Daemon logs are bounded to 256 MiB and worker logs to
+  16 MiB per logical session across worker generations.
 - Log: daemon start/stop, single-instance/socket recovery, control requests (with
   `id`) + status, session start/attach/detach/stop/exit/resume, PTY
   alloc/resize/stream errors, state transitions with `source`.

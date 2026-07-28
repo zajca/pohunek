@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -2277,6 +2278,40 @@ async fn remove_stops_a_live_session_then_evicts() {
         .await
         .expect_err("removed session is gone");
     assert_eq!(err.code, "session_not_found");
+}
+
+#[tokio::test]
+async fn delete_session_logs_removes_the_worker_log_family() {
+    let log_dir = temp_dir("remove-worker-logs");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        log_dir: Some(log_dir.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let session_id = SessionId("s-cleanup".to_owned());
+    let files =
+        pohunek_logging::config::worker_files(&session_id.0).expect("safe managed session id");
+    let mut writer = pohunek_logging::Writer::open(
+        &log_dir,
+        files,
+        pohunek_logging::config::worker_policy().expect("valid application policy"),
+    )
+    .expect("open worker log family");
+    writer.write_all(b"{\"worker\":\"running\"}\n").unwrap();
+    drop(writer);
+
+    registry
+        .delete_session_logs(&session_id)
+        .await
+        .expect("delete session logs");
+
+    assert!(
+        fs::read_dir(&log_dir)
+            .expect("read log directory")
+            .next()
+            .is_none(),
+        "session removal must delete its worker log and lock files"
+    );
+    fs::remove_dir_all(log_dir).expect("remove test log directory");
 }
 
 #[tokio::test]
