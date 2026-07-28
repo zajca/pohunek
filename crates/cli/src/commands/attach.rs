@@ -31,6 +31,37 @@ use crate::target::Target;
 
 const DETACH_BYTE: u8 = 0x1d;
 const IO_BUFFER_BYTES: usize = 8192;
+/// Selective terminal reset emitted whenever raw attach passthrough ends.
+///
+/// Agent TUIs may enable these DEC modes through ordinary PTY output. Termios
+/// restoration does not disable them, so an unexpected stream close would make
+/// the parent shell receive mouse, focus, or paste reports as text. This reset
+/// returns to the main screen and normal shell-oriented modes without using the
+/// destructive full-terminal RIS sequence.
+const ATTACH_TERMINAL_MODE_CLEANUP: &[u8] = concat!(
+    "\x1b[?1000l", // X10 mouse tracking.
+    "\x1b[?1001l", // Mouse highlight tracking.
+    "\x1b[?1002l", // Button-event mouse tracking.
+    "\x1b[?1003l", // Any-event mouse tracking.
+    "\x1b[?1004l", // Focus reporting.
+    "\x1b[?1005l", // UTF-8 mouse coordinates.
+    "\x1b[?1006l", // SGR mouse coordinates.
+    "\x1b[?1015l", // urxvt mouse coordinates.
+    "\x1b[?1016l", // SGR pixel mouse coordinates.
+    "\x1b[?2004l", // Bracketed paste.
+    "\x1b[?2026l", // Synchronized terminal updates.
+    "\x1b[?1049l", // Alternate screen with saved cursor.
+    "\x1b[?1047l", // Alternate screen fallback.
+    "\x1b[?47l",   // Legacy alternate screen fallback.
+    "\x1b[?1l",    // Normal cursor keys.
+    "\x1b>",       // Normal numeric keypad.
+    "\x1b[?6l",    // Absolute cursor addressing.
+    "\x1b[?7h",    // Normal automatic line wrapping.
+    "\x1b[r",      // Full-height scroll region.
+    "\x1b[0m",     // Default character attributes.
+    "\x1b[?25h",   // Visible cursor.
+)
+.as_bytes();
 /// Maximum agent output retained while the attach menu is open.
 ///
 /// Four MiB covers sustained repaint bursts while preventing an unattended
@@ -921,7 +952,14 @@ async fn shutdown_banner_updates(updates: &mut Option<BannerUpdates>) {
 
 async fn prepare_attach_terminal(
     updates: &mut Option<BannerUpdates>,
-) -> Result<(Option<RawTerminal>, tokio::signal::unix::Signal), CliError> {
+) -> Result<
+    (
+        Option<RawTerminal>,
+        TerminalOutputGuard,
+        tokio::signal::unix::Signal,
+    ),
+    CliError,
+> {
     let terminal = match RawTerminal::enable(libc::STDIN_FILENO) {
         Ok(terminal) => terminal,
         Err(error) => {
@@ -936,7 +974,11 @@ async fn prepare_attach_terminal(
             return Err(CliError::Io(error));
         }
     };
-    Ok((terminal, winch))
+    // Output cleanup follows the physical output terminal independently of
+    // whether stdin could enter raw mode (for example, piped stdin with a TTY
+    // stdout can still receive mode-enabling agent output).
+    let output = TerminalOutputGuard::new(is_tty(libc::STDOUT_FILENO));
+    Ok((terminal, output, winch))
 }
 
 /// Renders the active modal and its status banner.
@@ -967,6 +1009,15 @@ where
     writer.flush().await?;
     modal.pending_output.clear();
     modal.active = false;
+    Ok(())
+}
+
+async fn restore_terminal_output_modes<W>(writer: &mut W) -> Result<(), CliError>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(ATTACH_TERMINAL_MODE_CLEANUP).await?;
+    writer.flush().await?;
     Ok(())
 }
 
@@ -1396,7 +1447,8 @@ async fn forward_attached_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (mut terminal, mut winch) = prepare_attach_terminal(&mut status_updates).await?;
+    let (mut terminal, mut terminal_output, mut winch) =
+        prepare_attach_terminal(&mut status_updates).await?;
     let (mut socket_read, mut socket_write) = tokio::io::split(stream);
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -1489,6 +1541,7 @@ where
     // Best-effort restore; do not mask the loop's real outcome with a teardown
     // write error.
     let _ = close_modal(&mut stdout, modal.as_mut()).await;
+    let _ = terminal_output.restore(&mut stdout).await;
     shutdown_banner_updates(&mut status_updates).await;
     finish_attach_outcome(&mut client, &stream_id, outcome).await
 }
@@ -1973,6 +2026,44 @@ impl RawTerminal {
 impl Drop for RawTerminal {
     fn drop(&mut self) {
         let _ = tcsetattr(self.fd, &self.original);
+    }
+}
+
+#[derive(Debug)]
+struct TerminalOutputGuard {
+    enabled: bool,
+    restored: bool,
+}
+
+impl TerminalOutputGuard {
+    const fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            restored: false,
+        }
+    }
+
+    async fn restore<W>(&mut self, writer: &mut W) -> Result<(), CliError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        if self.restored || !self.enabled {
+            self.restored = true;
+            return Ok(());
+        }
+        restore_terminal_output_modes(writer).await?;
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalOutputGuard {
+    fn drop(&mut self) {
+        if self.enabled && !self.restored {
+            let mut stdout = std::io::stdout().lock();
+            let _ = std::io::Write::write_all(&mut stdout, ATTACH_TERMINAL_MODE_CLEANUP);
+            let _ = std::io::Write::flush(&mut stdout);
+        }
     }
 }
 
@@ -2976,6 +3067,75 @@ mod tests {
         );
         assert!(state.pending_output.is_empty());
         assert!(!state.active);
+    }
+
+    #[tokio::test]
+    async fn unexpected_attach_eof_emits_terminal_mode_cleanup() {
+        let mut stdout = Vec::new();
+        let mut modal = None;
+        let mut menu = MenuRuntime::new(false);
+        let mut output = TerminalOutputGuard::new(true);
+
+        let end = handle_socket_output(&[], &mut stdout, &mut modal, &mut menu)
+            .await
+            .expect("handle attach EOF");
+        assert_eq!(end, Some(AttachStreamEnd::StreamClosed));
+        output
+            .restore(&mut stdout)
+            .await
+            .expect("restore terminal modes");
+
+        assert_eq!(stdout, ATTACH_TERMINAL_MODE_CLEANUP);
+        for disabled_mode in [
+            b"\x1b[?1003l".as_slice(),
+            b"\x1b[?1006l".as_slice(),
+            b"\x1b[?1004l".as_slice(),
+            b"\x1b[?2004l".as_slice(),
+            b"\x1b[?1049l".as_slice(),
+        ] {
+            assert!(
+                stdout
+                    .windows(disabled_mode.len())
+                    .any(|window| window == disabled_mode),
+                "cleanup must contain {disabled_mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_detach_cleanup_follows_buffered_modal_output() {
+        let mut stdout = Vec::new();
+        let mut modal = ModalState {
+            compositor: Compositor::new(80, 24),
+            snapshot: AttachStatusSnapshot::unknown("local", "s-42"),
+            cols: 80,
+            pending_output: b"\x1b[?1003h\x1b[?1049hbuffered".to_vec(),
+            active: true,
+        };
+        let mut output = TerminalOutputGuard::new(true);
+
+        close_modal(&mut stdout, Some(&mut modal))
+            .await
+            .expect("replay modal output");
+        output
+            .restore(&mut stdout)
+            .await
+            .expect("restore after detach");
+
+        assert!(
+            stdout.ends_with(ATTACH_TERMINAL_MODE_CLEANUP),
+            "terminal cleanup must follow buffered mode-enabling output"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_tty_output_guard_emits_no_cleanup() {
+        let mut stdout = Vec::new();
+        let mut output = TerminalOutputGuard::new(false);
+
+        output.restore(&mut stdout).await.expect("non-TTY no-op");
+
+        assert!(stdout.is_empty());
     }
 
     #[tokio::test]

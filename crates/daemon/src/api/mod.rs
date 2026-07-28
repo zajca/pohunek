@@ -434,7 +434,7 @@ where
         )
         .await
         .map_err(AttachBridgeError::worker_stream)?;
-        write_sequence = write_sequence.saturating_add(1);
+        write_sequence = next_attach_sequence(write_sequence)?;
     }
     let mut input = [0_u8; 8 * 1024];
 
@@ -492,12 +492,18 @@ where
                 )
                 .await
                 .map_err(AttachBridgeError::worker_stream)?;
-                write_sequence = write_sequence.saturating_add(1);
+                write_sequence = next_attach_sequence(write_sequence)?;
             }
             () = cancel.cancelled() => break,
         }
     }
     Ok(())
+}
+
+fn next_attach_sequence(sequence: u64) -> Result<u64, AttachBridgeError> {
+    sequence
+        .checked_add(1)
+        .ok_or_else(|| AttachBridgeError::worker_message("attach input sequence was exhausted"))
 }
 
 #[derive(Debug)]

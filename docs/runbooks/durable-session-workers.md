@@ -140,6 +140,11 @@ Worker-aware releases negotiate the current and immediately preceding private
 worker protocol. An unsupported worker remains alive as `incompatible`. Do not
 force a worker restart as a compatibility shortcut.
 
+Worker-internal fixes apply only to workers created from the updated binary.
+Already-running workers continue executing their mapped binary, even when its
+on-disk file was replaced. Replace a live session only through an explicit safe
+operator workflow; never restart its worker merely to pick up an update.
+
 The first worker-aware release is a separate boundary from the normal N/N-1
 window. Follow
 [the migration guide](../migrations/durable-session-workers.md) before replacing

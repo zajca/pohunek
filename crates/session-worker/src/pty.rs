@@ -1,6 +1,6 @@
 //! Owns one PTY master and its managed process identity.
 
-// Rust guideline compliant 2026-07-27
+// Rust guideline compliant 2026-07-28
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -644,8 +644,14 @@ mod tests {
             }],
         };
 
-        pty.input().execute(operation.clone()).await.expect("input");
-        pty.input().execute(operation).await.expect("deduplicate");
+        pty.input()
+            .execute_control("daemon-test", 1, operation.clone())
+            .await
+            .expect("input");
+        pty.input()
+            .execute_control("daemon-test", 1, operation)
+            .await
+            .expect("deduplicate");
         let exit = pty
             .stop("stop-1", Duration::from_millis(200))
             .await
