@@ -64,8 +64,10 @@ the runtime generation. Use `pohunek session stop <session-id>` for an
 intentional session stop.
 
 For the first worker-aware installation, let all legacy sessions finish or stop
-them explicitly. The archive installer lists visible live sessions and refuses
-replacement. `packaging/install-daemon.sh --accept-runtime-loss` is destructive
-consent: existing legacy PTYs cannot be transferred into workers. Use it only
-after recording the affected ids and accepting that shell and uncaptured agent
-sessions cannot be reconstructed.
+them explicitly. The archive installer lists live sessions that lack durable
+`runtime` metadata and refuses replacement. Sessions with a runtime binding are
+already worker-owned, are excluded from this one-time guard, and survive the
+daemon restart. `packaging/install-daemon.sh --accept-runtime-loss` is
+destructive consent: existing legacy PTYs cannot be transferred into workers.
+Use it only after recording the affected ids and accepting that shell and
+uncaptured agent sessions cannot be reconstructed.
