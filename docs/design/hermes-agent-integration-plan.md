@@ -39,7 +39,10 @@ The implementation must preserve these decisions from the RFC:
 8. Prompt/input text crosses the CLI process boundary through standard input.
 9. Raw attach is not exposed as a Hermes tool.
 10. Plugin access mode and host allowlist are explicit required installation
-    inputs.
+    inputs, and they are the only operator-configurable policy fields besides
+    the CLI path/range, limits, and schema version. Permitted agents come from
+    runtime inventory and the metadata surface is a fixed compiled schema;
+    neither is expressible in the policy.
 11. Plugin installation is local and per Hermes profile/home.
 12. Plugin assets are embedded in the Pohunek CLI release and are installed
     atomically without a network download.
@@ -51,20 +54,30 @@ The implementation must preserve these decisions from the RFC:
 16. Public and private protocol versions are bumped deliberately; no pre-1.0
     backward shape shim is added.
 17. Deterministic tests are supplemented by a pinned real-Hermes compatibility
-    job.
+    job that requires no model provider. Turn-dependent terminal fixtures are
+    recorded goldens refreshed by a documented operator command; no fake
+    provider server is built.
 18. Only the local Hermes terminal backend is supported.
-19. Native identity uses the ordered worker-private claim path only; a valid
-    continuation-session claim supersedes the immutable launch identity.
+19. Native identity prefers the ordered worker-private claim path and falls
+    back to the public `session.report_native_id` method, which M1 extends with
+    the same ordering fields so the contract is uniform across providers. A
+    valid continuation-session claim supersedes the immutable launch identity.
 20. Bounded waits occupy dedicated public control connections, and the
-    required timeout is their only guaranteed termination bound.
+    required timeout is their only guaranteed termination bound. The maximum
+    wait is deliberately short so a waiter abandoned by a killed client frees
+    its slot within seconds.
 21. Plugin policy is a delegated-tool guardrail, not a same-user sandbox; the
     daemon authoritatively enforces the origin-session guard.
 22. Pohunek-owned policy lives outside the plugin directory and outside the
     immutable asset checksum set.
-23. M1 bumps the public protocol to introduce minimum/maximum range
-    negotiation; M2 advances it again for the breaking Hermes enum and
-    notification-policy shapes. Both transitions are coordinated fleet
-    boundaries.
+23. M1 performs the single public protocol break, carrying range negotiation,
+    the observation APIs, the provider-keyed notification policy, and
+    forward-compatible `AgentKind` deserialization. M2 and M3 are purely
+    additive and perform no public bump.
+24. An unknown `AgentKind` wire value deserializes into a neutral,
+    presentation-only variant that is never launchable, is rejected by every
+    mutating path, is never persisted, and is represented identically in Rust
+    and TypeScript.
 
 Changing one of these decisions requires updating the RFC first.
 
@@ -79,11 +92,13 @@ Implementation follows the repository milestone workflow:
    - **M1 — provider-neutral foundations:** decouple resume from fork; add
      `session.screen`, `session.output`, and `session.wait`; add private
      control-plane observation; complete CLI JSON parity and stdin input; add
-     the daemon origin-session guard; and perform the public/private protocol
-     bumps;
-   - **M2 — first-class Hermes runtime:** add `AgentKind::Hermes`, the compiled
-     local-backend adapter, detection manifest, provider-keyed notification
-     policy, and GUI/web/assistant ripples;
+     the daemon origin-session guard; harden the public identity report; and
+     perform the single public protocol break — range negotiation, the
+     provider-keyed notification policy, and forward-compatible `AgentKind`
+     deserialization — together with the private worker bump;
+   - **M2 — first-class Hermes runtime:** add `AgentKind::Hermes` additively,
+     the compiled local-backend adapter, detection manifest, and
+     GUI/web/assistant ripples, with no public protocol bump;
    - **M3 — Hermes operator plugin:** add the installer, real plugin, hooks,
      typed tools, Pohunek-owned policy, and generated skill;
 2. create a fresh `zajca/<ticket-or-topic>/hermes-integration` worktree from the
@@ -226,11 +241,21 @@ Expected additions or changes:
 - CI setup for an isolated pinned Hermes environment;
 - no production dependency on the fixture driver.
 
-Do not add real tokens or rely on a developer's configured model provider. Use
-the official Hermes test/offline mechanism when available. If Hermes cannot
-complete a turn without a provider, supply a local deterministic HTTP provider
-fixture that implements the real protocol boundary; do not replace the Hermes
-process itself with a mock for the compatibility suite.
+Do not add real tokens or rely on a developer's configured model provider. Do
+not build a fake provider server either: the CI suite is deliberately
+model-free and runs only what needs no model turn — version and CLI shape,
+`hermes plugins list`/`enable`/`disable`, successful `register_tool`,
+`register_skill`, and `register_hook` registration with the expected tool and
+skill names present, target resolution, and `integration install`/`status`/
+`doctor`/`uninstall` against an isolated profile.
+
+Turn-dependent terminal fixtures — prompt-ready, working, approval-blocked,
+completion, interruption, resumed session, and alternate-screen — are recorded
+goldens captured from a real Hermes run and refreshed by a documented operator
+command, not reproduced in CI. This keeps the gate stable in a repository that
+already has flaky PTY and socket tests under load, while still catching the
+failure the gate exists for: an upstream plugin or CLI API change, which is
+detectable without a model.
 
 ### 5.4 Completion checks
 
@@ -267,7 +292,12 @@ Update at least:
 
 Tasks:
 
-1. In M2, add `AgentKind::Hermes` with wire value `"hermes"`.
+1. In M1, make `AgentKind` forward compatible: an unknown wire value
+   deserializes into a neutral, presentation-only variant. It must never be
+   launchable, must be rejected by `session.new` and every other mutating path
+   with a typed error, must never be persisted, and must be represented
+   identically in Rust and TypeScript. In M2, add `AgentKind::Hermes` with wire
+   value `"hermes"` as a purely additive change.
 2. Add request/result types for:
    - `session.screen`;
    - `session.output`;
@@ -278,21 +308,25 @@ Tasks:
 5. Add typed capability indicators for terminal read, output read, and bounded
    wait if capabilities are advertised publicly.
 6. Add the error codes enumerated by the RFC.
-7. In M2, replace fixed notification-provider fields with
+7. In M1, replace fixed notification-provider fields with
    `providers: BTreeMap<String, NotificationKindPolicy>` or the project's
    canonical deterministic map type.
 8. Define strict deserialization and unknown-key behavior consistently in Rust
-   and TypeScript.
+   and TypeScript. `AgentKind` is the single deliberate exception, per task 1;
+   strictness elsewhere is unchanged.
+8a. In M1, extend `SessionReportNativeIdParams` with runtime identity, PID plus
+    process-start identity, a monotonic sequence, and a bounded expiry, so the
+    public identity report can carry the same ordering contract as the private
+    active identity claim.
 9. Derive the output byte and serialized screen-response ceilings from
    `MAX_CONTROL_LINE_BYTES`. Account for base64's four-thirds expansion and
    reserve envelope/JSON-escaping headroom, following the named,
    rationale-commented `MAX_SESSION_DIFF_BYTES` precedent.
-10. In M1, bump the public protocol and replace exact-only negotiation with
-    explicit client/server minimum and maximum supported versions. Update
-    overlap, no-overlap, and legacy exact-envelope rejection fixtures; do not
-    describe a nonexistent public current/previous window. In M2, advance the
-    public version again for the strict Hermes enum and notification-policy
-    shape, declaring no overlap with M1 for those breaking shapes.
+10. In M1, perform the single public protocol bump and replace exact-only
+    negotiation with explicit client/server minimum and maximum supported
+    versions. Update overlap, no-overlap, and legacy exact-envelope rejection
+    fixtures; do not describe a nonexistent public current/previous window. M2
+    and M3 perform no public bump, because every breaking shape lands in M1.
 11. Update every exhaustive method/enum mapping and compile-time export.
 
 ### 6.3 Wire-shape tests
@@ -435,6 +469,8 @@ Cover:
 - waiter wake on output;
 - waiter timeout;
 - waiter cancellation;
+- a waiter abandoned by a killed client frees its slot within the configured
+  maximum wait;
 - runtime identity mismatch;
 - current daemon/current worker;
 - current daemon/previous worker feature unavailable;
@@ -467,7 +503,11 @@ Add named, documented settings in the daemon's established config path:
 - maximum waiters per session.
 
 Use typed validation and fail fast on invalid configuration. Platform defaults
-must be named constants with rationale comments, not repeated literals. Derive
+must be named constants with rationale comments, not repeated literals. Default
+the two wait ceilings short, in the 5-10 second range; their rationale comment
+records that a client killed mid-wait holds its slot until the timeout expires
+because the sequential dispatch loop cannot observe the disconnect, so a low
+ceiling is what bounds the availability dip. Derive
 the output byte and serialized screen-response limits from
 `MAX_CONTROL_LINE_BYTES`; account for base64 expansion and response-envelope
 headroom exactly as required by RFC section 10.4.
@@ -509,6 +549,17 @@ Tasks:
     client disconnect is observed while sequential dispatch awaits a handler.
 11. Return a normal redacted `SessionInfo` in wait results.
 12. Add structured payload-free logs and duration/count metrics.
+12a. Enforce the extended `session.report_native_id` ordering contract with the
+     same rejection rules already applied to a private active identity claim:
+     stale runtime generation, mismatched PID start identity, lower or equal
+     sequence after a newer report, provider mismatch, expired report, and a
+     report targeting another logical session. Define and test the behavior for
+     a report that omits the new fields; do not silently accept it as
+     last-write-wins.
+12b. Update `crates/daemon/src/integration/assets/codex/pohunek-agent-state.sh`
+     and `.../claude/pohunek-agent-state.sh` to send the new ordering fields on
+     the public path, and cover both providers with tests. The hardened shape is
+     uniform, not Hermes-specific.
 13. Enforce the origin-session mutation guard in the daemon from
     `POHUNEK_SESSION_ID` plus `POHUNEK_DAEMON_ID`, using the existing
     self-feeding attach guard as the identity reference. Keep the plugin check
@@ -856,7 +907,6 @@ Support:
 - profile target or custom absolute home;
 - access mode;
 - repeated host allowlist;
-- optional agent/profile allowlist;
 - JSON/non-interactive output.
 
 Hermes installation dispatches in the CLI. Existing Codex/Claude RPC behavior
@@ -898,13 +948,15 @@ versioned serde model containing:
 - required CLI protocol range;
 - access mode;
 - allowed hosts;
-- optional allowed agents/profiles;
 - bounded tool timeout;
 - bounded output/screen limits;
 - bounded concurrent tool invocations.
 
 Required security fields have no silent defaults. Named safe maxima are
-compiled into the plugin and installer.
+compiled into the plugin and installer. The model carries no agent/profile list
+and no metadata key list: permitted agents are whatever runtime inventory
+returns, and metadata is a fixed compiled schema. Do not add a configurable
+field for either.
 
 Store the policy outside the Hermes plugin directory under the Pohunek state
 directory, keyed by the canonical resolved Hermes home. Record its absolute
@@ -1047,7 +1099,8 @@ Before CLI invocation:
 - resolve tool against access mode;
 - reject origin-session mutation;
 - reject stop/remove of origin unconditionally;
-- enforce agent/profile allowlist;
+- accept only agents returned by runtime inventory, from the compiled bound
+  rather than a policy list;
 - enforce timeout/result/input bounds;
 - reject arbitrary endpoints, executable paths, environment maps, and extra
   arguments;
@@ -1442,11 +1495,13 @@ Document this release order:
 9. verify native ID, continuation replacement, screen/output, wait, and resume;
 10. then enable remote/full policies as explicitly desired.
 
-Run steps 1-5 first for M1's exact-version-to-range-negotiation transition and
-again for M2's breaking enum/notification-policy version. Neither boundary has
-a mixed-fleet public compatibility window. A partially upgraded fleet is
-intentionally offline for cross-version public calls until both endpoints are
-upgraded. Steps 6-10 apply when M3 installs and validates the plugin after M2.
+Steps 1-5 apply exactly once, for M1's exact-version-to-range-negotiation
+transition, which has no mixed-fleet public compatibility window: a partially
+upgraded fleet is intentionally offline for cross-version public calls until
+both endpoints are upgraded. From M1 onward peers negotiate the highest
+overlapping version, so M2 and M3 need only an ordinary rollout and no
+coordinated boundary. Steps 6-10 apply when M3 installs and validates the
+plugin after M2.
 
 Document rollback limitations:
 
@@ -1556,9 +1611,9 @@ milestone; no milestone may claim items assigned to a later milestone.
 
 ### 18.7 Notifications and clients
 
-- [ ] Notification policy is provider-keyed.
-- [ ] M2 advances the public protocol for the strict Hermes enum and
-      notification-policy shape with no unsafe M1 overlap.
+- [ ] Notification policy is provider-keyed, landed in M1.
+- [ ] `AgentKind::Hermes` is added in M2 with no public protocol bump, and an
+      unknown value renders neutrally on an older M1 peer.
 - [ ] Hermes attention is sanitized and projected.
 - [ ] CLI, GUI, web SDK, client core, frontend, and fixtures support Hermes.
 - [ ] Resume/fork actions are capability-driven.
@@ -1604,6 +1659,13 @@ milestone; no milestone may claim items assigned to a later milestone.
       control-line bounds and the dedicated-connection wait contract.
 - [ ] The daemon origin-session guard rejects direct CLI/API bypass and the
       existing self-feeding attach behavior remains green.
+- [ ] The single public break is complete: range negotiation, the provider-keyed
+      notification policy, and forward-compatible `AgentKind` all land in M1, an
+      unknown wire value round-trips to the neutral variant, and that variant is
+      rejected by every mutating path.
+- [ ] `session.report_native_id` carries runtime identity, PID start identity,
+      sequence, and expiry; the daemon enforces the same rejection rules as the
+      private claim path; both existing hook scripts send the new fields.
 - [ ] Public range negotiation, the private compatibility window, generated
       TypeScript, `docs/public-api.md`, and relevant knowledge are current.
 - [ ] Relevant deterministic, real-daemon/worker, Rust, web, TypeScript, and
@@ -1617,8 +1679,9 @@ milestone; no milestone may claim items assigned to a later milestone.
 - [ ] Resume capability and exact argv are implemented and tested against an
       injected valid native reference; without M3 lifecycle reporting, a real
       session with no reference returns the typed missing-reference error.
-- [ ] Provider-keyed notifications and every non-plugin client item in section
-      18.7 pass.
+- [ ] `AgentKind::Hermes` is added additively with no public protocol bump, and
+      an M1 peer that predates the value still renders it neutrally.
+- [ ] Every non-plugin client item in section 18.7 passes.
 - [ ] Process/screen fallback remains bounded when lifecycle integration is
       absent.
 - [ ] Relevant deterministic, real-Hermes PTY, Rust, web, TypeScript, docs, and
@@ -1643,17 +1706,19 @@ milestone; no milestone may claim items assigned to a later milestone.
 | Protocol | serde/golden/version/error tests | daemon/client negotiation |
 | Worker | in-process PTY/output fixtures | spawned `pohunek-sessiond` |
 | Daemon | registry/watch/handler tests | real daemon + worker |
-| Hermes adapter | argv/input/detection fixtures | real Hermes PTY |
+| Hermes adapter | argv/input/detection fixtures | recorded real-Hermes PTY goldens |
 | CLI | parser + subprocess JSON tests | local/remote daemon calls |
 | Installer | temporary homes + controlled executable | pinned Hermes profile |
-| Hooks | socket/order/failure tests | real Hermes hook callbacks |
+| Hooks | socket/order/failure tests | registration in pinned Hermes; ordering from goldens |
 | Tools | policy/runner/result tests | real plugin -> CLI -> daemon |
-| Skill | generator/eval/drift tests | real Hermes discovery |
+| Skill | generator/eval/drift tests | real Hermes discovery (model-free) |
 | GUI/web | reducer/component/fixture tests | Playwright + real-daemon E2E |
 | Security | property/boundary/redaction tests | release smoke in isolated home |
 
 The controlled executable used for deterministic failure injection does not
-replace the pinned real-Hermes suite.
+replace the pinned real-Hermes suite. The real column is model-free: no row
+depends on a live model turn in CI, and every turn-dependent terminal state is
+covered by a recorded golden refreshed out of band.
 
 ## 20. Required verification commands
 
@@ -1696,13 +1761,18 @@ POHUNEK_DAEMON_BIN=/absolute/path/to/target/debug/pohunekd \
 Hermes compatibility:
 
 ```text
-Run the repository-provided pinned-Hermes setup and smoke command added by
-workstream 0. It must create an isolated environment/profile and must not use
-the operator's real Hermes configuration.
+Two commands are added by workstream 0. Both must create an isolated
+environment/profile and must not use the operator's real Hermes configuration.
+
+1. The model-free compatibility suite. CI gates on this one: version and CLI
+   shape, plugin list/enable/disable, tool/skill/hook registration, target
+   resolution, and integration install/status/doctor/uninstall.
+2. The golden refresh command, run by the operator against a real provider when
+   turn-dependent terminal fixtures need updating. CI never runs it.
 ```
 
-The implementation must add a stable repository command for the last gate and
-document it in `AGENTS.md` if CI requires it. The final report records exactly
+The implementation must add both as stable repository commands and document the
+CI-gated one in `AGENTS.md`. The final report records exactly
 which commands ran and any environmental skips; it must not claim green for an
 unrun gate.
 
@@ -1765,10 +1835,11 @@ unrun gate.
 | PATH/plugin hijack | arbitrary code execution | recorded canonical executables, owner/mode checks, embedded checksums |
 | Hermes profile collision | user data overwrite | ownership marker, collision error, marker-driven uninstall |
 | CLI/protocol mismatch | misinterpreted tools | versioned JSON envelope and fail-closed plugin |
-| Public protocol transitions break mixed versions | fleet-wide local/remote outage | explicit M1/M2 runbook, inventory all clients/hosts, drain cross-host calls, coordinated upgrades |
+| The single M1 protocol transition breaks mixed versions | fleet-wide local/remote outage, once | explicit M1 runbook, inventory all clients/hosts, range negotiation afterwards so M2/M3 and future providers never repeat it, drain cross-host calls, coordinated upgrades |
 | New worker feature breaks old live workers | session disruption | current/previous capability negotiation |
 | Notification schema breaks config | lost policy | explicit pre-1.0 upgrade note, deterministic new schema, no silent shim |
-| Real-Hermes tests need credentials | unreliable CI | official offline/test mode or local deterministic provider boundary |
+| Real-Hermes tests need credentials | unreliable CI | model-free CI suite (version/CLI shape, plugin enable, tool/skill/hook registration, installer); turn-dependent fixtures are recorded goldens, no provider server built |
+| Abandoned waiter exhausts waiter caps | temporary `session_waiter_limit_reached` for legitimate callers | short maximum wait so slots free within seconds, caps documented as an availability bound, slot-release test |
 | Sensitive PTY content leaks | confidentiality loss | explicit-only bounded APIs, payload-free logs/errors/notifications |
 
 ## 23. Release readiness

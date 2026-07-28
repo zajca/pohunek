@@ -85,8 +85,10 @@ The integration is successful only when all of the following are true:
    daemon independently and authoritatively protects the origin session.
 9. All new wire methods and errors have Rust and TypeScript parity and are
    documented in `docs/public-api.md`.
-10. Deterministic tests and a pinned real-Hermes smoke suite cover the runtime,
-    plugin loading, tools, hooks, resume behavior, and failure paths.
+10. Deterministic tests cover the runtime, tools, hooks, resume behavior, and
+    failure paths; a pinned real-Hermes suite covers plugin loading, tool/skill
+    registration, and the installer without requiring a model provider, and
+    turn-dependent terminal fixtures are recorded goldens.
 11. The assistant knowledge bundle and its source map describe the shipped
     behavior, and `cargo xtask docs check` detects drift.
 12. The complete Rust and web gate sets in `AGENTS.md` pass.
@@ -320,9 +322,15 @@ Its wire value, CLI value, profile base value, display identifier, process
 manifest key, and notification-provider key are all the lowercase string
 `"hermes"`.
 
-The new enum variant is propagated exhaustively. Unknown future providers
-continue to be rejected by old clients; this change therefore participates in
-the public protocol version bump described in section 20.
+The new enum variant is propagated exhaustively. Adding it is a purely additive
+change that requires no public protocol bump, because M1 already makes
+`AgentKind` forward compatible: an unknown wire value deserializes into a
+neutral variant instead of failing (see section 20.1).
+
+The neutral variant is presentation-only. It is never launchable, `session.new`
+and every other mutating path reject it with a typed error, it is never
+persisted as a way to smuggle an unknown agent into the store, and Rust and
+TypeScript agree on its representation.
 
 ### 9.2 Compiled adapter
 
@@ -475,13 +483,16 @@ reference. It also reports:
 - a bounded expiry;
 - the current Pohunek `runtime_id`, when inherited in the environment.
 
-The worker-private report path is the only authoritative native-identity path
-because it carries runtime generation, PID start identity, sequence, and lease
-expiry. The public `session.report_native_id` method is not a fallback: its
-last-write-wins shape cannot enforce that ordering contract. If the private
-endpoint is unavailable, identity degrades to process/screen detection and
-native resume remains unavailable until a valid private report succeeds. The
-plugin never connects to a remote host for lifecycle reporting.
+The worker-private report path remains the preferred native-identity path. The
+public `session.report_native_id` method is a genuine fallback, because M1
+extends it to carry the same ordering fields the private path already carries —
+runtime identity, PID plus process-start identity, a monotonic sequence, and a
+bounded expiry — and the daemon applies to it the same rejection rules it
+applies to a private active identity claim. The ordering contract is therefore
+uniform across every provider, not Hermes-specific. If both endpoints are
+unavailable, identity degrades to process/screen detection and native resume
+remains unavailable until a valid report succeeds. The plugin never connects to
+a remote host for lifecycle reporting.
 
 `on_session_start` supplies the first identity for a new session.
 `pre_llm_call` reasserts the identity on every turn, including a resumed native
@@ -616,7 +627,7 @@ Request:
     "session_id": "sess_...",
     "after_offset": 8192,
     "max_bytes": 65536,
-    "wait_ms": 10000
+    "wait_ms": 5000
   }
 }
 ```
@@ -677,7 +688,7 @@ Request:
     "after_output_offset": 12490,
     "states": ["exited", "stopped", "failed"],
     "activities": ["idle", "blocked"],
-    "timeout_ms": 30000
+    "timeout_ms": 8000
   }
 }
 ```
@@ -734,6 +745,14 @@ have named, documented platform defaults:
 - maximum serialized terminal rows, columns, and response size;
 - maximum concurrent waiters globally and per session on the owner-local
   daemon.
+
+The maximum `session.wait` duration and the maximum `session.output` wait have
+short defaults in the 5-10 second range. They are named constants whose
+rationale comment records why the ceiling is low: a client killed mid-wait
+holds its waiter slot until the timeout expires, because the sequential
+dispatch loop cannot observe the disconnect. A short ceiling is what bounds the
+resulting availability dip, and callers are expected to re-issue a bounded wait
+rather than request a long one.
 
 The `session.output` byte ceiling and `session.screen` serialized-size ceiling
 are derived from `MAX_CONTROL_LINE_BYTES`, following the existing
@@ -945,10 +964,14 @@ The bundled skill teaches this default loop:
 2. read the current screen;
 3. send one bounded input;
 4. wait for activity, terminal, output, or terminal state;
-5. read the screen/output using returned cursors;
-6. repeat with a bounded attempt budget;
-7. stop and report a blocked/error state rather than looping indefinitely.
+5. re-issue the bounded wait when it returns `timeout` and the work is still
+   expected to progress;
+6. read the screen/output using returned cursors;
+7. repeat with a bounded attempt budget;
+8. stop and report a blocked/error state rather than looping indefinitely.
 
+The maximum wait is deliberately short (section 10.4), so re-issuing is the
+contract rather than a limitation to work around by asking for a longer wait.
 The plugin enforces maximum timeout and result limits even when the model asks
 for larger values.
 
@@ -1030,16 +1053,19 @@ normal ability to mutate, stop, or remove it.
 ### 13.4 Agent/profile allowlist
 
 `pohunek_session_start` accepts only compiled agents and Pohunek agent profiles
-returned by runtime inventory. The Pohunek-owned policy may narrow this to an
-explicit list. It never accepts a raw executable, wrapper command, or
+returned by runtime inventory. That bound is compiled, not
+operator-configurable: the policy carries no agent list, because the daemon
+already validates every requested agent and runtime inventory already bounds
+the set. The tool never accepts a raw executable, wrapper command, or
 environment map from the model.
 
-### 13.5 Metadata allowlist
+### 13.5 Metadata schema
 
-The metadata tool exposes named public fields only. It does not accept an
-arbitrary serialized metadata object. Provider tokens, environment values,
-hook endpoints, socket paths, and private worker identifiers are never
-writeable through this tool.
+The metadata tool exposes named public fields from a fixed compiled schema. The
+schema is not operator-configurable; there is no policy list of permitted keys.
+The tool does not accept an arbitrary serialized metadata object. Provider
+tokens, environment values, hook endpoints, socket paths, and private worker
+identifiers are never writeable through it.
 
 ### 13.6 Logging and redaction
 
@@ -1085,17 +1111,18 @@ validated:
 - managed-session marker;
 - session/runtime identity;
 - worker-private hook endpoint and capability;
-- local daemon endpoint for activity and attention only;
+- local daemon endpoint for activity, attention, and fallback identity;
 - configured socket deadline.
 
 Per-hook execution only constructs a small fixed-shape message and attempts a
 local socket write.
 
-Native identity uses only the ordered worker-private path. Activity and
-attention use the public local daemon report methods because they affect the
-logical registry and notification policy. If either endpoint is unavailable,
-its report is dropped; the worker's terminal and process evidence continue to
-function.
+Native identity prefers the ordered worker-private path and falls back to the
+local public `session.report_native_id` method, which carries the same ordering
+fields (section 9.7). Activity and attention use the public local daemon report
+methods because they affect the logical registry and notification policy. Both
+paths are local only. If an endpoint is unavailable, its report is dropped; the
+worker's terminal and process evidence continue to function.
 
 ### 14.3 Ordering and expiry
 
@@ -1246,9 +1273,12 @@ owner-private, mutable without replacing plugin assets, and contains:
 
 - access mode;
 - allowed hosts;
-- optional allowed Pohunek agents/profiles;
 - operation/output/wait limits within compiled maximums;
 - configuration schema version.
+
+Those are the only operator-configurable fields. Permitted agents come from
+runtime inventory (section 13.4) and the metadata surface is a fixed compiled
+schema (section 13.5); neither is expressible in the policy.
 
 No secrets are stored there. Required policy fields have no silent defaults;
 safe implementation-level maximums remain named constants in the plugin.
@@ -1386,7 +1416,8 @@ UI behavior is capability-driven:
 - screen/output views use the provider-neutral APIs;
 - no UI infers support from the string `"hermes"`;
 - unknown future agents receive a neutral label/icon rather than crashing an
-  exhaustive client switch.
+  exhaustive client switch; from M1 this is backed by the protocol's neutral
+  `AgentKind` variant (section 20.1) rather than by client discipline alone.
 
 The Hermes logo or third-party trademark asset is not copied without a
 license-compatible source. A neutral terminal/agent glyph is sufficient.
@@ -1427,38 +1458,47 @@ unredacted subprocess output, or private hook paths.
 
 ### 20.1 Public protocol
 
-Delivery uses two explicit public protocol transitions. M1 bumps the protocol
-to introduce the minimum/maximum negotiation envelope together with session
-observation methods, typed errors, and capability fields. Those APIs are
-otherwise additive; the envelope change is what requires the M1 bump.
+Delivery uses exactly one public protocol transition, in M1. It is the last
+fleet-wide break this integration causes.
 
-M2 advances the public version again because:
+M1 carries every change that cannot be additive:
 
-- `AgentKind::Hermes` is a new strict enum value;
-- notification policy changes shape.
+- the minimum/maximum negotiation envelope;
+- `session.screen`, `session.output`, and `session.wait` with their result
+  types, capability fields, and typed errors;
+- the provider-keyed notification policy;
+- forward-compatible `AgentKind` deserialization, where an unknown wire value
+  becomes a neutral variant instead of failing.
 
-The current public negotiation requires exact version equality. A daemon bump
-therefore hard-fails every client that has not been upgraded, including the
-Rust CLI, native GUI, web backend/SDK, plugin CLI calls, and clients reaching
-remote hosts over NetBird. Likewise, an upgraded client cannot talk to a
-non-upgraded remote daemon. This is a fleet-wide lockstep boundary, not a
-Hermes-only feature gate.
+M2 and M3 are then purely additive and perform no public bump.
+`AgentKind::Hermes` is a new wire value that older M1 peers already tolerate as
+the neutral variant (section 9.1), and the plugin surface adds no wire shape at
+all.
 
-As part of the M1 bump, public negotiation gains explicit client/server minimum
-and maximum supported versions. M1 cannot interoperate with the legacy
-exact-version envelope. M2 uses the new envelope but declares no overlap for
-its breaking enum/policy shapes. Compatible future additive releases can
-negotiate the highest overlapping version instead of repeating a fleet-wide
-break. Tests cover overlap, no overlap, legacy rejection, and diagnostics.
+The reason for concentrating the break is the cost of the current negotiation,
+which requires exact version equality. A daemon bump hard-fails every client
+that has not been upgraded, including the Rust CLI, native GUI, web
+backend/SDK, plugin CLI calls, and clients reaching remote hosts over NetBird.
+Likewise, an upgraded client cannot talk to a non-upgraded remote daemon.
+Because remote hosts must be visited to be upgraded, each such boundary is an
+operational event across the whole fleet, not a Hermes-only feature gate. One
+boundary is therefore materially cheaper than two.
+
+The envelope introduced in M1 is what prevents a repeat. M1 cannot interoperate
+with the legacy exact-version envelope, but from M1 onward peers negotiate the
+highest overlapping version, so a future provider or additive method never
+forces another lockstep upgrade. Tests cover overlap, no overlap, legacy
+rejection, neutral-variant round-tripping, rejection of the neutral variant on
+mutating paths, and diagnostics.
 
 All version match arms, range-negotiation fixtures, client compatibility tests,
 generated TypeScript types, web fixtures, and public API documentation are
 updated in the same change.
 
-Because Pohunek is pre-1.0, no old notification-policy shape or unknown-agent
-shim is added. Upgrade notes state that every client and every local or remote
-daemon must cross the initial range-negotiation boundary, and later the
-breaking M2 shape boundary, in coordinated order.
+Because Pohunek is pre-1.0, no old notification-policy shape is preserved.
+Upgrade notes state that every client and every local or remote daemon must
+cross the single M1 range-negotiation boundary in coordinated order, and that
+no coordinated upgrade is required for M2 or M3.
 
 ### 20.2 Private worker protocol
 
@@ -1601,6 +1641,8 @@ Payloads and secrets are excluded as specified in section 13.6.
   sequential control connection until data, timeout, or daemon shutdown.
 - Waiters are capped globally and per session, which also caps concurrently
   occupied waiting connections.
+- The short maximum wait (section 10.4) bounds how long a waiter abandoned by a
+  killed client can occupy a slot, because disconnect itself is not observable.
 - Plugin subprocess concurrency is capped per Hermes process.
 - Tool results are capped before they enter Hermes context.
 - The default 10 MB (`10_000_000` bytes) worker history cap remains a
