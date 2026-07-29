@@ -218,6 +218,10 @@ jobs:
         if: endsWith(matrix.target, '-musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      - name: Install GUI smoke-test dependencies
+        if: matrix.component == 'gui'
+        run: sudo apt-get update && sudo apt-get install -y weston
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -229,9 +233,25 @@ jobs:
           key: ${{ matrix.target }}-${{ matrix.component }}
 
       - name: Build release binaries
-        run: >
-          cargo build --release --locked --target ${{ matrix.target }}
-          --bin pohunek --bin pohunekd --bin pohunek-sessiond --bin pohunek-gui
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_args=(--release --locked --target "${{ matrix.target }}")
+          case "${{ matrix.component }}" in
+            cli)
+              cargo build "${build_args[@]}" --bin pohunek
+              ;;
+            daemon)
+              cargo build "${build_args[@]}" --bin pohunek --bin pohunekd --bin pohunek-sessiond
+              ;;
+            gui)
+              cargo build "${build_args[@]}" --bin pohunek-gui
+              ;;
+            *)
+              echo "::error::unsupported release component: ${{ matrix.component }}"
+              exit 1
+              ;;
+          esac
 
       - name: Build docs artifacts
         run: cargo xtask docs site
@@ -270,6 +290,17 @@ jobs:
           ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
           echo "archive=dist/${name}.tar.gz" >> "${GITHUB_OUTPUT}"
           echo "checksum=dist/${name}.tar.gz.sha256" >> "${GITHUB_OUTPUT}"
+
+      - name: Smoke-test packaged GUI
+        if: matrix.component == 'gui'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${{ steps.package.outputs.archive }}"
+          extract_dir=$(mktemp -d)
+          trap 'rm -rf "$extract_dir"' EXIT
+          tar -xzf "$archive" -C "$extract_dir"
+          scripts/smoke-gui-release "$extract_dir/${{ matrix.archive_prefix }}-${GITHUB_REF_NAME#v}-${{ matrix.target }}/${{ matrix.binary }}"
 
       - name: Attach to release
         uses: softprops/action-gh-release@v2

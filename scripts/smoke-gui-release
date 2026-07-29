@@ -1,0 +1,72 @@
+#!/bin/sh
+
+# Starts a packaged GUI binary under an isolated headless Wayland compositor.
+# The process must stay alive long enough to initialize its theme subscription;
+# a missing Tokio reactor in zbus makes it exit during this interval.
+
+set -eu
+
+readonly SMOKE_WINDOW_SECONDS=5
+readonly SMOKE_KILL_GRACE_SECONDS=5
+readonly EXPECTED_TIMEOUT_STATUS=124
+readonly WAYLAND_SOCKET_NAME="pohunek-release-smoke"
+readonly WESTON_BACKEND="headless-backend.so"
+
+if [ "$#" -ne 1 ]; then
+    printf '%s\n' "usage: $0 <pohunek-gui-binary>" >&2
+    exit 64
+fi
+
+gui_binary=$1
+if [ ! -x "$gui_binary" ]; then
+    printf 'GUI binary is not executable: %s\n' "$gui_binary" >&2
+    exit 66
+fi
+
+runtime_dir=$(mktemp -d "${TMPDIR:-/tmp}/pohunek-gui-release-smoke.XXXXXX")
+log_dir=$(mktemp -d "${TMPDIR:-/tmp}/pohunek-gui-release-smoke-logs.XXXXXX")
+weston_pid=""
+
+cleanup() {
+    if [ -n "$weston_pid" ] && kill -0 "$weston_pid" 2>/dev/null; then
+        kill "$weston_pid" 2>/dev/null || true
+        wait "$weston_pid" 2>/dev/null || true
+    fi
+    rm -rf "$runtime_dir" "$log_dir"
+}
+trap cleanup EXIT HUP INT TERM
+
+export XDG_RUNTIME_DIR="$runtime_dir"
+weston --backend="$WESTON_BACKEND" --socket="$WAYLAND_SOCKET_NAME" --idle-time=0 \
+    >"$log_dir/weston.log" 2>&1 &
+weston_pid=$!
+
+socket_path="$XDG_RUNTIME_DIR/$WAYLAND_SOCKET_NAME"
+attempt=0
+readonly MAX_SOCKET_ATTEMPTS=50
+while [ ! -S "$socket_path" ]; do
+    if ! kill -0 "$weston_pid" 2>/dev/null; then
+        cat "$log_dir/weston.log" >&2
+        exit 1
+    fi
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge "$MAX_SOCKET_ATTEMPTS" ]; then
+        printf '%s\n' "headless Wayland compositor did not create its socket" >&2
+        cat "$log_dir/weston.log" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+
+export WAYLAND_DISPLAY="$WAYLAND_SOCKET_NAME"
+set +e
+timeout --signal=TERM --kill-after="$SMOKE_KILL_GRACE_SECONDS" "$SMOKE_WINDOW_SECONDS" \
+    "$gui_binary" >"$log_dir/gui.log" 2>&1
+gui_status=$?
+set -e
+
+if [ "$gui_status" -ne "$EXPECTED_TIMEOUT_STATUS" ]; then
+    printf '%s\n' "packaged GUI exited during startup" >&2
+    cat "$log_dir/gui.log" >&2
+    exit 1
+fi
