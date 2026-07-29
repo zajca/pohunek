@@ -15,7 +15,8 @@ use protocol::{
     event, method, ForkCwdMode, Request, SessionAttachParams, SessionAttachResult,
     SessionDetachParams, SessionDetachResult, SessionForkParams, SessionForkResult, SessionId,
     SessionInfo, SessionNewParams, SessionNewResult, SessionRenameParams, SessionRenameResult,
-    SessionResizeParams, SessionState, ENV_DAEMON_ID, ENV_SESSION_ID, ENV_WORKER_ID,
+    SessionResizeParams, SessionState, TerminalDimensions, ENV_DAEMON_ID, ENV_SESSION_ID,
+    ENV_WORKER_ID,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
@@ -549,8 +550,11 @@ async fn run_attach_once(
     origin_daemon_id: Option<String>,
     origin_worker_id: Option<String>,
 ) -> Result<AttachStreamEnd, CliError> {
+    let initial_dimensions = terminal_size(libc::STDOUT_FILENO)
+        .and_then(|(cols, rows)| TerminalDimensions::new(cols, rows).ok());
     let attach_request = build_attach_request(
         target,
+        initial_dimensions,
         origin_session_id,
         origin_daemon_id,
         origin_worker_id,
@@ -598,11 +602,7 @@ enum AttachStreamEnd {
     StreamClosed,
 }
 
-/// Push an initial resize, then bridge the terminal and the stream until
-/// detach/EOF — generic over the transport.
-///
-/// Mirrors the original local sequence after SDK attach negotiation: best-effort
-/// resize on the control connection, then the forward loop.
+/// Bridges the terminal and stream after attach negotiation.
 async fn attach_over_stream<S>(
     stream: S,
     mut client: Client,
@@ -614,15 +614,8 @@ async fn attach_over_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let terminal_size = terminal_size(libc::STDOUT_FILENO);
-    if let Some((cols, rows)) = terminal_size {
-        if let Ok(request) = build_resize_request(target, cols, rows) {
-            let _ = client.request(&request).await;
-        }
-    }
-
     let (modal, status_updates) = if let Some((cols, rows)) =
-        terminal_size.filter(|&(_, rows)| rows >= MIN_ROWS_WITH_BANNER)
+        terminal_size(libc::STDOUT_FILENO).filter(|&(_, rows)| rows >= MIN_ROWS_WITH_BANNER)
     {
         let snapshot = load_initial_banner_snapshot(&mut client, host, &target.session_id).await;
         // Best-effort live status updates keep the transient modal current. A
@@ -685,6 +678,7 @@ async fn load_initial_banner_snapshot(
 // self-feeding attach (see [`self_feedback_origin`]).
 fn build_attach_request(
     target: &Target,
+    initial_dimensions: Option<TerminalDimensions>,
     origin_session_id: Option<SessionId>,
     origin_daemon_id: Option<String>,
     origin_worker_id: Option<String>,
@@ -693,6 +687,7 @@ fn build_attach_request(
         method::SESSION_ATTACH,
         &SessionAttachParams {
             session_id: SessionId(target.session_id.clone()),
+            initial_dimensions,
             origin_session_id,
             origin_daemon_id,
             origin_worker_id,
@@ -2340,7 +2335,7 @@ mod tests {
     #[test]
     fn attach_request_sends_session_id() {
         let target: Target = "local/s-42".parse().expect("target");
-        let request = build_attach_request(&target, None, None, None).expect("request");
+        let request = build_attach_request(&target, None, None, None, None).expect("request");
 
         assert_request(
             &request,
@@ -2356,6 +2351,7 @@ mod tests {
         let target: Target = "local/s-42".parse().expect("target");
         let request = build_attach_request(
             &target,
+            Some(TerminalDimensions::new(120, 40).expect("valid dimensions")),
             Some(SessionId("s-42".to_owned())),
             Some("daemon-xyz".to_owned()),
             Some("worker-xyz".to_owned()),
@@ -2367,6 +2363,7 @@ mod tests {
             method::SESSION_ATTACH,
             json!({
                 "session_id": "s-42",
+                "initial_dimensions": { "cols": 120, "rows": 40 },
                 "origin_session_id": "s-42",
                 "origin_daemon_id": "daemon-xyz",
                 "origin_worker_id": "worker-xyz"
@@ -2444,7 +2441,7 @@ mod tests {
         // Remote is now supported: the attach request carries only the session
         // id; the host selects the transport, it never enters the request body.
         let remote: Target = "host-b/s-42".parse().expect("target");
-        let request = build_attach_request(&remote, None, None, None).expect("request");
+        let request = build_attach_request(&remote, None, None, None, None).expect("request");
 
         assert_request(
             &request,

@@ -437,6 +437,7 @@ where
         write_sequence = next_attach_sequence(write_sequence)?;
     }
     let mut input = [0_u8; 8 * 1024];
+    let mut snapshot_started = false;
 
     loop {
         tokio::select! {
@@ -451,15 +452,25 @@ where
                     ));
                 }
                 match header.kind {
-                    FrameKind::Replay { .. }
-                    | FrameKind::Output { .. }
-                    | FrameKind::TerminalSnapshot { .. } => {
+                    FrameKind::Replay { .. } => {
+                        return Err(AttachBridgeError::worker_message(
+                            "snapshot attachment received historical replay",
+                        ));
+                    }
+                    FrameKind::Output { .. } if !snapshot_started => {
+                        return Err(AttachBridgeError::worker_message(
+                            "snapshot attachment received live output before its repaint",
+                        ));
+                    }
+                    FrameKind::Output { .. } | FrameKind::TerminalSnapshot { .. } => {
+                        snapshot_started = true;
                         stream
                             .write_all(&payload)
                             .await
                             .map_err(AttachBridgeError::client_io)?;
                     }
-                    FrameKind::Gap { .. } | FrameKind::InputAck { .. } => {}
+                    FrameKind::Gap { .. } => snapshot_started = false,
+                    FrameKind::InputAck { .. } => {}
                     FrameKind::Exit { .. } | FrameKind::Close { .. } => break,
                     FrameKind::Error { error } => {
                         warn!(
@@ -470,7 +481,9 @@ where
                         );
                         return Err(AttachBridgeError::worker_control(error));
                     }
-                    FrameKind::Open { .. } | FrameKind::Input { .. } => {
+                    FrameKind::Open { .. }
+                    | FrameKind::AttachReady { .. }
+                    | FrameKind::Input { .. } => {
                         return Err(AttachBridgeError::worker_message(
                             "worker sent an invalid attach frame",
                         ));
@@ -738,6 +751,7 @@ mod tests {
             version: Version::new(1).expect("version"),
             stream_id: StreamId::new("a-typed-error").expect("stream id"),
             runtime_id: RuntimeId::new("runtime-typed-error").expect("runtime id"),
+            dimension_update: None,
         }
     }
 
@@ -817,5 +831,41 @@ mod tests {
             error.msg.contains("ended partway"),
             "worker frame cause must remain visible: {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn worker_attach_bridge_rejects_historical_replay() {
+        let (daemon_worker, mut fake_worker) = UnixStream::pair().expect("worker stream pair");
+        let mut data = data_stream(daemon_worker);
+        let frame = DataFrame::new(
+            FrameHeader {
+                version: data.version,
+                stream_id: data.stream_id.clone(),
+                runtime_id: data.runtime_id.clone(),
+                kind: FrameKind::Replay { offset: 0 },
+            },
+            b"historical bytes".to_vec(),
+        )
+        .expect("replay frame");
+        write_frame(&mut fake_worker, &frame)
+            .await
+            .expect("write replay frame");
+        let (mut public_stream, _public_peer) = tokio::io::duplex(64);
+
+        let failure = run_worker_attach_bridge(
+            &mut public_stream,
+            "a-replay",
+            &protocol::SessionId("s-replay".to_owned()),
+            &CancellationToken::new(),
+            &mut data,
+            Vec::new(),
+        )
+        .await
+        .expect_err("fresh attach must reject retained history replay");
+        let error = failure
+            .protocol_error()
+            .expect("replay contract failure must be typed");
+        assert_eq!(error.code, "worker_attach_stream_failed");
+        assert!(error.msg.contains("historical replay"));
     }
 }

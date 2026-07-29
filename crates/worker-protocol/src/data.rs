@@ -5,7 +5,7 @@
 //! Lengths are checked before allocation. Async helpers tolerate arbitrary
 //! partial reads and writes.
 
-// Rust guideline compliant 2026-07-27
+// Rust guideline compliant 2026-07-29
 
 use std::fmt::{Debug, Formatter};
 use std::io::ErrorKind;
@@ -15,8 +15,8 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
-    ControlError, DataToken, Dimensions, ExitStatus, RuntimeId, StreamId, StreamMode, Version,
-    WriteId,
+    AttachStart, ControlError, DataToken, Dimensions, ExitStatus, RuntimeId, StreamId, StreamMode,
+    Version, WriteId,
 };
 
 /// Maximum serialized JSON header bytes in one data frame.
@@ -106,6 +106,14 @@ pub enum FrameKind {
         mode: StreamMode,
         /// Last processed offset on reconnection.
         after_offset: Option<u64>,
+        /// Atomic terminal state requested by a fresh public attachment.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attach: Option<AttachStart>,
+    },
+    /// Confirms that an atomic attach start completed successfully.
+    AttachReady {
+        /// Authoritative PTY dimensions applied before snapshot capture.
+        dimensions: Dimensions,
     },
     /// Replays retained output beginning at `offset`.
     Replay {
@@ -274,6 +282,7 @@ fn validate_payload(kind: &FrameKind, payload: &[u8]) -> Result<(), FrameError> 
             }
         }
         FrameKind::Open { .. }
+        | FrameKind::AttachReady { .. }
         | FrameKind::InputAck { .. }
         | FrameKind::Exit { .. }
         | FrameKind::Error { .. }
@@ -488,12 +497,53 @@ mod tests {
                 token: DataToken::new("token-1").expect("valid token"),
                 mode: StreamMode::Attach,
                 after_offset: None,
+                attach: None,
             }),
             vec![1],
         )
         .expect_err("open frame must be metadata-only");
 
         assert!(matches!(error, FrameError::UnexpectedPayload));
+    }
+
+    #[test]
+    fn attach_open_round_trips_start_dimensions() {
+        let start = AttachStart {
+            dimensions: Some(Dimensions::new(120, 40).expect("valid dimensions")),
+        };
+        let frame = DataFrame::new(
+            header(FrameKind::Open {
+                token: DataToken::new("token-1").expect("valid token"),
+                mode: StreamMode::Attach,
+                after_offset: None,
+                attach: Some(start.clone()),
+            }),
+            Vec::new(),
+        )
+        .expect("valid attach open frame");
+
+        let json = serde_json::to_value(frame.header()).expect("serialize frame header");
+        let parsed: FrameHeader = serde_json::from_value(json).expect("deserialize frame header");
+
+        assert_eq!(parsed, frame.header().clone());
+        assert!(matches!(
+            parsed.kind,
+            FrameKind::Open {
+                attach: Some(ref actual),
+                ..
+            } if actual == &start
+        ));
+    }
+
+    #[test]
+    fn attach_ready_round_trips_authoritative_dimensions() {
+        let dimensions = Dimensions::new(100, 30).expect("valid dimensions");
+        let frame = DataFrame::new(header(FrameKind::AttachReady { dimensions }), Vec::new())
+            .expect("valid attach readiness frame");
+        let json = serde_json::to_value(frame.header()).expect("serialize frame header");
+        let parsed: FrameHeader = serde_json::from_value(json).expect("deserialize frame header");
+
+        assert_eq!(parsed.kind, FrameKind::AttachReady { dimensions });
     }
 
     #[test]

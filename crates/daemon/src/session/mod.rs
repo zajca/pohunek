@@ -44,7 +44,7 @@ use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessInspector};
 use crate::project::detect::{project_id, DetectedProject};
 use crate::project::{detect_at, ProjectManager};
 use crate::runtime::{
-    SystemdWorkerLauncher, Worker, WorkerError, WorkerLaunchMode, WorkerLauncher,
+    DimensionUpdate, SystemdWorkerLauncher, Worker, WorkerError, WorkerLaunchMode, WorkerLauncher,
 };
 use crate::store::{
     DesiredState, ProjectRecord, ResumeBinding, RuntimeRecord, SessionRecord, SessionTransaction,
@@ -1805,7 +1805,7 @@ impl SessionRegistry {
             entry.runtime.clone()
         };
 
-        match runtime {
+        let update = match runtime {
             RuntimeHandle::Worker(worker) => {
                 let sequence = self
                     .inner
@@ -1818,13 +1818,25 @@ impl SessionRegistry {
                 worker
                     .resize(source_id, sequence, dimensions)
                     .await
-                    .map_err(worker_error_to_protocol)?;
+                    .map_err(worker_error_to_protocol)?
             }
             RuntimeHandle::Unavailable(state) => {
                 return Err(unavailable_runtime_error(id, state));
             }
-        }
+        };
 
+        let info = self.record_dimensions(id, &update).await?;
+        Ok(protocol::SessionResizeResult { session: info })
+    }
+
+    async fn record_dimensions(
+        &self,
+        id: &SessionId,
+        update: &DimensionUpdate,
+    ) -> Result<SessionInfo, ProtocolError> {
+        let dimensions = update.dimensions();
+        let cols = dimensions.columns();
+        let rows = dimensions.rows();
         let (info, detector_resize, has_native) = {
             let mut sessions = self.inner.sessions.lock().await;
             let entry = sessions
@@ -1857,7 +1869,7 @@ impl SessionRegistry {
         }
 
         self.emit(event::SESSION_UPDATED, &info);
-        Ok(protocol::SessionResizeResult { session: info })
+        Ok(info)
     }
 
     /// Stop a running session.
@@ -2958,12 +2970,19 @@ fn session_external_read_only(id: &SessionId) -> ProtocolError {
     )
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "map_err adapters receive WorkerError by value and immediately render it"
-)]
 fn worker_error_to_protocol(err: WorkerError) -> ProtocolError {
-    runtime_error("worker_operation_failed", err.to_string())
+    match err {
+        unsupported @ WorkerError::AttachSnapshotUnsupported { .. } => ProtocolError::new(
+            ErrorClass::Runtime,
+            "attach_snapshot_unsupported",
+            unsupported.to_string(),
+            Some(
+                "restart the session on the upgraded worker, or fork it into a new session"
+                    .to_owned(),
+            ),
+        ),
+        other => runtime_error("worker_operation_failed", other.to_string()),
+    }
 }
 
 fn unavailable_runtime_error(id: &SessionId, state: RuntimeState) -> ProtocolError {

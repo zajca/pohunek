@@ -858,7 +858,9 @@ pub(super) async fn open_detector_output(
                         | FrameKind::Exit { .. }
                         | FrameKind::Error { .. }
                         | FrameKind::Close { .. } => {}
-                        FrameKind::Open { .. } | FrameKind::Input { .. } => {
+                        FrameKind::Open { .. }
+                        | FrameKind::AttachReady { .. }
+                        | FrameKind::Input { .. } => {
                             warn!("worker detector received an invalid server frame");
                             break;
                         }

@@ -23,13 +23,13 @@ use tokio::net::UnixStream;
 
 const CONNECT_ATTEMPTS: usize = 300;
 const CONNECT_DELAY: Duration = Duration::from_millis(50);
-/// Allows a debug-built worker to forward the full incident-sized replay.
+/// Allows a debug-built worker to render a snapshot and subsequent live output.
 const ATTACH_READ_TIMEOUT: Duration = Duration::from_secs(15);
-/// Incident-sized retained replay that previously exceeded one worker frame.
+/// Incident-sized historical output that keeps offset zero retained.
 const REPLAY_BURST_BYTES: usize = 2_655_396;
-/// Marker emitted immediately after the incident-sized replay.
+/// Visible marker emitted immediately after the historical output burst.
 const REPLAY_BURST_MARKER: &[u8] = b"replay-burst-complete";
-/// Retains the complete burst plus subsequent counter and interaction output.
+/// Retains the complete burst to exercise the non-evicted-history regression.
 const REPLAY_HISTORY_BYTES: u64 = 3_000_000;
 
 #[tokio::test]
@@ -144,7 +144,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
     assert_eq!(child_tty(child_pid), pty_device);
     let mut before_outage_attach = fixture.open_attach(&fixture.session_id).await;
     let before_outage_bytes = read_until_counter(&mut before_outage_attach, 5).await;
-    assert_complete_replay_burst(&before_outage_bytes);
+    assert_current_terminal_snapshot(&before_outage_bytes);
     let last_counter = extract_counters(&before_outage_bytes)
         .into_iter()
         .max()
@@ -170,17 +170,19 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
     assert_eq!(child_tty(child_pid), pty_device);
     let mut after_outage_attach = fixture.open_attach(&fixture.session_id).await;
     let after_outage_bytes = read_until_counter(&mut after_outage_attach, last_counter + 4).await;
-    assert_complete_replay_burst(&after_outage_bytes);
-    let missing = extract_counters(&after_outage_bytes)
+    assert_current_terminal_snapshot(&after_outage_bytes);
+    let current = extract_counters(&after_outage_bytes)
         .into_iter()
         .filter(|counter| *counter > last_counter)
         .collect::<Vec<_>>();
     assert!(
-        missing.len() >= 4,
-        "replacement attach must replay counters emitted during outage: {missing:?}"
+        current
+            .iter()
+            .copied()
+            .max()
+            .is_some_and(|counter| counter >= last_counter + 4),
+        "replacement attach must repaint current state after the outage: {current:?}"
     );
-    assert_eq!(missing[0], last_counter + 1);
-    assert!(missing.windows(2).all(|pair| pair[1] == pair[0] + 1));
 
     let mut gap_attach = fixture.open_attach(&fixture.isolation_session_id).await;
     let gap_bytes = read_until_counter(&mut gap_attach, 5).await;
@@ -216,6 +218,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
     let attach = client
         .call::<method::SessionAttach>(SessionAttachParams {
             session_id: SessionId(fixture.session_id.clone()),
+            initial_dimensions: None,
             origin_session_id: None,
             origin_daemon_id: None,
             origin_worker_id: None,
@@ -680,6 +683,7 @@ impl Fixture {
         let attach = client
             .call::<method::SessionAttach>(SessionAttachParams {
                 session_id: SessionId(session_id.to_owned()),
+                initial_dimensions: None,
                 origin_session_id: None,
                 origin_daemon_id: None,
                 origin_worker_id: None,
@@ -835,34 +839,23 @@ async fn read_until_marker(stream: &mut UnixStream, marker: &[u8]) -> Vec<u8> {
     .expect("marker arrives before timeout")
 }
 
-fn assert_complete_replay_burst(bytes: &[u8]) {
+fn assert_current_terminal_snapshot(bytes: &[u8]) {
+    assert!(
+        bytes
+            .windows(b"\x1b[2J\x1b[H".len())
+            .any(|window| window == b"\x1b[2J\x1b[H"),
+        "fresh attach must start with a complete terminal repaint"
+    );
     let marker_start = bytes
         .windows(REPLAY_BURST_MARKER.len())
         .position(|window| window == REPLAY_BURST_MARKER)
-        .expect("fresh attach must replay the completion marker");
+        .expect("fresh attach snapshot must contain the visible completion marker");
     let after_marker = marker_start + REPLAY_BURST_MARKER.len();
     assert!(
         !bytes[after_marker..]
             .windows(REPLAY_BURST_MARKER.len())
             .any(|window| window == REPLAY_BURST_MARKER),
-        "fresh attach must replay the burst marker exactly once"
-    );
-    let replay_end = bytes[..marker_start]
-        .iter()
-        .rposition(|byte| !matches!(*byte, b'\r' | b'\n'))
-        .map_or(0, |index| index + 1);
-    let replay_start = replay_end
-        .checked_sub(REPLAY_BURST_BYTES)
-        .expect("fresh attach replay must contain the full burst");
-    assert!(
-        bytes[replay_start..replay_end]
-            .iter()
-            .all(|byte| *byte == b'R'),
-        "fresh attach must replay every retained burst byte in order"
-    );
-    assert!(
-        replay_start == 0 || bytes[replay_start - 1] != b'R',
-        "fresh attach must not duplicate the retained burst"
+        "fresh attach snapshot must paint the burst marker exactly once"
     );
 }
 

@@ -115,6 +115,7 @@ export type { SessionStopResult } from "./SessionStopResult";
 export type { SessionWarning } from "./SessionWarning";
 export type { SessionWarningKind } from "./SessionWarningKind";
 export type { StateSource } from "./StateSource";
+export type { TerminalDimensions } from "./TerminalDimensions";
 export type { WorktreeRemoveParams } from "./WorktreeRemoveParams";
 export type { WorktreeRemoveResult } from "./WorktreeRemoveResult";
 

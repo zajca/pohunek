@@ -399,6 +399,7 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
         method::SESSION_ATTACH,
         serde_json::to_value(SessionAttachParams {
             session_id: created.id.clone(),
+            initial_dimensions: None,
             origin_session_id: None,
             origin_daemon_id: None,
             origin_worker_id: None,

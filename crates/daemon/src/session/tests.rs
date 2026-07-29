@@ -22,9 +22,11 @@ use crate::integration::{
 };
 use crate::procwatch::{ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessInspector};
 use crate::project::detect::project_id;
+use crate::runtime::WorkerError;
 
 use super::{
-    RuntimeExit, SessionRegistry, SessionRegistryConfig, ShellCommand, MAX_SESSION_NAME_BYTES,
+    worker_error_to_protocol, RuntimeExit, SessionRegistry, SessionRegistryConfig, ShellCommand,
+    MAX_SESSION_NAME_BYTES,
 };
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -92,10 +94,24 @@ fn metadata_patch(entries: &[(&str, Option<&str>)]) -> BTreeMap<String, Option<S
 fn attach_params(id: &SessionId) -> SessionAttachParams {
     SessionAttachParams {
         session_id: id.clone(),
+        initial_dimensions: None,
         origin_session_id: None,
         origin_daemon_id: None,
         origin_worker_id: None,
     }
+}
+
+#[test]
+fn old_worker_attach_failure_has_an_actionable_recovery_hint() {
+    let error = worker_error_to_protocol(WorkerError::AttachSnapshotUnsupported {
+        selected_version: pohunek_worker_protocol::PREVIOUS_VERSION,
+    });
+
+    assert_eq!(error.code, "attach_snapshot_unsupported");
+    assert!(error
+        .recover
+        .as_deref()
+        .is_some_and(|hint| hint.contains("restart") && hint.contains("fork")));
 }
 
 fn temp_store_path(tag: &str) -> PathBuf {
@@ -2465,6 +2481,7 @@ async fn attach_from_inside_the_same_session_is_rejected() {
 
     let self_feed = |session: &SessionId, worker: Option<&str>| SessionAttachParams {
         session_id: session.clone(),
+        initial_dimensions: None,
         origin_session_id: Some(session.clone()),
         origin_daemon_id: Some(daemon_id.clone()),
         origin_worker_id: worker.map(str::to_owned),
@@ -2496,6 +2513,7 @@ async fn attach_from_inside_the_same_session_is_rejected() {
     let err = registry
         .attach(&SessionAttachParams {
             session_id: created.id.clone(),
+            initial_dimensions: None,
             origin_session_id: Some(created.id.clone()),
             origin_daemon_id: Some("some-other-daemon".to_owned()),
             origin_worker_id: Some(worker_id.clone()),
@@ -2520,6 +2538,7 @@ async fn attach_from_inside_the_same_session_is_rejected() {
     registry
         .attach(&SessionAttachParams {
             session_id: created.id.clone(),
+            initial_dimensions: None,
             origin_session_id: Some(SessionId("s-other".to_owned())),
             origin_daemon_id: Some(daemon_id.clone()),
             origin_worker_id: Some(worker_id.clone()),

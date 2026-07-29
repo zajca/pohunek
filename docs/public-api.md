@@ -583,7 +583,8 @@ detail of the CLI.
 Sequence:
 
 1. On a normal control connection, send `session.attach` with
-   `SessionAttachParams`.
+   `SessionAttachParams`. Interactive clients should include validated
+   `initial_dimensions` when their terminal geometry is known.
 2. The daemon returns `SessionAttachResult` with a one-shot `stream_id`.
 3. Open a second connection to the same daemon and transport family.
 4. Send exactly one newline-delimited attach prelude:
@@ -592,9 +593,11 @@ Sequence:
    {"attach":"a-1"}
    ```
 
-5. After the prelude newline, the connection switches to raw bidirectional PTY
-   bytes. Terminal output flows daemon-to-client; user input flows
-   client-to-daemon.
+5. After the prelude newline, the worker applies `initial_dimensions` when
+   present and the connection switches to raw bidirectional PTY bytes. The
+   daemon first sends one complete ANSI repaint of the current terminal state,
+   followed atomically by live PTY output at the repaint watermark. User input
+   flows client-to-daemon.
 6. Send `session.resize` and `session.detach` on the control connection, not on
    the raw byte stream.
 
@@ -608,6 +611,15 @@ Attach stream rules:
 - If redemption fails, the daemon replies with a normal error response on the
   second connection and does not switch to raw byte mode.
 - After successful redemption, bytes are opaque. Clients must not assume UTF-8.
+- A fresh attach never reconstructs the screen by replaying raw output emitted
+  at historical terminal sizes. It starts from the current terminal snapshot,
+  then receives live bytes without a gap or overlap.
+- `initial_dimensions` is optional for non-terminal clients. Omitting it keeps
+  the worker's current geometry while preserving snapshot-first attach.
+- Workers negotiated below private worker protocol v3 cannot provide the
+  atomic resize-and-snapshot guarantee. The daemon rejects such an attach with
+  `runtime/attach_snapshot_unsupported`; restart the session on the upgraded
+  worker or fork it into a new session.
 - `session.detach` cancels an active stream by `stream_id`; closing the raw
   socket also ends the attach. If the worker ended the raw stream with a typed
   failure, the first detach call after EOF returns that failure in the optional

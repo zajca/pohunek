@@ -89,6 +89,7 @@ pub use session::{
     SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
     SessionResizeResult, SessionResumeResult, SessionRuntime, SessionSetMetadataParams,
     SessionSetMetadataResult, SessionState, SessionStopResult, SessionWarning, SessionWarningKind,
+    TerminalDimensions, TerminalDimensionsError,
 };
 #[doc(inline)]
 pub use version::{negotiate, ProtocolVersion, PROTOCOL_VERSION};

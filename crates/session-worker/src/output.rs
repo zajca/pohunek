@@ -1,6 +1,6 @@
 //! Maintains bounded output history and atomic subscriptions.
 
-// Rust guideline compliant 2026-07-27
+// Rust guideline compliant 2026-07-29
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -206,16 +206,31 @@ impl OutputHub {
     pub fn subscribe(&self, after_offset: Option<u64>) -> Result<OutputSubscriber, RingError> {
         let mut state = lock(&self.inner);
         let seed = state.subscription_seed(after_offset)?;
+        Ok(self.register_subscriber(&mut state, seed))
+    }
+
+    /// Atomically captures the current terminal repaint and registers a live
+    /// subscriber at the snapshot watermark.
+    #[must_use]
+    pub fn subscribe_terminal_snapshot(&self) -> OutputSubscriber {
+        let mut state = lock(&self.inner);
+        let seed = QueueSeed::Snapshot {
+            terminal: Arc::clone(&state.terminal_snapshot),
+        };
+        self.register_subscriber(&mut state, seed)
+    }
+
+    fn register_subscriber(&self, state: &mut HubState, seed: QueueSeed) -> OutputSubscriber {
         let queue = Arc::new(SubscriberQueue::new(self.subscriber_limit, seed));
         if state.exited {
             queue.push_terminal(state.ring.next_offset);
         } else {
             state.subscribers.push(Arc::downgrade(&queue));
         }
-        Ok(OutputSubscriber {
+        OutputSubscriber {
             hub: Arc::clone(&self.inner),
             queue,
-        })
+        }
     }
 
     /// Captures output without registering a subscriber.
@@ -360,6 +375,7 @@ impl SubscriberQueue {
         let expected_offset = match &seed {
             QueueSeed::Replay(range) => range.start,
             QueueSeed::Gap { missing, .. } => missing.start,
+            QueueSeed::Snapshot { terminal } => terminal.watermark,
         };
         let event_limit = MAX_DATA_PAYLOAD_BYTES.min(limit);
         let (replay, snapshot) = match seed {
@@ -367,6 +383,7 @@ impl SubscriberQueue {
             QueueSeed::Gap { missing, terminal } => {
                 (None, Some(SnapshotCursor::new(missing, terminal)))
             }
+            QueueSeed::Snapshot { terminal } => (None, Some(SnapshotCursor::without_gap(terminal))),
         };
         Self {
             limit,
@@ -416,6 +433,9 @@ enum QueueSeed {
         missing: Range<u64>,
         terminal: Arc<TerminalSnapshot>,
     },
+    Snapshot {
+        terminal: Arc<TerminalSnapshot>,
+    },
 }
 
 #[derive(Debug)]
@@ -449,6 +469,16 @@ impl SnapshotCursor {
             missing,
             terminal,
             gap_pending: true,
+            next: 0,
+        }
+    }
+
+    fn without_gap(terminal: Arc<TerminalSnapshot>) -> Self {
+        let watermark = terminal.watermark;
+        Self {
+            missing: watermark..watermark,
+            terminal,
+            gap_pending: false,
             next: 0,
         }
     }
@@ -639,6 +669,36 @@ mod tests {
             subscriber.recv().await,
             Some(OutputEvent::Output(chunk))
                 if chunk.offset == 6 && chunk.bytes == b"after"
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_snapshot_subscription_skips_history_and_continues_at_watermark() {
+        let hub = OutputHub::new(1024, 4096, 24, 80).expect("hub");
+        hub.push(b"\x1b[2J\x1b[Hfirst-size")
+            .expect("initial output");
+        hub.resize(40, 120);
+        hub.push(b"\x1b[2J\x1b[Hsecond-size")
+            .expect("resized output");
+        hub.resize(12, 60);
+        hub.push(b"\x1b[2J\x1b[Hfinal-size").expect("final output");
+        let watermark = hub.next_offset();
+
+        let mut subscriber = hub.subscribe_terminal_snapshot();
+        hub.push(b"-live").expect("live output");
+
+        let Some(OutputEvent::TerminalSnapshot(snapshot)) = subscriber.recv().await else {
+            panic!("fresh attach must begin with a terminal snapshot");
+        };
+        assert_eq!(snapshot.terminal().watermark, watermark);
+        assert_eq!(snapshot.terminal().rows, 12);
+        assert_eq!(snapshot.terminal().cols, 60);
+        assert!(snapshot.terminal().visible_text.contains("final-size"));
+        assert!(!snapshot.terminal().visible_text.contains("first-size"));
+        assert!(matches!(
+            subscriber.recv().await,
+            Some(OutputEvent::Output(chunk))
+                if chunk.offset == watermark && chunk.bytes == b"-live"
         ));
     }
 

@@ -208,11 +208,14 @@ incompatible pair fails with a clear, typed error instead of undefined behavior.
 Raw terminal bytes are never multiplexed onto the newline-delimited JSON control
 connection. Attach uses a **separate connection**:
 
-1. On the control connection the client sends `attach { session_id }`.
+1. On the control connection the client sends
+   `attach { session_id, initial_dimensions? }`.
 2. The daemon replies with a `stream_id` (and, for TCP, the port/token to dial).
 3. The client opens a second connection, sends a small header identifying
-   `stream_id`, and the connection becomes a raw, bidirectional byte pipe:
-   terminal output flows down, the client's keystrokes flow up.
+   `stream_id`. The worker applies the initial dimensions when supplied, emits
+   one complete ANSI repaint of the current screen, and atomically continues
+   with live PTY output. The connection then remains a raw, bidirectional byte
+   pipe: terminal output flows down, the client's keystrokes flow up.
 4. `resize`, `detach`, and other control actions are sent on the **control**
    connection, referencing `session_id` / `stream_id`, so they work while
    attached without escaping the byte stream.

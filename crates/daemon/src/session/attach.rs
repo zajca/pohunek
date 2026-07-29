@@ -6,11 +6,12 @@ use super::{
     SessionAttachParams, SessionId, SessionRegistry, SessionState, SystemTime, UNIX_EPOCH,
 };
 use crate::runtime::DataStream;
-use pohunek_worker_protocol::{StreamId, StreamMode};
+use pohunek_worker_protocol::{AttachStart, Dimensions as WorkerDimensions, StreamId};
 
 #[derive(Debug, Clone)]
 pub(super) struct PendingAttach {
     pub(super) session_id: SessionId,
+    pub(super) initial_dimensions: Option<protocol::TerminalDimensions>,
     pub(super) expires_at: tokio::time::Instant,
 }
 
@@ -68,17 +69,20 @@ impl SessionRegistry {
         let id = &params.session_id;
         self.prune_expired_pending_attaches().await;
         self.ensure_not_external(id).await?;
-        let target_worker_id = {
+        let (target_worker_id, target_runtime) = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
             if entry.info.state != SessionState::Running {
                 return Err(session_not_running(id));
             }
-            entry
-                .info
-                .runtime
-                .as_ref()
-                .and_then(|runtime| runtime.worker_id.clone())
+            (
+                entry
+                    .info
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.worker_id.clone()),
+                entry.runtime.clone(),
+            )
         };
 
         // The session exists and is running; only now is a self-feed possible.
@@ -89,6 +93,12 @@ impl SessionRegistry {
         if same_origin_session && same_worker {
             return Err(attach_self_feedback(id));
         }
+        if let RuntimeHandle::Worker(worker) = target_runtime {
+            worker
+                .ensure_attach_snapshot_supported()
+                .await
+                .map_err(super::worker_error_to_protocol)?;
+        }
 
         let stream_id = format!(
             "a-{}",
@@ -96,6 +106,7 @@ impl SessionRegistry {
         );
         let pending = PendingAttach {
             session_id: id.clone(),
+            initial_dimensions: params.initial_dimensions,
             expires_at: tokio::time::Instant::now() + self.inner.config.attach_token_ttl,
         };
         let mut pending_attaches = self.inner.pending_attaches.lock().await;
@@ -131,10 +142,20 @@ impl SessionRegistry {
                 let private_stream_id = StreamId::new(stream_id).map_err(|error| {
                     super::runtime_error("worker_attach_invalid", error.to_string())
                 })?;
-                let data = worker
-                    .open_data(private_stream_id, StreamMode::Attach, None)
+                let dimensions = pending
+                    .initial_dimensions
+                    .map(|dimensions| WorkerDimensions::new(dimensions.cols(), dimensions.rows()))
+                    .transpose()
+                    .map_err(|error| {
+                        super::runtime_error("worker_attach_invalid", error.to_string())
+                    })?;
+                let mut data = worker
+                    .open_attach(private_stream_id, AttachStart { dimensions })
                     .await
                     .map_err(super::worker_error_to_protocol)?;
+                if let Some(update) = data.dimension_update.take() {
+                    self.record_dimensions(&pending.session_id, &update).await?;
+                }
                 RedeemedRuntime::Worker(data)
             }
             RuntimeHandle::Unavailable(state) => {

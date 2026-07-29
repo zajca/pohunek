@@ -19,7 +19,7 @@ use super::{
 };
 use crate::session::target::open_detector_output;
 
-// Rust guideline compliant 2026-07-24
+// Rust guideline compliant 2026-07-29
 
 #[derive(Debug, Clone)]
 struct DiscoveredWorker {
@@ -1428,7 +1428,10 @@ fn classify_connect_error(error: &WorkerError) -> (RuntimeState, &'static str) {
         WorkerError::Socket { .. }
         | WorkerError::Protocol(_)
         | WorkerError::Rejected { .. }
-        | WorkerError::NotInitialized => (RuntimeState::Lost, "worker_unavailable"),
+        | WorkerError::NotInitialized
+        | WorkerError::AttachSnapshotUnsupported { .. } => {
+            (RuntimeState::Lost, "worker_unavailable")
+        }
     }
 }
 
@@ -1827,6 +1830,7 @@ mod tests {
         let self_attach = replacement
             .attach(&protocol::SessionAttachParams {
                 session_id: SessionId(session_id.to_owned()),
+                initial_dimensions: None,
                 origin_session_id: Some(SessionId(session_id.to_owned())),
                 origin_daemon_id: Some("daemon-old".to_owned()),
                 origin_worker_id: Some(worker_id.to_owned()),
@@ -1837,6 +1841,7 @@ mod tests {
         replacement
             .attach(&protocol::SessionAttachParams {
                 session_id: SessionId(session_id.to_owned()),
+                initial_dimensions: None,
                 origin_session_id: Some(SessionId(session_id.to_owned())),
                 origin_daemon_id: Some("daemon-old".to_owned()),
                 origin_worker_id: Some("different-worker".to_owned()),

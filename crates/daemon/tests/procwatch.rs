@@ -315,6 +315,7 @@ async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
     let attached = registry
         .attach(&SessionAttachParams {
             session_id: observed.id.clone(),
+            initial_dimensions: None,
             origin_session_id: None,
             origin_daemon_id: None,
             origin_worker_id: None,

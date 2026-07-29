@@ -26,7 +26,8 @@ use protocol::{
     SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId, SessionInfo,
     SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
     SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult, SessionResizeParams,
-    SessionResizeResult, SessionState, SessionStopResult, StateSource, PROTOCOL_VERSION,
+    SessionResizeResult, SessionState, SessionStopResult, StateSource, TerminalDimensions,
+    PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -531,11 +532,20 @@ async fn attach_session(
     framed: &mut Framed<UnixStream, LinesCodec>,
     id: &SessionId,
 ) -> SessionAttachResult {
+    attach_session_with_dimensions(framed, id, None).await
+}
+
+async fn attach_session_with_dimensions(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    id: &SessionId,
+    initial_dimensions: Option<TerminalDimensions>,
+) -> SessionAttachResult {
     let req = Request::new(
         "session-attach",
         method::SESSION_ATTACH,
         serde_json::to_value(SessionAttachParams {
             session_id: id.clone(),
+            initial_dimensions,
             origin_session_id: None,
             origin_daemon_id: None,
             origin_worker_id: None,
@@ -1422,7 +1432,7 @@ async fn session_input_writes_text_to_shell_pty() {
         output
             .windows(b"got:hello from control".len())
             .any(|window| window == b"got:hello from control"),
-        "input output should be replayed to attach stream: {output:?}"
+        "input output should be visible in the attach snapshot: {output:?}"
     );
 
     let _ = detach_stream(&mut client, &attach.stream_id).await;
@@ -1476,7 +1486,7 @@ async fn session_new_with_input_writes_text_to_shell_pty() {
         output
             .windows(b"got:hello from create".len())
             .any(|window| window == b"got:hello from create"),
-        "create-time input output should be replayed to attach stream: {output:?}"
+        "create-time input output should be visible in the attach snapshot: {output:?}"
     );
 
     let _ = detach_stream(&mut client, &attach.stream_id).await;
@@ -2304,8 +2314,8 @@ async fn attach_raw_stream_round_trips_resizes_detaches_and_reattaches() {
 }
 
 #[tokio::test]
-async fn reattach_replays_recent_output_history() {
-    let socket = temp_socket("attach-history-replay");
+async fn reattach_starts_from_current_snapshot_after_historical_resizes() {
+    let socket = temp_socket("attach-current-snapshot");
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
         stop_grace: Duration::from_millis(50),
@@ -2316,17 +2326,25 @@ async fn reattach_replays_recent_output_history() {
     let mut control = connect(&socket).await;
     let created = create_session(&mut control).await;
 
-    // First attach: produce output that should later be replayed on reattach.
+    // Produce full-screen output at several historical geometries. Replaying
+    // these bytes into a differently sized client is the regression: cursor
+    // movement from the old grids corrupts the reconstructed screen.
     let first = attach_session(&mut control, &created.id).await;
     let mut raw = open_attach_stream(&socket, &first.stream_id).await;
-    raw.write_all(b"printf 'HISTORY-REPLAY-MARK\\n'\n")
+    resize_session(&mut control, &created.id, 120, 40).await;
+    raw.write_all(b"printf '\\033[2J\\033[H%s%s\\n' 'WIDE-HISTORICAL-' 'STATE'\n")
         .await
-        .expect("send history marker command");
-    let live_output = read_until_marker(&mut raw, b"HISTORY-REPLAY-MARK").await;
+        .expect("send wide terminal state");
+    let _ = read_until_marker(&mut raw, b"WIDE-HISTORICAL-STATE").await;
+    resize_session(&mut control, &created.id, 60, 12).await;
+    raw.write_all(b"printf '\\033[2J\\033[H%s%s\\n' 'FINAL-SNAPSHOT-' 'STATE'\n")
+        .await
+        .expect("send final terminal state");
+    let live_output = read_until_marker(&mut raw, b"FINAL-SNAPSHOT-STATE").await;
     assert!(
         live_output
-            .windows(b"HISTORY-REPLAY-MARK".len())
-            .any(|window| window == b"HISTORY-REPLAY-MARK"),
+            .windows(b"FINAL-SNAPSHOT-STATE".len())
+            .any(|window| window == b"FINAL-SNAPSHOT-STATE"),
         "first attach should receive live output: {}",
         String::from_utf8_lossy(&live_output)
     );
@@ -2336,22 +2354,36 @@ async fn reattach_replays_recent_output_history() {
     assert!(detached.detached);
     assert_raw_stream_closes(&mut raw).await;
 
-    // Reattach WITHOUT sending any input. The marker produced before detach
-    // must arrive purely from the replayed history buffer.
-    let second = attach_session(&mut control, &created.id).await;
+    // A differently sized reattach starts from one repaint of current state,
+    // never the retained raw history from incompatible geometries.
+    let second = attach_session_with_dimensions(
+        &mut control,
+        &created.id,
+        Some(TerminalDimensions::new(100, 30).expect("dimensions")),
+    )
+    .await;
     assert_ne!(second.stream_id, first.stream_id);
     let mut raw_again = open_attach_stream(&socket, &second.stream_id).await;
-    let replayed = read_until_marker(&mut raw_again, b"HISTORY-REPLAY-MARK").await;
+    let snapshot = read_until_marker(&mut raw_again, b"FINAL-SNAPSHOT-STATE").await;
+    let resized = inspect_session(&mut control, &created.id).await;
+    assert_eq!((resized.cols, resized.rows), (100, 30));
     assert!(
-        replayed
-            .windows(b"HISTORY-REPLAY-MARK".len())
-            .any(|window| window == b"HISTORY-REPLAY-MARK"),
-        "reattach should replay prior output without new input: {}",
-        String::from_utf8_lossy(&replayed)
+        snapshot
+            .windows(b"\x1b[2J\x1b[H".len())
+            .any(|window| window == b"\x1b[2J\x1b[H"),
+        "fresh attach must begin with a full repaint: {}",
+        String::from_utf8_lossy(&snapshot)
+    );
+    assert!(
+        !snapshot
+            .windows(b"WIDE-HISTORICAL-STATE".len())
+            .any(|window| window == b"WIDE-HISTORICAL-STATE"),
+        "fresh attach must not replay bytes from the historical wide grid: {}",
+        String::from_utf8_lossy(&snapshot)
     );
 
     let stop_req = Request::new(
-        "session-stop-after-history-replay",
+        "session-stop-after-current-snapshot",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),
     );
