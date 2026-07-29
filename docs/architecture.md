@@ -163,6 +163,10 @@ connections for output and attach traffic. A worker accepts one leased daemon
 controller and one-use, short-lived data tokens. The daemon and worker support
 the current and immediately preceding worker protocol versions; an incompatible
 worker remains alive and is exposed as `runtime.state=incompatible`.
+When a new attach capability is unavailable on the preceding version, the
+daemon uses that version's bounded replay attach path. A daemon upgrade must
+never make an otherwise live PTY unreachable merely because it cannot provide a
+newer terminal snapshot feature.
 
 Retained replay and terminal repaint payloads are split into contiguous frames
 bounded by the negotiated worker data payload. History capacity is independent

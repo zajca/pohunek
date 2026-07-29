@@ -140,6 +140,11 @@ Worker-aware releases negotiate the current and immediately preceding private
 worker protocol. An unsupported worker remains alive as `incompatible`. Do not
 force a worker restart as a compatibility shortcut.
 
+When an older compatible worker lacks a newer attach feature, the daemon falls
+back to that worker protocol's bounded replay attach path. Snapshot-first
+terminal restoration is an enhancement, never a condition for reaching a live
+PTY after a daemon upgrade.
+
 Worker-internal fixes apply only to workers created from the updated binary.
 Already-running workers continue executing their mapped binary, even when its
 on-disk file was replaced. Replace a live session only through an explicit safe
