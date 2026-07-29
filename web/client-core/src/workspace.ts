@@ -3,6 +3,7 @@ import type {
   NotificationRecord,
   NotificationUpdateParams,
   ProtocolEvent,
+  TerminalDimensions,
 } from "@pohunek/protocol";
 import { PROTOCOL_VERSION } from "@pohunek/protocol";
 import { ClientError, type CatchAllEvent } from "@pohunek/sdk/browser";
@@ -60,7 +61,11 @@ export interface Workspace {
   readonly sessions: SnapshotStore<SessionsSnapshot>;
   readonly notifications: SnapshotStore<NotificationsSnapshot>;
   readonly actions: WorkspaceActions;
-  attach(host: string, sessionId: string): Promise<SessionAttachment>;
+  attach(
+    host: string,
+    sessionId: string,
+    initialDimensions?: TerminalDimensions,
+  ): Promise<SessionAttachment>;
   close(): Promise<void>;
 }
 
@@ -107,8 +112,12 @@ export class PohunekWorkspace implements Workspace, ActionCaller, OptimisticNoti
     return connection.call(method, params);
   }
 
-  public attach(host: string, sessionId: string): Promise<SessionAttachment> {
-    return attachSession(this.baseUrl, host, sessionId, this);
+  public attach(
+    host: string,
+    sessionId: string,
+    initialDimensions?: TerminalDimensions,
+  ): Promise<SessionAttachment> {
+    return attachSession(this.baseUrl, host, sessionId, this, initialDimensions);
   }
 
   public begin(host: string, params: NotificationUpdateParams): NotificationRollback | undefined {

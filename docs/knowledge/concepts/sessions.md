@@ -182,9 +182,14 @@ and controller sockets, but the worker keeps the same PTY and process group,
 continues draining bounded output, and accepts the replacement daemon after
 reconciliation. `pohunek attach` reconnects to the same runtime id. Reconnection
 emits `session_runtime_reconnected`; it does not emit `session_created`, report
-child exit, or invoke native resume. Retained raw output and terminal repaint
-data are replayed as bounded contiguous worker frames, so the configured history
-capacity can exceed one frame without making the live session unattachable.
+child exit, or invoke native resume. Detector reconnection can replay retained
+raw output from its last processed offset. A fresh interactive attach instead
+applies the client's initial dimensions when known and starts from one complete
+current terminal repaint, followed atomically by live output. It never rebuilds
+the screen from raw bytes emitted at historical terminal sizes.
+Workers negotiated below private protocol v3 cannot guarantee that ordering;
+the daemon returns `attach_snapshot_unsupported`, and the session must be
+restarted on an upgraded worker or forked into a new session.
 Interactive attach input is ordered by a stream-scoped sequence and does not
 consume the worker's bounded control-input deduplication capacity. A typed
 worker stream failure is retained by the daemon for the attaching CLI, which

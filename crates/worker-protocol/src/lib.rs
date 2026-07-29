@@ -11,7 +11,7 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-06-26
+// Rust guideline compliant 2026-07-29
 
 mod codec;
 mod control;
@@ -25,11 +25,11 @@ mod version;
 pub use codec::{ControlCodecError, ControlReader, ControlWriter, MAX_CONTROL_LINE_BYTES};
 #[doc(inline)]
 pub use control::{
-    ActiveIdentityClaim, Capability, ControlCode, ControlError, ControlEvent, ControlMessage,
-    ControlRequest, ControlResponse, ControlTypeError, Dimensions, EventKind, ExitStatus,
-    Initialize, InitializeLimits, InputFragment, InputPlan, InspectSnapshot, LaunchIdentity,
-    ProcessIdentity, ReportedLaunchIdentity, RequestKind, ResizeRequest, ResponseKind,
-    RuntimePhase, RuntimeScope, StopPolicy, StopRequest, StreamMode, WriteAck,
+    ActiveIdentityClaim, AttachStart, Capability, ControlCode, ControlError, ControlEvent,
+    ControlMessage, ControlRequest, ControlResponse, ControlTypeError, Dimensions, EventKind,
+    ExitStatus, Initialize, InitializeLimits, InputFragment, InputPlan, InspectSnapshot,
+    LaunchIdentity, ProcessIdentity, ReportedLaunchIdentity, RequestKind, ResizeRequest,
+    ResponseKind, RuntimePhase, RuntimeScope, StopPolicy, StopRequest, StreamMode, WriteAck,
 };
 #[doc(inline)]
 pub use data::{
@@ -47,6 +47,6 @@ pub use secret::{DataToken, LeaseChallenge, SecretBytes, SecretEnv, SecretError}
 pub use token::{TokenClaims, TokenError, TokenVault};
 #[doc(inline)]
 pub use version::{
-    negotiate, Version, VersionError, VersionRange, CURRENT_VERSION, PREVIOUS_VERSION,
-    SUPPORTED_RANGE,
+    negotiate, Version, VersionError, VersionRange, ATTACH_SNAPSHOT_VERSION, CURRENT_VERSION,
+    PREVIOUS_VERSION, SUPPORTED_RANGE,
 };

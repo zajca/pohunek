@@ -664,8 +664,8 @@ The first control request is:
   "type": "negotiate",
   "request_id": "…",
   "daemon_instance_id": "…",
-  "minimum_version": 1,
-  "maximum_version": 2
+  "minimum_version": 2,
+  "maximum_version": 3
 }
 ```
 
@@ -826,13 +826,25 @@ Opening an output stream is one operation in the worker actor:
 No PTY byte can exist between snapshot and subscription without being either in
 the captured replay range or queued as live output.
 
-If the requested `after_offset` is within the retained ring, the worker sends
+If a detector's requested `after_offset` is within the retained ring, the worker sends
 `Replay` frames beginning exactly at that offset, then `Output` frames beginning
 at the captured `next_offset`.
 
-If no offset is supplied, a new raw attach receives the retained ring followed
-by live output. A daemon detector reconnection requests its last processed
-offset.
+A fresh raw attach never requests historical replay. Its v3 `AttachStart`
+contains optional client dimensions. The worker serializes PTY resize, terminal
+model resize, snapshot capture, and live-subscriber registration against PTY
+output parsing. Normal output reads release that ordering gate after a bounded
+batch. Snapshot and resize operations temporarily suspend slave output, drain
+the finite bytes already queued on the master, apply the new geometry, capture
+the snapshot, and resume output on every success or error path. A continuously
+writing child cannot make one ordering-gate hold unbounded, although acquisition
+fairness remains scheduler-dependent. Once the gate is acquired, no
+old-geometry bytes can cross the snapshot boundary. The worker sends a complete
+`TerminalSnapshot`, then `Output` beginning exactly at the snapshot watermark.
+Omitting dimensions keeps the current worker geometry. A metadata-only
+`AttachReady` frame confirms the resize and subscription succeeded before the
+daemon switches the public connection to raw mode; failure remains a typed
+control error and opens no public byte stream.
 
 If the requested offset precedes `history_start_offset`, the worker sends:
 
@@ -870,8 +882,9 @@ An existing public Unix or TCP attach connection ends when `pohunekd` exits.
 This is not a session exit. CLI, GUI, and web clients reconnect to the new
 daemon and attach to the same logical session and runtime ID.
 
-The daemon translates private frames to the existing raw public byte stream. It
-uses the ANSI terminal snapshot on a gap and never exposes private headers.
+The daemon translates private frames to the existing raw public byte stream. A
+fresh attach begins with the ANSI terminal snapshot; a detector replay gap also
+uses the snapshot recovery path. Private headers are never exposed.
 Client-side automatic reconnect must compare runtime ID: the same runtime may
 be repainted; a changed runtime is presented as explicit recovery, not seamless
 continuation.
@@ -924,9 +937,13 @@ before close when the connection remains writable.
 
 Resize requests carry a runtime ID, attachment or control source ID, and
 monotonic source sequence. Duplicate or older source sequences are ignored.
-The daemon retains the public last-attach-wins policy and sends the resulting
-dimensions to the worker. `Inspect` returns actual PTY dimensions, allowing a
-replacement daemon to restore its public snapshot.
+Initial attach dimensions are bound to the one-shot stream grant and applied
+when that grant is redeemed. The daemon retains the public last-attach-wins
+policy: the last serialized attach redemption or later explicit resize wins. A
+single daemon-side ordering gate spans both the worker operation and the
+corresponding session-registry metadata commit, so a delayed older completion
+cannot overwrite newer dimensions. `Inspect` returns actual PTY dimensions,
+allowing a replacement daemon to restore its public snapshot.
 
 ## 14. Creation Transaction and Crash Windows
 

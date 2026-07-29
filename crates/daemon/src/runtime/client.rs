@@ -3,22 +3,30 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use pohunek_worker_protocol::{
-    write_frame, Capability, ControlCode, ControlMessage, ControlReader, ControlRequest,
-    ControlResponse, ControlWriter, DaemonId, DataFrame, Dimensions, ExitStatus, FrameHeader,
-    FrameKind, Initialize, InputFragment, InputPlan, InspectSnapshot, LeaseId, RequestId,
-    RequestKind, ResizeRequest, ResponseKind, RuntimeId, RuntimeScope, SessionId, StopRequest,
-    StreamId, StreamMode, TransactionId, Version, WorkerId, WriteId, SUPPORTED_RANGE,
+    read_frame, write_frame, AttachStart, Capability, ControlCode, ControlMessage, ControlReader,
+    ControlRequest, ControlResponse, ControlWriter, DaemonId, DataFrame, Dimensions, ExitStatus,
+    FrameHeader, FrameKind, Initialize, InputFragment, InputPlan, InspectSnapshot, LeaseId,
+    RequestId, RequestKind, ResizeRequest, ResponseKind, RuntimeId, RuntimeScope, SessionId,
+    StopRequest, StreamId, StreamMode, TransactionId, Version, WorkerId, WriteId,
+    ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
 };
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
-// Rust guideline compliant 2026-07-28
+// Rust guideline compliant 2026-07-29
 
 /// Prefix for daemon-generated, producer-scoped control input identifiers.
 const INPUT_WRITE_ID_PREFIX: &str = "input";
+/// Maximum wait for the worker's attach readiness frame.
+///
+/// The frame follows a redeemed one-use token and requires no user input, so a
+/// healthy local worker should respond promptly. Bounding it prevents an
+/// unresponsive worker from indefinitely retaining the dimension-order gate.
+const ATTACH_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Errors raised while controlling a durable worker.
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +59,18 @@ pub enum WorkerError {
     /// The worker runtime has not been initialized.
     #[error("worker has no live runtime generation")]
     NotInitialized,
+    /// The worker cannot provide an atomic attach snapshot.
+    #[error("worker protocol {selected_version} does not support atomic attach snapshots")]
+    AttachSnapshotUnsupported {
+        /// Protocol version selected for this daemon-worker connection.
+        selected_version: Version,
+    },
+    /// The worker did not confirm the atomic attach start in time.
+    #[error("worker attach readiness confirmation timed out after {timeout:?}")]
+    AttachReadyTimeout {
+        /// Maximum time allowed for the readiness frame.
+        timeout: Duration,
+    },
 }
 
 /// Cloneable controller for one worker lease.
@@ -59,6 +79,7 @@ pub struct Worker {
     inner: Arc<Mutex<Inner>>,
     socket_path: PathBuf,
     request_sequence: Arc<AtomicU64>,
+    dimension_order: Arc<Mutex<()>>,
 }
 
 #[derive(Debug)]
@@ -70,6 +91,7 @@ struct Inner {
     worker_id: WorkerId,
     runtime_id: Option<RuntimeId>,
     lease_id: LeaseId,
+    capabilities: Vec<Capability>,
     next_write_sequence: u64,
 }
 
@@ -84,6 +106,23 @@ pub struct DataStream {
     pub stream_id: StreamId,
     /// Runtime generation.
     pub runtime_id: RuntimeId,
+    /// Serialized dimension update held until the registry records it.
+    pub dimension_update: Option<DimensionUpdate>,
+}
+
+/// Holds the worker's dimension-order gate until control-plane metadata commits.
+#[derive(Debug)]
+pub struct DimensionUpdate {
+    dimensions: Dimensions,
+    _order: OwnedMutexGuard<()>,
+}
+
+impl DimensionUpdate {
+    /// Returns the authoritative PTY dimensions for this ordered update.
+    #[must_use]
+    pub const fn dimensions(&self) -> Dimensions {
+        self.dimensions
+    }
 }
 
 impl Worker {
@@ -214,15 +253,7 @@ impl Worker {
             };
         let request_id = RequestId::new("connect-acquire")
             .map_err(|error| WorkerError::Protocol(error.to_string()))?;
-        let requested_capabilities = [
-            Capability::AtomicReplay,
-            Capability::TerminalSnapshot,
-            Capability::DeduplicatedInput,
-            Capability::IdentityHook,
-        ]
-        .into_iter()
-        .filter(|capability| capabilities.contains(capability))
-        .collect();
+        let requested_capabilities = requested_capabilities(selected_version, &capabilities);
         let response = exchange(
             &mut reader,
             &mut writer,
@@ -236,8 +267,11 @@ impl Worker {
             },
         )
         .await?;
-        let lease_id = match response.kind {
-            ResponseKind::ControllerAcquired { lease_id, .. } => lease_id,
+        let (lease_id, capabilities) = match response.kind {
+            ResponseKind::ControllerAcquired {
+                lease_id,
+                capabilities,
+            } => (lease_id, capabilities),
             other => return response_error(other),
         };
 
@@ -250,10 +284,12 @@ impl Worker {
                 worker_id,
                 runtime_id,
                 lease_id,
+                capabilities,
                 next_write_sequence: 1,
             })),
             socket_path,
             request_sequence: Arc::new(AtomicU64::new(1)),
+            dimension_order: Arc::new(Mutex::new(())),
         })
     }
 
@@ -270,6 +306,17 @@ impl Worker {
     /// Returns the current runtime identity.
     pub async fn runtime_id(&self) -> Option<RuntimeId> {
         self.inner.lock().await.runtime_id.clone()
+    }
+
+    /// Verifies that this worker can open snapshot-first public attachments.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::AttachSnapshotUnsupported`] when the negotiated
+    /// protocol or granted capabilities cannot provide the required ordering.
+    pub async fn ensure_attach_snapshot_supported(&self) -> Result<(), WorkerError> {
+        let inner = self.inner.lock().await;
+        ensure_attach_snapshot_supported(&inner)
     }
 
     /// Returns the worker's authoritative runtime snapshot.
@@ -367,7 +414,8 @@ impl Worker {
         source_id: StreamId,
         sequence: u64,
         dimensions: Dimensions,
-    ) -> Result<Dimensions, WorkerError> {
+    ) -> Result<DimensionUpdate, WorkerError> {
+        let order = Arc::clone(&self.dimension_order).lock_owned().await;
         let mut inner = self.inner.lock().await;
         let scope = scope(&inner)?;
         let response = request_locked(
@@ -384,7 +432,10 @@ impl Worker {
         )
         .await?;
         match response {
-            ResponseKind::Resized { dimensions, .. } => Ok(dimensions),
+            ResponseKind::Resized { dimensions, .. } => Ok(DimensionUpdate {
+                dimensions,
+                _order: order,
+            }),
             other => response_error(other),
         }
     }
@@ -427,7 +478,41 @@ impl Worker {
         mode: StreamMode,
         after_offset: Option<u64>,
     ) -> Result<DataStream, WorkerError> {
+        self.open_data_with_attach(stream_id, mode, after_offset, None)
+            .await
+    }
+
+    /// Opens a fresh public attachment with an atomic terminal snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::AttachSnapshotUnsupported`] when the worker was
+    /// negotiated below protocol version three or did not grant the capability.
+    pub async fn open_attach(
+        &self,
+        stream_id: StreamId,
+        attach: AttachStart,
+    ) -> Result<DataStream, WorkerError> {
+        self.open_data_with_attach(stream_id, StreamMode::Attach, None, Some(attach))
+            .await
+    }
+
+    async fn open_data_with_attach(
+        &self,
+        stream_id: StreamId,
+        mode: StreamMode,
+        after_offset: Option<u64>,
+        attach: Option<AttachStart>,
+    ) -> Result<DataStream, WorkerError> {
+        let dimension_order = if attach.is_some() {
+            Some(Arc::clone(&self.dimension_order).lock_owned().await)
+        } else {
+            None
+        };
         let mut inner = self.inner.lock().await;
+        if attach.is_some() {
+            ensure_attach_snapshot_supported(&inner)?;
+        }
         let scope = scope(&inner)?;
         let response = request_locked(
             &mut inner,
@@ -437,6 +522,7 @@ impl Worker {
                 stream_id: stream_id.clone(),
                 mode,
                 after_offset,
+                attach: attach.clone(),
             },
         )
         .await?;
@@ -453,6 +539,7 @@ impl Worker {
                 path: self.socket_path.clone(),
                 source,
             })?;
+        let expects_attach_ready = attach.is_some();
         let open = DataFrame::new(
             FrameHeader {
                 version,
@@ -462,6 +549,7 @@ impl Worker {
                     token,
                     mode,
                     after_offset,
+                    attach,
                 },
             },
             Vec::new(),
@@ -470,11 +558,29 @@ impl Worker {
         write_frame(&mut stream, &open)
             .await
             .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+        let dimension_update = if expects_attach_ready {
+            Some(
+                read_ordered_attach_ready(
+                    &mut stream,
+                    &stream_id,
+                    &scope.runtime_id,
+                    dimension_order.ok_or_else(|| {
+                        WorkerError::Protocol(
+                            "snapshot attach lost its dimension ordering guard".to_owned(),
+                        )
+                    })?,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         Ok(DataStream {
             stream,
             version,
             stream_id,
             runtime_id: scope.runtime_id,
+            dimension_update,
         })
     }
 
@@ -507,6 +613,36 @@ impl Worker {
     }
 }
 
+fn requested_capabilities(selected_version: Version, advertised: &[Capability]) -> Vec<Capability> {
+    [
+        Capability::AtomicReplay,
+        Capability::TerminalSnapshot,
+        Capability::DeduplicatedInput,
+        Capability::IdentityHook,
+        Capability::AttachSnapshot,
+    ]
+    .into_iter()
+    .filter(|capability| {
+        (*capability != Capability::AttachSnapshot || selected_version >= ATTACH_SNAPSHOT_VERSION)
+            && advertised.contains(capability)
+    })
+    .collect()
+}
+
+fn supports_attach_snapshot(selected_version: Version, granted: &[Capability]) -> bool {
+    selected_version >= ATTACH_SNAPSHOT_VERSION && granted.contains(&Capability::AttachSnapshot)
+}
+
+fn ensure_attach_snapshot_supported(inner: &Inner) -> Result<(), WorkerError> {
+    if supports_attach_snapshot(inner.selected_version, &inner.capabilities) {
+        Ok(())
+    } else {
+        Err(WorkerError::AttachSnapshotUnsupported {
+            selected_version: inner.selected_version,
+        })
+    }
+}
+
 fn scope(inner: &Inner) -> Result<RuntimeScope, WorkerError> {
     let runtime_id = inner
         .runtime_id
@@ -517,6 +653,59 @@ fn scope(inner: &Inner) -> Result<RuntimeScope, WorkerError> {
         session_id: inner.session_id.clone(),
         worker_id: inner.worker_id.clone(),
         runtime_id,
+    })
+}
+
+async fn read_attach_ready(
+    stream: &mut UnixStream,
+    stream_id: &StreamId,
+    runtime_id: &RuntimeId,
+) -> Result<Dimensions, WorkerError> {
+    read_attach_ready_with_timeout(stream, stream_id, runtime_id, ATTACH_READY_TIMEOUT).await
+}
+
+async fn read_attach_ready_with_timeout(
+    stream: &mut UnixStream,
+    stream_id: &StreamId,
+    runtime_id: &RuntimeId,
+    timeout: Duration,
+) -> Result<Dimensions, WorkerError> {
+    let frame = tokio::time::timeout(timeout, read_frame(stream))
+        .await
+        .map_err(|_elapsed| WorkerError::AttachReadyTimeout { timeout })?
+        .map_err(|error| WorkerError::Protocol(error.to_string()))?
+        .ok_or_else(|| {
+            WorkerError::Protocol("worker attach closed before readiness confirmation".to_owned())
+        })?;
+    let (header, payload) = frame.into_parts();
+    if header.stream_id != *stream_id || header.runtime_id != *runtime_id || !payload.is_empty() {
+        return Err(WorkerError::Protocol(
+            "worker attach readiness frame did not match its stream".to_owned(),
+        ));
+    }
+    match header.kind {
+        FrameKind::AttachReady { dimensions } => Ok(dimensions),
+        FrameKind::Error { error } => Err(WorkerError::Rejected {
+            code: error.code,
+            message: error.message,
+            retryable: error.retryable,
+        }),
+        _ => Err(WorkerError::Protocol(
+            "worker attach did not begin with readiness confirmation".to_owned(),
+        )),
+    }
+}
+
+async fn read_ordered_attach_ready(
+    stream: &mut UnixStream,
+    stream_id: &StreamId,
+    runtime_id: &RuntimeId,
+    order: OwnedMutexGuard<()>,
+) -> Result<DimensionUpdate, WorkerError> {
+    let dimensions = read_attach_ready(stream, stream_id, runtime_id).await?;
+    Ok(DimensionUpdate {
+        dimensions,
+        _order: order,
     })
 }
 
@@ -585,6 +774,138 @@ fn response_error<T>(response: ResponseKind) -> Result<T, WorkerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_negotiation_does_not_request_attach_snapshots() {
+        let requested = requested_capabilities(
+            pohunek_worker_protocol::PREVIOUS_VERSION,
+            &[Capability::AttachSnapshot, Capability::AtomicReplay],
+        );
+
+        assert_eq!(requested, vec![Capability::AtomicReplay]);
+    }
+
+    #[test]
+    fn attach_snapshot_requires_v3_and_a_grant() {
+        assert!(!supports_attach_snapshot(
+            pohunek_worker_protocol::PREVIOUS_VERSION,
+            &[Capability::AttachSnapshot],
+        ));
+        assert!(!supports_attach_snapshot(ATTACH_SNAPSHOT_VERSION, &[]));
+        assert!(supports_attach_snapshot(
+            ATTACH_SNAPSHOT_VERSION,
+            &[Capability::AttachSnapshot],
+        ));
+    }
+
+    #[tokio::test]
+    async fn attach_ready_reports_authoritative_dimensions() {
+        let (mut client, mut worker) = UnixStream::pair().expect("worker stream pair");
+        let stream_id = StreamId::new("a-ready").expect("stream id");
+        let runtime_id = RuntimeId::new("runtime-ready").expect("runtime id");
+        let dimensions = Dimensions::new(100, 30).expect("dimensions");
+        let frame = DataFrame::new(
+            FrameHeader {
+                version: pohunek_worker_protocol::CURRENT_VERSION,
+                stream_id: stream_id.clone(),
+                runtime_id: runtime_id.clone(),
+                kind: FrameKind::AttachReady { dimensions },
+            },
+            Vec::new(),
+        )
+        .expect("ready frame");
+        write_frame(&mut worker, &frame)
+            .await
+            .expect("write ready frame");
+
+        assert_eq!(
+            read_attach_ready(&mut client, &stream_id, &runtime_id)
+                .await
+                .expect("read ready frame"),
+            dimensions
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_ready_surfaces_the_worker_error() {
+        let (mut client, mut worker) = UnixStream::pair().expect("worker stream pair");
+        let stream_id = StreamId::new("a-error").expect("stream id");
+        let runtime_id = RuntimeId::new("runtime-error").expect("runtime id");
+        let frame = DataFrame::new(
+            FrameHeader {
+                version: pohunek_worker_protocol::CURRENT_VERSION,
+                stream_id: stream_id.clone(),
+                runtime_id: runtime_id.clone(),
+                kind: FrameKind::Error {
+                    error: pohunek_worker_protocol::ControlError {
+                        code: ControlCode::InvalidState,
+                        message: "runtime exited before attach completed".to_owned(),
+                        retryable: false,
+                    },
+                },
+            },
+            Vec::new(),
+        )
+        .expect("error frame");
+        write_frame(&mut worker, &frame)
+            .await
+            .expect("write error frame");
+
+        assert!(matches!(
+            read_attach_ready(&mut client, &stream_id, &runtime_id).await,
+            Err(WorkerError::Rejected {
+                code: ControlCode::InvalidState,
+                retryable: false,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attach_ready_timeout_releases_dimension_order() {
+        let (mut client, _worker) = UnixStream::pair().expect("worker stream pair");
+        let stream_id = StreamId::new("a-timeout").expect("stream id");
+        let runtime_id = RuntimeId::new("runtime-timeout").expect("runtime id");
+        let order = Arc::new(Mutex::new(()));
+        let guard = Arc::clone(&order).lock_owned().await;
+
+        let ready = tokio::spawn(async move {
+            read_ordered_attach_ready(&mut client, &stream_id, &runtime_id, guard).await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(ATTACH_READY_TIMEOUT).await;
+
+        assert!(matches!(
+            ready.await.expect("readiness task joins"),
+            Err(WorkerError::AttachReadyTimeout {
+                timeout: ATTACH_READY_TIMEOUT
+            })
+        ));
+        assert!(
+            order.try_lock().is_ok(),
+            "a timeout must release the dimension-order gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn dimension_update_holds_order_until_metadata_commit_finishes() {
+        let order = Arc::new(Mutex::new(()));
+        let guard = Arc::clone(&order).lock_owned().await;
+        let update = DimensionUpdate {
+            dimensions: Dimensions::new(100, 30).expect("dimensions"),
+            _order: guard,
+        };
+
+        assert!(
+            order.try_lock().is_err(),
+            "a later resize must wait while the registry owns the update"
+        );
+        drop(update);
+        assert!(
+            order.try_lock().is_ok(),
+            "the ordering gate must reopen after metadata commit"
+        );
+    }
 
     #[test]
     fn current_protocol_is_in_supported_range() {

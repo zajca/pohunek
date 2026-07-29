@@ -6,6 +6,7 @@ import type {
   NotificationRecord,
   SessionId,
   StateSource,
+  TerminalDimensions,
 } from "@pohunek/protocol";
 
 export type ScenarioNotificationInput =
@@ -35,6 +36,7 @@ export interface ScenarioBackend {
   removeSession(sessionId: SessionId): void;
   createScenarioNotification(input: ScenarioNotificationInput): NotificationRecord;
   deleteNotification(id: NotificationId): void;
+  initialAttachDimensions(sessionId: SessionId): ReadonlyArray<TerminalDimensions>;
   resizes(sessionId: SessionId): ReadonlyArray<ScenarioResize>;
   writeToPty(sessionId: SessionId, bytes: Uint8Array): number;
   queuePtyOutput(sessionId: SessionId, bytes: Uint8Array): void;
@@ -71,6 +73,11 @@ export class FixtureScenario {
   /** Removes a fixture notification and emits `notification_deleted` to subscribers. */
   public deleteNotification(id: NotificationId): void {
     this.backend.deleteNotification(id);
+  }
+
+  /** Returns the initial terminal geometry supplied with each session attach. */
+  public initialAttachDimensions(sessionId: SessionId): ReadonlyArray<TerminalDimensions> {
+    return this.backend.initialAttachDimensions(sessionId);
   }
 
   /** Returns a snapshot of terminal sizes delivered for one session. */

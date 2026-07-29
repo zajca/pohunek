@@ -19,7 +19,7 @@ use super::{
 };
 use crate::session::target::open_detector_output;
 
-// Rust guideline compliant 2026-07-24
+// Rust guideline compliant 2026-07-29
 
 #[derive(Debug, Clone)]
 struct DiscoveredWorker {
@@ -1425,10 +1425,18 @@ fn classify_connect_error(error: &WorkerError) -> (RuntimeState, &'static str) {
             ..
         } => (RuntimeState::Conflict, "controller_busy"),
         WorkerError::ResponseMismatch => (RuntimeState::Conflict, "runtime_identity_mismatch"),
+        // `connect_discovered` cannot currently produce this error: it is only
+        // emitted by attach capability checks after a controller is connected.
+        // Keep a semantically correct classification for future callers rather
+        // than reporting an otherwise reachable capability mismatch as loss.
+        WorkerError::AttachSnapshotUnsupported { .. } => {
+            (RuntimeState::Incompatible, "attach_snapshot_unsupported")
+        }
         WorkerError::Socket { .. }
         | WorkerError::Protocol(_)
         | WorkerError::Rejected { .. }
-        | WorkerError::NotInitialized => (RuntimeState::Lost, "worker_unavailable"),
+        | WorkerError::NotInitialized
+        | WorkerError::AttachReadyTimeout { .. } => (RuntimeState::Lost, "worker_unavailable"),
     }
 }
 
@@ -1508,6 +1516,18 @@ mod tests {
             record.info.native_session_id.as_deref(),
             Some("native-launch"),
             "conflicting hook must not replace the accepted launch identity"
+        );
+    }
+
+    #[test]
+    fn attach_snapshot_capability_error_is_not_classified_as_worker_loss() {
+        let error = crate::runtime::WorkerError::AttachSnapshotUnsupported {
+            selected_version: pohunek_worker_protocol::PREVIOUS_VERSION,
+        };
+
+        assert_eq!(
+            super::classify_connect_error(&error),
+            (RuntimeState::Incompatible, "attach_snapshot_unsupported")
         );
     }
 
@@ -1827,6 +1847,7 @@ mod tests {
         let self_attach = replacement
             .attach(&protocol::SessionAttachParams {
                 session_id: SessionId(session_id.to_owned()),
+                initial_dimensions: None,
                 origin_session_id: Some(SessionId(session_id.to_owned())),
                 origin_daemon_id: Some("daemon-old".to_owned()),
                 origin_worker_id: Some(worker_id.to_owned()),
@@ -1837,6 +1858,7 @@ mod tests {
         replacement
             .attach(&protocol::SessionAttachParams {
                 session_id: SessionId(session_id.to_owned()),
+                initial_dimensions: None,
                 origin_session_id: Some(SessionId(session_id.to_owned())),
                 origin_daemon_id: Some("daemon-old".to_owned()),
                 origin_worker_id: Some("different-worker".to_owned()),

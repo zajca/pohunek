@@ -1,6 +1,6 @@
 //! Serves the private daemon-worker Unix protocol.
 
-// Rust guideline compliant 2026-07-28
+// Rust guideline compliant 2026-07-29
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -16,13 +16,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use pohunek_worker_protocol as protocol;
 use protocol::{
-    ActiveIdentityClaim, Capability, CloseReason, ControlCode, ControlError, ControlEvent,
-    ControlMessage, ControlReader, ControlRequest, ControlResponse, ControlWriter, Cursor,
-    DaemonId, DataFrame, DataToken, Dimensions, EventKind, ExitStatus, FrameHeader, FrameKind,
-    Initialize, InspectSnapshot, LeaseChallenge, LeaseId, ProcessIdentity as WireProcessIdentity,
-    ReportedLaunchIdentity, RequestKind, ResponseKind, RuntimeId, RuntimePhase as WireRuntimePhase,
-    RuntimeScope, SessionId, StreamId, StreamMode, TerminalSnapshot as WireTerminalSnapshot,
-    TokenClaims, TokenVault, TransactionId, Version, WorkerId, WriteAck, WriteId, SUPPORTED_RANGE,
+    ActiveIdentityClaim, AttachStart, Capability, CloseReason, ControlCode, ControlError,
+    ControlEvent, ControlMessage, ControlReader, ControlRequest, ControlResponse, ControlWriter,
+    Cursor, DaemonId, DataFrame, DataToken, Dimensions, EventKind, ExitStatus, FrameHeader,
+    FrameKind, Initialize, InspectSnapshot, LeaseChallenge, LeaseId,
+    ProcessIdentity as WireProcessIdentity, ReportedLaunchIdentity, RequestKind, ResponseKind,
+    RuntimeId, RuntimePhase as WireRuntimePhase, RuntimeScope, SessionId, StreamId, StreamMode,
+    TerminalSnapshot as WireTerminalSnapshot, TokenClaims, TokenVault, TransactionId, Version,
+    WorkerId, WriteAck, WriteId, ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
 };
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
@@ -324,6 +325,7 @@ struct DataGrant {
     stream_id: StreamId,
     mode: StreamMode,
     after_offset: Option<u64>,
+    attach: Option<AttachStart>,
 }
 
 #[derive(Debug)]
@@ -332,6 +334,7 @@ struct Connection {
     peer_start: u64,
     daemon_id: Option<DaemonId>,
     selected_version: Option<Version>,
+    capabilities: Vec<Capability>,
     challenge: Option<LeaseChallenge>,
     owner: Option<LeaseOwner>,
     lease_id: Option<LeaseId>,
@@ -344,6 +347,7 @@ impl Connection {
             peer_start,
             daemon_id: None,
             selected_version: None,
+            capabilities: Vec::new(),
             challenge: None,
             owner: None,
             lease_id: None,
@@ -553,7 +557,19 @@ async fn handle_request(
             stream_id,
             mode,
             after_offset,
-        } => open_data_request(shared, connection, &scope, stream_id, mode, after_offset).await,
+            attach,
+        } => {
+            open_data_request(
+                shared,
+                connection,
+                &scope,
+                stream_id,
+                mode,
+                after_offset,
+                attach,
+            )
+            .await
+        }
         RequestKind::WritePlan { scope, plan } => {
             write_request(shared, connection, &scope, plan).await
         }
@@ -604,7 +620,7 @@ async fn negotiate_request(
         runtime_id: state.runtime_id.clone(),
         worker_process: shared.worker_process,
         phase: state.phase,
-        capabilities: capabilities(),
+        capabilities: capabilities(selected),
         challenge,
     })
 }
@@ -639,14 +655,17 @@ fn acquire_request(
         .lease
         .acquire(owner.clone(), lease_id.to_string())
         .map_err(lease_control_error)?;
+    let selected = connection.selected_version.ok_or_else(identity_mismatch)?;
+    let granted_capabilities = capabilities(selected)
+        .into_iter()
+        .filter(|capability| requested.contains(capability))
+        .collect::<Vec<_>>();
     connection.owner = Some(owner);
     connection.lease_id = Some(lease_id.clone());
+    connection.capabilities.clone_from(&granted_capabilities);
     Ok(ResponseKind::ControllerAcquired {
         lease_id,
-        capabilities: capabilities()
-            .into_iter()
-            .filter(|capability| requested.contains(capability))
-            .collect(),
+        capabilities: granted_capabilities,
     })
 }
 
@@ -785,8 +804,10 @@ async fn open_data_request(
     stream_id: StreamId,
     mode: StreamMode,
     after_offset: Option<u64>,
+    attach: Option<AttachStart>,
 ) -> Result<ResponseKind, ControlError> {
     validate_scope(shared, connection, scope).await?;
+    validate_data_start(connection, mode, after_offset, attach.as_ref())?;
     let token_value = random_value("data")
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
     let token = DataToken::new(token_value)
@@ -800,6 +821,7 @@ async fn open_data_request(
         stream_id: stream_id.clone(),
         mode,
         after_offset,
+        attach,
     };
     let mut tokens = lock(&shared.tokens);
     let _ = tokens.vault.purge_expired(now);
@@ -821,6 +843,43 @@ async fn open_data_request(
         token,
         expires_at_ms,
     })
+}
+
+fn validate_data_start(
+    connection: &Connection,
+    mode: StreamMode,
+    after_offset: Option<u64>,
+    attach: Option<&AttachStart>,
+) -> Result<(), ControlError> {
+    let selected = connection.selected_version.ok_or_else(identity_mismatch)?;
+    match (mode, attach) {
+        (StreamMode::Attach, Some(_))
+            if after_offset.is_none()
+                && selected >= ATTACH_SNAPSHOT_VERSION
+                && connection
+                    .capabilities
+                    .contains(&Capability::AttachSnapshot) =>
+        {
+            Ok(())
+        }
+        (StreamMode::Attach, None) if selected < ATTACH_SNAPSHOT_VERSION => Ok(()),
+        (StreamMode::Detector, None) => Ok(()),
+        (StreamMode::Attach, Some(_)) if after_offset.is_some() => Err(control_error_message(
+            ControlCode::InvalidRequest,
+            "snapshot attachment cannot request an output replay offset",
+            false,
+        )),
+        (StreamMode::Attach, _) => Err(control_error_message(
+            ControlCode::InvalidRequest,
+            "atomic attach snapshot was not negotiated",
+            false,
+        )),
+        (StreamMode::Detector, Some(_)) => Err(control_error_message(
+            ControlCode::InvalidRequest,
+            "detector streams cannot request an attach snapshot",
+            false,
+        )),
+    }
 }
 
 async fn write_request(
@@ -1133,6 +1192,7 @@ async fn serve_data(
         token,
         mode,
         after_offset,
+        attach,
     } = header.kind
     else {
         return Err(WorkerError::Protocol(
@@ -1161,6 +1221,7 @@ async fn serve_data(
         || grant.stream_id != header.stream_id
         || grant.mode != mode
         || grant.after_offset != after_offset
+        || grant.attach != attach
     {
         return Err(WorkerError::Protocol(
             "data open frame does not match its grant".to_owned(),
@@ -1173,9 +1234,43 @@ async fn serve_data(
             .clone()
             .ok_or_else(|| WorkerError::Protocol("runtime is not live".to_owned()))?
     };
-    let mut subscriber = pty
-        .subscribe_output(after_offset)
-        .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+    let mut subscriber = if let Some(attach) = attach {
+        let dimensions = attach
+            .dimensions
+            .map(|dimensions| (dimensions.columns(), dimensions.rows()));
+        let (subscriber, (cols, rows)) = match pty.attach_snapshot(dimensions).await {
+            Ok(result) => result,
+            Err(error) => {
+                return write_data_error(
+                    &mut write_half,
+                    header.version,
+                    &header.stream_id,
+                    &header.runtime_id,
+                    control_error(ControlCode::RuntimeFault, error, true),
+                )
+                .await;
+            }
+        };
+        let dimensions = Dimensions::new(cols, rows)
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+        let mut state = shared.state.lock().await;
+        state.journal.cols = Some(cols);
+        state.journal.rows = Some(rows);
+        drop(state);
+        write_data_frame(
+            &mut write_half,
+            header.version,
+            &header.stream_id,
+            &header.runtime_id,
+            FrameKind::AttachReady { dimensions },
+            Vec::new(),
+        )
+        .await?;
+        subscriber
+    } else {
+        pty.subscribe_output(after_offset)
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?
+    };
     let mut lease_epoch = shared.lease_epoch_tx.subscribe();
     let version = header.version;
     let stream_id = header.stream_id;
@@ -1824,13 +1919,17 @@ fn signal_number(name: &str) -> Option<i32> {
     }
 }
 
-fn capabilities() -> Vec<Capability> {
-    vec![
+fn capabilities(version: Version) -> Vec<Capability> {
+    let mut capabilities = vec![
         Capability::AtomicReplay,
         Capability::TerminalSnapshot,
         Capability::DeduplicatedInput,
         Capability::IdentityHook,
-    ]
+    ];
+    if version >= ATTACH_SNAPSHOT_VERSION {
+        capabilities.push(Capability::AttachSnapshot);
+    }
+    capabilities
 }
 
 fn lease_control_error(error: LeaseError) -> ControlError {
@@ -2231,12 +2330,13 @@ where
 mod tests {
     use super::{
         control_input_id, parse_stat, random_value, signal_number, validate_attach_write_id,
-        write_data_error, write_output_chunks, write_terminal_chunks, ControlInputId, PrefixStream,
-        WireTerminalSnapshot,
+        validate_data_start, write_data_error, write_output_chunks, write_terminal_chunks,
+        Connection, ControlInputId, PrefixStream, WireTerminalSnapshot,
     };
     use pohunek_worker_protocol::{
-        self as protocol, ControlCode, ControlError, Cursor, Dimensions, FrameKind, RuntimeId,
-        StreamId, WriteId, CURRENT_VERSION, MAX_DATA_PAYLOAD_BYTES,
+        self as protocol, AttachStart, Capability, ControlCode, ControlError, Cursor, Dimensions,
+        FrameKind, RuntimeId, StreamId, StreamMode, WriteId, CURRENT_VERSION,
+        MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -2301,6 +2401,30 @@ mod tests {
         let error =
             validate_attach_write_id(&duplicate, &stream_id, 8_193).expect_err("old sequence");
         assert_eq!(error.code, ControlCode::InvalidRequest);
+    }
+
+    #[test]
+    fn attach_snapshot_requires_current_negotiated_capability() {
+        let attach = AttachStart {
+            dimensions: Some(Dimensions::new(120, 40).expect("dimensions")),
+        };
+        let mut current = Connection::new(1, 1);
+        current.selected_version = Some(CURRENT_VERSION);
+        current.capabilities.push(Capability::AttachSnapshot);
+        validate_data_start(&current, StreamMode::Attach, None, Some(&attach))
+            .expect("negotiated snapshot attach");
+
+        current.capabilities.clear();
+        let unsupported = validate_data_start(&current, StreamMode::Attach, None, Some(&attach))
+            .expect_err("missing capability");
+        assert_eq!(unsupported.code, ControlCode::InvalidRequest);
+
+        let mut previous = Connection::new(1, 1);
+        previous.selected_version = Some(PREVIOUS_VERSION);
+        validate_data_start(&previous, StreamMode::Attach, None, None)
+            .expect("previous protocol keeps its legacy attach shape");
+        assert!(validate_data_start(&previous, StreamMode::Attach, None, Some(&attach)).is_err());
+        assert!(validate_data_start(&current, StreamMode::Detector, None, Some(&attach)).is_err());
     }
 
     #[tokio::test]
