@@ -258,8 +258,15 @@ describe("@pohunek/client-core", () => {
       await waitFor(() => workspace.sessions.snapshot()[key]?.session.activity === "blocked");
       expect(workspace.sessions.snapshot()[key]?.session.state_source).toBe("report");
 
-      const attachment = await workspace.attach("events", created.id);
+      const attachment = await workspace.attach("events", created.id, {
+        cols: RESIZED_COLS,
+        rows: RESIZED_ROWS,
+      });
       await waitFor(() => workspace.sessions.snapshot()[key]?.attachStreamIds.includes(attachment.streamId) === true);
+      expect(daemon.scenario.initialAttachDimensions(created.id)).toEqual([{
+        cols: RESIZED_COLS,
+        rows: RESIZED_ROWS,
+      }]);
       await attachment.detach();
       await waitFor(() => workspace.sessions.snapshot()[key]?.attachStreamIds.length === 0);
 

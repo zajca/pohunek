@@ -837,8 +837,9 @@ output parsing. Normal output reads release that ordering gate after a bounded
 batch. Snapshot and resize operations temporarily suspend slave output, drain
 the finite bytes already queued on the master, apply the new geometry, capture
 the snapshot, and resume output on every success or error path. A continuously
-writing child therefore cannot starve attach or resize, and no old-geometry
-bytes can cross the snapshot boundary. The worker sends a complete
+writing child cannot make one ordering-gate hold unbounded, although acquisition
+fairness remains scheduler-dependent. Once the gate is acquired, no
+old-geometry bytes can cross the snapshot boundary. The worker sends a complete
 `TerminalSnapshot`, then `Output` beginning exactly at the snapshot watermark.
 Omitting dimensions keeps the current worker geometry. A metadata-only
 `AttachReady` frame confirms the resize and subscription succeeded before the

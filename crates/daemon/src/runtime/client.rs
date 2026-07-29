@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use pohunek_worker_protocol::{
     read_frame, write_frame, AttachStart, Capability, ControlCode, ControlMessage, ControlReader,
@@ -20,6 +21,12 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 /// Prefix for daemon-generated, producer-scoped control input identifiers.
 const INPUT_WRITE_ID_PREFIX: &str = "input";
+/// Maximum wait for the worker's attach readiness frame.
+///
+/// The frame follows a redeemed one-use token and requires no user input, so a
+/// healthy local worker should respond promptly. Bounding it prevents an
+/// unresponsive worker from indefinitely retaining the dimension-order gate.
+const ATTACH_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Errors raised while controlling a durable worker.
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +64,12 @@ pub enum WorkerError {
     AttachSnapshotUnsupported {
         /// Protocol version selected for this daemon-worker connection.
         selected_version: Version,
+    },
+    /// The worker did not confirm the atomic attach start in time.
+    #[error("worker attach readiness confirmation timed out after {timeout:?}")]
+    AttachReadyTimeout {
+        /// Maximum time allowed for the readiness frame.
+        timeout: Duration,
     },
 }
 
@@ -546,15 +559,19 @@ impl Worker {
             .await
             .map_err(|error| WorkerError::Protocol(error.to_string()))?;
         let dimension_update = if expects_attach_ready {
-            let dimensions = read_attach_ready(&mut stream, &stream_id, &scope.runtime_id).await?;
-            Some(DimensionUpdate {
-                dimensions,
-                _order: dimension_order.ok_or_else(|| {
-                    WorkerError::Protocol(
-                        "snapshot attach lost its dimension ordering guard".to_owned(),
-                    )
-                })?,
-            })
+            Some(
+                read_ordered_attach_ready(
+                    &mut stream,
+                    &stream_id,
+                    &scope.runtime_id,
+                    dimension_order.ok_or_else(|| {
+                        WorkerError::Protocol(
+                            "snapshot attach lost its dimension ordering guard".to_owned(),
+                        )
+                    })?,
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -644,8 +661,18 @@ async fn read_attach_ready(
     stream_id: &StreamId,
     runtime_id: &RuntimeId,
 ) -> Result<Dimensions, WorkerError> {
-    let frame = read_frame(stream)
+    read_attach_ready_with_timeout(stream, stream_id, runtime_id, ATTACH_READY_TIMEOUT).await
+}
+
+async fn read_attach_ready_with_timeout(
+    stream: &mut UnixStream,
+    stream_id: &StreamId,
+    runtime_id: &RuntimeId,
+    timeout: Duration,
+) -> Result<Dimensions, WorkerError> {
+    let frame = tokio::time::timeout(timeout, read_frame(stream))
         .await
+        .map_err(|_elapsed| WorkerError::AttachReadyTimeout { timeout })?
         .map_err(|error| WorkerError::Protocol(error.to_string()))?
         .ok_or_else(|| {
             WorkerError::Protocol("worker attach closed before readiness confirmation".to_owned())
@@ -667,6 +694,19 @@ async fn read_attach_ready(
             "worker attach did not begin with readiness confirmation".to_owned(),
         )),
     }
+}
+
+async fn read_ordered_attach_ready(
+    stream: &mut UnixStream,
+    stream_id: &StreamId,
+    runtime_id: &RuntimeId,
+    order: OwnedMutexGuard<()>,
+) -> Result<DimensionUpdate, WorkerError> {
+    let dimensions = read_attach_ready(stream, stream_id, runtime_id).await?;
+    Ok(DimensionUpdate {
+        dimensions,
+        _order: order,
+    })
 }
 
 fn input_write_id(lease_id: &LeaseId, sequence: u64) -> Result<WriteId, WorkerError> {
@@ -783,6 +823,67 @@ mod tests {
                 .await
                 .expect("read ready frame"),
             dimensions
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_ready_surfaces_the_worker_error() {
+        let (mut client, mut worker) = UnixStream::pair().expect("worker stream pair");
+        let stream_id = StreamId::new("a-error").expect("stream id");
+        let runtime_id = RuntimeId::new("runtime-error").expect("runtime id");
+        let frame = DataFrame::new(
+            FrameHeader {
+                version: pohunek_worker_protocol::CURRENT_VERSION,
+                stream_id: stream_id.clone(),
+                runtime_id: runtime_id.clone(),
+                kind: FrameKind::Error {
+                    error: pohunek_worker_protocol::ControlError {
+                        code: ControlCode::InvalidState,
+                        message: "runtime exited before attach completed".to_owned(),
+                        retryable: false,
+                    },
+                },
+            },
+            Vec::new(),
+        )
+        .expect("error frame");
+        write_frame(&mut worker, &frame)
+            .await
+            .expect("write error frame");
+
+        assert!(matches!(
+            read_attach_ready(&mut client, &stream_id, &runtime_id).await,
+            Err(WorkerError::Rejected {
+                code: ControlCode::InvalidState,
+                retryable: false,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attach_ready_timeout_releases_dimension_order() {
+        let (mut client, _worker) = UnixStream::pair().expect("worker stream pair");
+        let stream_id = StreamId::new("a-timeout").expect("stream id");
+        let runtime_id = RuntimeId::new("runtime-timeout").expect("runtime id");
+        let order = Arc::new(Mutex::new(()));
+        let guard = Arc::clone(&order).lock_owned().await;
+
+        let ready = tokio::spawn(async move {
+            read_ordered_attach_ready(&mut client, &stream_id, &runtime_id, guard).await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(ATTACH_READY_TIMEOUT).await;
+
+        assert!(matches!(
+            ready.await.expect("readiness task joins"),
+            Err(WorkerError::AttachReadyTimeout {
+                timeout: ATTACH_READY_TIMEOUT
+            })
+        ));
+        assert!(
+            order.try_lock().is_ok(),
+            "a timeout must release the dimension-order gate"
         );
     }
 

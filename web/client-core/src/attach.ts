@@ -1,5 +1,5 @@
 import { attachRawWs, type RawStream } from "@pohunek/sdk/browser";
-import type { Methods } from "@pohunek/protocol";
+import type { Methods, TerminalDimensions } from "@pohunek/protocol";
 
 export interface AttachCaller {
   call<K extends "session.attach" | "session.detach">(
@@ -22,8 +22,12 @@ export async function attachSession(
   host: string,
   sessionId: string,
   caller: AttachCaller,
+  initialDimensions?: TerminalDimensions,
 ): Promise<SessionAttachment> {
-  const attached = await caller.call(host, "session.attach", { session_id: sessionId });
+  const attached = await caller.call(host, "session.attach", {
+    session_id: sessionId,
+    ...(initialDimensions === undefined ? {} : { initial_dimensions: initialDimensions }),
+  });
   let stream: RawStream;
   try {
     stream = await attachRawWs(baseUrl, host, attached.stream_id);

@@ -29,11 +29,12 @@ use crate::{OutputHub, OutputSubscriber, RingError, WriteCoordinator};
 /// Eight KiB bounds temporary allocations while keeping terminal repaint
 /// throughput efficient.
 const READ_CHUNK_BYTES: usize = 8 * 1024;
-/// Maximum output drained by the reader while holding the snapshot ordering gate.
+/// Maximum output drained per turn while holding the snapshot ordering gate.
 ///
-/// A quarter MiB amortizes lock traffic without starving an attach or resize
-/// behind an unbounded producer such as `yes`.
-const READER_DRAIN_BATCH_BYTES: usize = 256 * 1024;
+/// A quarter MiB amortizes lock traffic while making every gate hold finite
+/// under an unbounded producer such as `yes`. This bounds one holder's work,
+/// but does not guarantee which waiting operation acquires the gate next.
+const OUTPUT_DRAIN_BATCH_BYTES: usize = 256 * 1024;
 /// Blocking and non-blocking epoll timeout values.
 ///
 /// The raw epoll API uses negative one for an indefinite wait and zero for an
@@ -160,6 +161,9 @@ pub enum PtyError {
     /// A blocking PTY task terminated unexpectedly.
     #[error("PTY blocking task terminated unexpectedly")]
     Task,
+    /// Queued output exceeds the atomic resize or snapshot drain limit.
+    #[error("queued PTY output exceeds the atomic resize or snapshot drain limit")]
+    OutputDrainLimit,
     /// Process identity changed before a signal.
     #[error("managed process identity no longer matches pid {pid}")]
     IdentityChanged {
@@ -327,7 +331,7 @@ impl PtyOwner {
             .spawn(move || {
                 let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
                 loop {
-                    if let Err(error) = wait_for_output(&thread_output_readiness) {
+                    if let Err(error) = wait_for_output(&*thread_output_readiness) {
                         event!(
                             name: "worker.pty.read.failed",
                             Level::WARN,
@@ -343,12 +347,12 @@ impl PtyOwner {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     match drain_available_output(
                         &thread_output_reader,
-                        &thread_output_readiness,
+                        &*thread_output_readiness,
                         &reader_output,
                         &mut buffer,
-                        READER_DRAIN_BATCH_BYTES,
+                        OUTPUT_DRAIN_BATCH_BYTES,
                     ) {
-                        Ok(OutputReadState::Open) => {}
+                        Ok(OutputReadState::Open | OutputReadState::BudgetExhausted) => {}
                         Ok(OutputReadState::Eof) => break,
                         Err(error) => {
                             event!(
@@ -458,7 +462,8 @@ impl PtyOwner {
     ///
     /// # Errors
     ///
-    /// Returns [`PtyError`] for invalid dimensions or PTY I/O failure.
+    /// Returns [`PtyError`] for invalid dimensions, queued-output limits, or
+    /// PTY I/O failure.
     pub async fn resize(
         &self,
         source_id: &str,
@@ -483,26 +488,19 @@ impl PtyOwner {
         let output_reader = Arc::clone(&self.output_reader);
         let output_readiness = Arc::clone(&self.output_readiness);
         let tty_name = Arc::clone(&self.tty_name);
-        tokio::task::spawn_blocking(move || {
+        let output_pause = tokio::task::spawn_blocking(move || {
             let _order = output_order
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let output_pause = OutputPause::new(&tty_name)?;
             let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
-            if drain_available_output(
+            drain_snapshot_boundary(
                 &output_reader,
-                &output_readiness,
+                &*output_readiness,
                 &output,
                 &mut buffer,
-                usize::MAX,
-            )? == OutputReadState::Eof
-            {
-                output.mark_exit();
-                return Err(PtyError::Io(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "PTY closed before resize",
-                )));
-            }
+                OUTPUT_DRAIN_BATCH_BYTES,
+            )?;
             let master = master.lock().map_err(|_poison| PtyError::Poisoned)?;
             master
                 .resize(PtySize {
@@ -513,16 +511,20 @@ impl PtyOwner {
                 })
                 .map_err(|source| PtyError::Io(io::Error::other(source)))?;
             output.resize(rows, cols);
-            output_pause.resume()?;
-            Ok::<(), PtyError>(())
+            Ok::<OutputPause, PtyError>(output_pause)
         })
         .await
         .map_err(|_join_error| PtyError::Task)??;
-        resize
-            .sequences
-            .insert(source_id.to_owned(), source_sequence);
-        resize.cols = cols;
-        resize.rows = rows;
+        commit_resize_before_resume(
+            &mut resize,
+            ResizeCommit::Resize {
+                source_id,
+                source_sequence,
+                cols,
+                rows,
+            },
+            || output_pause.resume(),
+        )?;
         Ok(true)
     }
 
@@ -555,26 +557,19 @@ impl PtyOwner {
         let output_reader = Arc::clone(&self.output_reader);
         let output_readiness = Arc::clone(&self.output_readiness);
         let tty_name = Arc::clone(&self.tty_name);
-        let subscriber = tokio::task::spawn_blocking(move || {
+        let (output_pause, subscriber) = tokio::task::spawn_blocking(move || {
             let _order = output_order
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let output_pause = OutputPause::new(&tty_name)?;
             let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
-            if drain_available_output(
+            drain_snapshot_boundary(
                 &output_reader,
-                &output_readiness,
+                &*output_readiness,
                 &output,
                 &mut buffer,
-                usize::MAX,
-            )? == OutputReadState::Eof
-            {
-                output.mark_exit();
-                return Err(PtyError::Io(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "PTY closed before attach snapshot",
-                )));
-            }
+                OUTPUT_DRAIN_BATCH_BYTES,
+            )?;
             if let Some((cols, rows)) = dimensions {
                 let master = master.lock().map_err(|_poison| PtyError::Poisoned)?;
                 master
@@ -588,15 +583,17 @@ impl PtyOwner {
                 output.resize(rows, cols);
             }
             let subscriber = output.subscribe_terminal_snapshot();
-            output_pause.resume()?;
-            Ok::<OutputSubscriber, PtyError>(subscriber)
+            Ok::<(OutputPause, OutputSubscriber), PtyError>((output_pause, subscriber))
         })
         .await
         .map_err(|_join_error| PtyError::Task)??;
 
         if let Some((cols, rows)) = dimensions {
-            resize.cols = cols;
-            resize.rows = rows;
+            commit_resize_before_resume(&mut resize, ResizeCommit::Attach { cols, rows }, || {
+                output_pause.resume()
+            })?;
+        } else {
+            output_pause.resume()?;
         }
         Ok((subscriber, (resize.cols, resize.rows)))
     }
@@ -696,10 +693,51 @@ struct ResizeState {
     sequences: HashMap<String, u64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ResizeCommit<'a> {
+    Resize {
+        source_id: &'a str,
+        source_sequence: u64,
+        cols: u16,
+        rows: u16,
+    },
+    Attach {
+        cols: u16,
+        rows: u16,
+    },
+}
+
+fn commit_resize_before_resume(
+    state: &mut ResizeState,
+    commit: ResizeCommit<'_>,
+    resume: impl FnOnce() -> Result<(), PtyError>,
+) -> Result<(), PtyError> {
+    match commit {
+        ResizeCommit::Resize {
+            source_id,
+            source_sequence,
+            cols,
+            rows,
+        } => {
+            state
+                .sequences
+                .insert(source_id.to_owned(), source_sequence);
+            state.cols = cols;
+            state.rows = rows;
+        }
+        ResizeCommit::Attach { cols, rows } => {
+            state.cols = cols;
+            state.rows = rows;
+        }
+    }
+    resume()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputReadState {
     Open,
     Eof,
+    BudgetExhausted,
 }
 
 #[derive(Debug)]
@@ -738,7 +776,15 @@ impl OutputPause {
 impl Drop for OutputPause {
     fn drop(&mut self) {
         if !self.resumed {
-            let _ = tcflow(&self.tty, Action::OOn);
+            if let Err(error) = tcflow(&self.tty, Action::OOn) {
+                event!(
+                    name: "worker.pty.output_resume.failed",
+                    Level::WARN,
+                    error.type = "io",
+                    error.code = error.raw_os_error(),
+                    "Last-resort PTY output resume failed; output may remain paused",
+                );
+            }
         }
     }
 }
@@ -795,21 +841,40 @@ fn rustix_errno_to_pty_error(error: rustix::io::Errno) -> PtyError {
     PtyError::Io(io::Error::from_raw_os_error(error.raw_os_error()))
 }
 
-fn wait_for_output(readiness: &OutputReadiness) -> Result<(), PtyError> {
+trait OutputReady {
+    fn is_ready(&self, timeout_ms: isize) -> Result<bool, PtyError>;
+}
+
+impl OutputReady for OutputReadiness {
+    fn is_ready(&self, timeout_ms: isize) -> Result<bool, PtyError> {
+        Self::is_ready(self, timeout_ms)
+    }
+}
+
+fn wait_for_output(readiness: &impl OutputReady) -> Result<(), PtyError> {
     readiness.is_ready(EPOLL_WAIT_FOREVER_MS).map(|_ready| ())
 }
 
-fn drain_available_output(
+fn drain_available_output<R>(
     reader: &Mutex<Box<dyn Read + Send>>,
-    readiness: &OutputReadiness,
+    readiness: &R,
     output: &OutputHub,
     buffer: &mut [u8],
     byte_budget: usize,
-) -> Result<OutputReadState, PtyError> {
+) -> Result<OutputReadState, PtyError>
+where
+    R: OutputReady + ?Sized,
+{
     let mut drained = 0_usize;
     loop {
         if drained >= byte_budget {
-            return Ok(OutputReadState::Open);
+            return readiness.is_ready(EPOLL_NO_WAIT_MS).map(|ready| {
+                if ready {
+                    OutputReadState::BudgetExhausted
+                } else {
+                    OutputReadState::Open
+                }
+            });
         }
         if !readiness.is_ready(EPOLL_NO_WAIT_MS)? {
             return Ok(OutputReadState::Open);
@@ -823,6 +888,29 @@ fn drain_available_output(
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(PtyError::Io(error)),
         }
+    }
+}
+
+fn drain_snapshot_boundary<R>(
+    reader: &Mutex<Box<dyn Read + Send>>,
+    readiness: &R,
+    output: &OutputHub,
+    buffer: &mut [u8],
+    byte_budget: usize,
+) -> Result<(), PtyError>
+where
+    R: OutputReady + ?Sized,
+{
+    match drain_available_output(reader, readiness, output, buffer, byte_budget)? {
+        OutputReadState::Open => Ok(()),
+        OutputReadState::Eof => {
+            output.mark_exit();
+            Err(PtyError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "PTY closed before atomic resize or snapshot",
+            )))
+        }
+        OutputReadState::BudgetExhausted => Err(PtyError::OutputDrainLimit),
     }
 }
 
@@ -859,13 +947,13 @@ fn lock_result<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, PtyE
 #[cfg(test)]
 mod tests {
     use super::{
-        drain_available_output, Command, OutputReadState, OutputReadiness, PtyOwner,
-        READ_CHUNK_BYTES,
+        commit_resize_before_resume, drain_available_output, drain_snapshot_boundary, Command,
+        OutputReadState, OutputReady, PtyError, PtyOwner, ResizeCommit, ResizeState,
+        OUTPUT_DRAIN_BATCH_BYTES, READ_CHUNK_BYTES,
     };
     use crate::{InputFragment, InputPlan, OutputEvent, OutputHub, WorkerConfig};
-    use std::io::Write;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::net::UnixStream;
+    use std::collections::{HashMap, VecDeque};
+    use std::io::Cursor;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -889,6 +977,30 @@ mod tests {
             config.input_dedup_entries,
         )
         .expect("spawn PTY")
+    }
+
+    #[derive(Debug)]
+    struct TestReadiness {
+        states: Mutex<VecDeque<bool>>,
+    }
+
+    impl TestReadiness {
+        fn new(states: impl IntoIterator<Item = bool>) -> Self {
+            Self {
+                states: Mutex::new(states.into_iter().collect()),
+            }
+        }
+    }
+
+    impl OutputReady for TestReadiness {
+        fn is_ready(&self, _timeout_ms: isize) -> Result<bool, PtyError> {
+            Ok(self
+                .states
+                .lock()
+                .expect("test readiness lock")
+                .pop_front()
+                .unwrap_or(false))
+        }
     }
 
     #[tokio::test]
@@ -967,18 +1079,22 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_includes_output_ready_before_the_ordering_gate() {
-        let (mut writer, reader) = UnixStream::pair().expect("socket pair");
-        let readiness = OutputReadiness::new(reader.as_raw_fd()).expect("readiness descriptor");
-        let reader = Mutex::new(Box::new(reader) as Box<dyn std::io::Read + Send>);
+        let readiness = TestReadiness::new([true, false]);
+        let reader = Mutex::new(Box::new(Cursor::new(
+            b"\x1b[2J\x1b[Hstable-before-snapshot".to_vec(),
+        )) as Box<dyn std::io::Read + Send>);
         let output = OutputHub::new(64 * 1024, 64 * 1024, 24, 80).expect("output hub");
-        writer
-            .write_all(b"\x1b[2J\x1b[Hstable-before-snapshot")
-            .expect("write ready output");
 
         let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
         assert_eq!(
-            drain_available_output(&reader, &readiness, &output, &mut buffer, usize::MAX,)
-                .expect("drain ready output"),
+            drain_available_output(
+                &reader,
+                &readiness,
+                &output,
+                &mut buffer,
+                OUTPUT_DRAIN_BATCH_BYTES,
+            )
+            .expect("drain ready output"),
             OutputReadState::Open
         );
         output.resize(30, 100);
@@ -1024,6 +1140,111 @@ mod tests {
             .stop("cleanup-noisy", Duration::from_millis(200))
             .await
             .expect("cleanup");
+    }
+
+    #[test]
+    fn drain_available_output_stops_at_the_byte_budget() {
+        let readiness = TestReadiness::new(std::iter::repeat_n(
+            true,
+            OUTPUT_DRAIN_BATCH_BYTES / READ_CHUNK_BYTES + 1,
+        ));
+        let reader = Mutex::new(Box::new(Cursor::new(vec![
+            b'x';
+            OUTPUT_DRAIN_BATCH_BYTES
+                + READ_CHUNK_BYTES
+        ])) as Box<dyn std::io::Read + Send>);
+        let output = OutputHub::new(64 * 1024, 64 * 1024, 24, 80).expect("output hub");
+
+        let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
+        assert_eq!(
+            drain_available_output(
+                &reader,
+                &readiness,
+                &output,
+                &mut buffer,
+                OUTPUT_DRAIN_BATCH_BYTES,
+            )
+            .expect("drain the bounded batch"),
+            OutputReadState::BudgetExhausted
+        );
+        assert_eq!(output.next_offset(), OUTPUT_DRAIN_BATCH_BYTES as u64);
+    }
+
+    #[test]
+    fn queued_output_beyond_the_budget_prevents_resize_state_commit() {
+        let readiness = TestReadiness::new([true, true]);
+        let reader = Mutex::new(Box::new(Cursor::new(vec![b'x'; READ_CHUNK_BYTES * 2]))
+            as Box<dyn std::io::Read + Send>);
+        let output = OutputHub::new(64 * 1024, 64 * 1024, 24, 80).expect("output hub");
+        let mut state = ResizeState {
+            cols: 80,
+            rows: 24,
+            sequences: HashMap::new(),
+        };
+        let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
+        let mut committed = false;
+
+        let error =
+            drain_snapshot_boundary(&reader, &readiness, &output, &mut buffer, READ_CHUNK_BYTES)
+                .and_then(|()| {
+                    committed = true;
+                    commit_resize_before_resume(
+                        &mut state,
+                        ResizeCommit::Attach { cols: 90, rows: 28 },
+                        || Ok(()),
+                    )
+                })
+                .expect_err("queued bytes beyond the budget must reject the atomic operation");
+
+        assert!(matches!(error, PtyError::OutputDrainLimit));
+        assert!(!committed);
+        assert_eq!((state.cols, state.rows), (80, 24));
+        assert!(state.sequences.is_empty());
+    }
+
+    #[test]
+    fn resize_state_commits_before_resume_failure() {
+        let mut state = ResizeState {
+            cols: 80,
+            rows: 24,
+            sequences: HashMap::new(),
+        };
+
+        let error = commit_resize_before_resume(
+            &mut state,
+            ResizeCommit::Resize {
+                source_id: "attach-1",
+                source_sequence: 7,
+                cols: 100,
+                rows: 40,
+            },
+            || Err(PtyError::Task),
+        )
+        .expect_err("injected resume failure");
+
+        assert!(matches!(error, PtyError::Task));
+        assert_eq!((state.cols, state.rows), (100, 40));
+        assert_eq!(state.sequences.get("attach-1"), Some(&7));
+    }
+
+    #[test]
+    fn attach_resize_state_commits_before_resume_failure() {
+        let mut state = ResizeState {
+            cols: 80,
+            rows: 24,
+            sequences: HashMap::new(),
+        };
+
+        let error = commit_resize_before_resume(
+            &mut state,
+            ResizeCommit::Attach { cols: 90, rows: 28 },
+            || Err(PtyError::Task),
+        )
+        .expect_err("injected resume failure");
+
+        assert!(matches!(error, PtyError::Task));
+        assert_eq!((state.cols, state.rows), (90, 28));
+        assert!(state.sequences.is_empty());
     }
 
     #[test]

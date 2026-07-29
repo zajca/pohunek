@@ -550,8 +550,7 @@ async fn run_attach_once(
     origin_daemon_id: Option<String>,
     origin_worker_id: Option<String>,
 ) -> Result<AttachStreamEnd, CliError> {
-    let initial_dimensions = terminal_size(libc::STDOUT_FILENO)
-        .and_then(|(cols, rows)| TerminalDimensions::new(cols, rows).ok());
+    let initial_dimensions = current_terminal_dimensions();
     let attach_request = build_attach_request(
         target,
         initial_dimensions,
@@ -576,6 +575,7 @@ async fn run_attach_once(
                 host,
                 paths,
                 target,
+                initial_dimensions,
             ))
             .await
         }
@@ -587,6 +587,7 @@ async fn run_attach_once(
                 host,
                 paths,
                 target,
+                initial_dimensions,
             ))
             .await
         }
@@ -610,6 +611,7 @@ async fn attach_over_stream<S>(
     host: &str,
     paths: &Paths,
     target: &Target,
+    initial_dimensions: Option<TerminalDimensions>,
 ) -> Result<AttachStreamEnd, CliError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -650,6 +652,7 @@ where
         },
         modal,
         status_updates,
+        initial_dimensions,
     )
     .await
 }
@@ -1344,9 +1347,28 @@ async fn apply_terminal_resize<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let Some((cols, rows)) = terminal_size(libc::STDOUT_FILENO) else {
+    let Some(dimensions) = current_terminal_dimensions() else {
         return Ok(());
     };
+    apply_terminal_dimensions(client, target, modal, menu, stdout, dimensions).await
+}
+
+/// Applies known dimensions to the shadow grid and daemon PTY.
+///
+/// An open modal is closed first because its background uses the old geometry.
+async fn apply_terminal_dimensions<W>(
+    client: &mut Client,
+    target: &Target,
+    modal: &mut Option<ModalState>,
+    menu: &mut MenuRuntime,
+    stdout: &mut W,
+    dimensions: TerminalDimensions,
+) -> Result<(), CliError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let cols = dimensions.cols();
+    let rows = dimensions.rows();
     close_modal(stdout, modal.as_mut()).await?;
     if let Some(state) = menu.state.as_mut() {
         *state = MenuState::Closed;
@@ -1359,6 +1381,36 @@ where
         let _ = client.request(&request).await;
     }
     Ok(())
+}
+
+fn current_terminal_dimensions() -> Option<TerminalDimensions> {
+    terminal_size(libc::STDOUT_FILENO)
+        .and_then(|(cols, rows)| TerminalDimensions::new(cols, rows).ok())
+}
+
+fn resize_after_signal_registration(
+    initial: Option<TerminalDimensions>,
+    current: Option<TerminalDimensions>,
+) -> Option<TerminalDimensions> {
+    current.filter(|dimensions| Some(*dimensions) != initial)
+}
+
+async fn apply_resize_after_signal_registration<W>(
+    client: &mut Client,
+    target: &Target,
+    ui: (&mut Option<ModalState>, &mut MenuRuntime, &mut W),
+    initial_dimensions: Option<TerminalDimensions>,
+) -> Result<(), CliError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let (modal, menu, stdout) = ui;
+    let Some(dimensions) =
+        resize_after_signal_registration(initial_dimensions, current_terminal_dimensions())
+    else {
+        return Ok(());
+    };
+    apply_terminal_dimensions(client, target, modal, menu, stdout, dimensions).await
 }
 
 async fn handle_stdin_input<W, O>(
@@ -1438,6 +1490,7 @@ async fn forward_attached_stream<S>(
     control: AttachControlContext,
     mut modal: Option<ModalState>,
     mut status_updates: Option<BannerUpdates>,
+    initial_dimensions: Option<TerminalDimensions>,
 ) -> Result<AttachStreamEnd, CliError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1445,11 +1498,17 @@ where
     let (mut terminal, mut terminal_output, mut winch) =
         prepare_attach_terminal(&mut status_updates).await?;
     let (mut socket_read, mut socket_write) = tokio::io::split(stream);
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    let mut stdin_buf = [0_u8; IO_BUFFER_BYTES];
-    let mut socket_buf = [0_u8; IO_BUFFER_BYTES];
+    let (mut stdin, mut stdout) = (tokio::io::stdin(), tokio::io::stdout());
+    let (mut stdin_buf, mut socket_buf) = ([0_u8; IO_BUFFER_BYTES], [0_u8; IO_BUFFER_BYTES]);
     let mut menu = MenuRuntime::new(modal.is_some());
+
+    apply_resize_after_signal_registration(
+        &mut client,
+        &control.target,
+        (&mut modal, &mut menu, &mut stdout),
+        initial_dimensions,
+    )
+    .await?;
 
     let outcome: Result<AttachStreamEnd, CliError> = async {
         loop {
@@ -2466,6 +2525,26 @@ mod tests {
                 "rows": 40
             }),
         );
+    }
+
+    #[test]
+    fn resize_after_signal_registration_only_applies_changed_dimensions() {
+        let initial = TerminalDimensions::new(120, 40).expect("initial dimensions");
+        let changed = TerminalDimensions::new(100, 30).expect("changed dimensions");
+
+        assert_eq!(
+            resize_after_signal_registration(Some(initial), Some(initial)),
+            None
+        );
+        assert_eq!(
+            resize_after_signal_registration(Some(initial), Some(changed)),
+            Some(changed)
+        );
+        assert_eq!(
+            resize_after_signal_registration(None, Some(changed)),
+            Some(changed)
+        );
+        assert_eq!(resize_after_signal_registration(Some(initial), None), None);
     }
 
     #[test]
