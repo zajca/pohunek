@@ -162,7 +162,9 @@ identity; Pohunek quarantines it and does not kill a worker automatically.
 `incompatible` means the worker is alive but has no compatible private protocol
 version, so the daemon leaves it running. Attach, input, and resize are not
 available in these degraded states, but list and inspect retain the logical
-record and diagnostic `loss_reason`.
+record and diagnostic `loss_reason`. After preserving diagnostic evidence, the
+operator can remove a degraded logical record with `session rm`; this does not
+stop or signal an unavailable or ambiguous worker.
 
 External observer mode is opt-in with `POHUNEK_OBSERVE_EXTERNAL_AGENTS=1` (or
 `SessionRegistryConfig.observe_external_agents = true`) and defaults off because

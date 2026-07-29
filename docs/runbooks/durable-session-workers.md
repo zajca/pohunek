@@ -61,7 +61,7 @@ Interpret the runtime independently from the agent lifecycle:
 | `reconnecting` | Reconciliation knows the worker but has not finished adoption | Wait; do not recover or restart the worker |
 | `terminal` | The worker observed child exit | Inspect the terminal result; acknowledge or recover explicitly when eligible |
 | `lost` | The PTY generation no longer exists | Preserve the logical record; use explicit native recovery only when available |
-| `conflict` | More than one or mismatched runtime identity is present | Preserve all evidence and resolve manually; do not kill automatically |
+| `conflict` | More than one or mismatched runtime identity is present | Preserve evidence; do not kill a worker automatically. After diagnosis, `session rm` may remove only the logical record. |
 | `incompatible` | A live worker has no compatible private protocol | Run a compatible daemon; leave the worker alive |
 
 Inspect the matching systemd unit without mutating it:
@@ -114,6 +114,10 @@ Do not:
 - interpret daemon disconnection as child exit;
 - invoke `session.resume` for a live or reconnecting runtime;
 - edit `worker_id` or `runtime_id` in metadata by hand.
+
+After preserving diagnostic evidence, `pohunek session rm <id>` can remove a
+`lost`, `conflict`, or `incompatible` logical record. It does not stop or signal
+an unavailable runtime; an ambiguous worker remains an operator responsibility.
 
 ## Runtime Loss and Explicit Recovery
 
