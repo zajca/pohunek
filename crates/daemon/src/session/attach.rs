@@ -69,20 +69,17 @@ impl SessionRegistry {
         let id = &params.session_id;
         self.prune_expired_pending_attaches().await;
         self.ensure_not_external(id).await?;
-        let (target_worker_id, target_runtime) = {
+        let target_worker_id = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
             if entry.info.state != SessionState::Running {
                 return Err(session_not_running(id));
             }
-            (
-                entry
-                    .info
-                    .runtime
-                    .as_ref()
-                    .and_then(|runtime| runtime.worker_id.clone()),
-                entry.runtime.clone(),
-            )
+            entry
+                .info
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.worker_id.clone())
         };
 
         // The session exists and is running; only now is a self-feed possible.
@@ -93,13 +90,6 @@ impl SessionRegistry {
         if same_origin_session && same_worker {
             return Err(attach_self_feedback(id));
         }
-        if let RuntimeHandle::Worker(worker) = target_runtime {
-            worker
-                .ensure_attach_snapshot_supported()
-                .await
-                .map_err(super::worker_error_to_protocol)?;
-        }
-
         let stream_id = format!(
             "a-{}",
             self.inner.next_stream_id.fetch_add(1, Ordering::Relaxed)

@@ -61,7 +61,7 @@ Interpret the runtime independently from the agent lifecycle:
 | `reconnecting` | Reconciliation knows the worker but has not finished adoption | Wait; do not recover or restart the worker |
 | `terminal` | The worker observed child exit | Inspect the terminal result; acknowledge or recover explicitly when eligible |
 | `lost` | The PTY generation no longer exists | Preserve the logical record; use explicit native recovery only when available |
-| `conflict` | More than one or mismatched runtime identity is present | Preserve all evidence and resolve manually; do not kill automatically |
+| `conflict` | More than one or mismatched runtime identity is present | Preserve evidence; do not kill a worker automatically. After diagnosis, `session rm` may remove only the logical record. |
 | `incompatible` | A live worker has no compatible private protocol | Run a compatible daemon; leave the worker alive |
 
 Inspect the matching systemd unit without mutating it:
@@ -115,6 +115,10 @@ Do not:
 - invoke `session.resume` for a live or reconnecting runtime;
 - edit `worker_id` or `runtime_id` in metadata by hand.
 
+After preserving diagnostic evidence, `pohunek session rm <id>` can remove a
+`lost`, `conflict`, or `incompatible` logical record. It does not stop or signal
+an unavailable runtime; an ambiguous worker remains an operator responsibility.
+
 ## Runtime Loss and Explicit Recovery
 
 Worker crash, worker `SIGKILL`, host reboot, user-manager shutdown, or power
@@ -139,6 +143,11 @@ unit definitions and restarts only `pohunekd.service`.
 Worker-aware releases negotiate the current and immediately preceding private
 worker protocol. An unsupported worker remains alive as `incompatible`. Do not
 force a worker restart as a compatibility shortcut.
+
+When an older compatible worker lacks a newer attach feature, the daemon falls
+back to that worker protocol's bounded replay attach path. Snapshot-first
+terminal restoration is an enhancement, never a condition for reaching a live
+PTY after a daemon upgrade.
 
 Worker-internal fixes apply only to workers created from the updated binary.
 Already-running workers continue executing their mapped binary, even when its

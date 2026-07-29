@@ -1978,10 +1978,13 @@ impl SessionRegistry {
     /// `stop` only flips a live session to a terminal state; the entry stays in
     /// the registry so `list`/`inspect` keep showing it, which is why a stopped
     /// session otherwise lingers forever. `remove` is the eviction step. A
-    /// still-live session is stopped first (so removal never orphans a live PTY),
-    /// then the entry is dropped and its resume binding cleared so a daemon
-    /// restart cannot resurrect it. A `session_removed` event is emitted with the
-    /// final snapshot so subscribed clients drop their view of the session.
+    /// still-live worker-backed session is stopped first (so removal never
+    /// orphans a live PTY), then the entry is dropped and its resume binding
+    /// cleared so a daemon restart cannot resurrect it. An unavailable runtime
+    /// is already outside the daemon's control, so removal evicts only its
+    /// logical record and deliberately does not signal an ambiguous worker. A
+    /// `session_removed` event is emitted with the final snapshot so subscribed
+    /// clients drop their view of the session.
     ///
     /// # Errors
     ///
@@ -1989,13 +1992,13 @@ impl SessionRegistry {
     /// surfaces any PTY shutdown error from the implied stop of a live session.
     pub async fn remove(&self, id: &SessionId) -> Result<SessionRemoveResult, ProtocolError> {
         self.ensure_not_external(id).await?;
-        let was_live = {
+        let should_stop = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
-            !is_terminal(entry.info.state)
+            !is_terminal(entry.info.state) && matches!(entry.runtime, RuntimeHandle::Worker(_))
         };
 
-        let stopped = if was_live {
+        let stopped = if should_stop {
             self.stop_with_intent(id, DesiredState::Removed, TransactionKind::Remove)
                 .await?
                 .stopped

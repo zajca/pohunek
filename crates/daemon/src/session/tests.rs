@@ -2297,6 +2297,39 @@ async fn remove_stops_a_live_session_then_evicts() {
 }
 
 #[tokio::test]
+async fn remove_evicts_a_conflicted_runtime_without_stopping_it() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+
+    let created = registry.create(params()).await.expect("create session");
+    registry.stop(&created.id).await.expect("stop session");
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&created.id).expect("stopped session");
+    entry.info.state = SessionState::Running;
+    entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Conflict);
+    drop(sessions);
+
+    let removed = registry
+        .remove(&created.id)
+        .await
+        .expect("remove conflicted session");
+
+    assert!(removed.removed);
+    assert!(
+        !removed.stopped,
+        "an unavailable runtime must not be signaled"
+    );
+    let error = registry
+        .inspect(&created.id)
+        .await
+        .expect_err("removed session is gone");
+    assert_eq!(error.code, "session_not_found");
+}
+
+#[tokio::test]
 async fn delete_session_logs_removes_the_worker_log_family() {
     let log_dir = temp_dir("remove-worker-logs");
     let registry = SessionRegistry::new(SessionRegistryConfig {

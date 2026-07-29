@@ -44,7 +44,8 @@ Interpret runtime states as follows:
   recovery reference.
 - `conflict`: multiple or mismatched identities claim the session. Do not stop,
   unlink, or kill either candidate automatically. Preserve the unit, journal,
-  and socket evidence for diagnosis.
+  and socket evidence for diagnosis. Afterward, `pohunek session rm <id>` can
+  remove only the quarantined logical record; it does not signal a worker.
 - `incompatible`: the worker is alive but private protocol negotiation failed.
   Leave it alive and use a compatible daemon release.
 

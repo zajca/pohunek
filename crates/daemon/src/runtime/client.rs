@@ -308,17 +308,6 @@ impl Worker {
         self.inner.lock().await.runtime_id.clone()
     }
 
-    /// Verifies that this worker can open snapshot-first public attachments.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WorkerError::AttachSnapshotUnsupported`] when the negotiated
-    /// protocol or granted capabilities cannot provide the required ordering.
-    pub async fn ensure_attach_snapshot_supported(&self) -> Result<(), WorkerError> {
-        let inner = self.inner.lock().await;
-        ensure_attach_snapshot_supported(&inner)
-    }
-
     /// Returns the worker's authoritative runtime snapshot.
     ///
     /// # Errors
@@ -482,19 +471,30 @@ impl Worker {
             .await
     }
 
-    /// Opens a fresh public attachment with an atomic terminal snapshot.
+    /// Opens a fresh public attachment with the best negotiated replay mode.
+    ///
+    /// Version-three workers receive an atomic terminal snapshot. A
+    /// version-two worker remains attachable through its bounded replay path:
+    /// replacing a daemon must never make an otherwise live PTY unreachable.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::AttachSnapshotUnsupported`] when the worker was
-    /// negotiated below protocol version three or did not grant the capability.
+    /// Returns [`WorkerError::AttachSnapshotUnsupported`] when a version-three
+    /// worker did not grant its required snapshot capability, or another
+    /// [`WorkerError`] when the worker rejects the stream or its socket fails.
     pub async fn open_attach(
         &self,
         stream_id: StreamId,
         attach: AttachStart,
     ) -> Result<DataStream, WorkerError> {
-        self.open_data_with_attach(stream_id, StreamMode::Attach, None, Some(attach))
+        let attach = self.attach_start(attach).await?;
+        self.open_data_with_attach(stream_id, StreamMode::Attach, None, attach)
             .await
+    }
+
+    async fn attach_start(&self, attach: AttachStart) -> Result<Option<AttachStart>, WorkerError> {
+        let inner = self.inner.lock().await;
+        select_attach_start(inner.selected_version, &inner.capabilities, attach)
     }
 
     async fn open_data_with_attach(
@@ -510,9 +510,6 @@ impl Worker {
             None
         };
         let mut inner = self.inner.lock().await;
-        if attach.is_some() {
-            ensure_attach_snapshot_supported(&inner)?;
-        }
         let scope = scope(&inner)?;
         let response = request_locked(
             &mut inner,
@@ -633,13 +630,18 @@ fn supports_attach_snapshot(selected_version: Version, granted: &[Capability]) -
     selected_version >= ATTACH_SNAPSHOT_VERSION && granted.contains(&Capability::AttachSnapshot)
 }
 
-fn ensure_attach_snapshot_supported(inner: &Inner) -> Result<(), WorkerError> {
-    if supports_attach_snapshot(inner.selected_version, &inner.capabilities) {
-        Ok(())
+fn select_attach_start(
+    selected_version: Version,
+    granted: &[Capability],
+    attach: AttachStart,
+) -> Result<Option<AttachStart>, WorkerError> {
+    if selected_version < ATTACH_SNAPSHOT_VERSION {
+        return Ok(None);
+    }
+    if supports_attach_snapshot(selected_version, granted) {
+        Ok(Some(attach))
     } else {
-        Err(WorkerError::AttachSnapshotUnsupported {
-            selected_version: inner.selected_version,
-        })
+        Err(WorkerError::AttachSnapshotUnsupported { selected_version })
     }
 }
 
@@ -795,6 +797,47 @@ mod tests {
         assert!(supports_attach_snapshot(
             ATTACH_SNAPSHOT_VERSION,
             &[Capability::AttachSnapshot],
+        ));
+    }
+
+    #[test]
+    fn v2_attach_uses_legacy_replay() {
+        let attach = AttachStart { dimensions: None };
+        assert!(
+            select_attach_start(pohunek_worker_protocol::PREVIOUS_VERSION, &[], attach)
+                .expect("v2 fallback must be supported")
+                .is_none(),
+            "a v2 worker must use the replay attach path"
+        );
+    }
+
+    #[test]
+    fn v3_attach_keeps_the_snapshot_request() {
+        let attach = AttachStart { dimensions: None };
+        assert_eq!(
+            select_attach_start(
+                ATTACH_SNAPSHOT_VERSION,
+                &[Capability::AttachSnapshot],
+                attach.clone()
+            )
+            .expect("v3 snapshot capability must be supported"),
+            Some(attach),
+        );
+    }
+
+    #[test]
+    fn v3_attach_without_snapshot_capability_is_rejected() {
+        let error = select_attach_start(
+            ATTACH_SNAPSHOT_VERSION,
+            &[],
+            AttachStart { dimensions: None },
+        )
+        .expect_err("v3 workers must not receive a v2 attach frame");
+        assert!(matches!(
+            error,
+            WorkerError::AttachSnapshotUnsupported {
+                selected_version: ATTACH_SNAPSHOT_VERSION
+            }
         ));
     }
 
