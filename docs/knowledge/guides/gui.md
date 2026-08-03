@@ -96,7 +96,9 @@ From an installed build:
 pohunek-gui
 ```
 
-Install `pohunek-gui` from the GUI component release archive.
+Install `pohunek-gui` from the glibc x86_64 GUI component release archive. The
+Wayland client and graphics stack are dynamic runtime dependencies, so releases
+do not include a self-contained MUSL GUI archive.
 
 If the GUI starts but shows no sessions, verify daemon health and `session.list`
 first. If host discovery fails, the GUI should still try the local host and
