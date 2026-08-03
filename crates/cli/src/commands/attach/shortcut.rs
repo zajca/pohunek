@@ -29,6 +29,22 @@ const EVENT_PRESS: u32 = 1;
 const EVENT_REPEAT: u32 = 2;
 /// Decimal terminal parameters use base ten.
 const DECIMAL_RADIX: u32 = 10;
+/// Largest incomplete terminal sequence retained between stdin reads.
+///
+/// Kitty keyboard reports are normally short. Sixty-four bytes leaves room for
+/// alternate key codes while bounding state independently of the outer timer.
+const MAX_PENDING_BYTES: usize = 64;
+
+/// Attach-menu state relevant to shortcut decoding and key normalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MenuInputMode {
+    /// This attach cannot display an interactive menu.
+    Unavailable,
+    /// The menu is available but currently closed.
+    Closed,
+    /// The menu is currently consuming keyboard input.
+    Open,
+}
 
 /// Local action intercepted before input reaches the attached PTY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,14 +81,14 @@ impl ShortcutDecoder {
     /// Bytes after the first shortcut are intentionally dropped, matching the
     /// historical single-byte shortcut behavior. A suffix that can still be a
     /// split CSI sequence remains pending until the next push or timeout.
-    pub(super) fn push(&mut self, input: &[u8], menu_available: bool) -> DecodedInput {
+    pub(super) fn push(&mut self, input: &[u8], menu_mode: MenuInputMode) -> DecodedInput {
         let mut joined = std::mem::take(&mut self.pending);
         joined.extend_from_slice(input);
 
         let mut bytes = Vec::with_capacity(joined.len());
         let mut index = 0;
         while index < joined.len() {
-            match parse_at(&joined[index..], menu_available) {
+            match parse_at(&joined[index..], menu_mode) {
                 Parse::Shortcut { shortcut } => {
                     return DecodedInput {
                         bytes,
@@ -80,8 +96,20 @@ impl ShortcutDecoder {
                     };
                 }
                 Parse::Pending => {
-                    self.pending.extend_from_slice(&joined[index..]);
+                    let pending = &joined[index..];
+                    if pending.len() <= MAX_PENDING_BYTES {
+                        self.pending.extend_from_slice(pending);
+                    } else {
+                        bytes.extend_from_slice(pending);
+                    }
                     break;
+                }
+                Parse::Normalized { byte, consumed } => {
+                    bytes.push(byte);
+                    index += consumed;
+                }
+                Parse::Consumed { consumed } => {
+                    index += consumed;
                 }
                 Parse::Pass => {
                     bytes.push(joined[index]);
@@ -110,24 +138,33 @@ impl ShortcutDecoder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Parse {
     Shortcut { shortcut: Shortcut },
+    Normalized { byte: u8, consumed: usize },
+    Consumed { consumed: usize },
     Pending,
     Pass,
 }
 
-fn parse_at(input: &[u8], menu_available: bool) -> Parse {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CsiUKey {
+    key: u32,
+    modifiers: u32,
+    event: u32,
+}
+
+fn parse_at(input: &[u8], menu_mode: MenuInputMode) -> Parse {
     match input[0] {
         DETACH_BYTE => Parse::Shortcut {
             shortcut: Shortcut::Detach,
         },
-        MENU_BYTE if menu_available => Parse::Shortcut {
+        MENU_BYTE if menu_mode == MenuInputMode::Closed => Parse::Shortcut {
             shortcut: Shortcut::Menu,
         },
-        ESC => parse_csi(input, menu_available),
+        ESC => parse_csi(input, menu_mode),
         _ => Parse::Pass,
     }
 }
 
-fn parse_csi(input: &[u8], menu_available: bool) -> Parse {
+fn parse_csi(input: &[u8], menu_mode: MenuInputMode) -> Parse {
     if input.len() == 1 {
         return Parse::Pending;
     }
@@ -145,32 +182,72 @@ fn parse_csi(input: &[u8], menu_available: bool) -> Parse {
         return Parse::Pass;
     }
 
-    parse_csi_u(&input[2..final_index], menu_available)
-        .map_or(Parse::Pass, |shortcut| Parse::Shortcut { shortcut })
-}
-
-fn parse_csi_u(params: &[u8], menu_available: bool) -> Option<Shortcut> {
-    let mut fields = params.split(|byte| *byte == b';');
-    let key = parse_decimal(fields.next()?.split(|byte| *byte == b':').next()?)?;
-    let mut modifier_fields = fields.next()?.split(|byte| *byte == b':');
-    let modifiers = parse_decimal(modifier_fields.next()?)?;
-    let event = match modifier_fields.next() {
-        Some(bytes) => parse_decimal(bytes)?,
-        None => EVENT_PRESS,
+    let Some(key) = parse_csi_u(&input[2..final_index]) else {
+        return Parse::Pass;
     };
+    let consumed = final_index + 1;
 
-    let ctrl = modifiers
-        .checked_sub(MODIFIER_OFFSET)
-        .is_some_and(|modifiers| modifiers & CTRL_MASK != 0);
-    let actionable_event = matches!(event, EVENT_PRESS | EVENT_REPEAT);
-    if !ctrl || !actionable_event {
-        return None;
+    if key.is_actionable() && key.has_ctrl() {
+        match key.key {
+            DETACH_KEY => {
+                return Parse::Shortcut {
+                    shortcut: Shortcut::Detach,
+                };
+            }
+            MENU_KEY if menu_mode == MenuInputMode::Closed => {
+                return Parse::Shortcut {
+                    shortcut: Shortcut::Menu,
+                };
+            }
+            _ => {}
+        }
     }
 
-    match key {
-        DETACH_KEY => Some(Shortcut::Detach),
-        MENU_KEY if menu_available => Some(Shortcut::Menu),
-        _ => None,
+    if menu_mode != MenuInputMode::Open {
+        return Parse::Pass;
+    }
+    if key.is_actionable() && key.modifiers == 0 {
+        if let Ok(byte) = u8::try_from(key.key) {
+            return Parse::Normalized { byte, consumed };
+        }
+    }
+
+    // A complete enhanced-keyboard report belongs to the open menu even when
+    // it has no canonical byte representation, for example a release event.
+    Parse::Consumed { consumed }
+}
+
+fn parse_csi_u(params: &[u8]) -> Option<CsiUKey> {
+    let mut fields = params.split(|byte| *byte == b';');
+    let key = parse_decimal(fields.next()?.split(|byte| *byte == b':').next()?)?;
+    let (modifiers, event) = match fields.next() {
+        Some(field) => {
+            let mut modifier_fields = field.split(|byte| *byte == b':');
+            let encoded_modifiers = parse_decimal(modifier_fields.next()?)?;
+            let modifiers = encoded_modifiers.checked_sub(MODIFIER_OFFSET)?;
+            let event = match modifier_fields.next() {
+                Some(bytes) => parse_decimal(bytes)?,
+                None => EVENT_PRESS,
+            };
+            (modifiers, event)
+        }
+        None => (0, EVENT_PRESS),
+    };
+
+    Some(CsiUKey {
+        key,
+        modifiers,
+        event,
+    })
+}
+
+impl CsiUKey {
+    fn has_ctrl(self) -> bool {
+        self.modifiers & CTRL_MASK != 0
+    }
+
+    fn is_actionable(self) -> bool {
+        matches!(self.event, EVENT_PRESS | EVENT_REPEAT)
     }
 }
 
@@ -189,17 +266,19 @@ fn parse_decimal(bytes: &[u8]) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Shortcut, ShortcutDecoder, DETACH_BYTE, MENU_BYTE};
+    use super::{
+        MenuInputMode, Shortcut, ShortcutDecoder, DETACH_BYTE, MAX_PENDING_BYTES, MENU_BYTE,
+    };
 
     #[test]
     fn legacy_shortcuts_preserve_prefix_and_drop_suffix() {
         let mut decoder = ShortcutDecoder::new();
-        let menu = decoder.push(b"prefix\x1csuffix", true);
+        let menu = decoder.push(b"prefix\x1csuffix", MenuInputMode::Closed);
         assert_eq!(menu.bytes, b"prefix");
         assert_eq!(menu.shortcut, Some(Shortcut::Menu));
 
         let mut decoder = ShortcutDecoder::new();
-        let detach = decoder.push(b"prefix\x1dsuffix", true);
+        let detach = decoder.push(b"prefix\x1dsuffix", MenuInputMode::Closed);
         assert_eq!(detach.bytes, b"prefix");
         assert_eq!(detach.shortcut, Some(Shortcut::Detach));
     }
@@ -207,12 +286,12 @@ mod tests {
     #[test]
     fn kitty_csi_u_shortcuts_are_decoded() {
         let mut decoder = ShortcutDecoder::new();
-        let menu = decoder.push(b"\x1b[92;5u", true);
+        let menu = decoder.push(b"\x1b[92;5u", MenuInputMode::Closed);
         assert!(menu.bytes.is_empty());
         assert_eq!(menu.shortcut, Some(Shortcut::Menu));
 
         let mut decoder = ShortcutDecoder::new();
-        let detach = decoder.push(b"\x1b[93;5u", true);
+        let detach = decoder.push(b"\x1b[93;5u", MenuInputMode::Closed);
         assert!(detach.bytes.is_empty());
         assert_eq!(detach.shortcut, Some(Shortcut::Detach));
     }
@@ -220,7 +299,7 @@ mod tests {
     #[test]
     fn kitty_csi_u_accepts_alternate_keys_and_repeat_events() {
         let mut parser = ShortcutDecoder::new();
-        let decoded = parser.push(b"\x1b[92:124:92;6:2u", true);
+        let decoded = parser.push(b"\x1b[92:124:92;6:2u", MenuInputMode::Closed);
 
         assert!(decoded.bytes.is_empty());
         assert_eq!(decoded.shortcut, Some(Shortcut::Menu));
@@ -230,7 +309,7 @@ mod tests {
     fn kitty_csi_u_release_and_non_ctrl_events_are_forwarded() {
         for input in [b"\x1b[92;5:3u".as_slice(), b"\x1b[92;2u".as_slice()] {
             let mut parser = ShortcutDecoder::new();
-            let decoded = parser.push(input, true);
+            let decoded = parser.push(input, MenuInputMode::Closed);
 
             assert_eq!(decoded.bytes, input);
             assert_eq!(decoded.shortcut, None);
@@ -243,12 +322,12 @@ mod tests {
         let input = b"\x1b[92:124:92;5:1u";
         for split in 1..input.len() {
             let mut decoder = ShortcutDecoder::new();
-            let first = decoder.push(&input[..split], true);
+            let first = decoder.push(&input[..split], MenuInputMode::Closed);
             assert!(first.bytes.is_empty(), "split={split}");
             assert_eq!(first.shortcut, None, "split={split}");
             assert!(decoder.has_pending(), "split={split}");
 
-            let second = decoder.push(&input[split..], true);
+            let second = decoder.push(&input[split..], MenuInputMode::Closed);
             assert!(second.bytes.is_empty(), "split={split}");
             assert_eq!(second.shortcut, Some(Shortcut::Menu), "split={split}");
             assert!(!decoder.has_pending(), "split={split}");
@@ -259,7 +338,7 @@ mod tests {
     fn menu_shortcuts_are_forwarded_when_the_menu_is_unavailable() {
         for input in [[MENU_BYTE].as_slice(), b"\x1b[92;5u".as_slice()] {
             let mut parser = ShortcutDecoder::new();
-            let decoded = parser.push(input, false);
+            let decoded = parser.push(input, MenuInputMode::Unavailable);
 
             assert_eq!(decoded.bytes, input);
             assert_eq!(decoded.shortcut, None);
@@ -277,7 +356,7 @@ mod tests {
             [DETACH_BYTE.wrapping_add(1)].as_slice(),
         ] {
             let mut parser = ShortcutDecoder::new();
-            let decoded = parser.push(input, true);
+            let decoded = parser.push(input, MenuInputMode::Closed);
 
             assert_eq!(decoded.bytes, input);
             assert_eq!(decoded.shortcut, None);
@@ -288,12 +367,52 @@ mod tests {
     #[test]
     fn incomplete_sequence_can_be_flushed_unchanged() {
         let mut parser = ShortcutDecoder::new();
-        let decoded = parser.push(b"prefix\x1b[92;", true);
+        let decoded = parser.push(b"prefix\x1b[92;", MenuInputMode::Closed);
 
         assert_eq!(decoded.bytes, b"prefix");
         assert_eq!(decoded.shortcut, None);
         assert!(parser.has_pending());
         assert_eq!(parser.flush(), b"\x1b[92;");
         assert!(!parser.has_pending());
+    }
+
+    #[test]
+    fn open_menu_normalizes_csi_u_keyboard_bytes() {
+        for (input, expected) in [
+            (b"\x1b[27u".as_slice(), 0x1b),
+            (b"\x1b[13u".as_slice(), b'\r'),
+            (b"\x1b[127u".as_slice(), 0x7f),
+            (b"\x1b[114u".as_slice(), b'r'),
+        ] {
+            let mut decoder = ShortcutDecoder::new();
+            let result = decoder.push(input, MenuInputMode::Open);
+
+            assert_eq!(result.bytes, [expected]);
+            assert_eq!(result.shortcut, None);
+            assert!(!decoder.has_pending());
+        }
+    }
+
+    #[test]
+    fn open_menu_consumes_non_actionable_csi_u_reports() {
+        let mut decoder = ShortcutDecoder::new();
+        let result = decoder.push(b"\x1b[27;1:3u", MenuInputMode::Open);
+
+        assert!(result.bytes.is_empty());
+        assert_eq!(result.shortcut, None);
+        assert!(!decoder.has_pending());
+    }
+
+    #[test]
+    fn oversized_pending_sequence_is_released_unchanged() {
+        let mut input = b"\x1b[".to_vec();
+        input.resize(MAX_PENDING_BYTES + 1, b'1');
+        let mut decoder = ShortcutDecoder::new();
+
+        let result = decoder.push(&input, MenuInputMode::Closed);
+
+        assert_eq!(result.bytes, input);
+        assert_eq!(result.shortcut, None);
+        assert!(!decoder.has_pending());
     }
 }
