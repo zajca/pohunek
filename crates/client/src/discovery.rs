@@ -317,7 +317,6 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use protocol::ProtocolVersion;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpListener;
 
     use super::*;
