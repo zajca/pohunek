@@ -239,13 +239,21 @@ jobs:
           build_args=(--release --locked --target "${{ matrix.target }}")
           case "${{ matrix.component }}" in
             cli)
-              cargo build "${build_args[@]}" --bin pohunek
+              cargo build "${build_args[@]}" -p pohunek-cli --bin pohunek
               ;;
             daemon)
-              cargo build "${build_args[@]}" --bin pohunek --bin pohunekd --bin pohunek-sessiond
+              cargo build "${build_args[@]}" \
+                -p pohunek-cli \
+                -p pohunek-daemon \
+                -p pohunek-session-worker \
+                --bin pohunek \
+                --bin pohunekd \
+                --bin pohunek-sessiond
               ;;
             gui)
-              cargo build "${build_args[@]}" --bin pohunek-gui
+              # Package selection keeps daemon-only features out of the GUI
+              # dependency graph; target selection alone does not isolate them.
+              cargo build "${build_args[@]}" -p pohunek-gui --bin pohunek-gui
               ;;
             *)
               echo "::error::unsupported release component: ${{ matrix.component }}"
