@@ -57,10 +57,17 @@ pub enum ClientError {
     #[error(transparent)]
     Netbird(#[from] netbird::NetbirdError),
 
-    /// Remote-host discovery failed inside the async blocking boundary.
+    /// Bounded remote-host discovery or its overall deadline failed.
     #[error("remote host discovery failed: {detail}")]
     RemoteDiscoveryFailed {
         /// Non-secret detail describing the discovery failure.
+        detail: String,
+    },
+
+    /// Caller-supplied standalone discovery settings violate required bounds.
+    #[error("invalid discovery options: {detail}")]
+    InvalidDiscoveryOptions {
+        /// Non-secret detail describing the violated local invariant.
         detail: String,
     },
 
@@ -155,6 +162,12 @@ impl ClientError {
                     "retry the remote request; if it persists, check the local NetBird state"
                         .to_owned(),
                 ),
+            ),
+            ClientError::InvalidDiscoveryOptions { detail } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "invalid_discovery_options",
+                format!("invalid discovery options: {detail}"),
+                Some("fix the invalid discovery option before running discovery".to_owned()),
             ),
             ClientError::HostUnreachable { host, source } => {
                 let mut err = ProtocolError::host_unreachable(host);
@@ -343,6 +356,21 @@ mod tests {
             structured.msg.contains("blocking task"),
             "msg includes detail: {}",
             structured.msg
+        );
+    }
+
+    #[test]
+    fn invalid_discovery_options_maps_to_non_retry_configuration_error() {
+        let structured = ClientError::InvalidDiscoveryOptions {
+            detail: "discovery concurrency must be non-zero".to_owned(),
+        }
+        .to_protocol_error();
+
+        assert_eq!(structured.class, ErrorClass::Configuration);
+        assert_eq!(structured.code, "invalid_discovery_options");
+        assert_eq!(
+            structured.recover.as_deref(),
+            Some("fix the invalid discovery option before running discovery")
         );
     }
 

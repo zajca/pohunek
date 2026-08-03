@@ -3242,6 +3242,7 @@ dependencies = [
  "clap",
  "futures",
  "libc",
+ "nix 0.29.0",
  "pohunek-client",
  "pohunek-gui-core",
  "pohunek-hostcheck",

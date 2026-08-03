@@ -332,6 +332,9 @@ Discovery is tokenless and NetBird-local. There is no signed manifest exchange.
 1. The daemon/CLI reads local NetBird state via `netbird status --json` (no
    management-API token) to enumerate peers, NetBird addresses, and names.
 2. Candidate peers are probed to see which run a reachable `pohunek` daemon.
+   A complete discovery, including local status loading, has a bounded deadline;
+   each health exchange is separately bounded and the status subprocess is
+   cancelled when that deadline expires.
 3. Capabilities are obtained by a **live query** to the target daemon over the
    direct NetBird connection (`host inspect`), not from a cached manifest.
 
@@ -509,7 +512,8 @@ terminal content. Useful signals:
   loss/conflict, and explicit native recovery.
 - PTY allocation, resize, stream errors, worker protocol versions, and
   controller reconnect latency.
-- NetBird discovery runs and candidate/capability results.
+- NetBird discovery runs and candidate/capability results. The CLI can discover
+  locally without `pohunekd`; daemon discovery remains available for GUI/web RPC consumers.
 - Agent state transitions with their `source`.
 - Latency for CLI commands, attach, discovery, and remote connections.
 

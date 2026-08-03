@@ -1,6 +1,6 @@
 //! Host-scoped methods: `host.inspect` and `host.discover`.
 
-use protocol::{HostDiscoverParams, ProtocolError, Request, Response};
+use protocol::{HostDiscoverParams, Request, Response};
 
 use super::util::{ok_value, parse_optional_params};
 use super::HealthInfo;
@@ -26,11 +26,10 @@ pub(super) fn handle_host_inspect(
 
 /// `host.discover`: enumerate `NetBird` peers and classify each daemon.
 ///
-/// The probe is run inside the daemon and cached for a short TTL (see
-/// [`DiscoveryCache`]), so repeated calls — e.g. every launcher keypress —
-/// return the cached snapshot instantly; `force` bypasses the cache and
-/// re-probes now. A NetBird-state failure surfaces as a typed
-/// `discovery/netbird_state_unavailable` error rather than an empty result.
+/// The daemon caches the shared discovery engine for a short TTL (see
+/// [`DiscoveryCache`]), so repeated calls return promptly; `force` bypasses
+/// that cache. Discovery errors retain their typed protocol mapping rather than
+/// being represented as an empty peer list.
 pub(super) async fn handle_host_discover(
     request: &Request,
     discovery: &DiscoveryCache,
@@ -41,9 +40,6 @@ pub(super) async fn handle_host_discover(
     };
     match discovery.records(params.force).await {
         Ok(records) => ok_value(request, &records),
-        Err(err) => Response::err(
-            request.id.clone(),
-            ProtocolError::netbird_state_unavailable(err.to_string()),
-        ),
+        Err(err) => Response::err(request.id.clone(), err.to_protocol_error()),
     }
 }

@@ -15,7 +15,10 @@ target a host, and session targets can use `<host>/<session-id>`.
 Use these commands for orientation:
 
 - `pohunek host discover --json` to enumerate NetBird peers and probe daemons.
-- `pohunek host list --json` to list known live peers.
+- `pohunek host list --json` to list known live peers. These commands need the
+  local NetBird CLI/state, but do not connect to local `pohunekd`; a short
+  owner-private cache avoids repeated probing, and `--refresh` bypasses it.
+  Status loading and peer probes are bounded by a complete discovery deadline.
 - `pohunek host inspect <host> --json` to inspect one host's daemon
   capabilities.
 
@@ -26,7 +29,7 @@ confirmation model; non-interactive remote starts require `--yes`.
 Durable notifications keep the same host-authoritative model. Each daemon owns
 only its local notification store, and cross-host notification views are
 client-side fan-out. `pohunek notifications list --all-hosts` queries the local
-daemon plus reachable daemon peers discovered through `host.discover`, then
+daemon plus reachable daemon peers discovered directly from local NetBird state, then
 renders per-host successes and structured per-host errors. The matching watch
 command with `--all-hosts` opens one subscription per reachable host and streams
 notification create, update, and delete events as they arrive.

@@ -2,10 +2,17 @@
 
 #![forbid(unsafe_code)]
 
+mod discovery;
 mod error;
 mod notifications;
 mod transport;
 
+#[doc(inline)]
+pub use discovery::{
+    discover_hosts, discover_hosts_with_options, DiscoveryOptions, DEFAULT_DISCOVERY_DEADLINE,
+    DEFAULT_PROBE_CONCURRENCY, DEFAULT_PROBE_TIMEOUT, DISCOVERY_CACHE_TTL,
+    DISCOVERY_LOCK_WAIT_MARGIN, MAX_DISCOVERY_DEADLINE,
+};
 pub use error::ClientError;
 pub use protocol;
 pub use transport::{

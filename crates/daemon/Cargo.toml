@@ -18,6 +18,7 @@ pohunek-protocol = { workspace = true }
 pohunek-netbird = { workspace = true }
 pohunek-paths = { workspace = true }
 pohunek-terminal = { workspace = true }
+pohunek-client = { workspace = true }
 pohunek-worker-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -40,7 +41,6 @@ zbus = { workspace = true }
 ulid = { workspace = true }
 
 [dev-dependencies]
-pohunek-client = { workspace = true }
 pohunek-session-worker = { workspace = true }
 # `test-util` enables tokio's paused clock (`start_paused`) so the attention
 # debounce coordinator tests advance time deterministically instead of sleeping.
