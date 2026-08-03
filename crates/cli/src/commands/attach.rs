@@ -6,6 +6,8 @@
 //! Press Ctrl-] (0x1d) while attached to detach from the session without
 //! stopping the PTY process.
 
+mod shortcut;
+
 use std::os::fd::RawFd;
 use std::path::Path;
 use std::time::Duration;
@@ -24,14 +26,20 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time;
 
+use self::shortcut::{Shortcut, ShortcutDecoder};
 use crate::client::{attach_raw, Client, RawStream};
 use crate::commands::{request_id, request_with_params};
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::Target;
 
-const DETACH_BYTE: u8 = 0x1d;
 const IO_BUFFER_BYTES: usize = 8192;
+/// Maximum ambiguity delay for a split terminal shortcut sequence.
+///
+/// Physical stdin is local, so bytes from one key report normally arrive in a
+/// single read. Twenty-five milliseconds still accommodates a split CSI-u
+/// report without making a standalone Escape key perceptibly sluggish.
+const SHORTCUT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
 /// Selective terminal reset emitted whenever raw attach passthrough ends.
 ///
 /// Agent TUIs may enable these DEC modes through ordinary PTY output. Termios
@@ -74,9 +82,6 @@ const MIN_ROWS_WITH_BANNER: u16 = 3;
 const BANNER_MENU_LABEL: &str = "[menu:Ctrl-\\]";
 // Two spaces keep dense banner fields readable in monospace terminals.
 const BANNER_FIELD_SEPARATOR: &str = "  ";
-// Ctrl-\ emits ASCII File Separator. Raw mode prevents the terminal driver from
-// turning it into SIGQUIT, and the shortcut stays adjacent to Ctrl-] detach.
-const BANNER_MENU_BYTE: u8 = 0x1c;
 /// Starting diagnostic generation for menu RPCs.
 ///
 /// Result delivery is governed by the single in-flight task slot and current
@@ -288,17 +293,6 @@ struct ModalState {
     active: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MenuShortcutAction {
-    OpenMenu,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MenuShortcutMatch {
-    start: usize,
-    action: MenuShortcutAction,
-}
-
 #[derive(Debug)]
 struct MenuInputDecoder {
     pending: Vec<u8>,
@@ -385,7 +379,15 @@ struct StdinInputContext<'a, W, O> {
     terminal: &'a mut Option<RawTerminal>,
     modal: &'a mut Option<ModalState>,
     menu: &'a mut MenuRuntime,
+    shortcuts: &'a mut ShortcutDecoder,
+    shortcut_deadline: &'a mut Option<time::Instant>,
     control: &'a AttachControlContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdinEvent {
+    Input(usize),
+    ShortcutTimeout,
 }
 
 impl AttachStatusSnapshot {
@@ -1057,6 +1059,31 @@ async fn wait_for_menu_task(task: &mut Option<MenuTask>) -> Option<MenuTaskResul
     })
 }
 
+fn update_shortcut_deadline(decoder: &ShortcutDecoder, deadline: &mut Option<time::Instant>) {
+    if decoder.has_pending() {
+        deadline.get_or_insert_with(|| time::Instant::now() + SHORTCUT_SEQUENCE_TIMEOUT);
+    } else {
+        *deadline = None;
+    }
+}
+
+async fn read_stdin_event<R>(
+    stdin: &mut R,
+    buffer: &mut [u8],
+    shortcut_deadline: Option<time::Instant>,
+) -> std::io::Result<StdinEvent>
+where
+    R: AsyncRead + Unpin,
+{
+    let Some(deadline) = shortcut_deadline else {
+        return stdin.read(buffer).await.map(StdinEvent::Input);
+    };
+    tokio::select! {
+        read = stdin.read(buffer) => read.map(StdinEvent::Input),
+        () = time::sleep_until(deadline) => Ok(StdinEvent::ShortcutTimeout),
+    }
+}
+
 impl MenuRuntime {
     fn new(active: bool) -> Self {
         Self {
@@ -1421,16 +1448,50 @@ where
     W: AsyncWrite + Unpin,
     O: AsyncWrite + Unpin,
 {
-    if let Some(end) = handle_detach_input(
-        input,
-        ctx.socket_write,
-        ctx.client,
-        ctx.stream_id,
-        ctx.terminal,
-    )
-    .await?
-    {
-        return Ok(Some(end));
+    let menu_available = ctx.modal.is_some()
+        && ctx
+            .menu
+            .state
+            .as_ref()
+            .is_some_and(|state| *state == MenuState::Closed);
+    let decoded = ctx.shortcuts.push(input, menu_available);
+    update_shortcut_deadline(ctx.shortcuts, ctx.shortcut_deadline);
+
+    if let Some(shortcut) = decoded.shortcut {
+        if !decoded.bytes.is_empty() {
+            ctx.socket_write.write_all(&decoded.bytes).await?;
+            ctx.socket_write.flush().await?;
+        }
+        match shortcut {
+            Shortcut::Detach => {
+                ctx.terminal.take();
+                let _ = send_detach(ctx.client, ctx.stream_id).await;
+                return Ok(Some(AttachStreamEnd::Detached));
+            }
+            Shortcut::Menu => {
+                ctx.menu.generation = next_menu_generation(ctx.menu.generation);
+                if let Some(state) = ctx.menu.state.as_mut() {
+                    *state = MenuState::open_root();
+                    sync_menu_view(state, ctx.modal, ctx.stdout).await?;
+                }
+                return Ok(None);
+            }
+        }
+    }
+
+    route_stdin_input(&decoded.bytes, ctx).await
+}
+
+async fn route_stdin_input<W, O>(
+    input: &[u8],
+    ctx: StdinInputContext<'_, W, O>,
+) -> Result<Option<AttachStreamEnd>, CliError>
+where
+    W: AsyncWrite + Unpin,
+    O: AsyncWrite + Unpin,
+{
+    if input.is_empty() {
+        return Ok(None);
     }
 
     if let Some(state) = ctx
@@ -1458,23 +1519,54 @@ where
         .await;
     }
 
-    if let Some(action) = handle_menu_shortcut(input, ctx.socket_write, ctx.modal.is_some()).await?
-    {
-        match action {
-            MenuShortcutAction::OpenMenu => {
-                ctx.menu.generation = next_menu_generation(ctx.menu.generation);
-                if let Some(state) = ctx.menu.state.as_mut() {
-                    *state = MenuState::open_root();
-                    sync_menu_view(state, ctx.modal, ctx.stdout).await?;
-                }
-            }
-        }
-        return Ok(None);
-    }
-
     ctx.socket_write.write_all(input).await?;
     ctx.socket_write.flush().await?;
     Ok(None)
+}
+
+async fn handle_stdin_read<W, O>(
+    bytes_read: usize,
+    buffer: &mut [u8],
+    ctx: StdinInputContext<'_, W, O>,
+) -> Result<Option<AttachStreamEnd>, CliError>
+where
+    W: AsyncWrite + Unpin,
+    O: AsyncWrite + Unpin,
+{
+    if bytes_read == 0 {
+        let pending = ctx.shortcuts.flush();
+        ctx.socket_write.write_all(&pending).await?;
+        ctx.socket_write.shutdown().await?;
+        return Ok(Some(AttachStreamEnd::InputClosed));
+    }
+    handle_stdin_input(&buffer[..bytes_read], ctx).await
+}
+
+async fn flush_shortcut_input<W, O>(
+    ctx: StdinInputContext<'_, W, O>,
+) -> Result<Option<AttachStreamEnd>, CliError>
+where
+    W: AsyncWrite + Unpin,
+    O: AsyncWrite + Unpin,
+{
+    *ctx.shortcut_deadline = None;
+    let pending = ctx.shortcuts.flush();
+    route_stdin_input(&pending, ctx).await
+}
+
+async fn handle_stdin_event<W, O>(
+    event: StdinEvent,
+    buffer: &mut [u8],
+    ctx: StdinInputContext<'_, W, O>,
+) -> Result<Option<AttachStreamEnd>, CliError>
+where
+    W: AsyncWrite + Unpin,
+    O: AsyncWrite + Unpin,
+{
+    match event {
+        StdinEvent::Input(bytes_read) => handle_stdin_read(bytes_read, buffer, ctx).await,
+        StdinEvent::ShortcutTimeout => flush_shortcut_input(ctx).await,
+    }
 }
 
 /// Bidirectionally bridge the terminal and the attach byte stream until detach
@@ -1501,6 +1593,8 @@ where
     let (mut stdin, mut stdout) = (tokio::io::stdin(), tokio::io::stdout());
     let (mut stdin_buf, mut socket_buf) = ([0_u8; IO_BUFFER_BYTES], [0_u8; IO_BUFFER_BYTES]);
     let mut menu = MenuRuntime::new(modal.is_some());
+    let mut shortcuts = ShortcutDecoder::new();
+    let mut shortcut_deadline = None;
 
     apply_resize_after_signal_registration(
         &mut client,
@@ -1526,27 +1620,25 @@ where
                         return Ok(end);
                     }
                 }
-                read = stdin.read(&mut stdin_buf) => {
-                    let bytes_read = read?;
-                    if bytes_read == 0 {
-                        socket_write.shutdown().await?;
-                        return Ok(AttachStreamEnd::InputClosed);
-                    }
-                    if let Some(end) = handle_stdin_input(
-                        &stdin_buf[..bytes_read],
-                        StdinInputContext {
-                            socket_write: &mut socket_write,
-                            stdout: &mut stdout,
-                            client: &mut client,
-                            stream_id: &stream_id,
-                            terminal: &mut terminal,
-                            modal: &mut modal,
-                            menu: &mut menu,
-                            control: &control,
-                        },
-                    )
-                    .await?
-                    {
+                event = read_stdin_event(
+                    &mut stdin,
+                    &mut stdin_buf,
+                    shortcut_deadline,
+                ) => {
+                    let ctx = StdinInputContext {
+                        socket_write: &mut socket_write,
+                        stdout: &mut stdout,
+                        client: &mut client,
+                        stream_id: &stream_id,
+                        terminal: &mut terminal,
+                        modal: &mut modal,
+                        menu: &mut menu,
+                        shortcuts: &mut shortcuts,
+                        shortcut_deadline: &mut shortcut_deadline,
+                        control: &control,
+                    };
+                    let end = handle_stdin_event(event?, &mut stdin_buf, ctx).await?;
+                    if let Some(end) = end {
                         return Ok(end);
                     }
                 }
@@ -1988,51 +2080,6 @@ enum MenuTaskArgs {
     Rename { name: String },
 }
 
-async fn handle_detach_input<W>(
-    input: &[u8],
-    socket_write: &mut W,
-    client: &mut Client,
-    stream_id: &str,
-    terminal: &mut Option<RawTerminal>,
-) -> Result<Option<AttachStreamEnd>, CliError>
-where
-    W: AsyncWrite + Unpin,
-{
-    let Some(detach_at) = input.iter().position(|byte| *byte == DETACH_BYTE) else {
-        return Ok(None);
-    };
-    if detach_at > 0 {
-        socket_write.write_all(&input[..detach_at]).await?;
-        socket_write.flush().await?;
-    }
-    terminal.take();
-    let _ = send_detach(client, stream_id).await;
-    Ok(Some(AttachStreamEnd::Detached))
-}
-
-async fn handle_menu_shortcut<W>(
-    input: &[u8],
-    socket_write: &mut W,
-    menu_available: bool,
-) -> Result<Option<MenuShortcutAction>, CliError>
-where
-    W: AsyncWrite + Unpin,
-{
-    // Non-interactive or extremely short terminals cannot render the modal.
-    if !menu_available {
-        return Ok(None);
-    }
-    let Some(input_match) = find_menu_shortcut(input) else {
-        return Ok(None);
-    };
-
-    if input_match.start > 0 {
-        socket_write.write_all(&input[..input_match.start]).await?;
-        socket_write.flush().await?;
-    }
-    Ok(Some(input_match.action))
-}
-
 async fn send_stop(client: &mut Client, target: &Target) -> Result<(), CliError> {
     let request = build_stop_request(target)?;
     let _ = client.request(&request).await?;
@@ -2041,18 +2088,6 @@ async fn send_stop(client: &mut Client, target: &Target) -> Result<(), CliError>
 
 fn build_stop_request(target: &Target) -> Result<Request, CliError> {
     request_with_params(method::SESSION_STOP, &SessionId(target.session_id.clone()))
-}
-
-fn parse_menu_shortcut(input: &[u8]) -> Option<MenuShortcutAction> {
-    input
-        .contains(&BANNER_MENU_BYTE)
-        .then_some(MenuShortcutAction::OpenMenu)
-}
-
-fn find_menu_shortcut(input: &[u8]) -> Option<MenuShortcutMatch> {
-    let start = input.iter().position(|byte| *byte == BANNER_MENU_BYTE)?;
-    let action = parse_menu_shortcut(&input[start..=start])?;
-    Some(MenuShortcutMatch { start, action })
 }
 
 #[derive(Debug)]
@@ -2228,6 +2263,32 @@ mod tests {
         active: Arc<AtomicUsize>,
         task: JoinHandle<()>,
         socket: PathBuf,
+    }
+
+    #[tokio::test]
+    async fn stdin_event_returns_available_input() {
+        let (mut stdin, mut writer) = tokio::io::duplex(8);
+        writer.write_all(b"x").await.expect("write stdin byte");
+        let mut buffer = [0_u8; 8];
+
+        let event = read_stdin_event(&mut stdin, &mut buffer, None)
+            .await
+            .expect("read stdin event");
+
+        assert_eq!(event, StdinEvent::Input(1));
+        assert_eq!(&buffer[..1], b"x");
+    }
+
+    #[tokio::test]
+    async fn stdin_event_reports_expired_shortcut_timeout() {
+        let (mut stdin, _writer) = tokio::io::duplex(8);
+        let mut buffer = [0_u8; 8];
+
+        let event = read_stdin_event(&mut stdin, &mut buffer, Some(time::Instant::now()))
+            .await
+            .expect("wait for shortcut timeout");
+
+        assert_eq!(event, StdinEvent::ShortcutTimeout);
     }
 
     impl Drop for BannerTestDaemon {
@@ -2838,31 +2899,6 @@ mod tests {
             text.chars().count() <= 80,
             "banner text must fit the declared terminal width: {text:?}"
         );
-    }
-
-    #[test]
-    fn attach_menu_shortcut_is_parsed_from_input() {
-        assert_eq!(
-            parse_menu_shortcut(&[BANNER_MENU_BYTE]),
-            Some(MenuShortcutAction::OpenMenu),
-            "the Ctrl-\\ byte must map to the open-menu action"
-        );
-    }
-
-    #[test]
-    fn attach_menu_trigger_splits_prefix_and_drops_suffix() {
-        let input = b"echo prefix\x1ctail dropped";
-        let input_match = find_menu_shortcut(input).expect("menu trigger");
-
-        assert_eq!(input_match.start, "echo prefix".len());
-        assert_eq!(input_match.action, MenuShortcutAction::OpenMenu);
-    }
-
-    #[test]
-    fn attach_non_menu_input_is_forwarded() {
-        let input = b"\x1b[<64;7;1M";
-
-        assert_eq!(parse_menu_shortcut(input), None);
     }
 
     #[test]
