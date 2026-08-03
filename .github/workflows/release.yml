@@ -194,8 +194,8 @@ jobs:
             component: gui
             archive_prefix: pohunek-gui
             binary: pohunek-gui
-          # Fully static musl build: a single self-contained binary that runs on
-          # any x86_64 Linux regardless of the host glibc version.
+          # Fully static musl CLI and daemon builds: self-contained binaries
+          # that run on x86_64 Linux regardless of the host glibc version.
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             component: cli
@@ -206,11 +206,6 @@ jobs:
             component: daemon
             archive_prefix: pohunek-daemon
             binary: pohunekd
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
-            component: gui
-            archive_prefix: pohunek-gui
-            binary: pohunek-gui
     steps:
       - uses: actions/checkout@v4
 

@@ -2,6 +2,9 @@
 
 ## Unreleased (2026-07-21)
 
+- Clarified that native GUI releases target glibc x86_64 because Wayland and
+  graphics libraries remain dynamic runtime dependencies; MUSL archives remain
+  available for the CLI and daemon.
 - Documented durable per-session PTY workers, daemon restart reconciliation,
   runtime state and events, explicit native recovery, systemd diagnostics, and
   the one-time legacy migration boundary.

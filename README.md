@@ -191,10 +191,12 @@ be recovered explicitly when it has valid native recovery metadata.
 
 ## Install
 
-Each release publishes per-component archives for x86_64 Linux (glibc and
-MUSL): `pohunek-cli-*`, `pohunek-daemon-*`, and `pohunek-gui-*`. Every archive
-contains its license and offline documentation under `docs/offline/`. Daemon
-archives contain `pohunekd`, `pohunek-sessiond`, the daemon service, the
+Each release publishes `pohunek-cli-*` and `pohunek-daemon-*` archives for
+x86_64 Linux with both glibc and MUSL. The native `pohunek-gui-*` archive is
+published for glibc because its Wayland client and graphics stack are dynamic
+runtime dependencies; there is no self-contained MUSL GUI archive. Every
+archive contains its license and offline documentation under `docs/offline/`.
+Daemon archives contain `pohunekd`, `pohunek-sessiond`, the daemon service, the
 per-session worker template, the worker slice, and the installer.
 
 Releases also publish `pohunek-web-*-linux-x86_64.tar.gz`: a standalone web
@@ -603,9 +605,10 @@ cargo xtask ts check      # CI gate
 ### Release
 
 `scripts/release` bumps the workspace version, tags `vX.Y.Z`, and pushes; the
-Release workflow re-runs the gates on the tag, then builds and publishes the
-glibc and MUSL x86_64 component archives with the offline docs bundled in, plus
-a self-contained Linux x86_64 web-control-center archive.
+Release workflow re-runs the gates on the tag, then builds and publishes glibc
+and MUSL x86_64 CLI and daemon archives, a glibc x86_64 GUI archive, and a
+self-contained Linux x86_64 web-control-center archive. The offline docs are
+bundled into every native component archive.
 
 ## License
 
