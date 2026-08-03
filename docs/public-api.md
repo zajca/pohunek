@@ -509,7 +509,7 @@ Canonical public codes currently emitted include:
 
 | Class | Codes |
 |---|---|
-| `configuration` | `paths_unavailable` |
+| `configuration` | `paths_unavailable`, `netbird_invalid_config`, `invalid_discovery_options` |
 | `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback` |
 | `transport` | `framing`, `host_unreachable` |
 | `discovery` | `netbird_cli_missing`, `netbird_state_unavailable`, `host_unknown`, `remote_discovery_failed` |
@@ -557,7 +557,8 @@ should reconcile by calling `session.list`, `session.inspect`, or
 The CLI exposes durable notifications through `pohunek notifications`:
 
 - `pohunek notifications list`: list records on one host; `--all-hosts` includes
-  local plus all reachable daemon hosts discovered by the local daemon.
+  local plus reachable daemon hosts from the standalone local-NetBird discovery
+  cache. It does not need a local daemon to expand remote targets.
 - `pohunek notifications watch`: stream `notification_created`,
   `notification_updated`, and `notification_deleted`; `--all-hosts` opens one
   subscription per reachable host.
@@ -661,6 +662,10 @@ Public exports:
   rendering.
 - `next_request_id(method)`: shared correlation-id generator used by SDK-backed
   clients.
+- `discover_hosts()`: local-NetBird peer discovery with default bounded probes.
+- `discover_hosts_with_options(options)`: the same discovery with an explicit
+  non-zero daemon port, per-probe timeout, overall deadline, and concurrency
+  bound. It needs local NetBird state but no local `pohunekd`.
 - Raw and attach helpers: `connect_raw*` and `attach_raw*`.
 
 Connection APIs:

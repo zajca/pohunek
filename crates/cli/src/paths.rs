@@ -31,6 +31,21 @@ pub(crate) struct Paths {
 }
 
 impl Paths {
+    /// Resolve only the pohunek cache directory.
+    ///
+    /// Standalone host discovery deliberately does not need a runtime directory
+    /// or local control socket, so it must not require `XDG_RUNTIME_DIR`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CliError::MissingEnv`] when neither `XDG_CACHE_HOME` nor `HOME`
+    /// is available.
+    pub(crate) fn cache_dir_only() -> Result<PathBuf, CliError> {
+        pohunek_paths::cache_home()
+            .map(|path| path.join(pohunek_paths::APP_DIR))
+            .map_err(path_error)
+    }
+
     /// Resolve CLI paths from the environment, failing fast on missing required
     /// variables.
     ///

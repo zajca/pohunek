@@ -68,9 +68,11 @@ where they are doing it, and when they need you.
 - Remote transport is a TCP listener bound **only** to the host's
   NetBird/WireGuard address, never `0.0.0.0`. Reachability and encryption come
   from the mesh; local access is an owner-only Unix socket.
-- **Tokenless discovery**: `pohunek host discover` enumerates NetBird peers
-  and probes which of them run a reachable daemon; `host inspect` queries live
-  capabilities (supported agents, worktree support) straight from the daemon.
+- **Tokenless discovery**: `pohunek host discover` enumerates local NetBird
+  peers and probes which run a reachable daemon. It needs local NetBird but not
+  local `pohunekd`, and uses a short owner-private cache; `--refresh` re-probes.
+  Status loading and peer probing have explicit bounded deadlines.
+  `host inspect` queries live capabilities straight from the selected daemon.
 
 **Projects and worktree isolation**
 
@@ -272,7 +274,7 @@ them `--json` for machine-readable output (the exceptions are `attach`,
 | `pohunek session rename / stop / rm` | Rename, stop, or evict a session. |
 | `pohunek project add / list / show / rename / rm` | Manage git-repo-aware project records. |
 | `pohunek project actions / action / prompt` | Resolve per-project launch recipes and prompt templates. |
-| `pohunek host discover / list / inspect` | Find NetBird peers running daemons and query live capabilities. |
+| `pohunek host discover / list / inspect` | Find NetBird peers running daemons (standalone cache; `--refresh`) and query live capabilities. |
 | `pohunek notifications list / watch` | Inspect or stream the durable inbox; `--all-hosts` fans out. |
 | `pohunek notifications read / ack / archive / delete` | Drive one record's lifecycle (`host/id` targets a specific host). |
 | `pohunek notifications policy / retention` | Per-kind/provider policy, retention pruning (`--dry-run` / `--apply`). |

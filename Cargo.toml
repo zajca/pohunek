@@ -69,6 +69,7 @@ clap = { version = "4", features = ["derive"] }
 # Advisory file locking (flock) and socket-mode chmod for the single-instance
 # lock and 0600 socket. Minimal, standard FFI surface; needed for milestone 2.
 libc = "0.2"
+nix = { version = "0.29", features = ["fs", "user"] }
 # RFC3339 timestamps for session metadata (milestone 3). Formatting only.
 time = { version = "0.3", features = ["formatting"] }
 vt100 = "0.16.2"

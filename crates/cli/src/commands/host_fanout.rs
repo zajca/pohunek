@@ -8,11 +8,9 @@ use std::collections::BTreeMap;
 use std::future::Future;
 
 use futures::{stream, StreamExt as _};
-use protocol::{method, HostClass, HostDiscoverParams, HostRecord, ProtocolError};
+use protocol::{HostClass, HostRecord, ProtocolError};
 use serde::Serialize;
 
-use crate::client::Client;
-use crate::commands::request_with_params;
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::LOCAL_HOST;
@@ -103,8 +101,7 @@ impl<T> HostResult<T> {
 ///
 /// # Errors
 ///
-/// Returns [`CliError`] when `--all-hosts` discovery cannot be loaded from the
-/// local daemon or the daemon returns an unexpected payload.
+/// Returns [`CliError`] when standalone `NetBird` discovery cannot be loaded.
 pub(crate) async fn resolve_targets(
     paths: &Paths,
     mode: FanOutMode,
@@ -183,10 +180,7 @@ fn targets_for_records(mode: FanOutMode, records: &[HostRecord]) -> Vec<HostTarg
 }
 
 async fn fetch_records(paths: &Paths) -> Result<Vec<HostRecord>, CliError> {
-    let mut client = Client::connect(LOCAL_HOST, paths).await?;
-    let request = request_with_params(method::HOST_DISCOVER, &HostDiscoverParams { force: false })?;
-    let result = client.request(&request).await?;
-    Ok(serde_json::from_value(result)?)
+    crate::commands::host::fetch_records(&paths.cache_dir, false).await
 }
 
 fn reachable_target(record: &HostRecord) -> Option<HostTarget> {

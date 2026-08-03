@@ -26,6 +26,7 @@ Current CLI and command surface:
 - `crates/cli/src/commands/project.rs`
 - `crates/cli/src/commands/notifications.rs`
 - `crates/cli/src/commands/host_fanout.rs`
+- `crates/cli/src/commands/discovery_cache.rs`
 - `crates/cli/src/commands/setup.rs`
 - `crates/cli/src/commands/host.rs`
 - `crates/cli/src/commands/integration.rs`
@@ -37,6 +38,7 @@ Current CLI and command surface:
 - `crates/cli/tests/notifications_clap.rs`
 - `crates/cli/tests/prompt_link.rs`
 - `crates/cli/tests/scripts.rs`
+- `crates/cli/tests/standalone_discovery.rs`
 
 Native GUI client:
 
@@ -157,6 +159,8 @@ Agent runtime and profile resolution:
 - `crates/daemon/src/detect/manifests/shell.toml`
 
 Protocol contracts and transport:
+
+- `crates/client/src/discovery.rs`
 
 - `crates/client/src/lib.rs`
 - `crates/client/src/notifications.rs`

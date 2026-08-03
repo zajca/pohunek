@@ -317,7 +317,9 @@ fn clamp(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::net::IpAddr;
+    use std::os::unix::fs::PermissionsExt as _;
 
     const STATUS_CURRENT: &str = include_str!("../tests/fixtures/status_current.json");
     const STATUS_LEGACY: &str = include_str!("../tests/fixtures/status_legacy.json");
@@ -472,6 +474,25 @@ mod tests {
             .await
             .expect_err("missing CLI returns an error");
         assert!(matches!(err, NetbirdError::CliMissing));
+    }
+
+    #[tokio::test]
+    async fn async_status_future_is_cancellation_safe() {
+        let path = std::env::temp_dir().join(format!(
+            "pohunek-netbird-slow-status-{}",
+            std::process::id()
+        ));
+        fs::write(&path, "#!/bin/sh\nsleep 1\n").expect("write script");
+        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).expect("chmod script");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            run_status_async_with_program(path.to_str().expect("utf8 path")),
+        )
+        .await;
+        assert!(result.is_err(), "slow status must exceed the test deadline");
+        let _ = fs::remove_file(path);
     }
 
     #[test]

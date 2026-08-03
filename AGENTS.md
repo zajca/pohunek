@@ -41,7 +41,7 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | Crate | Role |
 |-------|------|
 | `crates/protocol` | Shared control-protocol envelopes + version negotiation. The wire contract. |
-| `crates/client`   | SDK client: typed errors, daemon transport. |
+| `crates/client`   | SDK client: typed errors, daemon transport, standalone host discovery with bounded NetBird probing. |
 | `crates/daemon`   | Host control plane (`pohunekd`): logical registry, worker reconciliation, public protocol, detection/hooks. |
 | `crates/worker-protocol` | Private versioned daemon-to-worker protocol and framing. |
 | `crates/session-worker` | Durable per-session PTY owner (`pohunek-sessiond`). |
