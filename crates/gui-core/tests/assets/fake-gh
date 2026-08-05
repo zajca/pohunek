@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+
+pwd > ../seen-cwd
+case "$*" in
+  "pr list --json number,title,body,headRefName,url,author,isDraft,labels,reviewDecision,statusCheckRollup,additions,deletions,updatedAt")
+    printf '%s' '[{"number":7,"title":"Fix filters","body":"Body text","headRefName":"feature/filters","url":"https://github.example/repo/pull/7"}]'
+    ;;
+  "issue list --json number,title,body,url")
+    printf '%s' '[{"number":11,"title":"Crash on launch","body":"Issue body","url":"https://github.example/repo/issues/11"}]'
+    ;;
+  "pr view 7 --json reviewDecision")
+    printf '%s' '{"reviewDecision":"APPROVED"}'
+    ;;
+  "pr checks 7 --json name,state,bucket,link")
+    printf '%s' '[{"name":"test","state":"SUCCESS","bucket":"pass","link":"https://github.example/checks/1"}]'
+    ;;
+  *)
+    printf 'unexpected gh args: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac
