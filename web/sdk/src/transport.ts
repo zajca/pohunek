@@ -1,11 +1,16 @@
+import { resolveRequestOrigin, type RequestOrigin } from "./origin";
+
 export interface ConnectOptions {
   connectTimeoutMs?: number;
   requestTimeoutMs?: number;
+  /** Explicit origin for a client hosted inside one managed session. */
+  origin?: RequestOrigin;
 }
 
 export interface ResolvedConnectOptions {
   connectTimeoutMs: number;
   requestTimeoutMs: number;
+  origin?: RequestOrigin;
 }
 
 export interface ControlChannel {
@@ -32,5 +37,6 @@ export function resolveConnectOptions(options: ConnectOptions = {}): ResolvedCon
   return {
     connectTimeoutMs: options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
     requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+    ...(options.origin === undefined ? {} : { origin: resolveRequestOrigin(options.origin) }),
   };
 }

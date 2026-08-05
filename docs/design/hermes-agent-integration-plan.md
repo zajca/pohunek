@@ -59,15 +59,22 @@ The implementation must preserve these decisions from the RFC:
     provider server is built.
 18. Only the local Hermes terminal backend is supported.
 19. Native identity prefers the ordered worker-private claim path and falls
-    back to the public `session.report_native_id` method, which M1 extends with
-    the same ordering fields so the contract is uniform across providers. A
-    valid continuation-session claim supersedes the immutable launch identity.
+    back locally to the public `session.report_native_id` method, which is a
+    necessary fallback and which M1 extends with the same ordering fields so
+    the contract is uniform across providers. A valid continuation-session
+    claim supersedes the immutable launch identity.
 20. Bounded waits occupy dedicated public control connections, and the
     required timeout is their only guaranteed termination bound. The maximum
     wait is deliberately short so a waiter abandoned by a killed client frees
     its slot within seconds.
-21. Plugin policy is a delegated-tool guardrail, not a same-user sandbox; the
-    daemon authoritatively enforces the origin-session guard.
+21. Plugin policy is a delegated-tool guardrail, not a same-user sandbox. The
+    daemon authoritatively rejects exactly `session.stop`, `session.resume`,
+    `session.remove`, `session.fork`, `session.resize`,
+    `session.set_metadata`, `session.rename`, and `session.input` when they
+    target the caller's origin session. It deliberately allows
+    `session.report_agent`, `session.release_agent`, and
+    `session.report_native_id`; the last is the necessary local fallback when
+    the owner-private worker claim cannot be delivered.
 22. Pohunek-owned policy lives outside the plugin directory and outside the
     immutable asset checksum set.
 23. M1 performs the single public protocol break, carrying range negotiation,
@@ -92,7 +99,8 @@ Implementation follows the repository milestone workflow:
    - **M1 — provider-neutral foundations:** decouple resume from fork; add
      `session.screen`, `session.output`, and `session.wait`; add private
      control-plane observation; complete CLI JSON parity and stdin input; add
-     the daemon origin-session guard; harden the public identity report; and
+     the exact eight-method daemon origin-session guard with lifecycle-report
+     exceptions; harden the public identity report; and
      perform the single public protocol break — range negotiation, the
      provider-keyed notification policy, and forward-compatible `AgentKind`
      deserialization — together with the private worker bump;
@@ -560,10 +568,16 @@ Tasks:
      and `.../claude/pohunek-agent-state.sh` to send the new ordering fields on
      the public path, and cover both providers with tests. The hardened shape is
      uniform, not Hermes-specific.
-13. Enforce the origin-session mutation guard in the daemon from
-    `POHUNEK_SESSION_ID` plus `POHUNEK_DAEMON_ID`, using the existing
-    self-feeding attach guard as the identity reference. Keep the plugin check
-    as defence in depth.
+13. Enforce the origin-session guard in the daemon from `POHUNEK_SESSION_ID`
+    plus `POHUNEK_DAEMON_ID`, using the existing self-feeding attach guard as
+    the identity reference. Its complete denied set is `session.stop`,
+    `session.resume`, `session.remove`, `session.fork`, `session.resize`,
+    `session.set_metadata`, `session.rename`, and `session.input`. Explicitly
+    allow `session.report_agent`, `session.release_agent`, and
+    `session.report_native_id` for the origin session; the public native-id
+    method is the necessary local fallback for an unavailable owner-private
+    worker claim. Keep the plugin check as defence in depth and do not describe
+    this as a broader mutation policy.
 14. In M3, when a valid higher-sequence active identity claim reports a Hermes
     continuation session, persist it as the resume reference and prefer it to
     the immutable launch identity.
@@ -587,8 +601,10 @@ Cover:
 - output gap at retention boundary;
 - no PTY payload in logs/errors;
 - all request bounds, including exact control-line boundary payloads;
-- origin-session mutation denied through direct CLI/API bypass as well as the
-  plugin;
+- each of the eight guarded origin-session methods is denied through direct
+  CLI/API bypass as well as the plugin, while `session.report_agent`,
+  `session.release_agent`, and the necessary public fallback
+  `session.report_native_id` remain allowed;
 - continuation identity supersedes launch identity, while stale, expired, and
   lower-sequence claims cannot roll it back.
 
@@ -1097,8 +1113,12 @@ Before CLI invocation:
 
 - resolve host against the installed allowlist;
 - resolve tool against access mode;
-- reject origin-session mutation;
-- reject stop/remove of origin unconditionally;
+- reject `session.stop`, `session.resume`, `session.remove`, `session.fork`,
+  `session.resize`, `session.set_metadata`, `session.rename`, and
+  `session.input` when targeting the origin session;
+- allow lifecycle calls `session.report_agent`, `session.release_agent`, and
+  the necessary public fallback `session.report_native_id` to report the
+  origin session;
 - accept only agents returned by runtime inventory, from the compiled bound
   rather than a policy list;
 - enforce timeout/result/input bounds;
@@ -1108,9 +1128,10 @@ Before CLI invocation:
 
 Return stable plugin error codes matching the RFC.
 
-These checks are defence in depth for the delegated plugin surface. The daemon
-origin-session guard from workstream 3 remains authoritative even when Hermes
-bypasses the plugin and invokes the CLI directly.
+These checks are defence in depth for the delegated plugin surface. The exact
+eight-method daemon origin-session guard from workstream 3 remains authoritative
+even when Hermes bypasses the plugin and invokes the CLI directly; it is not a
+broader mutation policy and does not block the three lifecycle reports.
 
 ### 13.4 Lifecycle reporter
 
@@ -1119,7 +1140,9 @@ Implement a small local reporter:
 - initialize immutable endpoint/runtime metadata once;
 - obtain PID and process-start identity through the same supported Linux
   mechanism as existing Pohunek hooks;
-- use the worker-private identity report as the only native-identity path;
+- prefer the worker-private identity report and retain the hardened public
+  `session.report_native_id` method as the necessary local fallback when the
+  private endpoint is unavailable;
 - use local public daemon methods for activity/attention;
 - increment a monotonic sequence;
 - apply a short configured socket deadline;
@@ -1134,10 +1157,11 @@ timeout, derives process start identity, and sends `identity_report`. Adapt that
 reference implementation to the supported Hermes plugin API instead of
 recreating the transport and identity logic.
 
-Native identity uses only the worker-private ordered claim. A higher-sequence
-valid continuation-session reference supersedes the immutable launch identity
-for the next resume; the public `session.report_native_id` method is not a
-fallback.
+Native identity uses the same ordered claim contract over both transports. The
+worker-private endpoint is preferred; the hardened public
+`session.report_native_id` method is the necessary local fallback. A
+higher-sequence valid continuation-session reference supersedes the immutable
+launch identity for the next resume.
 
 Map hooks exactly as specified in RFC section 9.8. Ensure
 `on_session_end` does not report process exit.
@@ -1254,8 +1278,9 @@ Implement and test:
 - `pohunek_session_stop`;
 - `pohunek_session_remove`.
 
-They register only in `full` mode. They cannot target the origin session. They
-do not bypass daemon preconditions or accept a force flag from the model.
+They register only in `full` mode. As two members of the exact eight-method
+origin guard, they cannot target the origin session. They do not bypass daemon
+preconditions or accept a force flag from the model.
 
 ### 14.6 Control-loop tests
 
@@ -1297,7 +1322,7 @@ Update or add focused English sources under `docs/knowledge/` covering:
 - native resume and unsupported fork;
 - session screen/output/wait;
 - plugin install/update/uninstall/doctor;
-- access modes, host allowlist, and self-target rules;
+- access modes, host allowlist, and the exact eight-method self-target rule;
 - all tool names and safe control loop;
 - output cursor/gap/runtime-change recovery;
 - remote direct-NetBird behavior;
@@ -1331,7 +1356,8 @@ Extend assistant/knowledge evaluations with scenarios:
 - explain unsupported Hermes fork;
 - operate a peer session with send/wait/screen;
 - recover from output gap/runtime change;
-- refuse disallowed host/destructive/self-target action;
+- refuse a disallowed host/destructive action or any of the eight guarded
+  self-target methods while preserving the three lifecycle-report exceptions;
 - avoid raw attach for model control;
 - ask a human to attach when terminal interaction is not safely expressible.
 
@@ -1574,8 +1600,13 @@ milestone; no milestone may claim items assigned to a later milestone.
 - [ ] Access mode is explicit.
 - [ ] Host allowlist is explicit.
 - [ ] Agent/profile and metadata inputs are constrained.
-- [ ] The daemon enforces origin-session policy authoritatively, and the
-      plugin repeats it before subprocess start as defence in depth.
+- [ ] The daemon authoritatively rejects `session.stop`, `session.resume`,
+      `session.remove`, `session.fork`, `session.resize`,
+      `session.set_metadata`, `session.rename`, and `session.input` for the
+      origin session, and the plugin repeats that exact check before subprocess
+      start as defence in depth. `session.report_agent`,
+      `session.release_agent`, and the necessary public fallback
+      `session.report_native_id` remain allowed.
 - [ ] Stop/remove register only in `full`.
 - [ ] CLI version incompatibility disables tools safely.
 - [ ] Doctor covers files, policy, versions, tools, skill, and hook dry run.
@@ -1657,8 +1688,13 @@ milestone; no milestone may claim items assigned to a later milestone.
       Codex/Claude regression.
 - [ ] Every item in sections 18.2 and 18.3 passes, including derived
       control-line bounds and the dedicated-connection wait contract.
-- [ ] The daemon origin-session guard rejects direct CLI/API bypass and the
-      existing self-feeding attach behavior remains green.
+- [ ] The daemon rejects all eight guarded origin-session methods —
+      `session.stop`, `session.resume`, `session.remove`, `session.fork`,
+      `session.resize`, `session.set_metadata`, `session.rename`, and
+      `session.input` — through direct CLI/API bypass. Lifecycle
+      `session.report_agent`, `session.release_agent`, and the necessary public
+      fallback `session.report_native_id` remain allowed, and the existing
+      self-feeding attach behavior remains green.
 - [ ] The single public break is complete: range negotiation, the provider-keyed
       notification policy, and forward-compatible `AgentKind` all land in M1, an
       unknown wire value round-trips to the neutral variant, and that variant is
@@ -1795,8 +1831,12 @@ unrun gate.
 - Does the delegated plugin surface reject a host outside policy without
   claiming to constrain same-user shell/file-write bypass?
 - Can `manage` stop/remove?
-- Does the daemon reject origin-session mutation even when Hermes bypasses the
-  plugin and invokes the CLI directly?
+- Does the daemon reject exactly `session.stop`, `session.resume`,
+  `session.remove`, `session.fork`, `session.resize`,
+  `session.set_metadata`, `session.rename`, and `session.input` for the origin
+  session even when Hermes invokes the CLI directly, while allowing
+  `session.report_agent`, `session.release_agent`, and the necessary public
+  fallback `session.report_native_id`?
 - Can policy-file tampering raise delegated capability, and is that limitation
   diagnosed and documented rather than misrepresented as a sandbox?
 - Can terminal/prompt content reach logs, errors, or notifications?
@@ -1830,8 +1870,8 @@ unrun gate.
 | Output replay exceeds frame limit | disconnect or memory spike | bounded reads, multi-frame chunking, >1 MiB and retention-cap tests |
 | Wait lost wakeup | stalled model loop | snapshot/register/recheck algorithm and race test |
 | Prompt injection triggers delegated mutation | unintended session action | explicit access/host/agent guardrails, no arbitrary plugin command, full-only delegated destruction, daemon safety checks |
-| Same-user Hermes tampers with policy or bypasses the plugin | delegated scope escalation | document that policy is not a sandbox, keep policy outside plugin assets, diagnose permissions/schema, rely on daemon safety and authoritative origin guard |
-| Plugin terminates its own process | missing result/corruption | origin self-target guard, unconditional own stop/remove ban |
+| Same-user Hermes tampers with policy or bypasses the plugin | delegated scope escalation | document that policy is not a sandbox, keep policy outside plugin assets, diagnose permissions/schema, rely on daemon safety and the exact eight-method origin guard from decision 21, including its lifecycle-report exceptions |
+| Plugin terminates its own process | missing result/corruption | reject origin-targeted `session.stop` and `session.remove` as two members of the exact eight-method guard; do not block lifecycle reports |
 | PATH/plugin hijack | arbitrary code execution | recorded canonical executables, owner/mode checks, embedded checksums |
 | Hermes profile collision | user data overwrite | ownership marker, collision error, marker-driven uninstall |
 | CLI/protocol mismatch | misinterpreted tools | versioned JSON envelope and fail-closed plugin |
@@ -1856,8 +1896,12 @@ Before tagging the release:
 7. Resume the same native Hermes session under the same logical Pohunek
    session.
 8. Run a real Hermes tool against a peer fixture session.
-9. Confirm manage/full/host policy denials and the daemon origin-session
-   denial.
+9. Confirm manage/full/host policy denials, denial of each of `session.stop`,
+   `session.resume`, `session.remove`, `session.fork`, `session.resize`,
+   `session.set_metadata`, `session.rename`, and `session.input` for the origin
+   session, and continued delivery of `session.report_agent`,
+   `session.release_agent`, and the necessary public fallback
+   `session.report_native_id`.
 10. Update and uninstall the plugin, verifying unrelated profile state is
     unchanged.
 11. Verify a previous-version live worker remains reconciled after daemon

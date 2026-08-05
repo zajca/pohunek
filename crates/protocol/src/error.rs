@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::version::ProtocolVersion;
+use crate::version::ProtocolVersionRange;
 
 /// Broad error category for a control-protocol error.
 ///
@@ -56,6 +56,7 @@ impl std::fmt::Display for ErrorClass {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "ProtocolError.ts"))]
+#[serde(deny_unknown_fields)]
 #[error("{class}/{code}: {msg}")]
 pub struct ProtocolError {
     /// Broad category, for coarse branching.
@@ -92,14 +93,143 @@ impl ProtocolError {
     /// Carries both versions in the message so the operator sees exactly what to
     /// upgrade. Code is stable: `version_mismatch`.
     #[must_use]
-    pub fn version_mismatch(client_v: ProtocolVersion, daemon_v: ProtocolVersion) -> Self {
+    pub fn version_mismatch(client: ProtocolVersionRange, daemon: ProtocolVersionRange) -> Self {
         Self::new(
             ErrorClass::Daemon,
             "version_mismatch",
             format!(
-                "client protocol version {client_v} is incompatible with daemon protocol version {daemon_v}"
+                "client protocol range {}..={} does not overlap daemon protocol range {}..={}",
+                client.minimum(), client.maximum(), daemon.minimum(), daemon.maximum()
             ),
-            Some("upgrade the older side so both speak the same protocol version".to_owned()),
+            Some("upgrade the older side so the client and daemon support an overlapping protocol version".to_owned()),
+        )
+    }
+
+    /// The canonical `daemon/agent_kind_unsupported` error.
+    #[must_use]
+    pub fn agent_kind_unsupported(agent: &str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "agent_kind_unsupported",
+            format!("agent kind `{agent}` is presentation-only and cannot be mutated or persisted"),
+            Some(
+                "upgrade the daemon to a version that explicitly supports this agent kind"
+                    .to_owned(),
+            ),
+        )
+    }
+
+    /// Creates one payload-free M1 observation error.
+    #[must_use]
+    pub fn observation(code: &'static str, msg: &'static str) -> Self {
+        Self::new(ErrorClass::Runtime, code, msg, None)
+    }
+
+    /// The canonical `runtime/agent_fork_unsupported` error.
+    #[must_use]
+    pub fn agent_fork_unsupported() -> Self {
+        Self::observation(
+            "agent_fork_unsupported",
+            "the selected agent does not support fork",
+        )
+    }
+
+    /// The canonical rejection for input outside an agent's safe-text contract.
+    #[must_use]
+    pub fn session_input_rejected() -> Self {
+        Self::observation(
+            "session_input_rejected",
+            "the input does not satisfy the selected agent's safe-text contract",
+        )
+    }
+
+    /// The canonical rejection for input while an agent awaits owner action.
+    #[must_use]
+    pub fn session_input_blocked() -> Self {
+        Self::observation(
+            "session_input_blocked",
+            "programmatic input is disabled while the agent awaits owner action",
+        )
+    }
+
+    /// The canonical rejection for a missing or incompatible managed runtime.
+    #[must_use]
+    pub fn agent_runtime_unsupported() -> Self {
+        Self::observation(
+            "agent_runtime_unsupported",
+            "the selected agent runtime is unavailable or incompatible with this daemon",
+        )
+    }
+
+    /// The canonical `runtime/session_terminal_unavailable` error.
+    #[must_use]
+    pub fn session_terminal_unavailable() -> Self {
+        Self::observation(
+            "session_terminal_unavailable",
+            "the session terminal is unavailable",
+        )
+    }
+
+    /// The canonical `runtime/session_has_no_managed_terminal` error.
+    #[must_use]
+    pub fn session_has_no_managed_terminal() -> Self {
+        Self::observation(
+            "session_has_no_managed_terminal",
+            "the session has no pohunek-managed terminal",
+        )
+    }
+
+    /// The canonical `runtime/session_runtime_changed` error.
+    #[must_use]
+    pub fn session_runtime_changed() -> Self {
+        Self::observation(
+            "session_runtime_changed",
+            "the session runtime changed; restart observation with the current runtime identity",
+        )
+    }
+
+    /// The canonical `runtime/session_output_limit_exceeded` error.
+    #[must_use]
+    pub fn session_output_limit_exceeded() -> Self {
+        Self::observation(
+            "session_output_limit_exceeded",
+            "the requested output limit exceeds the configured maximum",
+        )
+    }
+
+    /// The canonical `runtime/session_wait_limit_exceeded` error.
+    #[must_use]
+    pub fn session_wait_limit_exceeded() -> Self {
+        Self::observation(
+            "session_wait_limit_exceeded",
+            "the requested wait exceeds the configured maximum",
+        )
+    }
+
+    /// The canonical `runtime/session_waiter_limit_reached` error.
+    #[must_use]
+    pub fn session_waiter_limit_reached() -> Self {
+        Self::observation(
+            "session_waiter_limit_reached",
+            "the session waiter limit is currently reached",
+        )
+    }
+
+    /// The canonical `runtime/worker_feature_unavailable` error.
+    #[must_use]
+    pub fn worker_feature_unavailable() -> Self {
+        Self::observation(
+            "worker_feature_unavailable",
+            "the live worker does not support this control-plane feature",
+        )
+    }
+
+    /// The canonical origin-session mutation denial.
+    #[must_use]
+    pub fn plugin_self_target_denied() -> Self {
+        Self::observation(
+            "plugin_self_target_denied",
+            "a process running inside a session cannot mutate that origin session",
         )
     }
 

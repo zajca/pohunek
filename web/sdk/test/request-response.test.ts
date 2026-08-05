@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, type ProtocolError, type SessionInfo } from "@pohunek/protocol";
-import { Client, ClientError, connectLocal, connectTcp, type Request } from "@pohunek/sdk";
+import { MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, type ProtocolError, type SessionInfo } from "@pohunek/protocol";
+import {
+  Client,
+  ClientError,
+  connectLocal,
+  connectTcp,
+  isRequest,
+  type ConnectOptions,
+  type Request,
+} from "@pohunek/sdk";
 import {
   errResponseLine,
   minimalSessionInfo,
@@ -13,6 +21,58 @@ import {
 } from "./mock-daemon";
 
 describe("Client request/response", () => {
+  test("request decoder accepts ordered ranges and rejects legacy exact versions", () => {
+    expect(isRequest({
+      v: SUPPORTED_PROTOCOL_VERSIONS,
+      id: "range-request",
+      method: "daemon.health",
+      params: null,
+    })).toBe(true);
+    expect(isRequest({
+      v: PROTOCOL_VERSION,
+      id: "legacy-request",
+      method: "daemon.health",
+      params: null,
+    })).toBe(false);
+    expect(isRequest({
+      v: { minimum: 2, maximum: 1 },
+      id: "reversed-request",
+      method: "daemon.health",
+      params: null,
+    })).toBe(false);
+    expect(isRequest({
+      v: SUPPORTED_PROTOCOL_VERSIONS,
+      id: "origin-request",
+      method: "daemon.health",
+      params: null,
+      origin_session_id: "s-origin",
+      origin_daemon_id: "daemon-origin",
+    })).toBe(true);
+    expect(isRequest({
+      v: SUPPORTED_PROTOCOL_VERSIONS,
+      id: "partial-origin",
+      method: "daemon.health",
+      params: null,
+      origin_session_id: "s-origin",
+    })).toBe(false);
+    expect(isRequest({
+      v: SUPPORTED_PROTOCOL_VERSIONS,
+      id: "unsafe-origin",
+      method: "daemon.health",
+      params: null,
+      origin_session_id: "s-origin",
+      origin_daemon_id: "daemon origin",
+    })).toBe(false);
+    expect(isRequest({
+      v: SUPPORTED_PROTOCOL_VERSIONS,
+      id: "oversized-origin",
+      method: "daemon.health",
+      params: null,
+      origin_session_id: "s-origin",
+      origin_daemon_id: "d".repeat(129),
+    })).toBe(false);
+  });
+
   test("call decodes a typed session.list output and sends method params", async () => {
     const session = minimalSessionInfo();
     const daemon = await startUnixDaemon([
@@ -27,9 +87,11 @@ describe("Client request/response", () => {
 
       expect(result).toEqual([session] satisfies SessionInfo[]);
       const sent = parseRequestLine(await daemon.nextRequest());
-      expect(sent["v"]).toBe(PROTOCOL_VERSION);
+      expect(sent["v"]).toEqual(SUPPORTED_PROTOCOL_VERSIONS);
       expect(sent["method"]).toBe("session.list");
       expect(sent["params"]).toEqual({ filters: [{ key: "state", value: "running" }] });
+      expect(sent["origin_session_id"]).toBeUndefined();
+      expect(sent["origin_daemon_id"]).toBeUndefined();
       expect(String(sent["id"])).toStartWith("sdk-session.list-");
     } finally {
       await daemon.close();
@@ -140,7 +202,7 @@ describe("Client request/response", () => {
     try {
       const client = await connectClient(daemon);
       const request: Request = {
-        v: PROTOCOL_VERSION,
+        v: SUPPORTED_PROTOCOL_VERSIONS,
         id: "req-too-large",
         method: "daemon.health",
         params: { payload: "x".repeat(MAX_CONTROL_LINE_BYTES + 1) },
@@ -175,6 +237,212 @@ describe("Client request/response", () => {
 
       expect(error.toProtocolError().class).toBe("daemon");
       expect(error.toProtocolError().code).toBe("version_mismatch");
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("response outside the offered range is rejected and poisons the connection", async () => {
+    const daemon = await startUnixDaemon([
+      {
+        kind: "reply",
+        line: (requestLine) => JSON.stringify({
+          v: PROTOCOL_VERSION + 1,
+          id: requestIdFromLine(requestLine),
+          ok: { status: "ok" },
+        }),
+      },
+    ]);
+    try {
+      const client = await connectClient(daemon);
+
+      const error = await expectClientError(client.call("daemon.health", null));
+
+      expect(error.toProtocolError().code).toBe("version_mismatch");
+      const poisoned = await expectClientError(client.call("daemon.health", null));
+      expect(poisoned.toProtocolError().code).toBe("framing");
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("typed screen, output, and wait methods preserve observation payloads", async () => {
+    const screen = {
+      session_id: "s-test-1",
+      worker_id: "worker-test-1",
+      runtime_id: "runtime-test-1",
+      runtime_generation: "1",
+      watermark: "2",
+      dimensions: { cols: 80, rows: 24 },
+      cursor: { row: 0, col: 3, visible: true },
+      alternate_screen: false,
+      visible_lines: ["test"],
+    } as const;
+    const output = {
+      session_id: "s-test-1",
+      runtime_id: "runtime-test-1",
+      runtime_generation: "1",
+      history_start_offset: "0",
+      start_offset: "0",
+      next_offset: "4",
+      runtime_end_offset: "4",
+      data_base64: "dGVzdA==",
+      has_more: false,
+      timed_out: false,
+    } as const;
+    const wait = {
+      reason: "output_advanced",
+      session: minimalSessionInfo(),
+      terminal_watermark: "2",
+      output_offset: "4",
+    } as const;
+    const daemon = await startUnixDaemon([
+      { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), screen) },
+      { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), output) },
+      { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), wait) },
+    ]);
+    try {
+      const screenClient = await connectClient(daemon);
+      expect(await screenClient.sessionScreen({ session_id: "s-test-1" })).toEqual(screen);
+      await screenClient.close();
+      const outputClient = await connectClient(daemon);
+      expect(await outputClient.sessionOutput({ session_id: "s-test-1", max_bytes: 128 })).toEqual(output);
+      await outputClient.close();
+      const waitClient = await connectClient(daemon);
+      expect(await waitClient.sessionWait({
+        session_id: "s-test-1",
+        after_updated_at: "2026-07-08T00:00:00Z",
+        timeout_ms: 50,
+      })).toEqual(wait);
+      await waitClient.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("configured origin reaches ordinary and dedicated observation connections", async () => {
+    const screen = {
+      session_id: "s-target",
+      worker_id: "worker-target",
+      runtime_id: "runtime-target",
+      runtime_generation: "1",
+      watermark: "2",
+      dimensions: { cols: 80, rows: 24 },
+      cursor: { row: 0, col: 0, visible: true },
+      alternate_screen: false,
+      visible_lines: [],
+    } as const;
+    const output = {
+      session_id: "s-target",
+      runtime_id: "runtime-target",
+      runtime_generation: "1",
+      history_start_offset: "0",
+      start_offset: "0",
+      next_offset: "0",
+      runtime_end_offset: "0",
+      data_base64: "",
+      has_more: false,
+      timed_out: true,
+    } as const;
+    const wait = {
+      reason: "timeout",
+      session: minimalSessionInfo(),
+      terminal_watermark: "2",
+      output_offset: "0",
+    } as const;
+    const daemon = await startUnixDaemon([
+      { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), screen) },
+      { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), output) },
+      { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), wait) },
+    ]);
+    try {
+      const client = await connectClient(daemon, undefined, {
+        origin: { sessionId: "s-origin", daemonId: "daemon-origin" },
+      });
+      await client.sessionScreen({ session_id: "s-target" });
+      await client.sessionOutput({
+        session_id: "s-target",
+        runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+        after_offset: "0",
+        max_bytes: 128,
+        wait_ms: 25,
+      });
+      await client.sessionWait({
+        session_id: "s-target",
+        after_updated_at: "2026-08-04T00:00:00Z",
+        timeout_ms: 25,
+      });
+
+      for (const method of ["session.screen", "session.output", "session.wait"]) {
+        const sent = parseRequestLine(await daemon.nextRequest());
+        expect(sent["method"]).toBe(method);
+        expect(sent["origin_session_id"]).toBe("s-origin");
+        expect(sent["origin_daemon_id"]).toBe("daemon-origin");
+      }
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("partial request origins fail before any wire write", async () => {
+    const daemon = await startUnixDaemon([{ kind: "silent" }]);
+    try {
+      const client = await connectClient(daemon);
+      const request: Request = {
+        v: SUPPORTED_PROTOCOL_VERSIONS,
+        id: "partial-origin",
+        method: "daemon.health",
+        params: null,
+        origin_session_id: "s-origin",
+      };
+
+      const error = await expectClientError(client.request(request));
+      expect(error.toProtocolError().code).toBe("framing");
+      await daemon.expectNoRequest(50);
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("configured origin rejects a conflicting complete request origin before write", async () => {
+    const daemon = await startUnixDaemon([{ kind: "silent" }]);
+    try {
+      const client = await connectClient(daemon, undefined, {
+        origin: { sessionId: "s-origin", daemonId: "daemon-origin" },
+      });
+      const request: Request = {
+        v: SUPPORTED_PROTOCOL_VERSIONS,
+        id: "conflicting-origin",
+        method: "daemon.health",
+        params: null,
+        origin_session_id: "s-other",
+        origin_daemon_id: "daemon-other",
+      };
+
+      const error = await expectClientError(client.request(request));
+      expect(error.toProtocolError().code).toBe("framing");
+      await daemon.expectNoRequest(50);
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("invalid configured origins fail closed", async () => {
+    const daemon = await startUnixDaemon([{ kind: "silent" }]);
+    try {
+      const invalid = {
+        origin: { sessionId: "s-origin" },
+      } as unknown as ConnectOptions;
+      try {
+        await connectClient(daemon, undefined, invalid);
+        throw new Error("expected invalid origin to reject");
+      } catch (error: unknown) {
+        expect(error).toBeInstanceOf(TypeError);
+      }
+      await daemon.expectNoRequest(50);
     } finally {
       await daemon.close();
     }
@@ -253,7 +521,7 @@ describe("Client request/response", () => {
 async function connectClient(
   daemon: MockDaemon,
   host?: string,
-  opts?: { connectTimeoutMs?: number; requestTimeoutMs?: number },
+  opts?: ConnectOptions,
 ): Promise<Client> {
   if (daemon.endpoint.kind === "unix") {
     return connectLocal(daemon.endpoint.socketPath, opts);

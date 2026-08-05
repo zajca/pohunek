@@ -11,10 +11,12 @@ export type CatchAllEvent = {
 
 export class Subscription {
   private readonly lines: AsyncIterator<string>;
+  private readonly selectedVersion: ProtocolVersion;
   private readonly remoteHost: string | undefined;
 
-  public constructor(channel: ControlChannel, remoteHost?: string) {
+  public constructor(channel: ControlChannel, selectedVersion: ProtocolVersion, remoteHost?: string) {
     this.lines = channel.lines[Symbol.asyncIterator]();
+    this.selectedVersion = selectedVersion;
     this.remoteHost = remoteHost;
   }
 
@@ -34,7 +36,11 @@ export class Subscription {
     }
 
     const value = this.parseEventLine(line);
-    return decodeProtocolEvent(value);
+    const event = decodeProtocolEvent(value);
+    if (event.v !== this.selectedVersion) {
+      throw ClientError.versionMismatch(this.selectedVersion, event.v);
+    }
+    return event;
   }
 
   private parseEventLine(line: string): unknown {

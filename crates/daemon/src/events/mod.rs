@@ -27,6 +27,17 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+/// Build one daemon-originated event at the daemon's current protocol version.
+///
+/// Event names are compile-time constants and payloads are daemon-owned JSON
+/// objects. Centralizing the checked constructor keeps producers concise while
+/// subscription transport remains responsible for projecting the negotiated
+/// version onto each connection.
+pub(crate) fn event(name: &str, payload: serde_json::Value) -> Event {
+    Event::new(protocol::PROTOCOL_VERSION, name, payload)
+        .expect("daemon events use valid names and object payloads")
+}
+
 /// File name of the append-only event log inside the events directory.
 const EVENT_LOG_NAME: &str = "events.jsonl";
 
@@ -186,7 +197,7 @@ fn append_event(log: &EventLog, event: &Event) {
     if let Err(err) = log.append(event) {
         warn!(
             error = %err,
-            event = %event.event,
+            event = %event.event(),
             "failed to append event to the event log"
         );
     }
@@ -196,7 +207,7 @@ fn append_event(log: &EventLog, event: &Event) {
 /// stays honest about the gap.
 fn record_lag(log: &EventLog, dropped: u64) {
     warn!(dropped, "event log lagged; some events were not recorded");
-    let marker = Event::new(EVENT_DROPPED, json!({ "dropped": dropped }));
+    let marker = event(EVENT_DROPPED, json!({ "dropped": dropped }));
     if let Err(err) = log.append(&marker) {
         warn!(error = %err, "failed to append events_dropped marker");
     }
@@ -209,7 +220,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use protocol::{event, Event};
+    use protocol::event;
     use serde_json::{json, Value};
     use tokio::sync::broadcast;
     use tokio_util::sync::CancellationToken;
@@ -241,15 +252,15 @@ mod tests {
         let dir = temp_events_dir("append");
         let log = EventLog::open(&dir).expect("open log");
         let events = [
-            Event::new(
+            crate::events::event(
                 event::SESSION_CREATED,
                 json!({ "session": { "id": "s-1" } }),
             ),
-            Event::new(
+            crate::events::event(
                 event::AGENT_STATE,
                 json!({ "session_id": "s-1", "activity": "working" }),
             ),
-            Event::new(
+            crate::events::event(
                 event::SESSION_STOPPED,
                 json!({ "session": { "id": "s-1" } }),
             ),
@@ -262,7 +273,7 @@ mod tests {
         assert_eq!(lines.len(), events.len(), "one line per event");
         for (line, expected) in lines.iter().zip(events.iter()) {
             let parsed: Value = serde_json::from_str(line).expect("each line is valid JSON");
-            assert_eq!(parsed["event"], json!(expected.event));
+            assert_eq!(parsed["event"], json!(expected.event()));
             assert!(
                 parsed.get("v").is_some(),
                 "each line carries a protocol version"
@@ -278,15 +289,15 @@ mod tests {
         let handle = spawn_drain(Arc::clone(&log), rx, CancellationToken::new());
 
         let sent = [
-            Event::new(
+            crate::events::event(
                 event::SESSION_CREATED,
                 json!({ "session": { "id": "s-1" } }),
             ),
-            Event::new(
+            crate::events::event(
                 event::SESSION_UPDATED,
                 json!({ "session": { "id": "s-1" } }),
             ),
-            Event::new(
+            crate::events::event(
                 event::SESSION_STOPPED,
                 json!({ "session": { "id": "s-1" } }),
             ),
@@ -310,7 +321,7 @@ mod tests {
 
         let dir = temp_events_dir("perms");
         let log = EventLog::open(&dir).expect("open log");
-        log.append(&Event::new(event::SESSION_CREATED, json!({})))
+        log.append(&crate::events::event(event::SESSION_CREATED, json!({})))
             .expect("append");
 
         let dir_mode = fs::metadata(&dir)
@@ -358,8 +369,11 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).expect("set loose mode");
 
         let log = EventLog::open(&dir).expect("open log");
-        log.append(&Event::new(event::SESSION_CREATED, json!({ "n": 1 })))
-            .expect("append");
+        log.append(&crate::events::event(
+            event::SESSION_CREATED,
+            json!({ "n": 1 }),
+        ))
+        .expect("append");
 
         let mode = fs::metadata(log.path())
             .expect("metadata")
@@ -378,13 +392,19 @@ mod tests {
         let dir = temp_events_dir("reopen");
         {
             let log = EventLog::open(&dir).expect("first open");
-            log.append(&Event::new(event::SESSION_CREATED, json!({ "n": 1 })))
-                .expect("append 1");
+            log.append(&crate::events::event(
+                event::SESSION_CREATED,
+                json!({ "n": 1 }),
+            ))
+            .expect("append 1");
         };
         {
             let log = EventLog::open(&dir).expect("second open");
-            log.append(&Event::new(event::SESSION_STOPPED, json!({ "n": 2 })))
-                .expect("append 2");
+            log.append(&crate::events::event(
+                event::SESSION_STOPPED,
+                json!({ "n": 2 }),
+            ))
+            .expect("append 2");
             assert_eq!(
                 read_lines(log.path()).len(),
                 2,
@@ -402,7 +422,10 @@ mod tests {
         let (tx, rx) = broadcast::channel(2);
         // Fill beyond capacity before the drain starts so the first recv lags.
         for n in 0..8 {
-            let _ = tx.send(Event::new(event::SESSION_UPDATED, json!({ "n": n })));
+            let _ = tx.send(crate::events::event(
+                event::SESSION_UPDATED,
+                json!({ "n": n }),
+            ));
         }
         let handle = spawn_drain(Arc::clone(&log), rx, CancellationToken::new());
         // Give the drain a moment to process the lag + remaining buffered events.
@@ -432,8 +455,11 @@ mod tests {
         // real daemon keeps the broadcast Sender alive at shutdown, so the drain
         // never sees Closed and must rely on the cancellation flush instead.
         for n in 0..4 {
-            tx.send(Event::new(event::SESSION_UPDATED, json!({ "n": n })))
-                .expect("broadcast send");
+            tx.send(crate::events::event(
+                event::SESSION_UPDATED,
+                json!({ "n": n }),
+            ))
+            .expect("broadcast send");
         }
         shutdown.cancel();
         handle.await.expect("drain joins after shutdown");

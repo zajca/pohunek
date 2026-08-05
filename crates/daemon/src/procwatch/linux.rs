@@ -38,6 +38,10 @@ impl LinuxInspector {
 }
 
 impl ProcessInspector for LinuxInspector {
+    fn process(&self, pid: Pid) -> io::Result<Option<ProcessFact>> {
+        read_process_fact(pid, current_euid()?)
+    }
+
     fn same_user_processes(&self) -> io::Result<Vec<ProcessFact>> {
         same_user_processes()
     }
@@ -217,12 +221,36 @@ fn read_process_fact(process_id: Pid, euid: u32) -> io::Result<Option<ProcessFac
     let Some((comm, parent_id)) = read_status(process_id)? else {
         return Ok(None);
     };
+    let Some(start_identity) = read_start_identity(process_id)? else {
+        return Ok(None);
+    };
     Ok(Some(ProcessFact {
         pid: process_id,
         ppid: parent_id,
+        start_identity,
         comm,
         cmdline: read_cmdline(process_id)?,
     }))
+}
+
+fn read_start_identity(process_id: Pid) -> io::Result<Option<u64>> {
+    let stat = match fs::read_to_string(proc_path(process_id).join("stat")) {
+        Ok(stat) => stat,
+        Err(err) if is_process_race(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let Some(command_end) = stat.rfind(')') else {
+        return Ok(None);
+    };
+    let Some(fields) = stat.get(command_end + 1..) else {
+        return Ok(None);
+    };
+    // After the command, field 3 (`state`) is first. Skipping 19 values lands
+    // on field 22 (`starttime`), whose value is stable for the process lifetime.
+    Ok(fields
+        .split_whitespace()
+        .nth(19)
+        .and_then(|value| value.parse().ok()))
 }
 
 fn read_status(process_id: Pid) -> io::Result<Option<(String, Pid)>> {

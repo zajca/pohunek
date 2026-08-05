@@ -36,4 +36,16 @@ export type HostCapabilities = {
    * by [`git_available`](Self::git_available)).
    */
   worktree_supported: boolean;
+  /**
+   * Whether managed sessions support point-in-time terminal snapshots.
+   */
+  terminal_read_supported: boolean;
+  /**
+   * Whether managed sessions support bounded retained-output reads.
+   */
+  output_read_supported: boolean;
+  /**
+   * Whether managed sessions support bounded `session.wait` long polls.
+   */
+  session_wait_supported: boolean;
 };

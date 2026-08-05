@@ -3,6 +3,7 @@
 mod checks;
 mod eval;
 mod generators;
+mod hermes;
 mod site;
 mod ts;
 
@@ -289,6 +290,33 @@ where
                 Ok(())
             }
         },
+        TopCommand::Hermes { action } => run_hermes(action, &root),
+    }
+}
+
+fn run_hermes(action: HermesAction, root: &Path) -> Result<(), XtaskError> {
+    match action {
+        HermesAction::Compatibility { hermes_bin } => {
+            let summary = hermes::compatibility(root, &hermes_bin)?;
+            println!(
+                "hermes compatibility ok: {} {}, {} CLI checks, {} golden records",
+                summary.release, summary.tag, summary.cli_checks, summary.golden_records
+            );
+            Ok(())
+        }
+        HermesAction::RefreshGoldens {
+            hermes_bin,
+            provider_env,
+        } => {
+            let summary = hermes::refresh_goldens(root, &hermes_bin, &provider_env)?;
+            println!(
+                "hermes golden refresh ok: {} captures, {} unsupported diagnostics, manifest {}",
+                summary.captures,
+                summary.unsupported,
+                summary.manifest_path.display()
+            );
+            Ok(())
+        }
     }
 }
 
@@ -310,6 +338,10 @@ enum TopCommand {
         #[command(subcommand)]
         action: TsAction,
     },
+    Hermes {
+        #[command(subcommand)]
+        action: HermesAction,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -324,6 +356,25 @@ enum DocsAction {
 enum TsAction {
     Generate,
     Check,
+}
+
+#[derive(Debug, Subcommand)]
+enum HermesAction {
+    /// Run the model-free pinned Hermes compatibility checks.
+    Compatibility {
+        /// Hermes executable to inspect; defaults to PATH resolution.
+        #[arg(long, value_name = "PATH", default_value = "hermes")]
+        hermes_bin: PathBuf,
+    },
+    /// Refresh sanitized PTY goldens with an explicit Hermes executable.
+    RefreshGoldens {
+        /// Exact Hermes executable used for every capture.
+        #[arg(long, value_name = "PATH", required = true)]
+        hermes_bin: PathBuf,
+        /// Provider credential environment variable to pass by name.
+        #[arg(long = "provider-env", value_name = "NAME")]
+        provider_env: Vec<String>,
+    },
 }
 
 fn repo_root() -> PathBuf {

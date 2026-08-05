@@ -2,6 +2,8 @@
 
 use protocol::{Request, Response, WorktreeRemoveParams};
 
+use super::util::error_value;
+
 use super::util::{ok_value, parse_params};
 use crate::session::SessionRegistry;
 
@@ -14,10 +16,10 @@ pub(super) async fn handle_worktree_remove(
 ) -> Response {
     let params = match parse_params::<WorktreeRemoveParams>(request) {
         Ok(params) => params,
-        Err(err) => return Response::err(request.id.clone(), err),
+        Err(err) => return error_value(request, err),
     };
     match sessions.remove_worktree(&params.path).await {
         Ok(result) => ok_value(request, &result),
-        Err(err) => Response::err(request.id.clone(), err),
+        Err(err) => error_value(request, err),
     }
 }

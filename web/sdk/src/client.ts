@@ -1,6 +1,20 @@
-import { PROTOCOL_VERSION, type Methods, type ProtocolError } from "@pohunek/protocol";
+import {
+  PROTOCOL_VERSION,
+  SUPPORTED_PROTOCOL_VERSIONS,
+  type Methods,
+  type ProtocolError,
+  type ProtocolVersion,
+  type ProtocolVersionRange,
+  type SessionOutputParams,
+  type SessionOutputResult,
+  type SessionScreenParams,
+  type SessionScreenResult,
+  type SessionWaitParams,
+  type SessionWaitResult,
+} from "@pohunek/protocol";
 import { ClientError } from "./error";
 import { decodeResponse, type Request, type Response } from "./envelope";
+import { hasValidWireOrigin, type RequestOrigin } from "./origin";
 import { Subscription } from "./subscription";
 import type { ConnectOptions, ControlChannel, ResolvedConnectOptions, Transport } from "./transport";
 import { resolveConnectOptions } from "./transport";
@@ -8,6 +22,8 @@ import { WsTransport } from "./transport-ws";
 
 // A 128-bit prefix keeps independently started SDK clients collision-resistant.
 const RUN_TOKEN_RANDOM_BYTES = 16;
+// Dedicated long polls need transport cleanup headroom beyond the wire timeout.
+const DEDICATED_REQUEST_HEADROOM_MS = 1_000;
 const RUN_TOKEN = `${randomToken()}${Date.now().toString(16)}`;
 let nextSequence = 0;
 
@@ -22,6 +38,7 @@ function randomToken(): string {
 }
 
 export class Client {
+  private readonly transport: Transport;
   private readonly channel: ControlChannel;
   private readonly replies: AsyncIterator<string>;
   private readonly options: ResolvedConnectOptions;
@@ -29,8 +46,15 @@ export class Client {
   private poisoned: string | undefined;
   private consumed = false;
   private closed = false;
+  private selectedVersion: ProtocolVersion | undefined;
 
-  private constructor(channel: ControlChannel, options: ResolvedConnectOptions, remoteHost?: string) {
+  private constructor(
+    transport: Transport,
+    channel: ControlChannel,
+    options: ResolvedConnectOptions,
+    remoteHost?: string,
+  ) {
+    this.transport = transport;
     this.channel = channel;
     this.replies = channel.lines[Symbol.asyncIterator]();
     this.options = options;
@@ -50,7 +74,7 @@ export class Client {
     params: Methods[K]["params"],
   ): Promise<Methods[K]["output"]> {
     const request: Request = {
-      v: PROTOCOL_VERSION,
+      v: SUPPORTED_PROTOCOL_VERSIONS,
       id: nextRequestId(String(method)),
       method: String(method),
       params,
@@ -59,12 +83,28 @@ export class Client {
     return value as Methods[K]["output"];
   }
 
+  public async sessionScreen(params: SessionScreenParams): Promise<SessionScreenResult> {
+    return this.call("session.screen", params);
+  }
+
+  public async sessionOutput(params: SessionOutputParams): Promise<SessionOutputResult> {
+    if (params.wait_ms !== undefined) {
+      return this.callDedicated("session.output", params, params.wait_ms);
+    }
+    return this.call("session.output", params);
+  }
+
+  public async sessionWait(params: SessionWaitParams): Promise<SessionWaitResult> {
+    return this.callDedicated("session.wait", params, params.timeout_ms);
+  }
+
   public async request(req: Request): Promise<unknown> {
     this.ensureUsable();
+    const request = applyRequestOrigin(req, this.options.origin);
 
     let line: string;
     try {
-      const encoded = JSON.stringify(req);
+      const encoded = JSON.stringify(request);
       if (encoded === undefined) {
         throw new Error("request serialized to undefined");
       }
@@ -75,7 +115,7 @@ export class Client {
 
     try {
       return await withTimeout(
-        this.exchange(req.id, line),
+        this.exchange(request, line),
         this.options.requestTimeoutMs,
         () => {
           this.poisoned = "previous request timed out; pending daemon response may be stale";
@@ -98,9 +138,10 @@ export class Client {
 
   public async subscribe(request: Request): Promise<Subscription> {
     this.ensureUsable();
+    const prepared = applyRequestOrigin(request, this.options.origin);
     try {
       await withTimeout(
-        this.exchange(request.id, stringifyRequest(request)),
+        this.exchange(prepared, stringifyRequest(prepared)),
         this.options.requestTimeoutMs,
         () => noResponseError(this.remoteHost, "timed out waiting for subscription ack"),
       );
@@ -110,7 +151,11 @@ export class Client {
     }
 
     this.consumed = true;
-    return new Subscription(this.channel, this.remoteHost);
+    const selectedVersion = this.selectedVersion;
+    if (selectedVersion === undefined) {
+      throw ClientError.framing("subscription acknowledgement did not select a protocol version");
+    }
+    return new Subscription(this.channel, selectedVersion, this.remoteHost);
   }
 
   public async close(): Promise<void> {
@@ -128,7 +173,7 @@ export class Client {
   ): Promise<Client> {
     const options = resolveConnectOptions(opts);
     const channel = await transport.control();
-    return new Client(channel, options, remoteHost);
+    return new Client(transport, channel, options, remoteHost);
   }
 
   private ensureUsable(): void {
@@ -143,7 +188,7 @@ export class Client {
     }
   }
 
-  private async exchange(requestId: string, line: string): Promise<unknown> {
+  private async exchange(request: Request, line: string): Promise<unknown> {
     try {
       await this.channel.send(line);
     } catch (error: unknown) {
@@ -152,15 +197,50 @@ export class Client {
 
     const reply = await this.nextReply();
     const response = this.parseResponse(reply);
-    if (response.id !== requestId) {
-      this.poisoned = `previous response id mismatch; expected '${requestId}', got '${response.id}'`;
-      throw responseIdMismatchError(this.remoteHost, requestId, response.id);
+    if (response.id !== request.id) {
+      this.poisoned = `previous response id mismatch; expected '${request.id}', got '${response.id}'`;
+      throw responseIdMismatchError(this.remoteHost, request.id, response.id);
     }
+    this.validateSelectedVersion(request.v, response.v);
 
     if ("ok" in response) {
       return response.ok;
     }
     throw mapDaemonError(this.remoteHost, response.err);
+  }
+
+  private validateSelectedVersion(
+    offered: ProtocolVersionRange,
+    received: ProtocolVersion,
+  ): void {
+    const outsideOffered = received < offered.minimum || received > offered.maximum;
+    const changed = this.selectedVersion !== undefined && received !== this.selectedVersion;
+    if (outsideOffered || changed) {
+      this.poisoned = `response selected incompatible protocol version ${received}`;
+      throw ClientError.versionMismatch(offered, received);
+    }
+    this.selectedVersion = received;
+  }
+
+  private async callDedicated<K extends "session.output" | "session.wait">(
+    method: K,
+    params: Methods[K]["params"],
+    wireTimeoutMs: number,
+  ): Promise<Methods[K]["output"]> {
+    const requestTimeoutMs = Math.max(
+      this.options.requestTimeoutMs,
+      wireTimeoutMs + DEDICATED_REQUEST_HEADROOM_MS,
+    );
+    const client = await Client.connectTransport(
+      this.transport,
+      { ...this.options, requestTimeoutMs },
+      this.remoteHost,
+    );
+    try {
+      return await client.call(method, params);
+    } finally {
+      await client.close();
+    }
   }
 
   private async nextReply(): Promise<string> {
@@ -197,6 +277,28 @@ export class Client {
       throw ClientError.json(error);
     }
   }
+}
+
+function applyRequestOrigin(request: Request, configured: RequestOrigin | undefined): Request {
+  const wireSession = request.origin_session_id;
+  const wireDaemon = request.origin_daemon_id;
+  if (!hasValidWireOrigin(wireSession, wireDaemon)) {
+    throw ClientError.framing("request origin markers must be a valid atomic pair");
+  }
+  if (configured === undefined) {
+    return request;
+  }
+  if (
+    wireSession !== undefined
+    && (wireSession !== configured.sessionId || wireDaemon !== configured.daemonId)
+  ) {
+    throw ClientError.framing("request origin markers conflict with the client origin");
+  }
+  return {
+    ...request,
+    origin_session_id: configured.sessionId,
+    origin_daemon_id: configured.daemonId,
+  };
 }
 
 export function nextRequestId(method: string): string {

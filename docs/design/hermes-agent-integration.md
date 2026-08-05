@@ -82,7 +82,9 @@ The integration is successful only when all of the following are true:
    owner-private.
 8. Read, ordinary mutation, destructive mutation, and remote-host access are
    independently configured on the plugin's delegated tool surface, while the
-   daemon independently and authoritatively protects the origin session.
+   daemon independently and authoritatively applies the exact eight-method
+   origin-session guard defined in section 13.3 without blocking lifecycle
+   reports.
 9. All new wire methods and errors have Rust and TypeScript parity and are
    documented in `docs/public-api.md`.
 10. Deterministic tests cover the runtime, tools, hooks, resume behavior, and
@@ -484,7 +486,8 @@ reference. It also reports:
 - the current Pohunek `runtime_id`, when inherited in the environment.
 
 The worker-private report path remains the preferred native-identity path. The
-public `session.report_native_id` method is a genuine fallback, because M1
+public `session.report_native_id` method is the necessary local fallback,
+because M1
 extends it to carry the same ordering fields the private path already carries —
 runtime identity, PID plus process-start identity, a monotonic sequence, and a
 bounded expiry — and the daemon applies to it the same rejection rules it
@@ -570,8 +573,8 @@ Result:
   "session_id": "sess_...",
   "worker_id": "worker_...",
   "runtime_id": "runtime_...",
-  "runtime_generation": 2,
-  "watermark": 1842,
+  "runtime_generation": "2",
+  "watermark": "1842",
   "dimensions": {
     "cols": 120,
     "rows": 40
@@ -583,7 +586,6 @@ Result:
   },
   "alternate_screen": true,
   "title": "Hermes",
-  "progress": null,
   "visible_lines": [
     "..."
   ]
@@ -625,7 +627,11 @@ Request:
   "method": "session.output",
   "params": {
     "session_id": "sess_...",
-    "after_offset": 8192,
+    "runtime": {
+      "runtime_id": "runtime_...",
+      "runtime_generation": "2"
+    },
+    "after_offset": "8192",
     "max_bytes": 65536,
     "wait_ms": 5000
   }
@@ -638,13 +644,12 @@ Result:
 {
   "session_id": "sess_...",
   "runtime_id": "runtime_...",
-  "runtime_generation": 2,
-  "history_start_offset": 4096,
-  "start_offset": 8192,
-  "next_offset": 12490,
-  "runtime_end_offset": 12490,
+  "runtime_generation": "2",
+  "history_start_offset": "4096",
+  "start_offset": "8192",
+  "next_offset": "12490",
+  "runtime_end_offset": "12490",
   "data_base64": "...",
-  "gap": null,
   "has_more": false,
   "timed_out": false
 }
@@ -682,11 +687,14 @@ Request:
   "method": "session.wait",
   "params": {
     "session_id": "sess_...",
-    "runtime_id": "runtime_...",
+    "runtime": {
+      "runtime_id": "runtime_...",
+      "runtime_generation": "2"
+    },
     "after_updated_at": "2026-07-27T12:00:00Z",
-    "after_terminal_watermark": 1842,
-    "after_output_offset": 12490,
-    "states": ["exited", "stopped", "failed"],
+    "after_terminal_watermark": "1842",
+    "after_output_offset": "12490",
+    "states": ["stopped", "done", "failed"],
     "activities": ["idle", "blocked"],
     "timeout_ms": 8000
   }
@@ -699,8 +707,8 @@ Result:
 {
   "reason": "activity_matched",
   "session": {},
-  "terminal_watermark": 1851,
-  "output_offset": 12720
+  "terminal_watermark": "1851",
+  "output_offset": "12720"
 }
 ```
 
@@ -1035,16 +1043,22 @@ For every caller running inside a managed session:
 
 - reading the origin session is allowed;
 - starting a child/peer session is allowed;
-- mutating, stopping, removing, resuming, forking from, resizing, renaming, or
-  changing metadata on the origin session is rejected;
+- exactly `session.stop`, `session.resume`, `session.remove`, `session.fork`,
+  `session.resize`, `session.set_metadata`, `session.rename`, and
+  `session.input` are rejected when they target the origin session;
+- `session.report_agent`, `session.release_agent`, and
+  `session.report_native_id` remain allowed to target the origin session,
+  because hooks report their own lifecycle and the public native-id method is
+  the necessary local fallback when the owner-private worker claim cannot be
+  delivered;
 - no argument accepted by the delegated plugin tool can bypass the rejection.
 
 The daemon is the authoritative enforcement point. It receives the caller's
 origin identity from `POHUNEK_SESSION_ID` and `POHUNEK_DAEMON_ID` through the
 same mechanism used by the self-feeding attach guard, and rejects prohibited
-origin-session mutations regardless of which Pohunek client surface issued
-them. The plugin repeats the check before subprocess launch as defence in
-depth.
+calls to those eight methods regardless of which Pohunek client surface issued
+them. It does not impose a broader mutation policy. The plugin repeats the
+same eight-method check before subprocess launch as defence in depth.
 
 The Pohunek-owned plugin policy cannot disable this daemon guard. A human CLI
 outside that session has no managed-session origin marker and retains the
@@ -1117,12 +1131,16 @@ validated:
 Per-hook execution only constructs a small fixed-shape message and attempts a
 local socket write.
 
-Native identity prefers the ordered worker-private path and falls back to the
-local public `session.report_native_id` method, which carries the same ordering
-fields (section 9.7). Activity and attention use the public local daemon report
-methods because they affect the logical registry and notification policy. Both
-paths are local only. If an endpoint is unavailable, its report is dropped; the
-worker's terminal and process evidence continue to function.
+Native identity prefers the ordered worker-private path and retains the
+necessary local fallback to the public `session.report_native_id` method, which
+carries the same ordering fields (section 9.7). The origin-session guard must
+allow that report, plus `session.report_agent` and `session.release_agent`, to
+target the reporting session. Activity and attention use the public local
+daemon report methods because they affect the logical registry and notification
+policy. Both paths are local only. If the private endpoint is unavailable, the
+native report uses the public fallback; only when that local fallback is also
+unavailable is the report dropped. The worker's terminal and process evidence
+continue to function.
 
 ### 14.3 Ordering and expiry
 
@@ -1329,7 +1347,7 @@ teaches the operating model and safe multi-step workflows:
 - terminal screen versus output history;
 - cursor/gap/runtime-generation handling;
 - typed error recovery;
-- access-mode, host, and self-target restrictions;
+- access-mode, host, and the exact eight-method self-target restriction;
 - secret and terminal-content handling;
 - when to ask a human to attach.
 
@@ -1449,10 +1467,11 @@ New stable public or CLI errors include at least:
 - `plugin_self_target_denied`;
 - `plugin_agent_denied`.
 
-Errors have typed fields for recovery, such as current runtime identity,
-supported capability, configured maximum, allowed host identifiers, or the
-diagnostic command. They do not include tokens, prompts, terminal payloads,
-unredacted subprocess output, or private hook paths.
+M1 observation errors are deliberately payload-free. Callers refresh public
+session state or restart from a fresh screen/tail rather than receiving terminal
+or runtime coordinates in an error. Later plugin-specific errors may add typed,
+non-secret recovery fields, but they must not include tokens, prompts, terminal
+payloads, unredacted subprocess output, or private hook paths.
 
 ## 20. Protocol and persistence compatibility
 
@@ -1552,8 +1571,9 @@ Within that scope:
 - host scope is explicit;
 - mutation scope is explicit;
 - destructive operations require `full`;
-- the daemon authoritatively restricts origin-session mutation, with a
-  plugin-side defence-in-depth check;
+- the daemon authoritatively rejects the eight origin-session methods listed in
+  section 13.3, with a plugin-side defence-in-depth check, while the three
+  lifecycle reports listed there remain allowed;
 - tool arguments cannot select arbitrary commands or endpoints;
 - tool output is data, not executable instructions;
 - the skill tells Hermes to treat terminal/repository text as untrusted;
@@ -1771,11 +1791,13 @@ No raw attach is acquired.
 A plugin installed with `manage` calls `pohunek_session_remove`. The plugin
 rejects it locally with `plugin_access_denied`; it does not invoke the CLI.
 
-### 25.5 Origin-session mutation denied
+### 25.5 Guarded origin-session input denied
 
 Hermes running inside `sess_origin` attempts to send input to `sess_origin`.
 The plugin returns `plugin_self_target_denied`. Reading its screen for
-diagnostics remains allowed.
+diagnostics remains allowed. The same denial applies to the other seven methods
+listed in section 13.3; `session.report_agent`, `session.release_agent`, and the
+necessary public fallback `session.report_native_id` remain allowed.
 
 ## 26. Alternatives considered
 
@@ -1847,7 +1869,8 @@ client parity, and the Hermes plugin/operator capability. Each milestone must
 meet its own Definition of Done in the implementation plan; an enum, adapter,
 plugin scaffold, or tool-schema-only slice is never releasable. Full RFC
 completion requires the runtime, observation protocol, CLI parity, real plugin,
-delegated-capability policy, daemon origin guard, skill, UI/web ripples,
+delegated-capability policy, the exact eight-method daemon origin guard and its
+lifecycle-report exceptions, skill, UI/web ripples,
 compatibility handling, documentation, and tests described here.
 
 ## 29. References

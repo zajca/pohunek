@@ -28,10 +28,12 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use protocol::{
-    method, AttachHeader, Request, Response, SessionAttachParams, SessionAttachResult, SessionInfo,
-    SessionNewParams, SessionReportNativeIdParams, SessionReportNativeIdResult, SessionState,
-    SessionStopResult,
+    method, AttachHeader, ProcessStartIdentity, ReportSequence, Request as ProtocolRequest,
+    Response, SessionAttachParams, SessionAttachResult, SessionInfo, SessionNewParams,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionState, SessionStopResult,
 };
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
@@ -44,6 +46,14 @@ use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLaunc
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct Request;
+
+impl Request {
+    fn make(id: &str, method: &str, params: serde_json::Value) -> ProtocolRequest {
+        ProtocolRequest::new(id, method, params).expect("valid integration-test request")
+    }
+}
 
 /// A unique temp directory for one test, so parallel `#[tokio::test]` runs
 /// (and repeated runs of this file) never collide on disk.
@@ -104,7 +114,10 @@ async fn connect(socket: &Path) -> Framed<UnixStream, LinesCodec> {
 }
 
 /// Send one request line and read the matching response line.
-async fn exchange(framed: &mut Framed<UnixStream, LinesCodec>, request: &Request) -> Response {
+async fn exchange(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    request: &ProtocolRequest,
+) -> Response {
     let line = serde_json::to_string(request).expect("serialize request");
     framed.send(line).await.expect("send");
     let reply = framed
@@ -116,10 +129,26 @@ async fn exchange(framed: &mut Framed<UnixStream, LinesCodec>, request: &Request
 }
 
 fn ok_payload(response: Response) -> serde_json::Value {
-    match response {
-        Response::Ok { ok, .. } => ok,
-        Response::Err { err, .. } => panic!("expected ok, got error: {err}"),
-    }
+    response
+        .into_result()
+        .unwrap_or_else(|err| panic!("expected ok, got error: {err}"))
+}
+
+fn process_start_identity(pid: u32) -> ProcessStartIdentity {
+    let stat =
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read child process identity");
+    let fields = stat
+        .rsplit_once(") ")
+        .expect("process stat contains command terminator")
+        .1
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>();
+    let start_identity = fields
+        .get(19)
+        .expect("process stat contains start identity")
+        .parse()
+        .expect("process start identity is numeric");
+    ProcessStartIdentity::new(start_identity)
 }
 
 /// Open a raw attach stream: a fresh connection carrying only the attach
@@ -364,7 +393,7 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
 
     let mut control = connect(&socket).await;
 
-    let create_req = Request::new(
+    let create_req = Request::make(
         "privacy-sentinel-create",
         method::SESSION_NEW,
         serde_json::to_value(SessionNewParams {
@@ -394,7 +423,7 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
     // Attach and read the child's real terminal output: proof the output and
     // prompt sentinels actually flowed through the PTY, before asserting they
     // never land anywhere durable below.
-    let attach_req = Request::new(
+    let attach_req = Request::make(
         "privacy-sentinel-attach",
         method::SESSION_ATTACH,
         serde_json::to_value(SessionAttachParams {
@@ -431,15 +460,30 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
     // `session/tests.rs` does; this is the same call the shipped
     // `pohunek-agent-state.sh` hook falls back to when it cannot reach the
     // worker's private hook socket.
-    let report_req = Request::new(
+    let runtime_id = created
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.runtime_id.as_deref())
+        .expect("created managed session exposes its runtime id");
+    let report_req = Request::make(
         "privacy-sentinel-report-native-id",
         method::SESSION_REPORT_NATIVE_ID,
-        serde_json::to_value(SessionReportNativeIdParams {
-            session_id: created.id.clone(),
-            agent: "claude".to_owned(),
-            native_session_id: HOOK.to_owned(),
-            transcript_path: None,
-        })
+        serde_json::to_value(
+            SessionReportNativeIdParams::new(
+                created.id.clone(),
+                runtime_id,
+                "claude",
+                created.pid,
+                process_start_identity(created.pid),
+                ReportSequence::new(1),
+                (OffsetDateTime::now_utc() + time::Duration::seconds(30))
+                    .format(&Rfc3339)
+                    .expect("format native identity expiry"),
+                HOOK,
+                None,
+            )
+            .expect("valid native identity claim"),
+        )
         .expect("serialize report-native-id params"),
     );
     let reported: SessionReportNativeIdResult =
@@ -447,7 +491,7 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
             .expect("report-native-id result");
     assert!(reported.recorded, "the sentinel native id must be recorded");
 
-    let stop_req = Request::new(
+    let stop_req = Request::make(
         "privacy-sentinel-stop",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),

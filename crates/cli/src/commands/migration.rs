@@ -228,6 +228,7 @@ mod tests {
         let mut worker = session("worker", SessionState::Running);
         worker.runtime = Some(SessionRuntime {
             state: RuntimeState::Live,
+            runtime_generation: protocol::RuntimeGeneration::new(1),
             worker_id: Some("worker-1".to_owned()),
             runtime_id: Some("runtime-1".to_owned()),
             started_at: None,
@@ -290,6 +291,7 @@ mod tests {
             name: None,
             id: SessionId(id.to_owned()),
             external: Some(false),
+            capabilities: protocol::SessionCapabilities::default(),
             agent: "codex".to_owned(),
             agent_base: AgentKind::Codex,
             cwd: PathBuf::from("/repo"),

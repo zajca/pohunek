@@ -1,0 +1,25 @@
+{
+  "id": "req-screen-fixture-1",
+  "ok": {
+    "alternate_screen": false,
+    "cursor": {
+      "col": 4,
+      "row": 1,
+      "visible": true
+    },
+    "dimensions": {
+      "cols": 80,
+      "rows": 24
+    },
+    "runtime_generation": "3",
+    "runtime_id": "runtime-fixture-1",
+    "session_id": "s-fixture-1",
+    "title": "fixture terminal",
+    "visible_lines": [
+      "pohunek fixture"
+    ],
+    "watermark": "7",
+    "worker_id": "worker-fixture-1"
+  },
+  "v": 2
+}

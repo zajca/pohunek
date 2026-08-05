@@ -53,6 +53,8 @@ import type {
   SessionListParams,
   SessionNewParams,
   SessionNewResult,
+  SessionOutputParams,
+  SessionOutputResult,
   SessionReleaseAgentParams,
   SessionReleaseAgentResult,
   SessionRemoveResult,
@@ -65,9 +67,13 @@ import type {
   SessionResizeParams,
   SessionResizeResult,
   SessionResumeResult,
+  SessionScreenParams,
+  SessionScreenResult,
   SessionSetMetadataParams,
   SessionSetMetadataResult,
   SessionStopResult,
+  SessionWaitParams,
+  SessionWaitResult,
   WorktreeRemoveParams,
   WorktreeRemoveResult,
 } from "./index";
@@ -102,6 +108,7 @@ export interface Methods {
   "session.inspect": { params: SessionId; output: SessionInfo };
   "session.list": { params: SessionListParams; output: SessionInfo[] };
   "session.new": { params: SessionNewParams; output: SessionNewResult };
+  "session.output": { params: SessionOutputParams; output: SessionOutputResult };
   "session.release_agent": { params: SessionReleaseAgentParams; output: SessionReleaseAgentResult };
   "session.remove": { params: SessionId; output: SessionRemoveResult };
   "session.rename": { params: SessionRenameParams; output: SessionRenameResult };
@@ -110,8 +117,10 @@ export interface Methods {
   "session.resize": { params: SessionResizeParams; output: SessionResizeResult };
   "session.resume": { params: SessionId; output: SessionResumeResult };
   "session.runtime_inventory": { params: null; output: RuntimeInventoryResult };
+  "session.screen": { params: SessionScreenParams; output: SessionScreenResult };
   "session.set_metadata": { params: SessionSetMetadataParams; output: SessionSetMetadataResult };
   "session.stop": { params: SessionId; output: SessionStopResult };
+  "session.wait": { params: SessionWaitParams; output: SessionWaitResult };
   "subscribe": { params: null; output: JsonValue };
   "worktree.remove": { params: WorktreeRemoveParams; output: WorktreeRemoveResult };
 }

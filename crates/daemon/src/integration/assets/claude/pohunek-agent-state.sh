@@ -3,7 +3,7 @@
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # POHUNEK_INTEGRATION_ID=claude
-# POHUNEK_INTEGRATION_VERSION=2
+# POHUNEK_INTEGRATION_VERSION=4
 #
 # SessionStart/SessionEnd hook: report active-agent identity, capture the
 # agent's native session id for direct-session resume, and release active-agent
@@ -57,6 +57,7 @@ session_id = os.environ.get("POHUNEK_SESSION_ID")
 socket_path = os.environ.get("POHUNEK_SOCKET_PATH")
 worker_socket_path = os.environ.get("POHUNEK_WORKER_SOCKET_PATH")
 protocol_raw = os.environ.get("POHUNEK_PROTOCOL_VERSION")
+runtime_id = os.environ.get("POHUNEK_RUNTIME_ID")
 hook_input_file = os.environ.get("POHUNEK_HOOK_INPUT_FILE")
 agent_pid_raw = os.environ.get("POHUNEK_AGENT_PID")
 
@@ -66,11 +67,11 @@ if action not in (ACTION_SESSION, ACTION_RELEASE):
     raise SystemExit(0)
 
 protocol_version = None
-if not worker_socket_path:
+if socket_path and protocol_raw:
     try:
         protocol_version = int(protocol_raw)
     except ValueError:
-        raise SystemExit(0)
+        protocol_version = None
 
 try:
     parsed_agent_pid = int(agent_pid_raw) if agent_pid_raw else None
@@ -107,13 +108,14 @@ def process_start_identity(pid):
 
 
 def send_worker_hook(request_type):
-    if not worker_socket_path or agent_pid is None:
-        return
+    if not worker_socket_path or not runtime_id or agent_pid is None:
+        return False
     start_identity = process_start_identity(agent_pid)
     if start_identity is None:
-        return
+        return False
     request = {
         "type": request_type,
+        "runtime_id": runtime_id,
         "provider": agent,
         "pid": agent_pid,
         "start_identity": start_identity,
@@ -134,18 +136,17 @@ def send_worker_hook(request_type):
         client.settimeout(SOCKET_TIMEOUT_SECS)
         client.connect(worker_socket_path)
         client.sendall((json.dumps(request) + "\n").encode())
-        try:
-            client.recv(RESPONSE_BYTES)
-        except Exception:
-            pass
+        response = client.recv(RESPONSE_BYTES)
         client.close()
+        result = json.loads(response.splitlines()[0])
+        return result.get("ok") is True
     except Exception:
-        pass
+        return False
 
 
 def send_request(method, params, suffix):
     request = {
-        "v": protocol_version,
+        "v": {"minimum": protocol_version, "maximum": protocol_version},
         "id": f"hook:{agent}:{timestamp_ms}:{suffix}",
         "method": method,
         "params": params,
@@ -165,8 +166,9 @@ def send_request(method, params, suffix):
 
 
 if action == ACTION_RELEASE:
-    if worker_socket_path:
-        send_worker_hook("identity_release")
+    if worker_socket_path and send_worker_hook("identity_release"):
+        raise SystemExit(0)
+    if not socket_path or protocol_version is None:
         raise SystemExit(0)
     release_agent_params = {
         "session_id": session_id,
@@ -180,8 +182,10 @@ if action == ACTION_RELEASE:
 if not native_session_id:
     raise SystemExit(0)
 
-if worker_socket_path:
-    send_worker_hook("identity_report")
+if worker_socket_path and send_worker_hook("identity_report"):
+    raise SystemExit(0)
+
+if not socket_path or protocol_version is None:
     raise SystemExit(0)
 
 report_agent_params = {
@@ -198,13 +202,22 @@ if transcript_path:
 
 send_request("session.report_agent", report_agent_params, "agent")
 
-native_id_params = {
-    "session_id": session_id,
-    "agent": agent,
-    "native_session_id": native_session_id,
-}
-if transcript_path:
-    native_id_params["transcript_path"] = transcript_path
-
-send_request("session.report_native_id", native_id_params, "native")
+if runtime_id and agent_pid is not None:
+    start_identity = process_start_identity(agent_pid)
+    if start_identity is not None:
+        native_id_params = {
+            "session_id": session_id,
+            "runtime_id": runtime_id,
+            "agent": agent,
+            "pid": agent_pid,
+            "pid_start_identity": str(start_identity),
+            "sequence": str(timestamp_ms),
+            "expires_at": (
+                datetime.now(timezone.utc) + timedelta(seconds=IDENTITY_TTL_SECS)
+            ).isoformat().replace("+00:00", "Z"),
+            "native_session_id": native_session_id,
+        }
+        if transcript_path:
+            native_id_params["transcript_path"] = transcript_path
+        send_request("session.report_native_id", native_id_params, "native")
 PY

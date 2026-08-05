@@ -9,15 +9,15 @@ use pohunek_worker_protocol::{
     read_frame, write_frame, AttachStart, Capability, ControlCode, ControlMessage, ControlReader,
     ControlRequest, ControlResponse, ControlWriter, DaemonId, DataFrame, Dimensions, ExitStatus,
     FrameHeader, FrameKind, Initialize, InputFragment, InputPlan, InspectSnapshot, LeaseId,
-    RequestId, RequestKind, ResizeRequest, ResponseKind, RuntimeId, RuntimeScope, SessionId,
-    StopRequest, StreamId, StreamMode, TransactionId, Version, WorkerId, WriteId,
+    OutputGap, RequestId, RequestKind, ResizeRequest, ResponseKind, RuntimeId, RuntimeScope,
+    SessionId, StopRequest, StreamId, StreamMode, TransactionId, Version, WorkerId, WriteId,
     ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
 };
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-// Rust guideline compliant 2026-07-29
+// Rust guideline compliant 2026-08-04
 
 /// Prefix for daemon-generated, producer-scoped control input identifiers.
 const INPUT_WRITE_ID_PREFIX: &str = "input";
@@ -71,6 +71,35 @@ pub enum WorkerError {
         /// Maximum time allowed for the readiness frame.
         timeout: Duration,
     },
+    /// The negotiated worker protocol cannot serve terminal observation.
+    #[error("worker protocol {selected_version} does not support control-plane observation")]
+    ObservationUnsupported {
+        /// Protocol version selected for this daemon-worker connection.
+        selected_version: Version,
+    },
+}
+
+/// Runtime-bound output page returned by a private worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedOutput {
+    /// Runtime that produced the output.
+    pub runtime_id: RuntimeId,
+    /// First currently retained byte offset.
+    pub history_start_offset: u64,
+    /// Offset of the first returned byte.
+    pub start_offset: u64,
+    /// Offset immediately after returned bytes.
+    pub next_offset: u64,
+    /// Current output end in this runtime.
+    pub runtime_end_offset: u64,
+    /// Opaque PTY bytes. Callers must not log these bytes.
+    pub data: pohunek_worker_protocol::SecretBytes,
+    /// Missing output range, when the requested cursor was evicted.
+    pub gap: Option<OutputGap>,
+    /// More retained bytes are immediately available.
+    pub has_more: bool,
+    /// Waiting reached the requested deadline.
+    pub timed_out: bool,
 }
 
 /// Cloneable controller for one worker lease.
@@ -358,6 +387,98 @@ impl Worker {
         }
     }
 
+    /// Returns the current rendered terminal without creating an attach stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::ObservationUnsupported`] for a previous worker
+    /// and [`WorkerError`] when runtime identity or transport validation fails.
+    pub async fn terminal_snapshot(
+        &self,
+    ) -> Result<pohunek_worker_protocol::TerminalSnapshot, WorkerError> {
+        let mut inner = self.inner.lock().await;
+        ensure_observation(&inner)?;
+        let scope = scope(&inner)?;
+        let response = request_locked(
+            &mut inner,
+            self.next_request_id("terminal-snapshot")?,
+            RequestKind::TerminalSnapshot { scope },
+        )
+        .await?;
+        match response {
+            ResponseKind::TerminalSnapshot {
+                runtime_id,
+                snapshot,
+            } if inner.runtime_id.as_ref() == Some(&runtime_id) => Ok(*snapshot),
+            ResponseKind::TerminalSnapshot { .. } => Err(WorkerError::ResponseMismatch),
+            other => response_error(other),
+        }
+    }
+
+    /// Returns one runtime-bound page of retained output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::ObservationUnsupported`] for a previous worker
+    /// and [`WorkerError`] when the worker rejects the cursor or byte bound.
+    pub async fn read_output(
+        &self,
+        after_offset: Option<u64>,
+        max_bytes: u32,
+        wait: Duration,
+    ) -> Result<ObservedOutput, WorkerError> {
+        // Token issuance uses the shared controller connection. Shield this
+        // short exchange from caller cancellation so a late response is always
+        // consumed and cannot desynchronize the next control request. The
+        // potentially long wait runs only on the dedicated data socket below.
+        let worker = self.clone();
+        let open =
+            tokio::spawn(
+                async move { worker.open_observation(after_offset, max_bytes, wait).await },
+            )
+            .await
+            .map_err(|error| {
+                WorkerError::Protocol(format!("observation opener task failed: {error}"))
+            })??;
+        read_observation_stream(&self.socket_path, open).await
+    }
+
+    async fn open_observation(
+        &self,
+        after_offset: Option<u64>,
+        max_bytes: u32,
+        wait: Duration,
+    ) -> Result<ObservationOpen, WorkerError> {
+        let mut inner = self.inner.lock().await;
+        ensure_observation(&inner)?;
+        let scope = scope(&inner)?;
+        let wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+        let stream_id = self.next_stream_id("observation")?;
+        let response = request_locked(
+            &mut inner,
+            self.next_request_id("read-output")?,
+            RequestKind::ReadOutput {
+                scope: scope.clone(),
+                stream_id: stream_id.clone(),
+                after_offset,
+                max_bytes,
+                wait_ms,
+            },
+        )
+        .await?;
+        match response {
+            ResponseKind::OutputReadOpened { token, .. } => Ok(ObservationOpen {
+                token,
+                version: inner.selected_version,
+                stream_id,
+                runtime_id: scope.runtime_id,
+                after_offset,
+                max_bytes,
+            }),
+            other => response_error(other),
+        }
+    }
+
     /// Executes one lease-scoped deduplicated input plan.
     ///
     /// The sequence is allocated while the control mutex is held, so one daemon
@@ -473,8 +594,9 @@ impl Worker {
 
     /// Opens a fresh public attachment with the best negotiated replay mode.
     ///
-    /// Version-three workers receive an atomic terminal snapshot. A
-    /// version-two worker remains attachable through its bounded replay path:
+    /// Version-three workers preserve their established atomic terminal
+    /// snapshot behavior. Version-four adds observation without changing the
+    /// attach data stream:
     /// replacing a daemon must never make an otherwise live PTY unreachable.
     ///
     /// # Errors
@@ -608,6 +730,180 @@ impl Worker {
         RequestId::new(format!("{operation}-{sequence}"))
             .map_err(|error| WorkerError::Protocol(error.to_string()))
     }
+
+    fn next_stream_id(&self, operation: &str) -> Result<StreamId, WorkerError> {
+        let sequence = self.request_sequence.fetch_add(1, Ordering::Relaxed);
+        StreamId::new(format!("{operation}-{sequence}"))
+            .map_err(|error| WorkerError::Protocol(error.to_string()))
+    }
+}
+
+#[derive(Debug)]
+struct ObservationOpen {
+    token: pohunek_worker_protocol::DataToken,
+    version: Version,
+    stream_id: StreamId,
+    runtime_id: RuntimeId,
+    after_offset: Option<u64>,
+    max_bytes: u32,
+}
+
+async fn read_observation_stream(
+    socket_path: &Path,
+    open: ObservationOpen,
+) -> Result<ObservedOutput, WorkerError> {
+    let mut stream =
+        UnixStream::connect(socket_path)
+            .await
+            .map_err(|source| WorkerError::Socket {
+                path: socket_path.to_path_buf(),
+                source,
+            })?;
+    let open_frame = DataFrame::new(
+        FrameHeader {
+            version: open.version,
+            stream_id: open.stream_id.clone(),
+            runtime_id: open.runtime_id.clone(),
+            kind: FrameKind::Open {
+                token: open.token,
+                mode: StreamMode::Observation,
+                after_offset: open.after_offset,
+                attach: None,
+            },
+        },
+        Vec::new(),
+    )
+    .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+    write_frame(&mut stream, &open_frame)
+        .await
+        .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+
+    collect_observation_frames(
+        &mut stream,
+        open.version,
+        open.stream_id,
+        open.runtime_id,
+        open.max_bytes,
+    )
+    .await
+}
+
+async fn collect_observation_frames(
+    stream: &mut UnixStream,
+    version: Version,
+    stream_id: StreamId,
+    runtime_id: RuntimeId,
+    requested_max_bytes: u32,
+) -> Result<ObservedOutput, WorkerError> {
+    let start = read_matching_frame(stream, version, &stream_id, &runtime_id).await?;
+    let (
+        history_start_offset,
+        start_offset,
+        next_offset,
+        runtime_end_offset,
+        gap,
+        has_more,
+        timed_out,
+    ) = match start.header().kind.clone() {
+        FrameKind::ObservationStart {
+            history_start_offset,
+            start_offset,
+            next_offset,
+            runtime_end_offset,
+            gap,
+            has_more,
+            timed_out,
+        } => (
+            history_start_offset,
+            start_offset,
+            next_offset,
+            runtime_end_offset,
+            gap,
+            has_more,
+            timed_out,
+        ),
+        FrameKind::Error { error } => {
+            return Err(WorkerError::Rejected {
+                code: error.code,
+                message: error.message,
+                retryable: error.retryable,
+            });
+        }
+        _ => return Err(WorkerError::ResponseMismatch),
+    };
+    let declared_span = next_offset
+        .checked_sub(start_offset)
+        .ok_or(WorkerError::ResponseMismatch)?;
+    if declared_span > u64::from(requested_max_bytes) {
+        return Err(WorkerError::ResponseMismatch);
+    }
+    let requested_max_bytes = usize::try_from(requested_max_bytes)
+        .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+    let expected_bytes =
+        usize::try_from(declared_span).map_err(|error| WorkerError::Protocol(error.to_string()))?;
+    let mut data = Vec::with_capacity(expected_bytes);
+    let mut expected_offset = start_offset;
+    loop {
+        let frame = read_matching_frame(stream, version, &stream_id, &runtime_id).await?;
+        match frame.header().kind.clone() {
+            FrameKind::Replay { offset } if offset == expected_offset => {
+                let accumulated = data
+                    .len()
+                    .checked_add(frame.payload().len())
+                    .ok_or(WorkerError::ResponseMismatch)?;
+                if accumulated > expected_bytes || accumulated > requested_max_bytes {
+                    return Err(WorkerError::ResponseMismatch);
+                }
+                expected_offset = expected_offset
+                    .checked_add(u64::try_from(frame.payload().len()).unwrap_or(u64::MAX))
+                    .ok_or_else(|| {
+                        WorkerError::Protocol("observation offset overflowed".to_owned())
+                    })?;
+                data.extend_from_slice(frame.payload());
+            }
+            FrameKind::Close {
+                reason: pohunek_worker_protocol::CloseReason::ObservationComplete,
+            } if expected_offset == next_offset && data.len() == expected_bytes => break,
+            FrameKind::Error { error } => {
+                return Err(WorkerError::Rejected {
+                    code: error.code,
+                    message: error.message,
+                    retryable: error.retryable,
+                });
+            }
+            _ => return Err(WorkerError::ResponseMismatch),
+        }
+    }
+    Ok(ObservedOutput {
+        runtime_id,
+        history_start_offset,
+        start_offset,
+        next_offset,
+        runtime_end_offset,
+        data: pohunek_worker_protocol::SecretBytes::new(data),
+        gap,
+        has_more,
+        timed_out,
+    })
+}
+
+async fn read_matching_frame(
+    stream: &mut UnixStream,
+    version: Version,
+    stream_id: &StreamId,
+    runtime_id: &RuntimeId,
+) -> Result<DataFrame, WorkerError> {
+    let frame = read_frame(stream)
+        .await
+        .map_err(|error| WorkerError::Protocol(error.to_string()))?
+        .ok_or_else(|| WorkerError::Protocol("observation stream closed early".to_owned()))?;
+    if frame.header().version != version
+        || frame.header().stream_id != *stream_id
+        || frame.header().runtime_id != *runtime_id
+    {
+        return Err(WorkerError::ResponseMismatch);
+    }
+    Ok(frame)
 }
 
 fn requested_capabilities(selected_version: Version, advertised: &[Capability]) -> Vec<Capability> {
@@ -617,13 +913,29 @@ fn requested_capabilities(selected_version: Version, advertised: &[Capability]) 
         Capability::DeduplicatedInput,
         Capability::IdentityHook,
         Capability::AttachSnapshot,
+        Capability::ControlPlaneObservation,
     ]
     .into_iter()
     .filter(|capability| {
         (*capability != Capability::AttachSnapshot || selected_version >= ATTACH_SNAPSHOT_VERSION)
+            && (*capability != Capability::ControlPlaneObservation
+                || selected_version >= pohunek_worker_protocol::CONTROL_PLANE_OBSERVATION_VERSION)
             && advertised.contains(capability)
     })
     .collect()
+}
+
+fn ensure_observation(inner: &Inner) -> Result<(), WorkerError> {
+    if inner
+        .capabilities
+        .contains(&Capability::ControlPlaneObservation)
+    {
+        Ok(())
+    } else {
+        Err(WorkerError::ObservationUnsupported {
+            selected_version: inner.selected_version,
+        })
+    }
 }
 
 fn supports_attach_snapshot(selected_version: Version, granted: &[Capability]) -> bool {
@@ -775,21 +1087,523 @@ fn response_error<T>(response: ResponseKind) -> Result<T, WorkerError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    use pohunek_session_worker::{Server, ServerArgs, WorkerConfig};
+
     use super::*;
 
-    #[test]
-    fn v2_negotiation_does_not_request_attach_snapshots() {
-        let requested = requested_capabilities(
-            pohunek_worker_protocol::PREVIOUS_VERSION,
-            &[Capability::AttachSnapshot, Capability::AtomicReplay],
-        );
+    static TEST_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-        assert_eq!(requested, vec![Capability::AtomicReplay]);
+    fn test_root(name: &str) -> PathBuf {
+        let sequence = TEST_PATH_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
+        std::env::temp_dir().join(format!("pohunek-{name}-{}-{sequence}", std::process::id()))
+    }
+
+    fn observation_initialize(root: &Path, output_bytes: usize) -> Initialize {
+        Initialize {
+            session_id: SessionId::new("s-9001").expect("session id"),
+            transaction_id: TransactionId::new("transaction-e2e").expect("transaction id"),
+            expected_worker_id: WorkerId::new("worker-e2e").expect("worker id"),
+            launch: pohunek_worker_protocol::LaunchIdentity {
+                agent: "test".to_owned(),
+                agent_base: "test".to_owned(),
+                reference_kind: None,
+            },
+            executable: PathBuf::from("/bin/sh"),
+            arguments: vec![
+                "-c".to_owned(),
+                format!("/usr/bin/head -c {output_bytes} /dev/zero; sleep 1"),
+            ],
+            cwd: root.to_path_buf(),
+            dimensions: Dimensions::new(80, 24).expect("dimensions"),
+            environment: pohunek_worker_protocol::SecretEnv::new(BTreeMap::new())
+                .expect("valid environment"),
+            limits: pohunek_worker_protocol::InitializeLimits::new(
+                u64::try_from(output_bytes).expect("history fits u64"),
+                1_048_576,
+                1_024,
+                10_000,
+            )
+            .expect("initialize limits"),
+            stop_policy: pohunek_worker_protocol::StopPolicy::new(500).expect("stop policy"),
+            hook_protocol_version: pohunek_worker_protocol::CURRENT_VERSION,
+            public_protocol_version: protocol::PROTOCOL_VERSION.get(),
+        }
+    }
+
+    async fn write_observation_fixture(
+        stream: &mut UnixStream,
+        stream_id: &StreamId,
+        runtime_id: &RuntimeId,
+        payloads: &[&[u8]],
+    ) {
+        let byte_count = payloads.iter().map(|payload| payload.len()).sum::<usize>();
+        let next_offset = u64::try_from(byte_count).expect("fixture length fits u64");
+        let start = DataFrame::new(
+            FrameHeader {
+                version: pohunek_worker_protocol::CURRENT_VERSION,
+                stream_id: stream_id.clone(),
+                runtime_id: runtime_id.clone(),
+                kind: FrameKind::ObservationStart {
+                    history_start_offset: 0,
+                    start_offset: 0,
+                    next_offset,
+                    runtime_end_offset: next_offset,
+                    gap: None,
+                    has_more: false,
+                    timed_out: false,
+                },
+            },
+            Vec::new(),
+        )
+        .expect("observation metadata");
+        write_frame(stream, &start).await.expect("write metadata");
+        let mut offset = 0_u64;
+        for payload in payloads {
+            let frame = DataFrame::new(
+                FrameHeader {
+                    version: pohunek_worker_protocol::CURRENT_VERSION,
+                    stream_id: stream_id.clone(),
+                    runtime_id: runtime_id.clone(),
+                    kind: FrameKind::Replay { offset },
+                },
+                payload.to_vec(),
+            )
+            .expect("observation payload");
+            write_frame(stream, &frame).await.expect("write payload");
+            offset += u64::try_from(payload.len()).expect("payload fits u64");
+        }
+        let close = DataFrame::new(
+            FrameHeader {
+                version: pohunek_worker_protocol::CURRENT_VERSION,
+                stream_id: stream_id.clone(),
+                runtime_id: runtime_id.clone(),
+                kind: FrameKind::Close {
+                    reason: pohunek_worker_protocol::CloseReason::ObservationComplete,
+                },
+            },
+            Vec::new(),
+        )
+        .expect("observation close");
+        write_frame(stream, &close).await.expect("write close");
     }
 
     #[test]
-    fn attach_snapshot_requires_v3_and_a_grant() {
-        assert!(!supports_attach_snapshot(
+    fn previous_negotiation_preserves_attach_snapshot_but_not_observation() {
+        let requested = requested_capabilities(
+            pohunek_worker_protocol::PREVIOUS_VERSION,
+            &[
+                Capability::AttachSnapshot,
+                Capability::AtomicReplay,
+                Capability::ControlPlaneObservation,
+            ],
+        );
+
+        assert_eq!(
+            requested,
+            vec![Capability::AtomicReplay, Capability::AttachSnapshot]
+        );
+    }
+
+    #[test]
+    fn current_negotiation_requests_control_plane_observation() {
+        let requested = requested_capabilities(
+            pohunek_worker_protocol::CURRENT_VERSION,
+            &[Capability::ControlPlaneObservation],
+        );
+        assert_eq!(requested, vec![Capability::ControlPlaneObservation]);
+    }
+
+    #[tokio::test]
+    async fn real_worker_observation_handshake_streams_exact_public_limit_in_multiple_frames() {
+        const SESSION_ID: &str = "s-9001";
+        let root = test_root("observation-e2e");
+        let socket_path = root.join("socket/worker.sock");
+        let output_bytes = protocol::MAX_SESSION_OUTPUT_BYTES;
+        let server = Server::bind(ServerArgs {
+            session_id: SESSION_ID.to_owned(),
+            worker_id: "worker-e2e".to_owned(),
+            socket_path: socket_path.clone(),
+            journal_path: root.join("journal/worker.json"),
+            daemon_socket_path: root.join("daemon.sock"),
+            config: WorkerConfig {
+                data_payload_bytes: 1_024,
+                ..WorkerConfig::new()
+            },
+        })
+        .await
+        .expect("bind real worker");
+        let server_task = tokio::spawn(server.serve());
+        let worker = Worker::connect(&socket_path, SESSION_ID, "daemon-e2e")
+            .await
+            .expect("control handshake");
+        let runtime_id = worker
+            .initialize(observation_initialize(&root, output_bytes))
+            .await
+            .expect("initialize runtime");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let snapshot = worker.inspect().await.expect("inspect runtime");
+                if snapshot.phase == pohunek_worker_protocol::RuntimePhase::Exited
+                    && snapshot.next_offset
+                        == u64::try_from(output_bytes).expect("output limit fits u64")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("runtime output completion");
+
+        let observed = worker
+            .read_output(
+                Some(0),
+                u32::try_from(output_bytes).expect("public limit fits u32"),
+                Duration::ZERO,
+            )
+            .await
+            .expect("dedicated observation stream");
+        assert_eq!(observed.runtime_id, runtime_id);
+        assert_eq!(observed.data.expose().len(), output_bytes);
+        assert_eq!(observed.start_offset, 0);
+        assert_eq!(
+            observed.next_offset,
+            u64::try_from(output_bytes).expect("output limit fits u64")
+        );
+        assert!(!observed.has_more);
+        assert!(!observed.timed_out);
+
+        worker
+            .release_controller()
+            .await
+            .expect("release controller");
+        server_task.abort();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the scripted peer keeps the cancellation and response ordering visible end to end"
+    )]
+    async fn cancelled_observation_control_exchange_does_not_desynchronize_next_request() {
+        let root = test_root("observation-cancel");
+        std::fs::create_dir_all(&root).expect("create test root");
+        let socket_path = root.join("worker.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind fake worker");
+        let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
+        let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept control");
+            let (read_half, write_half) = stream.into_split();
+            let mut reader = ControlReader::new(read_half);
+            let mut writer = ControlWriter::new(write_half);
+            let session_id = SessionId::new("session-cancel").expect("session id");
+            let worker_id = WorkerId::new("worker-cancel").expect("worker id");
+            let runtime_id = RuntimeId::new("runtime-cancel").expect("runtime id");
+            let challenge = pohunek_worker_protocol::LeaseChallenge::new("challenge-cancel")
+                .expect("challenge");
+
+            let request = reader
+                .read::<ControlMessage>()
+                .await
+                .expect("read negotiation")
+                .expect("negotiation");
+            let ControlMessage::Request(request) = request else {
+                panic!("control request");
+            };
+            assert!(matches!(request.kind, RequestKind::Negotiate { .. }));
+            writer
+                .write(&ControlMessage::Response(ControlResponse {
+                    request_id: request.request_id,
+                    kind: ResponseKind::Negotiated {
+                        selected_version: pohunek_worker_protocol::CURRENT_VERSION,
+                        supported_range: pohunek_worker_protocol::SUPPORTED_RANGE,
+                        session_id: session_id.clone(),
+                        worker_id: worker_id.clone(),
+                        runtime_id: Some(runtime_id.clone()),
+                        worker_process: pohunek_worker_protocol::ProcessIdentity {
+                            pid: std::process::id(),
+                            start_identity: 1,
+                        },
+                        phase: pohunek_worker_protocol::RuntimePhase::Running,
+                        capabilities: vec![Capability::ControlPlaneObservation],
+                        challenge: challenge.clone(),
+                    },
+                }))
+                .await
+                .expect("write negotiation");
+            writer.flush().await.expect("flush negotiation");
+
+            let request = reader
+                .read::<ControlMessage>()
+                .await
+                .expect("read acquire")
+                .expect("acquire");
+            let ControlMessage::Request(request) = request else {
+                panic!("control request");
+            };
+            assert!(matches!(
+                request.kind,
+                RequestKind::AcquireController { .. }
+            ));
+            writer
+                .write(&ControlMessage::Response(ControlResponse {
+                    request_id: request.request_id,
+                    kind: ResponseKind::ControllerAcquired {
+                        lease_id: LeaseId::new("lease-cancel").expect("lease id"),
+                        capabilities: vec![Capability::ControlPlaneObservation],
+                    },
+                }))
+                .await
+                .expect("write acquire");
+            writer.flush().await.expect("flush acquire");
+
+            let request = reader
+                .read::<ControlMessage>()
+                .await
+                .expect("read output request")
+                .expect("output request");
+            let ControlMessage::Request(request) = request else {
+                panic!("control request");
+            };
+            assert!(matches!(request.kind, RequestKind::ReadOutput { .. }));
+            request_seen_tx.send(()).expect("signal request");
+            respond_rx.await.expect("allow delayed response");
+            writer
+                .write(&ControlMessage::Response(ControlResponse {
+                    request_id: request.request_id,
+                    kind: ResponseKind::OutputReadOpened {
+                        token: pohunek_worker_protocol::DataToken::new("unused-cancel-token")
+                            .expect("token"),
+                        expires_at_ms: 10_000,
+                    },
+                }))
+                .await
+                .expect("write delayed response");
+            writer.flush().await.expect("flush delayed response");
+
+            let request = reader
+                .read::<ControlMessage>()
+                .await
+                .expect("read snapshot request")
+                .expect("snapshot request");
+            let ControlMessage::Request(request) = request else {
+                panic!("control request");
+            };
+            assert!(matches!(request.kind, RequestKind::TerminalSnapshot { .. }));
+            writer
+                .write(&ControlMessage::Response(ControlResponse {
+                    request_id: request.request_id,
+                    kind: ResponseKind::TerminalSnapshot {
+                        runtime_id,
+                        snapshot: Box::new(pohunek_worker_protocol::TerminalSnapshot {
+                            watermark: 0,
+                            dimensions: Dimensions::new(80, 24).expect("dimensions"),
+                            cursor: pohunek_worker_protocol::Cursor {
+                                column: 0,
+                                row: 0,
+                                visible: true,
+                            },
+                            alternate_screen: false,
+                            title: None,
+                            progress: None,
+                            visible_lines: Vec::new(),
+                        }),
+                    },
+                }))
+                .await
+                .expect("write snapshot");
+            writer.flush().await.expect("flush snapshot");
+        });
+
+        let worker = Worker::connect(&socket_path, "session-cancel", "daemon-cancel")
+            .await
+            .expect("connect fake worker");
+        let cancelled_worker = worker.clone();
+        let read_task = tokio::spawn(async move {
+            cancelled_worker
+                .read_output(Some(0), 64, Duration::from_secs(1))
+                .await
+        });
+        request_seen_rx.await.expect("output request reached peer");
+        read_task.abort();
+        let _ = read_task.await;
+        respond_tx.send(()).expect("release response");
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(1), worker.terminal_snapshot())
+            .await
+            .expect("next request deadline")
+            .expect("next request remains synchronized");
+        assert_eq!(snapshot.watermark, 0);
+        server_task.await.expect("fake worker task");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn observation_client_reassembles_multiple_frames() {
+        let (mut client, mut worker) = UnixStream::pair().expect("socket pair");
+        let stream_id = StreamId::new("observation-client").expect("stream id");
+        let runtime_id = RuntimeId::new("runtime-client").expect("runtime id");
+        write_observation_fixture(
+            &mut worker,
+            &stream_id,
+            &runtime_id,
+            &[&b"first"[..], &b"-second"[..]],
+        )
+        .await;
+
+        let output = collect_observation_frames(
+            &mut client,
+            pohunek_worker_protocol::CURRENT_VERSION,
+            stream_id,
+            runtime_id,
+            64,
+        )
+        .await
+        .expect("collect output");
+        assert_eq!(output.data.expose(), b"first-second");
+        assert_eq!(output.next_offset, 12);
+    }
+
+    #[tokio::test]
+    async fn observation_client_rejects_runtime_mismatch_without_payload_leak() {
+        let (mut client, mut worker) = UnixStream::pair().expect("socket pair");
+        let stream_id = StreamId::new("observation-client").expect("stream id");
+        let expected_runtime = RuntimeId::new("runtime-expected").expect("runtime id");
+        let wrong_runtime = RuntimeId::new("runtime-wrong").expect("runtime id");
+        write_observation_fixture(&mut worker, &stream_id, &wrong_runtime, &[&b"secret"[..]]).await;
+
+        let error = collect_observation_frames(
+            &mut client,
+            pohunek_worker_protocol::CURRENT_VERSION,
+            stream_id,
+            expected_runtime,
+            64,
+        )
+        .await
+        .expect_err("runtime mismatch");
+        assert!(matches!(error, WorkerError::ResponseMismatch));
+        assert!(!error.to_string().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn observation_client_rejects_oversized_declared_span_before_allocation() {
+        let (mut client, mut worker) = UnixStream::pair().expect("socket pair");
+        let stream_id = StreamId::new("observation-client").expect("stream id");
+        let runtime_id = RuntimeId::new("runtime-client").expect("runtime id");
+        let metadata = DataFrame::new(
+            FrameHeader {
+                version: pohunek_worker_protocol::CURRENT_VERSION,
+                stream_id: stream_id.clone(),
+                runtime_id: runtime_id.clone(),
+                kind: FrameKind::ObservationStart {
+                    history_start_offset: 0,
+                    start_offset: 0,
+                    next_offset: u64::MAX,
+                    runtime_end_offset: u64::MAX,
+                    gap: None,
+                    has_more: false,
+                    timed_out: false,
+                },
+            },
+            Vec::new(),
+        )
+        .expect("valid malicious metadata");
+        write_frame(&mut worker, &metadata)
+            .await
+            .expect("write metadata");
+
+        let error = collect_observation_frames(
+            &mut client,
+            pohunek_worker_protocol::CURRENT_VERSION,
+            stream_id,
+            runtime_id,
+            1_024,
+        )
+        .await
+        .expect_err("declared span above request must fail");
+        assert!(matches!(error, WorkerError::ResponseMismatch));
+    }
+
+    #[tokio::test]
+    async fn observation_client_rejects_v3_v4_frame_header_mismatch() {
+        let (mut client, mut worker) = UnixStream::pair().expect("socket pair");
+        let stream_id = StreamId::new("observation-client").expect("stream id");
+        let runtime_id = RuntimeId::new("runtime-client").expect("runtime id");
+        write_observation_fixture(&mut worker, &stream_id, &runtime_id, &[&b"data"[..]]).await;
+
+        let error = collect_observation_frames(
+            &mut client,
+            pohunek_worker_protocol::PREVIOUS_VERSION,
+            stream_id,
+            runtime_id,
+            64,
+        )
+        .await
+        .expect_err("negotiated v3 must reject a v4 frame");
+        assert!(matches!(error, WorkerError::ResponseMismatch));
+    }
+
+    #[tokio::test]
+    async fn observation_client_caps_cumulative_replay_before_copying() {
+        let (mut client, mut worker) = UnixStream::pair().expect("socket pair");
+        let stream_id = StreamId::new("observation-client").expect("stream id");
+        let runtime_id = RuntimeId::new("runtime-client").expect("runtime id");
+        let metadata = DataFrame::new(
+            FrameHeader {
+                version: pohunek_worker_protocol::CURRENT_VERSION,
+                stream_id: stream_id.clone(),
+                runtime_id: runtime_id.clone(),
+                kind: FrameKind::ObservationStart {
+                    history_start_offset: 0,
+                    start_offset: 0,
+                    next_offset: 4,
+                    runtime_end_offset: 4,
+                    gap: None,
+                    has_more: false,
+                    timed_out: false,
+                },
+            },
+            Vec::new(),
+        )
+        .expect("metadata");
+        write_frame(&mut worker, &metadata)
+            .await
+            .expect("write metadata");
+        let oversized = DataFrame::new(
+            FrameHeader {
+                version: pohunek_worker_protocol::CURRENT_VERSION,
+                stream_id: stream_id.clone(),
+                runtime_id: runtime_id.clone(),
+                kind: FrameKind::Replay { offset: 0 },
+            },
+            b"12345".to_vec(),
+        )
+        .expect("replay frame");
+        write_frame(&mut worker, &oversized)
+            .await
+            .expect("write replay");
+
+        let error = collect_observation_frames(
+            &mut client,
+            pohunek_worker_protocol::CURRENT_VERSION,
+            stream_id,
+            runtime_id,
+            4,
+        )
+        .await
+        .expect_err("cumulative replay above declaration must fail");
+        assert!(matches!(error, WorkerError::ResponseMismatch));
+    }
+
+    #[test]
+    fn attach_snapshot_is_available_to_the_previous_protocol() {
+        assert!(supports_attach_snapshot(
             pohunek_worker_protocol::PREVIOUS_VERSION,
             &[Capability::AttachSnapshot],
         ));
@@ -801,13 +1615,16 @@ mod tests {
     }
 
     #[test]
-    fn v2_attach_uses_legacy_replay() {
+    fn previous_attach_keeps_the_snapshot_request() {
         let attach = AttachStart { dimensions: None };
-        assert!(
-            select_attach_start(pohunek_worker_protocol::PREVIOUS_VERSION, &[], attach)
-                .expect("v2 fallback must be supported")
-                .is_none(),
-            "a v2 worker must use the replay attach path"
+        assert_eq!(
+            select_attach_start(
+                pohunek_worker_protocol::PREVIOUS_VERSION,
+                &[Capability::AttachSnapshot],
+                attach.clone()
+            )
+            .expect("v3 snapshot capability must be supported"),
+            Some(attach),
         );
     }
 

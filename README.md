@@ -22,7 +22,7 @@ client, not a requirement: pohunek is fully usable from the CLI alone, and the
 Rust/TypeScript SDKs exist precisely so you can **build your own GUI or client**
 tailored to how you work. See [SDKs and building your own client](#sdks-and-building-your-own-client).
 
-Start Codex or Claude Code on any of your machines, detach, walk away, and
+Start Codex, Claude Code, or Hermes Agent on any of your machines, detach, walk away, and
 come back later — from any terminal, from a GUI, or from a keyboard
 launcher. The agents keep working; pohunek keeps track of what they are doing,
 where they are doing it, and when they need you.
@@ -41,9 +41,14 @@ where they are doing it, and when they need you.
   terminal crashes, daemon restart, daemon failure, and daemon binary upgrade.
   Attach from any terminal with `pohunek attach`, detach with `Ctrl-]`, and
   reattach later. Multiple clients can attach to one session.
-- Codex and Claude Code are first-class agents (plus plain `shell`), with
+- Codex, Claude Code, and Hermes Agent are first-class agents (plus plain
+  `shell`), with
   per-host **agent profiles** that define the program, arguments, environment,
   and input rules for custom runtimes (e.g. `claude-otel`).
+- Hermes M2 support is intentionally limited to the local interactive terminal
+  backend and the pinned Hermes Agent `0.20.0` release. Docker, SSH, browser,
+  desktop, gateway, ACP, and other Hermes backends are outside Pohunek's PTY
+  ownership model.
 - **Live agent state detection** — `working` / `blocked` / `idle` — derived
   from OSC terminal titles, screen-content pattern matching, and PTY activity.
   Detection rules are TOML manifests, so new agents can be added without
@@ -57,6 +62,9 @@ where they are doing it, and when they need you.
 - **Prompt injection done right**: `session input` and `--input` use per-agent
   framing (bracketed paste, delayed submit) so multi-line prompts actually
   submit into Ink/TUI agents instead of being half-swallowed.
+- **Provider-neutral observation**: read a bounded rendered screen, page through
+  retained binary-safe output with exact runtime cursors, or wait up to eight
+  seconds for state/activity/output changes without taking attach ownership.
 - Rename sessions, attach arbitrary `key=value` metadata, and inspect
   everything as JSON.
 
@@ -138,9 +146,12 @@ where they are doing it, and when they need you.
 
 **Built to be driven by agents, not just humans**
 
-- Every command has `--json`; errors are structured (`class`/`code`/`msg` plus
-  a recovery hint); `subscribe` streams typed events (session lifecycle, agent
-  state, notifications) over the same protocol.
+- Automation commands have a versioned `--json` process envelope with exactly
+  one `ok` or `err` document on stdout; diagnostics stay on stderr. Errors are
+  structured (`class`/`code`/`msg` plus a recovery hint), and `subscribe`
+  streams typed events over the same protocol. Session creation and input can
+  read bounded UTF-8 payloads from stdin so prompts do not need to appear in
+  argv, diagnostics, or logs.
 - **Universal assistant**: `pohunek assistant "how do I …"` launches a capable
   agent session preloaded with an offline knowledge bundle about pohunek
   itself and a redacted live snapshot of your hosts — self-hosted support for
@@ -175,7 +186,7 @@ where they are doing it, and when they need you.
  | PTY master | child process | output ring | terminal state  |
  +-----------------------------------------------------------+
        |
-   Codex / Claude Code running in worker-owned PTYs
+   Codex / Claude Code / Hermes Agent running in worker-owned PTYs
 ```
 
 Each host is authoritative for its own sessions, projects, worktrees, and
@@ -208,6 +219,16 @@ archive's `README.md` for the complete commands.
 
 Download from [Releases](https://github.com/zajca/pohunek/releases), unpack,
 and put the binaries on your `PATH`.
+
+Protocol v2 is a one-time coordinated pre-1.0 boundary. Before upgrading any
+host, inventory every CLI, GUI, web backend/SDK, custom client, and local or
+remote daemon that must communicate. Drain cross-host automation, upgrade all
+peers together, then verify each host with `pohunek health --json` and
+`pohunek host inspect <host> --json`. The legacy integer-v1 request envelope and
+fixed `codex`/`claude` notification-policy fields have no compatibility shim.
+Downgrading one peer to v1 breaks communication with v2 peers; restore the
+coordinated v2 set instead of rewriting persisted state. Future overlapping
+protocol ranges do not repeat this lockstep transition.
 
 For the daemon component, run the included installer so the worker binary and
 all systemd user units are installed together. The first upgrade from a legacy
@@ -254,6 +275,31 @@ pohunek session new --agent codex \
   --input "Add retry logic to the API client, then run the tests."
 ```
 
+### Hermes Agent
+
+M2 manages the local interactive Hermes terminal as `--agent hermes`. Before
+launching, inspect the target host: the `hermes` runtime must be `available`
+and report `version=0.20.0` with `supported=true`.
+
+```bash
+pohunek host inspect local --json
+pohunek session new --agent hermes --name "investigate-login-bug"
+```
+
+Pohunek launches exactly `hermes chat`. A valid recorded native Hermes reference
+is resumed only as `hermes chat --resume <reference>`; it never resumes ambient
+Hermes state with `--continue` and does not add `--pass-session-id`. Hermes has
+no supported fork operation, so clients expose fork only from session
+capabilities and Hermes fork requests fail before they create a worktree or
+child session. M2 does not install a Hermes plugin or lifecycle hooks and never
+reads Hermes `state.db`; a session without an already valid native reference is
+therefore not resumable yet.
+
+Hermes programmatic input preserves multiline prompts with bracketed paste and
+a separate submit. It accepts LF and tab, rejects other terminal control
+characters without rewriting them, and refuses input while Hermes is visibly
+waiting for owner approval.
+
 ## CLI guide
 
 Every command accepts `--host <name>` (default `local`), and nearly all of
@@ -270,8 +316,11 @@ them `--json` for machine-readable output (the exceptions are `attach`,
 | `pohunek session list` | List sessions; `--filter state=running --filter agent=codex` (ANDed), `-q` for ids only. |
 | `pohunek session inspect <target>` | Full logical session record: agent state, runtime state and generation, cwd, project, branch, worktree, recovery binding. |
 | `pohunek attach <target>` | Attach the current terminal; `Ctrl-]` detaches. |
-| `pohunek session input <target> <text>` | Inject a prompt with agent-correct framing. |
-| `pohunek session fork <target>` | Fork an agent conversation into a new session (Claude Code). |
+| `pohunek session input <target> <text>` | Inject a prompt with agent-correct framing; use `--stdin` for non-argv input. |
+| `pohunek session screen <target>` | Read the current rendered terminal; `--json` preserves runtime identity, watermark, geometry, cursor, and visible lines. |
+| `pohunek session output <target>` | Read a newest retained tail or continue with `--runtime-id`, `--runtime-generation`, and `--after-offset`; `--wait-ms` performs a bounded wait. |
+| `pohunek session wait <target>` | Long-poll up to 8000 ms for explicit state, activity, metadata, terminal, output, or runtime predicates. |
+| `pohunek session fork <target>` | Fork an agent conversation into a new session when that session advertises fork capability (currently Claude Code). |
 | `pohunek session diff <target> [--base <ref>]` | Unified diff of the session's worktree vs its base. |
 | `pohunek session rename / stop / rm` | Rename, stop, or evict a session. |
 | `pohunek project add / list / show / rename / rm` | Manage git-repo-aware project records. |
@@ -279,7 +328,7 @@ them `--json` for machine-readable output (the exceptions are `attach`,
 | `pohunek host discover / list / inspect` | Find NetBird peers running daemons (standalone cache; `--refresh`) and query live capabilities. |
 | `pohunek notifications list / watch` | Inspect or stream the durable inbox; `--all-hosts` fans out. |
 | `pohunek notifications read / ack / archive / delete` | Drive one record's lifecycle (`host/id` targets a specific host). |
-| `pohunek notifications policy / retention` | Per-kind/provider policy, retention pruning (`--dry-run` / `--apply`). |
+| `pohunek notifications policy / retention` | Per-kind/provider policy (including `hermes`), retention pruning (`--dry-run` / `--apply`). |
 | `pohunek integration install` | Install Codex/Claude hooks for resume capture and notifications. |
 | `pohunek setup [scripts\|config\|sway]` | Install launcher scripts, default config + prompt templates, sway keybindings. |
 | `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + live snapshot. |
@@ -304,12 +353,61 @@ Remote session starts ask for confirmation (skip with `--yes`); project
 references resolve on the *target* host, so no filesystem path ever crosses
 the wire.
 
+### Automation and bounded observation
+
+Use stdin for prompts that must not appear in the process list. The creation
+forms `--input` and `--input-stdin` (alias `--stdin`) are mutually exclusive;
+`session input` likewise accepts either positional text or `--stdin`:
+
+```bash
+printf '%s' 'Review the failing test and propose a fix.' \
+  | pohunek session new --agent codex --input-stdin --json
+
+printf '%s' 'Run the focused tests.' \
+  | pohunek session input s-01J00000000000000000000000 --stdin --json
+```
+
+Every `--json` success is one document shaped as
+`{cli_version, protocol: {minimum, maximum}, ok}`; failures use the same prefix
+with `err` instead of `ok` and exit non-zero. Human diagnostics remain on
+stderr. Long counters such as `runtime_generation`, offsets, and watermarks are
+decimal JSON strings.
+
+Start observation with a screen or newest output tail, then carry the returned
+runtime identity and cursor into later calls:
+
+```bash
+pohunek session screen s-01J00000000000000000000000 --json
+pohunek session output s-01J00000000000000000000000 --max-bytes 65536 --json
+pohunek session output s-01J00000000000000000000000 \
+  --runtime-id runtime-1 --runtime-generation 3 --after-offset 4096 \
+  --max-bytes 65536 --wait-ms 5000 --json
+pohunek session wait s-01J00000000000000000000000 \
+  --runtime-id runtime-1 --runtime-generation 3 --after-output-offset 4096 \
+  --timeout-ms 8000 --json
+```
+
+Waiting output and `session wait` use dedicated connections. Re-issue short
+waits as needed; a killed client does not promise immediate daemon-side waiter
+cancellation, so the requested timeout is the release bound.
+
+TypeScript clients running inside a managed session configure the atomic origin
+pair explicitly; the SDK copies it to ordinary, subscription, and dedicated
+observation connections and never reads `process.env`:
+
+```ts
+const client = await connectLocal(socketPath, {
+  origin: { sessionId: "s-origin", daemonId: "daemon-origin" },
+});
+```
+
 ### Notifications triage
 
 ```bash
 pohunek notifications list --unread
 pohunek notifications ack buildbox/n-42
 pohunek notifications policy set --provider claude --kind turn_completed --enabled
+pohunek notifications policy set --provider hermes --kind agent_blocked --enabled
 pohunek notifications retention prune --status archived --before 2026-06-01T00:00:00Z --apply
 ```
 
@@ -319,11 +417,15 @@ pohunek notifications retention prune --status archived --before 2026-06-01T00:0
 pohunek assistant "why does attach fail on my laptop?"
 pohunek assistant setup                # steer toward host setup
 pohunek assistant debug --host buildbox --no-snapshot
+pohunek assistant --agent hermes "Explain the current session runtime."
 ```
 
 The assistant is an ordinary agent session — the same PTY, attach, and
 notification machinery — launched with a materialized offline knowledge
-bundle and a redacted snapshot of live state. No secrets enter the prompt.
+bundle and a redacted snapshot of live state. No secrets enter the prompt. Its
+automatic preference order is `pohunek-assistant`, `codex`, `claude`, then
+`hermes`; explicit Hermes selection still requires the supported runtime on the
+selected host.
 
 ## GUI
 

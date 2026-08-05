@@ -3,5 +3,5 @@
   "event": "agent_state",
   "session_id": "s-fixture-1",
   "source": "report",
-  "v": 1
+  "v": 2
 }

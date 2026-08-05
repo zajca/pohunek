@@ -5,7 +5,7 @@
 //! Lengths are checked before allocation. Async helpers tolerate arbitrary
 //! partial reads and writes.
 
-// Rust guideline compliant 2026-07-29
+// Rust guideline compliant 2026-08-04
 
 use std::fmt::{Debug, Formatter};
 use std::io::ErrorKind;
@@ -92,6 +92,8 @@ pub enum CloseReason {
     SubscriberTooSlow,
     /// The controller lease ended.
     LeaseReleased,
+    /// A bounded observation page was delivered completely.
+    ObservationComplete,
 }
 
 /// Describes one data frame and its kind-specific metadata.
@@ -119,6 +121,23 @@ pub enum FrameKind {
     Replay {
         /// Offset of the first payload byte.
         offset: u64,
+    },
+    /// Starts one bounded output observation page.
+    ObservationStart {
+        /// First retained byte offset.
+        history_start_offset: u64,
+        /// Offset of the first returned byte.
+        start_offset: u64,
+        /// Offset immediately after returned bytes.
+        next_offset: u64,
+        /// Current runtime output end.
+        runtime_end_offset: u64,
+        /// Missing retained range, when the requested cursor was evicted.
+        gap: Option<crate::OutputGap>,
+        /// More retained bytes are immediately available.
+        has_more: bool,
+        /// The wait deadline elapsed without new output or runtime termination.
+        timed_out: bool,
     },
     /// Carries newly observed PTY output.
     Output {
@@ -281,6 +300,36 @@ fn validate_payload(kind: &FrameKind, payload: &[u8]) -> Result<(), FrameError> 
                 });
             }
         }
+        FrameKind::ObservationStart {
+            history_start_offset,
+            start_offset,
+            next_offset,
+            runtime_end_offset,
+            gap,
+            has_more,
+            timed_out,
+        } => {
+            if !payload.is_empty() {
+                return Err(FrameError::UnexpectedPayload);
+            }
+            let gap_valid = gap.as_ref().is_none_or(|gap| {
+                gap.missing_start < gap.missing_end
+                    && gap.missing_end == *history_start_offset
+                    && start_offset == history_start_offset
+            });
+            let pagination_valid = *has_more == (*next_offset < *runtime_end_offset);
+            let timeout_valid = !timed_out
+                || (*start_offset == *next_offset && *next_offset == *runtime_end_offset);
+            if history_start_offset > start_offset
+                || start_offset > next_offset
+                || next_offset > runtime_end_offset
+                || !gap_valid
+                || !pagination_valid
+                || !timeout_valid
+            {
+                return Err(FrameError::InvalidObservationOffsets);
+            }
+        }
         FrameKind::Open { .. }
         | FrameKind::AttachReady { .. }
         | FrameKind::InputAck { .. }
@@ -342,6 +391,9 @@ pub enum FrameError {
         /// Claimed snapshot watermark.
         watermark: u64,
     },
+    /// Observation page offsets or its retention gap were inconsistent.
+    #[error("worker observation frame offsets are invalid")]
+    InvalidObservationOffsets,
 }
 
 /// Reads one complete data frame.
@@ -552,6 +604,53 @@ mod tests {
             .expect_err("overflowing output range must fail");
 
         assert!(matches!(error, FrameError::OffsetOverflow));
+    }
+
+    #[test]
+    fn observation_payload_boundary_is_exact() {
+        let exact = DataFrame::new(
+            header(FrameKind::Replay { offset: 0 }),
+            vec![0; MAX_DATA_PAYLOAD_BYTES],
+        )
+        .expect("exact maximum payload");
+        assert_eq!(exact.payload().len(), MAX_DATA_PAYLOAD_BYTES);
+
+        let error = DataFrame::new(
+            header(FrameKind::Replay { offset: 0 }),
+            vec![0; MAX_DATA_PAYLOAD_BYTES + 1],
+        )
+        .expect_err("payload above maximum");
+        assert!(matches!(error, FrameError::PayloadTooLarge { .. }));
+    }
+
+    #[test]
+    fn observation_start_rejects_inconsistent_offsets_and_gap() {
+        let valid = FrameKind::ObservationStart {
+            history_start_offset: 4,
+            start_offset: 4,
+            next_offset: 8,
+            runtime_end_offset: 9,
+            gap: Some(crate::OutputGap {
+                missing_start: 0,
+                missing_end: 4,
+            }),
+            has_more: true,
+            timed_out: false,
+        };
+        DataFrame::new(header(valid), Vec::new()).expect("valid observation metadata");
+
+        let invalid = FrameKind::ObservationStart {
+            history_start_offset: 4,
+            start_offset: 3,
+            next_offset: 8,
+            runtime_end_offset: 9,
+            gap: None,
+            has_more: true,
+            timed_out: false,
+        };
+        let error = DataFrame::new(header(invalid), Vec::new())
+            .expect_err("start before retention must fail");
+        assert!(matches!(error, FrameError::InvalidObservationOffsets));
     }
 
     #[test]

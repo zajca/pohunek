@@ -223,7 +223,7 @@ fn defer(
         commit(notifications, record);
         return;
     };
-    let debounce = Duration::from_secs(notifications.policy().attention_debounce_secs);
+    let debounce = Duration::from_secs(u64::from(notifications.policy().attention_debounce_secs));
     prune_recently_resolved_turns(recently_resolved_turns, debounce);
     if record.kind == protocol::NotificationKind::TurnCompleted
         && is_turn_dedupe_key(&dedupe_key)
@@ -266,7 +266,8 @@ fn resolve(
     // no-op, so the token is left to expire on its own rather than tracked.
     let removed = pending.remove(dedupe_key);
     if removed.is_none() && is_turn_dedupe_key(dedupe_key) {
-        let debounce = Duration::from_secs(notifications.policy().attention_debounce_secs);
+        let debounce =
+            Duration::from_secs(u64::from(notifications.policy().attention_debounce_secs));
         prune_recently_resolved_turns(recently_resolved_turns, debounce);
         recently_resolved_turns.insert(dedupe_key.to_owned(), Instant::now());
     }
@@ -374,8 +375,7 @@ mod tests {
             turn_completed: true,
             ..policy.enabled
         };
-        policy.codex = None;
-        policy.claude = None;
+        policy.providers.clear();
         service.set_policy(policy).expect("set policy");
     }
 
@@ -472,10 +472,11 @@ mod tests {
     async fn next_created(events: &mut broadcast::Receiver<Event>) -> Option<NotificationRecord> {
         for _ in 0..128 {
             match events.try_recv() {
-                Ok(event) if event.event == event::NOTIFICATION_CREATED => {
-                    let record =
-                        serde_json::from_value::<protocol::NotificationCreatedEvent>(event.payload)
-                            .expect("notification_created payload");
+                Ok(event) if event.event() == event::NOTIFICATION_CREATED => {
+                    let record = serde_json::from_value::<protocol::NotificationCreatedEvent>(
+                        event.payload().clone(),
+                    )
+                    .expect("notification_created payload");
                     return Some(record.record);
                 }
                 Ok(_) => {}

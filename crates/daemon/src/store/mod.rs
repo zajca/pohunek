@@ -31,11 +31,15 @@
 //!
 //! The resume binding additionally carries the **structural relaunch snapshot**
 //! (Part C, C.4): `program`, `args`, `input_rules`, `resume_mode`, `ref_kind`,
-//! `resumable`, and `agent_base`. These are the seven non-secret fields needed to
+//! `resumable`, `fork_mode`, `fork_resume_mode`, `fork_ref_kind`, `forkable`, and
+//! `agent_base`. These
+//! are the non-secret fields needed to
 //! relaunch-and-resume a host-profile session with exactly its launch-time shape
 //! after a daemon restart. The profile's **`env` is deliberately NOT among them** —
 //! it may hold secrets, so it is re-resolved by agent name at resume, never
 //! persisted (a deleted profile resumes from the structural snapshot with no env).
+//! Fork fields deliberately default to disabled when absent. Persisted bindings
+//! from earlier pre-1.0 builds do not infer capabilities from current code.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -48,13 +52,13 @@ use protocol::{AgentKind, ProjectSource, RuntimeState, SessionInfo};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::agent::{InputRules, ResumeMode, SessionRefKind};
+use crate::agent::{ForkMode, InputRules, ResumeMode, SessionRefKind};
 use crate::project::detect::project_id;
 
 #[cfg(unix)]
 const OWNER_PRIVATE_FILE_MODE: u32 = 0o600;
 
-/// One session's resume binding: everything needed to relaunch-and-resume.
+/// One session's native resume and fork recovery binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResumeBinding {
     /// The pohunek session id (stable across restart).
@@ -76,10 +80,10 @@ pub struct ResumeBinding {
     pub cols: u16,
     /// Terminal height at capture time.
     pub rows: u16,
-    /// Captured native session id used to build the resume argv.
+    /// Captured native session id used to build resume or fork argv.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_id: Option<String>,
-    /// Captured native session path, for agents that resume from a path.
+    /// Captured native session path, for agents that resume or fork from a path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_path: Option<String>,
     /// Project this session belongs to ([`ProjectRecord::id`]), captured here so a
@@ -127,6 +131,19 @@ pub struct ResumeBinding {
     /// frozen at creation. Serde default (`false`) for a legacy line.
     #[serde(default)]
     pub resumable: bool,
+    /// Structural relaunch snapshot: the provider-native fork argv shape. `None`
+    /// when the session cannot fork or a legacy binding predates this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_mode: Option<ForkMode>,
+    /// Structural relaunch snapshot: the resume argv operation used by fork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_resume_mode: Option<ResumeMode>,
+    /// Structural relaunch snapshot: the native-reference kind used by fork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_ref_kind: Option<SessionRefKind>,
+    /// Whether the session retained a native fork capability at creation.
+    #[serde(default)]
+    pub forkable: bool,
 }
 
 impl<'de> Deserialize<'de> for ResumeBinding {
@@ -167,6 +184,14 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             ref_kind: Option<SessionRefKind>,
             #[serde(default)]
             resumable: bool,
+            #[serde(default)]
+            fork_mode: Option<ForkMode>,
+            #[serde(default)]
+            fork_resume_mode: Option<ResumeMode>,
+            #[serde(default)]
+            fork_ref_kind: Option<SessionRefKind>,
+            #[serde(default)]
+            forkable: bool,
         }
 
         let raw = RawResumeBinding::deserialize(deserializer)?;
@@ -174,6 +199,9 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             .agent_base
             .or_else(|| legacy_agent_base_from_agent(&raw.agent))
             .ok_or_else(|| serde::de::Error::missing_field("agent_base"))?;
+        agent_base
+            .validate_persistence()
+            .map_err(serde::de::Error::custom)?;
 
         Ok(Self {
             session_id: raw.session_id,
@@ -194,6 +222,10 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             resume_mode: raw.resume_mode,
             ref_kind: raw.ref_kind,
             resumable: raw.resumable,
+            fork_mode: raw.fork_mode,
+            fork_resume_mode: raw.fork_resume_mode,
+            fork_ref_kind: raw.fork_ref_kind,
+            forkable: raw.forkable,
         })
     }
 }
@@ -203,6 +235,7 @@ fn legacy_agent_base_from_agent(agent: &str) -> Option<AgentKind> {
         "shell" => Some(AgentKind::Shell),
         "codex" => Some(AgentKind::Codex),
         "claude" => Some(AgentKind::Claude),
+        "hermes" => Some(AgentKind::Hermes),
         _ => None,
     }
 }
@@ -234,11 +267,11 @@ impl From<InputRules> for StoredInputRules {
 impl StoredInputRules {
     /// Rebuild the in-memory [`InputRules`] from the persisted snapshot.
     #[must_use]
-    pub fn to_input_rules(self) -> InputRules {
-        InputRules {
-            bracketed_paste: self.bracketed_paste,
-            submit_delay: Duration::from_millis(self.submit_delay_ms),
-        }
+    pub fn to_input_rules(self, base: &AgentKind) -> InputRules {
+        crate::agent::adapter_for(base).input_rules().with_framing(
+            self.bracketed_paste,
+            Duration::from_millis(self.submit_delay_ms),
+        )
     }
 }
 
@@ -434,6 +467,19 @@ pub struct RuntimeRecord {
     pub reason: Option<String>,
 }
 
+/// Durable ordering key for provider-native identity reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeIdentityOrdering {
+    /// Runtime generation that accepted the report.
+    pub runtime_id: String,
+    /// Process id validated for the runtime root.
+    pub pid: u32,
+    /// Kernel start identity that protects against pid reuse.
+    pub pid_start_identity: u64,
+    /// Highest accepted monotonic sequence for this runtime.
+    pub sequence: u64,
+}
+
 /// Durable logical session authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRecord {
@@ -451,8 +497,29 @@ pub struct SessionRecord {
     /// Structural native-recovery snapshot without profile environment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery: Option<ResumeBinding>,
+    /// Last accepted native identity ordering key, including reports that only
+    /// reaffirmed an already-known reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_identity_ordering: Option<NativeIdentityOrdering>,
     /// Last durable worker binding.
     pub runtime: RuntimeRecord,
+}
+
+/// Result of a conditional durable logical-session write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionWriteOutcome {
+    /// The candidate became the durable session authority.
+    Applied,
+    /// The candidate is visible at the authoritative path, but syncing the
+    /// parent directory failed after the atomic rename.
+    AppliedDurabilityUncertain {
+        /// Sanitized filesystem error describing the failed durability step.
+        error: String,
+    },
+    /// A newer or different runtime already owns this generation on disk.
+    StaleRuntime,
+    /// The durable record changed after the caller captured its base snapshot.
+    StaleSnapshot,
 }
 
 /// A single line of the unified store, internally tagged by `kind` so both
@@ -473,6 +540,20 @@ type StoreRecords = (
     Vec<SessionRecord>,
 );
 
+enum MetadataWriteOutcome {
+    Synced,
+    CommittedDurabilityUncertain(io::Error),
+}
+
+impl MetadataWriteOutcome {
+    fn require_synced(self) -> io::Result<()> {
+        match self {
+            Self::Synced => Ok(()),
+            Self::CommittedDurabilityUncertain(error) => Err(error),
+        }
+    }
+}
+
 /// File-backed unified metadata store.
 ///
 /// A single internal lock is the **one writer-serialization point** for the
@@ -482,6 +563,10 @@ type StoreRecords = (
 pub struct Store {
     path: PathBuf,
     write_lock: Mutex<()>,
+    #[cfg(test)]
+    fail_parent_sync_after_rename: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_before_rename_countdown: std::sync::atomic::AtomicUsize,
 }
 
 impl Store {
@@ -491,7 +576,28 @@ impl Store {
         Self {
             path,
             write_lock: Mutex::new(()),
+            #[cfg(test)]
+            fail_parent_sync_after_rename: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_before_rename_countdown: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_parent_sync_after_rename(&self) {
+        self.fail_parent_sync_after_rename
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_write_before_rename(&self) {
+        self.fail_write_before_rename_after(1);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_write_before_rename_after(&self, writes: usize) {
+        self.fail_before_rename_countdown
+            .store(writes, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// The backing file path.
@@ -521,7 +627,7 @@ impl Store {
     }
 
     /// Upserts one logical session and preserves every other record kind.
-    pub fn record_session(&self, record: &SessionRecord) -> io::Result<()> {
+    pub fn record_session(&self, record: &SessionRecord) -> io::Result<SessionWriteOutcome> {
         let _guard = self
             .write_lock
             .lock()
@@ -531,11 +637,61 @@ impl Store {
             .iter_mut()
             .find(|existing| existing.session_id == record.session_id)
         {
-            *existing = record.clone();
+            if stale_runtime_snapshot(existing, record) {
+                return Ok(SessionWriteOutcome::StaleRuntime);
+            }
+            let mut replacement = record.clone();
+            preserve_newer_native_identity(existing, &mut replacement);
+            *existing = replacement;
         } else {
             sessions.push(record.clone());
         }
-        self.write_all(&resume, &worktrees, &projects, &sessions)
+        match self.write_all(&resume, &worktrees, &projects, &sessions)? {
+            MetadataWriteOutcome::Synced => Ok(SessionWriteOutcome::Applied),
+            MetadataWriteOutcome::CommittedDurabilityUncertain(error) => {
+                Ok(SessionWriteOutcome::AppliedDurabilityUncertain {
+                    error: error.to_string(),
+                })
+            }
+        }
+    }
+
+    /// Conditionally replaces one session only when its durable record still
+    /// equals `expected`, preventing a stale same-runtime snapshot from ever
+    /// reaching the authoritative path.
+    pub fn record_session_if_current(
+        &self,
+        expected: &SessionRecord,
+        record: &SessionRecord,
+    ) -> io::Result<SessionWriteOutcome> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (resume, worktrees, projects, mut sessions) = self.read_all()?;
+        let Some(existing) = sessions
+            .iter_mut()
+            .find(|existing| existing.session_id == record.session_id)
+        else {
+            return Ok(SessionWriteOutcome::StaleSnapshot);
+        };
+        if stale_runtime_snapshot(existing, record) {
+            return Ok(SessionWriteOutcome::StaleRuntime);
+        }
+        if existing != expected {
+            return Ok(SessionWriteOutcome::StaleSnapshot);
+        }
+        let mut replacement = record.clone();
+        preserve_newer_native_identity(existing, &mut replacement);
+        *existing = replacement;
+        match self.write_all(&resume, &worktrees, &projects, &sessions)? {
+            MetadataWriteOutcome::Synced => Ok(SessionWriteOutcome::Applied),
+            MetadataWriteOutcome::CommittedDurabilityUncertain(error) => {
+                Ok(SessionWriteOutcome::AppliedDurabilityUncertain {
+                    error: error.to_string(),
+                })
+            }
+        }
     }
 
     /// Removes one logical session and preserves every other record kind.
@@ -549,7 +705,8 @@ impl Store {
         sessions.retain(|record| record.session_id != session_id);
         let removed = before != sessions.len();
         if removed {
-            self.write_all(&resume, &worktrees, &projects, &sessions)?;
+            self.write_all(&resume, &worktrees, &projects, &sessions)?
+                .require_synced()?;
         }
         Ok(removed)
     }
@@ -562,15 +719,32 @@ impl Store {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (mut resume, worktrees, projects, sessions) = self.read_all()?;
+        let mut replacement = binding.clone();
+        if let Some(authoritative) = sessions
+            .iter()
+            .find(|record| record.session_id == binding.session_id)
+            .and_then(|record| record.recovery.as_ref())
+            .filter(|recovery| {
+                recovery.native_session_id.is_some() || recovery.native_session_path.is_some()
+            })
+        {
+            replacement
+                .native_session_id
+                .clone_from(&authoritative.native_session_id);
+            replacement
+                .native_session_path
+                .clone_from(&authoritative.native_session_path);
+        }
         if let Some(existing) = resume
             .iter_mut()
             .find(|existing| existing.session_id == binding.session_id)
         {
-            *existing = binding.clone();
+            *existing = replacement;
         } else {
-            resume.push(binding.clone());
+            resume.push(replacement);
         }
-        self.write_all(&resume, &worktrees, &projects, &sessions)
+        self.write_all(&resume, &worktrees, &projects, &sessions)?
+            .require_synced()
     }
 
     /// Remove a resume binding by session id, preserving every worktree record. A
@@ -586,7 +760,8 @@ impl Store {
         if resume.len() == before {
             return Ok(());
         }
-        self.write_all(&resume, &worktrees, &projects, &sessions)
+        self.write_all(&resume, &worktrees, &projects, &sessions)?
+            .require_synced()
     }
 
     /// Find the active worktree binding for a `(session_id, repository,
@@ -637,7 +812,8 @@ impl Store {
         } else {
             worktrees.push(binding.clone());
         }
-        self.write_all(&resume, &worktrees, &projects, &sessions)
+        self.write_all(&resume, &worktrees, &projects, &sessions)?
+            .require_synced()
     }
 
     /// Remove every worktree binding owned by `session_id`, preserving every
@@ -652,7 +828,8 @@ impl Store {
         worktrees.retain(|binding| binding.session_id != session_id);
         let removed = before - worktrees.len();
         if removed > 0 {
-            self.write_all(&resume, &worktrees, &projects, &sessions)?;
+            self.write_all(&resume, &worktrees, &projects, &sessions)?
+                .require_synced()?;
         }
         Ok(removed)
     }
@@ -695,7 +872,8 @@ impl Store {
             Some(index) => projects[index] = updated.clone(),
             None => projects.push(updated.clone()),
         }
-        self.write_all(&resume, &worktrees, &projects, &sessions)?;
+        self.write_all(&resume, &worktrees, &projects, &sessions)?
+            .require_synced()?;
         Ok(Some(updated))
     }
 
@@ -724,7 +902,8 @@ impl Store {
         } else {
             projects.push(record.clone());
         }
-        self.write_all(&resume, &worktrees, &projects, &sessions)
+        self.write_all(&resume, &worktrees, &projects, &sessions)?
+            .require_synced()
     }
 
     /// Remove the project keyed by `git_common_dir`, preserving every resume and
@@ -741,7 +920,8 @@ impl Store {
         projects.retain(|project| project.git_common_dir != git_common_dir);
         let removed = projects.len() != before;
         if removed {
-            self.write_all(&resume, &worktrees, &projects, &sessions)?;
+            self.write_all(&resume, &worktrees, &projects, &sessions)?
+                .require_synced()?;
         }
         Ok(removed)
     }
@@ -784,8 +964,15 @@ impl Store {
         let mut sessions = Vec::new();
         for line in content.lines().filter(|line| !line.trim().is_empty()) {
             match serde_json::from_str::<Record>(line) {
-                Ok(Record::Session(record)) => sessions.push(*record),
-                Ok(Record::Resume(binding)) => resume.push(binding),
+                Ok(Record::Session(record)) if record_agents_are_known(&record) => {
+                    sessions.push(*record);
+                }
+                Ok(Record::Resume(binding)) if binding.agent_base.is_known() => {
+                    resume.push(binding);
+                }
+                Ok(Record::Session(_) | Record::Resume(_)) => {
+                    warn!("skipping metadata-store record with an unsupported agent kind");
+                }
                 Ok(Record::Worktree(binding)) => worktrees.push(binding),
                 Ok(Record::Project(record)) => projects.push(record),
                 // Skip a corrupt line so it cannot block loading the rest, but
@@ -810,7 +997,17 @@ impl Store {
         worktrees: &[WorktreeBinding],
         projects: &[ProjectRecord],
         sessions: &[SessionRecord],
-    ) -> io::Result<()> {
+    ) -> io::Result<MetadataWriteOutcome> {
+        if resume.iter().any(|binding| !binding.agent_base.is_known())
+            || sessions
+                .iter()
+                .any(|record| !record_agents_are_known(record))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "metadata records cannot persist unsupported agent kinds",
+            ));
+        }
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -829,16 +1026,39 @@ impl Store {
         }
 
         let tmp = self.temp_path();
-        let result = (|| {
-            write_owner_private(&tmp, body.as_bytes())?;
-            reject_symlink(&self.path)?;
-            fs::rename(&tmp, &self.path)?;
-            sync_parent_directory(&self.path)
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&tmp);
+        #[cfg(test)]
+        let should_fail = self
+            .fail_before_rename_countdown
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok_and(|previous| previous == 1);
+        #[cfg(test)]
+        if should_fail {
+            return Err(io::Error::other("injected pre-rename write failure"));
         }
-        result
+        if let Err(error) = write_owner_private(&tmp, body.as_bytes())
+            .and_then(|()| reject_symlink(&self.path))
+            .and_then(|()| fs::rename(&tmp, &self.path))
+        {
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
+        #[cfg(test)]
+        if self
+            .fail_parent_sync_after_rename
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(MetadataWriteOutcome::CommittedDurabilityUncertain(
+                io::Error::other("injected parent directory sync failure"),
+            ));
+        }
+        match sync_parent_directory(&self.path) {
+            Ok(()) => Ok(MetadataWriteOutcome::Synced),
+            Err(error) => Ok(MetadataWriteOutcome::CommittedDurabilityUncertain(error)),
+        }
     }
 
     fn temp_path(&self) -> PathBuf {
@@ -852,6 +1072,125 @@ impl Store {
             None => PathBuf::from(name),
         }
     }
+}
+
+pub(crate) fn preserve_newer_native_identity(
+    existing: &SessionRecord,
+    replacement: &mut SessionRecord,
+) {
+    let Some(ordering) = existing.native_identity_ordering.as_ref() else {
+        return;
+    };
+    if replacement.runtime.runtime_id.as_deref() != Some(ordering.runtime_id.as_str()) {
+        return;
+    }
+    if let Some(candidate) = replacement
+        .native_identity_ordering
+        .as_ref()
+        .filter(|candidate| {
+            candidate.runtime_id == ordering.runtime_id && candidate.sequence >= ordering.sequence
+        })
+    {
+        if candidate.sequence > ordering.sequence {
+            return;
+        }
+        replacement.native_identity_ordering = Some(ordering.clone());
+        preserve_nonempty_native_identity(existing, replacement);
+        return;
+    }
+
+    replacement.native_identity_ordering = Some(ordering.clone());
+    replacement
+        .info
+        .native_session_id
+        .clone_from(&existing.info.native_session_id);
+    replacement
+        .info
+        .native_session_path
+        .clone_from(&existing.info.native_session_path);
+    match (replacement.recovery.as_mut(), existing.recovery.as_ref()) {
+        (Some(replacement), Some(existing)) => {
+            replacement
+                .native_session_id
+                .clone_from(&existing.native_session_id);
+            replacement
+                .native_session_path
+                .clone_from(&existing.native_session_path);
+        }
+        (None, Some(existing)) => replacement.recovery = Some(existing.clone()),
+        _ => {}
+    }
+}
+
+fn preserve_nonempty_native_identity(existing: &SessionRecord, replacement: &mut SessionRecord) {
+    if existing.info.native_session_id.is_some() {
+        replacement
+            .info
+            .native_session_id
+            .clone_from(&existing.info.native_session_id);
+    }
+    if existing.info.native_session_path.is_some() {
+        replacement
+            .info
+            .native_session_path
+            .clone_from(&existing.info.native_session_path);
+    }
+    match (replacement.recovery.as_mut(), existing.recovery.as_ref()) {
+        (Some(replacement), Some(existing)) => {
+            if existing.native_session_id.is_some() {
+                replacement
+                    .native_session_id
+                    .clone_from(&existing.native_session_id);
+            }
+            if existing.native_session_path.is_some() {
+                replacement
+                    .native_session_path
+                    .clone_from(&existing.native_session_path);
+            }
+        }
+        (None, Some(existing)) => replacement.recovery = Some(existing.clone()),
+        _ => {}
+    }
+}
+
+fn stale_runtime_snapshot(existing: &SessionRecord, replacement: &SessionRecord) -> bool {
+    let (Some(current), Some(candidate)) = (
+        existing.info.runtime.as_ref(),
+        replacement.info.runtime.as_ref(),
+    ) else {
+        return false;
+    };
+    if candidate.runtime_generation < current.runtime_generation {
+        return true;
+    }
+    if candidate.runtime_generation > current.runtime_generation {
+        return false;
+    }
+
+    let current_id = existing
+        .runtime
+        .runtime_id
+        .as_deref()
+        .or(current.runtime_id.as_deref());
+    let candidate_id = replacement
+        .runtime
+        .runtime_id
+        .as_deref()
+        .or(candidate.runtime_id.as_deref());
+    current_id.is_some() && candidate_id != current_id
+}
+
+fn record_agents_are_known(record: &SessionRecord) -> bool {
+    record.info.agent_base.is_known()
+        && record
+            .info
+            .active_agent_base
+            .as_ref()
+            .is_none_or(AgentKind::is_known)
+        && record
+            .recovery
+            .as_ref()
+            .is_none_or(|binding| binding.agent_base.is_known())
 }
 
 /// Serialize one record onto `body` as a single JSON line. Our own types
@@ -934,11 +1273,11 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use protocol::{AgentKind, ProjectSource};
+    use protocol::{AgentActivity, AgentKind, ProjectSource};
 
     use super::{
-        ProjectRecord, ProjectResolution, ResumeBinding, ResumeMode, SessionRefKind, Store,
-        StoredInputRules, WorktreeBinding, WorktreeStatus,
+        ForkMode, ProjectRecord, ProjectResolution, ResumeBinding, ResumeMode, SessionRefKind,
+        Store, StoredInputRules, WorktreeBinding, WorktreeStatus,
     };
 
     fn temp_store_path(tag: &str) -> PathBuf {
@@ -977,6 +1316,10 @@ mod tests {
             resume_mode: Some(ResumeMode::Flag),
             ref_kind: Some(SessionRefKind::Id),
             resumable: true,
+            fork_mode: Some(ForkMode::ClaudeSession),
+            fork_resume_mode: Some(ResumeMode::Flag),
+            fork_ref_kind: Some(SessionRefKind::Id),
+            forkable: true,
         }
     }
 
@@ -1067,6 +1410,10 @@ mod tests {
             resume_mode: Some(ResumeMode::Subcommand),
             ref_kind: Some(SessionRefKind::Path),
             resumable: true,
+            fork_mode: None,
+            fork_resume_mode: None,
+            fork_ref_kind: None,
+            forkable: false,
         };
         store.record_resume(&binding).expect("record");
         let loaded = store.load_resume().expect("load");
@@ -1074,10 +1421,37 @@ mod tests {
     }
 
     #[test]
+    fn stored_hermes_framing_reapplies_compiled_input_safety() {
+        let stored = StoredInputRules {
+            bracketed_paste: false,
+            submit_delay_ms: 25,
+        };
+        let rules = stored.to_input_rules(&AgentKind::Hermes);
+
+        assert!(!rules.bracketed_paste);
+        assert_eq!(rules.submit_delay, std::time::Duration::from_millis(25));
+        assert_eq!(
+            rules
+                .validate_text("unsafe\u{1b}[201~")
+                .expect_err("restored Hermes safety rejects terminal controls")
+                .code,
+            "session_input_rejected"
+        );
+        assert_eq!(
+            rules
+                .validate_activity(Some(AgentActivity::Blocked))
+                .expect_err("restored Hermes safety rejects approval input")
+                .code,
+            "session_input_blocked"
+        );
+    }
+
+    #[test]
     fn resume_legacy_line_loads_with_default_snapshot() {
         // A resume line written before the C.4 snapshot existed (no program/args/
-        // input_rules/resume_mode/ref_kind/resumable) still loads, defaulting the
-        // snapshot — the store's only compatibility concession (serde default).
+        // input_rules/resume/fork fields) still loads for inspection. This is not
+        // a compatibility promise: absent fork fields default fail-closed rather
+        // than inferring current compiled provider behavior.
         let store = Store::new(temp_store_path("resume-legacy"));
         let legacy = concat!(
             r#"{"kind":"resume","session_id":"s-old","agent":"claude","agent_base":"claude","#,
@@ -1096,6 +1470,10 @@ mod tests {
         assert_eq!(b.resume_mode, None);
         assert_eq!(b.ref_kind, None);
         assert!(!b.resumable);
+        assert_eq!(b.fork_mode, None);
+        assert_eq!(b.fork_resume_mode, None);
+        assert_eq!(b.fork_ref_kind, None);
+        assert!(!b.forkable);
         assert!(b.metadata.is_empty());
     }
 
@@ -1125,6 +1503,34 @@ mod tests {
             .expect("claude legacy binding");
         assert_eq!(codex.agent_base, AgentKind::Codex);
         assert_eq!(claude.agent_base, AgentKind::Claude);
+    }
+
+    #[test]
+    fn unsupported_agent_kinds_are_neither_loaded_nor_persisted() {
+        let path = temp_store_path("unknown-agent-kind");
+        let store = Store::new(path.clone());
+        let mut binding = resume("s-future", "native-future");
+        binding.agent_base = AgentKind::Unknown("future-agent".to_owned());
+
+        let error = store
+            .record_resume(&binding)
+            .expect_err("unknown agent kind must fail closed on write");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!path.exists(), "rejected record must not create the store");
+
+        fs::write(
+            &path,
+            concat!(
+                r#"{"kind":"resume","session_id":"s-future","agent":"future-agent",#,
+                r#""agent_base":"future-agent","cwd":"/w","cols":80,"rows":24}"#,
+                "\n"
+            ),
+        )
+        .expect("write future record");
+        assert!(
+            store.load_resume().expect("load future record").is_empty(),
+            "unsupported persisted record must be ignored"
+        );
     }
 
     #[test]

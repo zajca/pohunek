@@ -10,22 +10,25 @@ use pohunek_gui_core::assistant::{AssistantPaths, LaunchParams as AssistantLaunc
 use pohunek_gui_core::{
     add_project_with_options, assistant as assistant_core, create_session_with_options,
     delete_notification_with_options, diff_session_with_options, discover_hosts, dispatch_review,
-    fork_session_with_options, inspect_session_with_options, launch_provider_item_with_options,
-    list_project_actions_with_options, preview_action_prompt, providers,
+    fork_session_with_options, get_notification_policy_with_options, inspect_session_with_options,
+    launch_provider_item_with_options, list_project_actions_with_options, preview_action_prompt,
+    providers, read_session_output_with_options, read_session_screen_with_options,
     remove_session_with_options, remove_worktree_with_options, rename_project_with_options,
     rename_session_with_options, render_review_prompt, resolve_project_action_with_options,
-    resume_session_with_options, set_session_metadata_with_options, show_project_with_options,
-    stop_session_with_options, update_notification_with_options, ConnectionOptions,
-    DomainEvent as CoreEvent, HostConfig, HostId, ProviderLaunchItem, ProviderLaunchParams,
-    ProviderOperation, ProviderPanel, ProviderRequestId, ReviewDiffStatus, ReviewDispatchParams,
-    ReviewSource, RightTab, Selection, SessionLinkProvider, WindowSize,
+    resume_session_with_options, set_notification_policy_with_options,
+    set_session_metadata_with_options, show_project_with_options, stop_session_with_options,
+    update_notification_with_options, wait_for_session_with_options, ConnectionOptions, CoreError,
+    DomainEvent as CoreEvent, HostConfig, HostId, HostView, ProviderLaunchItem,
+    ProviderLaunchParams, ProviderOperation, ProviderPanel, ProviderRequestId, ReviewDiffStatus,
+    ReviewDispatchParams, ReviewSource, RightTab, Selection, SessionLinkProvider, WindowSize,
 };
 use protocol::{
-    AgentActivity, ForkCwdMode, NotificationDeleteParams, NotificationId, NotificationStatus,
-    NotificationUpdateParams, ProjectActionParams, ProjectActionsParams, ProjectAddParams,
-    ProjectRenameParams, ProjectShowParams, ProviderKind, SessionDiffParams, SessionForkParams,
-    SessionId, SessionNewParams, SessionRenameParams, SessionSetMetadataParams,
-    WorktreeRemoveParams,
+    AgentActivity, ForkCwdMode, NotificationDeleteParams, NotificationId, NotificationPolicyParams,
+    NotificationStatus, NotificationUpdateParams, ProjectActionParams, ProjectActionsParams,
+    ProjectAddParams, ProjectRenameParams, ProjectShowParams, ProviderKind, SessionDiffParams,
+    SessionForkParams, SessionId, SessionNewParams, SessionOutputParams, SessionRenameParams,
+    SessionScreenParams, SessionSetMetadataParams, SessionWaitParams, WorktreeRemoveParams,
+    MAX_SESSION_WAIT_MS,
 };
 
 use crate::attach::{attach_task, spawn_notification, spawn_open_url, window_dimension_to_u32};
@@ -52,6 +55,10 @@ use crate::PohunekApp;
 // A second click on the same session within this window counts as a double-click
 // and opens the session in a terminal (matching the desktop double-click idiom).
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+
+// One GUI click reads a bounded page small enough to render responsively while
+// repeated clicks continue from the headless state's exact output cursor.
+const GUI_SESSION_OUTPUT_PAGE_BYTES: u32 = 16 * 1_024;
 
 #[expect(
     clippy::too_many_lines,
@@ -397,6 +404,18 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             Ok(task) => tasks.push(task),
             Err(err) => app.status = Some(err),
         },
+        Message::ReadSelectedSessionScreen => match read_selected_session_screen_task(app) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
+        Message::ReadSelectedSessionOutput => match read_selected_session_output_task(app) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
+        Message::WaitForSelectedSession => match wait_for_selected_session_task(app) {
+            Ok(task) => tasks.push(task),
+            Err(err) => app.status = Some(err),
+        },
         Message::ForkSelectedSession => match fork_selected_session_task(app) {
             Ok(task) => tasks.push(task),
             Err(err) => app.status = Some(err),
@@ -419,6 +438,33 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             Ok(task) => tasks.push(task),
             Err(err) => app.status = Some(err),
         },
+        Message::LoadNotificationPolicy(host_id) => {
+            match load_notification_policy_task(app, &host_id) {
+                Ok(task) => tasks.push(task),
+                Err(err) => app.status = Some(err),
+            }
+        }
+        Message::SetNotificationPolicyKind {
+            host_id,
+            provider,
+            kind,
+            enabled,
+        } => {
+            if !app.workspace.set_notification_policy_kind(
+                &host_id,
+                provider.as_deref(),
+                kind,
+                enabled,
+            ) {
+                app.status = Some("load the notification policy before editing it".to_owned());
+            }
+        }
+        Message::SaveNotificationPolicy(host_id) => {
+            match save_notification_policy_task(app, &host_id) {
+                Ok(task) => tasks.push(task),
+                Err(err) => app.status = Some(err),
+            }
+        }
         Message::ProjectPathChanged(value) => app.project_edit.path = value,
         Message::ProjectNameChanged(value) => app.project_edit.name = value,
         Message::ProjectBaseBranchChanged(value) => app.project_edit.base_branch = value,
@@ -615,7 +661,16 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                     } else {
                         None
                     };
+                let observation_error = match &message {
+                    CoreEvent::SessionObservationRuntimeChanged { error, .. } => {
+                        Some(error.clone())
+                    }
+                    _ => None,
+                };
                 app.workspace.apply(message);
+                if let Some(error) = observation_error {
+                    app.status = Some(error);
+                }
                 normalize_inbox_cursor(app);
                 if let Some((host_id, session_id)) = removed_session {
                     if app.ui_state.selection
@@ -1225,6 +1280,7 @@ fn confirm_review_dispatch_task(app: &PohunekApp) -> Result<Task<Message>, Strin
         .ok_or_else(|| "no dispatch in progress".to_owned())?;
     let rendered_prompt = dispatch.prompt_preview.clone()?;
     let agent = dispatch.agent.clone();
+    ensure_agent_launchable(&host_id, host, &agent)?;
     let ReviewSource::Session { session_id, .. } = &review.source else {
         return Err(
             "dispatching requires reviewing from an existing session's worktree".to_owned(),
@@ -1319,6 +1375,12 @@ fn notification_tasks(app: &mut PohunekApp) -> Task<Message> {
 fn create_session_task(app: &PohunekApp) -> Result<Task<Message>, String> {
     let host = selected_host_config(app)?;
     let host_id = host.id.clone();
+    let host_view = app
+        .workspace
+        .hosts
+        .get(&host_id)
+        .ok_or_else(|| format!("unknown host `{host_id}`"))?;
+    ensure_agent_launchable(&host_id, host_view, &app.start.agent)?;
     let options = connection_options(app)?;
     let project = selected_project_reference(app)?;
     let terminal_size = terminal_size(app)?;
@@ -1361,6 +1423,12 @@ fn create_session_task(app: &PohunekApp) -> Result<Task<Message>, String> {
 fn launch_assistant_task(app: &PohunekApp) -> Result<Task<Message>, String> {
     let target = selected_assistant_project(app)?;
     let host_id = target.host.id.clone();
+    let host = app
+        .workspace
+        .hosts
+        .get(&host_id)
+        .ok_or_else(|| format!("unknown host `{host_id}`"))?;
+    ensure_assistant_agent_launchable(&host_id, host, app.assistant.agent.as_deref())?;
     let options = connection_options(app)?;
     let paths = AssistantPaths::resolve().map_err(|err| err.to_string())?;
     let terminal_size = terminal_size(app)?;
@@ -1393,6 +1461,33 @@ fn launch_assistant_task(app: &PohunekApp) -> Result<Task<Message>, String> {
     ))
 }
 
+fn ensure_agent_launchable(host_id: &HostId, host: &HostView, agent: &str) -> Result<(), String> {
+    if host.agent_is_launchable(agent) {
+        Ok(())
+    } else {
+        Err(format!(
+            "agent runtime `{agent}` is not launchable on host `{host_id}`"
+        ))
+    }
+}
+
+fn ensure_assistant_agent_launchable(
+    host_id: &HostId,
+    host: &HostView,
+    agent: Option<&str>,
+) -> Result<(), String> {
+    match agent {
+        Some(agent) if host.agent_is_assistant_capable(agent) => Ok(()),
+        Some(agent) => Err(format!(
+            "agent runtime `{agent}` cannot host the assistant on host `{host_id}`"
+        )),
+        None if !host.launchable_assistant_agents().is_empty() => Ok(()),
+        None => Err(format!(
+            "host `{host_id}` has no launchable assistant runtime"
+        )),
+    }
+}
+
 fn inspect_selected_session_task(app: &PohunekApp) -> Result<Task<Message>, String> {
     let (host, session_id) = selected_session_target(app)?;
     let host_id = host.id.clone();
@@ -1403,6 +1498,161 @@ fn inspect_selected_session_task(app: &PohunekApp) -> Result<Task<Message>, Stri
                 .await
                 .map(|session| CoreEvent::SessionInspected { host_id, session })
                 .map_err(|err| err.to_string())
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn read_selected_session_screen_task(app: &PohunekApp) -> Result<Task<Message>, String> {
+    let (host, session_id) = selected_session_target(app)?;
+    let host_id = host.id.clone();
+    let options = connection_options(app)?;
+    let params = SessionScreenParams::new(session_id);
+    Ok(Task::perform(
+        runtime::perform(async move {
+            read_session_screen_with_options(&host, params, options)
+                .await
+                .map(|result| CoreEvent::SessionScreenLoaded { host_id, result })
+                .map_err(|err| err.to_string())
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn read_selected_session_output_task(app: &PohunekApp) -> Result<Task<Message>, String> {
+    let (host, session_id) = selected_session_target(app)?;
+    let host_id = host.id.clone();
+    let options = connection_options(app)?;
+    let observed_session_id = session_id.clone();
+    let params = session_output_params(
+        session_id,
+        app.workspace
+            .session_observation(&host_id, &observed_session_id),
+    )?;
+    Ok(Task::perform(
+        runtime::perform(async move {
+            map_session_output_result(
+                host_id,
+                observed_session_id,
+                read_session_output_with_options(&host, params, options).await,
+            )
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn session_output_params(
+    session_id: SessionId,
+    observation: Option<&pohunek_gui_core::SessionObservation>,
+) -> Result<SessionOutputParams, String> {
+    let runtime = observation.and_then(|observation| observation.output_runtime.clone());
+    let cursor = observation.and_then(|observation| observation.output_cursor);
+    SessionOutputParams::new(
+        session_id,
+        runtime,
+        cursor,
+        GUI_SESSION_OUTPUT_PAGE_BYTES,
+        None,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn map_session_output_result(
+    host_id: HostId,
+    session_id: SessionId,
+    result: Result<protocol::SessionOutputResult, CoreError>,
+) -> Result<CoreEvent, String> {
+    match result {
+        Ok(result) => Ok(CoreEvent::SessionOutputLoaded { host_id, result }),
+        Err(error) if error.is_session_runtime_changed() => {
+            Ok(CoreEvent::SessionObservationRuntimeChanged {
+                host_id,
+                session_id,
+                error: error.to_string(),
+            })
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn wait_for_selected_session_task(app: &PohunekApp) -> Result<Task<Message>, String> {
+    let (host, session_id) = selected_session_target(app)?;
+    let host_id = host.id.clone();
+    let options = connection_options(app)?;
+    let session = app
+        .workspace
+        .hosts
+        .get(&host_id)
+        .and_then(|host| host.sessions.get(&session_id.0))
+        .ok_or_else(|| "selected session is not loaded".to_owned())?;
+    let runtime = session.runtime.as_ref().and_then(|runtime| {
+        runtime.runtime_id.as_ref().and_then(|runtime_id| {
+            protocol::SessionRuntimeIdentity::new(runtime_id.clone(), runtime.runtime_generation)
+                .ok()
+        })
+    });
+    let params = SessionWaitParams::new(
+        session_id,
+        runtime,
+        Some(session.updated_at.clone()),
+        None,
+        None,
+        None,
+        None,
+        MAX_SESSION_WAIT_MS,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(Task::perform(
+        runtime::perform(async move {
+            wait_for_session_with_options(&host, params, options)
+                .await
+                .map(|result| CoreEvent::SessionWaitCompleted { host_id, result })
+                .map_err(|err| err.to_string())
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn load_notification_policy_task(
+    app: &PohunekApp,
+    host_id: &HostId,
+) -> Result<Task<Message>, String> {
+    let host = host_config(app, host_id)?;
+    let host_id = host_id.clone();
+    let options = connection_options(app)?;
+    Ok(Task::perform(
+        runtime::perform(async move {
+            get_notification_policy_with_options(&host, options)
+                .await
+                .map(|result| CoreEvent::NotificationPolicyLoaded { host_id, result })
+                .map_err(|err| err.to_string())
+        }),
+        Message::CoreCommandCompleted,
+    ))
+}
+
+fn save_notification_policy_task(
+    app: &PohunekApp,
+    host_id: &HostId,
+) -> Result<Task<Message>, String> {
+    let host = host_config(app, host_id)?;
+    let policy = app
+        .workspace
+        .notification_policy(host_id)
+        .cloned()
+        .ok_or_else(|| "load the notification policy before saving it".to_owned())?;
+    let host_id = host_id.clone();
+    let options = connection_options(app)?;
+    Ok(Task::perform(
+        runtime::perform(async move {
+            set_notification_policy_with_options(
+                &host,
+                NotificationPolicyParams { policy },
+                options,
+            )
+            .await
+            .map(|result| CoreEvent::NotificationPolicyLoaded { host_id, result })
+            .map_err(|err| err.to_string())
         }),
         Message::CoreCommandCompleted,
     ))
@@ -1588,6 +1838,15 @@ pub(crate) fn fork_session_task(
     host_id: &HostId,
     session_id: &SessionId,
 ) -> Result<Task<Message>, String> {
+    let can_fork = app
+        .workspace
+        .hosts
+        .get(host_id)
+        .and_then(|host| host.sessions.get(&session_id.0))
+        .is_some_and(|session| session.capabilities.fork);
+    if !can_fork {
+        return Err("session does not support fork".to_owned());
+    }
     let host = host_config(app, host_id)?;
     let host_id = host_id.clone();
     let session_id = session_id.clone();
@@ -2021,16 +2280,62 @@ fn launch_github_pull_request_task(app: &PohunekApp) -> Result<Task<Message>, St
 #[cfg(test)]
 mod tests {
     use pohunek_gui_core::{
-        parse_unified_diff, ConnState, GitHubProviderScope, HostView, NotificationFilter,
-        NotificationScope, PromptState, ProviderState, Review, UiState, Workspace,
+        parse_unified_diff, ConnState, GitHubProviderScope, NotificationFilter, NotificationScope,
+        PromptState, ProviderState, Review, UiState, Workspace,
     };
     use protocol::{
-        AgentKind, NotificationKind, NotificationRecord, NotificationSeverity, NotificationSource,
-        ProjectInfo, ProjectSource,
+        AgentKind, AgentRuntime, NotificationKind, NotificationRecord, NotificationSeverity,
+        NotificationSource, ProjectInfo, ProjectSource,
     };
 
     use super::*;
     use crate::message::{MetadataEdit, ProjectEdit};
+
+    #[test]
+    fn launch_guard_uses_runtime_capabilities_and_preserves_legacy_profiles() {
+        let host_id = HostId::new("local");
+        let mut host = test_host();
+        host.runtimes = vec![
+            test_runtime("legacy-custom", None, true, None),
+            test_runtime("hermes", None, true, None),
+            test_runtime(
+                "hermes-supported",
+                Some(AgentKind::Hermes),
+                true,
+                Some(true),
+            ),
+            test_runtime(
+                "future-profile",
+                Some(AgentKind::Unknown("future".to_owned())),
+                true,
+                Some(true),
+            ),
+        ];
+
+        ensure_agent_launchable(&host_id, &host, "legacy-custom")
+            .expect("legacy custom runtime remains launchable");
+        ensure_agent_launchable(&host_id, &host, "hermes-supported")
+            .expect("supported Hermes runtime is launchable");
+        assert!(ensure_agent_launchable(&host_id, &host, "hermes").is_err());
+        assert!(ensure_agent_launchable(&host_id, &host, "future-profile").is_err());
+        assert!(ensure_agent_launchable(&host_id, &host, "missing-profile").is_err());
+    }
+
+    #[test]
+    fn assistant_launch_guard_rejects_shell_backed_profiles() {
+        let host_id = HostId::new("local");
+        let mut host = test_host();
+        host.runtimes = vec![
+            test_runtime("shell-profile", Some(AgentKind::Shell), true, None),
+            test_runtime("legacy-custom", None, true, None),
+        ];
+
+        assert!(ensure_assistant_agent_launchable(&host_id, &host, Some("shell-profile")).is_err());
+        ensure_assistant_agent_launchable(&host_id, &host, Some("legacy-custom"))
+            .expect("legacy custom runtime can host the assistant");
+        ensure_assistant_agent_launchable(&host_id, &host, None)
+            .expect("auto selection can use the legacy custom runtime");
+    }
 
     #[test]
     fn move_list_selection_moves_inbox_cursor_with_wrapping() {
@@ -2207,6 +2512,58 @@ mod tests {
         assert_ne!(first_selection, second_selection);
     }
 
+    #[test]
+    fn runtime_changed_output_error_invalidates_the_cached_cursor() {
+        let host_id = HostId::new("local");
+        let session_id = SessionId("s-1".to_owned());
+        let runtime =
+            protocol::SessionRuntimeIdentity::new("runtime-1", protocol::RuntimeGeneration::new(1))
+                .expect("valid runtime identity");
+        let mut workspace = Workspace::default();
+        workspace.apply(CoreEvent::SessionOutputLoaded {
+            host_id: host_id.clone(),
+            result: protocol::SessionOutputResult::new(
+                session_id.clone(),
+                runtime,
+                protocol::OutputOffset::new(0),
+                protocol::OutputOffset::new(0),
+                protocol::OutputOffset::new(1),
+                protocol::OutputOffset::new(1),
+                "YQ==",
+                None,
+                false,
+                false,
+            )
+            .expect("valid output result"),
+        });
+        let event = map_session_output_result(
+            host_id.clone(),
+            session_id.clone(),
+            Err(CoreError::Protocol(
+                protocol::ProtocolError::session_runtime_changed(),
+            )),
+        )
+        .expect("runtime change becomes a reducible event");
+
+        assert!(matches!(
+            &event,
+            CoreEvent::SessionObservationRuntimeChanged {
+                host_id: actual_host,
+                session_id: actual_session,
+                ..
+            } if actual_host == &host_id && actual_session == &session_id
+        ));
+        workspace.apply(event);
+
+        let retry = session_output_params(
+            session_id.clone(),
+            workspace.session_observation(&host_id, &session_id),
+        )
+        .expect("retry params");
+        assert!(retry.runtime().is_none());
+        assert!(retry.after_offset().is_none());
+    }
+
     fn app_without_selection() -> PohunekApp {
         PohunekApp {
             workspace: Workspace::default(),
@@ -2253,6 +2610,25 @@ mod tests {
             last_agent_state: None,
             last_error: None,
             supported_agents: Vec::new(),
+            runtimes: Vec::new(),
+            notification_providers: Vec::new(),
+            observation_capabilities: pohunek_gui_core::ObservationCapabilities::default(),
+        }
+    }
+
+    fn test_runtime(
+        name: &str,
+        agent_base: Option<AgentKind>,
+        available: bool,
+        supported: Option<bool>,
+    ) -> AgentRuntime {
+        AgentRuntime {
+            agent: name.to_owned(),
+            agent_base,
+            available,
+            path: None,
+            version: None,
+            supported,
         }
     }
 

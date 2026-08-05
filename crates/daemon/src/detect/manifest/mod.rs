@@ -265,18 +265,21 @@ mod tests {
         assert!(matchers.matches(&ProcessFact {
             pid: 100,
             ppid: 1,
+            start_identity: 100,
             comm: "codex".to_owned(),
             cmdline: vec!["/usr/bin/other".to_owned()],
         }));
         assert!(matchers.matches(&ProcessFact {
             pid: 101,
             ppid: 1,
+            start_identity: 101,
             comm: "sleep".to_owned(),
             cmdline: vec!["/tmp/tools/codex".to_owned(), "30".to_owned()],
         }));
         assert!(!matchers.matches(&ProcessFact {
             pid: 102,
             ppid: 1,
+            start_identity: 102,
             comm: "sleep".to_owned(),
             cmdline: vec!["/tmp/tools/not-codex".to_owned(), "30".to_owned()],
         }));

@@ -37,6 +37,7 @@ const BEL: u8 = 0x07;
 const GENERIC_SHELL_MANIFEST: &str = include_str!("manifests/shell.toml");
 const CODEX_MANIFEST: &str = include_str!("manifests/codex.toml");
 const CLAUDE_MANIFEST: &str = include_str!("manifests/claude.toml");
+const HERMES_MANIFEST: &str = include_str!("manifests/hermes.toml");
 
 #[derive(Debug, Clone, Default)]
 pub struct DetectorConfig {
@@ -56,11 +57,12 @@ impl DetectorConfig {
 
     /// Production detector config for a specific agent kind.
     #[must_use]
-    pub fn for_agent(agent: AgentKind) -> Self {
+    pub fn for_agent(agent: &AgentKind) -> Self {
         match agent {
-            AgentKind::Shell => Self::generic_shell(),
+            AgentKind::Shell | AgentKind::Unknown(_) => Self::generic_shell(),
             AgentKind::Codex => Self::codex(),
             AgentKind::Claude => Self::claude(),
+            AgentKind::Hermes => Self::hermes(),
         }
     }
 
@@ -70,7 +72,7 @@ impl DetectorConfig {
     /// non-panicking [`Manifest::parse_str`] (a malformed one disabled the profile
     /// before this point), so detection never `.expect`-panics on host input.
     #[must_use]
-    pub fn for_profile(base: AgentKind, override_manifest: Option<Manifest>) -> Self {
+    pub fn for_profile(base: &AgentKind, override_manifest: Option<Manifest>) -> Self {
         match override_manifest {
             Some(manifest) => Self {
                 detection: DetectionConfig::default(),
@@ -97,6 +99,15 @@ impl DetectorConfig {
             manifest: Some(claude_manifest().clone()),
         }
     }
+
+    /// Production detector config using the embedded Hermes Agent manifest.
+    #[must_use]
+    pub fn hermes() -> Self {
+        Self {
+            detection: DetectionConfig::default(),
+            manifest: Some(hermes_manifest().clone()),
+        }
+    }
 }
 
 /// Parses the embedded generic shell manifest.
@@ -121,6 +132,16 @@ pub fn claude_manifest() -> &'static Manifest {
         .get_or_init(|| Manifest::parse_str(CLAUDE_MANIFEST).expect("claude manifest must parse"))
 }
 
+/// Parses the embedded Hermes Agent manifest.
+///
+/// The manifest is a shipped, trusted, unit-tested constant, so a parse failure
+/// is a programming error rather than a recoverable condition.
+pub fn hermes_manifest() -> &'static Manifest {
+    static MANIFEST: OnceLock<Manifest> = OnceLock::new();
+    MANIFEST
+        .get_or_init(|| Manifest::parse_str(HERMES_MANIFEST).expect("Hermes manifest must parse"))
+}
+
 /// Identifies a built-in agent from process facts.
 #[must_use]
 pub fn identify_agent(fact: &ProcessFact) -> Option<AgentKind> {
@@ -134,6 +155,11 @@ pub fn identify_agent(fact: &ProcessFact) -> Option<AgentKind> {
         .is_some_and(|matchers| matchers.matches(fact))
     {
         Some(AgentKind::Claude)
+    } else if hermes_manifest()
+        .process_matchers()
+        .is_some_and(|matchers| matchers.matches(fact))
+    {
+        Some(AgentKind::Hermes)
     } else {
         None
     }
@@ -490,7 +516,10 @@ mod tests {
 
     use protocol::{AgentActivity, AgentKind, StateSource};
 
-    use super::{ActivityTransition, DetectionConfig, Detector, DetectorConfig, Manifest};
+    use super::{
+        ActivityTransition, DetectionConfig, Detector, DetectorConfig, Manifest, ManifestRegion,
+        MatchContext,
+    };
     use crate::procwatch::ProcessFact;
 
     fn instant() -> Instant {
@@ -542,6 +571,7 @@ mod tests {
             super::identify_agent(&ProcessFact {
                 pid: 100,
                 ppid: 1,
+                start_identity: 100,
                 comm: "codex".to_owned(),
                 cmdline: vec!["/usr/bin/codex".to_owned()],
             }),
@@ -551,6 +581,7 @@ mod tests {
             super::identify_agent(&ProcessFact {
                 pid: 101,
                 ppid: 1,
+                start_identity: 101,
                 comm: "node".to_owned(),
                 cmdline: vec![
                     "node".to_owned(),
@@ -563,11 +594,80 @@ mod tests {
             super::identify_agent(&ProcessFact {
                 pid: 102,
                 ppid: 1,
+                start_identity: 102,
                 comm: "sleep".to_owned(),
                 cmdline: vec!["sleep".to_owned(), "30".to_owned()],
             }),
             None
         );
+
+        for (pid, comm, cmdline) in [
+            (103, "hermes", vec!["/usr/local/bin/hermes", "chat"]),
+            (104, "python3", vec!["/usr/local/bin/hermes", "chat"]),
+            (
+                105,
+                "python3",
+                vec!["/usr/bin/python3", "-m", "hermes_cli.main", "chat"],
+            ),
+            (
+                106,
+                "python3.13",
+                vec![
+                    "/usr/bin/python3.13",
+                    "/opt/hermes/hermes_cli/main.py",
+                    "chat",
+                ],
+            ),
+        ] {
+            assert_eq!(
+                super::identify_agent(&ProcessFact {
+                    pid,
+                    ppid: 1,
+                    start_identity: u64::from(pid),
+                    comm: comm.to_owned(),
+                    cmdline: cmdline.into_iter().map(str::to_owned).collect(),
+                }),
+                Some(AgentKind::Hermes)
+            );
+        }
+
+        for (pid, comm, cmdline) in [
+            (107, "hermes-helper", vec!["/usr/bin/hermes-helper", "chat"]),
+            (108, "python3", vec!["python3", "/tmp/cli.py", "chat"]),
+            (
+                109,
+                "python3",
+                vec!["python3", "-m", "not_hermes_cli.main", "chat"],
+            ),
+            (110, "cat", vec!["cat", "/tmp/hermes"]),
+            (
+                111,
+                "echo",
+                vec!["echo", "/usr/bin/python3", "-m", "hermes_cli.main"],
+            ),
+            (
+                112,
+                "node",
+                vec!["node", "/opt/hermes/hermes_cli/main.py", "chat"],
+            ),
+            (
+                113,
+                "python3",
+                vec!["python3", "/opt/hermes/hermes_cli/helper.py", "chat"],
+            ),
+        ] {
+            assert_eq!(
+                super::identify_agent(&ProcessFact {
+                    pid,
+                    ppid: 1,
+                    start_identity: u64::from(pid),
+                    comm: comm.to_owned(),
+                    cmdline: cmdline.into_iter().map(str::to_owned).collect(),
+                }),
+                None,
+                "unrelated process must not be identified as Hermes"
+            );
+        }
     }
 
     #[test]
@@ -1095,9 +1195,74 @@ mod tests {
     }
 
     #[test]
+    fn embedded_hermes_manifest_parses() {
+        let _ = super::hermes_manifest();
+        let _ = super::DetectorConfig::hermes();
+    }
+
+    #[test]
+    fn hermes_manifest_maps_bounded_classic_and_tui_evidence() {
+        let manifest = super::hermes_manifest();
+        let cases = [
+            (
+                ManifestRegion::BottomNonEmptyLines(16),
+                "⚠ Dangerous Command\n1. Allow once\n4. Deny",
+                AgentActivity::Blocked,
+            ),
+            (
+                ManifestRegion::BottomNonEmptyLines(16),
+                "⚠ approval required · run command\n1. Allow once\n4. Deny",
+                AgentActivity::Blocked,
+            ),
+            (
+                ManifestRegion::BottomNonEmptyLines(8),
+                "output\n⚕ ❯",
+                AgentActivity::Working,
+            ),
+            (
+                ManifestRegion::BottomNonEmptyLines(8),
+                "Ctrl+C to interrupt…",
+                AgentActivity::Working,
+            ),
+            (
+                ManifestRegion::BottomNonEmptyLines(4),
+                "❯",
+                AgentActivity::Idle,
+            ),
+            (
+                ManifestRegion::BottomNonEmptyLines(4),
+                "─ ready │ model",
+                AgentActivity::Idle,
+            ),
+            (
+                ManifestRegion::WholeRecent,
+                "Failed to initialize agent: provider unavailable",
+                AgentActivity::Blocked,
+            ),
+        ];
+
+        for (region, text, activity) in cases {
+            let matched = manifest
+                .match_context(&MatchContext::default().with_region_text(region, text))
+                .expect("Hermes fixture should match");
+            assert_eq!(matched.activity, activity);
+        }
+    }
+
+    #[test]
+    fn hermes_manifest_rejects_unrelated_screen_text() {
+        let matched =
+            super::hermes_manifest().match_context(&MatchContext::default().with_region_text(
+                ManifestRegion::WholeRecent,
+                "documentation: type Allow once or Deny when asked",
+            ));
+        assert!(matched.is_none());
+    }
+
+    #[test]
     fn detector_config_for_agent_loads_agent_manifest() {
         let started_at = instant();
-        let mut codex_config = super::DetectorConfig::for_agent(protocol::AgentKind::Codex);
+        let mut codex_config = super::DetectorConfig::for_agent(&protocol::AgentKind::Codex);
         codex_config.detection = config().detection;
         let mut codex = Detector::new(3, 80, started_at, codex_config);
         assert_eq!(
@@ -1105,7 +1270,7 @@ mod tests {
             vec![transition(AgentActivity::Blocked, StateSource::OscTitle)]
         );
 
-        let mut claude_config = super::DetectorConfig::for_agent(protocol::AgentKind::Claude);
+        let mut claude_config = super::DetectorConfig::for_agent(&protocol::AgentKind::Claude);
         claude_config.detection = config().detection;
         let mut claude = Detector::new(3, 80, started_at, claude_config);
         assert_eq!(
@@ -1127,8 +1292,10 @@ mod tests {
             "#,
         );
 
-        let mut config =
-            super::DetectorConfig::for_profile(protocol::AgentKind::Codex, Some(override_manifest));
+        let mut config = super::DetectorConfig::for_profile(
+            &protocol::AgentKind::Codex,
+            Some(override_manifest),
+        );
         config.detection = self::config().detection;
         let started_at = instant();
         let mut detector = Detector::new(3, 80, started_at, config);
@@ -1146,7 +1313,7 @@ mod tests {
         // behavior: feeding a Claude blocking pattern yields the same blocked
         // transition the base Claude config produces.
         let mut profile_config =
-            super::DetectorConfig::for_profile(protocol::AgentKind::Claude, None);
+            super::DetectorConfig::for_profile(&protocol::AgentKind::Claude, None);
         profile_config.detection = self::config().detection;
         let mut base_config = super::DetectorConfig::claude();
         base_config.detection = self::config().detection;

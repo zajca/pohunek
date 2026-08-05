@@ -388,6 +388,7 @@ pub struct NotificationDeleteResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "NotificationKindPolicy.ts"))]
+#[serde(deny_unknown_fields)]
 pub struct NotificationKindPolicy {
     /// Whether `agent_blocked` notifications are enabled.
     pub agent_blocked: bool,
@@ -410,7 +411,7 @@ pub struct NotificationKindPolicy {
 /// policy keeps loading. The daemon owns the authoritative default
 /// (`DEFAULT_ATTENTION_DEBOUNCE_SECS`); this mirror only exists because the
 /// protocol crate cannot depend on the daemon, and the two must stay in sync.
-const fn default_attention_debounce_secs() -> u64 {
+const fn default_attention_debounce_secs() -> u32 {
     5
 }
 
@@ -418,9 +419,10 @@ const fn default_attention_debounce_secs() -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "NotificationPolicy.ts"))]
+#[serde(deny_unknown_fields)]
 pub struct NotificationPolicy {
     /// Dedupe window for equivalent attention events.
-    pub attention_dedupe_window_secs: u64,
+    pub attention_dedupe_window_secs: u32,
     /// Debounce window before a pending session notification may surface.
     ///
     /// Additive: an older client omits it, and a policy JSON without it loads the
@@ -428,27 +430,31 @@ pub struct NotificationPolicy {
     /// [`Self::attention_dedupe_window_secs`], which merges duplicate reports of
     /// one attention moment rather than delaying when it surfaces.
     #[serde(default = "default_attention_debounce_secs")]
-    pub attention_debounce_secs: u64,
-    /// Default per-kind enable flags.
+    pub attention_debounce_secs: u32,
+    /// Base per-kind policy used when a provider has no explicit entry.
     pub enabled: NotificationKindPolicy,
-    /// Codex-specific per-kind override, when configured.
+    /// Deterministically ordered provider-specific policy overrides.
     ///
-    /// Additive: an older daemon omits it, and an older client ignores it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts", ts(optional))]
-    pub codex: Option<NotificationKindPolicy>,
-    /// Claude-specific per-kind override, when configured.
-    ///
-    /// Additive: an older daemon omits it, and an older client ignores it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts", ts(optional))]
-    pub claude: Option<NotificationKindPolicy>,
+    /// Missing keys use [`Self::enabled`]. Keys are provider wire names rather
+    /// than an enum so a newly added provider does not require another public
+    /// notification schema change.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, NotificationKindPolicy>,
+}
+
+impl NotificationPolicy {
+    /// Returns the policy for `provider`, falling back to the base policy.
+    #[must_use]
+    pub fn for_provider(&self, provider: &str) -> &NotificationKindPolicy {
+        self.providers.get(provider).unwrap_or(&self.enabled)
+    }
 }
 
 /// Parameters for `notification.policy.set`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "NotificationPolicyParams.ts"))]
+#[serde(deny_unknown_fields)]
 pub struct NotificationPolicyParams {
     /// Replacement notification policy.
     pub policy: NotificationPolicy,
@@ -458,6 +464,7 @@ pub struct NotificationPolicyParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "NotificationPolicyResult.ts"))]
+#[serde(deny_unknown_fields)]
 pub struct NotificationPolicyResult {
     /// Current notification policy.
     pub policy: NotificationPolicy,

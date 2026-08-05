@@ -2,7 +2,7 @@
   import type { HostsSnapshot, Workspace } from "@pohunek/client-core";
   import { onDestroy } from "svelte";
   import type { Readable } from "svelte/store";
-  import { addErrorToast } from "../lib";
+  import { addErrorToast, agentRuntimeLabel, isLaunchableRuntime } from "../lib";
   import TerminalSizeProbe from "./TerminalSizeProbe.svelte";
 
   export interface TerminalSize {
@@ -110,7 +110,7 @@
       const inspected = await workspace.actions.hostInspect(host);
       if (optionsGeneration === generation) {
         capabilities = inspected;
-        selectedAgent = inspected.supported_agents.find((agent) => runtimeAvailable(inspected, agent)) ?? "";
+        selectedAgent = inspected.supported_agents.find((agent) => runtimeLaunchable(inspected, agent)) ?? "";
       }
     } catch (error: unknown) {
       if (optionsGeneration === generation) {
@@ -139,8 +139,12 @@
     }
   }
 
-  function runtimeAvailable(snapshot: Capabilities, agent: string): boolean {
-    return snapshot.runtimes.find((runtime) => runtime.agent === agent)?.available === true;
+  function runtimeFor(snapshot: Capabilities, agent: string): Capabilities["runtimes"][number] | undefined {
+    return snapshot.runtimes.find((runtime) => runtime.agent === agent);
+  }
+
+  function runtimeLaunchable(snapshot: Capabilities, agent: string): boolean {
+    return isLaunchableRuntime(agent, runtimeFor(snapshot, agent));
   }
 
   function onProjectChange(): void {
@@ -222,8 +226,8 @@
             <option value="">Inspecting host…</option>
           {:else if capabilities !== undefined}
             {#each capabilities.supported_agents as agent (agent)}
-              <option value={agent} disabled={!runtimeAvailable(capabilities, agent)}>
-                {agent}{runtimeAvailable(capabilities, agent) ? "" : " — unavailable"}
+              <option value={agent} disabled={!runtimeLaunchable(capabilities, agent)}>
+                {agentRuntimeLabel(agent, runtimeFor(capabilities, agent))}
               </option>
             {/each}
           {/if}

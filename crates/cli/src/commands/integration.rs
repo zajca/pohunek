@@ -63,12 +63,8 @@ pub(crate) async fn run_install(
     Ok(())
 }
 
-fn agent_label(agent: AgentKind) -> &'static str {
-    match agent {
-        AgentKind::Shell => "shell",
-        AgentKind::Codex => "codex",
-        AgentKind::Claude => "claude",
-    }
+fn agent_label(agent: &AgentKind) -> &str {
+    agent.as_wire()
 }
 
 fn render_install_human(result: &IntegrationInstallResult) -> String {
@@ -80,7 +76,7 @@ fn render_install_human(result: &IntegrationInstallResult) -> String {
         let _ = writeln!(
             output,
             "installed {} hook: {}",
-            agent_label(report.agent),
+            agent_label(&report.agent),
             report.hook_path
         );
         for path in &report.config_paths {
@@ -148,8 +144,7 @@ mod tests {
             }],
         };
         let doc = crate::commands::render_json(&result).expect("json doc");
-        let parsed: IntegrationInstallResult =
-            serde_json::from_str(&doc).expect("parse install result");
+        let parsed: IntegrationInstallResult = crate::commands::parse_json_ok(&doc);
         assert_eq!(parsed, result);
     }
 }

@@ -6,6 +6,10 @@ use thiserror::Error;
 
 use crate::{PromptError, ReviewStoreError};
 
+// The daemon uses this stable protocol code when an observation cursor belongs
+// to a different runtime identity and must be discarded before retrying.
+const SESSION_RUNTIME_CHANGED_CODE: &str = "session_runtime_changed";
+
 /// Errors raised by the GUI core bridge.
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -55,4 +59,16 @@ pub enum CoreError {
     },
     #[error("session `{}` has no bound worktree to dispatch a review into", session_id.0)]
     ReviewSessionMissingWorktree { session_id: protocol::SessionId },
+}
+
+impl CoreError {
+    /// Return whether this error requires discarding a session observation cursor.
+    #[must_use]
+    pub fn is_session_runtime_changed(&self) -> bool {
+        match self {
+            Self::Client(error) => error.to_protocol_error().code == SESSION_RUNTIME_CHANGED_CODE,
+            Self::Protocol(error) => error.code == SESSION_RUNTIME_CHANGED_CODE,
+            _ => false,
+        }
+    }
 }

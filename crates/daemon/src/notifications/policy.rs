@@ -1,5 +1,7 @@
 //! Notification policy defaults and retention evaluation.
 
+use std::collections::BTreeMap;
+
 use protocol::{
     NotificationId, NotificationKind, NotificationKindPolicy, NotificationPolicy,
     NotificationRecord, NotificationRetentionParams, NotificationStatus,
@@ -12,7 +14,7 @@ use super::{parse_timestamp, NotificationError};
 /// Provider hooks and daemon projectors often report the same approval/blocking
 /// moment within a few UI polling cycles. Two minutes covers normal scheduling
 /// delay without merging unrelated later turns.
-pub const DEFAULT_ATTENTION_DEDUPE_WINDOW_SECS: u64 = 120;
+pub const DEFAULT_ATTENTION_DEDUPE_WINDOW_SECS: u32 = 120;
 
 /// Default debounce window before a pending session notification may surface.
 ///
@@ -25,17 +27,21 @@ pub const DEFAULT_ATTENTION_DEDUPE_WINDOW_SECS: u64 = 120;
 /// attention moment across producers rather than delaying when it surfaces. Must
 /// stay in sync with the protocol crate's `default_attention_debounce_secs`
 /// serde backfill.
-pub const DEFAULT_ATTENTION_DEBOUNCE_SECS: u64 = 5;
+pub const DEFAULT_ATTENTION_DEBOUNCE_SECS: u32 = 5;
 
 /// Default policy for daemon notification creation.
 #[must_use]
 pub fn default_policy() -> NotificationPolicy {
+    let provider_policy = default_enabled_kinds();
     NotificationPolicy {
         attention_dedupe_window_secs: DEFAULT_ATTENTION_DEDUPE_WINDOW_SECS,
         attention_debounce_secs: DEFAULT_ATTENTION_DEBOUNCE_SECS,
         enabled: default_enabled_kinds(),
-        codex: Some(codex_policy()),
-        claude: Some(claude_policy()),
+        providers: BTreeMap::from([
+            ("claude".to_owned(), provider_policy.clone()),
+            ("codex".to_owned(), provider_policy.clone()),
+            ("hermes".to_owned(), provider_policy),
+        ]),
     }
 }
 
@@ -46,39 +52,12 @@ pub fn policy_enables_kind(
     provider: &str,
     kind: NotificationKind,
 ) -> bool {
-    let kinds = if provider.eq_ignore_ascii_case("codex") {
-        policy.codex.as_ref().unwrap_or(&policy.enabled)
-    } else if provider.eq_ignore_ascii_case("claude") {
-        policy.claude.as_ref().unwrap_or(&policy.enabled)
-    } else {
-        &policy.enabled
-    };
+    let normalized_provider = provider.to_ascii_lowercase();
+    let kinds = policy.for_provider(&normalized_provider);
     kind_enabled(kinds, kind)
 }
 
 fn default_enabled_kinds() -> NotificationKindPolicy {
-    NotificationKindPolicy {
-        agent_blocked: true,
-        approval_required: true,
-        turn_completed: false,
-        session_finished: false,
-        error: true,
-        system: false,
-    }
-}
-
-fn codex_policy() -> NotificationKindPolicy {
-    NotificationKindPolicy {
-        agent_blocked: true,
-        approval_required: true,
-        turn_completed: false,
-        session_finished: false,
-        error: true,
-        system: false,
-    }
-}
-
-fn claude_policy() -> NotificationKindPolicy {
     NotificationKindPolicy {
         agent_blocked: true,
         approval_required: true,

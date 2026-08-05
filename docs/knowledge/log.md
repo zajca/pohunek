@@ -15,11 +15,10 @@
 - Documented the self-contained Linux x86_64 web release archive and its
   systemd user-service installation flow.
 - Documented that the native GUI `Start session` and Review "Dispatch as
-  session…" agent pickers now list the selected host's `supported_agents`
-  (seeded from `host.inspect`): the base kinds `shell`/`codex`/`claude` plus
-  every resolvable host agent profile (e.g. `claude-otel`), superseding the
-  0.7.4 note that the picker only supported the three built-ins. Falls back to
-  the base kinds when the host hasn't seeded `supported_agents` yet.
+  session…" agent pickers use the selected host's launchable runtime inventory,
+  including resolvable profiles. The GUI fails closed when that inventory is
+  unavailable instead of deriving launch permission from the name-only
+  `supported_agents` field or falling back to built-in base kinds.
 - Cross-linked agent profiles from the GUI Session Launch section.
 
 ## 0.18.3

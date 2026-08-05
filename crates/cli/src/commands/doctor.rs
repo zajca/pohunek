@@ -1,6 +1,6 @@
 //! `pohunek doctor` — environment health checks.
 //!
-//! Per `docs/plan-phase-1.md` "CLI Grammar": check Codex/Claude binaries, git,
+//! Per `docs/plan-phase-1.md` "CLI Grammar": check agent binaries, git,
 //! socket-dir perms, and state-dir writability. (Schema-version check is part of
 //! the `SQLite` milestone and is therefore reported as not-yet-available rather
 //! than faked.)

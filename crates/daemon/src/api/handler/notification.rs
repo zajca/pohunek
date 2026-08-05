@@ -11,7 +11,7 @@ use protocol::{
     NotificationRetentionParams, NotificationUpdateParams, ProtocolError, Request, Response,
 };
 
-use super::util::{ok_value, parse_optional_params, parse_params};
+use super::util::{error_value, ok_value, parse_optional_params, parse_params};
 use crate::notifications::{is_debounced_create, AttentionCoordinator, NotificationService};
 use crate::session::SessionRegistry;
 
@@ -22,8 +22,8 @@ fn require_notifications(
     notifications: Option<&NotificationService>,
 ) -> Result<NotificationService, Response> {
     notifications.cloned().ok_or_else(|| {
-        Response::err(
-            request.id.clone(),
+        error_value(
+            request,
             ProtocolError::new(
                 protocol::ErrorClass::Daemon,
                 "notifications_not_configured",
@@ -43,8 +43,8 @@ fn require_attention(
     attention: Option<&AttentionCoordinator>,
 ) -> Result<AttentionCoordinator, Response> {
     attention.cloned().ok_or_else(|| {
-        Response::err(
-            request.id.clone(),
+        error_value(
+            request,
             ProtocolError::new(
                 protocol::ErrorClass::Daemon,
                 "notifications_not_configured",
@@ -86,7 +86,7 @@ pub(super) async fn handle_notification_create(
 ) -> Response {
     let params = match parse_params::<NotificationCreateParams>(request) {
         Ok(params) => params,
-        Err(err) => return Response::err(request.id.clone(), err),
+        Err(err) => return error_value(request, err),
     };
     let notifications = match require_notifications(request, notifications) {
         Ok(notifications) => notifications,
@@ -154,7 +154,7 @@ pub(super) async fn handle_notification_list(
 ) -> Response {
     let params = match parse_optional_params::<NotificationListParams>(request) {
         Ok(params) => params,
-        Err(err) => return Response::err(request.id.clone(), err),
+        Err(err) => return error_value(request, err),
     };
     let notifications = match require_notifications(request, notifications) {
         Ok(notifications) => notifications,
@@ -175,7 +175,7 @@ pub(super) async fn handle_notification_update(
 ) -> Response {
     let params = match parse_params::<NotificationUpdateParams>(request) {
         Ok(params) => params,
-        Err(err) => return Response::err(request.id.clone(), err),
+        Err(err) => return error_value(request, err),
     };
     let notifications = match require_notifications(request, notifications) {
         Ok(notifications) => notifications,
@@ -196,7 +196,7 @@ pub(super) async fn handle_notification_delete(
 ) -> Response {
     let params = match parse_params::<NotificationDeleteParams>(request) {
         Ok(params) => params,
-        Err(err) => return Response::err(request.id.clone(), err),
+        Err(err) => return error_value(request, err),
     };
     let notifications = match require_notifications(request, notifications) {
         Ok(notifications) => notifications,
@@ -215,9 +215,9 @@ pub(super) fn handle_notification_policy_get(
     request: &Request,
     notifications: Option<&NotificationService>,
 ) -> Response {
-    if !request.params.is_null() {
-        return Response::err(
-            request.id.clone(),
+    if !request.params().is_null() {
+        return error_value(
+            request,
             ProtocolError::bad_request("notification.policy.get does not accept params"),
         );
     }
@@ -240,7 +240,7 @@ pub(super) async fn handle_notification_policy_set(
 ) -> Response {
     let params = match parse_params::<NotificationPolicyParams>(request) {
         Ok(params) => params,
-        Err(err) => return Response::err(request.id.clone(), err),
+        Err(err) => return error_value(request, err),
     };
     let notifications = match require_notifications(request, notifications) {
         Ok(notifications) => notifications,
@@ -263,7 +263,7 @@ pub(super) async fn handle_notification_retention_prune(
 ) -> Response {
     let params = match parse_optional_params::<NotificationRetentionParams>(request) {
         Ok(params) => params,
-        Err(err) => return Response::err(request.id.clone(), err),
+        Err(err) => return error_value(request, err),
     };
     let notifications = match require_notifications(request, notifications) {
         Ok(notifications) => notifications,

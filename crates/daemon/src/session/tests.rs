@@ -3,14 +3,19 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+
 use protocol::{
-    AgentActivity, AgentKind, CwdSource, Event, ForkCwdMode, ProjectSource, RuntimeState,
-    SessionAttachParams, SessionForkParams, SessionId, SessionInfo, SessionNativeRecoveredEvent,
-    SessionNewParams, SessionReleaseAgentParams, SessionReportAgentParams,
-    SessionReportNativeIdParams, SessionRuntime, SessionState, StateSource,
+    AgentActivity, AgentKind, CwdSource, Event, ForkCwdMode, OutputOffset, ProcessStartIdentity,
+    ProjectSource, ReportSequence, RuntimeGeneration, RuntimeState, SessionAttachParams,
+    SessionForkParams, SessionId, SessionInfo, SessionNativeRecoveredEvent, SessionNewParams,
+    SessionOutputParams, SessionReleaseAgentParams, SessionReportAgentParams,
+    SessionReportNativeIdParams, SessionRuntime, SessionRuntimeIdentity, SessionState,
+    SessionWaitParams, SessionWaitReason, StateSource, TerminalWatermark,
 };
 
 use crate::agent::LaunchCommand;
@@ -25,11 +30,108 @@ use crate::project::detect::project_id;
 use crate::runtime::WorkerError;
 
 use super::{
-    worker_error_to_protocol, RuntimeExit, SessionRegistry, SessionRegistryConfig, ShellCommand,
-    MAX_SESSION_NAME_BYTES,
+    native_report_is_current, worker_error_to_protocol, RuntimeExit, RuntimeHandle, SessionEntry,
+    SessionRegistry, SessionRegistryConfig, ShellCommand, MAX_SESSION_NAME_BYTES,
 };
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static NATIVE_REPORT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn native_report_expiry() -> String {
+    (OffsetDateTime::now_utc() + time::Duration::seconds(30))
+        .format(&Rfc3339)
+        .expect("format native report expiry")
+}
+
+async fn native_report_params(
+    registry: &SessionRegistry,
+    session_id: SessionId,
+    agent: String,
+    native_session_id: String,
+    transcript_path: Option<String>,
+) -> SessionReportNativeIdParams {
+    let worker = {
+        let sessions = registry.inner.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .and_then(|entry| match &entry.runtime {
+                RuntimeHandle::Worker(worker) => Some(worker.clone()),
+                RuntimeHandle::Unavailable(_) => None,
+            })
+    };
+    let identity = if let Some(worker) = worker {
+        worker
+            .inspect()
+            .await
+            .ok()
+            .and_then(|snapshot| Some((snapshot.runtime_id?, snapshot.child_process?)))
+    } else {
+        None
+    };
+    let (runtime_id, pid, pid_start_identity) = identity.map_or_else(
+        || ("runtime-unavailable".to_owned(), 1, 1),
+        |(runtime_id, process)| (runtime_id.to_string(), process.pid, process.start_identity),
+    );
+    SessionReportNativeIdParams::new(
+        session_id,
+        runtime_id,
+        agent,
+        pid,
+        ProcessStartIdentity::new(pid_start_identity),
+        ReportSequence::new(NATIVE_REPORT_SEQUENCE.fetch_add(1, Ordering::Relaxed)),
+        native_report_expiry(),
+        native_session_id,
+        transcript_path,
+    )
+    .expect("valid native identity report")
+}
+
+macro_rules! native_report {
+    (
+        $registry:expr;
+        session_id: $session_id:expr,
+        runtime_id: $runtime_id:expr,
+        agent: $agent:expr,
+        pid: $pid:expr,
+        pid_start_identity: $pid_start_identity:expr,
+        sequence: $sequence:expr,
+        expires_at: $expires_at:expr,
+        native_session_id: $native_session_id:expr,
+        transcript_path: $transcript_path:expr $(,)?
+    ) => {{
+        let _ = (
+            $runtime_id,
+            $pid,
+            $pid_start_identity,
+            $sequence,
+            $expires_at,
+        );
+        native_report_params(
+            $registry,
+            $session_id,
+            $agent,
+            $native_session_id,
+            $transcript_path,
+        )
+        .await
+    }};
+    (
+        $registry:expr;
+        session_id: $session_id:expr,
+        agent: $agent:expr,
+        native_session_id: $native_session_id:expr,
+        transcript_path: $transcript_path:expr $(,)?
+    ) => {
+        native_report_params(
+            $registry,
+            $session_id,
+            $agent,
+            $native_session_id,
+            $transcript_path,
+        )
+        .await
+    };
+}
 
 fn params() -> SessionNewParams {
     SessionNewParams {
@@ -59,6 +161,40 @@ fn production_registry_rejects_missing_durable_worker_backend() {
         ..SessionRegistryConfig::default()
     };
     SessionRegistry::new_production(configured).expect("configured production registry");
+}
+
+#[test]
+fn production_registry_rejects_invalid_observation_limits() {
+    let config = SessionRegistryConfig {
+        worker_runtime_root: Some(PathBuf::from("/run/user/1000/pohunek/workers")),
+        worker_state_root: Some(PathBuf::from("/home/user/.local/state/pohunek/workers")),
+        observation_output_bytes: 0,
+        ..SessionRegistryConfig::default()
+    };
+    let error = SessionRegistry::new_production(config)
+        .expect_err("production registry must reject zero observation limits");
+    assert_eq!(error.code, "observation_limits_invalid");
+
+    for config in [
+        SessionRegistryConfig {
+            worker_runtime_root: Some(PathBuf::from("/run/user/1000/pohunek/workers")),
+            worker_state_root: Some(PathBuf::from("/home/user/.local/state/pohunek/workers")),
+            observation_output_wait: Duration::from_millis(u64::from(
+                protocol::MAX_SESSION_WAIT_MS + 1,
+            )),
+            ..SessionRegistryConfig::default()
+        },
+        SessionRegistryConfig {
+            worker_runtime_root: Some(PathBuf::from("/run/user/1000/pohunek/workers")),
+            worker_state_root: Some(PathBuf::from("/home/user/.local/state/pohunek/workers")),
+            session_wait: Duration::from_millis(u64::from(protocol::MAX_SESSION_WAIT_MS + 1)),
+            ..SessionRegistryConfig::default()
+        },
+    ] {
+        let error = SessionRegistry::new_production(config)
+            .expect_err("production registry must reject waits above the shared ceiling");
+        assert_eq!(error.code, "observation_limits_invalid");
+    }
 }
 
 #[test]
@@ -114,6 +250,496 @@ fn old_worker_attach_failure_has_an_actionable_recovery_hint() {
         .is_some_and(|hint| hint.contains("restart") && hint.contains("fork")));
 }
 
+#[tokio::test]
+async fn managed_observation_returns_runtime_bound_screen_output_and_wait() {
+    use base64::prelude::{Engine as _, BASE64_STANDARD};
+
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "printf observation-ready; sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+
+    let screen = registry.screen(&created.id).await.expect("screen snapshot");
+    assert_eq!(screen.session_id, created.id);
+    assert_eq!(
+        screen.runtime.runtime_generation(),
+        RuntimeGeneration::new(1)
+    );
+
+    let output = registry
+        .output(
+            &SessionOutputParams::new(created.id.clone(), None, None, 4096, None)
+                .expect("output params"),
+        )
+        .await
+        .expect("output page");
+    let decoded = BASE64_STANDARD
+        .decode(output.data_base64())
+        .expect("valid output base64");
+    assert!(decoded
+        .windows(b"observation-ready".len())
+        .any(|window| { window == b"observation-ready" }));
+    assert_eq!(output.runtime(), &screen.runtime);
+
+    let wait = registry
+        .wait(
+            &SessionWaitParams::new(
+                created.id.clone(),
+                None,
+                None,
+                None,
+                None,
+                Some(vec![SessionState::Running]),
+                None,
+                100,
+            )
+            .expect("wait params"),
+        )
+        .await
+        .expect("already-satisfied wait");
+    assert_eq!(wait.reason, SessionWaitReason::StateMatched);
+
+    let stale_runtime = SessionRuntimeIdentity::new(
+        screen.runtime.runtime_id(),
+        RuntimeGeneration::new(screen.runtime.runtime_generation().get() + 1),
+    )
+    .expect("stale runtime identity");
+    let stale = registry
+        .output(
+            &SessionOutputParams::new(
+                created.id.clone(),
+                Some(stale_runtime),
+                Some(OutputOffset::new(0)),
+                16,
+                None,
+            )
+            .expect("stale output params"),
+        )
+        .await
+        .expect_err("stale generation must fail");
+    assert_eq!(stale.code, "session_runtime_changed");
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_wait_wakes_for_metadata_and_state_and_returns_timeout() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+
+    let metadata_params = SessionWaitParams::new(
+        created.id.clone(),
+        None,
+        Some(created.updated_at.clone()),
+        None,
+        None,
+        None,
+        None,
+        1_000,
+    )
+    .expect("metadata wait params");
+    let metadata_registry = registry.clone();
+    let metadata_wait = tokio::spawn(async move { metadata_registry.wait(&metadata_params).await });
+    tokio::task::yield_now().await;
+    registry
+        .set_metadata(
+            &created.id,
+            BTreeMap::from([("phase".to_owned(), Some("review".to_owned()))]),
+        )
+        .await
+        .expect("update metadata");
+    let metadata = metadata_wait
+        .await
+        .expect("metadata waiter task")
+        .expect("metadata waiter result");
+    assert_eq!(metadata.reason, SessionWaitReason::SessionUpdated);
+
+    let timeout = registry
+        .wait(
+            &SessionWaitParams::new(
+                created.id.clone(),
+                None,
+                None,
+                None,
+                None,
+                Some(vec![SessionState::Failed]),
+                None,
+                10,
+            )
+            .expect("timeout params"),
+        )
+        .await
+        .expect("timeout is a normal wait result");
+    assert_eq!(timeout.reason, SessionWaitReason::Timeout);
+
+    let state_params = SessionWaitParams::new(
+        created.id.clone(),
+        None,
+        None,
+        None,
+        None,
+        Some(vec![SessionState::Stopped]),
+        None,
+        1_000,
+    )
+    .expect("state wait params");
+    let state_registry = registry.clone();
+    let state_wait = tokio::spawn(async move { state_registry.wait(&state_params).await });
+    let live_runtime = created
+        .runtime
+        .as_ref()
+        .and_then(|runtime| {
+            Some(SessionRuntimeIdentity::new(
+                runtime.runtime_id.as_deref()?,
+                runtime.runtime_generation,
+            ))
+        })
+        .expect("live runtime identity")
+        .expect("valid runtime identity");
+    let runtime_params = SessionWaitParams::new(
+        created.id.clone(),
+        Some(live_runtime),
+        None,
+        None,
+        None,
+        None,
+        None,
+        1_000,
+    )
+    .expect("runtime wait params");
+    let runtime_registry = registry.clone();
+    let runtime_wait = tokio::spawn(async move { runtime_registry.wait(&runtime_params).await });
+    tokio::task::yield_now().await;
+    registry.stop(&created.id).await.expect("stop session");
+    let state = state_wait
+        .await
+        .expect("state waiter task")
+        .expect("state waiter result");
+    assert_eq!(state.reason, SessionWaitReason::StateMatched);
+    let runtime = runtime_wait
+        .await
+        .expect("runtime waiter task")
+        .expect("runtime waiter result");
+    assert_eq!(runtime.reason, SessionWaitReason::RuntimeChanged);
+}
+
+async fn assert_runtime_change_precedes_cursor_access(
+    registry: &SessionRegistry,
+    session_id: &SessionId,
+    runtime: &SessionRuntimeIdentity,
+) {
+    for (watermark, output) in [
+        (Some(TerminalWatermark::new(0)), None),
+        (None, Some(OutputOffset::new(0))),
+    ] {
+        let result = registry
+            .wait(
+                &SessionWaitParams::new(
+                    session_id.clone(),
+                    Some(runtime.clone()),
+                    None,
+                    watermark,
+                    output,
+                    None,
+                    None,
+                    100,
+                )
+                .expect("composite runtime/cursor wait"),
+            )
+            .await
+            .expect("runtime change wins before terminal access");
+        assert_eq!(result.reason, SessionWaitReason::RuntimeChanged);
+    }
+}
+
+#[tokio::test]
+async fn composite_wait_short_circuits_ended_lost_and_disappeared_runtimes() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+
+    let ended = registry
+        .create(params())
+        .await
+        .expect("create ended session");
+    let ended_runtime = SessionRuntimeIdentity::new(
+        ended
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.runtime_id.as_deref())
+            .expect("ended runtime id"),
+        ended
+            .runtime
+            .as_ref()
+            .expect("ended runtime")
+            .runtime_generation,
+    )
+    .expect("ended runtime identity");
+    registry.stop(&ended.id).await.expect("end session");
+    assert_runtime_change_precedes_cursor_access(&registry, &ended.id, &ended_runtime).await;
+
+    for runtime_case in [RuntimeState::Lost, RuntimeState::Reconnecting] {
+        let created = registry
+            .create(params())
+            .await
+            .expect("create live session");
+        let expected = SessionRuntimeIdentity::new(
+            created
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.runtime_id.as_deref())
+                .expect("live runtime id"),
+            created
+                .runtime
+                .as_ref()
+                .expect("live runtime")
+                .runtime_generation,
+        )
+        .expect("live runtime identity");
+        let (runtime_handle, runtime_info) = {
+            let mut sessions = registry.inner.sessions.lock().await;
+            let entry = sessions.get_mut(&created.id).expect("registered session");
+            let handle = entry.runtime.clone();
+            let info = entry.info.runtime.clone();
+            if runtime_case == RuntimeState::Lost {
+                entry.runtime = RuntimeHandle::Unavailable(RuntimeState::Lost);
+                entry.info.runtime.as_mut().expect("runtime").state = RuntimeState::Lost;
+            } else {
+                entry.info.runtime = None;
+            }
+            (handle, info)
+        };
+        assert_runtime_change_precedes_cursor_access(&registry, &created.id, &expected).await;
+        let () = {
+            let mut sessions = registry.inner.sessions.lock().await;
+            let entry = sessions.get_mut(&created.id).expect("registered session");
+            entry.runtime = runtime_handle;
+            entry.info.runtime = runtime_info;
+        };
+        let _ = registry.stop(&created.id).await;
+    }
+}
+
+#[cfg(unix)]
+const LIVE_IDENTITY_REPORTER: &str = r#"import datetime
+import json
+import os
+import socket
+import time
+
+reporter_pid = os.fork()
+if reporter_pid != 0:
+    time.sleep(30)
+    raise SystemExit(0)
+
+pid = os.getpid()
+with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+    fields = handle.read().rsplit(")", 1)[1].split()
+start_identity = int(fields[19])
+sequence = int(time.time() * 1000)
+
+def send(request):
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(os.environ["POHUNEK_WORKER_SOCKET_PATH"])
+    client.sendall((json.dumps(request) + "\n").encode())
+    response = json.loads(client.recv(4096).splitlines()[0])
+    client.close()
+    return response["ok"] is True
+
+report = {
+    "type": "identity_report",
+    "runtime_id": os.environ["POHUNEK_RUNTIME_ID"],
+    "provider": "claude",
+    "pid": pid,
+    "start_identity": start_identity,
+    "sequence": sequence,
+    "expires_at": (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=30)).isoformat().replace("+00:00", "Z"),
+    "reference_kind": "id",
+    "native_reference": "live-native",
+}
+wrong_runtime = dict(report, runtime_id="wrong-runtime")
+assert send(wrong_runtime) is False
+unknown_provider = dict(report, provider="future-provider")
+assert send(unknown_provider) is False
+overlong = dict(report, expires_at=(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=61)).isoformat().replace("+00:00", "Z"))
+assert send(overlong) is False
+wrong_process = dict(report, pid=1, start_identity=1)
+assert send(wrong_process) is False
+assert send(report) is True
+duplicate = dict(report, native_reference="rejected-native")
+assert send(duplicate) is False
+stale = dict(report, sequence=sequence - 1, native_reference="rejected-stale")
+assert send(stale) is False
+time.sleep(1)
+assert send({
+    "type": "identity_release",
+    "runtime_id": os.environ["POHUNEK_RUNTIME_ID"],
+    "provider": "claude",
+    "pid": pid,
+    "start_identity": start_identity,
+    "sequence": sequence + 1,
+}) is True
+late_after_release = dict(report, sequence=sequence + 1, native_reference="rejected-after-release")
+assert send(late_after_release) is False
+time.sleep(1)
+reasserted = dict(report, sequence=sequence + 2, native_reference="live-reasserted")
+assert send(reasserted) is True
+time.sleep(1)
+assert send({
+    "type": "identity_release",
+    "runtime_id": os.environ["POHUNEK_RUNTIME_ID"],
+    "provider": "claude",
+    "pid": pid,
+    "start_identity": start_identity,
+    "sequence": sequence + 3,
+}) is True
+os._exit(0)
+"#;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn worker_identity_changes_project_live_into_the_logical_session() {
+    let root = temp_dir("live-worker-identity-projection");
+    let reporter = root.join("identity_reporter.py");
+    std::fs::write(&reporter, LIVE_IDENTITY_REPORTER).expect("write identity reporter");
+    let agents_dir = temp_agents_dir_with(
+        "live-worker-identity-projection",
+        "identity-live",
+        &format!(
+            "base = \"claude\"\nprogram = \"python3\"\nargs = [\"{}\"]\n",
+            reporter.display()
+        ),
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(SessionNewParams {
+            agent: "identity-live".to_owned(),
+            cwd: Some(root),
+            ..params()
+        })
+        .await
+        .expect("create identity projection session");
+
+    let active_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let info = registry.inspect(&created.id).await.expect("inspect active");
+        if info.active_agent.as_deref() == Some("claude")
+            && info.active_agent_session_id.as_deref() == Some("live-native")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < active_deadline,
+            "worker identity report was not projected: {info:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let released_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let info = registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect release");
+        if info.active_agent.is_none() && info.active_agent_session_id.is_none() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < released_deadline,
+            "worker identity release was not projected: {info:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let reasserted_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let info = registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect reassertion");
+        if info.active_agent_session_id.as_deref() == Some("live-reasserted") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < reasserted_deadline,
+            "higher-sequence worker identity was not reasserted: {info:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let final_release_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let info = registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect final release");
+        if info.active_agent.is_none() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < final_release_deadline,
+            "final worker identity release was not projected: {info:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn mutations_fail_closed_for_an_unsupported_persisted_agent_kind() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let mut sessions = registry.inner.sessions.lock().await;
+    sessions
+        .get_mut(&created.id)
+        .expect("registered session")
+        .info
+        .agent_base = AgentKind::Unknown("future-agent".to_owned());
+    drop(sessions);
+
+    let error = registry
+        .stop(&created.id)
+        .await
+        .expect_err("unsupported agent mutation must fail closed");
+    assert_eq!(error.code, "agent_kind_unsupported");
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect unchanged session")
+            .state,
+        SessionState::Running
+    );
+
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&created.id)
+        .expect("registered session")
+        .info
+        .agent_base = AgentKind::Shell;
+    let _ = registry.stop(&created.id).await;
+}
+
 fn temp_store_path(tag: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -151,6 +777,16 @@ fn write_executable(path: &std::path::Path, body: &str) {
     let mut perms = fs::metadata(path).expect("metadata").permissions();
     perms.set_mode(0o700);
     fs::set_permissions(path, perms).expect("chmod executable");
+}
+
+#[cfg(unix)]
+fn write_supported_hermes_executable(path: &std::path::Path, launch_body: &str) {
+    write_executable(
+        path,
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf '%s\\n' 'Hermes Agent v0.20.0'\n  exit 0\nfi\n{launch_body}"
+        ),
+    );
 }
 
 #[cfg(unix)]
@@ -284,6 +920,22 @@ impl MockInspector {
 }
 
 impl ProcessInspector for MockInspector {
+    fn process(&self, pid: Pid) -> std::io::Result<Option<ProcessFact>> {
+        let fact = self
+            .inner
+            .lock()
+            .expect("mock inspector lock")
+            .descendants
+            .values()
+            .flatten()
+            .find(|fact| fact.pid == pid)
+            .cloned();
+        match fact {
+            Some(fact) => Ok(Some(fact)),
+            None => crate::procwatch::LinuxInspector::new().process(pid),
+        }
+    }
+
     fn same_user_processes(&self) -> std::io::Result<Vec<ProcessFact>> {
         let mut facts = self
             .inner
@@ -381,28 +1033,28 @@ async fn next_session_updated(rx: &mut tokio::sync::broadcast::Receiver<Event>) 
     let event = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             let event = rx.recv().await.expect("receive session event");
-            if event.event == protocol::event::SESSION_UPDATED {
+            if event.event() == protocol::event::SESSION_UPDATED {
                 break event;
             }
         }
     })
     .await
     .expect("session_updated event");
-    serde_json::from_value(event.payload["session"].clone()).expect("session info payload")
+    serde_json::from_value(event.payload()["session"].clone()).expect("session info payload")
 }
 
 async fn next_session_removed(rx: &mut tokio::sync::broadcast::Receiver<Event>) -> SessionInfo {
     let event = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             let event = rx.recv().await.expect("receive session event");
-            if event.event == protocol::event::SESSION_REMOVED {
+            if event.event() == protocol::event::SESSION_REMOVED {
                 break event;
             }
         }
     })
     .await
     .expect("session_removed event");
-    serde_json::from_value(event.payload["session"].clone()).expect("session info payload")
+    serde_json::from_value(event.payload()["session"].clone()).expect("session info payload")
 }
 
 async fn wait_for_cwd_source(
@@ -850,6 +1502,87 @@ async fn failed_launch_rolls_back_the_bound_worktree() {
         !listing.contains("feat/x"),
         "branch checkout must be pruned from git's worktree list: {listing}"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn incompatible_hermes_profile_fails_before_session_and_worktree_side_effects() {
+    for (case, version_output) in [
+        ("missing", None),
+        ("wrong", Some("Hermes Agent v0.21.0")),
+        ("unparseable", Some("unexpected provider output")),
+    ] {
+        let repo = init_git_repo(&format!("hermes-policy-{case}"));
+        let store_path = temp_store_path(&format!("hermes-policy-{case}"));
+        let root = store_path.parent().expect("store parent");
+        let worktree_root = root.join("worktrees");
+        let marker = root.join("launched");
+        let executable = root.join(format!("hermes-{case}"));
+        if let Some(version_output) = version_output {
+            write_executable(
+                &executable,
+                &format!(
+                    "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '%s\\n' '{version_output}'; exit 0; fi\ntouch {}\nsleep 30\n",
+                    marker.display()
+                ),
+            );
+        }
+        let agents_dir = temp_agents_dir_with(
+            &format!("hermes-policy-{case}"),
+            "hermes-policy",
+            &format!(
+                "base = \"hermes\"\nprogram = \"{}\"\nargs = [\"chat\"]\n",
+                executable.display()
+            ),
+        );
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            agents_dir: Some(agents_dir),
+            store_path: Some(store_path.clone()),
+            worktree_root: Some(worktree_root.clone()),
+            ..SessionRegistryConfig::default()
+        });
+
+        let error = registry
+            .create(SessionNewParams {
+                agent: "hermes-policy".to_owned(),
+                cwd: None,
+                repo: Some(repo.clone()),
+                branch: Some(format!("feat/hermes-{case}")),
+                ..params()
+            })
+            .await
+            .expect_err("incompatible Hermes runtime must fail before launch");
+
+        assert_eq!(error.code, "agent_runtime_unsupported");
+        assert!(!error.msg.contains(&executable.display().to_string()));
+        if let Some(version_output) = version_output {
+            assert!(!error.msg.contains(version_output));
+        }
+        assert!(registry.list().await.is_empty());
+        assert!(
+            !marker.exists(),
+            "Hermes process must not launch for {case}"
+        );
+        let worktrees = std::fs::read_dir(&worktree_root)
+            .map(|entries| entries.filter_map(Result::ok).count())
+            .unwrap_or_default();
+        assert_eq!(worktrees, 0, "no worktree side effect for {case}");
+        assert!(
+            crate::store::Store::new(store_path)
+                .load_sessions()
+                .expect("load sessions")
+                .is_empty(),
+            "no logical session record for {case}"
+        );
+        let worktree_listing = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .expect("list git worktrees");
+        assert!(worktree_listing.status.success());
+        assert!(!String::from_utf8_lossy(&worktree_listing.stdout).contains("feat/hermes-"));
+    }
 }
 
 #[tokio::test]
@@ -1665,12 +2398,12 @@ async fn session_stop_hook_reports_stopped_done_and_failed_reasons_once() {
             .await
             .expect("create session");
         let recorded = registry
-            .report_native_id(SessionReportNativeIdParams {
+            .report_native_id(native_report!(&registry;
                 session_id: created.id.clone(),
                 agent: "claude".to_owned(),
                 native_session_id: format!("native-{tag}"),
                 transcript_path: None,
-            })
+            ))
             .await;
         assert!(recorded.recorded, "native id captured for {tag}");
         assert_eq!(
@@ -2052,7 +2785,7 @@ async fn agent_state_hook_dispatcher_survives_lag_and_shutdown_cancellation() {
         .await;
     let (tx, rx) = tokio::sync::broadcast::channel(1);
     for n in 0..8 {
-        let _ = tx.send(Event::new(
+        let _ = tx.send(crate::events::event(
             protocol::event::SESSION_UPDATED,
             serde_json::json!({ "n": n }),
         ));
@@ -2061,7 +2794,7 @@ async fn agent_state_hook_dispatcher_survives_lag_and_shutdown_cancellation() {
     let handle = super::spawn_agent_state_hook_dispatcher(registry.clone(), rx, shutdown.clone());
     wait_for_file_contains(&marker, "working").await;
     for n in 8..16 {
-        let _ = tx.send(Event::new(
+        let _ = tx.send(crate::events::event(
             protocol::event::SESSION_UPDATED,
             serde_json::json!({ "n": n }),
         ));
@@ -2077,7 +2810,7 @@ async fn agent_state_hook_dispatcher_survives_lag_and_shutdown_cancellation() {
     registry
         .record_activity(&created.id, transition(AgentActivity::Blocked))
         .await;
-    tx.send(Event::new(
+    tx.send(crate::events::event(
         protocol::event::AGENT_STATE,
         serde_json::json!({
             "session_id": created.id.clone(),
@@ -2130,7 +2863,7 @@ async fn agent_state_hook_dispatcher_flushes_buffered_event_on_shutdown() {
     let (tx, rx) = tokio::sync::broadcast::channel(16);
     let shutdown = tokio_util::sync::CancellationToken::new();
     let handle = super::spawn_agent_state_hook_dispatcher(registry.clone(), rx, shutdown.clone());
-    tx.send(Event::new(
+    tx.send(crate::events::event(
         protocol::event::AGENT_STATE,
         serde_json::json!({
             "session_id": created.id.clone(),
@@ -2617,11 +3350,9 @@ async fn inspect_missing_session_returns_not_found() {
 fn bracketed_paste_input_frame_wraps_text_and_submit_together() {
     let writes = super::build_input_writes(
         "hello\nworld",
-        InputRules {
-            bracketed_paste: true,
-            submit_delay: Duration::ZERO,
-        },
-    );
+        InputRules::unrestricted(true, Duration::ZERO),
+    )
+    .expect("unrestricted input");
 
     assert_eq!(
         writes.immediate,
@@ -2634,17 +3365,98 @@ fn bracketed_paste_input_frame_wraps_text_and_submit_together() {
 fn delayed_submit_input_frame_splits_text_and_submit() {
     let writes = super::build_input_writes(
         "hello Claude",
-        InputRules {
-            bracketed_paste: false,
-            submit_delay: Duration::from_millis(150),
-        },
-    );
+        InputRules::unrestricted(false, Duration::from_millis(150)),
+    )
+    .expect("unrestricted input");
 
     assert_eq!(writes.immediate, b"hello Claude".to_vec());
     assert_eq!(
         writes.delayed_submit,
         Some((Duration::from_millis(150), b"\r".to_vec()))
     );
+}
+
+#[test]
+fn hermes_multiline_input_is_one_bracketed_paste_then_separate_submit() {
+    let rules = super::input_rules_for_agent(&AgentKind::Hermes, &SessionRegistryConfig::default());
+    let writes = super::build_input_writes("first line\nsecond line", rules)
+        .expect("Hermes multiline safe text");
+
+    assert_eq!(
+        writes.immediate,
+        b"\x1b[200~first line\nsecond line\x1b[201~".to_vec()
+    );
+    assert_eq!(
+        writes.delayed_submit,
+        Some((Duration::from_millis(150), b"\r".to_vec()))
+    );
+}
+
+#[test]
+fn hermes_input_rejects_terminal_controls_without_mutating_text() {
+    let rules = super::input_rules_for_agent(&AgentKind::Hermes, &SessionRegistryConfig::default());
+    for unsafe_text in [
+        "prompt\u{1b}[201~\rsubmit",
+        "prompt\0suffix",
+        "prompt\rsuffix",
+        "prompt\u{7f}suffix",
+        "prompt\u{85}suffix",
+    ] {
+        let error = super::build_input_writes(unsafe_text, rules)
+            .expect_err("Hermes terminal control must be rejected");
+        assert_eq!(error.code, "session_input_rejected");
+        assert!(!error.msg.contains(unsafe_text));
+    }
+
+    let safe = super::build_input_writes("first\n\tsecond", rules)
+        .expect("Hermes allows intentional multiline LF and tab");
+    assert_eq!(
+        safe.immediate,
+        b"\x1b[200~first\n\tsecond\x1b[201~".to_vec()
+    );
+}
+
+#[test]
+fn hermes_input_enforces_shared_byte_ceiling() {
+    let rules = super::input_rules_for_agent(&AgentKind::Hermes, &SessionRegistryConfig::default());
+    let at_limit = "x".repeat(protocol::MAX_SESSION_INPUT_BYTES);
+    super::build_input_writes(&at_limit, rules).expect("Hermes input at the ceiling is accepted");
+
+    let over_limit = "x".repeat(protocol::MAX_SESSION_INPUT_BYTES + 1);
+    let error = super::build_input_writes(&over_limit, rules)
+        .expect_err("Hermes input above the shared ceiling must be rejected");
+    assert_eq!(error.code, "session_input_rejected");
+}
+
+#[test]
+fn codex_input_control_behavior_is_unchanged() {
+    let rules = super::input_rules_for_agent(&AgentKind::Codex, &SessionRegistryConfig::default());
+    let text = "prompt\u{1b}[201~\rsubmit";
+    let writes = super::build_input_writes(text, rules).expect("Codex remains unrestricted");
+
+    assert!(writes
+        .immediate
+        .windows(text.len())
+        .any(|window| window == text.as_bytes()));
+}
+
+#[test]
+fn hermes_programmatic_input_fails_closed_while_blocked() {
+    let hermes =
+        super::input_rules_for_agent(&AgentKind::Hermes, &SessionRegistryConfig::default());
+    let error = hermes
+        .validate_activity(Some(AgentActivity::Blocked))
+        .expect_err("Hermes input must be denied while approval is visible");
+    assert_eq!(error.code, "session_input_blocked");
+    assert!(!error.msg.contains("terminal"));
+
+    hermes
+        .validate_activity(Some(AgentActivity::Idle))
+        .expect("Hermes input is allowed after approval clears");
+    let codex = super::input_rules_for_agent(&AgentKind::Codex, &SessionRegistryConfig::default());
+    codex
+        .validate_activity(Some(AgentActivity::Blocked))
+        .expect("Codex blocked-input behavior remains unchanged");
 }
 
 #[test]
@@ -2692,6 +3504,24 @@ fn shell_launch_keeps_initial_input_for_pty_injection() {
 }
 
 #[test]
+fn bare_hermes_keeps_initial_input_for_pty_injection() {
+    let resolved = crate::agent::ProfileRegistry::default()
+        .resolve_agent("hermes")
+        .expect("resolve bare Hermes");
+    let plan = super::plan_initial_input_delivery(
+        &resolved,
+        pty_command("hermes", ["chat"]),
+        Some("first line\nsecond line".to_owned()),
+    );
+
+    assert_eq!(plan.command.args, vec!["chat"]);
+    assert_eq!(
+        plan.pending_initial_input.as_deref(),
+        Some("first line\nsecond line")
+    );
+}
+
+#[test]
 fn host_profile_launch_keeps_initial_input_for_pty_injection() {
     let agents_dir = temp_dir("profile-initial-prompt-agents");
     fs::write(
@@ -2728,7 +3558,12 @@ fn hook_env_injected_for_every_agent_kind_with_socket() {
     });
     let id = SessionId("s-7".to_owned());
 
-    for agent in [AgentKind::Shell, AgentKind::Codex, AgentKind::Claude] {
+    for agent in [
+        AgentKind::Shell,
+        AgentKind::Codex,
+        AgentKind::Claude,
+        AgentKind::Hermes,
+    ] {
         let env = registry.hook_env(agent, &id);
         let lookup = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
         assert_eq!(lookup(ENV_FLAG).as_deref(), Some("1"));
@@ -2766,7 +3601,7 @@ fn session_pty_env_marks_session_id_for_every_agent_kind() {
     // instance, and POHUNEK_SESSION_ID must not be duplicated on top of the
     // hook env that already carries it.
     for agent in [AgentKind::Shell, AgentKind::Codex, AgentKind::Claude] {
-        let env = registry.session_pty_env(agent, &id);
+        let env = registry.session_pty_env(agent.clone(), &id);
         let lookup = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
         let session_ids: Vec<&str> = env
             .iter()
@@ -2826,7 +3661,7 @@ async fn report_agent_on_shell_session_sets_active_agent_without_changing_launch
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Working),
-            seq: Some(1),
+            seq: Some(ReportSequence::new(1)),
             pid: None,
             agent_session_id: Some("codex-native".to_owned()),
             agent_session_path: None,
@@ -2902,7 +3737,7 @@ async fn report_agent_reconfigures_detector_and_release_restores_default_config(
             source: "pohunek:nested-codex".to_owned(),
             agent: "nested-codex".to_owned(),
             activity: Some(AgentActivity::Working),
-            seq: Some(1),
+            seq: Some(ReportSequence::new(1)),
             pid: None,
             agent_session_id: None,
             agent_session_path: None,
@@ -2924,7 +3759,7 @@ async fn report_agent_reconfigures_detector_and_release_restores_default_config(
             session_id: created.id.clone(),
             source: "pohunek:nested-codex".to_owned(),
             agent: "nested-codex".to_owned(),
-            seq: Some(1),
+            seq: Some(ReportSequence::new(1)),
         })
         .await;
     assert!(release.released);
@@ -2993,7 +3828,7 @@ async fn release_agent_clears_current_active_agent_but_ignores_stale_sequence() 
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Working),
-            seq: Some(10),
+            seq: Some(ReportSequence::new(10)),
             pid: None,
             agent_session_id: Some("codex-newer".to_owned()),
             agent_session_path: None,
@@ -3006,7 +3841,7 @@ async fn release_agent_clears_current_active_agent_but_ignores_stale_sequence() 
             session_id: created.id.clone(),
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
-            seq: Some(9),
+            seq: Some(ReportSequence::new(9)),
         })
         .await;
     assert!(!stale_release.released);
@@ -3022,7 +3857,7 @@ async fn release_agent_clears_current_active_agent_but_ignores_stale_sequence() 
             session_id: created.id.clone(),
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
-            seq: Some(10),
+            seq: Some(ReportSequence::new(10)),
         })
         .await;
     assert!(current_release.released);
@@ -3055,7 +3890,7 @@ async fn report_agent_release_with_no_sequence_does_not_clear_newer_sequenced_re
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Working),
-            seq: Some(10),
+            seq: Some(ReportSequence::new(10)),
             pid: None,
             agent_session_id: Some("codex-newer".to_owned()),
             agent_session_path: None,
@@ -3101,7 +3936,7 @@ async fn report_agent_with_no_sequence_does_not_overwrite_newer_sequenced_report
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Working),
-            seq: Some(10),
+            seq: Some(ReportSequence::new(10)),
             pid: None,
             agent_session_id: Some("codex-newer".to_owned()),
             agent_session_path: None,
@@ -3152,7 +3987,7 @@ async fn report_agent_release_tombstone_rejects_delayed_lower_sequence() {
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Blocked),
-            seq: Some(10),
+            seq: Some(ReportSequence::new(10)),
             pid: None,
             agent_session_id: Some("codex-seq-10".to_owned()),
             agent_session_path: None,
@@ -3165,7 +4000,7 @@ async fn report_agent_release_tombstone_rejects_delayed_lower_sequence() {
             session_id: created.id.clone(),
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
-            seq: Some(11),
+            seq: Some(ReportSequence::new(11)),
         })
         .await;
     assert!(release.released);
@@ -3189,7 +4024,7 @@ async fn report_agent_release_tombstone_rejects_delayed_lower_sequence() {
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Blocked),
-            seq: Some(10),
+            seq: Some(ReportSequence::new(10)),
             pid: None,
             agent_session_id: Some("codex-stale".to_owned()),
             agent_session_path: None,
@@ -3210,7 +4045,7 @@ async fn report_agent_release_tombstone_rejects_delayed_lower_sequence() {
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Blocked),
-            seq: Some(12),
+            seq: Some(ReportSequence::new(12)),
             pid: None,
             agent_session_id: Some("codex-seq-12".to_owned()),
             agent_session_path: None,
@@ -3247,7 +4082,7 @@ async fn report_agent_activity_blocks_detector_until_release() {
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Blocked),
-            seq: Some(1),
+            seq: Some(ReportSequence::new(1)),
             pid: None,
             agent_session_id: None,
             agent_session_path: None,
@@ -3267,7 +4102,7 @@ async fn report_agent_activity_blocks_detector_until_release() {
             session_id: created.id.clone(),
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
-            seq: Some(1),
+            seq: Some(ReportSequence::new(1)),
         })
         .await;
     assert!(release.released);
@@ -3300,7 +4135,7 @@ async fn report_agent_without_activity_keeps_detector_activity_enabled() {
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             activity: None,
-            seq: Some(1),
+            seq: Some(ReportSequence::new(1)),
             pid: None,
             agent_session_id: Some("codex-native".to_owned()),
             agent_session_path: None,
@@ -3325,7 +4160,7 @@ async fn report_agent_without_activity_keeps_detector_activity_enabled() {
             session_id: created.id.clone(),
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
-            seq: Some(1),
+            seq: Some(ReportSequence::new(1)),
         })
         .await;
     assert!(release.released);
@@ -3358,7 +4193,7 @@ async fn report_agent_active_metadata_is_cleared_on_terminal_session() {
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Blocked),
-            seq: Some(1),
+            seq: Some(ReportSequence::new(1)),
             pid: None,
             agent_session_id: Some("codex-native".to_owned()),
             agent_session_path: Some("/tmp/codex-session.jsonl".to_owned()),
@@ -3396,7 +4231,7 @@ async fn report_agent_returns_false_for_unknown_agent() {
             source: "pohunek:unknown".to_owned(),
             agent: "not-a-real-agent".to_owned(),
             activity: Some(AgentActivity::Working),
-            seq: Some(1),
+            seq: Some(ReportSequence::new(1)),
             pid: None,
             agent_session_id: None,
             agent_session_path: None,
@@ -3415,6 +4250,7 @@ fn codex_fact(process_id: Pid, parent_id: Pid) -> ProcessFact {
     ProcessFact {
         pid: process_id,
         ppid: parent_id,
+        start_identity: u64::from(process_id),
         comm: "codex".to_owned(),
         cmdline: vec!["/usr/bin/codex".to_owned()],
     }
@@ -3424,6 +4260,7 @@ fn claude_fact(process_id: Pid, parent_id: Pid) -> ProcessFact {
     ProcessFact {
         pid: process_id,
         ppid: parent_id,
+        start_identity: u64::from(process_id),
         comm: "claude".to_owned(),
         cmdline: vec!["/usr/bin/claude".to_owned()],
     }
@@ -3528,7 +4365,7 @@ async fn report_release_matrix_agent(registry: &SessionRegistry, created: &Sessi
             source: CODEX_HOOK_SOURCE.to_owned(),
             agent: CODEX_HOOK_AGENT.to_owned(),
             activity: Some(AgentActivity::Working),
-            seq: Some(RELEASE_MATRIX_REPORT_SEQ),
+            seq: Some(ReportSequence::new(RELEASE_MATRIX_REPORT_SEQ)),
             pid: Some(RELEASE_MATRIX_AGENT_PID),
             agent_session_id: Some(RELEASE_MATRIX_NATIVE_ID.to_owned()),
             agent_session_path: None,
@@ -3558,7 +4395,7 @@ async fn direct_agent_root_pid_hook_claim_survives_procwatch_reconciles() {
             source: CODEX_HOOK_SOURCE.to_owned(),
             agent: CODEX_HOOK_AGENT.to_owned(),
             activity: Some(AgentActivity::Working),
-            seq: Some(DIRECT_AGENT_REPORT_SEQ),
+            seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
             pid: Some(created.pid),
             agent_session_id: Some("direct-native".to_owned()),
             agent_session_path: None,
@@ -3659,7 +4496,7 @@ async fn procwatch_reconciles_unbound_claim_after_descendants_error() {
             source: CODEX_HOOK_SOURCE.to_owned(),
             agent: CODEX_HOOK_AGENT.to_owned(),
             activity: Some(AgentActivity::Working),
-            seq: Some(DIRECT_AGENT_REPORT_SEQ),
+            seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
             pid: None,
             agent_session_id: Some("codex-unbound".to_owned()),
             agent_session_path: None,
@@ -3860,7 +4697,7 @@ async fn active_agent_release_matrix_covers_hook_fast_path_and_procwatch_backsto
             session_id: hook_created.id.clone(),
             source: CODEX_HOOK_SOURCE.to_owned(),
             agent: CODEX_HOOK_AGENT.to_owned(),
-            seq: Some(RELEASE_MATRIX_RELEASE_SEQ),
+            seq: Some(ReportSequence::new(RELEASE_MATRIX_RELEASE_SEQ)),
         })
         .await;
     assert!(release.released);
@@ -3909,7 +4746,7 @@ async fn procwatch_releases_hook_claim_when_observed_pid_exits() {
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Working),
-            seq: Some(10),
+            seq: Some(ReportSequence::new(10)),
             pid: Some(100),
             agent_session_id: Some("codex-native".to_owned()),
             agent_session_path: None,
@@ -3952,7 +4789,7 @@ async fn procwatch_late_hook_report_for_dead_pid_is_cleared_on_reconcile() {
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Working),
-            seq: Some(20),
+            seq: Some(ReportSequence::new(20)),
             pid: Some(100),
             agent_session_id: Some("late-native".to_owned()),
             agent_session_path: None,
@@ -4001,7 +4838,7 @@ async fn procwatch_expires_unbound_hook_claim_after_ttl() {
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Working),
-            seq: Some(30),
+            seq: Some(ReportSequence::new(30)),
             pid: None,
             agent_session_id: Some("codex-native".to_owned()),
             agent_session_path: None,
@@ -4070,7 +4907,7 @@ async fn procwatch_rebinds_restart_to_new_observed_pid() {
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Working),
-            seq: Some(40),
+            seq: Some(ReportSequence::new(40)),
             pid: Some(100),
             agent_session_id: Some("old-native".to_owned()),
             agent_session_path: None,
@@ -4113,12 +4950,12 @@ async fn report_native_id_records_binding_and_updates_info() {
     assert_eq!(created.native_session_id, None);
 
     let result = registry
-        .report_native_id(SessionReportNativeIdParams {
+        .report_native_id(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-abc".to_owned(),
             transcript_path: None,
-        })
+        ))
         .await;
     assert!(result.recorded);
 
@@ -4136,8 +4973,924 @@ async fn report_native_id_records_binding_and_updates_info() {
         persisted[0].native_session_id.as_deref(),
         Some("native-abc")
     );
+    let sessions = crate::store::Store::new(store_path)
+        .load_sessions()
+        .expect("reload durable sessions");
+    let ordering = sessions[0]
+        .native_identity_ordering
+        .as_ref()
+        .expect("native identity ordering persisted");
+    assert!(
+        !native_report_is_current(Some(ordering), &ordering.runtime_id, ordering.sequence - 1),
+        "a lower sequence must remain stale after the ordering key is reloaded"
+    );
 
     let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn concurrent_session_writes_cannot_regress_native_ordering() {
+    let store_path = temp_store_path("native-ordering-concurrent");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        agents_dir: Some(temp_resumable_agents_dir("native-ordering-concurrent")),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(resumable_params())
+        .await
+        .expect("create session");
+    assert!(
+        registry
+            .report_native_id(native_report!(&registry;
+                session_id: created.id.clone(),
+                agent: "claude".to_owned(),
+                native_session_id: "native-initial".to_owned(),
+                transcript_path: None,
+            ))
+            .await
+            .recorded
+    );
+    let store = Arc::new(crate::store::Store::new(store_path));
+    let base = store
+        .load_sessions()
+        .expect("load base record")
+        .pop()
+        .expect("base session record");
+    let runtime_id = base.runtime.runtime_id.clone().expect("runtime identity");
+    let older = native_ordering_record(
+        &base,
+        &runtime_id,
+        created.pid,
+        u64::MAX - 1,
+        "native-older",
+    );
+    let newer = native_ordering_record(&base, &runtime_id, created.pid, u64::MAX, "native-newer");
+    write_newer_then_older(Arc::clone(&store), older.clone(), newer);
+    let collision = native_ordering_record(
+        &base,
+        &runtime_id,
+        created.pid,
+        u64::MAX,
+        "native-collision",
+    );
+    store
+        .record_session(&collision)
+        .expect("attempt equal-sequence identity collision");
+    store
+        .record_resume(collision.recovery.as_ref().expect("collision recovery"))
+        .expect("attempt equal-sequence resume collision");
+
+    let mut delayed_resize = older;
+    delayed_resize.info.cols = 132;
+    store
+        .record_session(&delayed_resize)
+        .expect("write delayed resize snapshot");
+    let persisted = store
+        .load_sessions()
+        .expect("reload ordered record")
+        .pop()
+        .expect("persisted session");
+    assert_eq!(persisted.info.cols, 132);
+    assert_eq!(
+        persisted
+            .native_identity_ordering
+            .as_ref()
+            .expect("persisted ordering")
+            .sequence,
+        u64::MAX
+    );
+    assert_eq!(
+        persisted.info.native_session_id.as_deref(),
+        Some("native-newer")
+    );
+    assert_eq!(
+        store
+            .load_resume()
+            .expect("reload ordered resume")
+            .pop()
+            .and_then(|binding| binding.native_session_id),
+        Some("native-newer".to_owned())
+    );
+    assert_eq!(
+        persisted
+            .recovery
+            .as_ref()
+            .and_then(|binding| binding.native_session_id.as_deref()),
+        Some("native-newer")
+    );
+
+    assert_previous_runtime_cannot_overwrite(&store, &persisted, &delayed_resize);
+    let _ = registry.stop(&created.id).await;
+}
+
+fn assert_previous_runtime_cannot_overwrite(
+    store: &crate::store::Store,
+    persisted: &crate::store::SessionRecord,
+    delayed: &crate::store::SessionRecord,
+) {
+    let mut next_runtime = persisted.clone();
+    let next_generation = next_runtime
+        .info
+        .runtime
+        .as_ref()
+        .expect("runtime projection")
+        .runtime_generation
+        .get()
+        + 1;
+    let runtime = next_runtime
+        .info
+        .runtime
+        .as_mut()
+        .expect("runtime projection");
+    runtime.runtime_generation = RuntimeGeneration::new(next_generation);
+    runtime.runtime_id = Some("runtime-next".to_owned());
+    next_runtime.runtime.runtime_id = Some("runtime-next".to_owned());
+    next_runtime.native_identity_ordering = None;
+    next_runtime.info.cols = 144;
+    store
+        .record_session(&next_runtime)
+        .expect("write next runtime generation");
+    store
+        .record_resume(next_runtime.recovery.as_ref().expect("next recovery"))
+        .expect("write next runtime resume");
+    store
+        .record_session(delayed)
+        .expect("attempt previous-runtime physical write");
+    store
+        .record_resume(delayed.recovery.as_ref().expect("older recovery"))
+        .expect("attempt previous-runtime resume write");
+    let persisted = store
+        .load_sessions()
+        .expect("reload next runtime record")
+        .pop()
+        .expect("persisted next runtime");
+    let runtime = persisted.info.runtime.as_ref().expect("persisted runtime");
+    assert_eq!(
+        runtime.runtime_generation,
+        RuntimeGeneration::new(next_generation)
+    );
+    assert_eq!(runtime.runtime_id.as_deref(), Some("runtime-next"));
+    assert_eq!(
+        persisted.runtime.runtime_id.as_deref(),
+        Some("runtime-next")
+    );
+    assert_eq!(persisted.info.cols, 144);
+    assert_eq!(
+        store
+            .load_resume()
+            .expect("reload next runtime resume")
+            .pop()
+            .and_then(|binding| binding.native_session_id),
+        Some("native-newer".to_owned())
+    );
+
+    let base = persisted;
+    let mut newer_same_runtime = base.clone();
+    newer_same_runtime.info.cols = 155;
+    store
+        .record_session(&newer_same_runtime)
+        .expect("persist newer same-runtime resize");
+    let mut stale_terminal = base.clone();
+    stale_terminal.info.state = SessionState::Done;
+    stale_terminal.info.runtime.as_mut().expect("runtime").state = RuntimeState::Terminal;
+    stale_terminal.runtime.state = RuntimeState::Terminal;
+    assert_eq!(
+        store
+            .record_session_if_current(&base, &stale_terminal)
+            .expect("reject stale conditional transition"),
+        crate::store::SessionWriteOutcome::StaleSnapshot
+    );
+    let durable = store
+        .load_sessions()
+        .expect("reload after rejected conditional transition")
+        .pop()
+        .expect("durable record");
+    assert_eq!(durable.info.cols, 155);
+    assert_eq!(durable.info.state, SessionState::Running);
+}
+
+#[tokio::test]
+async fn concurrent_equal_generation_commits_publish_only_the_durable_winner() {
+    let store_path = temp_store_path("runtime-commit-race");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create base session");
+    registry.stop(&created.id).await.expect("stop base session");
+    let base = registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .remove(&created.id)
+        .expect("remove base registry entry");
+    let candidate_a = runtime_commit_candidate(base.clone(), "runtime-a");
+    let candidate_b = runtime_commit_candidate(base, "runtime-b");
+    let mut preparing = SessionRegistry::session_record(
+        &created.id,
+        &candidate_a,
+        crate::store::DesiredState::Running,
+        None,
+    );
+    preparing.info.state = SessionState::Starting;
+    preparing
+        .info
+        .runtime
+        .as_mut()
+        .expect("preparing runtime")
+        .runtime_id = None;
+    preparing.runtime.runtime_id = None;
+    let store = crate::store::Store::new(store_path);
+    assert_eq!(
+        store.record_session(&preparing).expect("persist preparing"),
+        crate::store::SessionWriteOutcome::Applied
+    );
+    registry
+        .inner
+        .store
+        .as_ref()
+        .expect("registry store")
+        .fail_next_parent_sync_after_rename();
+
+    let mut events = registry.subscribe();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let first = commit_runtime_candidate(
+        registry.clone(),
+        Arc::clone(&barrier),
+        created.id.clone(),
+        candidate_a,
+    );
+    let second =
+        commit_runtime_candidate(registry.clone(), barrier, created.id.clone(), candidate_b);
+    let (first, second) = tokio::join!(first, second);
+    let winner = match (first, second) {
+        (Ok(winner), Err(error)) | (Err(error), Ok(winner)) => {
+            assert_eq!(error.code, "session_runtime_commit_stale");
+            winner
+        }
+        outcomes => panic!("exactly one runtime commit must win: {outcomes:?}"),
+    };
+    assert_runtime_commit_winner(&registry, &store, &created.id, &winner).await;
+    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("winner event timeout")
+        .expect("winner event");
+    assert_eq!(event.event(), protocol::event::SESSION_UPDATED);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), events.recv())
+            .await
+            .is_err(),
+        "losing runtime must not publish a success event"
+    );
+}
+
+#[tokio::test]
+async fn stale_runtime_watchers_emit_nothing_during_new_runtime_commit() {
+    let store_path = temp_store_path("stale-watcher-commit-window");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create base session");
+    registry.stop(&created.id).await.expect("stop base session");
+    let base = registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .remove(&created.id)
+        .expect("remove base registry entry");
+    let old_runtime = runtime_commit_candidate_for_generation(base.clone(), "runtime-old", 1);
+    let expected_old =
+        super::RuntimeWatchIdentity::from_info(&old_runtime.info).expect("old watcher identity");
+    let new_runtime = runtime_commit_candidate(base, "runtime-new");
+    let new_record = SessionRegistry::session_record(
+        &created.id,
+        &new_runtime,
+        crate::store::DesiredState::Running,
+        None,
+    );
+    let store = crate::store::Store::new(store_path);
+    assert_eq!(
+        store
+            .record_session(&new_record)
+            .expect("commit new runtime"),
+        crate::store::SessionWriteOutcome::Applied
+    );
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .insert(created.id.clone(), new_runtime);
+    let mut events = registry.subscribe();
+
+    let _ = registry
+        .record_exit(
+            &created.id,
+            RuntimeExit {
+                exit_code: Some(0),
+                success: true,
+            },
+            false,
+            Some(&expected_old),
+            None,
+        )
+        .await;
+    registry
+        .mark_worker_lost(
+            &created.id,
+            &expected_old,
+            &WorkerError::Protocol("test disconnect".to_owned()),
+        )
+        .await;
+    assert!(
+        !registry
+            .mark_worker_reconnecting(
+                &created.id,
+                &expected_old,
+                &WorkerError::Protocol("test reconnect".to_owned()),
+            )
+            .await,
+        "stale reconnect callback must stop its watcher"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), events.recv())
+            .await
+            .is_err(),
+        "stale runtime watchers must not publish lifecycle events"
+    );
+
+    assert_runtime_commit_winner(&registry, &store, &created.id, "runtime-new").await;
+}
+
+#[tokio::test]
+async fn reconnect_rejects_a_replacement_worker_before_mutating_registry() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(temp_store_path("reconnect-identity-mismatch")),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, original) = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("live entry");
+        let RuntimeHandle::Worker(worker) = &entry.runtime else {
+            panic!("worker runtime");
+        };
+        let original = entry.info.runtime.clone().expect("runtime info");
+        entry
+            .info
+            .runtime
+            .as_mut()
+            .expect("runtime info")
+            .runtime_id = Some("runtime-old".to_owned());
+        (worker.clone(), original)
+    };
+    let expected = {
+        let sessions = registry.inner.sessions.lock().await;
+        super::RuntimeWatchIdentity::from_info(&sessions[&created.id].info)
+            .expect("old runtime identity")
+    };
+    let mut events = registry.subscribe();
+
+    let outcome = registry
+        .adopt_reconnected_worker(&created.id, &expected, worker)
+        .await;
+
+    assert!(matches!(
+        outcome,
+        super::RuntimeTransitionOutcome::IdentityMismatch
+    ));
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect unchanged entry")
+            .runtime
+            .and_then(|runtime| runtime.runtime_id),
+        Some("runtime-old".to_owned())
+    );
+    assert_no_runtime_event(&mut events).await;
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&created.id)
+        .expect("restore live entry")
+        .info
+        .runtime = Some(original);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn reconnect_persistence_failure_retries_without_orphaning_live_handle() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(temp_store_path("reconnect-persist-retry")),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, expected) = live_worker_and_identity(&registry, &created.id).await;
+    assert!(
+        registry
+            .mark_worker_reconnecting(
+                &created.id,
+                &expected,
+                &WorkerError::Protocol("test disconnect".to_owned()),
+            )
+            .await
+    );
+    let mut events = registry.subscribe();
+    registry
+        .inner
+        .store
+        .as_ref()
+        .expect("registry store")
+        .fail_next_write_before_rename();
+
+    let failed = registry
+        .adopt_reconnected_worker(&created.id, &expected, worker.clone())
+        .await;
+    assert!(matches!(
+        failed,
+        super::RuntimeTransitionOutcome::RetryablePersistenceFailure(_)
+    ));
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect reconnecting entry")
+            .runtime
+            .expect("runtime")
+            .state,
+        RuntimeState::Reconnecting
+    );
+    assert!(matches!(
+        registry
+            .adopt_reconnected_worker(&created.id, &expected, worker.clone())
+            .await,
+        super::RuntimeTransitionOutcome::Applied(_)
+    ));
+    assert_eq!(
+        next_runtime_event(&mut events).await,
+        protocol::event::SESSION_RUNTIME_RECONNECTED
+    );
+
+    assert!(
+        registry
+            .mark_worker_reconnecting(
+                &created.id,
+                &expected,
+                &WorkerError::Protocol("test second disconnect".to_owned()),
+            )
+            .await
+    );
+    registry
+        .inner
+        .store
+        .as_ref()
+        .expect("registry store")
+        .fail_next_parent_sync_after_rename();
+    assert!(matches!(
+        registry
+            .adopt_reconnected_worker(&created.id, &expected, worker)
+            .await,
+        super::RuntimeTransitionOutcome::Applied(_)
+    ));
+    assert_eq!(
+        next_runtime_event(&mut events).await,
+        protocol::event::SESSION_RUNTIME_RECONNECTED
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn lost_transition_retries_precommit_failure_before_single_event() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(temp_store_path("lost-persist-retry")),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, expected) = live_worker_and_identity(&registry, &created.id).await;
+    assert!(
+        registry
+            .mark_worker_reconnecting(
+                &created.id,
+                &expected,
+                &WorkerError::Protocol("test disconnect".to_owned()),
+            )
+            .await
+    );
+    let mut events = registry.subscribe();
+    registry
+        .inner
+        .store
+        .as_ref()
+        .expect("registry store")
+        .fail_next_write_before_rename();
+
+    assert!(matches!(
+        registry
+            .mark_worker_lost(
+                &created.id,
+                &expected,
+                &WorkerError::Protocol("test lost".to_owned()),
+            )
+            .await,
+        super::RuntimeTransitionOutcome::RetryablePersistenceFailure(_)
+    ));
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect retryable lost")
+            .runtime
+            .expect("runtime")
+            .state,
+        RuntimeState::Reconnecting
+    );
+    assert!(matches!(
+        registry
+            .mark_worker_lost(
+                &created.id,
+                &expected,
+                &WorkerError::Protocol("test lost retry".to_owned()),
+            )
+            .await,
+        super::RuntimeTransitionOutcome::Applied(_)
+    ));
+    assert_eq!(
+        next_runtime_event(&mut events).await,
+        protocol::event::SESSION_RUNTIME_LOST
+    );
+    assert_no_runtime_event(&mut events).await;
+    stop_test_worker(worker).await;
+}
+
+#[tokio::test]
+async fn exit_transition_retries_precommit_failure_before_single_event() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(temp_store_path("exit-persist-retry")),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, expected) = live_worker_and_identity(&registry, &created.id).await;
+    let mut events = registry.subscribe();
+    registry
+        .inner
+        .store
+        .as_ref()
+        .expect("registry store")
+        .fail_next_write_before_rename();
+    let exit = RuntimeExit {
+        exit_code: Some(0),
+        success: true,
+    };
+
+    let error = registry
+        .record_exit(&created.id, exit, false, Some(&expected), None)
+        .await
+        .expect_err("precommit exit failure");
+    assert_eq!(error.code, "session_store_failed");
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect retryable exit")
+            .state,
+        SessionState::Running
+    );
+    assert!(registry
+        .record_exit(&created.id, exit, false, Some(&expected), None)
+        .await
+        .expect("retry exit transition"));
+    assert_eq!(
+        next_runtime_event(&mut events).await,
+        protocol::event::SESSION_UPDATED
+    );
+    assert_no_runtime_event(&mut events).await;
+    stop_test_worker(worker).await;
+}
+
+#[tokio::test]
+async fn stop_retries_terminal_write_failure_before_canceling_watcher() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(temp_store_path("stop-terminal-persist-retry")),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let mut events = registry.subscribe();
+    registry
+        .inner
+        .store
+        .as_ref()
+        .expect("registry store")
+        .fail_write_before_rename_after(2);
+
+    assert!(
+        registry
+            .stop(&created.id)
+            .await
+            .expect("retry transient terminal commit failure")
+            .stopped
+    );
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect stopped session")
+            .state,
+        SessionState::Stopped
+    );
+    assert_eq!(
+        next_runtime_event(&mut events).await,
+        protocol::event::SESSION_STOPPED
+    );
+    assert_no_runtime_event(&mut events).await;
+}
+
+#[tokio::test]
+async fn spontaneous_exit_uses_durable_base_after_uncaptured_resize() {
+    let store_path = temp_store_path("exit-after-uncaptured-resize");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let (worker, _) = live_worker_and_identity(&registry, &created.id).await;
+    registry
+        .resize(&created.id, 137, 47)
+        .await
+        .expect("resize uncaptured session");
+    let store = crate::store::Store::new(store_path);
+    let mut durable_before_exit = store
+        .load_sessions()
+        .expect("load pre-exit session")
+        .into_iter()
+        .find(|record| record.session_id == created.id.0)
+        .expect("durable pre-exit session");
+    let runtime_id = durable_before_exit
+        .runtime
+        .runtime_id
+        .clone()
+        .expect("durable runtime id");
+    durable_before_exit.info.native_session_id = Some("durable-native-newer".to_owned());
+    durable_before_exit.info.native_session_path = Some("/tmp/durable-native-newer".to_owned());
+    durable_before_exit.native_identity_ordering = Some(crate::store::NativeIdentityOrdering {
+        runtime_id,
+        pid: 4242,
+        pid_start_identity: 777,
+        sequence: 9,
+    });
+    let recovery = durable_before_exit
+        .recovery
+        .as_mut()
+        .expect("durable recovery snapshot");
+    recovery.native_session_id = durable_before_exit.info.native_session_id.clone();
+    recovery.native_session_path = durable_before_exit.info.native_session_path.clone();
+    assert!(matches!(
+        store
+            .record_session(&durable_before_exit)
+            .expect("persist newer durable native identity"),
+        crate::store::SessionWriteOutcome::Applied
+    ));
+    let mut events = registry.subscribe();
+
+    stop_test_worker(worker).await;
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let state = registry
+                .inspect(&created.id)
+                .await
+                .expect("inspect exited session")
+                .state;
+            if state.is_terminal() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("exit watcher terminal commit");
+    let durable = store
+        .load_sessions()
+        .expect("load terminal session")
+        .into_iter()
+        .find(|record| record.session_id == created.id.0)
+        .expect("durable session");
+    assert!(durable.info.state.is_terminal());
+    assert_eq!(durable.runtime.state, RuntimeState::Terminal);
+    assert_eq!((durable.info.cols, durable.info.rows), (137, 47));
+    assert_eq!(
+        durable.info.native_session_id.as_deref(),
+        Some("durable-native-newer")
+    );
+    assert_eq!(
+        durable.info.native_session_path.as_deref(),
+        Some("/tmp/durable-native-newer")
+    );
+    let registry_info = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect committed terminal session");
+    let event_info = next_session_updated(&mut events).await;
+    assert_eq!(registry_info, durable.info);
+    assert_eq!(event_info, durable.info);
+    assert_no_runtime_event(&mut events).await;
+}
+
+async fn live_worker_and_identity(
+    registry: &SessionRegistry,
+    id: &SessionId,
+) -> (crate::runtime::Worker, super::RuntimeWatchIdentity) {
+    let sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get(id).expect("live entry");
+    let RuntimeHandle::Worker(worker) = &entry.runtime else {
+        panic!("worker runtime");
+    };
+    (
+        worker.clone(),
+        super::RuntimeWatchIdentity::from_info(&entry.info).expect("watch identity"),
+    )
+}
+
+async fn next_runtime_event(events: &mut tokio::sync::broadcast::Receiver<Event>) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("runtime event timeout")
+            .expect("runtime event");
+        if is_runtime_transition_event(event.event()) {
+            return event.event().to_owned();
+        }
+    }
+}
+
+async fn assert_no_runtime_event(events: &mut tokio::sync::broadcast::Receiver<Event>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+    loop {
+        let Ok(event) = tokio::time::timeout_at(deadline, events.recv()).await else {
+            return;
+        };
+        let event = event.expect("runtime event channel");
+        assert!(
+            !is_runtime_transition_event(event.event()),
+            "unexpected runtime event: {event:?}"
+        );
+    }
+}
+
+fn is_runtime_transition_event(name: &str) -> bool {
+    matches!(
+        name,
+        protocol::event::SESSION_RUNTIME_RECONNECTED
+            | protocol::event::SESSION_RUNTIME_LOST
+            | protocol::event::SESSION_UPDATED
+            | protocol::event::SESSION_STOPPED
+    )
+}
+
+async fn stop_test_worker(worker: crate::runtime::Worker) {
+    let transaction =
+        pohunek_worker_protocol::TransactionId::new("test-cleanup").expect("cleanup transaction");
+    let _ = worker.stop(transaction).await;
+}
+
+fn runtime_commit_candidate(entry: SessionEntry, runtime_id: &str) -> SessionEntry {
+    runtime_commit_candidate_for_generation(entry, runtime_id, 2)
+}
+
+fn runtime_commit_candidate_for_generation(
+    mut entry: SessionEntry,
+    runtime_id: &str,
+    generation: u64,
+) -> SessionEntry {
+    entry.info.state = SessionState::Running;
+    let runtime = entry.info.runtime.as_mut().expect("candidate runtime");
+    runtime.state = RuntimeState::Live;
+    runtime.runtime_generation = RuntimeGeneration::new(generation);
+    runtime.runtime_id = Some(runtime_id.to_owned());
+    entry.runtime = RuntimeHandle::Unavailable(RuntimeState::Live);
+    entry.last_native_report = None;
+    entry
+}
+
+async fn commit_runtime_candidate(
+    registry: SessionRegistry,
+    barrier: Arc<tokio::sync::Barrier>,
+    id: SessionId,
+    entry: SessionEntry,
+) -> Result<String, protocol::ProtocolError> {
+    let runtime_id = entry
+        .info
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.runtime_id.clone())
+        .expect("candidate runtime id");
+    let info = entry.info.clone();
+    barrier.wait().await;
+    registry.commit_session_entry(&id, entry).await?;
+    registry.emit(protocol::event::SESSION_UPDATED, &info);
+    Ok(runtime_id)
+}
+
+async fn assert_runtime_commit_winner(
+    registry: &SessionRegistry,
+    store: &crate::store::Store,
+    id: &SessionId,
+    winner: &str,
+) {
+    let memory = registry.inspect(id).await.expect("inspect durable winner");
+    let durable = store
+        .load_sessions()
+        .expect("load durable winner")
+        .into_iter()
+        .find(|record| record.session_id == id.0)
+        .expect("durable winner record");
+    assert_eq!(
+        memory.runtime.and_then(|runtime| runtime.runtime_id),
+        Some(winner.to_owned())
+    );
+    assert_eq!(durable.runtime.runtime_id.as_deref(), Some(winner));
+    registry
+        .write_session_record(durable)
+        .await
+        .expect("retry exact committed runtime");
+}
+
+fn native_ordering_record(
+    base: &crate::store::SessionRecord,
+    runtime_id: &str,
+    pid: u32,
+    sequence: u64,
+    native: &str,
+) -> crate::store::SessionRecord {
+    let mut record = base.clone();
+    record.native_identity_ordering = Some(crate::store::NativeIdentityOrdering {
+        runtime_id: runtime_id.to_owned(),
+        pid,
+        pid_start_identity: 1,
+        sequence,
+    });
+    record.info.native_session_id = Some(native.to_owned());
+    record
+        .recovery
+        .as_mut()
+        .expect("recovery binding")
+        .native_session_id = Some(native.to_owned());
+    record
+}
+
+fn write_newer_then_older(
+    store: Arc<crate::store::Store>,
+    older: crate::store::SessionRecord,
+    newer: crate::store::SessionRecord,
+) {
+    let older_resume = older.recovery.clone().expect("older recovery");
+    let newer_resume = newer.recovery.clone().expect("newer recovery");
+    let barrier = Arc::new(Barrier::new(2));
+    let (newer_written, wait_for_newer) = std::sync::mpsc::channel();
+    let older_store = Arc::clone(&store);
+    let older_barrier = Arc::clone(&barrier);
+    let older_write = std::thread::spawn(move || {
+        older_barrier.wait();
+        wait_for_newer.recv().expect("newer write completed");
+        older_store
+            .record_session(&older)
+            .expect("attempt stale physical write");
+        older_store
+            .record_resume(&older_resume)
+            .expect("attempt stale resume write");
+    });
+    let newer_write = std::thread::spawn(move || {
+        barrier.wait();
+        store.record_session(&newer).expect("write newer record");
+        store
+            .record_resume(&newer_resume)
+            .expect("write newer resume");
+        newer_written.send(()).expect("release older writer");
+    });
+    newer_write.join().expect("newer writer");
+    older_write.join().expect("older writer");
 }
 
 #[tokio::test]
@@ -4157,22 +5910,22 @@ async fn report_native_id_ignores_reports_from_a_different_agent_base() {
         .expect("create claude session");
 
     let claude_report = registry
-        .report_native_id(SessionReportNativeIdParams {
+        .report_native_id(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "claude-native".to_owned(),
             transcript_path: None,
-        })
+        ))
         .await;
     assert!(claude_report.recorded);
 
     let codex_report = registry
-        .report_native_id(SessionReportNativeIdParams {
+        .report_native_id(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "codex".to_owned(),
             native_session_id: "codex-thread".to_owned(),
             transcript_path: None,
-        })
+        ))
         .await;
     assert!(
         !codex_report.recorded,
@@ -4194,6 +5947,127 @@ async fn report_native_id_ignores_reports_from_a_different_agent_base() {
         Some("claude-native")
     );
 
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the ordered-claim scenario keeps rejection ordering and rollback assertions together"
+)]
+async fn report_native_id_rejects_stale_expired_and_mismatched_claims() {
+    let agents_dir = temp_resumable_agents_dir("report-ordered-claims");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        agents_dir: Some(agents_dir),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(resumable_params())
+        .await
+        .expect("create session");
+    let coordinates = native_report_params(
+        &registry,
+        created.id.clone(),
+        "claude".to_owned(),
+        "coordinate-only".to_owned(),
+        None,
+    )
+    .await;
+    let claim = |session_id: SessionId,
+                 runtime_id: &str,
+                 start_identity: ProcessStartIdentity,
+                 sequence: u64,
+                 expires_at: &str,
+                 native_id: &str| {
+        SessionReportNativeIdParams::new(
+            session_id,
+            runtime_id,
+            "claude",
+            coordinates.pid(),
+            start_identity,
+            ReportSequence::new(sequence),
+            expires_at,
+            native_id,
+            None,
+        )
+        .expect("valid report shape")
+    };
+    let valid_expiry = native_report_expiry();
+
+    let first = registry
+        .report_native_id(claim(
+            created.id.clone(),
+            coordinates.runtime_id(),
+            coordinates.pid_start_identity(),
+            100,
+            &valid_expiry,
+            "native-current",
+        ))
+        .await;
+    assert!(first.recorded);
+
+    for rejected in [
+        claim(
+            created.id.clone(),
+            coordinates.runtime_id(),
+            coordinates.pid_start_identity(),
+            100,
+            &valid_expiry,
+            "native-duplicate",
+        ),
+        claim(
+            created.id.clone(),
+            coordinates.runtime_id(),
+            coordinates.pid_start_identity(),
+            99,
+            &valid_expiry,
+            "native-lower",
+        ),
+        claim(
+            created.id.clone(),
+            "runtime-stale",
+            coordinates.pid_start_identity(),
+            101,
+            &valid_expiry,
+            "native-stale-runtime",
+        ),
+        claim(
+            created.id.clone(),
+            coordinates.runtime_id(),
+            ProcessStartIdentity::new(coordinates.pid_start_identity().get() + 1),
+            101,
+            &valid_expiry,
+            "native-reused-pid",
+        ),
+        claim(
+            created.id.clone(),
+            coordinates.runtime_id(),
+            coordinates.pid_start_identity(),
+            101,
+            "2000-01-01T00:00:00Z",
+            "native-expired",
+        ),
+        claim(
+            SessionId("s-other".to_owned()),
+            coordinates.runtime_id(),
+            coordinates.pid_start_identity(),
+            101,
+            &valid_expiry,
+            "native-wrong-session",
+        ),
+    ] {
+        assert!(!registry.report_native_id(rejected).await.recorded);
+    }
+
+    let inspected = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_eq!(
+        inspected.native_session_id.as_deref(),
+        Some("native-current")
+    );
     let _ = registry.stop(&created.id).await;
 }
 
@@ -4243,6 +6117,37 @@ fn temp_agent_that_exits_then_resumes(tag: &str, marker: &std::path::Path) -> Pa
     )
 }
 
+#[cfg(unix)]
+fn temp_hermes_that_exits_then_resumes(tag: &str, marker: &std::path::Path) -> (PathBuf, PathBuf) {
+    let runtime = temp_dir(&format!("{tag}-runtime"));
+    let script = runtime.join("hermes");
+    write_hermes_resume_executable(&script, marker, "Hermes Agent v0.20.0");
+    let agents = temp_agents_dir_with(
+        tag,
+        "hermes-test",
+        &format!(
+            "base = \"hermes\"\nprogram = \"{}\"\nargs = [\"chat\"]\n",
+            script.display()
+        ),
+    );
+    (agents, script)
+}
+
+#[cfg(unix)]
+fn write_hermes_resume_executable(
+    script: &std::path::Path,
+    marker: &std::path::Path,
+    version_output: &str,
+) {
+    write_executable(
+        script,
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf '%s\\n' '{version_output}'\n  exit 0\nfi\nprintf '<%s>\\n' \"$@\" >> {}\ncase \" $* \" in *\" --resume \"*) sleep 30 ;; *) sleep 0.2; exit 0 ;; esac\n",
+            marker.display()
+        ),
+    );
+}
+
 fn resumable_params() -> SessionNewParams {
     SessionNewParams {
         name: None,
@@ -4288,12 +6193,12 @@ async fn fork_live_claude_session_mints_new_id_and_builds_fork_argv() {
         .expect("create forkable session");
     assert_eq!(created.state, SessionState::Running);
     let recorded = registry
-        .report_native_id(SessionReportNativeIdParams {
+        .report_native_id(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-live".to_owned(),
             transcript_path: None,
-        })
+        ))
         .await;
     assert!(recorded.recorded);
 
@@ -4335,7 +6240,7 @@ async fn fork_live_claude_session_mints_new_id_and_builds_fork_argv() {
 }
 
 #[tokio::test]
-async fn fork_shell_session_reports_agent_not_resumable() {
+async fn fork_shell_session_reports_agent_fork_unsupported() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         stop_grace: Duration::from_millis(50),
@@ -4357,7 +6262,8 @@ async fn fork_shell_session_reports_agent_not_resumable() {
         .await
         .expect_err("shell sessions cannot be forked");
 
-    assert_eq!(err.code, "agent_not_resumable");
+    assert_eq!(err, protocol::ProtocolError::agent_fork_unsupported());
+    assert_eq!(registry.list().await.len(), 1);
     let _ = registry.stop(&created.id).await;
 }
 
@@ -4385,16 +6291,6 @@ async fn fork_codex_session_reports_agent_fork_unsupported() {
         })
         .await
         .expect("create codex session");
-    let recorded = registry
-        .report_native_id(SessionReportNativeIdParams {
-            session_id: created.id.clone(),
-            agent: "codex".to_owned(),
-            native_session_id: "codex-native".to_owned(),
-            transcript_path: None,
-        })
-        .await;
-    assert!(recorded.recorded);
-
     let err = registry
         .fork(SessionForkParams {
             session_id: created.id.clone(),
@@ -4406,7 +6302,169 @@ async fn fork_codex_session_reports_agent_fork_unsupported() {
         .await
         .expect_err("codex fork is intentionally unsupported");
 
+    assert_eq!(err, protocol::ProtocolError::agent_fork_unsupported());
+    assert_eq!(
+        registry.list().await.len(),
+        1,
+        "unsupported fork must fail before registering a logical child or worker"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fork_hermes_session_is_rejected_before_child_side_effects() {
+    let dir = temp_dir("fork-hermes-runtime");
+    let script = dir.join("hermes");
+    write_supported_hermes_executable(&script, "sleep 30\n");
+    let agents_dir = temp_agents_dir_with(
+        "fork-hermes",
+        "hermes-test",
+        &format!(
+            "base = \"hermes\"\nprogram = \"{}\"\nargs = [\"chat\"]\n",
+            script.display()
+        ),
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        agents_dir: Some(agents_dir),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(SessionNewParams {
+            agent: "hermes-test".to_owned(),
+            cwd: Some(dir),
+            ..params()
+        })
+        .await
+        .expect("create Hermes session");
+
+    let error = registry
+        .fork(SessionForkParams {
+            session_id: created.id.clone(),
+            name: Some("must-not-exist".to_owned()),
+            cwd_mode: ForkCwdMode::Same,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .expect_err("Hermes fork is unsupported");
+
+    assert_eq!(error, protocol::ProtocolError::agent_fork_unsupported());
+    assert_eq!(registry.list().await.len(), 1);
+    assert!(registry
+        .list()
+        .await
+        .iter()
+        .all(|session| session.name.as_deref() != Some("must-not-exist")));
+    let _ = registry.stop(&created.id).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fork_only_claude_profile_records_its_required_native_reference() {
+    let dir = temp_dir("fork-only-native-reference");
+    let script = dir.join("claude-agent");
+    write_executable(&script, "#!/bin/sh\nsleep 30\n");
+    let store_path = temp_store_path("fork-only-native-reference");
+    let agents_dir = temp_agents_dir_with(
+        "fork-only-native-reference",
+        "fork-only",
+        &format!(
+            "base = \"claude\"\nprogram = \"{}\"\n[resume]\nresumable = false\n",
+            script.display()
+        ),
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        agents_dir: Some(agents_dir),
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(SessionNewParams {
+            agent: "fork-only".to_owned(),
+            cwd: Some(dir),
+            ..params()
+        })
+        .await
+        .expect("create fork-only Claude session");
+    let runtime_id = created
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.runtime_id.clone())
+        .expect("live runtime id");
+
+    let result = registry
+        .report_native_id(native_report!(&registry;
+            session_id: created.id.clone(),
+            runtime_id: runtime_id,
+            agent: "claude".to_owned(),
+            pid: created.pid,
+            pid_start_identity: 1,
+            sequence: 1,
+            expires_at: native_report_expiry(),
+            native_session_id: "fork-native".to_owned(),
+            transcript_path: None,
+        ))
+        .await;
+    assert!(result.recorded);
+
+    let persisted = crate::store::Store::new(store_path)
+        .load_resume()
+        .expect("load fork-only binding");
+    assert_eq!(persisted.len(), 1);
+    assert!(!persisted[0].resumable);
+    assert!(persisted[0].forkable);
+    assert_eq!(
+        persisted[0].native_session_id.as_deref(),
+        Some("fork-native")
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fork_disable_is_frozen_across_profile_removal() {
+    let dir = temp_dir("fork-disable-frozen-runtime");
+    let script = dir.join("claude-agent");
+    write_executable(&script, "#!/bin/sh\nsleep 30\n");
+    let agents_dir = temp_agents_dir_with(
+        "fork-disable-frozen",
+        "no-fork",
+        &format!(
+            "base = \"claude\"\nprogram = \"{}\"\n[fork]\nsupported = false\n",
+            script.display()
+        ),
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        agents_dir: Some(agents_dir.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(SessionNewParams {
+            agent: "no-fork".to_owned(),
+            cwd: Some(dir),
+            ..params()
+        })
+        .await
+        .expect("create fork-disabled Claude session");
+    std::fs::remove_file(agents_dir.join("no-fork.toml")).expect("remove profile after launch");
+
+    let err = registry
+        .fork(SessionForkParams {
+            session_id: created.id.clone(),
+            name: None,
+            cwd_mode: ForkCwdMode::Same,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .expect_err("frozen fork disable must survive profile removal");
+
     assert_eq!(err.code, "agent_fork_unsupported");
+    assert_eq!(registry.list().await.len(), 1);
     let _ = registry.stop(&created.id).await;
 }
 
@@ -4439,14 +6497,14 @@ async fn report_native_id_path_profile_stores_path_and_ignores_wire_agent() {
         .expect("create path-profile session");
 
     let result = registry
-        .report_native_id(SessionReportNativeIdParams {
+        .report_native_id(native_report!(&registry;
             session_id: created.id.clone(),
             // Wire agent is a base-kind literal (what the hook reports); ignored
             // for ref-kind selection.
             agent: "claude".to_owned(),
             native_session_id: "opaque-native-id".to_owned(),
             transcript_path: Some("/home/u/.claude/t.jsonl".to_owned()),
-        })
+        ))
         .await;
     assert!(result.recorded);
 
@@ -4516,12 +6574,12 @@ async fn non_resumable_profile_ignores_native_id_reports() {
         .expect("create non-resumable profile session");
 
     let result = registry
-        .report_native_id(SessionReportNativeIdParams {
+        .report_native_id(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "codex".to_owned(),
             native_session_id: "native-ignored".to_owned(),
             transcript_path: None,
-        })
+        ))
         .await;
     assert!(
         !result.recorded,
@@ -4560,6 +6618,10 @@ async fn non_resumable_profile_binding_reports_agent_not_resumable() {
         resume_mode: Some(ResumeMode::Flag),
         ref_kind: Some(SessionRefKind::Id),
         resumable: false,
+        fork_mode: None,
+        fork_resume_mode: None,
+        fork_ref_kind: None,
+        forkable: false,
     };
 
     let err = registry
@@ -4596,12 +6658,12 @@ async fn resume_binding_never_persists_profile_env_secrets() {
         .await
         .expect("create env-profile session");
     let result = registry
-        .report_native_id(SessionReportNativeIdParams {
+        .report_native_id(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-xyz".to_owned(),
             transcript_path: None,
-        })
+        ))
         .await;
     assert!(result.recorded);
 
@@ -4630,12 +6692,12 @@ async fn stopping_a_session_drops_its_resume_binding() {
         .await
         .expect("create session");
     let recorded = registry
-        .report_native_id(SessionReportNativeIdParams {
+        .report_native_id(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-stop".to_owned(),
             transcript_path: None,
-        })
+        ))
         .await;
     assert!(recorded.recorded);
     assert_eq!(
@@ -4676,12 +6738,12 @@ async fn legacy_harness_exit_during_daemon_shutdown_keeps_recovery_binding() {
         .await
         .expect("create session");
     let recorded = registry
-        .report_native_id(SessionReportNativeIdParams {
+        .report_native_id(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-shutdown".to_owned(),
             transcript_path: None,
-        })
+        ))
         .await;
     assert!(recorded.recorded, "native id captured");
     assert_eq!(
@@ -4694,7 +6756,7 @@ async fn legacy_harness_exit_during_daemon_shutdown_keeps_recovery_binding() {
     );
 
     registry.begin_daemon_shutdown();
-    registry
+    let _ = registry
         .record_exit(
             &created.id,
             RuntimeExit {
@@ -4702,6 +6764,8 @@ async fn legacy_harness_exit_during_daemon_shutdown_keeps_recovery_binding() {
                 success: false,
             },
             false,
+            None,
+            None,
         )
         .await;
 
@@ -4725,6 +6789,10 @@ async fn legacy_harness_exit_during_daemon_shutdown_keeps_recovery_binding() {
 
 #[cfg(unix)]
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the recovery scenario verifies one ordered lifecycle across persistence and events"
+)]
 async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_is_idempotent() {
     let store_path = temp_store_path("manual-resume");
     let marker = temp_dir("manual-resume-marker").join("argv.txt");
@@ -4742,12 +6810,12 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
         .await
         .expect("create session");
     let recorded = registry
-        .report_native_id(SessionReportNativeIdParams {
+        .report_native_id(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-manual".to_owned(),
             transcript_path: None,
-        })
+        ))
         .await;
     assert!(recorded.recorded, "native id captured");
 
@@ -4761,6 +6829,7 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
     let entry = sessions.get_mut(&created.id).expect("terminal entry");
     entry.info.runtime = Some(SessionRuntime {
         state: RuntimeState::Lost,
+        runtime_generation: protocol::RuntimeGeneration::new(1),
         worker_id: Some("worker-before-recovery".to_owned()),
         runtime_id: Some("runtime-before-recovery".to_owned()),
         started_at: Some(original_created_at.clone()),
@@ -4779,6 +6848,14 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
     assert_eq!(resumed.created_at, original_created_at);
     assert_eq!(resumed.state, SessionState::Running);
     assert_eq!(resumed.native_session_id.as_deref(), Some("native-manual"));
+    assert_eq!(
+        resumed
+            .runtime
+            .as_ref()
+            .expect("resumed runtime")
+            .runtime_generation,
+        RuntimeGeneration::new(2)
+    );
 
     let argv = wait_for_file_contains(&marker, "native-manual").await;
     assert!(
@@ -4789,7 +6866,7 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
     let event = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             let event = events.recv().await.expect("receive recovery event");
-            if event.event == protocol::event::SESSION_NATIVE_RECOVERED {
+            if event.event() == protocol::event::SESSION_NATIVE_RECOVERED {
                 break event;
             }
         }
@@ -4797,7 +6874,7 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
     .await
     .expect("session_native_recovered event");
     let recovered_event: SessionNativeRecoveredEvent =
-        serde_json::from_value(event.payload).expect("recovery event payload");
+        serde_json::from_value(event.payload().clone()).expect("recovery event payload");
     assert_eq!(recovered_event.session.id, created.id);
     assert_eq!(
         recovered_event.previous_runtime_id.as_deref(),
@@ -4835,6 +6912,239 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
 
 #[cfg(unix)]
 #[tokio::test]
+async fn hermes_resume_reuses_logical_session_with_exact_argv_and_new_generation() {
+    let marker = temp_dir("hermes-resume-marker").join("argv.txt");
+    let (agents_dir, _script) = temp_hermes_that_exits_then_resumes("hermes-resume", &marker);
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(temp_store_path("hermes-resume")),
+        agents_dir: Some(agents_dir),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(SessionNewParams {
+            agent: "hermes-test".to_owned(),
+            ..params()
+        })
+        .await
+        .expect("create Hermes session");
+    let native_reference = "native id with spaces + symbols";
+    assert!(
+        registry
+            .report_native_id(native_report!(&registry;
+                session_id: created.id.clone(),
+                agent: "hermes".to_owned(),
+                native_session_id: native_reference.to_owned(),
+                transcript_path: None,
+            ))
+            .await
+            .recorded
+    );
+    let terminal = registry
+        .wait_for_exit(&created.id, Duration::from_secs(2))
+        .await
+        .expect("fresh Hermes process exits");
+    let initial_generation = terminal
+        .runtime
+        .as_ref()
+        .expect("terminal runtime")
+        .runtime_generation;
+
+    let resumed = registry
+        .resume(&created.id)
+        .await
+        .expect("resume Hermes session");
+
+    assert_eq!(resumed.id, created.id);
+    assert_eq!(resumed.created_at, created.created_at);
+    assert_eq!(
+        resumed
+            .runtime
+            .as_ref()
+            .expect("resumed runtime")
+            .runtime_generation,
+        RuntimeGeneration::new(initial_generation.get() + 1)
+    );
+    let argv = wait_for_file_contains(&marker, native_reference).await;
+    let lines = argv.lines().collect::<Vec<_>>();
+    assert!(
+        lines
+            .windows(3)
+            .any(|window| window == ["<chat>", "<--resume>", "<native id with spaces + symbols>"]),
+        "Hermes resume argv must be exact and keep the reference in one element: {lines:?}"
+    );
+    assert!(!argv.contains("--continue"));
+    assert!(!argv.contains("--pass-session-id"));
+    let _ = registry.stop(&resumed.id).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn incompatible_hermes_resume_has_no_runtime_or_store_side_effects() {
+    let marker = temp_dir("hermes-policy-resume-marker").join("argv.txt");
+    let (agents_dir, script) = temp_hermes_that_exits_then_resumes("hermes-policy-resume", &marker);
+    let store_path = temp_store_path("hermes-policy-resume");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        agents_dir: Some(agents_dir),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(SessionNewParams {
+            agent: "hermes-test".to_owned(),
+            ..params()
+        })
+        .await
+        .expect("create supported Hermes session");
+    assert!(
+        registry
+            .report_native_id(native_report!(&registry;
+                session_id: created.id.clone(),
+                agent: "hermes".to_owned(),
+                native_session_id: "native-policy-test".to_owned(),
+                transcript_path: None,
+            ))
+            .await
+            .recorded
+    );
+    let terminal = registry
+        .wait_for_exit(&created.id, Duration::from_secs(2))
+        .await
+        .expect("fresh Hermes process exits");
+    let marker_before = fs::read_to_string(&marker).expect("fresh launch marker");
+    let store_before = fs::read(&store_path).expect("durable session store");
+
+    for version_output in ["Hermes Agent v0.21.0", "unexpected provider output"] {
+        write_hermes_resume_executable(&script, &marker, version_output);
+        let error = registry
+            .resume(&created.id)
+            .await
+            .expect_err("incompatible Hermes runtime must not resume");
+        assert_eq!(error.code, "agent_runtime_unsupported");
+        assert!(!error.msg.contains(version_output));
+        assert_eq!(
+            fs::read_to_string(&marker).expect("launch marker"),
+            marker_before
+        );
+        assert_eq!(fs::read(&store_path).expect("session store"), store_before);
+        assert_eq!(registry.list().await.len(), 1);
+        let after = registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect terminal");
+        assert_eq!(after.state, terminal.state);
+        assert_eq!(after.pid, terminal.pid);
+        assert_eq!(after.runtime, terminal.runtime);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects() {
+    let dir = temp_dir("hermes-policy-resume-binding");
+    let script = dir.join("hermes");
+    let missing = dir.join("missing-hermes");
+    let marker = dir.join("argv.txt");
+    let store_path = dir.join("sessions.jsonl");
+    let sentinel = b"store must not be read or rewritten\n";
+    fs::write(&store_path, sentinel).expect("seed untouched store sentinel");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        store_path: Some(store_path.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let binding = crate::store::ResumeBinding {
+        session_id: "s-hermes-policy".to_owned(),
+        name: None,
+        agent: "hermes".to_owned(),
+        agent_base: AgentKind::Hermes,
+        cwd: dir.clone(),
+        cols: 80,
+        rows: 24,
+        native_session_id: Some("native-policy-test".to_owned()),
+        native_session_path: None,
+        project_id: None,
+        is_linked_worktree: None,
+        metadata: BTreeMap::new(),
+        program: script.display().to_string(),
+        args: vec!["chat".to_owned()],
+        input_rules: crate::store::StoredInputRules::default(),
+        resume_mode: Some(ResumeMode::Flag),
+        ref_kind: Some(SessionRefKind::Id),
+        resumable: true,
+        fork_mode: None,
+        fork_resume_mode: None,
+        fork_ref_kind: None,
+        forkable: false,
+    };
+
+    for (program, version_output) in [
+        (Some(script.clone()), "Hermes Agent v0.21.0"),
+        (Some(script.clone()), "unexpected provider output"),
+        (None, "missing"),
+    ] {
+        let mut candidate = binding.clone();
+        if let Some(program) = program {
+            write_hermes_resume_executable(&program, &marker, version_output);
+            candidate.program = program.display().to_string();
+        } else {
+            candidate.program = missing.display().to_string();
+        }
+
+        let error = registry
+            .resume_binding(candidate)
+            .await
+            .expect_err("incompatible Hermes binding must not enter recovery");
+        assert_eq!(error.code, "agent_runtime_unsupported");
+        assert_eq!(
+            error.msg,
+            "the selected agent runtime is unavailable or incompatible with this daemon"
+        );
+        assert!(error.recover.is_none());
+        assert_eq!(fs::read(&store_path).expect("store sentinel"), sentinel);
+        assert!(!marker.exists(), "resume process must not be launched");
+        assert!(registry.list().await.is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hermes_resume_without_native_reference_fails_before_relaunch() {
+    let marker = temp_dir("hermes-no-reference-marker").join("argv.txt");
+    let (agents_dir, _script) = temp_hermes_that_exits_then_resumes("hermes-no-reference", &marker);
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        stop_grace: Duration::from_millis(50),
+        agents_dir: Some(agents_dir),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(SessionNewParams {
+            agent: "hermes-test".to_owned(),
+            ..params()
+        })
+        .await
+        .expect("create Hermes session");
+    registry
+        .wait_for_exit(&created.id, Duration::from_secs(2))
+        .await
+        .expect("fresh Hermes process exits");
+    let before = fs::read_to_string(&marker).expect("fresh argv marker");
+
+    let error = registry
+        .resume(&created.id)
+        .await
+        .expect_err("resume requires an exact native reference");
+
+    assert_eq!(error.code, "not_resumable");
+    assert_eq!(
+        fs::read_to_string(&marker).expect("argv marker after rejection"),
+        before,
+        "missing-reference rejection must not launch another process"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn explicit_native_recovery_accepts_terminal_runtime() {
     let marker = temp_dir("terminal-recovery-marker").join("argv.txt");
     let agents_dir = temp_agent_that_exits_then_resumes("terminal-recovery", &marker);
@@ -4850,12 +7160,12 @@ async fn explicit_native_recovery_accepts_terminal_runtime() {
         .expect("create session");
     assert!(
         registry
-            .report_native_id(SessionReportNativeIdParams {
+            .report_native_id(native_report!(&registry;
                 session_id: created.id.clone(),
                 agent: "claude".to_owned(),
                 native_session_id: "native-terminal".to_owned(),
                 transcript_path: None,
-            })
+            ))
             .await
             .recorded
     );
@@ -4904,6 +7214,7 @@ async fn explicit_native_recovery_rejects_nonterminal_runtime_states() {
         let entry = sessions.get_mut(&created.id).expect("live entry");
         entry.info.runtime = Some(SessionRuntime {
             state,
+            runtime_generation: protocol::RuntimeGeneration::new(1),
             worker_id: Some("worker-live".to_owned()),
             runtime_id: Some("runtime-live".to_owned()),
             started_at: None,
@@ -4934,6 +7245,7 @@ async fn native_recovered_event_carries_previous_and_new_runtime_ids() {
     let mut session = registry.create(params()).await.expect("create session");
     session.runtime = Some(SessionRuntime {
         state: RuntimeState::Live,
+        runtime_generation: protocol::RuntimeGeneration::new(1),
         worker_id: Some("worker-new".to_owned()),
         runtime_id: Some("runtime-new".to_owned()),
         started_at: Some(session.created_at.clone()),
@@ -4945,9 +7257,9 @@ async fn native_recovered_event_carries_previous_and_new_runtime_ids() {
     registry.emit_native_recovered(&session, Some("runtime-old".to_owned()));
 
     let event = events.recv().await.expect("native recovery event");
-    assert_eq!(event.event, protocol::event::SESSION_NATIVE_RECOVERED);
+    assert_eq!(event.event(), protocol::event::SESSION_NATIVE_RECOVERED);
     let payload: SessionNativeRecoveredEvent =
-        serde_json::from_value(event.payload).expect("recovery payload");
+        serde_json::from_value(event.payload().clone()).expect("recovery payload");
     assert_eq!(payload.session.id, session.id);
     assert_eq!(payload.previous_runtime_id.as_deref(), Some("runtime-old"));
     assert_eq!(payload.runtime_id.as_deref(), Some("runtime-new"));
@@ -4972,12 +7284,12 @@ async fn resize_after_capture_updates_persisted_binding() {
         .expect("create session");
     // Capture a native id so a resume binding exists at the launch size.
     let recorded = registry
-        .report_native_id(SessionReportNativeIdParams {
+        .report_native_id(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-resize".to_owned(),
             transcript_path: None,
-        })
+        ))
         .await;
     assert!(recorded.recorded);
     let before = crate::store::Store::new(store_path.clone())
@@ -5030,12 +7342,12 @@ async fn set_metadata_after_capture_updates_persisted_binding() {
         .await
         .expect("create session");
     let recorded = registry
-        .report_native_id(SessionReportNativeIdParams {
+        .report_native_id(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-metadata".to_owned(),
             transcript_path: None,
-        })
+        ))
         .await;
     assert!(recorded.recorded);
 
@@ -5083,6 +7395,10 @@ async fn resume_binding_restores_metadata_from_store() {
             resume_mode: Some(ResumeMode::Flag),
             ref_kind: Some(SessionRefKind::Id),
             resumable: true,
+            fork_mode: None,
+            fork_resume_mode: None,
+            fork_ref_kind: None,
+            forkable: false,
         })
         .expect("seed resume binding");
     let binding = crate::store::Store::new(store_path.clone())
@@ -5180,12 +7496,12 @@ async fn resume_after_profile_edit_and_resize_uses_original_snapshot() {
         .await
         .expect("create editable profile session");
     let recorded = registry
-        .report_native_id(SessionReportNativeIdParams {
+        .report_native_id(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-edit-resize".to_owned(),
             transcript_path: None,
-        })
+        ))
         .await;
     assert!(recorded.recorded);
     registry
@@ -5272,12 +7588,12 @@ async fn resume_binding_persists_project_context_for_restart() {
 
     // Capturing the native id persists the resume binding from live state.
     let recorded = registry
-        .report_native_id(SessionReportNativeIdParams {
+        .report_native_id(native_report!(&registry;
             session_id: info.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-resume".to_owned(),
             transcript_path: None,
-        })
+        ))
         .await;
     assert!(recorded.recorded, "native id captured");
 
@@ -5316,12 +7632,12 @@ async fn concurrent_resize_and_recapture_keep_store_consistent_with_memory() {
         .await
         .expect("create session");
     let recorded = registry
-        .report_native_id(SessionReportNativeIdParams {
+        .report_native_id(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-concurrent".to_owned(),
             transcript_path: None,
-        })
+        ))
         .await;
     assert!(recorded.recorded);
 
@@ -5339,12 +7655,12 @@ async fn concurrent_resize_and_recapture_keep_store_consistent_with_memory() {
         let id = created.id.clone();
         tokio::spawn(async move {
             registry
-                .report_native_id(SessionReportNativeIdParams {
+                .report_native_id(native_report!(&registry;
                     session_id: id,
                     agent: "claude".to_owned(),
                     native_session_id: "native-concurrent".to_owned(),
                     transcript_path: None,
-                })
+                ))
                 .await
         })
     };
@@ -5385,12 +7701,12 @@ async fn resize_then_stop_leaves_no_binding() {
         .await
         .expect("create session");
     let recorded = registry
-        .report_native_id(SessionReportNativeIdParams {
+        .report_native_id(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "claude".to_owned(),
             native_session_id: "native-resize-stop".to_owned(),
             transcript_path: None,
-        })
+        ))
         .await;
     assert!(recorded.recorded);
     registry
@@ -5428,37 +7744,40 @@ async fn report_native_id_ignores_unknown_invalid_and_terminal() {
 
     // Unknown session id.
     let unknown = registry
-        .report_native_id(SessionReportNativeIdParams {
+        .report_native_id(native_report!(&registry;
             session_id: SessionId("s-missing".to_owned()),
             agent: "claude".to_owned(),
             native_session_id: "native-1".to_owned(),
             transcript_path: None,
-        })
+        ))
         .await;
     assert!(!unknown.recorded);
 
     let created = registry.create(params()).await.expect("create session");
 
-    // Invalid (empty) native id on a live session.
-    let invalid = registry
-        .report_native_id(SessionReportNativeIdParams {
-            session_id: created.id.clone(),
-            agent: "shell".to_owned(),
-            native_session_id: String::new(),
-            transcript_path: None,
-        })
-        .await;
-    assert!(!invalid.recorded);
+    // Invalid (empty) native ids are rejected at the strict public boundary.
+    SessionReportNativeIdParams::new(
+        created.id.clone(),
+        "runtime-invalid",
+        "shell",
+        1,
+        ProcessStartIdentity::new(1),
+        ReportSequence::new(1),
+        native_report_expiry(),
+        "",
+        None,
+    )
+    .expect_err("an empty native id must fail validation");
 
     // Terminal session.
     let _ = registry.stop(&created.id).await;
     let terminal = registry
-        .report_native_id(SessionReportNativeIdParams {
+        .report_native_id(native_report!(&registry;
             session_id: created.id.clone(),
             agent: "shell".to_owned(),
             native_session_id: "native-late".to_owned(),
             transcript_path: None,
-        })
+        ))
         .await;
     assert!(!terminal.recorded);
 }
@@ -5470,7 +7789,7 @@ fn claude_input_rules_use_configured_submit_delay() {
         ..SessionRegistryConfig::default()
     };
 
-    let rules = super::input_rules_for_agent(AgentKind::Claude, &config);
+    let rules = super::input_rules_for_agent(&AgentKind::Claude, &config);
 
     assert!(!rules.bracketed_paste);
     assert_eq!(rules.submit_delay, Duration::from_millis(75));
@@ -5651,9 +7970,11 @@ fn session_diff_truncates_a_large_untracked_file_and_keeps_the_response_envelope
     );
 
     let response = protocol::Response::ok(
-        "req-1".to_owned(),
+        protocol::PROTOCOL_VERSION,
+        "req-1",
         serde_json::to_value(&result).expect("serialize SessionDiffResult"),
-    );
+    )
+    .expect("valid response envelope");
     let serialized = serde_json::to_string(&response).expect("serialize Response envelope");
     assert!(
         serialized.len() < protocol::MAX_CONTROL_LINE_BYTES,

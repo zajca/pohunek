@@ -9,7 +9,7 @@ export type NotificationPolicy = {
   /**
    * Dedupe window for equivalent attention events.
    */
-  attention_dedupe_window_secs: bigint;
+  attention_dedupe_window_secs: number;
   /**
    * Debounce window before a pending session notification may surface.
    *
@@ -18,21 +18,17 @@ export type NotificationPolicy = {
    * [`Self::attention_dedupe_window_secs`], which merges duplicate reports of
    * one attention moment rather than delaying when it surfaces.
    */
-  attention_debounce_secs: bigint;
+  attention_debounce_secs: number;
   /**
-   * Default per-kind enable flags.
+   * Base per-kind policy used when a provider has no explicit entry.
    */
   enabled: NotificationKindPolicy;
   /**
-   * Codex-specific per-kind override, when configured.
+   * Deterministically ordered provider-specific policy overrides.
    *
-   * Additive: an older daemon omits it, and an older client ignores it.
+   * Missing keys use [`Self::enabled`]. Keys are provider wire names rather
+   * than an enum so a newly added provider does not require another public
+   * notification schema change.
    */
-  codex?: NotificationKindPolicy;
-  /**
-   * Claude-specific per-kind override, when configured.
-   *
-   * Additive: an older daemon omits it, and an older client ignores it.
-   */
-  claude?: NotificationKindPolicy;
+  providers?: { [key in string]: NotificationKindPolicy };
 };

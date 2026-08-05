@@ -31,12 +31,30 @@ The assistant must:
 - Never copy worker journal or structured-log diagnostics into shared reports
   without review. Journals intentionally omit prompt, input, terminal, and
   environment bytes; preserve that boundary when adding diagnostics.
+- Preserve paired `origin_session_id`/`origin_daemon_id` request markers on
+  ordinary, subscription, and dedicated SDK connections. The daemon uses them
+  to deny exactly `session.stop`, `session.resume`, `session.remove`,
+  `session.fork`, `session.resize`, `session.set_metadata`, `session.rename`, and
+  `session.input` when they target the session hosting the caller. Do not strip
+  or forge them to bypass `plugin_self_target_denied`. This is a narrow
+  confused-deputy guard within the owner trust boundary, not per-session
+  authentication or a general mutation policy. The lifecycle reports
+  `session.report_agent`, `session.release_agent`, and
+  `session.report_native_id` are deliberately allowed to target their own
+  session; hooks require that path, and the public native-id report is the
+  necessary local fallback when the owner-private worker claim cannot be
+  delivered.
 - Treat `notification.create` like every other control method: it is guarded by
   the owner-only daemon socket, not by per-session authentication. Any same-user
   process that can reach the socket can create notifications and influence
   attention dedupe within the single-operator trust boundary. A supplied
   `session_id` is shape-validated so it is bounded and contains no control
   characters, but it is not cryptographically authenticated to a session.
+- For Hermes, never read, copy, or modify `HERMES_HOME` or `state.db` to infer
+  a resumable session. Use only a valid reported native reference. Programmatic
+  Hermes input is restricted to bounded text with LF/tab as the only controls
+  and is denied while owner approval is visible; do not bypass that guard with
+  raw attach bytes.
 
 The assistant may write host or repo configuration when that is the requested
 task, but it must stay inside the user's requested scope and respect the

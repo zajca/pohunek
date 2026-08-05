@@ -33,7 +33,10 @@ use futures::{SinkExt, StreamExt};
 use pohunek_worker_protocol::{
     read_frame, write_frame, ControlCode, ControlError, DataFrame, FrameHeader, FrameKind, WriteId,
 };
-use protocol::{ErrorClass, Event, ProtocolError, Response, MAX_CONTROL_LINE_BYTES};
+use protocol::{
+    negotiate, ErrorClass, Event, ProtocolError, ProtocolVersion, ProtocolVersionRange, Request,
+    Response, MAX_CONTROL_LINE_BYTES, SUPPORTED_PROTOCOL_VERSIONS,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::broadcast;
@@ -309,6 +312,7 @@ where
 {
     let codec = LinesCodec::new_with_max_length(MAX_CONTROL_LINE_BYTES);
     let mut framed = Framed::new(stream, codec);
+    let mut negotiated_version = None;
 
     while let Some(line) = framed.next().await {
         let line = match line {
@@ -320,11 +324,24 @@ where
             Err(LinesCodecError::Io(err)) => return Err(err),
         };
 
+        if let Ok(request) = serde_json::from_str::<Request>(&line) {
+            if let Some(rejection) = enforce_connection_version(
+                &request,
+                &mut negotiated_version,
+                SUPPORTED_PROTOCOL_VERSIONS,
+            ) {
+                let response = serde_json::to_string(&rejection)
+                    .expect("validated response serialization is infallible");
+                framed.send(response).await.map_err(codec_to_io)?;
+                continue;
+            }
+        }
+
         match handler::dispatch_line(&line, &state).await {
             Dispatch::Reply(response_line) => {
                 framed.send(response_line).await.map_err(codec_to_io)?;
             }
-            Dispatch::Subscribe(ack_line) => {
+            Dispatch::Subscribe(ack_line, version) => {
                 // Subscribe BEFORE sending the ack so no event emitted between
                 // the ack and the recv loop is missed.
                 let mut session_events = state.sessions.subscribe();
@@ -336,8 +353,13 @@ where
                         (Some(sender), receiver)
                     };
                 framed.send(ack_line).await.map_err(codec_to_io)?;
-                run_event_subscription(&mut framed, &mut session_events, &mut notification_events)
-                    .await?;
+                run_event_subscription(
+                    &mut framed,
+                    &mut session_events,
+                    &mut notification_events,
+                    version,
+                )
+                .await?;
                 // The connection is consumed by the subscription stream.
                 return Ok(());
             }
@@ -348,6 +370,45 @@ where
         }
     }
     Ok(())
+}
+
+fn enforce_connection_version(
+    request: &Request,
+    frozen: &mut Option<ProtocolVersion>,
+    supported: ProtocolVersionRange,
+) -> Option<Response> {
+    let Ok(selected) = negotiate(request.version_range(), supported) else {
+        let current = (*frozen)?;
+        let frozen_range = ProtocolVersionRange::new(current, current)
+            .expect("a frozen protocol version forms a valid singleton range");
+        return Some(
+            Response::err(
+                current,
+                request.id(),
+                ProtocolError::version_mismatch(request.version_range(), frozen_range),
+            )
+            .expect("deserialized request ids satisfy response validation"),
+        );
+    };
+    match frozen {
+        None => {
+            *frozen = Some(selected);
+            None
+        }
+        Some(current) if *current == selected => None,
+        Some(current) => {
+            let frozen_range = ProtocolVersionRange::new(*current, *current)
+                .expect("a frozen protocol version forms a valid singleton range");
+            Some(
+                Response::err(
+                    *current,
+                    request.id(),
+                    ProtocolError::version_mismatch(request.version_range(), frozen_range),
+                )
+                .expect("deserialized request ids satisfy response validation"),
+            )
+        }
+    }
 }
 
 async fn run_attach_connection<S>(
@@ -361,7 +422,8 @@ where
     let mut attach = match registry.redeem_attach(&stream_id).await {
         Ok(attach) => attach,
         Err(err) => {
-            let response = Response::err(stream_id, err);
+            let response = Response::err(protocol::PROTOCOL_VERSION, stream_id, err)
+                .expect("validated stream ids satisfy response validation");
             framed
                 .send(handler::serialize_response(&response))
                 .await
@@ -455,6 +517,11 @@ where
                     FrameKind::Replay { .. } => {
                         return Err(AttachBridgeError::worker_message(
                             "snapshot attachment received historical replay",
+                        ));
+                    }
+                    FrameKind::ObservationStart { .. } => {
+                        return Err(AttachBridgeError::worker_message(
+                            "attach stream received an observation frame",
                         ));
                     }
                     FrameKind::Output { .. } if !snapshot_started => {
@@ -560,6 +627,8 @@ impl AttachBridgeError {
             ControlCode::InvalidDataToken => "worker_invalid_data_token",
             ControlCode::WriteOutcomeUnknown => "worker_write_outcome_unknown",
             ControlCode::RuntimeFault => "worker_runtime_fault",
+            ControlCode::WorkerFeatureUnavailable => "worker_feature_unavailable",
+            ControlCode::ObservationLimitExceeded => "worker_observation_limit_exceeded",
         };
         Self {
             source: io::Error::other(error.message.clone()),
@@ -623,6 +692,7 @@ async fn run_event_subscription<S>(
     framed: &mut Framed<S, LinesCodec>,
     session_events: &mut broadcast::Receiver<Event>,
     notification_events: &mut broadcast::Receiver<Event>,
+    version: protocol::ProtocolVersion,
 ) -> Result<(), io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -637,7 +707,7 @@ where
             },
             evt = session_events.recv() => match evt {
                 Ok(event) => {
-                    send_event_line(framed, &event).await?;
+                    send_event_line(framed, &event.with_version(version)).await?;
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(skipped, "event subscriber lagged; some events were dropped");
@@ -646,7 +716,7 @@ where
             },
             evt = notification_events.recv() => match evt {
                 Ok(event) => {
-                    send_event_line(framed, &event).await?;
+                    send_event_line(framed, &event.with_version(version)).await?;
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(skipped, "event subscriber lagged; some events were dropped");
@@ -738,11 +808,12 @@ mod tests {
     use pohunek_worker_protocol::{
         ControlCode, ControlError, DataFrame, FrameHeader, FrameKind, RuntimeId, StreamId, Version,
     };
+    use protocol::{ProtocolVersion, ProtocolVersionRange, Request};
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
     use tokio_util::sync::CancellationToken;
 
-    use super::{run_worker_attach_bridge, write_frame};
+    use super::{enforce_connection_version, run_worker_attach_bridge, write_frame};
     use crate::runtime::DataStream;
 
     fn data_stream(stream: UnixStream) -> DataStream {
@@ -753,6 +824,57 @@ mod tests {
             runtime_id: RuntimeId::new("runtime-typed-error").expect("runtime id"),
             dimension_update: None,
         }
+    }
+
+    #[test]
+    fn connection_freezes_first_negotiated_version_and_rejects_switches() {
+        let v1 = ProtocolVersion::new(1).expect("v1");
+        let v2 = ProtocolVersion::new(2).expect("v2");
+        let supported = ProtocolVersionRange::new(v1, v2).expect("supported range");
+        let first: Request = serde_json::from_value(serde_json::json!({
+            "v": {"minimum": 1, "maximum": 1},
+            "id": "first",
+            "method": "daemon.health",
+            "params": null
+        }))
+        .expect("first request");
+        let switching: Request = serde_json::from_value(serde_json::json!({
+            "v": {"minimum": 1, "maximum": 2},
+            "id": "switch",
+            "method": "subscribe",
+            "params": null
+        }))
+        .expect("switch request");
+        let incompatible: Request = serde_json::from_value(serde_json::json!({
+            "v": {"minimum": 3, "maximum": 3},
+            "id": "incompatible",
+            "method": "daemon.health",
+            "params": null
+        }))
+        .expect("later incompatible request");
+        let mut frozen = None;
+
+        assert!(enforce_connection_version(&first, &mut frozen, supported).is_none());
+        assert_eq!(frozen, Some(v1));
+        let rejection = enforce_connection_version(&switching, &mut frozen, supported)
+            .expect("later version switch must be rejected before subscription");
+        assert_eq!(rejection.version(), v1);
+        assert_eq!(
+            rejection.into_result().expect_err("switch rejection").code,
+            "version_mismatch"
+        );
+        assert_eq!(frozen, Some(v1), "subscription events remain pinned to v1");
+        let incompatible_rejection =
+            enforce_connection_version(&incompatible, &mut frozen, supported)
+                .expect("later no-overlap request uses the frozen envelope");
+        assert_eq!(incompatible_rejection.version(), v1);
+        assert_eq!(
+            incompatible_rejection
+                .into_result()
+                .expect_err("no-overlap rejection")
+                .code,
+            "version_mismatch"
+        );
     }
 
     #[tokio::test]

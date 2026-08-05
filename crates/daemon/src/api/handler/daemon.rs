@@ -2,7 +2,7 @@
 
 use protocol::{ProtocolError, Request, Response, PROTOCOL_VERSION};
 
-use super::util::ok_value;
+use super::util::{error_value, ok_value};
 use super::HealthInfo;
 
 /// `daemon.health`: report daemon version + protocol version.
@@ -19,17 +19,17 @@ pub(super) fn handle_health(request: &Request, health: &HealthInfo) -> Response 
 
 /// `daemon.doctor`: run host-side self-checks off the async runtime.
 pub(super) async fn handle_daemon_doctor(request: &Request) -> Response {
-    if !request.params.is_null() {
-        return Response::err(
-            request.id.clone(),
+    if !request.params().is_null() {
+        return error_value(
+            request,
             ProtocolError::bad_request("daemon.doctor does not accept params"),
         );
     }
     let paths = match crate::Paths::resolve() {
         Ok(paths) => paths,
         Err(err) => {
-            return Response::err(
-                request.id.clone(),
+            return error_value(
+                request,
                 ProtocolError::new(
                     protocol::ErrorClass::Configuration,
                     "paths_unavailable",
@@ -41,8 +41,8 @@ pub(super) async fn handle_daemon_doctor(request: &Request) -> Response {
     };
     match tokio::task::spawn_blocking(move || crate::doctor::report(&paths)).await {
         Ok(report) => ok_value(request, &protocol::DaemonDoctorResult { report }),
-        Err(_) => Response::err(
-            request.id.clone(),
+        Err(_) => error_value(
+            request,
             ProtocolError::new(
                 protocol::ErrorClass::Daemon,
                 "doctor_task_panicked",

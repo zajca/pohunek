@@ -39,6 +39,7 @@ Current CLI and command surface:
 - `crates/cli/tests/prompt_link.rs`
 - `crates/cli/tests/scripts.rs`
 - `crates/cli/tests/standalone_discovery.rs`
+- `crates/cli/tests/session_process_api.rs`
 
 Native GUI client:
 
@@ -47,12 +48,14 @@ Native GUI client:
 - `crates/gui/src/command.rs`
 - `crates/gui/src/keyboard.rs`
 - `crates/gui/src/runtime.rs`
+- `crates/gui/src/view/modals.rs`
 - `crates/gui/src/view/inbox.rs`
 - `crates/gui/src/view/provider.rs`
 - `crates/gui/src/view/session.rs`
 - `crates/gui/src/view/review.rs`
 - `crates/gui-core/src/assistant.rs`
 - `crates/gui-core/src/lib.rs`
+- `crates/gui-core/src/sdk.rs`
 - `crates/gui-core/src/state.rs`
 - `crates/gui-core/src/providers/linear.rs`
 - `crates/gui-core/src/providers/github.rs`
@@ -81,6 +84,11 @@ Launcher scripts:
 Web control center client:
 
 - `web/sdk/src/index.browser.ts`
+- `web/sdk/README.md`
+- `web/sdk/src/client.ts`
+- `web/sdk/src/envelope.ts`
+- `web/sdk/src/origin.ts`
+- `web/sdk/src/transport.ts`
 - `web/backend/src/config.ts`
 - `web/backend/src/hosts.ts`
 - `web/backend/src/server.ts`
@@ -89,6 +97,8 @@ Web control center client:
 - `web/release/`
 - `web/client-core/src/index.ts`
 - `web/frontend/src/App.svelte`
+- `web/frontend/src/lib/agent-presentation.ts`
+- `web/frontend/src/components/NewSessionDialog.svelte`
 - `web/scripts/dev.ts`
 - `docs/knowledge/guides/web-control-center.md`
 - `docs/design/track-b-web-control-center-plan-2026-07-22.md`
@@ -111,6 +121,7 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/lib.rs`
 - `crates/daemon/src/api/handler/mod.rs`
 - `crates/daemon/src/session/mod.rs`
+- `crates/daemon/src/session/observation.rs`
 - `crates/daemon/src/session/diff.rs`
 - `crates/daemon/src/session/hooks.rs`
 - `crates/daemon/src/session/detector.rs`
@@ -150,13 +161,22 @@ Agent runtime and profile resolution:
 - `crates/daemon/src/agent/profile.rs`
 - `crates/daemon/src/agent/codex.rs`
 - `crates/daemon/src/agent/claude.rs`
+- `crates/daemon/src/agent/hermes.rs`
 - `crates/daemon/src/agent/shell.rs`
 - `crates/daemon/src/detect/mod.rs`
 - `crates/daemon/src/detect/osc.rs`
 - `crates/daemon/src/detect/manifest/mod.rs`
 - `crates/daemon/src/detect/manifests/codex.toml`
 - `crates/daemon/src/detect/manifests/claude.toml`
+- `crates/daemon/src/detect/manifests/hermes.toml`
 - `crates/daemon/src/detect/manifests/shell.toml`
+
+Hermes compatibility evidence:
+
+- `compat/hermes/compatibility-lock.json`
+- `compat/hermes/README.md`
+- `compat/hermes/goldens/manifest.json`
+- `crates/xtask/src/hermes.rs`
 
 Protocol contracts and transport:
 
@@ -168,6 +188,8 @@ Protocol contracts and transport:
 - `crates/paths/src/lib.rs`
 - `crates/protocol/src/assistant.rs`
 - `crates/protocol/src/envelope.rs`
+- `crates/protocol/src/decimal.rs`
+- `crates/protocol/src/limits.rs`
 - `crates/protocol/src/lib.rs`
 - `crates/protocol/src/method.rs`
 - `crates/protocol/src/notification.rs`

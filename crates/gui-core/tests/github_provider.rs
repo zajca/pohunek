@@ -7,6 +7,8 @@ use std::future::Future;
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pohunek_gui_core::providers::github::{
@@ -14,6 +16,9 @@ use pohunek_gui_core::providers::github::{
     GitHubLabel, GitHubPullRequest, PullRequestStatus, ReviewDecision,
 };
 use serde_json::json;
+
+#[cfg(unix)]
+static NEXT_FAKE_GH_DIR: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecordedGhCall {
@@ -682,11 +687,17 @@ fn write_fake_gh(path: &Path, body: &str) {
 
     std::fs::create_dir_all(path.parent().expect("fake gh path has parent"))
         .expect("create fake gh dir");
-    let tmp_path = path.with_extension(format!("tmp-{}", std::process::id()));
-    let mut file = std::fs::File::create(&tmp_path).expect("create temporary fake gh script");
+    let tmp_path = path.with_extension("tmp");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .expect("create unique temporary fake gh script");
     file.write_all(body.as_bytes())
         .expect("write temporary fake gh script");
+    file.flush().expect("flush temporary fake gh script");
     file.sync_all().expect("sync temporary fake gh script");
+    // Linux rejects exec while any process still holds the script open for writing.
     drop(file);
     let mut permissions = std::fs::metadata(&tmp_path)
         .expect("fake gh metadata")
@@ -699,14 +710,19 @@ fn write_fake_gh(path: &Path, body: &str) {
 /// Creates a unique temporary directory for one fake GitHub CLI fixture.
 #[cfg(unix)]
 fn fake_gh_dir(name: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock is after the Unix epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "pohunek-gui-core-{name}-{}-{nanos}",
-        std::process::id()
-    ))
+    loop {
+        // The counter reserves names only; it does not synchronize fixture data.
+        let sequence = NEXT_FAKE_GH_DIR.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "pohunek-gui-core-{name}-{}-{sequence}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return path,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("create unique fake gh dir {}: {error}", path.display()),
+        }
+    }
 }
 
 #[cfg(unix)]

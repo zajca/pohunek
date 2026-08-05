@@ -503,6 +503,7 @@ function host(name: string): HostDescriptor {
 function session(id: string, runtimeId?: string): SessionInfo {
   return {
     id,
+    capabilities: { resume: true, fork: true },
     agent: "codex",
     agent_base: "codex",
     cwd: "/tmp/pohunek-client-core-test",
@@ -520,6 +521,7 @@ function session(id: string, runtimeId?: string): SessionInfo {
         state: "live",
         worker_id: `worker-${runtimeId}`,
         runtime_id: runtimeId,
+        runtime_generation: "1",
         started_at: "2026-07-22T12:00:00Z",
         last_connected_at: "2026-07-22T12:00:00Z",
       },

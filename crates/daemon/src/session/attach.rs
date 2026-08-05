@@ -2,8 +2,8 @@
 
 use super::{
     debug, event, event_payload, session_not_found, session_not_running, AtomicU64, AttachEvent,
-    CancellationToken, ErrorClass, Event, Ordering, ProtocolError, RuntimeHandle,
-    SessionAttachParams, SessionId, SessionRegistry, SessionState, SystemTime, UNIX_EPOCH,
+    CancellationToken, ErrorClass, Ordering, ProtocolError, RuntimeHandle, SessionAttachParams,
+    SessionId, SessionRegistry, SessionState, SystemTime, UNIX_EPOCH,
 };
 use crate::runtime::DataStream;
 use pohunek_worker_protocol::{AttachStart, Dimensions as WorkerDimensions, StreamId};
@@ -271,7 +271,7 @@ impl SessionRegistry {
     }
 
     fn emit_attach(&self, name: &str, session_id: &SessionId, stream_id: &str) {
-        let event = Event::new(
+        let event = crate::events::event(
             name,
             event_payload(AttachEvent {
                 session_id: session_id.clone(),

@@ -8,12 +8,13 @@ use pohunek_gui_core::{
 };
 use protocol::{CwdSource, SessionInfo};
 
+use crate::attach::{session_can_open, session_requires_resume_before_attach};
 use crate::message::Message;
 use crate::selection::{selected_host_config, selected_session};
 use crate::view::provider::linked_github_status;
 use crate::PohunekApp;
 
-use super::{card, section_title};
+use super::{card, section_title, session_agent_label};
 
 /// Session surface: the session card with its actions and metadata.
 pub(crate) fn session_pane(app: &PohunekApp) -> Element<'_, Message> {
@@ -36,7 +37,7 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
             };
             detail = detail
                 .push(text(heading).size(16))
-                .push(text(format!("agent: {}", session.agent)).size(14))
+                .push(text(format!("agent: {}", session_agent_label(session))).size(14))
                 .push(text(origin_label(session)).size(14))
                 .push(text(format!("state: {}", session.state.as_str())).size(14))
                 .push(text(format!("activity: {activity}")).size(14));
@@ -104,7 +105,10 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
             if has_worktree_drift(session) {
                 detail = detail.push(text("worktree drift: yes").size(14));
             }
-            detail = detail.push(session_actions(host_id, session, external));
+            detail = detail.push(session_actions(app, host_id, session, external));
+            if let Some(observation) = session_observation_view(app, host_id, session) {
+                detail = detail.push(observation);
+            }
             if !external {
                 detail = detail.push(rename_view(app));
                 detail = detail.push(metadata_view(app, session));
@@ -117,7 +121,40 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
     card(detail)
 }
 
+fn session_observation_view(
+    app: &PohunekApp,
+    host_id: &HostId,
+    session: &SessionInfo,
+) -> Option<Element<'static, Message>> {
+    let observation = app.workspace.session_observation(host_id, &session.id)?;
+    let mut content = column![].spacing(4);
+    if let Some(screen) = &observation.screen {
+        content = content
+            .push(text("Terminal screen").size(14))
+            .push(text(screen.visible_lines.join("\n")).size(12));
+    }
+    if let Some((start, end)) = observation.output_gap {
+        content = content.push(
+            text(format!(
+                "output gap: {start}..{end}; showing retained bytes"
+            ))
+            .size(12),
+        );
+    }
+    if !observation.output_text.is_empty() {
+        content = content
+            .push(text("Retained output").size(14))
+            .push(text(observation.output_text.clone()).size(12));
+    }
+    if let Some(wait) = &observation.wait {
+        content =
+            content.push(text(format!("last wait: {}", wait_reason_label(wait.reason))).size(12));
+    }
+    Some(content.into())
+}
+
 fn session_actions<'a>(
+    app: &'a PohunekApp,
     host_id: &'a HostId,
     session: &'a SessionInfo,
     external: bool,
@@ -127,20 +164,53 @@ fn session_actions<'a>(
         .style(iced::widget::button::secondary)]
     .spacing(8);
     if !external {
+        let observation = app
+            .workspace
+            .hosts
+            .get(host_id)
+            .map(|host| host.observation_capabilities)
+            .unwrap_or_default();
+        let needs_resume = session_requires_resume_before_attach(app, host_id, &session.id);
+        let can_open = session_can_open(session);
+        let open_label = if needs_resume && !can_open {
+            "Resume unavailable"
+        } else {
+            "Open in terminal"
+        };
+        let mut open_button = button(open_label).style(iced::widget::button::primary);
+        if can_open {
+            open_button = open_button.on_press(Message::OpenSession {
+                host_id: host_id.clone(),
+                session_id: session.id.clone(),
+            });
+        }
+        let mut fork_button = button(if session.capabilities.fork {
+            "Fork"
+        } else {
+            "Fork unsupported"
+        })
+        .style(iced::widget::button::secondary);
+        if session.capabilities.fork {
+            fork_button = fork_button.on_press(Message::ForkSelectedSession);
+        }
         actions = actions
-            .push(
-                button("Open in terminal")
-                    .on_press(Message::OpenSession {
-                        host_id: host_id.clone(),
-                        session_id: session.id.clone(),
-                    })
-                    .style(iced::widget::button::primary),
-            )
-            .push(
-                button("Fork")
-                    .on_press(Message::ForkSelectedSession)
-                    .style(iced::widget::button::secondary),
-            )
+            .push(open_button)
+            .push(fork_button)
+            .push(optional_action_button(
+                "Read screen",
+                observation.terminal_read,
+                Message::ReadSelectedSessionScreen,
+            ))
+            .push(optional_action_button(
+                "Read output",
+                observation.output_read,
+                Message::ReadSelectedSessionOutput,
+            ))
+            .push(optional_action_button(
+                "Wait for change",
+                observation.session_wait,
+                Message::WaitForSelectedSession,
+            ))
             .push(
                 button("Stop")
                     .on_press(Message::StopSelectedSession)
@@ -163,6 +233,31 @@ fn session_actions<'a>(
         }
     }
     actions.into()
+}
+
+fn optional_action_button(
+    label: &str,
+    supported: bool,
+    message: Message,
+) -> iced::widget::Button<'_, Message> {
+    let mut action = button(if supported { label } else { "Unsupported" })
+        .style(iced::widget::button::secondary);
+    if supported {
+        action = action.on_press(message);
+    }
+    action
+}
+
+fn wait_reason_label(reason: protocol::SessionWaitReason) -> &'static str {
+    match reason {
+        protocol::SessionWaitReason::StateMatched => "state matched",
+        protocol::SessionWaitReason::ActivityMatched => "activity matched",
+        protocol::SessionWaitReason::SessionUpdated => "session updated",
+        protocol::SessionWaitReason::TerminalChanged => "terminal changed",
+        protocol::SessionWaitReason::OutputAdvanced => "output advanced",
+        protocol::SessionWaitReason::RuntimeChanged => "runtime changed",
+        protocol::SessionWaitReason::Timeout => "timeout",
+    }
 }
 
 fn cwd_source_label(source: Option<CwdSource>) -> &'static str {
@@ -261,4 +356,29 @@ pub(crate) fn session_name_input(app: &PohunekApp) -> Element<'_, Message> {
     .spacing(8)
     .align_y(Center)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_neutral_wait_reasons_have_operator_labels() {
+        assert_eq!(
+            wait_reason_label(protocol::SessionWaitReason::RuntimeChanged),
+            "runtime changed"
+        );
+        assert_eq!(
+            wait_reason_label(protocol::SessionWaitReason::OutputAdvanced),
+            "output advanced"
+        );
+    }
+
+    #[test]
+    fn observation_action_buttons_render_for_supported_and_unsupported_hosts() {
+        let _: iced::widget::Button<'_, Message> =
+            optional_action_button("Read screen", true, Message::ReadSelectedSessionScreen);
+        let _: iced::widget::Button<'_, Message> =
+            optional_action_button("Read screen", false, Message::ReadSelectedSessionScreen);
+    }
 }

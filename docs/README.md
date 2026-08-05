@@ -15,7 +15,9 @@ sessions across your own machines on a NetBird (WireGuard) network.
 
 - CLI-first; Rust daemon + Rust CLI.
 - Daemon owns PTYs; clients attach/detach. Agents run PTY/TUI-first.
-- Codex and Claude Code are both first-class.
+- Codex, Claude Code, and the local interactive Hermes Agent runtime are
+  first-class. Hermes is pinned to version 0.20.0; its operator plugin remains
+  a later M3 deliverable.
 - Remote transport is **direct over NetBird**, not an SSH bridge.
 - Discovery is **tokenless NetBird-local** + live capability query (no signed
   manifests, no mesh crypto).

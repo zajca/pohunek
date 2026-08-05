@@ -13,9 +13,13 @@ import {
   EVENT_SESSION_STOPPED,
   EVENT_SESSION_UPDATED,
   MAX_CONTROL_LINE_BYTES,
+  MAX_RUNTIME_ID_BYTES,
+  MAX_SESSION_OUTPUT_BYTES,
+  MAX_SESSION_WAIT_MS,
   PROTOCOL_VERSION,
   type AgentActivity,
   type AgentKind,
+  type AgentRuntime,
   type ErrorClass,
   type HostCapabilities,
   type HostRecord,
@@ -25,6 +29,9 @@ import {
   type NotificationId,
   type NotificationListParams,
   type NotificationListResult,
+  type NotificationPolicy,
+  type NotificationPolicyParams,
+  type NotificationPolicyResult,
   type NotificationRecord,
   type NotificationSeverity,
   type NotificationStatus,
@@ -39,20 +46,32 @@ import {
   type ProtocolError,
   type ProtocolEvent,
   type ProtocolVersion,
+  type ProtocolVersionRange,
   type SessionAttachParams,
   type SessionAttachResult,
   type SessionDetachParams,
   type SessionDetachResult,
   type SessionInfo,
+  type SessionInputParams,
+  type SessionInputResult,
   type SessionListFilter,
   type SessionListParams,
   type SessionNewParams,
   type SessionNewResult,
   type SessionResizeParams,
   type SessionResizeResult,
+  type SessionReportNativeIdParams,
+  type SessionReportNativeIdResult,
   type SessionRenameParams,
+  type SessionOutputParams,
+  type SessionOutputResult,
+  type SessionRuntimeIdentity,
+  type SessionScreenParams,
+  type SessionScreenResult,
   type SessionSetMetadataParams,
   type SessionStopResult,
+  type SessionWaitParams,
+  type SessionWaitResult,
   type WorktreeRemoveParams,
   type StateSource,
   type TerminalDimensions,
@@ -90,6 +109,7 @@ export interface StartFixtureDaemonOptions {
   readonly host?: FixtureHostOptions;
   readonly initialSessions?: readonly SessionInfo[];
   readonly initialNotifications?: readonly NotificationRecord[];
+  readonly notificationPolicy?: NotificationPolicy;
   readonly initialProjects?: readonly FixtureProject[];
   readonly pty?: FixturePtyOptions;
 }
@@ -112,7 +132,7 @@ type MethodName = keyof Methods;
 type JsonRecord = Record<string, unknown>;
 
 interface ControlRequest {
-  readonly v: number;
+  readonly v: ProtocolVersionRange;
   readonly id: string;
   readonly method: string;
   readonly params: unknown;
@@ -130,6 +150,18 @@ interface SocketContext {
   queue: Promise<void>;
 }
 
+interface FixtureObservation {
+  runtime_id: string;
+  runtime_generation: bigint;
+  worker_id: string;
+  history_start_offset: bigint;
+  output: Uint8Array;
+  watermark: bigint;
+}
+
+const U64_MAX = 18_446_744_073_709_551_615n;
+const U64_DECIMAL_DIGITS = U64_MAX.toString().length;
+
 const DEFAULT_DAEMON_VERSION = "0.0.0-testkit";
 const DEFAULT_CWD = "/tmp/pohunek-testkit";
 const FIRST_FIXTURE_PID = 42_000;
@@ -138,7 +170,7 @@ const NOTIFICATION_ID_PREFIX = "n-testkit-";
 const PROJECT_ID_PREFIX = "p-testkit-";
 const LINE_FEED = 0x0a;
 const CARRIAGE_RETURN = 0x0d;
-const SUPPORTED_AGENTS = ["shell", "codex", "claude"] as const;
+const SUPPORTED_AGENTS = ["shell", "codex", "claude", "hermes"] as const;
 const SESSION_STATES = ["starting", "running", "stopped", "done", "failed"] as const;
 const AGENT_ACTIVITIES = ["working", "blocked", "idle"] as const;
 const NOTIFICATION_KINDS = [
@@ -158,6 +190,7 @@ const DEFAULT_NOTIFICATION_SOURCE = {
 } as const;
 
 const decoder = new TextDecoder("utf-8", { fatal: true });
+const encoder = new TextEncoder();
 
 class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBackend {
   public readonly scenario: FixtureScenario;
@@ -172,10 +205,12 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
   private readonly subscribers = new Set<Socket>();
   private readonly sessions = new Map<string, SessionInfo>();
   private readonly notifications = new Map<string, NotificationRecord>();
+  private notificationPolicy: NotificationPolicy;
   private readonly projects = new Map<string, ProjectInfo>();
   private readonly projectWorktrees = new Map<string, ProjectWorktree[]>();
   private readonly sessionInitialAttachDimensions = new Map<string, TerminalDimensions[]>();
   private readonly sessionResizes = new Map<string, ScenarioResize[]>();
+  private readonly observations = new Map<string, FixtureObservation>();
   private endpointsValue: FixtureDaemonEndpoint[] = [];
   private discoveredHosts: HostRecord[];
   private nextSessionId = 1;
@@ -190,6 +225,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     this.protocolVersion = options.protocolVersion ?? PROTOCOL_VERSION;
     this.hostCapabilities = cloneValue(options.host?.capabilities ?? defaultHostCapabilities(this.daemonVersion));
     this.discoveredHosts = cloneValue([...(options.host?.discoveredHosts ?? [])]);
+    this.notificationPolicy = cloneValue(options.notificationPolicy ?? defaultNotificationPolicy());
     this.pty = new FixturePtyRegistry(this, options.pty);
     this.scenario = new FixtureScenario(this);
 
@@ -312,12 +348,41 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
 
   public writeToPty(sessionId: string, bytes: Uint8Array): number {
     this.requireSession(sessionId);
+    this.appendObservationOutput(sessionId, bytes);
     return this.pty.writeToSession(sessionId, bytes);
   }
 
   public queuePtyOutput(sessionId: string, bytes: Uint8Array): void {
     this.requireSession(sessionId);
+    this.appendObservationOutput(sessionId, bytes);
     this.pty.queueOutput(sessionId, bytes);
+  }
+
+  public setRetainedOutput(
+    sessionId: string,
+    bytes: Uint8Array,
+    historyStartOffset: number | bigint,
+    runtimeId?: string,
+  ): void {
+    this.requireSession(sessionId);
+    const parsedHistoryStart = fixtureU64(historyStartOffset);
+    if (parsedHistoryStart === undefined) {
+      throw new Error("fixture output history start must be an unsigned u64");
+    }
+    if (checkedAddU64(parsedHistoryStart, BigInt(bytes.byteLength)) === undefined) {
+      throw new Error("fixture retained output end exceeds u64");
+    }
+    if (runtimeId !== undefined && !isBoundedRuntimeId(runtimeId)) {
+      throw new Error("fixture runtime id must be a bounded control-free identifier");
+    }
+    const current = this.observation(sessionId);
+    this.observations.set(sessionId, {
+      ...current,
+      runtime_id: runtimeId ?? current.runtime_id,
+      history_start_offset: parsedHistoryStart,
+      output: copyBytes(bytes),
+      watermark: incrementU64(current.watermark, "fixture terminal watermark"),
+    });
   }
 
   public setDiscoveredHosts(hosts: readonly HostRecord[]): void {
@@ -451,7 +516,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       return;
     }
 
-    if (request.v !== PROTOCOL_VERSION) {
+    if (request.v.minimum > PROTOCOL_VERSION || request.v.maximum < PROTOCOL_VERSION) {
       this.writeResponse(socket, errResponse(request.id, versionMismatch(request.v)));
       return;
     }
@@ -467,6 +532,10 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
   }
 
   private dispatchRequest(request: ControlRequest): ControlResponse {
+    const unsupportedMutation = this.rejectUnsupportedAgentMutation(request);
+    if (unsupportedMutation !== undefined) {
+      return unsupportedMutation;
+    }
     switch (request.method as MethodName) {
       case "daemon.health":
         return okResponse(request.id, {
@@ -492,22 +561,38 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
         return this.handleSessionSetMetadata(request);
       case "session.resume":
         return this.handleSessionResume(request);
+      case "session.report_native_id":
+        return this.handleSessionReportNativeId(request);
       case "session.fork":
         return this.handleSessionFork(request);
       case "session.remove":
         return this.handleSessionRemove(request);
+      case "session.input":
+        return this.handleSessionInput(request);
       case "session.attach":
         return this.handleSessionAttach(request);
       case "session.detach":
         return this.handleSessionDetach(request);
       case "session.resize":
         return this.handleSessionResize(request);
+      case "session.screen":
+        return this.handleSessionScreen(request);
+      case "session.output":
+        return this.handleSessionOutput(request);
+      case "session.wait":
+        return this.handleSessionWait(request);
       case "notification.list":
         return this.handleNotificationList(request);
       case "notification.update":
         return this.handleNotificationUpdate(request);
       case "notification.create":
         return this.handleNotificationCreate(request);
+      case "notification.policy.get":
+        return okResponse(request.id, {
+          policy: cloneValue(this.notificationPolicy),
+        } satisfies NotificationPolicyResult);
+      case "notification.policy.set":
+        return this.handleNotificationPolicySet(request);
       case "project.list":
         return this.handleProjectList(request);
       case "project.add":
@@ -537,8 +622,21 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     if (params === undefined) {
       return errResponse(request.id, invalidParams(request.method));
     }
+    if (!this.hostCapabilities.supported_agents.includes(params.agent)) {
+      return errResponse(request.id, agentKindUnsupported(params.agent));
+    }
+    const runtime = this.agentRuntime(params.agent);
+    if (runtime === undefined) {
+      return errResponse(request.id, agentRuntimeUnsupported());
+    }
+    if (!this.isLaunchableRuntime(runtime)) {
+      if (runtime.agent_base !== undefined && !isLaunchableAgentBase(runtime.agent_base)) {
+        return errResponse(request.id, agentKindUnsupported(runtime.agent_base));
+      }
+      return errResponse(request.id, agentRuntimeUnsupported());
+    }
 
-    const session = this.buildSession(params);
+    const session = this.buildSession(params, runtime.agent_base ?? agentBaseFor(params.agent));
     this.sessions.set(session.id, session);
     this.emitSessionEvent(EVENT_SESSION_CREATED, session);
 
@@ -632,12 +730,48 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     if (typeof request.params !== "string") return errResponse(request.id, invalidParams(request.method));
     const session = this.sessions.get(request.params);
     if (session === undefined) return errResponse(request.id, sessionNotFound(request.params));
-    if (session.state === "running" || session.external === true) return errResponse(request.id, badRequest("session cannot be resumed"));
+    if (session.external === true) return errResponse(request.id, badRequest("session cannot be resumed"));
+    if (!session.capabilities.resume) return errResponse(request.id, agentResumeUnsupported(session.id));
+    if (!isResumableSessionState(session)) {
+      return errResponse(request.id, sessionRuntimeNotRecoverable(session));
+    }
+    if (!hasNativeSessionReference(session)) {
+      return errResponse(request.id, sessionNotResumable(session));
+    }
     session.state = "running";
     delete session.exit_code;
     session.updated_at = timestamp();
     this.emitSessionEvent(EVENT_SESSION_UPDATED, session);
     return okResponse(request.id, { session: cloneValue(session) });
+  }
+
+  private handleSessionReportNativeId(request: ControlRequest): ControlResponse {
+    const params = readObjectParams<SessionReportNativeIdParams>(request);
+    if (
+      params === undefined
+      || typeof params.session_id !== "string"
+      || typeof params.runtime_id !== "string"
+      || typeof params.agent !== "string"
+      || !isPositiveInteger(params.pid)
+      || typeof params.pid_start_identity !== "string"
+      || typeof params.sequence !== "string"
+      || typeof params.expires_at !== "string"
+      || typeof params.native_session_id !== "string"
+      || params.native_session_id.length === 0
+      || (params.transcript_path !== undefined && typeof params.transcript_path !== "string")
+    ) {
+      return errResponse(request.id, invalidParams(request.method));
+    }
+    const session = this.sessions.get(params.session_id);
+    if (session === undefined) return errResponse(request.id, sessionNotFound(params.session_id));
+    if (session.state !== "running" || session.agent !== params.agent || session.pid !== params.pid) {
+      return okResponse(request.id, { recorded: false } satisfies SessionReportNativeIdResult);
+    }
+    session.native_session_id = params.native_session_id;
+    delete session.native_session_path;
+    session.updated_at = timestamp();
+    this.emitSessionEvent(EVENT_SESSION_UPDATED, session);
+    return okResponse(request.id, { recorded: true } satisfies SessionReportNativeIdResult);
   }
 
   private handleSessionFork(request: ControlRequest): ControlResponse {
@@ -648,7 +782,11 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     const source = this.sessions.get(params.session_id);
     if (source === undefined) return errResponse(request.id, sessionNotFound(params.session_id));
     if (source.external === true) return errResponse(request.id, badRequest("external sessions cannot be forked"));
-    const session = this.buildSession({ agent: source.agent, cols: params.cols, rows: params.rows, cwd: source.cwd, ...(params.name === undefined ? {} : { name: params.name }) });
+    if (!source.capabilities.fork) return errResponse(request.id, agentForkUnsupported());
+    const session = this.buildSession(
+      { agent: source.agent, cols: params.cols, rows: params.rows, cwd: source.cwd, ...(params.name === undefined ? {} : { name: params.name }) },
+      source.agent_base,
+    );
     if (source.metadata !== undefined) session.metadata = cloneValue(source.metadata);
     this.sessions.set(session.id, session);
     this.emitSessionEvent(EVENT_SESSION_CREATED, session);
@@ -665,6 +803,18 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     this.pty.closeSession(session.id);
     this.emitEvent({ v: PROTOCOL_VERSION, event: EVENT_SESSION_REMOVED, session: cloneValue(session) });
     return okResponse(request.id, { removed: true, stopped });
+  }
+
+  private handleSessionInput(request: ControlRequest): ControlResponse {
+    const params = readObjectParams<SessionInputParams>(request);
+    if (params === undefined || typeof params.session_id !== "string" || typeof params.text !== "string") {
+      return errResponse(request.id, invalidParams(request.method));
+    }
+    const session = this.sessions.get(params.session_id);
+    if (session === undefined) return errResponse(request.id, sessionNotFound(params.session_id));
+    if (session.state !== "running") return errResponse(request.id, sessionNotRunning(params.session_id));
+    this.pty.writeToSession(session.id, encoder.encode(params.text));
+    return okResponse(request.id, { accepted: true } satisfies SessionInputResult);
   }
 
   private handleSessionAttach(request: ControlRequest): ControlResponse {
@@ -738,6 +888,195 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     return okResponse(request.id, { session: cloneValue(session) } satisfies SessionResizeResult);
   }
 
+  private handleSessionScreen(request: ControlRequest): ControlResponse {
+    const params = readObjectParams<SessionScreenParams>(request);
+    if (
+      params === undefined
+      || !hasOnlyKeys(params, ["session_id"])
+      || typeof params.session_id !== "string"
+    ) {
+      return errResponse(request.id, invalidParams(request.method));
+    }
+    const session = this.sessions.get(params.session_id);
+    if (session === undefined) {
+      return errResponse(request.id, sessionNotFound(params.session_id));
+    }
+    const observation = this.observation(session.id);
+    const text = new TextDecoder().decode(observation.output);
+    const visibleLines = text.length === 0 ? [] : text.split(/\r?\n/u).slice(-session.rows);
+    const lastLine = visibleLines.at(-1) ?? "";
+    const result = {
+      session_id: session.id,
+      worker_id: observation.worker_id,
+      runtime_id: observation.runtime_id,
+      runtime_generation: observation.runtime_generation.toString(),
+      watermark: observation.watermark.toString(),
+      dimensions: { cols: session.cols, rows: session.rows },
+      cursor: {
+        row: Math.max(0, visibleLines.length - 1),
+        col: Math.min(lastLine.length, session.cols - 1),
+        visible: true,
+      },
+      alternate_screen: false,
+      visible_lines: visibleLines,
+    } satisfies SessionScreenResult;
+    return okResponse(request.id, result);
+  }
+
+  private handleSessionOutput(request: ControlRequest): ControlResponse {
+    const params = readObjectParams<SessionOutputParams>(request);
+    if (
+      params === undefined
+      || !hasOnlyKeys(params, ["session_id", "runtime", "after_offset", "max_bytes", "wait_ms"])
+      || typeof params.session_id !== "string"
+      || !isPositiveInteger(params.max_bytes)
+      || params.max_bytes > MAX_SESSION_OUTPUT_BYTES
+      || (params.wait_ms !== undefined && (
+        !isPositiveInteger(params.wait_ms)
+        || params.wait_ms > MAX_SESSION_WAIT_MS
+        || params.after_offset === undefined
+      ))
+      || (params.after_offset !== undefined && params.runtime === undefined)
+      || (params.runtime !== undefined && !isRuntimeIdentity(params.runtime))
+    ) {
+      return errResponse(request.id, invalidParams(request.method));
+    }
+    const session = this.sessions.get(params.session_id);
+    if (session === undefined) {
+      return errResponse(request.id, sessionNotFound(params.session_id));
+    }
+    const observation = this.observation(session.id);
+    if (params.runtime !== undefined && !sameRuntime(params.runtime, observation)) {
+      return errResponse(request.id, sessionRuntimeChanged());
+    }
+
+    const historyStart = observation.history_start_offset;
+    const runtimeEnd = checkedAddU64(historyStart, BigInt(observation.output.byteLength));
+    if (runtimeEnd === undefined) {
+      throw new Error("fixture retained output end exceeds u64");
+    }
+    const maxBytes = BigInt(params.max_bytes);
+    const requested = params.after_offset === undefined
+      ? maxU64(historyStart, runtimeEnd > maxBytes ? runtimeEnd - maxBytes : 0n)
+      : parseDecimalU64(params.after_offset);
+    if (requested === undefined) {
+      return errResponse(request.id, invalidParams(request.method));
+    }
+    if (requested > runtimeEnd) {
+      return errResponse(request.id, sessionTerminalUnavailable());
+    }
+    const start = maxU64(historyStart, requested);
+    const next = start + minU64(maxBytes, runtimeEnd - start);
+    const data = observation.output.subarray(
+      Number(start - historyStart),
+      Number(next - historyStart),
+    );
+    const result: SessionOutputResult = {
+      session_id: session.id,
+      runtime_id: observation.runtime_id,
+      runtime_generation: observation.runtime_generation.toString(),
+      history_start_offset: historyStart.toString(),
+      start_offset: start.toString(),
+      next_offset: next.toString(),
+      runtime_end_offset: runtimeEnd.toString(),
+      data_base64: Buffer.from(data).toString("base64"),
+      ...(requested < historyStart
+        ? { gap: { start_offset: requested.toString(), end_offset: historyStart.toString() } }
+        : {}),
+      has_more: next < runtimeEnd,
+      timed_out: params.wait_ms !== undefined && requested === runtimeEnd,
+    };
+    return okResponse(request.id, result);
+  }
+
+  private handleSessionWait(request: ControlRequest): ControlResponse {
+    const params = readObjectParams<SessionWaitParams>(request);
+    if (
+      params === undefined
+      || !hasOnlyKeys(params, [
+        "session_id",
+        "runtime",
+        "after_updated_at",
+        "after_terminal_watermark",
+        "after_output_offset",
+        "states",
+        "activities",
+        "timeout_ms",
+      ])
+      || typeof params.session_id !== "string"
+      || !isPositiveInteger(params.timeout_ms)
+      || params.timeout_ms > MAX_SESSION_WAIT_MS
+      || (params.runtime !== undefined && !isRuntimeIdentity(params.runtime))
+      || ((params.after_terminal_watermark !== undefined || params.after_output_offset !== undefined)
+        && params.runtime === undefined)
+      || (params.states !== undefined && (!Array.isArray(params.states) || params.states.length === 0
+        || params.states.some((state) => !isSessionState(state))))
+      || (params.activities !== undefined && (!Array.isArray(params.activities) || params.activities.length === 0
+        || params.activities.some((activity) => !isAgentActivity(activity))))
+      || (params.after_updated_at !== undefined && !isRfc3339Timestamp(params.after_updated_at))
+      || (params.after_terminal_watermark !== undefined
+        && parseDecimalU64(params.after_terminal_watermark) === undefined)
+      || (params.after_output_offset !== undefined
+        && parseDecimalU64(params.after_output_offset) === undefined)
+      || (params.runtime === undefined
+        && params.after_updated_at === undefined
+        && params.after_terminal_watermark === undefined
+        && params.after_output_offset === undefined
+        && params.states === undefined
+        && params.activities === undefined)
+    ) {
+      return errResponse(request.id, invalidParams(request.method));
+    }
+    const session = this.sessions.get(params.session_id);
+    if (session === undefined) {
+      return errResponse(request.id, sessionNotFound(params.session_id));
+    }
+    const observation = this.observation(session.id);
+    const outputCursor = params.after_output_offset === undefined
+      ? undefined
+      : parseDecimalU64(params.after_output_offset);
+    const terminalCursor = params.after_terminal_watermark === undefined
+      ? undefined
+      : parseDecimalU64(params.after_terminal_watermark);
+    const runtimeEnd = checkedAddU64(
+      observation.history_start_offset,
+      BigInt(observation.output.byteLength),
+    );
+    if (runtimeEnd === undefined) {
+      throw new Error("fixture retained output end exceeds u64");
+    }
+    if (outputCursor !== undefined && outputCursor > runtimeEnd) {
+      return errResponse(request.id, sessionTerminalUnavailable());
+    }
+    let reason: SessionWaitResult["reason"] = "timeout";
+    if (params.runtime !== undefined && !sameRuntime(params.runtime, observation)) {
+      reason = "runtime_changed";
+    } else if (params.states?.includes(session.state) === true) {
+      reason = "state_matched";
+    } else if (session.activity !== undefined && params.activities?.includes(session.activity) === true) {
+      reason = "activity_matched";
+    } else if (params.after_updated_at !== undefined && params.after_updated_at < session.updated_at) {
+      reason = "session_updated";
+    } else if (
+      terminalCursor !== undefined
+      && terminalCursor < observation.watermark
+    ) {
+      reason = "terminal_changed";
+    } else if (
+      outputCursor !== undefined
+      && outputCursor < runtimeEnd
+    ) {
+      reason = "output_advanced";
+    }
+    const result: SessionWaitResult = {
+      reason,
+      session: cloneValue(session),
+      terminal_watermark: observation.watermark.toString(),
+      output_offset: runtimeEnd.toString(),
+    };
+    return okResponse(request.id, result);
+  }
+
   private handleNotificationCreate(request: ControlRequest): ControlResponse {
     const params = readObjectParams<NotificationCreateParams>(request);
     if (params === undefined || !isNotificationCreateParams(params)) {
@@ -745,6 +1084,17 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     }
     const record = this.createNotification(params, true);
     return okResponse(request.id, { created: true, record } satisfies NotificationCreateResult);
+  }
+
+  private handleNotificationPolicySet(request: ControlRequest): ControlResponse {
+    const params = readObjectParams<NotificationPolicyParams>(request);
+    if (params === undefined || !isNotificationPolicy(params.policy)) {
+      return errResponse(request.id, invalidParams(request.method));
+    }
+    this.notificationPolicy = cloneValue(params.policy);
+    return okResponse(request.id, {
+      policy: cloneValue(this.notificationPolicy),
+    } satisfies NotificationPolicyResult);
   }
 
   private handleNotificationList(request: ControlRequest): ControlResponse {
@@ -868,15 +1218,19 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     return Array.from(this.projects.values()).find((project) => project.id === reference || project.label === reference);
   }
 
-  private buildSession(params: SessionNewParams): SessionInfo {
+  private buildSession(params: SessionNewParams, agentBase: AgentKind): SessionInfo {
     const now = timestamp();
     const id = `${SESSION_ID_PREFIX}${this.nextSessionId}`;
     this.nextSessionId += 1;
 
     const session: SessionInfo = {
       id,
+      capabilities: {
+        resume: agentCapabilities(agentBase).resume,
+        fork: agentCapabilities(agentBase).fork,
+      },
       agent: params.agent,
-      agent_base: agentBaseFor(params.agent),
+      agent_base: agentBase,
       cwd: params.cwd ?? DEFAULT_CWD,
       cwd_source: "launch",
       pid: this.nextPid,
@@ -888,6 +1242,11 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       created_at: now,
       updated_at: now,
     };
+    if (agentBase === "codex") {
+      session.native_session_id = `fixture-native-${id}`;
+    } else if (agentBase === "claude") {
+      session.native_session_path = `${session.cwd}/fixture-native-${id}.jsonl`;
+    }
     this.nextPid += 1;
 
     if (params.name !== undefined) {
@@ -912,6 +1271,40 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     }
 
     return session;
+  }
+
+  private agentRuntime(agent: string): AgentRuntime | undefined {
+    return this.hostCapabilities.runtimes.find((candidate) => candidate.agent === agent);
+  }
+
+  private isLaunchableRuntime(runtime: AgentRuntime): boolean {
+    if (!runtime.available) {
+      return false;
+    }
+    const base = runtime.agent_base;
+    if (base !== undefined && !isLaunchableAgentBase(base)) {
+      return false;
+    }
+    if (base === "hermes" || (base === undefined && runtime.agent === "hermes")) {
+      return runtime.supported === true;
+    }
+    return runtime.supported !== false;
+  }
+
+  private isMutableSession(session: SessionInfo): boolean {
+    return isLaunchableAgentBase(session.agent_base)
+      && (session.active_agent_base === undefined || isLaunchableAgentBase(session.active_agent_base));
+  }
+
+  private rejectUnsupportedAgentMutation(request: ControlRequest): ControlResponse | undefined {
+    const sessionId = mutationSessionId(request);
+    if (sessionId === undefined) {
+      return undefined;
+    }
+    const session = this.sessions.get(sessionId);
+    return session !== undefined && !this.isMutableSession(session)
+      ? errResponse(request.id, agentKindUnsupported(session.active_agent_base ?? session.agent_base))
+      : undefined;
   }
 
   private createNotification(input: ScenarioNotificationInput, emit: boolean): NotificationRecord {
@@ -992,6 +1385,50 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     return session;
   }
 
+  private observation(sessionId: string): FixtureObservation {
+    const existing = this.observations.get(sessionId);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const session = this.requireSession(sessionId);
+    const runtimeGeneration = parseDecimalU64(session.runtime?.runtime_generation ?? "1");
+    if (runtimeGeneration === undefined) {
+      throw new Error("fixture session runtime generation must be an unsigned u64");
+    }
+    const runtimeId = session.runtime?.runtime_id ?? `runtime-${sessionId}`;
+    if (!isBoundedRuntimeId(runtimeId)) {
+      throw new Error("fixture session runtime id must be a bounded control-free identifier");
+    }
+    const observation: FixtureObservation = {
+      runtime_id: runtimeId,
+      runtime_generation: runtimeGeneration,
+      worker_id: session.runtime?.worker_id ?? `worker-${sessionId}`,
+      history_start_offset: 0n,
+      output: new Uint8Array(),
+      watermark: 0n,
+    };
+    this.observations.set(sessionId, observation);
+    return observation;
+  }
+
+  private appendObservationOutput(sessionId: string, bytes: Uint8Array): void {
+    if (bytes.byteLength === 0) {
+      return;
+    }
+    const current = this.observation(sessionId);
+    if (checkedAddU64(current.history_start_offset, BigInt(current.output.byteLength + bytes.byteLength)) === undefined) {
+      throw new Error("fixture retained output end exceeds u64");
+    }
+    const output = new Uint8Array(current.output.byteLength + bytes.byteLength);
+    output.set(current.output);
+    output.set(bytes, current.output.byteLength);
+    this.observations.set(sessionId, {
+      ...current,
+      output,
+      watermark: incrementU64(current.watermark, "fixture terminal watermark"),
+    });
+  }
+
   private async shutdown(): Promise<void> {
     if (this.closed) {
       return;
@@ -1041,10 +1478,89 @@ function defaultHostCapabilities(daemonVersion: string): HostCapabilities {
     daemon_version: daemonVersion,
     protocol_version: PROTOCOL_VERSION,
     supported_agents: [...SUPPORTED_AGENTS],
-    runtimes: SUPPORTED_AGENTS.map((agent) => ({ agent, available: true })),
+    runtimes: SUPPORTED_AGENTS.map((agent) => ({
+      agent,
+      agent_base: agent,
+      available: true,
+      ...(agent === "hermes" ? { version: "0.20.0", supported: true } : {}),
+    })),
     git_available: true,
     worktree_supported: true,
+    terminal_read_supported: true,
+    output_read_supported: true,
+    session_wait_supported: true,
   };
+}
+
+function defaultNotificationPolicy(): NotificationPolicy {
+  return {
+    attention_dedupe_window_secs: 30,
+    attention_debounce_secs: 5,
+    enabled: enabledNotificationKinds(),
+    providers: {
+      codex: enabledNotificationKinds(),
+      claude: enabledNotificationKinds(),
+      hermes: enabledNotificationKinds(),
+    },
+  };
+}
+
+function enabledNotificationKinds(): NotificationPolicy["enabled"] {
+  return {
+    agent_blocked: true,
+    approval_required: true,
+    turn_completed: true,
+    session_finished: true,
+    error: true,
+    system: true,
+  };
+}
+
+function isNotificationPolicy(value: unknown): value is NotificationPolicy {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const keys = Object.keys(value);
+  if (
+    keys.some((key) => ![
+      "attention_dedupe_window_secs",
+      "attention_debounce_secs",
+      "enabled",
+      "providers",
+    ].includes(key))
+    || !isNonNegativeInteger(value["attention_dedupe_window_secs"])
+    || !isNonNegativeInteger(value["attention_debounce_secs"])
+    || !isNotificationKindPolicy(value["enabled"])
+  ) {
+    return false;
+  }
+  const providers = value["providers"];
+  return providers === undefined || (
+    isRecord(providers)
+    && Object.entries(providers).every(([provider, policy]) => (
+      provider.length > 0 && isNotificationKindPolicy(policy)
+    ))
+  );
+}
+
+function isNotificationKindPolicy(value: unknown): value is NotificationPolicy["enabled"] {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const keys = [
+    "agent_blocked",
+    "approval_required",
+    "turn_completed",
+    "session_finished",
+    "error",
+    "system",
+  ];
+  return Object.keys(value).length === keys.length
+    && keys.every((key) => typeof value[key] === "boolean");
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function listen(server: Server, target: string | { readonly host: string; readonly port: number }): Promise<void> {
@@ -1124,7 +1640,7 @@ function parseRequest(line: string): ControlRequest | { readonly err: ProtocolEr
   const version = parsed["v"];
   const id = parsed["id"];
   const method = parsed["method"];
-  if (typeof version !== "number" || typeof id !== "string" || typeof method !== "string") {
+  if (!isProtocolVersionRange(version) || typeof id !== "string" || typeof method !== "string") {
     return { err: badRequest("invalid request envelope") };
   }
   return {
@@ -1133,6 +1649,38 @@ function parseRequest(line: string): ControlRequest | { readonly err: ProtocolEr
     method,
     params: Object.hasOwn(parsed, "params") ? parsed["params"] : null,
   };
+}
+
+function mutationSessionId(request: ControlRequest): string | undefined {
+  switch (request.method) {
+    case "session.stop":
+    case "session.resume":
+    case "session.remove":
+      return typeof request.params === "string" ? request.params : undefined;
+    case "session.fork":
+    case "session.resize":
+    case "session.set_metadata":
+    case "session.rename":
+    case "session.input":
+      return isRecord(request.params) && typeof request.params["session_id"] === "string"
+        ? request.params["session_id"]
+        : undefined;
+    default:
+      return undefined;
+  }
+}
+
+function isProtocolVersionRange(value: unknown): value is ProtocolVersionRange {
+  if (!isRecord(value) || Object.keys(value).length !== 2) {
+    return false;
+  }
+  const minimum = value["minimum"];
+  const maximum = value["maximum"];
+  return (
+    isPositiveInteger(minimum)
+    && isPositiveInteger(maximum)
+    && minimum <= maximum
+  );
 }
 
 function appendPendingLine(context: SocketContext, bytes: Uint8Array): boolean {
@@ -1438,13 +1986,109 @@ function badRequest(message: string): ProtocolError {
   return protocolError("daemon", "bad_request", message);
 }
 
-function versionMismatch(clientVersion: number): ProtocolError {
+function versionMismatch(clientVersion: ProtocolVersionRange): ProtocolError {
   return protocolError(
     "daemon",
     "version_mismatch",
-    `client protocol version ${clientVersion} is incompatible with daemon protocol version ${PROTOCOL_VERSION}`,
+    `client protocol range ${clientVersion.minimum}..=${clientVersion.maximum} is incompatible with daemon protocol version ${PROTOCOL_VERSION}`,
     "upgrade the older side so both speak the same protocol version",
   );
+}
+
+function sessionRuntimeChanged(): ProtocolError {
+  return protocolError(
+    "runtime",
+    "session_runtime_changed",
+    "session runtime changed while reading retained output",
+    "read the current screen and restart output reads from its runtime identity",
+  );
+}
+
+function sessionTerminalUnavailable(): ProtocolError {
+  return protocolError(
+    "runtime",
+    "session_terminal_unavailable",
+    "the managed terminal is temporarily unavailable",
+  );
+}
+
+function sameRuntime(
+  runtime: SessionRuntimeIdentity,
+  observation: FixtureObservation,
+): boolean {
+  return runtime.runtime_id === observation.runtime_id
+    && parseDecimalU64(runtime.runtime_generation) === observation.runtime_generation;
+}
+
+function isRuntimeIdentity(value: unknown): value is SessionRuntimeIdentity {
+  return isRecord(value)
+    && hasOnlyKeys(value, ["runtime_id", "runtime_generation"])
+    && isBoundedRuntimeId(value["runtime_id"])
+    && parseDecimalU64(value["runtime_generation"]) !== undefined;
+}
+
+function isRfc3339Timestamp(value: unknown): value is string {
+  return typeof value === "string"
+    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u.test(value)
+    && !Number.isNaN(Date.parse(value));
+}
+
+function parseDecimalU64(value: unknown): bigint | undefined {
+  if (
+    typeof value !== "string"
+    || value.length > U64_DECIMAL_DIGITS
+    || !/^(0|[1-9][0-9]*)$/u.test(value)
+  ) {
+    return undefined;
+  }
+  const parsed = BigInt(value);
+  return parsed <= U64_MAX ? parsed : undefined;
+}
+
+function fixtureU64(value: number | bigint): bigint | undefined {
+  if (typeof value === "bigint") {
+    return value >= 0n && value <= U64_MAX ? value : undefined;
+  }
+  return Number.isSafeInteger(value) && value >= 0 ? BigInt(value) : undefined;
+}
+
+function checkedAddU64(left: bigint, right: bigint): bigint | undefined {
+  const result = left + right;
+  return result <= U64_MAX ? result : undefined;
+}
+
+function incrementU64(value: bigint, field: string): bigint {
+  const incremented = checkedAddU64(value, 1n);
+  if (incremented === undefined) {
+    throw new Error(`${field} exceeds u64`);
+  }
+  return incremented;
+}
+
+function maxU64(left: bigint, right: bigint): bigint {
+  return left > right ? left : right;
+}
+
+function minU64(left: bigint, right: bigint): bigint {
+  return left < right ? left : right;
+}
+
+function isBoundedRuntimeId(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && Buffer.byteLength(value, "utf8") <= MAX_RUNTIME_ID_BYTES
+    && !/\p{Cc}/u.test(value);
+}
+
+function hasOnlyKeys(value: object, allowed: readonly string[]): boolean {
+  const keys = new Set(allowed);
+  return Object.keys(value).every((key) => keys.has(key));
+}
+
+function copyBytes(bytes: Uint8Array): Uint8Array {
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return copy;
 }
 
 function sessionNotFound(sessionId: string): ProtocolError {
@@ -1453,6 +2097,63 @@ function sessionNotFound(sessionId: string): ProtocolError {
 
 function sessionNotRunning(sessionId: string): ProtocolError {
   return protocolError("runtime", "session_not_running", `session is not running: ${sessionId}`);
+}
+
+function agentKindUnsupported(agent: string): ProtocolError {
+  return protocolError(
+    "runtime",
+    "agent_kind_unsupported",
+    `agent kind \`${agent}\` is presentation-only and cannot be mutated or persisted`,
+    "upgrade the daemon to a version that explicitly supports this agent kind",
+  );
+}
+
+function agentRuntimeUnsupported(): ProtocolError {
+  return protocolError(
+    "runtime",
+    "agent_runtime_unsupported",
+    "the selected agent runtime is unavailable or incompatible with this daemon",
+  );
+}
+
+function agentResumeUnsupported(sessionId: string): ProtocolError {
+  return protocolError("runtime", "agent_resume_unsupported", `agent does not support resume: ${sessionId}`);
+}
+
+function agentForkUnsupported(): ProtocolError {
+  return protocolError("runtime", "agent_fork_unsupported", "the selected agent does not support fork");
+}
+
+function isResumableSessionState(session: SessionInfo): boolean {
+  if (session.runtime !== undefined) {
+    return session.runtime.state === "lost" || session.runtime.state === "terminal";
+  }
+  return session.state === "done" || session.state === "failed" || session.state === "stopped";
+}
+
+function hasNativeSessionReference(session: SessionInfo): boolean {
+  return (session.native_session_id?.length ?? 0) > 0
+    || (session.native_session_path?.length ?? 0) > 0;
+}
+
+function sessionRuntimeNotRecoverable(session: SessionInfo): ProtocolError {
+  const state = session.runtime?.state ?? session.state;
+  return protocolError(
+    "runtime",
+    "session_runtime_not_recoverable",
+    `session ${session.id} runtime is ${state}; native recovery requires terminal or lost`,
+  );
+}
+
+function sessionNotResumable(session: SessionInfo): ProtocolError {
+  const pathKind = session.agent_base === "claude";
+  return protocolError(
+    "runtime",
+    "not_resumable",
+    pathKind
+      ? `resume binding for ${session.id} is path-kind but has no native path`
+      : `resume binding for ${session.id} is id-kind but has no native id`,
+  );
 }
 
 function attachNotFound(streamId: string): ProtocolError {
@@ -1494,7 +2195,24 @@ function agentBaseFor(agent: string): AgentKind {
   if (agent === "claude") {
     return "claude";
   }
+  if (agent === "hermes") {
+    return "hermes";
+  }
   return "shell";
+}
+
+function agentCapabilities(base: AgentKind): { readonly resume: boolean; readonly fork: boolean } {
+  if (base === "hermes") {
+    return { resume: true, fork: false };
+  }
+  if (base === "codex" || base === "claude") {
+    return { resume: true, fork: true };
+  }
+  return { resume: false, fork: false };
+}
+
+function isLaunchableAgentBase(agent: AgentKind): boolean {
+  return agent === "shell" || agent === "codex" || agent === "claude" || agent === "hermes";
 }
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -1526,7 +2244,7 @@ function optionalStringRecord(value: unknown): boolean {
 }
 
 function optionalAgentKind(value: unknown): boolean {
-  return value === undefined || isAgentKind(value);
+  return value === undefined || typeof value === "string";
 }
 
 function optionalNotificationStatus(value: unknown): boolean {
@@ -1569,10 +2287,6 @@ function isNotificationSource(value: unknown): value is NotificationCreateParams
     typeof value["provider_event"] === "string" &&
     typeof value["host_local_source_id"] === "string"
   );
-}
-
-function isAgentKind(value: unknown): value is AgentKind {
-  return value === "shell" || value === "codex" || value === "claude";
 }
 
 function isSessionState(value: unknown): value is SessionInfo["state"] {

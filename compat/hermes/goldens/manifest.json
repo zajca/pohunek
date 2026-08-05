@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "release": "0.20.0",
+  "records": [
+    {"id":"prompt-ready","mode":"classic","status":"pending","note":"Requires an operator refresh with a provider available to the isolated process."},
+    {"id":"short-input","mode":"classic","status":"pending","note":"Requires an operator-configured provider."},
+    {"id":"multiline-input","mode":"classic","status":"pending","note":"Requires an operator-configured provider."},
+    {"id":"working","mode":"classic","status":"pending","note":"Requires an operator-configured provider."},
+    {"id":"approval-blocked","mode":"classic","status":"pending","note":"Requires an operator-configured provider and deterministic approval policy."},
+    {"id":"completion","mode":"classic","status":"pending","note":"Requires an operator-configured provider."},
+    {"id":"interruption","mode":"classic","status":"pending","note":"Requires an operator-configured provider."},
+    {"id":"exit","mode":"classic","status":"pending","note":"Captured with the same provider-isolated refresh for consistent startup evidence."},
+    {"id":"resume","mode":"classic","status":"pending","note":"Requires a completed isolated turn that yields a native session reference."},
+    {"id":"alternate-screen-tui","mode":"alternate_screen_tui","status":"pending","note":"Refresh requires alternate-screen evidence or a recognized bounded local-TUI-unavailable diagnosis."}
+  ]
+}

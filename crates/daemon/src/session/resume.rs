@@ -4,9 +4,9 @@ use super::{
     agent_fork_unsupported, agent_not_resumable, base_resume_template, default_program,
     fork_pty_command_from_template, input_rules_for_agent, is_terminal,
     resume_pty_command_from_template, runtime_error, session_not_found, validate_session_name,
-    warn, LaunchOpts, Ordering, PathBuf, ProtocolError, PtySessionSpec, ResumeBinding,
-    ResumeTemplate, SessionEntry, SessionForkParams, SessionId, SessionInfo, SessionRef,
-    SessionRefKind, SessionRegistry,
+    warn, ForkTemplate, LaunchOpts, Ordering, PathBuf, ProtocolError, PtySessionSpec,
+    ResumeBinding, ResumeTemplate, SessionEntry, SessionForkParams, SessionId, SessionInfo,
+    SessionRef, SessionRefKind, SessionRegistry, ValidatedLaunchProgram,
 };
 
 use std::io;
@@ -27,6 +27,17 @@ pub(super) struct ResumeSnapshot {
     pub(super) args: Vec<String>,
     /// Resolved resume template; `None` ⇒ this session does not resume.
     pub(super) resume: Option<ResumeTemplate>,
+    /// Resolved fork template; `None` ⇒ this session cannot fork natively.
+    pub(super) fork: Option<ForkTemplate>,
+}
+
+impl ResumeSnapshot {
+    /// Return the native reference kind required by resume or fork.
+    pub(super) fn native_ref_kind(&self) -> Option<SessionRefKind> {
+        self.resume
+            .map(|template| template.ref_kind)
+            .or_else(|| self.fork.map(|template| template.resume.ref_kind))
+    }
 }
 
 impl SessionRegistry {
@@ -57,10 +68,9 @@ impl SessionRegistry {
                 if is_terminal(entry.info.state) {
                     return None;
                 }
-                entry.snapshot.resume?;
-                // Resumable once the agent has reported a native reference — an
-                // opaque id (claude/codex) or a transcript path (a path-resuming
-                // host profile). No reference yet ⇒ no binding.
+                entry.snapshot.native_ref_kind()?;
+                // Resume/fork recovery becomes actionable once the agent reports
+                // the native reference required by either frozen capability.
                 if entry.info.native_session_id.is_none()
                     && entry.info.native_session_path.is_none()
                 {
@@ -107,6 +117,9 @@ impl SessionRegistry {
         let (binding, registration) = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
+            if !entry.info.capabilities.resume {
+                return Err(agent_not_resumable(&entry.info.agent));
+            }
             let runtime_state = entry.info.runtime.as_ref().map(|runtime| runtime.state);
             let eligible = matches!(
                 runtime_state,
@@ -142,33 +155,29 @@ impl SessionRegistry {
                         .runtime
                         .as_ref()
                         .and_then(|runtime| runtime.runtime_id.clone()),
+                    previous_runtime_generation: entry
+                        .info
+                        .runtime
+                        .as_ref()
+                        .map_or(protocol::RuntimeGeneration::new(0), |runtime| {
+                            runtime.runtime_generation
+                        }),
                     created_at: entry.info.created_at.clone(),
                     runtime_watch_cancel: entry.runtime_watch_cancel.clone(),
                 },
             )
         };
+        let configured_program = binding_program(&binding);
+        let validated_program =
+            crate::capabilities::validate_launch_runtime(&binding.agent_base, &configured_program)?;
 
         let info = match self
-            .resume_binding_with_registration(binding, registration)
+            .resume_binding_with_registration(binding, registration, validated_program)
             .await
         {
             Ok(info) => info,
             Err(error) => {
-                let restored = {
-                    let sessions = self.inner.sessions.lock().await;
-                    sessions
-                        .get(id)
-                        .map(|entry| Self::session_record(id, entry, entry.desired_state, None))
-                };
-                if let Some(record) = restored {
-                    if let Err(store_error) = self.write_session_record(record).await {
-                        warn!(
-                            session_id = %id.0,
-                            error = %store_error,
-                            "failed to roll back native recovery transaction"
-                        );
-                    }
-                }
+                self.persist_failed_recovery_rollback(id).await;
                 return Err(error);
             }
         };
@@ -176,11 +185,26 @@ impl SessionRegistry {
         Ok(info)
     }
 
+    async fn persist_failed_recovery_rollback(&self, id: &SessionId) {
+        let restored = {
+            let sessions = self.inner.sessions.lock().await;
+            sessions
+                .get(id)
+                .map(|entry| Self::session_record(id, entry, entry.desired_state, None))
+        };
+        let Some(record) = restored else {
+            return;
+        };
+        if let Err(store_error) = self.write_session_record(record).await {
+            warn!(
+                session_id = %id.0,
+                error = %store_error,
+                "failed to roll back native recovery transaction"
+            );
+        }
+    }
+
     /// Fork a native agent conversation into a new pohunek session.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "fork mirrors resume launch assembly while minting a fresh session id"
-    )]
     pub async fn fork(&self, params: SessionForkParams) -> Result<SessionInfo, ProtocolError> {
         self.ensure_not_external(&params.session_id).await?;
         let (binding, repo, branch, worktree_path) = {
@@ -188,6 +212,9 @@ impl SessionRegistry {
             let entry = sessions
                 .get(&params.session_id)
                 .ok_or_else(|| session_not_found(&params.session_id.0))?;
+            if !entry.info.capabilities.fork {
+                return Err(agent_fork_unsupported());
+            }
             (
                 Self::resume_binding_from_entry(&params.session_id, entry),
                 entry.info.repo.clone(),
@@ -196,34 +223,17 @@ impl SessionRegistry {
             )
         };
 
-        match params.cwd_mode {
-            protocol::ForkCwdMode::Same => {}
-        }
-
-        if !binding.resumable && !binding.program.is_empty() {
-            return Err(agent_not_resumable(&binding.agent));
-        }
-        let template = match (binding.resume_mode, binding.ref_kind) {
-            (Some(mode), Some(ref_kind)) => ResumeTemplate { mode, ref_kind },
-            _ => base_resume_template(binding.agent_base)
-                .ok_or_else(|| agent_not_resumable(&binding.agent))?,
-        };
-        let session_ref = session_ref_from_binding(template, &binding)?;
-        if binding.agent_base == protocol::AgentKind::Codex {
-            return Err(agent_fork_unsupported(&binding.agent));
-        }
+        let fork_template = binding_fork_template(&binding).ok_or_else(agent_fork_unsupported)?;
+        let session_ref = session_ref_from_binding(fork_template.resume, &binding)?;
+        let resume_template = binding_resume_template(&binding);
 
         let id = Self::allocate_session_id();
         let has_snapshot = !binding.program.is_empty();
-        let program = if has_snapshot {
-            binding.program.clone()
-        } else {
-            default_program(binding.agent_base)
-        };
+        let program = binding_program(&binding);
         let input_rules = if has_snapshot {
-            binding.input_rules.to_input_rules()
+            binding.input_rules.to_input_rules(&binding.agent_base)
         } else {
-            input_rules_for_agent(binding.agent_base, &self.inner.config)
+            input_rules_for_agent(&binding.agent_base, &self.inner.config)
         };
 
         let (profile_env, manifest_override) = match self
@@ -245,25 +255,26 @@ impl SessionRegistry {
             }
         };
         let mut env_extra = profile_env;
-        env_extra.extend(self.session_pty_env(binding.agent_base, &id));
+        env_extra.extend(self.session_pty_env(binding.agent_base.clone(), &id));
         let opts = LaunchOpts {
             cwd: binding.cwd.clone(),
             cols: params.cols,
             rows: params.rows,
             env_extra,
+            validated_program: None,
         };
         let command = fork_pty_command_from_template(
-            &binding.agent,
             &program,
             binding.args.clone(),
-            template,
+            fork_template,
             &session_ref,
             &opts,
         )?;
         let snapshot = ResumeSnapshot {
             program,
             args: binding.args.clone(),
-            resume: Some(template),
+            resume: resume_template,
+            fork: Some(fork_template),
         };
         let info = self
             .register_pty_session(PtySessionSpec {
@@ -271,7 +282,7 @@ impl SessionRegistry {
                 registration: super::target::PtyRegistration::Create,
                 name: validate_session_name(params.name.as_deref())?,
                 agent: binding.agent,
-                agent_base: binding.agent_base,
+                agent_base: binding.agent_base.clone(),
                 input_rules,
                 snapshot,
                 manifest_override,
@@ -299,7 +310,7 @@ impl SessionRegistry {
             session_id: id.0.clone(),
             name: entry.info.name.clone(),
             agent: entry.info.agent.clone(),
-            agent_base: entry.info.agent_base,
+            agent_base: entry.info.agent_base.clone(),
             cwd: entry.info.cwd.clone(),
             cols: entry.info.cols,
             rows: entry.info.rows,
@@ -321,6 +332,10 @@ impl SessionRegistry {
             resume_mode: entry.snapshot.resume.map(|template| template.mode),
             ref_kind: entry.snapshot.resume.map(|template| template.ref_kind),
             resumable: entry.snapshot.resume.is_some(),
+            fork_mode: entry.snapshot.fork.map(|template| template.mode),
+            fork_resume_mode: entry.snapshot.fork.map(|template| template.resume.mode),
+            fork_ref_kind: entry.snapshot.fork.map(|template| template.resume.ref_kind),
+            forkable: entry.snapshot.fork.is_some(),
         }
     }
 
@@ -330,7 +345,31 @@ impl SessionRegistry {
         &self,
         binding: ResumeBinding,
     ) -> Result<SessionInfo, ProtocolError> {
-        self.resume_binding_with_registration(binding, super::target::PtyRegistration::Create)
+        let configured_program = binding_program(&binding);
+        let validated_program =
+            crate::capabilities::validate_launch_runtime(&binding.agent_base, &configured_program)?;
+        let id = SessionId(binding.session_id.clone());
+        let registration = match self.load_durable_session_record(&id).await? {
+            Some(record) => super::target::PtyRegistration::Recover {
+                transaction_id: format!(
+                    "recover-{}",
+                    self.inner.next_write_id.fetch_add(1, Ordering::Relaxed)
+                ),
+                previous_worker_id: record.runtime.worker_id,
+                previous_runtime_id: record.runtime.runtime_id,
+                previous_runtime_generation: record
+                    .info
+                    .runtime
+                    .as_ref()
+                    .map_or(protocol::RuntimeGeneration::new(0), |runtime| {
+                        runtime.runtime_generation
+                    }),
+                created_at: record.info.created_at,
+                runtime_watch_cancel: tokio_util::sync::CancellationToken::new(),
+            },
+            None => super::target::PtyRegistration::Create,
+        };
+        self.resume_binding_with_registration(binding, registration, validated_program)
             .await
     }
 
@@ -339,18 +378,13 @@ impl SessionRegistry {
         &self,
         binding: ResumeBinding,
         registration: super::target::PtyRegistration,
+        validated_program: Option<ValidatedLaunchProgram>,
     ) -> Result<SessionInfo, ProtocolError> {
         // The resume mechanics come from the frozen structural snapshot (C.4). An
         // explicit `(resume_mode, ref_kind)` pair drives the argv; a legacy binding
         // (pre-C2, no snapshot) falls back to the base kind's native template.
-        if !binding.resumable && !binding.program.is_empty() {
-            return Err(agent_not_resumable(&binding.agent));
-        }
-        let template = match (binding.resume_mode, binding.ref_kind) {
-            (Some(mode), Some(ref_kind)) => ResumeTemplate { mode, ref_kind },
-            _ => base_resume_template(binding.agent_base)
-                .ok_or_else(|| agent_not_resumable(&binding.agent))?,
-        };
+        let template =
+            binding_resume_template(&binding).ok_or_else(|| agent_not_resumable(&binding.agent))?;
         // Build the native reference from the field the frozen `ref_kind` names, so
         // a `path`-kind profile inherits the absolute-path guard and an `id`-kind the
         // leading-dash guard (the documented asymmetry).
@@ -362,15 +396,11 @@ impl SessionRegistry {
         // default so it still relaunches. `program`/`input_rules` are frozen
         // structural fields — never re-resolved from the profile.
         let has_snapshot = !binding.program.is_empty();
-        let program = if has_snapshot {
-            binding.program.clone()
-        } else {
-            default_program(binding.agent_base)
-        };
+        let program = binding_program(&binding);
         let input_rules = if has_snapshot {
-            binding.input_rules.to_input_rules()
+            binding.input_rules.to_input_rules(&binding.agent_base)
         } else {
-            input_rules_for_agent(binding.agent_base, &self.inner.config)
+            input_rules_for_agent(&binding.agent_base, &self.inner.config)
         };
 
         // Re-resolve the profile by NAME to recover its (possibly-secret) env + its
@@ -397,12 +427,13 @@ impl SessionRegistry {
         };
         // Profile env first, daemon handshake env appended last (POHUNEK_* wins).
         let mut env_extra = profile_env;
-        env_extra.extend(self.session_pty_env(binding.agent_base, &id));
+        env_extra.extend(self.session_pty_env(binding.agent_base.clone(), &id));
         let opts = LaunchOpts {
             cwd: binding.cwd.clone(),
             cols: binding.cols,
             rows: binding.rows,
             env_extra,
+            validated_program,
         };
         let command = resume_pty_command_from_template(
             &program,
@@ -417,6 +448,7 @@ impl SessionRegistry {
             program,
             args: binding.args.clone(),
             resume: Some(template),
+            fork: binding_fork_template(&binding),
         };
         // A resumed session relaunches in its recorded cwd, which already is the
         // worktree path for worktree sessions (the worktree persists on disk
@@ -437,7 +469,7 @@ impl SessionRegistry {
             registration,
             name: binding.name,
             agent: binding.agent,
-            agent_base: binding.agent_base,
+            agent_base: binding.agent_base.clone(),
             input_rules,
             snapshot,
             manifest_override,
@@ -494,6 +526,53 @@ impl SessionRegistry {
             }
         }
     }
+}
+
+fn binding_program(binding: &ResumeBinding) -> String {
+    if binding.program.is_empty() {
+        default_program(&binding.agent_base)
+    } else {
+        binding.program.clone()
+    }
+}
+
+/// Return the resume capability frozen into a persisted binding.
+fn binding_resume_template(binding: &ResumeBinding) -> Option<ResumeTemplate> {
+    if !binding.resumable && !binding.program.is_empty() {
+        return None;
+    }
+    binding
+        .resume_mode
+        .zip(binding.ref_kind)
+        .map(|(mode, ref_kind)| ResumeTemplate { mode, ref_kind })
+        .or_else(|| {
+            binding
+                .program
+                .is_empty()
+                .then(|| base_resume_template(&binding.agent_base))
+                .flatten()
+        })
+}
+
+/// Return the fork capability frozen into a persisted binding.
+///
+/// Bindings without an explicit fork snapshot are fail-closed. This includes
+/// persisted pre-1.0 bindings written before the fork fields existed.
+fn binding_fork_template(binding: &ResumeBinding) -> Option<ForkTemplate> {
+    if binding.forkable {
+        return binding
+            .fork_mode
+            .zip(binding.fork_resume_mode)
+            .zip(binding.fork_ref_kind)
+            .map(|((mode, resume_mode), ref_kind)| ForkTemplate {
+                resume: ResumeTemplate {
+                    mode: resume_mode,
+                    ref_kind,
+                },
+                mode,
+            });
+    }
+    None
 }
 
 fn session_ref_from_binding(

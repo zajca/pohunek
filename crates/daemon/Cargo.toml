@@ -11,6 +11,7 @@ name = "pohunekd"
 path = "src/main.rs"
 
 [dependencies]
+base64 = { workspace = true }
 pohunek-knowledge = { workspace = true, features = ["protocol"] }
 pohunek-hostcheck = { workspace = true }
 pohunek-logging = { workspace = true }

@@ -4,7 +4,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createConnection, type Socket } from "node:net";
 import { describe, expect, test } from "bun:test";
-import { MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, type HostRecord, type ProtocolEvent } from "@pohunek/protocol";
+import {
+  MAX_CONTROL_LINE_BYTES,
+  MAX_SESSION_OUTPUT_BYTES,
+  MAX_SESSION_WAIT_MS,
+  PROTOCOL_VERSION,
+  SUPPORTED_PROTOCOL_VERSIONS,
+  type HostRecord,
+  type ProtocolEvent,
+  type SessionOutputParams,
+  type SessionWaitParams,
+} from "@pohunek/protocol";
 import {
   ClientError,
   attachRawLocal,
@@ -25,6 +35,9 @@ const RESIZED_ROWS = 30;
 const MISMATCHED_PROTOCOL_VERSION = PROTOCOL_VERSION + 1;
 const SOCKET_END_TIMEOUT_MS = 5_000;
 const NON_UTF8_PAYLOAD = Uint8Array.of(0x00, 0xff, 0x80, 0x61, 0xc3, 0x28);
+const ABOVE_MAX_SAFE_U64 = "9007199254740993";
+const U64_MAX_WIRE = "18446744073709551615";
+const U64_OVERFLOW_WIRE = "18446744073709551616";
 
 describe("@pohunek/testkit fixture daemon", () => {
   test("state transitions emit real session and agent events", async () => {
@@ -94,6 +107,227 @@ describe("@pohunek/testkit fixture daemon", () => {
     }
   });
 
+  test("models Hermes capability boundaries and rejects unknown launch agents", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("hermes-capabilities") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const inspected = await client.call("host.inspect", null);
+      expect(inspected.supported_agents).toContain("hermes");
+      expect(inspected.runtimes.find((runtime) => runtime.agent === "hermes")).toEqual({
+        agent: "hermes",
+        agent_base: "hermes",
+        available: true,
+        version: "0.20.0",
+        supported: true,
+      });
+
+      const hermes = await client.call("session.new", {
+        agent: "hermes",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      });
+      expect(hermes.capabilities).toEqual({ resume: true, fork: false });
+      expect(await client.call("session.report_native_id", {
+        session_id: hermes.id,
+        runtime_id: `runtime-${hermes.id}`,
+        agent: "hermes",
+        pid: hermes.pid,
+        pid_start_identity: "fixture-start-identity",
+        sequence: "1",
+        expires_at: "2099-08-04T00:00:00Z",
+        native_session_id: "hermes-native-session",
+      })).toEqual({ recorded: true });
+      await client.call("session.stop", hermes.id);
+      await client.call("session.resume", hermes.id);
+
+      const sessionIdsBeforeFork = (await client.call("session.list", {})).map((session) => session.id);
+      const forkError = await expectClientError(client.call("session.fork", {
+        session_id: hermes.id,
+        cwd_mode: "same",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      }));
+      expect(forkError.toProtocolError()).toEqual({
+        class: "runtime",
+        code: "agent_fork_unsupported",
+        msg: "the selected agent does not support fork",
+      });
+      expect((await client.call("session.list", {})).map((session) => session.id)).toEqual(sessionIdsBeforeFork);
+
+      const missingReference = await client.call("session.new", {
+        agent: "hermes",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      });
+      await client.call("session.stop", missingReference.id);
+      const missingReferenceError = await expectClientError(client.call("session.resume", missingReference.id));
+      expect(missingReferenceError.toProtocolError().code).toBe("not_resumable");
+      expect((await client.call("session.inspect", missingReference.id)).state).toBe("stopped");
+
+      const unknownError = await expectClientError(client.call("session.new", {
+        agent: "future-agent",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      }));
+      expect(unknownError.toProtocolError().code).toBe("agent_kind_unsupported");
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("resolves Hermes profile capabilities from runtime inventory", async () => {
+    const daemon = await startFixtureDaemon({
+      listen: { unixSocketPath: testSocketPath("hermes-profile") },
+      host: {
+        capabilities: {
+          daemon_version: "0.0.0-testkit-hermes-profile",
+          protocol_version: PROTOCOL_VERSION,
+          supported_agents: ["hermes-work"],
+          runtimes: [{
+            agent: "hermes-work",
+            agent_base: "hermes",
+            available: true,
+            version: "0.20.0",
+            supported: true,
+          }],
+          git_available: true,
+          worktree_supported: true,
+          terminal_read_supported: true,
+          output_read_supported: true,
+          session_wait_supported: true,
+        },
+      },
+    });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const created = await client.call("session.new", {
+        agent: "hermes-work",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      });
+      expect(created.agent).toBe("hermes-work");
+      expect(created.agent_base).toBe("hermes");
+      expect(created.capabilities).toEqual({ resume: true, fork: false });
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("rejects missing and unsupported Hermes runtimes without creating sessions", async () => {
+    const cases = [
+      { name: "bare-missing", agent: "hermes", available: false, supported: undefined },
+      { name: "bare-wrong", agent: "hermes", available: true, supported: false },
+      { name: "profile-missing", agent: "hermes-work", available: false, supported: true },
+      { name: "profile-unproven", agent: "hermes-work", available: true, supported: undefined },
+    ] as const;
+    for (const testCase of cases) {
+      const daemon = await startFixtureDaemon({
+        listen: { unixSocketPath: testSocketPath(`hermes-runtime-${testCase.name}`) },
+        host: {
+          capabilities: {
+            daemon_version: "0.0.0-testkit-hermes-runtime",
+            protocol_version: PROTOCOL_VERSION,
+            supported_agents: [testCase.agent],
+            runtimes: [{
+              agent: testCase.agent,
+              agent_base: "hermes",
+              available: testCase.available,
+              ...(testCase.supported === undefined ? {} : { supported: testCase.supported }),
+            }],
+            git_available: true,
+            worktree_supported: true,
+            terminal_read_supported: true,
+            output_read_supported: true,
+            session_wait_supported: true,
+          },
+        },
+      });
+      try {
+        const client = await connectLocal(requireUnixSocket(daemon));
+        const error = await expectClientError(client.call("session.new", {
+          agent: testCase.agent,
+          cols: TEST_COLS,
+          rows: TEST_ROWS,
+        }));
+        expect(error.toProtocolError()).toEqual({
+          class: "runtime",
+          code: "agent_runtime_unsupported",
+          msg: "the selected agent runtime is unavailable or incompatible with this daemon",
+        });
+        expect(await client.call("session.list", {})).toEqual([]);
+        await client.close();
+      } finally {
+        await daemon.close();
+      }
+    }
+  });
+
+  test("rejects every unknown-agent mutation without side effects", async () => {
+    const futureSession = {
+      id: "s-future-agent",
+      capabilities: { resume: true, fork: true },
+      agent: "future-agent",
+      agent_base: "future-agent",
+      cwd: "/tmp/pohunek-testkit/future-agent",
+      pid: 42_500,
+      cols: TEST_COLS,
+      rows: TEST_ROWS,
+      state: "running",
+      state_source: "process",
+      activity: "idle",
+      created_at: "2026-08-04T00:00:00Z",
+      updated_at: "2026-08-04T00:00:00Z",
+    } as const;
+    const daemon = await startFixtureDaemon({
+      listen: { unixSocketPath: testSocketPath("future-agent-capabilities") },
+      initialSessions: [futureSession],
+    });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const before = await client.call("session.inspect", futureSession.id);
+      const mutations = [
+        (): Promise<unknown> => client.call("session.stop", futureSession.id),
+        (): Promise<unknown> => client.call("session.resume", futureSession.id),
+        (): Promise<unknown> => client.call("session.remove", futureSession.id),
+        (): Promise<unknown> => client.call("session.fork", {
+          session_id: futureSession.id,
+          cwd_mode: "same",
+          cols: RESIZED_COLS,
+          rows: RESIZED_ROWS,
+        }),
+        (): Promise<unknown> => client.call("session.resize", {
+          session_id: futureSession.id,
+          cols: RESIZED_COLS,
+          rows: RESIZED_ROWS,
+        }),
+        (): Promise<unknown> => client.call("session.set_metadata", {
+          session_id: futureSession.id,
+          metadata: { changed: "true" },
+        }),
+        (): Promise<unknown> => client.call("session.rename", {
+          session_id: futureSession.id,
+          name: "Mutated future session",
+        }),
+        (): Promise<unknown> => client.call("session.input", {
+          session_id: futureSession.id,
+          text: "must not be delivered",
+        }),
+      ];
+      for (const mutate of mutations) {
+        const error = await expectClientError(mutate());
+        expect(error.toProtocolError().code).toBe("agent_kind_unsupported");
+      }
+      expect(await client.call("session.inspect", futureSession.id)).toEqual(before);
+      expect((await client.call("session.list", {})).map((session) => session.id)).toEqual([futureSession.id]);
+      expect(daemon.scenario.resizes(futureSession.id)).toEqual([]);
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
   test("attach round-trips binary bytes without UTF-8 assumptions", async () => {
     const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("binary") } });
     try {
@@ -141,7 +375,7 @@ describe("@pohunek/testkit fixture daemon", () => {
       const client = await connectLocal(requireUnixSocket(daemon));
       const error = await expectClientError(
         client.request({
-          v: PROTOCOL_VERSION,
+          v: SUPPORTED_PROTOCOL_VERSIONS,
           id: "unknown-method",
           method: "session.unknown",
           params: null,
@@ -168,6 +402,194 @@ describe("@pohunek/testkit fixture daemon", () => {
       const health = await client.call("daemon.health", null);
 
       expect(health.protocol_version).toBe(MISMATCHED_PROTOCOL_VERSION);
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("fixture serves screen, retained output gaps, bounded waits, and provider policies", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("observe") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const session = await client.call("session.new", {
+        agent: "codex",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+        metadata: {},
+      });
+      daemon.scenario.setRetainedOutput(
+        session.id,
+        new TextEncoder().encode("retained"),
+        4,
+        "runtime-observe-2",
+      );
+
+      const screen = await client.sessionScreen({ session_id: session.id });
+      expect(screen.visible_lines).toEqual(["retained"]);
+      expect(screen.runtime_id).toBe("runtime-observe-2");
+
+      const output = await client.sessionOutput({
+        session_id: session.id,
+        runtime: { runtime_id: screen.runtime_id, runtime_generation: screen.runtime_generation },
+        after_offset: "2",
+        max_bytes: 128,
+      });
+      expect(output.gap).toEqual({ start_offset: "2", end_offset: "4" });
+      expect(Buffer.from(output.data_base64, "base64").toString("utf8")).toBe("retained");
+
+      const waited = await client.sessionWait({
+        session_id: session.id,
+        runtime: { runtime_id: "stale-runtime", runtime_generation: "1" },
+        timeout_ms: 50,
+      });
+      expect(waited.reason).toBe("runtime_changed");
+
+      const runtime = {
+        runtime_id: screen.runtime_id,
+        runtime_generation: screen.runtime_generation,
+      };
+      const invalidOutputCases: readonly SessionOutputParams[] = [
+        { session_id: session.id, after_offset: "4", max_bytes: 1 },
+        { session_id: session.id, wait_ms: 1, max_bytes: 1 },
+        { session_id: session.id, max_bytes: MAX_SESSION_OUTPUT_BYTES + 1 },
+        { session_id: session.id, runtime, after_offset: U64_OVERFLOW_WIRE, max_bytes: 1 },
+      ];
+      for (const params of invalidOutputCases) {
+        await expectProtocolError(client.sessionOutput(params), "bad_request");
+      }
+      await expectProtocolError(client.sessionOutput({
+        session_id: session.id,
+        runtime,
+        after_offset: "999",
+        max_bytes: 1,
+      }), "session_terminal_unavailable");
+
+      const invalidWaitCases: readonly SessionWaitParams[] = [
+        { session_id: session.id, timeout_ms: 1 },
+        { session_id: session.id, states: [], timeout_ms: 1 },
+        { session_id: session.id, after_output_offset: "4", timeout_ms: 1 },
+        { session_id: session.id, runtime, timeout_ms: MAX_SESSION_WAIT_MS + 1 },
+        { session_id: session.id, runtime, after_terminal_watermark: U64_OVERFLOW_WIRE, timeout_ms: 1 },
+        { session_id: session.id, runtime, after_output_offset: U64_OVERFLOW_WIRE, timeout_ms: 1 },
+        { session_id: session.id, runtime: {
+          runtime_id: runtime.runtime_id,
+          runtime_generation: U64_OVERFLOW_WIRE,
+        }, timeout_ms: 1 },
+        { session_id: session.id, runtime: {
+          runtime_id: "r".repeat(129),
+          runtime_generation: "1",
+        }, timeout_ms: 1 },
+        { session_id: session.id, runtime: {
+          runtime_id: "runtime\u0000control",
+          runtime_generation: "1",
+        }, timeout_ms: 1 },
+      ];
+      for (const params of invalidWaitCases) {
+        await expectProtocolError(client.sessionWait(params), "bad_request");
+      }
+      await expectProtocolError(client.sessionWait({
+        session_id: session.id,
+        runtime,
+        after_output_offset: "999",
+        timeout_ms: 1,
+      }), "session_terminal_unavailable");
+
+      const screenWithExtra = { session_id: session.id, unexpected: true };
+      await expectProtocolError(client.sessionScreen(screenWithExtra), "bad_request");
+      const outputWithExtra = {
+        session_id: session.id,
+        max_bytes: 1,
+        unexpected: true,
+      };
+      await expectProtocolError(client.sessionOutput(outputWithExtra), "bad_request");
+      const waitWithExtra: SessionWaitParams & { readonly unexpected: boolean } = {
+        session_id: session.id,
+        states: ["running"],
+        timeout_ms: 1,
+        unexpected: true,
+      };
+      await expectProtocolError(client.sessionWait(waitWithExtra), "bad_request");
+      const runtimeWithExtra = {
+        ...runtime,
+        unexpected: true,
+      };
+      await expectProtocolError(client.sessionWait({
+        session_id: session.id,
+        runtime: runtimeWithExtra,
+        timeout_ms: 1,
+      }), "bad_request");
+
+      const largeWatermarkWait = await client.sessionWait({
+        session_id: session.id,
+        runtime,
+        after_terminal_watermark: ABOVE_MAX_SAFE_U64,
+        timeout_ms: 1,
+      });
+      expect(largeWatermarkWait.reason).toBe("timeout");
+      const maxWatermarkWait = await client.sessionWait({
+        session_id: session.id,
+        runtime,
+        after_terminal_watermark: U64_MAX_WIRE,
+        timeout_ms: 1,
+      });
+      expect(maxWatermarkWait.reason).toBe("timeout");
+      const largeGenerationWait = await client.sessionWait({
+        session_id: session.id,
+        runtime: {
+          runtime_id: runtime.runtime_id,
+          runtime_generation: ABOVE_MAX_SAFE_U64,
+        },
+        timeout_ms: 1,
+      });
+      expect(largeGenerationWait.reason).toBe("runtime_changed");
+      const maxLengthRuntimeWait = await client.sessionWait({
+        session_id: session.id,
+        runtime: { runtime_id: "r".repeat(128), runtime_generation: "1" },
+        timeout_ms: 1,
+      });
+      expect(maxLengthRuntimeWait.reason).toBe("runtime_changed");
+
+      daemon.scenario.setRetainedOutput(
+        session.id,
+        new TextEncoder().encode("wide"),
+        BigInt(ABOVE_MAX_SAFE_U64),
+        runtime.runtime_id,
+      );
+      const largeOutput = await client.sessionOutput({
+        session_id: session.id,
+        runtime,
+        after_offset: (BigInt(ABOVE_MAX_SAFE_U64) + 1n).toString(),
+        max_bytes: 16,
+      });
+      expect(largeOutput.history_start_offset).toBe(ABOVE_MAX_SAFE_U64);
+      expect(largeOutput.start_offset).toBe((BigInt(ABOVE_MAX_SAFE_U64) + 1n).toString());
+      expect(Buffer.from(largeOutput.data_base64, "base64").toString("utf8")).toBe("ide");
+      let overflowError: unknown;
+      try {
+        daemon.scenario.setRetainedOutput(
+          session.id,
+          Uint8Array.of(1),
+          BigInt(U64_MAX_WIRE),
+        );
+      } catch (error: unknown) {
+        overflowError = error;
+      }
+      expect(overflowError).toBeInstanceOf(Error);
+      if (!(overflowError instanceof Error)) {
+        throw new Error("expected retained output overflow error");
+      }
+      expect(overflowError.message).toContain("exceeds u64");
+
+      const currentPolicy = await client.call("notification.policy.get", null);
+      const futurePolicy = { ...currentPolicy.policy.enabled, system: false };
+      const updatedPolicy = await client.call("notification.policy.set", {
+        policy: {
+          ...currentPolicy.policy,
+          providers: { ...currentPolicy.policy.providers, "future-agent": futurePolicy },
+        },
+      });
+      expect(updatedPolicy.policy.providers?.["future-agent"]).toEqual(futurePolicy);
       await client.close();
     } finally {
       await daemon.close();
@@ -323,13 +745,19 @@ describe("@pohunek/testkit fixture daemon", () => {
   });
 });
 
+async function expectProtocolError(promise: Promise<unknown>, code: string): Promise<void> {
+  const error = await promise.catch((caught: unknown) => caught);
+  expect(error).toBeInstanceOf(ClientError);
+  expect((error as ClientError).toProtocolError().code).toBe(code);
+}
+
 function testSocketPath(label: string): string {
   return join(tmpdir(), `pohunek-testkit-${process.pid}-${label}-${randomUUID()}.sock`);
 }
 
 function subscribeRequest(id: string): Request {
   return {
-    v: PROTOCOL_VERSION,
+    v: SUPPORTED_PROTOCOL_VERSIONS,
     id,
     method: "subscribe",
     params: null,

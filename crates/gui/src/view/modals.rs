@@ -9,7 +9,7 @@ use pohunek_gui_core::{providers, ProviderPanel, Toast};
 use protocol::ProviderKind;
 
 use crate::keyboard::{KeyBindingHelp, KeyContext};
-use crate::message::{Message, ASSISTANT_AUTO_AGENT_LABEL, BASE_AGENT_KINDS, BLANK_TEMPLATE_LABEL};
+use crate::message::{Message, ASSISTANT_AUTO_AGENT_LABEL, BLANK_TEMPLATE_LABEL};
 use crate::selection::{available_actions, selected_assistant_project, selected_host_id};
 use crate::view::inbox::notification_age_label;
 use crate::view::provider::{
@@ -82,11 +82,11 @@ pub(crate) fn start_modal_content(app: &PohunekApp) -> Element<'_, Message> {
             .spacing(8),
         );
     }
-    let panel = panel.push(
-        button("Start session")
-            .on_press(Message::CreateSession)
-            .style(iced::widget::button::primary),
-    );
+    let mut start_button = button("Start session").style(iced::widget::button::primary);
+    if selected_host(app).is_some_and(|host| host.agent_is_launchable(&app.start.agent)) {
+        start_button = start_button.on_press(Message::CreateSession);
+    }
+    let panel = panel.push(start_button);
     dialog_card("Start a session", panel)
 }
 
@@ -162,11 +162,17 @@ pub(crate) fn assistant_modal_content(app: &PohunekApp) -> Element<'_, Message> 
                 .spacing(12),
             );
     }
-    let panel = panel.push(
-        button("Start assistant")
-            .on_press(Message::LaunchAssistant)
-            .style(iced::widget::button::primary),
-    );
+    let assistant_is_launchable = selected_host(app).is_some_and(|host| {
+        app.assistant.agent.as_deref().map_or_else(
+            || !host.launchable_assistant_agents().is_empty(),
+            |agent| host.agent_is_assistant_capable(agent),
+        )
+    });
+    let mut assistant_button = button("Start assistant").style(iced::widget::button::primary);
+    if assistant_is_launchable {
+        assistant_button = assistant_button.on_press(Message::LaunchAssistant);
+    }
+    let panel = panel.push(assistant_button);
     dialog_card("Start assistant", panel)
 }
 
@@ -200,65 +206,27 @@ fn keymap_section(
     section.into()
 }
 
-/// A host's `supported_agents` (seeded from `host.inspect`), or the compiled
-/// base kinds when the host reported none (older daemon, or not seeded yet).
+/// A host's capability-honest launch choices from its runtime inventory.
 fn agent_options_for_host(host: &pohunek_gui_core::HostView) -> Vec<String> {
-    if host.supported_agents.is_empty() {
-        BASE_AGENT_KINDS
-            .iter()
-            .map(|kind| (*kind).to_owned())
-            .collect()
-    } else {
-        host.supported_agents.clone()
-    }
+    host.launchable_agents()
 }
 
-/// Agent options for the Start modal picker: the selected host's
-/// `supported_agents` (falling back to `BASE_AGENT_KINDS` when the host isn't
-/// loaded yet or reported none), always including the currently selected
-/// value so `pick_list` can render it.
-fn start_agent_options(app: &PohunekApp) -> Vec<String> {
-    let options = selected_host_id(app)
+fn selected_host(app: &PohunekApp) -> Option<&pohunek_gui_core::HostView> {
+    selected_host_id(app)
         .ok()
         .and_then(|host_id| app.workspace.hosts.get(&host_id))
-        .map_or_else(
-            || {
-                BASE_AGENT_KINDS
-                    .iter()
-                    .map(|kind| (*kind).to_owned())
-                    .collect()
-            },
-            agent_options_for_host,
-        );
-    with_selected_agent(options, &app.start.agent)
 }
 
-/// Prepends `selected` to `options` when it is not already present, so the
-/// `pick_list` selection is always a valid option even for a value the host
-/// hasn't reported (e.g. a stale dispatch default from a removed profile).
-fn with_selected_agent(mut options: Vec<String>, selected: &str) -> Vec<String> {
-    if !options.iter().any(|option| option == selected) {
-        options.insert(0, selected.to_owned());
-    }
-    options
+/// Agent options for the Start modal picker.
+fn start_agent_options(app: &PohunekApp) -> Vec<String> {
+    selected_host(app).map_or_else(Vec::new, agent_options_for_host)
 }
 
 fn assistant_agent_options(app: &PohunekApp) -> Vec<String> {
-    let mut options = vec![
-        ASSISTANT_AUTO_AGENT_LABEL.to_owned(),
-        "pohunek-assistant".to_owned(),
-        "codex".to_owned(),
-        "claude".to_owned(),
-    ];
+    let mut options = vec![ASSISTANT_AUTO_AGENT_LABEL.to_owned()];
     if let Ok(host_id) = selected_host_id(app) {
         if let Some(host) = app.workspace.hosts.get(&host_id) {
-            for session in host.sessions.values() {
-                if session.agent != "shell"
-                    && !options.iter().any(|option| option == &session.agent)
-                {
-                    options.push(session.agent.clone());
-                }
-            }
+            options.extend(host.launchable_assistant_agents());
         }
     }
     options
@@ -474,7 +442,7 @@ fn open_in_browser_button(url: String) -> Element<'static, Message> {
 /// The Review tab's "Dispatch as session…" confirmation: the source
 /// session's working-agent warning (when applicable), an agent picker
 /// (defaults to the source session's own profile, listing the host's
-/// `supported_agents`), the rendered prompt preview or its render error, and
+/// launchable runtime inventory), the rendered prompt preview or its render error, and
 /// the confirm action.
 pub(crate) fn dispatch_review_modal_content(app: &PohunekApp) -> Element<'_, Message> {
     let Ok(host_id) = selected_host_id(app) else {
@@ -507,7 +475,7 @@ pub(crate) fn dispatch_review_modal_content(app: &PohunekApp) -> Element<'_, Mes
         row![
             text("Agent").size(13),
             pick_list(
-                with_selected_agent(agent_options_for_host(host), &dispatch.agent),
+                agent_options_for_host(host),
                 Some(dispatch.agent.clone()),
                 Message::DispatchAgentSelected,
             ),
@@ -523,11 +491,14 @@ pub(crate) fn dispatch_review_modal_content(app: &PohunekApp) -> Element<'_, Mes
                     scrollable(text(preview.clone()).size(12).font(iced::Font::MONOSPACE))
                         .height(240),
                 )
-                .push(
-                    button("Dispatch")
-                        .on_press(Message::ConfirmReviewDispatch)
-                        .style(iced::widget::button::primary),
-                );
+                .push({
+                    let mut dispatch_button =
+                        button("Dispatch").style(iced::widget::button::primary);
+                    if host.agent_is_launchable(&dispatch.agent) {
+                        dispatch_button = dispatch_button.on_press(Message::ConfirmReviewDispatch);
+                    }
+                    dispatch_button
+                });
         }
         Err(error) => {
             body = body.push(text(format!("Cannot render the review prompt: {error}")).size(13));
@@ -555,10 +526,27 @@ mod tests {
     use pohunek_gui_core::{
         ConnState, HostId, HostView, PromptState, ProviderState, ReviewTabState, Selection,
     };
+    use protocol::{AgentKind, AgentRuntime};
 
     use super::*;
 
-    fn test_host(supported_agents: Vec<String>) -> HostView {
+    fn runtime(
+        name: &str,
+        agent_base: Option<AgentKind>,
+        available: bool,
+        supported: Option<bool>,
+    ) -> AgentRuntime {
+        AgentRuntime {
+            agent: name.to_owned(),
+            agent_base,
+            available,
+            path: None,
+            version: None,
+            supported,
+        }
+    }
+
+    fn test_host(supported_agents: Vec<String>, runtimes: Vec<AgentRuntime>) -> HostView {
         HostView {
             conn: ConnState::Connected,
             health: None,
@@ -572,6 +560,9 @@ mod tests {
             last_agent_state: None,
             last_error: None,
             supported_agents,
+            runtimes,
+            notification_providers: Vec::new(),
+            observation_capabilities: pohunek_gui_core::ObservationCapabilities::default(),
         }
     }
 
@@ -585,47 +576,86 @@ mod tests {
     }
 
     #[test]
-    fn start_agent_options_lists_host_supported_agents() {
+    fn start_agent_options_use_only_launchable_runtime_inventory() {
         let host_id = HostId::new("local");
-        let host = test_host(vec![
-            "shell".to_owned(),
-            "codex".to_owned(),
-            "claude".to_owned(),
-            "claude-otel".to_owned(),
-        ]);
+        let host = test_host(
+            vec!["ghost-supported-name".to_owned()],
+            vec![
+                runtime("shell", Some(AgentKind::Shell), true, None),
+                runtime("legacy-custom", None, true, None),
+                runtime("hermes-review", Some(AgentKind::Hermes), true, Some(true)),
+                runtime("hermes-missing", Some(AgentKind::Hermes), false, None),
+                runtime("hermes-unconfirmed", Some(AgentKind::Hermes), true, None),
+                runtime(
+                    "hermes-unsupported",
+                    Some(AgentKind::Hermes),
+                    true,
+                    Some(false),
+                ),
+                runtime(
+                    "future-profile",
+                    Some(AgentKind::Unknown("future".to_owned())),
+                    true,
+                    Some(true),
+                ),
+            ],
+        );
         let app = test_app(host_id, host);
 
         assert_eq!(
             start_agent_options(&app),
-            vec!["shell", "codex", "claude", "claude-otel"]
+            vec!["shell", "legacy-custom", "hermes-review"]
         );
     }
 
     #[test]
-    fn start_agent_options_falls_back_to_base_kinds_when_host_reports_none() {
+    fn assistant_agent_options_exclude_shell_and_unlaunchable_runtimes() {
         let host_id = HostId::new("local");
-        let host = test_host(Vec::new());
+        let host = test_host(
+            vec!["hermes-unconfirmed".to_owned()],
+            vec![
+                runtime("shell", Some(AgentKind::Shell), true, None),
+                runtime("shell-profile", Some(AgentKind::Shell), true, None),
+                runtime("legacy-custom", None, true, None),
+                runtime(
+                    "hermes-supported",
+                    Some(AgentKind::Hermes),
+                    true,
+                    Some(true),
+                ),
+                runtime("hermes-unconfirmed", Some(AgentKind::Hermes), true, None),
+            ],
+        );
         let app = test_app(host_id, host);
 
-        assert_eq!(start_agent_options(&app), vec!["shell", "codex", "claude"]);
+        assert_eq!(
+            assistant_agent_options(&app),
+            vec![
+                ASSISTANT_AUTO_AGENT_LABEL,
+                "legacy-custom",
+                "hermes-supported"
+            ]
+        );
     }
 
     #[test]
-    fn start_agent_options_prepends_selected_value_when_host_omits_it() {
+    fn start_agent_options_do_not_preserve_a_stale_selected_value() {
         let host_id = HostId::new("local");
-        let host = test_host(vec!["shell".to_owned(), "codex".to_owned()]);
+        let host = test_host(
+            vec!["shell".to_owned(), "stale-profile".to_owned()],
+            vec![runtime("shell", Some(AgentKind::Shell), true, None)],
+        );
         let mut app = test_app(host_id, host);
-        app.start.agent = "claude-otel".to_owned();
+        app.start.agent = "stale-profile".to_owned();
 
         let options = start_agent_options(&app);
-        assert_eq!(options.first(), Some(&"claude-otel".to_owned()));
-        assert!(options.contains(&"codex".to_owned()));
+        assert_eq!(options, vec!["shell"]);
     }
 
     #[test]
-    fn start_agent_options_falls_back_when_no_host_is_selected() {
+    fn start_agent_options_are_empty_when_no_host_is_selected() {
         let app = PohunekApp::test_default();
 
-        assert_eq!(start_agent_options(&app), vec!["shell", "codex", "claude"]);
+        assert!(start_agent_options(&app).is_empty());
     }
 }

@@ -8,6 +8,10 @@
   "agent": "codex",
   "agent_base": "codex",
   "branch": "zajca/12-typescript-sdk",
+  "capabilities": {
+    "fork": true,
+    "resume": true
+  },
   "cols": 120,
   "created_at": "2026-07-08T00:00:00Z",
   "cwd": "/workspace/pohunek",

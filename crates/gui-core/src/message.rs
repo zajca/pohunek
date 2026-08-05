@@ -3,10 +3,12 @@
 use std::path::PathBuf;
 
 use protocol::{
-    NotificationDeleteResult, NotificationUpdateResult, ProjectActionResult, ProjectActionsResult,
-    ProjectInfo, ProjectPromptResult, ProjectRemoveResult, ProjectShowResult, SessionForkResult,
-    SessionId, SessionInfo, SessionNewResult, SessionRemoveResult, SessionRenameResult,
-    SessionResumeResult, SessionSetMetadataResult, SessionStopResult, WorktreeRemoveResult,
+    NotificationDeleteResult, NotificationPolicyResult, NotificationUpdateResult,
+    ProjectActionResult, ProjectActionsResult, ProjectInfo, ProjectPromptResult,
+    ProjectRemoveResult, ProjectShowResult, SessionForkResult, SessionId, SessionInfo,
+    SessionNewResult, SessionOutputResult, SessionRemoveResult, SessionRenameResult,
+    SessionResumeResult, SessionScreenResult, SessionSetMetadataResult, SessionStopResult,
+    SessionWaitResult, WorktreeRemoveResult,
 };
 
 use crate::providers;
@@ -63,6 +65,27 @@ pub enum DomainEvent {
     SessionForked {
         host_id: HostId,
         result: SessionForkResult,
+    },
+    SessionScreenLoaded {
+        host_id: HostId,
+        result: SessionScreenResult,
+    },
+    SessionOutputLoaded {
+        host_id: HostId,
+        result: SessionOutputResult,
+    },
+    SessionObservationRuntimeChanged {
+        host_id: HostId,
+        session_id: SessionId,
+        error: String,
+    },
+    SessionWaitCompleted {
+        host_id: HostId,
+        result: SessionWaitResult,
+    },
+    NotificationPolicyLoaded {
+        host_id: HostId,
+        result: NotificationPolicyResult,
     },
     SessionStopCompleted {
         host_id: HostId,

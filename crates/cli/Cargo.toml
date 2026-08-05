@@ -21,6 +21,7 @@ pohunek-terminal = { workspace = true }
 pohunek-gui-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+base64 = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-std"] }
@@ -35,3 +36,6 @@ time = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+pohunek-logging = { workspace = true }

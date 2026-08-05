@@ -10,11 +10,14 @@ use std::time::Duration;
 
 use futures::{stream, StreamExt as _};
 use protocol::{
-    method, HostClass, HostRecord, Request, Response, MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION,
+    method, HostClass, HostRecord, Request, Response, MAX_CONTROL_LINE_BYTES,
+    SUPPORTED_PROTOCOL_VERSIONS,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+use crate::transport::RequestOrigin;
 
 /// Default lifetime for discovery snapshots.
 ///
@@ -176,28 +179,36 @@ pub async fn discover_hosts() -> Result<Vec<HostRecord>, crate::ClientError> {
 ///
 /// Returns [`crate::ClientError::Netbird`] when local `NetBird` state cannot
 /// be loaded. Returns [`crate::ClientError::RemoteDiscoveryFailed`] when
-/// complete discovery exceeds [`DiscoveryOptions::deadline`].
+/// complete discovery exceeds [`DiscoveryOptions::deadline`]. Returns an
+/// origin-environment error when exactly one origin marker is present or a
+/// marker value is invalid.
 pub async fn discover_hosts_with_options(
     options: DiscoveryOptions,
 ) -> Result<Vec<HostRecord>, crate::ClientError> {
-    discover_with_status(options, async {
-        netbird::run_status_async()
-            .await
-            .map_err(crate::ClientError::Netbird)
-    })
+    let origin = RequestOrigin::from_environment()?;
+    discover_with_status(
+        options,
+        async {
+            netbird::run_status_async()
+                .await
+                .map_err(crate::ClientError::Netbird)
+        },
+        origin,
+    )
     .await
 }
 
 async fn discover_with_status<F>(
     options: DiscoveryOptions,
     status: F,
+    origin: Option<RequestOrigin>,
 ) -> Result<Vec<HostRecord>, crate::ClientError>
 where
     F: std::future::Future<Output = Result<netbird::NetbirdStatus, crate::ClientError>>,
 {
     tokio::time::timeout(options.deadline(), async {
         let status = status.await?;
-        Ok(discover_status(&status, options).await)
+        Ok(discover_status(&status, options, origin.as_ref()).await)
     })
     .await
     .map_err(|_timeout| crate::ClientError::RemoteDiscoveryFailed {
@@ -210,6 +221,7 @@ where
 async fn discover_status(
     status: &netbird::NetbirdStatus,
     options: DiscoveryOptions,
+    origin: Option<&RequestOrigin>,
 ) -> Vec<HostRecord> {
     stream::iter(status.peers().iter().cloned())
         .map(|peer| async move {
@@ -217,7 +229,7 @@ async fn discover_status(
             let fqdn = peer.fqdn.clone();
             let netbird_ip = peer.netbird_ip.clone();
             let class = match probe_target(&peer, options.port()) {
-                Some(addr) => classify(addr, options.probe_timeout()).await,
+                Some(addr) => classify(addr, options.probe_timeout(), origin).await,
                 None => HostClass::Candidate,
             };
             HostRecord {
@@ -241,8 +253,12 @@ fn probe_target(peer: &netbird::Peer, port: u16) -> Option<SocketAddr> {
         .map(|ip| SocketAddr::new(ip, port))
 }
 
-async fn classify(addr: SocketAddr, timeout: Duration) -> HostClass {
-    match tokio::time::timeout(timeout, probe_health(addr)).await {
+async fn classify(
+    addr: SocketAddr,
+    timeout: Duration,
+    origin: Option<&RequestOrigin>,
+) -> HostClass {
+    match tokio::time::timeout(timeout, probe_health(addr, origin)).await {
         Ok(Ok(response)) => classify_response(&response),
         Ok(Err(_)) | Err(_) => HostClass::Unreachable,
     }
@@ -250,20 +266,25 @@ async fn classify(addr: SocketAddr, timeout: Duration) -> HostClass {
 
 async fn probe_health(
     addr: SocketAddr,
+    origin: Option<&RequestOrigin>,
 ) -> Result<Response, Box<dyn std::error::Error + Send + Sync>> {
     let mut stream = TcpStream::connect(addr).await?;
     let request = Request::new(
         crate::next_request_id(method::DAEMON_HEALTH),
         method::DAEMON_HEALTH,
         Value::Null,
-    );
+    )?;
+    let request = match origin {
+        Some(origin) => origin.apply(request)?,
+        None => request,
+    };
     let mut line = serde_json::to_vec(&request)?;
     line.push(b'\n');
     stream.write_all(&line).await?;
     stream.flush().await?;
     let reply = read_line(&mut stream, MAX_CONTROL_LINE_BYTES).await?;
     let response: Response = serde_json::from_slice(&reply)?;
-    if response.id() != request.id {
+    if response.id() != request.id() {
         return Err("probe response id did not match request".into());
     }
     Ok(response)
@@ -292,19 +313,19 @@ async fn read_line(
 
 fn classify_response(response: &Response) -> HostClass {
     let daemon_protocol_version = response.version().get();
-    if daemon_protocol_version != PROTOCOL_VERSION.get() {
+    if !SUPPORTED_PROTOCOL_VERSIONS.contains(response.version()) {
         return HostClass::VersionMismatch {
             daemon_protocol_version,
         };
     }
-    match response {
-        Response::Ok { ok, .. } => HostClass::ReachableDaemon {
+    match response.result() {
+        Ok(ok) => HostClass::ReachableDaemon {
             daemon_version: ok
                 .get("daemon_version")
                 .and_then(Value::as_str)
                 .map_or_else(|| "<unknown>".to_owned(), str::to_owned),
         },
-        Response::Err { .. } => HostClass::Unreachable,
+        Err(_) => HostClass::Unreachable,
     }
 }
 
@@ -316,8 +337,9 @@ fn short_hostname(fqdn: &str) -> &str {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use protocol::ProtocolVersion;
+    use protocol::{ProtocolVersion, ProtocolVersionRange, PROTOCOL_VERSION};
     use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
 
     use super::*;
 
@@ -383,10 +405,14 @@ mod tests {
             .expect("options")
             .with_deadline(Duration::from_millis(10))
             .expect("deadline");
-        let result = discover_with_status(options, async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            Ok(netbird::parse_status(r#"{"peers":[]}"#).expect("status"))
-        })
+        let result = discover_with_status(
+            options,
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Ok(netbird::parse_status(r#"{"peers":[]}"#).expect("status"))
+            },
+            None,
+        )
         .await;
         let timeout = result.expect_err("status loading must time out");
         assert!(matches!(
@@ -405,14 +431,18 @@ mod tests {
     #[test]
     fn response_version_is_the_classification_authority() {
         let other = PROTOCOL_VERSION.get() + 1;
-        let response = Response::Err {
-            v: ProtocolVersion(other),
-            id: "probe".to_owned(),
-            err: protocol::ProtocolError::version_mismatch(
-                PROTOCOL_VERSION,
-                ProtocolVersion(other),
+        let other_version = ProtocolVersion::new(other).expect("nonzero test version");
+        let response = Response::err(
+            other_version,
+            "probe",
+            protocol::ProtocolError::version_mismatch(
+                ProtocolVersionRange::new(PROTOCOL_VERSION, PROTOCOL_VERSION)
+                    .expect("valid exact test range"),
+                ProtocolVersionRange::new(other_version, other_version)
+                    .expect("valid exact test range"),
             ),
-        };
+        )
+        .expect("valid test response");
         assert_eq!(
             classify_response(&response),
             HostClass::VersionMismatch {
@@ -429,7 +459,7 @@ mod tests {
         let addr = listener.local_addr().expect("address");
         drop(listener);
         assert_eq!(
-            classify(addr, Duration::from_millis(100)).await,
+            classify(addr, Duration::from_millis(100), None).await,
             HostClass::Unreachable
         );
     }
@@ -472,7 +502,7 @@ mod tests {
             let request: Request = serde_json::from_slice(&request).expect("request");
             let response = serde_json::json!({
                 "v": PROTOCOL_VERSION.get(),
-                "id": request.id,
+                "id": request.id(),
                 "ok": { "daemon_version": daemon_version },
             });
             socket
@@ -483,15 +513,63 @@ mod tests {
         addr
     }
 
+    async fn health_capture_stub() -> (SocketAddr, oneshot::Receiver<Request>) {
+        let listener = TcpListener::bind((IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let (request_tx, request_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let request = read_line(&mut socket, MAX_CONTROL_LINE_BYTES)
+                .await
+                .expect("read request");
+            let request: Request = serde_json::from_slice(&request).expect("request");
+            let response = serde_json::json!({
+                "v": PROTOCOL_VERSION.get(),
+                "id": request.id(),
+                "ok": { "daemon_version": "test" },
+            });
+            socket
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .expect("write");
+            request_tx.send(request).expect("capture request");
+        });
+        (addr, request_rx)
+    }
+
     #[tokio::test]
     async fn health_response_extracts_daemon_version() {
         let addr = health_echo_stub("1.2.3").await;
         assert_eq!(
-            classify(addr, DEFAULT_PROBE_TIMEOUT).await,
+            classify(addr, DEFAULT_PROBE_TIMEOUT, None).await,
             HostClass::ReachableDaemon {
                 daemon_version: "1.2.3".to_owned()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn discovery_health_probe_carries_complete_origin_pair() {
+        let (addr, request_rx) = health_capture_stub().await;
+        let origin = RequestOrigin::from_values(
+            Some("session-origin".to_owned()),
+            Some("daemon-origin".to_owned()),
+        )
+        .expect("valid origin")
+        .expect("complete origin");
+
+        let response = probe_health(addr, Some(&origin))
+            .await
+            .expect("health response");
+        let request = request_rx.await.expect("captured request");
+        assert_eq!(response.id(), request.id());
+        assert_eq!(
+            request.origin_session_id(),
+            Some(&protocol::SessionId("session-origin".to_owned()))
+        );
+        assert_eq!(request.origin_daemon_id(), Some("daemon-origin"));
     }
 
     #[tokio::test]
@@ -503,7 +581,7 @@ mod tests {
         .into_bytes();
         let addr = health_stub(line, Duration::ZERO).await;
         assert_eq!(
-            classify(addr, DEFAULT_PROBE_TIMEOUT).await,
+            classify(addr, DEFAULT_PROBE_TIMEOUT, None).await,
             HostClass::Unreachable
         );
     }
@@ -512,19 +590,19 @@ mod tests {
     async fn malformed_oversized_and_timeout_responses_are_unreachable() {
         let malformed = health_stub(b"not-json\n".to_vec(), Duration::ZERO).await;
         assert_eq!(
-            classify(malformed, DEFAULT_PROBE_TIMEOUT).await,
+            classify(malformed, DEFAULT_PROBE_TIMEOUT, None).await,
             HostClass::Unreachable
         );
 
         let oversized = health_stub(vec![b'x'; MAX_CONTROL_LINE_BYTES + 1], Duration::ZERO).await;
         assert_eq!(
-            classify(oversized, DEFAULT_PROBE_TIMEOUT).await,
+            classify(oversized, DEFAULT_PROBE_TIMEOUT, None).await,
             HostClass::Unreachable
         );
 
         let slow = health_stub(Vec::new(), Duration::from_millis(100)).await;
         assert_eq!(
-            classify(slow, Duration::from_millis(10)).await,
+            classify(slow, Duration::from_millis(10), None).await,
             HostClass::Unreachable
         );
     }
@@ -546,6 +624,7 @@ mod tests {
                 .expect("probe timeout")
                 .with_concurrency(2)
                 .expect("concurrency"),
+            None,
         )
         .await;
         assert_eq!(records[0].name.as_deref(), Some("first"));

@@ -4,7 +4,7 @@
 //! command supports `--json` where the plan calls for machine-readable output
 //! (see `docs/plan-phase-1.md` "CLI Grammar").
 
-use protocol::Request;
+use protocol::{ProtocolError, Request, SUPPORTED_PROTOCOL_VERSIONS};
 use serde::Serialize;
 
 use crate::error::CliError;
@@ -32,7 +32,42 @@ pub(crate) mod setup;
 /// serializes its result type identically and a script receives exactly one JSON
 /// document on stdout.
 pub(crate) fn render_json<T: Serialize + ?Sized>(value: &T) -> Result<String, CliError> {
+    render_json_document(&JsonEnvelope {
+        cli_version: env!("CARGO_PKG_VERSION"),
+        protocol: SUPPORTED_PROTOCOL_VERSIONS,
+        ok: Some(value),
+        err: None,
+    })
+}
+
+/// Render a typed error in the same versioned process envelope as successes.
+pub(crate) fn render_json_error(error: &ProtocolError) -> Result<String, CliError> {
+    render_json_document(&JsonEnvelope::<()> {
+        cli_version: env!("CARGO_PKG_VERSION"),
+        protocol: SUPPORTED_PROTOCOL_VERSIONS,
+        ok: None,
+        err: Some(error),
+    })
+}
+
+#[derive(Serialize)]
+struct JsonEnvelope<'a, T: ?Sized> {
+    cli_version: &'static str,
+    protocol: protocol::ProtocolVersionRange,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ok: Option<&'a T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    err: Option<&'a ProtocolError>,
+}
+
+fn render_json_document<T: Serialize + ?Sized>(value: &T) -> Result<String, CliError> {
     Ok(format!("{}\n", serde_json::to_string_pretty(value)?))
+}
+
+#[cfg(test)]
+pub(crate) fn parse_json_ok<T: serde::de::DeserializeOwned>(document: &str) -> T {
+    let envelope: serde_json::Value = serde_json::from_str(document).expect("parse JSON envelope");
+    serde_json::from_value(envelope["ok"].clone()).expect("parse JSON success payload")
 }
 
 /// Build a unique correlation id for a single control request.
@@ -58,11 +93,10 @@ pub(crate) fn request_with_params<T>(method: &str, params: &T) -> Result<Request
 where
     T: Serialize + ?Sized,
 {
-    Ok(Request::new(
-        request_id(method),
-        method,
-        serde_json::to_value(params)?,
-    ))
+    Ok(
+        Request::new(request_id(method), method, serde_json::to_value(params)?)
+            .map_err(pohunek_client::ClientError::from)?,
+    )
 }
 
 #[cfg(test)]
@@ -78,5 +112,25 @@ mod tests {
         assert!(b.starts_with("sdk-daemon.health-"), "id: {b}");
         // Two calls (as in concurrent discover probes) never collide.
         assert_ne!(a, b, "request ids must be unique per call");
+    }
+
+    #[test]
+    fn json_success_envelope_is_versioned_and_has_one_result_arm() {
+        let doc = render_json(&serde_json::json!({"value": 42})).expect("render envelope");
+        let value: serde_json::Value = serde_json::from_str(&doc).expect("parse envelope");
+        assert_eq!(value["cli_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["protocol"]["minimum"], 2);
+        assert_eq!(value["protocol"]["maximum"], 2);
+        assert_eq!(value["ok"]["value"], 42);
+        assert!(value.get("err").is_none());
+    }
+
+    #[test]
+    fn json_error_envelope_is_versioned_and_has_one_error_arm() {
+        let error = ProtocolError::agent_binary_missing("codex");
+        let doc = render_json_error(&error).expect("render envelope");
+        let value: serde_json::Value = serde_json::from_str(&doc).expect("parse envelope");
+        assert_eq!(value["err"]["code"], "agent_binary_missing");
+        assert!(value.get("ok").is_none());
     }
 }

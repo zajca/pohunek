@@ -6,16 +6,22 @@
 
 use std::{collections::BTreeMap, path::PathBuf};
 
-use serde::{Deserialize, Serialize};
+use base64::prelude::{Engine as _, BASE64_STANDARD};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::{envelope::StateSource, ProtocolError};
+use crate::{
+    envelope::StateSource, OutputOffset, ProcessStartIdentity, ProtocolError, ReportSequence,
+    RuntimeGeneration, TerminalWatermark, MAX_RUNTIME_ID_BYTES, MAX_SESSION_ID_BYTES,
+    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_WAIT_MS,
+};
 
 /// The kind of agent backing a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "AgentKind.ts"))]
-#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", ts(type = "string"))]
 pub enum AgentKind {
     /// A plain shell session.
     Shell,
@@ -23,6 +29,85 @@ pub enum AgentKind {
     Codex,
     /// A Claude Code agent session.
     Claude,
+    /// A Hermes Agent interactive terminal session.
+    Hermes,
+    /// A future wire value rendered neutrally by an older peer.
+    Unknown(String),
+}
+
+impl AgentKind {
+    /// Returns the stable wire value.
+    #[must_use]
+    pub fn as_wire(&self) -> &str {
+        match self {
+            Self::Shell => "shell",
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Hermes => "hermes",
+            Self::Unknown(value) => value,
+        }
+    }
+
+    /// Returns whether this is a known, supported agent kind.
+    #[must_use]
+    pub const fn is_known(&self) -> bool {
+        !matches!(self, Self::Unknown(_))
+    }
+
+    /// Rejects presentation-only agent kinds before a mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable `agent_kind_unsupported` protocol error for an unknown
+    /// value. Call this from every agent-targeted public mutation.
+    pub fn validate_mutation(&self) -> Result<(), ProtocolError> {
+        if self.is_known() {
+            Ok(())
+        } else {
+            Err(ProtocolError::agent_kind_unsupported(self.as_wire()))
+        }
+    }
+
+    /// Rejects presentation-only agent kinds before durable persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same stable error as [`Self::validate_mutation`]. Keeping a
+    /// dedicated entry point makes durable stores auditable without treating an
+    /// unknown display value as a valid launch or recovery configuration.
+    pub fn validate_persistence(&self) -> Result<(), ProtocolError> {
+        self.validate_mutation()
+    }
+}
+
+impl std::fmt::Display for AgentKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_wire())
+    }
+}
+
+impl Serialize for AgentKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_wire())
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match String::deserialize(deserializer)?.as_str() {
+            "shell" => Self::Shell,
+            "codex" => Self::Codex,
+            "claude" => Self::Claude,
+            "hermes" => Self::Hermes,
+            other => Self::Unknown(other.to_owned()),
+        })
+    }
 }
 
 /// Current detected agent activity within a running session.
@@ -207,10 +292,11 @@ impl SessionListFilter {
             Self::Activity(activity) => session.activity == Some(*activity),
             Self::Agent(name) => {
                 session.agent == *name
-                    || base_kind_label(session.agent_base) == name
+                    || base_kind_label(&session.agent_base) == name
                     || session.active_agent.as_deref() == Some(name)
                     || session
                         .active_agent_base
+                        .as_ref()
                         .is_some_and(|base| base_kind_label(base) == name)
             }
             Self::Id(id) => session.id.0 == *id,
@@ -222,11 +308,13 @@ impl SessionListFilter {
     }
 }
 
-fn base_kind_label(agent: AgentKind) -> &'static str {
+fn base_kind_label(agent: &AgentKind) -> &str {
     match agent {
         AgentKind::Shell => "shell",
         AgentKind::Codex => "codex",
         AgentKind::Claude => "claude",
+        AgentKind::Hermes => "hermes",
+        AgentKind::Unknown(value) => value,
     }
 }
 
@@ -379,6 +467,908 @@ pub struct SessionInputResult {
     pub accepted: bool,
 }
 
+/// Reports an invalid bounded-observation request.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ObservationParamsError {
+    /// A required identifier was empty or contained control characters.
+    #[error("{field} must be nonempty and contain no control characters")]
+    InvalidIdentifier {
+        /// Invalid field name.
+        field: &'static str,
+    },
+    /// An identifier exceeded its documented UTF-8 byte ceiling.
+    #[error("{field} must be at most {maximum} UTF-8 bytes, got {actual}")]
+    IdentifierTooLong {
+        /// Invalid field name.
+        field: &'static str,
+        /// Maximum accepted UTF-8 byte length.
+        maximum: usize,
+        /// Actual UTF-8 byte length.
+        actual: usize,
+    },
+    /// A cursor was supplied without the runtime that scopes it.
+    #[error("{cursor} requires a runtime identity")]
+    CursorRequiresRuntime {
+        /// Cursor field name.
+        cursor: &'static str,
+    },
+    /// A bounded byte count was zero or exceeded the protocol ceiling.
+    #[error("max_bytes must be between 1 and {maximum}, got {actual}")]
+    InvalidMaxBytes {
+        /// Protocol maximum.
+        maximum: u32,
+        /// Requested value.
+        actual: u32,
+    },
+    /// A required or optional wait duration was zero.
+    #[error("{field} must be nonzero")]
+    ZeroDuration {
+        /// Invalid duration field.
+        field: &'static str,
+    },
+    /// A bounded duration exceeded the public protocol ceiling.
+    #[error("{field} must be at most {maximum} ms, got {actual}")]
+    DurationTooLong {
+        /// Invalid duration field.
+        field: &'static str,
+        /// Protocol maximum in milliseconds.
+        maximum: u32,
+        /// Requested duration in milliseconds.
+        actual: u32,
+    },
+    /// Waiting output requires an explicit cursor.
+    #[error("wait_ms requires after_offset")]
+    OutputWaitRequiresCursor,
+    /// A present state or activity predicate was empty.
+    #[error("{field} must be omitted or contain at least one value")]
+    EmptyPredicate {
+        /// Empty predicate field.
+        field: &'static str,
+    },
+    /// A wait contained no condition except its timeout.
+    #[error("session.wait requires at least one predicate or cursor")]
+    MissingPredicate,
+    /// A timestamp was not valid RFC 3339.
+    #[error("{field} must be a valid RFC 3339 timestamp")]
+    InvalidTimestamp {
+        /// Invalid timestamp field.
+        field: &'static str,
+    },
+    /// A process identifier was zero.
+    #[error("pid must be nonzero")]
+    ZeroPid,
+    /// Output data was not canonical standard base64.
+    #[error("data_base64 must be canonical standard base64")]
+    InvalidOutputBase64,
+    /// Decoded output exceeded the protocol byte ceiling.
+    #[error("decoded output must be at most {maximum} bytes, got {actual}")]
+    OutputDataTooLarge {
+        /// Protocol byte ceiling.
+        maximum: usize,
+        /// Actual decoded byte length.
+        actual: usize,
+    },
+    /// Output offsets were not monotonically ordered.
+    #[error("output offsets must satisfy history_start <= start <= next <= runtime_end")]
+    InvalidOutputOffsetOrder,
+    /// Decoded data length did not match the returned offset interval.
+    #[error("decoded output length {decoded} does not match offset span {span}")]
+    OutputLengthMismatch {
+        /// Decoded data byte length.
+        decoded: u64,
+        /// `next_offset - start_offset`.
+        span: u64,
+    },
+    /// Gap coordinates did not describe the evicted range ending at retained history.
+    #[error("output gap must be nonempty and end at history_start_offset/start_offset")]
+    InvalidOutputGap,
+    /// `has_more` disagreed with the returned and runtime end offsets.
+    #[error("has_more must equal next_offset < runtime_end_offset")]
+    InvalidOutputHasMore,
+}
+
+fn validate_identifier(value: &str, field: &'static str) -> Result<(), ObservationParamsError> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        Err(ObservationParamsError::InvalidIdentifier { field })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_bounded_identifier(
+    value: &str,
+    field: &'static str,
+    maximum: usize,
+) -> Result<(), ObservationParamsError> {
+    validate_identifier(value, field)?;
+    if value.len() > maximum {
+        Err(ObservationParamsError::IdentifierTooLong {
+            field,
+            maximum,
+            actual: value.len(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_timestamp(value: &str, field: &'static str) -> Result<(), ObservationParamsError> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .map(|_timestamp| ())
+        .map_err(|_error| ObservationParamsError::InvalidTimestamp { field })
+}
+
+/// Parameters for `session.screen`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionScreenParams.ts"))]
+#[serde(deny_unknown_fields)]
+pub struct SessionScreenParams {
+    /// Session whose managed terminal should be rendered.
+    session_id: SessionId,
+}
+
+impl SessionScreenParams {
+    /// Creates a terminal-screen request.
+    #[must_use]
+    pub const fn new(session_id: SessionId) -> Self {
+        Self { session_id }
+    }
+
+    /// Returns the requested logical session.
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+}
+
+/// Visible terminal cursor in a rendered screen snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "TerminalCursor.ts"))]
+#[serde(deny_unknown_fields)]
+pub struct TerminalCursor {
+    /// Zero-based visible row.
+    pub row: u16,
+    /// Zero-based visible column.
+    pub col: u16,
+    /// Whether the terminal cursor is currently visible.
+    pub visible: bool,
+}
+
+/// Runtime identity that scopes terminal cursors and output offsets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionRuntimeIdentity.ts"))]
+pub struct SessionRuntimeIdentity {
+    /// PTY runtime identifier.
+    runtime_id: String,
+    /// Monotonic logical-session generation for this runtime.
+    runtime_generation: RuntimeGeneration,
+}
+
+impl<'de> Deserialize<'de> for SessionRuntimeIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireIdentity {
+            runtime_id: String,
+            runtime_generation: RuntimeGeneration,
+        }
+        let wire = WireIdentity::deserialize(deserializer)?;
+        Self::new(wire.runtime_id, wire.runtime_generation).map_err(serde::de::Error::custom)
+    }
+}
+
+impl SessionRuntimeIdentity {
+    /// Creates a validated runtime identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObservationParamsError::InvalidIdentifier`] for an empty or
+    /// control-bearing runtime identifier.
+    pub fn new(
+        runtime_id: impl Into<String>,
+        runtime_generation: RuntimeGeneration,
+    ) -> Result<Self, ObservationParamsError> {
+        let runtime_id = runtime_id.into();
+        validate_bounded_identifier(&runtime_id, "runtime_id", MAX_RUNTIME_ID_BYTES)?;
+        Ok(Self {
+            runtime_id,
+            runtime_generation,
+        })
+    }
+
+    /// Returns the PTY runtime identifier.
+    #[must_use]
+    pub fn runtime_id(&self) -> &str {
+        &self.runtime_id
+    }
+
+    /// Returns the logical-session runtime generation.
+    #[must_use]
+    pub const fn runtime_generation(&self) -> RuntimeGeneration {
+        self.runtime_generation
+    }
+}
+
+/// Rendered terminal snapshot returned by `session.screen`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionScreenResult.ts"))]
+#[serde(deny_unknown_fields)]
+pub struct SessionScreenResult {
+    /// Logical session that owns the terminal.
+    pub session_id: SessionId,
+    /// Stable worker identity that supplied the snapshot.
+    pub worker_id: String,
+    /// Runtime identity scoped to this snapshot.
+    #[serde(flatten)]
+    pub runtime: SessionRuntimeIdentity,
+    /// Monotonic terminal repaint revision.
+    pub watermark: TerminalWatermark,
+    /// Terminal geometry at the snapshot point.
+    pub dimensions: TerminalDimensions,
+    /// Cursor projection at the snapshot point.
+    pub cursor: TerminalCursor,
+    /// Whether the terminal is in its alternate screen buffer.
+    pub alternate_screen: bool,
+    /// Sanitized terminal title when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub title: Option<String>,
+    /// Sanitized terminal progress when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub progress: Option<String>,
+    /// Visible terminal lines with control sequences removed.
+    pub visible_lines: Vec<String>,
+}
+
+/// Parameters for `session.output`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionOutputParams.ts"))]
+pub struct SessionOutputParams {
+    /// Session whose retained PTY output should be read.
+    session_id: SessionId,
+    /// Runtime that owns [`Self::after_offset`], when continuing a read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    runtime: Option<SessionRuntimeIdentity>,
+    /// Exclusive output cursor. Omission requests the newest retained tail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    after_offset: Option<OutputOffset>,
+    /// Maximum raw output bytes requested before base64 encoding.
+    max_bytes: u32,
+    /// Bounded wait used only when `after_offset` is at the current end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    wait_ms: Option<u32>,
+}
+
+impl SessionOutputParams {
+    /// Creates a bounded output-read request.
+    ///
+    /// A cursor is meaningful only with its exact runtime identity. Waiting is
+    /// allowed only at an explicit cursor, never on an implicit newest tail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObservationParamsError`] for an unscoped cursor, zero or
+    /// over-limit byte count, zero wait, or wait without a cursor.
+    pub fn new(
+        session_id: SessionId,
+        runtime: Option<SessionRuntimeIdentity>,
+        after_offset: Option<OutputOffset>,
+        max_bytes: u32,
+        wait_ms: Option<u32>,
+    ) -> Result<Self, ObservationParamsError> {
+        if after_offset.is_some() && runtime.is_none() {
+            return Err(ObservationParamsError::CursorRequiresRuntime {
+                cursor: "after_offset",
+            });
+        }
+        let maximum = u32::try_from(MAX_SESSION_OUTPUT_BYTES)
+            .expect("session output ceiling is guaranteed to fit u32");
+        if max_bytes == 0 || max_bytes > maximum {
+            return Err(ObservationParamsError::InvalidMaxBytes {
+                maximum,
+                actual: max_bytes,
+            });
+        }
+        if wait_ms == Some(0) {
+            return Err(ObservationParamsError::ZeroDuration { field: "wait_ms" });
+        }
+        if wait_ms.is_some_and(|wait| wait > MAX_SESSION_WAIT_MS) {
+            return Err(ObservationParamsError::DurationTooLong {
+                field: "wait_ms",
+                maximum: MAX_SESSION_WAIT_MS,
+                actual: wait_ms.unwrap_or_default(),
+            });
+        }
+        if wait_ms.is_some() && after_offset.is_none() {
+            return Err(ObservationParamsError::OutputWaitRequiresCursor);
+        }
+        Ok(Self {
+            session_id,
+            runtime,
+            after_offset,
+            max_bytes,
+            wait_ms,
+        })
+    }
+
+    /// Returns the requested session.
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// Returns the runtime that scopes the cursor.
+    #[must_use]
+    pub const fn runtime(&self) -> Option<&SessionRuntimeIdentity> {
+        self.runtime.as_ref()
+    }
+
+    /// Returns the exclusive output cursor.
+    #[must_use]
+    pub const fn after_offset(&self) -> Option<OutputOffset> {
+        self.after_offset
+    }
+
+    /// Returns the requested raw-byte ceiling.
+    #[must_use]
+    pub const fn max_bytes(&self) -> u32 {
+        self.max_bytes
+    }
+
+    /// Returns the optional bounded wait duration.
+    #[must_use]
+    pub const fn wait_ms(&self) -> Option<u32> {
+        self.wait_ms
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionOutputParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireParams {
+            session_id: SessionId,
+            #[serde(default)]
+            runtime: Option<SessionRuntimeIdentity>,
+            #[serde(default)]
+            after_offset: Option<OutputOffset>,
+            max_bytes: u32,
+            #[serde(default)]
+            wait_ms: Option<u32>,
+        }
+        let wire = WireParams::deserialize(deserializer)?;
+        Self::new(
+            wire.session_id,
+            wire.runtime,
+            wire.after_offset,
+            wire.max_bytes,
+            wire.wait_ms,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Retained-history range missing before an output replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionOutputGap.ts"))]
+pub struct SessionOutputGap {
+    /// First unavailable byte offset requested by the caller.
+    start_offset: OutputOffset,
+    /// First retained byte offset returned by the daemon.
+    end_offset: OutputOffset,
+}
+
+impl SessionOutputGap {
+    /// Creates a nonempty evicted-output range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObservationParamsError::InvalidOutputGap`] unless `start_offset`
+    /// is strictly before `end_offset`.
+    pub fn new(
+        start_offset: OutputOffset,
+        end_offset: OutputOffset,
+    ) -> Result<Self, ObservationParamsError> {
+        if start_offset >= end_offset {
+            Err(ObservationParamsError::InvalidOutputGap)
+        } else {
+            Ok(Self {
+                start_offset,
+                end_offset,
+            })
+        }
+    }
+
+    /// Returns the first unavailable requested offset.
+    #[must_use]
+    pub const fn start_offset(self) -> OutputOffset {
+        self.start_offset
+    }
+
+    /// Returns the first retained offset after the gap.
+    #[must_use]
+    pub const fn end_offset(self) -> OutputOffset {
+        self.end_offset
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionOutputGap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireGap {
+            start_offset: OutputOffset,
+            end_offset: OutputOffset,
+        }
+
+        let wire = WireGap::deserialize(deserializer)?;
+        Self::new(wire.start_offset, wire.end_offset).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Bounded retained-output replay returned by `session.output`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionOutputResult.ts"))]
+pub struct SessionOutputResult {
+    /// Logical session that owns the output.
+    session_id: SessionId,
+    /// Runtime identity that scopes every returned offset.
+    #[serde(flatten)]
+    runtime: SessionRuntimeIdentity,
+    /// First retained output byte offset.
+    history_start_offset: OutputOffset,
+    /// First byte included in this response.
+    start_offset: OutputOffset,
+    /// Exclusive cursor for the next output request.
+    next_offset: OutputOffset,
+    /// Current exclusive end offset for the runtime.
+    runtime_end_offset: OutputOffset,
+    /// Raw output bytes encoded as standard base64.
+    data_base64: String,
+    /// Missing retained-history range, when the requested cursor was evicted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    gap: Option<SessionOutputGap>,
+    /// Whether more bytes are immediately available after `next_offset`.
+    has_more: bool,
+    /// Whether a bounded wait elapsed without output.
+    timed_out: bool,
+}
+
+impl SessionOutputResult {
+    /// Creates a validated retained-output result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObservationParamsError`] when identifiers exceed their wire
+    /// bounds, data is not canonical standard base64 or exceeds the protocol
+    /// limit, offsets and decoded length disagree, gap coordinates are
+    /// inconsistent, or `has_more` disagrees with the runtime end offset.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the arguments are the independent public output coordinates"
+    )]
+    pub fn new(
+        session_id: SessionId,
+        runtime: SessionRuntimeIdentity,
+        history_start_offset: OutputOffset,
+        start_offset: OutputOffset,
+        next_offset: OutputOffset,
+        runtime_end_offset: OutputOffset,
+        data_base64: impl Into<String>,
+        gap: Option<SessionOutputGap>,
+        has_more: bool,
+        timed_out: bool,
+    ) -> Result<Self, ObservationParamsError> {
+        validate_bounded_identifier(&session_id.0, "session_id", MAX_SESSION_ID_BYTES)?;
+        let data_base64 = data_base64.into();
+        let decoded = BASE64_STANDARD
+            .decode(&data_base64)
+            .map_err(|_error| ObservationParamsError::InvalidOutputBase64)?;
+        if decoded.len() > MAX_SESSION_OUTPUT_BYTES {
+            return Err(ObservationParamsError::OutputDataTooLarge {
+                maximum: MAX_SESSION_OUTPUT_BYTES,
+                actual: decoded.len(),
+            });
+        }
+
+        let history_start = history_start_offset.get();
+        let start = start_offset.get();
+        let next = next_offset.get();
+        let runtime_end = runtime_end_offset.get();
+        if !(history_start <= start && start <= next && next <= runtime_end) {
+            return Err(ObservationParamsError::InvalidOutputOffsetOrder);
+        }
+        let span = next - start;
+        let decoded_len = u64::try_from(decoded.len()).expect("decoded output length fits u64");
+        if decoded_len != span {
+            return Err(ObservationParamsError::OutputLengthMismatch {
+                decoded: decoded_len,
+                span,
+            });
+        }
+        if gap.is_some_and(|range| {
+            range.end_offset() != history_start_offset || start_offset != history_start_offset
+        }) {
+            return Err(ObservationParamsError::InvalidOutputGap);
+        }
+        if has_more != (next < runtime_end) {
+            return Err(ObservationParamsError::InvalidOutputHasMore);
+        }
+
+        Ok(Self {
+            session_id,
+            runtime,
+            history_start_offset,
+            start_offset,
+            next_offset,
+            runtime_end_offset,
+            data_base64,
+            gap,
+            has_more,
+            timed_out,
+        })
+    }
+
+    /// Returns the logical session that owns the output.
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// Returns the runtime identity that scopes the offsets.
+    #[must_use]
+    pub const fn runtime(&self) -> &SessionRuntimeIdentity {
+        &self.runtime
+    }
+
+    /// Returns the first retained output offset.
+    #[must_use]
+    pub const fn history_start_offset(&self) -> OutputOffset {
+        self.history_start_offset
+    }
+
+    /// Returns the first byte offset included in this response.
+    #[must_use]
+    pub const fn start_offset(&self) -> OutputOffset {
+        self.start_offset
+    }
+
+    /// Returns the exclusive cursor for the next request.
+    #[must_use]
+    pub const fn next_offset(&self) -> OutputOffset {
+        self.next_offset
+    }
+
+    /// Returns the current exclusive runtime end offset.
+    #[must_use]
+    pub const fn runtime_end_offset(&self) -> OutputOffset {
+        self.runtime_end_offset
+    }
+
+    /// Returns the canonical standard-base64 output data.
+    #[must_use]
+    pub fn data_base64(&self) -> &str {
+        &self.data_base64
+    }
+
+    /// Returns the missing retained-history range, when present.
+    #[must_use]
+    pub const fn gap(&self) -> Option<SessionOutputGap> {
+        self.gap
+    }
+
+    /// Reports whether more output is immediately available.
+    #[must_use]
+    pub const fn has_more(&self) -> bool {
+        self.has_more
+    }
+
+    /// Reports whether a bounded output wait elapsed.
+    #[must_use]
+    pub const fn timed_out(&self) -> bool {
+        self.timed_out
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionOutputResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireResult {
+            session_id: SessionId,
+            runtime_id: String,
+            runtime_generation: RuntimeGeneration,
+            history_start_offset: OutputOffset,
+            start_offset: OutputOffset,
+            next_offset: OutputOffset,
+            runtime_end_offset: OutputOffset,
+            data_base64: String,
+            #[serde(default)]
+            gap: Option<SessionOutputGap>,
+            has_more: bool,
+            timed_out: bool,
+        }
+
+        let wire = WireResult::deserialize(deserializer)?;
+        let runtime = SessionRuntimeIdentity::new(wire.runtime_id, wire.runtime_generation)
+            .map_err(serde::de::Error::custom)?;
+        Self::new(
+            wire.session_id,
+            runtime,
+            wire.history_start_offset,
+            wire.start_offset,
+            wire.next_offset,
+            wire.runtime_end_offset,
+            wire.data_base64,
+            wire.gap,
+            wire.has_more,
+            wire.timed_out,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Parameters for the bounded long-poll `session.wait` method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionWaitParams.ts"))]
+pub struct SessionWaitParams {
+    /// Session to observe.
+    session_id: SessionId,
+    /// Runtime identity whose replacement should wake the waiter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    runtime: Option<SessionRuntimeIdentity>,
+    /// Session update cursor in the daemon's RFC 3339 wire format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    after_updated_at: Option<String>,
+    /// Terminal watermark cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    after_terminal_watermark: Option<TerminalWatermark>,
+    /// Output cursor scoped by [`Self::runtime`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    after_output_offset: Option<OutputOffset>,
+    /// Terminal states that complete the wait when observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    states: Option<Vec<SessionState>>,
+    /// Agent activities that complete the wait when observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    activities: Option<Vec<AgentActivity>>,
+    /// Required nonzero bounded wait duration.
+    timeout_ms: u32,
+}
+
+impl SessionWaitParams {
+    /// Creates a validated bounded session wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObservationParamsError`] when the timeout is zero, a present
+    /// predicate is empty, a runtime-scoped cursor lacks a runtime identity, a
+    /// timestamp is invalid, or no wake predicate is supplied.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the arguments are the independent public wait predicates"
+    )]
+    pub fn new(
+        session_id: SessionId,
+        runtime: Option<SessionRuntimeIdentity>,
+        after_updated_at: Option<String>,
+        after_terminal_watermark: Option<TerminalWatermark>,
+        after_output_offset: Option<OutputOffset>,
+        states: Option<Vec<SessionState>>,
+        activities: Option<Vec<AgentActivity>>,
+        timeout_ms: u32,
+    ) -> Result<Self, ObservationParamsError> {
+        if timeout_ms == 0 {
+            return Err(ObservationParamsError::ZeroDuration {
+                field: "timeout_ms",
+            });
+        }
+        if timeout_ms > MAX_SESSION_WAIT_MS {
+            return Err(ObservationParamsError::DurationTooLong {
+                field: "timeout_ms",
+                maximum: MAX_SESSION_WAIT_MS,
+                actual: timeout_ms,
+            });
+        }
+        if (after_terminal_watermark.is_some() || after_output_offset.is_some())
+            && runtime.is_none()
+        {
+            return Err(ObservationParamsError::CursorRequiresRuntime {
+                cursor: "terminal/output cursor",
+            });
+        }
+        if states.as_ref().is_some_and(Vec::is_empty) {
+            return Err(ObservationParamsError::EmptyPredicate { field: "states" });
+        }
+        if activities.as_ref().is_some_and(Vec::is_empty) {
+            return Err(ObservationParamsError::EmptyPredicate {
+                field: "activities",
+            });
+        }
+        if let Some(timestamp) = &after_updated_at {
+            validate_timestamp(timestamp, "after_updated_at")?;
+        }
+        if runtime.is_none()
+            && after_updated_at.is_none()
+            && after_terminal_watermark.is_none()
+            && after_output_offset.is_none()
+            && states.is_none()
+            && activities.is_none()
+        {
+            return Err(ObservationParamsError::MissingPredicate);
+        }
+        Ok(Self {
+            session_id,
+            runtime,
+            after_updated_at,
+            after_terminal_watermark,
+            after_output_offset,
+            states,
+            activities,
+            timeout_ms,
+        })
+    }
+
+    /// Returns the requested session.
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// Returns the runtime-change predicate and cursor scope.
+    #[must_use]
+    pub const fn runtime(&self) -> Option<&SessionRuntimeIdentity> {
+        self.runtime.as_ref()
+    }
+
+    /// Returns the session update cursor.
+    #[must_use]
+    pub fn after_updated_at(&self) -> Option<&str> {
+        self.after_updated_at.as_deref()
+    }
+
+    /// Returns the terminal watermark cursor.
+    #[must_use]
+    pub const fn after_terminal_watermark(&self) -> Option<TerminalWatermark> {
+        self.after_terminal_watermark
+    }
+
+    /// Returns the output cursor.
+    #[must_use]
+    pub const fn after_output_offset(&self) -> Option<OutputOffset> {
+        self.after_output_offset
+    }
+
+    /// Returns lifecycle-state predicates.
+    #[must_use]
+    pub fn states(&self) -> Option<&[SessionState]> {
+        self.states.as_deref()
+    }
+
+    /// Returns agent-activity predicates.
+    #[must_use]
+    pub fn activities(&self) -> Option<&[AgentActivity]> {
+        self.activities.as_deref()
+    }
+
+    /// Returns the bounded wait duration.
+    #[must_use]
+    pub const fn timeout_ms(&self) -> u32 {
+        self.timeout_ms
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionWaitParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireParams {
+            session_id: SessionId,
+            #[serde(default)]
+            runtime: Option<SessionRuntimeIdentity>,
+            #[serde(default)]
+            after_updated_at: Option<String>,
+            #[serde(default)]
+            after_terminal_watermark: Option<TerminalWatermark>,
+            #[serde(default)]
+            after_output_offset: Option<OutputOffset>,
+            #[serde(default)]
+            states: Option<Vec<SessionState>>,
+            #[serde(default)]
+            activities: Option<Vec<AgentActivity>>,
+            timeout_ms: u32,
+        }
+        let wire = WireParams::deserialize(deserializer)?;
+        Self::new(
+            wire.session_id,
+            wire.runtime,
+            wire.after_updated_at,
+            wire.after_terminal_watermark,
+            wire.after_output_offset,
+            wire.states,
+            wire.activities,
+            wire.timeout_ms,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Reason a bounded `session.wait` request completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionWaitReason.ts"))]
+#[serde(rename_all = "snake_case")]
+pub enum SessionWaitReason {
+    /// A requested lifecycle state is current.
+    StateMatched,
+    /// A requested agent activity is current.
+    ActivityMatched,
+    /// Metadata changed after the supplied session-update cursor.
+    SessionUpdated,
+    /// The terminal repaint watermark advanced.
+    TerminalChanged,
+    /// The runtime output cursor advanced.
+    OutputAdvanced,
+    /// The supplied runtime identity no longer matches.
+    RuntimeChanged,
+    /// The requested bounded wait elapsed.
+    Timeout,
+}
+
+/// Result returned by the bounded long-poll `session.wait` method.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionWaitResult.ts"))]
+#[serde(deny_unknown_fields)]
+pub struct SessionWaitResult {
+    /// Condition that completed the wait.
+    pub reason: SessionWaitReason,
+    /// Redacted current public session snapshot.
+    pub session: SessionInfo,
+    /// Current terminal watermark when a managed terminal is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub terminal_watermark: Option<TerminalWatermark>,
+    /// Current output cursor when a managed terminal is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub output_offset: Option<OutputOffset>,
+}
+
 /// Parameters for `session.report_native_id`.
 ///
 /// Fire-and-forget capture sent by an agent's `SessionStart` hook (see
@@ -386,7 +1376,7 @@ pub struct SessionInputResult {
 /// `session_id` and `agent` from the launch-time handshake env and reads the
 /// agent's own `native_session_id` (and optional `transcript_path`) from its
 /// stdin JSON. The daemon records it as the session's resume binding.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(
     feature = "ts",
@@ -394,15 +1384,180 @@ pub struct SessionInputResult {
 )]
 pub struct SessionReportNativeIdParams {
     /// The pohunek session id the agent was launched under.
-    pub session_id: SessionId,
+    session_id: SessionId,
+    /// Runtime identity that received the report.
+    runtime_id: String,
     /// Agent profile name reporting its native session id.
-    pub agent: String,
+    agent: String,
+    /// Reporting process identifier.
+    pid: u32,
+    /// Kernel process-start identity paired with [`Self::pid`].
+    pid_start_identity: ProcessStartIdentity,
+    /// Strictly monotonic report sequence for this process/runtime claim.
+    sequence: ReportSequence,
+    /// RFC 3339 expiry after which the report is invalid.
+    expires_at: String,
     /// The agent's own native session identifier used to build the resume argv.
-    pub native_session_id: String,
+    native_session_id: String,
     /// Optional transcript path reported by the agent (Claude provides one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
-    pub transcript_path: Option<String>,
+    transcript_path: Option<String>,
+}
+
+impl SessionReportNativeIdParams {
+    /// Creates a validated ordered native-identity report.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObservationParamsError`] for invalid identifiers, zero PID, or
+    /// a non-RFC-3339 expiry.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "all arguments are authenticated identity-claim coordinates"
+    )]
+    pub fn new(
+        session_id: SessionId,
+        runtime_id: impl Into<String>,
+        agent: impl Into<String>,
+        pid: u32,
+        pid_start_identity: ProcessStartIdentity,
+        sequence: ReportSequence,
+        expires_at: impl Into<String>,
+        native_session_id: impl Into<String>,
+        transcript_path: Option<String>,
+    ) -> Result<Self, ObservationParamsError> {
+        let runtime_id = runtime_id.into();
+        let agent = agent.into();
+        let expires_at = expires_at.into();
+        let native_session_id = native_session_id.into();
+        validate_bounded_identifier(&runtime_id, "runtime_id", MAX_RUNTIME_ID_BYTES)?;
+        validate_identifier(&agent, "agent")?;
+        validate_identifier(&native_session_id, "native_session_id")?;
+        if pid == 0 {
+            return Err(ObservationParamsError::ZeroPid);
+        }
+        validate_timestamp(&expires_at, "expires_at")?;
+        Ok(Self {
+            session_id,
+            runtime_id,
+            agent,
+            pid,
+            pid_start_identity,
+            sequence,
+            expires_at,
+            native_session_id,
+            transcript_path,
+        })
+    }
+
+    /// Returns the logical session receiving the report.
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// Returns the exact PTY runtime identifier.
+    #[must_use]
+    pub fn runtime_id(&self) -> &str {
+        &self.runtime_id
+    }
+
+    /// Returns the reporting agent profile.
+    #[must_use]
+    pub fn agent(&self) -> &str {
+        &self.agent
+    }
+
+    /// Returns the reporting process identifier.
+    #[must_use]
+    pub const fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Returns the paired kernel process-start identity.
+    #[must_use]
+    pub const fn pid_start_identity(&self) -> ProcessStartIdentity {
+        self.pid_start_identity
+    }
+
+    /// Returns the monotonic report sequence.
+    #[must_use]
+    pub const fn sequence(&self) -> ReportSequence {
+        self.sequence
+    }
+
+    /// Returns the validated RFC 3339 expiry.
+    #[must_use]
+    pub fn expires_at(&self) -> &str {
+        &self.expires_at
+    }
+
+    /// Returns the provider-native recovery reference.
+    #[must_use]
+    pub fn native_session_id(&self) -> &str {
+        &self.native_session_id
+    }
+
+    /// Returns the optional provider-native transcript path.
+    #[must_use]
+    pub fn transcript_path(&self) -> Option<&str> {
+        self.transcript_path.as_deref()
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionReportNativeIdParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireParams {
+            session_id: SessionId,
+            runtime_id: String,
+            agent: String,
+            pid: u32,
+            pid_start_identity: ProcessStartIdentity,
+            sequence: ReportSequence,
+            expires_at: String,
+            native_session_id: String,
+            #[serde(default)]
+            transcript_path: Option<String>,
+        }
+        let wire = WireParams::deserialize(deserializer)?;
+        Self::new(
+            wire.session_id,
+            wire.runtime_id,
+            wire.agent,
+            wire.pid,
+            wire.pid_start_identity,
+            wire.sequence,
+            wire.expires_at,
+            wire.native_session_id,
+            wire.transcript_path,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+impl std::fmt::Debug for SessionReportNativeIdParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionReportNativeIdParams")
+            .field("session_id", &self.session_id)
+            .field("runtime_id", &self.runtime_id)
+            .field("agent", &self.agent)
+            .field("pid", &self.pid)
+            .field("pid_start_identity", &self.pid_start_identity)
+            .field("sequence", &self.sequence)
+            .field("expires_at", &self.expires_at)
+            .field("native_session_id", &"[REDACTED]")
+            .field(
+                "transcript_path",
+                &self.transcript_path.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 /// Result returned by `session.report_native_id`.
@@ -415,6 +1570,7 @@ pub struct SessionReportNativeIdParams {
     feature = "ts",
     ts(export, export_to = "SessionReportNativeIdResult.ts")
 )]
+#[serde(deny_unknown_fields)]
 pub struct SessionReportNativeIdResult {
     /// Whether the daemon recorded the report as a resume binding.
     pub recorded: bool,
@@ -442,7 +1598,7 @@ pub struct SessionReportAgentParams {
     /// Optional monotonic sequence from the reporting hook.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
-    pub seq: Option<u64>,
+    pub seq: Option<ReportSequence>,
     /// OS pid of the active nested agent process, when the hook can report it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
@@ -474,7 +1630,7 @@ pub struct SessionReleaseAgentParams {
     /// Optional monotonic sequence from the reporting hook.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
-    pub seq: Option<u64>,
+    pub seq: Option<ReportSequence>,
 }
 
 /// Result returned by `session.report_agent`.
@@ -652,6 +1808,8 @@ pub struct RuntimeInventoryEvent {
 pub struct SessionRuntime {
     /// Current runtime availability.
     pub state: RuntimeState,
+    /// Monotonic generation scoped to the logical session.
+    pub runtime_generation: RuntimeGeneration,
     /// Stable owner of the PTY, when one is known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
@@ -761,6 +1919,23 @@ pub struct SessionWarning {
     pub detail: Option<String>,
 }
 
+/// Mutation capabilities frozen for one logical session.
+///
+/// Clients use these flags to render resume and fork actions without inferring
+/// provider behavior from [`SessionInfo::agent`] or [`SessionInfo::agent_base`].
+/// A daemon loading a record that predates this field defaults both flags to
+/// false, preserving the fail-closed persistence contract.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionCapabilities.ts"))]
+#[serde(deny_unknown_fields)]
+pub struct SessionCapabilities {
+    /// Whether the session has a frozen native resume operation.
+    pub resume: bool,
+    /// Whether the session has a frozen native fork operation.
+    pub fork: bool,
+}
+
 /// Summary returned by session lifecycle methods and published by events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -777,6 +1952,9 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub external: Option<bool>,
+    /// Session-specific mutation capabilities frozen when the session started.
+    #[serde(default)]
+    pub capabilities: SessionCapabilities,
     /// Owner-set display name, or `None` when the session is shown by its id.
     /// Set at `session.new` and changed via `session.rename`; cosmetic only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1140,6 +2318,7 @@ mod tests {
         SessionInfo {
             id: SessionId(id.to_owned()),
             external: Some(false),
+            capabilities: SessionCapabilities::default(),
             name: None,
             agent: "claude".to_owned(),
             agent_base: AgentKind::Claude,

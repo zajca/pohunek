@@ -3,18 +3,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
+use base64::prelude::{Engine as _, BASE64_STANDARD};
 use protocol::{
-    AgentActivity, Event, NotificationId, NotificationKind, NotificationRecord,
-    NotificationSeverity, NotificationStatus, ProjectActionResult, ProjectActionsResult,
-    ProjectInfo, ProjectPromptResult, ProjectShowResult, SessionId, SessionInfo, SessionState,
-    StateSource,
+    AgentActivity, Event, NotificationId, NotificationKind, NotificationKindPolicy,
+    NotificationPolicy, NotificationRecord, NotificationSeverity, NotificationStatus, OutputOffset,
+    ProjectActionResult, ProjectActionsResult, ProjectInfo, ProjectPromptResult, ProjectShowResult,
+    SessionId, SessionInfo, SessionRuntimeIdentity, SessionScreenResult, SessionState,
+    SessionWaitResult, StateSource,
 };
 
 use crate::providers;
 use crate::{
-    parse_unified_diff, CoreError, DiffModel, DomainEvent, HealthSummary, HostId, PromptPreview,
-    Review, ReviewComment, ReviewSide, ReviewSource, ReviewStatus, ReviewStore, Selection,
-    SessionLinkProvider,
+    parse_unified_diff, CoreError, DiffModel, DomainEvent, HealthSummary, HostId,
+    ObservationCapabilities, PromptPreview, Review, ReviewComment, ReviewSide, ReviewSource,
+    ReviewStatus, ReviewStore, Selection, SessionLinkProvider,
 };
 
 /// Prompt/action browse and preview state for one host.
@@ -424,6 +426,20 @@ fn inbox_row_tier(record: &NotificationRecord) -> u8 {
     }
 }
 
+fn notification_kind_enabled_mut(
+    policy: &mut NotificationKindPolicy,
+    kind: NotificationKind,
+) -> &mut bool {
+    match kind {
+        NotificationKind::AgentBlocked => &mut policy.agent_blocked,
+        NotificationKind::ApprovalRequired => &mut policy.approval_required,
+        NotificationKind::TurnCompleted => &mut policy.turn_completed,
+        NotificationKind::SessionFinished => &mut policy.session_finished,
+        NotificationKind::Error => &mut policy.error,
+        NotificationKind::System => &mut policy.system,
+    }
+}
+
 /// GUI-facing state for one daemon host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostView {
@@ -440,13 +456,72 @@ pub struct HostView {
     pub notifications: BTreeMap<String, NotificationRecord>,
     pub last_agent_state: Option<AgentStateEvent>,
     pub last_error: Option<String>,
-    /// Agent kinds this host can launch, seeded from `host.inspect`.
+    /// Agent and profile names known to the daemon, seeded from `host.inspect`.
     ///
-    /// See [`crate::HostSnapshot::supported_agents`] for the fallback contract.
+    /// See [`crate::HostSnapshot::supported_agents`] for its compatibility
+    /// contract. Launch decisions must use `runtimes`.
     pub supported_agents: Vec<String>,
+    /// Full host runtime inventory used for capability-honest launch choices.
+    pub runtimes: Vec<protocol::AgentRuntime>,
+    /// Provider names reported by the host's runtime inventory.
+    pub notification_providers: Vec<String>,
+    pub observation_capabilities: ObservationCapabilities,
+}
+
+/// Provider-neutral terminal observation retained for one GUI session pane.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionObservation {
+    /// Most recently loaded terminal screen snapshot.
+    pub screen: Option<SessionScreenResult>,
+    /// UTF-8-lossy output accumulated from contiguous output pages.
+    pub output_text: String,
+    /// Runtime identity associated with the accumulated output.
+    pub output_runtime: Option<SessionRuntimeIdentity>,
+    /// Cursor to use for the next output page.
+    pub output_cursor: Option<OutputOffset>,
+    /// Retention gap reported by the most recent output response.
+    pub output_gap: Option<(OutputOffset, OutputOffset)>,
+    /// Most recently completed session wait.
+    pub wait: Option<SessionWaitResult>,
 }
 
 impl HostView {
+    /// Returns whether `agent` is launchable according to the host inventory.
+    #[must_use]
+    pub fn agent_is_launchable(&self, agent: &str) -> bool {
+        self.runtimes
+            .iter()
+            .any(|runtime| runtime.agent == agent && crate::runtime_is_launchable(runtime))
+    }
+
+    /// Returns whether `agent` is a launchable non-shell assistant runtime.
+    #[must_use]
+    pub fn agent_is_assistant_capable(&self, agent: &str) -> bool {
+        self.runtimes
+            .iter()
+            .any(|runtime| runtime.agent == agent && crate::runtime_is_assistant_capable(runtime))
+    }
+
+    /// Returns launchable agent names in host inventory order.
+    #[must_use]
+    pub fn launchable_agents(&self) -> Vec<String> {
+        self.runtimes
+            .iter()
+            .filter(|runtime| crate::runtime_is_launchable(runtime))
+            .map(|runtime| runtime.agent.clone())
+            .collect()
+    }
+
+    /// Returns launchable assistant runtime names in host inventory order.
+    #[must_use]
+    pub fn launchable_assistant_agents(&self) -> Vec<String> {
+        self.runtimes
+            .iter()
+            .filter(|runtime| crate::runtime_is_assistant_capable(runtime))
+            .map(|runtime| runtime.agent.clone())
+            .collect()
+    }
+
     fn connecting() -> Self {
         Self {
             conn: ConnState::Connecting,
@@ -461,6 +536,9 @@ impl HostView {
             last_agent_state: None,
             last_error: None,
             supported_agents: Vec::new(),
+            runtimes: Vec::new(),
+            notification_providers: Vec::new(),
+            observation_capabilities: ObservationCapabilities::default(),
         }
     }
 }
@@ -472,6 +550,8 @@ pub struct Workspace {
     pub selection: Option<Selection>,
     pub notification_intents: Vec<NotificationIntent>,
     pub toasts: Vec<Toast>,
+    session_observations: BTreeMap<(HostId, String), SessionObservation>,
+    notification_policies: BTreeMap<HostId, NotificationPolicy>,
     runtime_continuity: BTreeMap<(HostId, String), RuntimeContinuity>,
     reconnecting_hosts: BTreeSet<HostId>,
     next_intent_id: u64,
@@ -479,6 +559,45 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    /// Returns cached provider-neutral terminal observation for a session.
+    #[must_use]
+    pub fn session_observation(
+        &self,
+        host_id: &HostId,
+        session_id: &SessionId,
+    ) -> Option<&SessionObservation> {
+        self.session_observations
+            .get(&(host_id.clone(), session_id.0.clone()))
+    }
+
+    /// Returns the current provider-keyed notification policy for a host.
+    #[must_use]
+    pub fn notification_policy(&self, host_id: &HostId) -> Option<&NotificationPolicy> {
+        self.notification_policies.get(host_id)
+    }
+
+    /// Updates one base or provider-specific notification kind in cached state.
+    pub fn set_notification_policy_kind(
+        &mut self,
+        host_id: &HostId,
+        provider: Option<&str>,
+        kind: NotificationKind,
+        enabled: bool,
+    ) -> bool {
+        let Some(policy) = self.notification_policies.get_mut(host_id) else {
+            return false;
+        };
+        let kind_policy = match provider {
+            Some(provider) => policy
+                .providers
+                .entry(provider.to_owned())
+                .or_insert_with(|| policy.enabled.clone()),
+            None => &mut policy.enabled,
+        };
+        *notification_kind_enabled_mut(kind_policy, kind) = enabled;
+        true
+    }
+
     /// Return how the current runtime relates to the prior observed generation.
     #[must_use]
     pub fn runtime_continuity(
@@ -623,6 +742,7 @@ impl Workspace {
                     };
                     let key = (host_id.clone(), session_id.clone());
                     if runtime_generation_changed(previous, session) {
+                        self.session_observations.remove(&key);
                         self.runtime_continuity
                             .insert(key, RuntimeContinuity::Recovered);
                     } else if reconnecting && same_runtime_generation(previous, session) {
@@ -678,6 +798,9 @@ impl Workspace {
                         last_agent_state: None,
                         last_error: snapshot.project_error,
                         supported_agents: snapshot.supported_agents,
+                        runtimes: snapshot.runtimes,
+                        notification_providers: snapshot.notification_providers,
+                        observation_capabilities: snapshot.observation_capabilities,
                     },
                 );
             }
@@ -694,6 +817,10 @@ impl Workspace {
                     });
             }
             DomainEvent::HostEvent { host_id, event } => {
+                let observation_invalidation = self
+                    .hosts
+                    .get(&host_id)
+                    .and_then(|host| observation_invalidation_for_host_event(host, &event));
                 let Some(host) = self.hosts.get_mut(&host_id) else {
                     trace_ignored_unknown_host(&host_id, "host event");
                     return;
@@ -709,6 +836,9 @@ impl Workspace {
                     &mut self.next_intent_id,
                     &mut self.runtime_continuity,
                 );
+                if let Some(session_id) = observation_invalidation {
+                    self.session_observations.remove(&(host_id, session_id));
+                }
             }
             DomainEvent::HostDisconnected { host_id, error } => {
                 let Some(host) = self.host_mut_if_known(&host_id, "host disconnected") else {
@@ -726,17 +856,35 @@ impl Workspace {
             }
             DomainEvent::SessionCreated { host_id, session }
             | DomainEvent::SessionInspected { host_id, session } => {
+                let key = (host_id.clone(), session.id.0.clone());
+                let runtime_changed = self
+                    .hosts
+                    .get(&host_id)
+                    .and_then(|host| host.sessions.get(&session.id.0))
+                    .is_some_and(|previous| runtime_generation_changed(previous, &session));
                 let Some(host) = self.host_mut_if_known(&host_id, "session result") else {
                     return;
                 };
                 host.sessions.insert(session.id.0.clone(), session);
+                if runtime_changed {
+                    self.session_observations.remove(&key);
+                }
             }
             DomainEvent::SessionResumed { host_id, result } => {
+                let key = (host_id.clone(), result.session.id.0.clone());
+                let runtime_changed = self
+                    .hosts
+                    .get(&host_id)
+                    .and_then(|host| host.sessions.get(&result.session.id.0))
+                    .is_some_and(|previous| runtime_generation_changed(previous, &result.session));
                 let Some(host) = self.host_mut_if_known(&host_id, "session resume result") else {
                     return;
                 };
                 let session = result.session;
                 host.sessions.insert(session.id.0.clone(), session);
+                if runtime_changed {
+                    self.session_observations.remove(&key);
+                }
             }
             DomainEvent::SessionForked { host_id, result } => {
                 let Some(host) = self.host_mut_if_known(&host_id, "session fork result") else {
@@ -744,6 +892,73 @@ impl Workspace {
                 };
                 let session = result.session;
                 host.sessions.insert(session.id.0.clone(), session);
+            }
+            DomainEvent::SessionScreenLoaded { host_id, result } => {
+                let key = (host_id, result.session_id.0.clone());
+                let observation = self.session_observations.entry(key).or_default();
+                if observation.output_runtime.as_ref() != Some(&result.runtime) {
+                    observation.output_text.clear();
+                    observation.output_runtime = None;
+                    observation.output_cursor = None;
+                    observation.output_gap = None;
+                }
+                observation.screen = Some(result);
+            }
+            DomainEvent::SessionOutputLoaded { host_id, result } => {
+                let key = (host_id, result.session_id().0.clone());
+                let observation = self.session_observations.entry(key).or_default();
+                if observation.output_runtime.as_ref() != Some(result.runtime()) {
+                    observation.output_text.clear();
+                    observation.output_gap = None;
+                    if observation
+                        .screen
+                        .as_ref()
+                        .is_some_and(|screen| &screen.runtime != result.runtime())
+                    {
+                        observation.screen = None;
+                    }
+                }
+                if let Some(gap) = result.gap() {
+                    observation.output_text.clear();
+                    observation.output_gap = Some((gap.start_offset(), gap.end_offset()));
+                }
+                if let Ok(bytes) = BASE64_STANDARD.decode(result.data_base64()) {
+                    observation
+                        .output_text
+                        .push_str(&String::from_utf8_lossy(&bytes));
+                }
+                observation.output_runtime = Some(result.runtime().clone());
+                observation.output_cursor = Some(result.next_offset());
+            }
+            DomainEvent::SessionObservationRuntimeChanged {
+                host_id,
+                session_id,
+                ..
+            } => {
+                self.session_observations.remove(&(host_id, session_id.0));
+            }
+            DomainEvent::SessionWaitCompleted { host_id, result } => {
+                let session_id = result.session.id.clone();
+                let key = (host_id.clone(), session_id.0.clone());
+                let runtime_changed = self
+                    .hosts
+                    .get(&host_id)
+                    .and_then(|host| host.sessions.get(&session_id.0))
+                    .is_some_and(|previous| runtime_generation_changed(previous, &result.session));
+                if let Some(host) = self.hosts.get_mut(&host_id) {
+                    host.sessions
+                        .insert(session_id.0.clone(), result.session.clone());
+                }
+                if runtime_changed {
+                    self.session_observations.remove(&key);
+                }
+                self.session_observations
+                    .entry((host_id, session_id.0))
+                    .or_default()
+                    .wait = Some(result);
+            }
+            DomainEvent::NotificationPolicyLoaded { host_id, result } => {
+                self.notification_policies.insert(host_id, result.policy);
             }
             DomainEvent::SessionStopCompleted {
                 host_id,
@@ -772,8 +987,11 @@ impl Workspace {
                 let Some(host) = self.host_mut_if_known(&host_id, "session remove result") else {
                     return;
                 };
-                host.sessions.remove(&session_id.0);
-                self.runtime_continuity.remove(&(host_id, session_id.0));
+                let session_key = session_id.0;
+                host.sessions.remove(&session_key);
+                self.runtime_continuity
+                    .remove(&(host_id.clone(), session_key.clone()));
+                self.session_observations.remove(&(host_id, session_key));
             }
             DomainEvent::SessionMetadataUpdated { host_id, result } => {
                 let Some(host) = self.host_mut_if_known(&host_id, "session metadata result") else {
@@ -2239,32 +2457,45 @@ fn apply_host_event(
     }
 }
 
+fn observation_invalidation_for_host_event(host: &HostView, event: &HostEvent) -> Option<String> {
+    let session = match event {
+        HostEvent::SessionCreated(session)
+        | HostEvent::SessionUpdated(session)
+        | HostEvent::SessionStopped(session)
+        | HostEvent::RuntimeReconnected(session)
+        | HostEvent::NativeRecovered(session)
+        | HostEvent::RuntimeLost(session)
+        | HostEvent::RuntimeConflict(session) => session,
+        HostEvent::SessionRemoved(session) => return Some(session.id.0.clone()),
+        HostEvent::AgentState(_)
+        | HostEvent::NotificationCreated(_)
+        | HostEvent::NotificationUpdated(_)
+        | HostEvent::NotificationDeleted(_)
+        | HostEvent::Other(_) => return None,
+    };
+    host.sessions
+        .get(&session.id.0)
+        .is_some_and(|previous| runtime_generation_changed(previous, session))
+        .then(|| session.id.0.clone())
+}
+
+fn session_runtime_identity(session: &SessionInfo) -> Option<(&str, protocol::RuntimeGeneration)> {
+    session.runtime.as_ref().and_then(|runtime| {
+        runtime
+            .runtime_id
+            .as_deref()
+            .map(|runtime_id| (runtime_id, runtime.runtime_generation))
+    })
+}
+
 fn same_runtime_generation(previous: &SessionInfo, current: &SessionInfo) -> bool {
-    previous
-        .runtime
-        .as_ref()
-        .and_then(|runtime| runtime.runtime_id.as_deref())
-        .zip(
-            current
-                .runtime
-                .as_ref()
-                .and_then(|runtime| runtime.runtime_id.as_deref()),
-        )
-        .is_some_and(|(previous_id, current_id)| previous_id == current_id)
+    session_runtime_identity(previous)
+        .zip(session_runtime_identity(current))
+        .is_some_and(|(previous_identity, current_identity)| previous_identity == current_identity)
 }
 
 fn runtime_generation_changed(previous: &SessionInfo, current: &SessionInfo) -> bool {
-    previous
-        .runtime
-        .as_ref()
-        .and_then(|runtime| runtime.runtime_id.as_deref())
-        .zip(
-            current
-                .runtime
-                .as_ref()
-                .and_then(|runtime| runtime.runtime_id.as_deref()),
-        )
-        .is_some_and(|(previous_id, current_id)| previous_id != current_id)
+    session_runtime_identity(previous) != session_runtime_identity(current)
 }
 
 /// Store or replace a notification record, dropping it when the daemon reports a
@@ -2360,6 +2591,10 @@ mod tests {
 
     use super::*;
 
+    fn test_event(name: &str, payload: serde_json::Value) -> Event {
+        Event::new(protocol::PROTOCOL_VERSION, name, payload).expect("test event is valid")
+    }
+
     #[test]
     fn workspace_applies_agent_state_to_known_session() {
         let mut workspace = Workspace::default();
@@ -2368,7 +2603,7 @@ mod tests {
             snapshot: snapshot("local", vec![session]),
         });
 
-        let raw = Event::new(
+        let raw = test_event(
             event::AGENT_STATE,
             serde_json::json!({
                 "session_id": "s-1",
@@ -2403,7 +2638,7 @@ mod tests {
             snapshot: snapshot("local", vec![session("s-1", None)]),
         });
 
-        let raw = Event::new(
+        let raw = test_event(
             event::AGENT_STATE,
             serde_json::json!({
                 "session_id": "s-1",
@@ -2600,6 +2835,202 @@ mod tests {
     }
 
     #[test]
+    fn observation_events_reduce_into_headless_state() {
+        let host_id = HostId::new("local");
+        let session = session("s-observe", None);
+        let mut workspace = Workspace::default();
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
+            snapshot: snapshot("local", vec![session.clone()]),
+        });
+        let runtime = protocol::SessionRuntimeIdentity::new(
+            "runtime-observe",
+            protocol::RuntimeGeneration::new(3),
+        )
+        .expect("valid test runtime");
+        workspace.apply(DomainEvent::SessionScreenLoaded {
+            host_id: host_id.clone(),
+            result: protocol::SessionScreenResult {
+                session_id: session.id.clone(),
+                worker_id: "worker-observe".to_owned(),
+                runtime: runtime.clone(),
+                watermark: protocol::TerminalWatermark::new(7),
+                dimensions: protocol::TerminalDimensions::new(80, 24).expect("valid dimensions"),
+                cursor: protocol::TerminalCursor {
+                    row: 0,
+                    col: 5,
+                    visible: true,
+                },
+                alternate_screen: false,
+                title: None,
+                progress: None,
+                visible_lines: vec!["hello".to_owned()],
+            },
+        });
+        workspace.apply(DomainEvent::SessionOutputLoaded {
+            host_id: host_id.clone(),
+            result: protocol::SessionOutputResult::new(
+                session.id.clone(),
+                runtime,
+                protocol::OutputOffset::new(0),
+                protocol::OutputOffset::new(0),
+                protocol::OutputOffset::new(5),
+                protocol::OutputOffset::new(5),
+                "aGVsbG8=",
+                None,
+                false,
+                false,
+            )
+            .expect("valid output result"),
+        });
+        workspace.apply(DomainEvent::SessionWaitCompleted {
+            host_id: host_id.clone(),
+            result: protocol::SessionWaitResult {
+                reason: protocol::SessionWaitReason::Timeout,
+                session: session.clone(),
+                terminal_watermark: Some(protocol::TerminalWatermark::new(7)),
+                output_offset: Some(protocol::OutputOffset::new(5)),
+            },
+        });
+
+        let observation = workspace
+            .session_observation(&host_id, &session.id)
+            .expect("observation state");
+        assert_eq!(observation.output_text, "hello");
+        assert_eq!(
+            observation
+                .screen
+                .as_ref()
+                .expect("screen snapshot")
+                .visible_lines
+                .as_slice(),
+            ["hello".to_owned()].as_slice()
+        );
+        assert_eq!(
+            observation.wait.as_ref().map(|wait| wait.reason),
+            Some(protocol::SessionWaitReason::Timeout)
+        );
+    }
+
+    #[test]
+    fn runtime_identity_changes_and_typed_errors_discard_observation_cursors() {
+        let host_id = HostId::new("local");
+        let session_id = SessionId("s-observe".to_owned());
+        let original = session_with_runtime(&session_id.0, "runtime-stable");
+        let runtime_one = protocol::SessionRuntimeIdentity::new(
+            "runtime-stable",
+            protocol::RuntimeGeneration::new(1),
+        )
+        .expect("valid runtime identity");
+        let mut workspace = Workspace::default();
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
+            snapshot: snapshot("local", vec![original.clone()]),
+        });
+        workspace.apply(DomainEvent::SessionOutputLoaded {
+            host_id: host_id.clone(),
+            result: protocol::SessionOutputResult::new(
+                session_id.clone(),
+                runtime_one,
+                protocol::OutputOffset::new(0),
+                protocol::OutputOffset::new(0),
+                protocol::OutputOffset::new(1),
+                protocol::OutputOffset::new(1),
+                "YQ==",
+                None,
+                false,
+                false,
+            )
+            .expect("valid output result"),
+        });
+        assert!(workspace
+            .session_observation(&host_id, &session_id)
+            .and_then(|observation| observation.output_cursor)
+            .is_some());
+
+        let mut recovered = original;
+        recovered
+            .runtime
+            .as_mut()
+            .expect("runtime")
+            .runtime_generation = protocol::RuntimeGeneration::new(2);
+        workspace.apply(DomainEvent::HostEvent {
+            host_id: host_id.clone(),
+            event: HostEvent::SessionUpdated(recovered),
+        });
+        assert!(workspace
+            .session_observation(&host_id, &session_id)
+            .is_none());
+
+        let runtime_two = protocol::SessionRuntimeIdentity::new(
+            "runtime-stable",
+            protocol::RuntimeGeneration::new(2),
+        )
+        .expect("valid runtime identity");
+        workspace.apply(DomainEvent::SessionOutputLoaded {
+            host_id: host_id.clone(),
+            result: protocol::SessionOutputResult::new(
+                session_id.clone(),
+                runtime_two,
+                protocol::OutputOffset::new(0),
+                protocol::OutputOffset::new(0),
+                protocol::OutputOffset::new(1),
+                protocol::OutputOffset::new(1),
+                "Yg==",
+                None,
+                false,
+                false,
+            )
+            .expect("valid output result"),
+        });
+        workspace.apply(DomainEvent::SessionObservationRuntimeChanged {
+            host_id: host_id.clone(),
+            session_id: session_id.clone(),
+            error: "runtime changed".to_owned(),
+        });
+        assert!(workspace
+            .session_observation(&host_id, &session_id)
+            .is_none());
+    }
+
+    #[test]
+    fn provider_policy_events_reduce_into_headless_state() {
+        let host_id = HostId::new("local");
+        let mut workspace = Workspace::default();
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
+            snapshot: snapshot("local", Vec::new()),
+        });
+        let kind_policy = NotificationKindPolicy {
+            agent_blocked: true,
+            approval_required: true,
+            turn_completed: true,
+            session_finished: true,
+            error: true,
+            system: true,
+        };
+        workspace.apply(DomainEvent::NotificationPolicyLoaded {
+            host_id: host_id.clone(),
+            result: protocol::NotificationPolicyResult {
+                policy: NotificationPolicy {
+                    attention_dedupe_window_secs: 30,
+                    attention_debounce_secs: 5,
+                    enabled: kind_policy.clone(),
+                    providers: BTreeMap::from([("future-agent".to_owned(), kind_policy)]),
+                },
+            },
+        });
+        assert!(workspace.set_notification_policy_kind(
+            &host_id,
+            Some("future-agent"),
+            NotificationKind::System,
+            false,
+        ));
+        let policy = workspace
+            .notification_policy(&host_id)
+            .expect("policy state");
+        assert!(!policy.providers["future-agent"].system);
+        assert!(policy.enabled.system, "provider edit preserves base policy");
+    }
+
+    #[test]
     fn session_removed_event_drops_the_session() {
         let mut workspace = Workspace::default();
         workspace.apply(DomainEvent::HostSnapshotLoaded {
@@ -2621,7 +3052,7 @@ mod tests {
 
     #[test]
     fn session_removed_wire_event_parses_to_host_event() {
-        let raw = Event::new(
+        let raw = test_event(
             event::SESSION_REMOVED,
             serde_json::json!({ "session": session("s-1", None) }),
         );
@@ -2843,6 +3274,9 @@ mod tests {
                 project_error: None,
                 notifications: Vec::new(),
                 supported_agents: Vec::new(),
+                runtimes: Vec::new(),
+                notification_providers: Vec::new(),
+                observation_capabilities: ObservationCapabilities::default(),
             },
         });
         workspace.selection = Some(Selection::Project {
@@ -3187,7 +3621,7 @@ mod tests {
             snapshot: snapshot("local", vec![session("s-1", Some(AgentActivity::Working))]),
         });
 
-        let raw = Event::new(
+        let raw = test_event(
             event::AGENT_STATE,
             serde_json::json!({
                 "session_id": "s-1",
@@ -3210,7 +3644,7 @@ mod tests {
     #[test]
     fn host_snapshot_carries_notification_records() {
         let mut workspace = Workspace::default();
-        let snapshot = snapshot_with_notifications(
+        let mut snapshot = snapshot_with_notifications(
             "local",
             vec![session("s-1", None)],
             vec![notification_record(
@@ -3219,10 +3653,21 @@ mod tests {
                 NotificationSeverity::ActionRequired,
             )],
         );
+        snapshot.notification_providers = vec!["future-agent".to_owned()];
+        snapshot.runtimes = vec![protocol::AgentRuntime {
+            agent: "hermes-review".to_owned(),
+            agent_base: Some(protocol::AgentKind::Hermes),
+            available: true,
+            path: Some("/usr/bin/hermes".to_owned()),
+            version: Some("0.2.0".to_owned()),
+            supported: Some(true),
+        }];
         workspace.apply(DomainEvent::HostSnapshotLoaded { snapshot });
 
         let host = workspace.hosts.get(&HostId::new("local")).expect("host");
         assert!(host.notifications.contains_key("n-1"));
+        assert_eq!(host.notification_providers, ["future-agent"]);
+        assert_eq!(host.launchable_agents(), ["hermes-review"]);
     }
 
     #[test]
@@ -3232,7 +3677,7 @@ mod tests {
             NotificationStatus::Unread,
             NotificationSeverity::ActionRequired,
         );
-        let event = Event::new(
+        let event = test_event(
             event::NOTIFICATION_CREATED,
             serde_json::to_value(NotificationCreatedEvent {
                 record: record.clone(),
@@ -3258,7 +3703,7 @@ mod tests {
             NotificationStatus::Read,
             NotificationSeverity::ActionRequired,
         );
-        let event = Event::new(
+        let event = test_event(
             event::NOTIFICATION_UPDATED,
             serde_json::to_value(NotificationUpdatedEvent {
                 record: record.clone(),
@@ -3279,7 +3724,7 @@ mod tests {
 
     #[test]
     fn notification_deleted_event_parses_from_subscription_line() {
-        let event = Event::new(
+        let event = test_event(
             event::NOTIFICATION_DELETED,
             serde_json::to_value(NotificationDeletedEvent {
                 notification_id: NotificationId("n-9".to_owned()),
@@ -3301,7 +3746,7 @@ mod tests {
     #[test]
     fn runtime_reconnect_event_parses_from_subscription_line() {
         let expected = session_with_runtime("s-runtime", "runtime-1");
-        let event = Event::new(
+        let event = test_event(
             event::SESSION_RUNTIME_RECONNECTED,
             serde_json::json!({ "session": expected }),
         );
@@ -4063,11 +4508,11 @@ mod tests {
         let first = subscribe_request();
         let second = subscribe_request();
 
-        assert_eq!(first.method, method::SUBSCRIBE);
-        assert_eq!(first.params, Value::Null);
-        assert!(first.id.starts_with("sdk-subscribe-"));
-        assert!(second.id.starts_with("sdk-subscribe-"));
-        assert_ne!(first.id, second.id);
+        assert_eq!(first.method(), method::SUBSCRIBE);
+        assert_eq!(first.params(), &Value::Null);
+        assert!(first.id().starts_with("sdk-subscribe-"));
+        assert!(second.id().starts_with("sdk-subscribe-"));
+        assert_ne!(first.id(), second.id());
     }
 
     fn snapshot(host_id: &str, sessions: Vec<SessionInfo>) -> HostSnapshot {
@@ -4083,6 +4528,9 @@ mod tests {
             project_error: None,
             notifications: Vec::new(),
             supported_agents: Vec::new(),
+            runtimes: Vec::new(),
+            notification_providers: Vec::new(),
+            observation_capabilities: ObservationCapabilities::default(),
         }
     }
 
@@ -4091,6 +4539,10 @@ mod tests {
             name: None,
             id: SessionId(id.to_owned()),
             external: Some(false),
+            capabilities: protocol::SessionCapabilities {
+                resume: true,
+                fork: true,
+            },
             agent: "codex".to_owned(),
             agent_base: protocol::AgentKind::Codex,
             cwd: PathBuf::from("/repo"),
@@ -4127,6 +4579,7 @@ mod tests {
         let mut session = session(id, None);
         session.runtime = Some(protocol::SessionRuntime {
             state: protocol::RuntimeState::Live,
+            runtime_generation: protocol::RuntimeGeneration::new(1),
             worker_id: Some(format!("worker-{runtime_id}")),
             runtime_id: Some(runtime_id.to_owned()),
             started_at: Some("2026-01-01T00:00:00Z".to_owned()),

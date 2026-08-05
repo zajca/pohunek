@@ -1,6 +1,6 @@
 //! Serves the private daemon-worker Unix protocol.
 
-// Rust guideline compliant 2026-07-29
+// Rust guideline compliant 2026-08-04
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -19,11 +19,11 @@ use protocol::{
     ActiveIdentityClaim, AttachStart, Capability, CloseReason, ControlCode, ControlError,
     ControlEvent, ControlMessage, ControlReader, ControlRequest, ControlResponse, ControlWriter,
     Cursor, DaemonId, DataFrame, DataToken, Dimensions, EventKind, ExitStatus, FrameHeader,
-    FrameKind, Initialize, InspectSnapshot, LeaseChallenge, LeaseId,
-    ProcessIdentity as WireProcessIdentity, ReportedLaunchIdentity, RequestKind, ResponseKind,
-    RuntimeId, RuntimePhase as WireRuntimePhase, RuntimeScope, SessionId, StreamId, StreamMode,
-    TerminalSnapshot as WireTerminalSnapshot, TokenClaims, TokenVault, TransactionId, Version,
-    WorkerId, WriteAck, WriteId, ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
+    FrameKind, Initialize, InspectSnapshot, LeaseChallenge, LeaseId, OutputGap,
+    ProcessIdentity as WireProcessIdentity, ReleasedIdentityClaim, ReportedLaunchIdentity,
+    RequestKind, ResponseKind, RuntimeId, RuntimePhase as WireRuntimePhase, RuntimeScope,
+    SessionId, StreamId, StreamMode, TerminalSnapshot as WireTerminalSnapshot, TransactionId,
+    Version, WorkerId, WriteAck, WriteId, ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
 };
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
@@ -34,12 +34,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{event, Level};
 
 use crate::journal::{
-    ActiveIdentity, ChildIdentity, JournalRecord, LaunchIdentity, RuntimeOutcome,
+    ActiveIdentity, ChildIdentity, JournalRecord, LaunchIdentity, ReleasedIdentity, RuntimeOutcome,
     RuntimePhase as JournalPhase,
 };
 use crate::{
     Command, ControllerLease, Exit, InputFragment, InputPlan, Journal, LeaseError, LeaseOwner,
-    OutputChunk, OutputEvent, ProcessIdentity, PtyOwner, WorkerConfig, WorkerError,
+    OutputChunk, OutputEvent, ProcessIdentity, PtyError, PtyOwner, WorkerConfig, WorkerError,
 };
 
 /// Number of worker events buffered per control connection.
@@ -146,9 +146,7 @@ impl Server {
             journal,
             state: AsyncMutex::new(State::new(record)),
             lease: ControllerLease::new(),
-            tokens: Mutex::new(TokenState::new().map_err(|error| {
-                WorkerError::Protocol(format!("token vault initialization failed: {error}"))
-            })?),
+            tokens: Mutex::new(TokenState::new()),
             events,
             next_event: AtomicU64::new(1),
             started: Instant::now(),
@@ -305,27 +303,117 @@ impl State {
 
 #[derive(Debug)]
 struct TokenState {
-    vault: TokenVault,
     grants: HashMap<DataToken, DataGrant>,
+    maximum: usize,
 }
 
 impl TokenState {
-    fn new() -> Result<Self, protocol::TokenError> {
+    fn new() -> Self {
+        Self {
+            grants: HashMap::with_capacity(DATA_TOKEN_CAPACITY),
+            maximum: DATA_TOKEN_CAPACITY,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_maximum(maximum: usize) -> Result<Self, TokenStateError> {
+        if maximum == 0 {
+            return Err(TokenStateError::InvalidCapacity);
+        }
         Ok(Self {
-            vault: TokenVault::new(DATA_TOKEN_CAPACITY)?,
-            grants: HashMap::new(),
+            grants: HashMap::with_capacity(maximum),
+            maximum,
         })
     }
+
+    fn insert(
+        &mut self,
+        token: DataToken,
+        grant: DataGrant,
+        now_ms: u64,
+    ) -> Result<(), TokenStateError> {
+        if grant.expires_at_ms <= now_ms {
+            return Err(TokenStateError::AlreadyExpired);
+        }
+        self.purge_expired(now_ms);
+        if self.grants.contains_key(&token) {
+            return Err(TokenStateError::Duplicate);
+        }
+        if self.grants.len() >= self.maximum {
+            return Err(TokenStateError::Full {
+                maximum: self.maximum,
+            });
+        }
+        self.grants.insert(token, grant);
+        Ok(())
+    }
+
+    fn redeem(
+        &mut self,
+        token: &DataToken,
+        now_ms: u64,
+        validate: impl FnOnce(&DataGrant) -> Result<(), WorkerError>,
+    ) -> Result<DataGrant, WorkerError> {
+        self.purge_expired(now_ms);
+        let validation = self
+            .grants
+            .get(token)
+            .ok_or_else(|| {
+                WorkerError::Protocol("data token is invalid, expired, or already used".to_owned())
+            })
+            .and_then(validate);
+        let grant = self.grants.remove(token);
+        validation?;
+        grant.ok_or_else(|| {
+            WorkerError::Protocol("data token is invalid, expired, or already used".to_owned())
+        })
+    }
+
+    fn purge_expired(&mut self, now_ms: u64) -> usize {
+        let before = self.grants.len();
+        self.grants
+            .retain(|_token, grant| grant.expires_at_ms > now_ms);
+        before - self.grants.len()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.grants.len()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum TokenStateError {
+    #[cfg(test)]
+    #[error("data grant capacity must be nonzero")]
+    InvalidCapacity,
+    #[error("data grant was already expired when issued")]
+    AlreadyExpired,
+    #[error("data token is already registered")]
+    Duplicate,
+    #[error("data grant vault is full at its configured maximum of {maximum}")]
+    Full { maximum: usize },
 }
 
 #[derive(Debug, Clone)]
 struct DataGrant {
+    lease_owner: LeaseOwner,
     lease_id: LeaseId,
+    lease_epoch: u64,
+    version: Version,
+    expires_at_ms: u64,
     runtime_id: RuntimeId,
     stream_id: StreamId,
     mode: StreamMode,
     after_offset: Option<u64>,
     attach: Option<AttachStart>,
+    observation: Option<ObservationGrant>,
+}
+
+#[derive(Debug, Clone)]
+struct ObservationGrant {
+    max_bytes: usize,
+    wait: Duration,
 }
 
 #[derive(Debug)]
@@ -570,6 +658,27 @@ async fn handle_request(
             )
             .await
         }
+        RequestKind::TerminalSnapshot { scope } => {
+            terminal_snapshot_request(shared, connection, &scope).await
+        }
+        RequestKind::ReadOutput {
+            scope,
+            stream_id,
+            after_offset,
+            max_bytes,
+            wait_ms,
+        } => {
+            read_output_request(
+                shared,
+                connection,
+                &scope,
+                stream_id,
+                after_offset,
+                max_bytes,
+                wait_ms,
+            )
+            .await
+        }
         RequestKind::WritePlan { scope, plan } => {
             write_request(shared, connection, &scope, plan).await
         }
@@ -587,10 +696,16 @@ async fn handle_request(
         }
     };
 
-    ControlResponse {
+    let mut response = ControlResponse {
         request_id,
         kind: result.unwrap_or_else(|error| ResponseKind::Error { error }),
+    };
+    if matches!(response.kind, ResponseKind::TerminalSnapshot { .. }) {
+        if let Err(error) = validate_terminal_snapshot_response(&response, &shared.config) {
+            response.kind = ResponseKind::Error { error };
+        }
     }
+    response
 }
 
 async fn negotiate_request(
@@ -734,7 +849,7 @@ async fn initialize_request(
     };
     persist_control(shared.journal.clone(), starting).await?;
 
-    let command = command_from_initialize(shared, &initialize);
+    let command = command_from_initialize(shared, &initialize, &runtime_id);
     let history_bytes = usize::try_from(initialize.limits.output_history_bytes())
         .map_err(|error| control_error(ControlCode::InvalidRequest, error, false))?;
     let subscriber_bytes = usize::try_from(initialize.limits.subscriber_queue_bytes())
@@ -815,34 +930,174 @@ async fn open_data_request(
     let now = shared.now_ms();
     let ttl = u64::try_from(shared.config.data_token_ttl.as_millis()).unwrap_or(u64::MAX);
     let expires_at_ms = now.saturating_add(ttl);
+    let (lease_owner, lease_epoch, version) = data_grant_authority(shared, connection)?;
     let grant = DataGrant {
+        lease_owner,
         lease_id: scope.lease_id.clone(),
+        lease_epoch,
+        version,
+        expires_at_ms,
         runtime_id: scope.runtime_id.clone(),
         stream_id: stream_id.clone(),
         mode,
         after_offset,
         attach,
+        observation: None,
     };
     let mut tokens = lock(&shared.tokens);
-    let _ = tokens.vault.purge_expired(now);
     tokens
-        .vault
-        .insert(
-            token.clone(),
-            TokenClaims {
-                lease_id: grant.lease_id.clone(),
-                runtime_id: grant.runtime_id.clone(),
-                stream_id: grant.stream_id.clone(),
-                expires_at_ms,
-            },
-            now,
-        )
+        .insert(token.clone(), grant, now)
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
-    tokens.grants.insert(token.clone(), grant);
     Ok(ResponseKind::DataStreamOpened {
         token,
         expires_at_ms,
     })
+}
+
+fn data_grant_authority(
+    shared: &Shared,
+    connection: &Connection,
+) -> Result<(LeaseOwner, u64, Version), ControlError> {
+    let lease_owner = connection.owner.clone().ok_or_else(identity_mismatch)?;
+    let lease_id = connection.lease_id.as_ref().ok_or_else(identity_mismatch)?;
+    shared
+        .lease
+        .validate(&lease_owner, lease_id.as_str())
+        .map_err(lease_control_error)?;
+    let lease_epoch = *shared.lease_epoch_tx.borrow();
+    let version = connection.selected_version.ok_or_else(identity_mismatch)?;
+    Ok((lease_owner, lease_epoch, version))
+}
+
+fn observation_capability(connection: &Connection) -> Result<(), ControlError> {
+    if connection
+        .capabilities
+        .contains(&Capability::ControlPlaneObservation)
+    {
+        Ok(())
+    } else {
+        Err(control_error_message(
+            ControlCode::WorkerFeatureUnavailable,
+            "control-plane observation was not negotiated",
+            false,
+        ))
+    }
+}
+
+async fn terminal_snapshot_request(
+    shared: &Shared,
+    connection: &Connection,
+    scope: &RuntimeScope,
+) -> Result<ResponseKind, ControlError> {
+    observation_capability(connection)?;
+    let pty = scoped_pty(shared, connection, scope).await?;
+    let snapshot = wire_terminal(&pty.output().terminal_snapshot())
+        .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
+    validate_terminal_snapshot_dimensions(&snapshot, &shared.config)?;
+    Ok(ResponseKind::TerminalSnapshot {
+        runtime_id: scope.runtime_id.clone(),
+        snapshot: Box::new(snapshot),
+    })
+}
+
+fn validate_terminal_snapshot_dimensions(
+    snapshot: &WireTerminalSnapshot,
+    config: &WorkerConfig,
+) -> Result<(), ControlError> {
+    if snapshot.dimensions.rows() > config.max_snapshot_rows
+        || snapshot.dimensions.columns() > config.max_snapshot_columns
+    {
+        return Err(control_error_message(
+            ControlCode::ObservationLimitExceeded,
+            "terminal snapshot dimensions exceed the worker limit",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_terminal_snapshot_response(
+    response: &ControlResponse,
+    config: &WorkerConfig,
+) -> Result<(), ControlError> {
+    let serialized = serde_json::to_vec(response)
+        .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
+    if serialized.len() > config.max_snapshot_bytes {
+        return Err(control_error_message(
+            ControlCode::ObservationLimitExceeded,
+            "serialized terminal snapshot response exceeds the worker limit",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+async fn read_output_request(
+    shared: &Shared,
+    connection: &Connection,
+    scope: &RuntimeScope,
+    stream_id: StreamId,
+    after_offset: Option<u64>,
+    max_bytes: u32,
+    wait_ms: u64,
+) -> Result<ResponseKind, ControlError> {
+    observation_capability(connection)?;
+    validate_scope(shared, connection, scope).await?;
+    let (max_bytes, wait) = validate_observation_request(max_bytes, wait_ms, &shared.config)?;
+    let token_value = random_value("observation")
+        .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
+    let token = DataToken::new(token_value)
+        .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
+    let now = shared.now_ms();
+    let ttl = u64::try_from(shared.config.data_token_ttl.as_millis()).unwrap_or(u64::MAX);
+    let expires_at_ms = now.saturating_add(ttl);
+    let (lease_owner, lease_epoch, version) = data_grant_authority(shared, connection)?;
+    let grant = DataGrant {
+        lease_owner,
+        lease_id: scope.lease_id.clone(),
+        lease_epoch,
+        version,
+        expires_at_ms,
+        runtime_id: scope.runtime_id.clone(),
+        stream_id,
+        mode: StreamMode::Observation,
+        after_offset,
+        attach: None,
+        observation: Some(ObservationGrant { max_bytes, wait }),
+    };
+    let mut tokens = lock(&shared.tokens);
+    tokens
+        .insert(token.clone(), grant, now)
+        .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
+    Ok(ResponseKind::OutputReadOpened {
+        token,
+        expires_at_ms,
+    })
+}
+
+fn validate_observation_request(
+    max_bytes: u32,
+    wait_ms: u64,
+    config: &WorkerConfig,
+) -> Result<(usize, Duration), ControlError> {
+    let max_bytes = usize::try_from(max_bytes)
+        .map_err(|error| control_error(ControlCode::InvalidRequest, error, false))?;
+    if max_bytes == 0 || max_bytes > config.history_bytes {
+        return Err(control_error_message(
+            ControlCode::ObservationLimitExceeded,
+            "output observation byte limit is invalid",
+            false,
+        ));
+    }
+    let wait = Duration::from_millis(wait_ms);
+    if wait > config.max_observation_wait {
+        return Err(control_error_message(
+            ControlCode::ObservationLimitExceeded,
+            "output observation wait exceeds the worker limit",
+            false,
+        ));
+    }
+    Ok((max_bytes, wait))
 }
 
 fn validate_data_start(
@@ -864,6 +1119,11 @@ fn validate_data_start(
         }
         (StreamMode::Attach, None) if selected < ATTACH_SNAPSHOT_VERSION => Ok(()),
         (StreamMode::Detector, None) => Ok(()),
+        (StreamMode::Observation, _) => Err(control_error_message(
+            ControlCode::InvalidRequest,
+            "observation streams require a read-output grant",
+            false,
+        )),
         (StreamMode::Attach, Some(_)) if after_offset.is_some() => Err(control_error_message(
             ControlCode::InvalidRequest,
             "snapshot attachment cannot request an output replay offset",
@@ -1057,6 +1317,7 @@ async fn inspect_snapshot(shared: &Shared, state: &State) -> Result<InspectSnaps
             .journal
             .active_identity
             .as_ref()
+            .filter(|identity| valid_identity_expiry(&identity.expires_at))
             .map(|identity| {
                 Ok(ActiveIdentityClaim {
                     provider: identity.provider.clone(),
@@ -1065,6 +1326,18 @@ async fn inspect_snapshot(shared: &Shared, state: &State) -> Result<InspectSnaps
                     expires_at: identity.expires_at.clone(),
                     reference_kind: identity.reference_kind.clone(),
                     native_reference: identity.native_reference.clone(),
+                })
+            })
+            .transpose()?,
+        active_identity_release: state
+            .journal
+            .active_identity_release
+            .as_ref()
+            .map(|release| {
+                Ok(ReleasedIdentityClaim {
+                    provider: release.provider.clone(),
+                    process: wire_child_identity(&release.process)?,
+                    sequence: release.sequence,
                 })
             })
             .transpose()?,
@@ -1118,13 +1391,10 @@ fn spawn_runtime_monitors(shared: Arc<Shared>, pty: PtyOwner, runtime_id: Runtim
     });
 
     tokio::spawn(async move {
-        let exit = match pty.wait_exit().await {
+        let exit = match wait_runtime_exit(&pty).await {
             Ok(exit) => exit,
             Err(error) => {
-                shared.emit(EventKind::RuntimeFault {
-                    runtime_id: Some(runtime_id),
-                    error: control_error(ControlCode::RuntimeFault, error, false),
-                });
+                mark_runtime_faulted(&shared, runtime_id, WorkerError::Pty(error)).await;
                 return;
             }
         };
@@ -1169,6 +1439,26 @@ fn spawn_runtime_monitors(shared: Arc<Shared>, pty: PtyOwner, runtime_id: Runtim
     });
 }
 
+async fn wait_runtime_exit(pty: &PtyOwner) -> Result<Exit, PtyError> {
+    let exit = pty.wait_exit().await;
+    // Child exit is authoritative even while descendants keep the slave PTY
+    // open, so observation waiters cannot depend on master EOF.
+    pty.output().mark_exit();
+    exit
+}
+
+async fn mark_runtime_faulted(shared: &Shared, runtime_id: RuntimeId, error: WorkerError) {
+    let mut state = shared.state.lock().await;
+    state.phase = WireRuntimePhase::Faulted;
+    state.journal.phase = JournalPhase::Faulted;
+    state.journal.updated_at = timestamp();
+    drop(state);
+    shared.emit(EventKind::RuntimeFault {
+        runtime_id: Some(runtime_id),
+        error: control_error(ControlCode::RuntimeFault, error, false),
+    });
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the bidirectional data-stream select loop keeps lease, output, and input ordering in one place"
@@ -1178,6 +1468,9 @@ async fn serve_data(
     stream: PrefixStream<UnixStream>,
 ) -> Result<(), WorkerError> {
     let (mut read_half, mut write_half) = tokio::io::split(stream);
+    // Register before redemption so a lease release in the handoff window is
+    // retained by the watch receiver instead of becoming an invisible past event.
+    let mut lease_epoch = shared.lease_epoch_tx.subscribe();
     let open = protocol::read_frame(&mut read_half)
         .await
         .map_err(|error| WorkerError::Protocol(error.to_string()))?
@@ -1193,38 +1486,27 @@ async fn serve_data(
         mode,
         after_offset,
         attach,
-    } = header.kind
+    } = header.kind.clone()
     else {
         return Err(WorkerError::Protocol(
             "first data frame must open a stream".to_owned(),
         ));
     };
-    let grant = {
-        let mut tokens = lock(&shared.tokens);
-        let grant = tokens
-            .grants
-            .remove(&token)
-            .ok_or_else(|| WorkerError::Protocol("data token has no matching grant".to_owned()))?;
-        tokens
-            .vault
-            .redeem(
-                &token,
-                &grant.lease_id,
-                &grant.runtime_id,
-                &grant.stream_id,
-                shared.now_ms(),
-            )
-            .map_err(|error| WorkerError::Protocol(error.to_string()))?;
-        grant
-    };
-    if grant.runtime_id != header.runtime_id
-        || grant.stream_id != header.stream_id
-        || grant.mode != mode
-        || grant.after_offset != after_offset
-        || grant.attach != attach
-    {
+    let redeemed_epoch = *lease_epoch.borrow();
+    let grant = redeem_data_grant(
+        &shared.tokens,
+        &shared.lease,
+        redeemed_epoch,
+        shared.now_ms(),
+        &token,
+        &header,
+        mode,
+        after_offset,
+        attach.as_ref(),
+    )?;
+    if *lease_epoch.borrow() != grant.lease_epoch {
         return Err(WorkerError::Protocol(
-            "data open frame does not match its grant".to_owned(),
+            "data token lease generation changed during redemption".to_owned(),
         ));
     }
     let pty = {
@@ -1234,6 +1516,25 @@ async fn serve_data(
             .clone()
             .ok_or_else(|| WorkerError::Protocol("runtime is not live".to_owned()))?
     };
+    if mode == StreamMode::Observation {
+        let observation = grant.observation.ok_or_else(|| {
+            WorkerError::Protocol("observation data grant is incomplete".to_owned())
+        })?;
+        return serve_observation_data(
+            &shared,
+            &pty,
+            &mut read_half,
+            &mut write_half,
+            header.version,
+            &header.stream_id,
+            &header.runtime_id,
+            after_offset,
+            observation,
+            grant.lease_epoch,
+            &mut lease_epoch,
+        )
+        .await;
+    }
     let mut subscriber = if let Some(attach) = attach {
         let dimensions = attach
             .dimensions
@@ -1271,7 +1572,6 @@ async fn serve_data(
         pty.subscribe_output(after_offset)
             .map_err(|error| WorkerError::Protocol(error.to_string()))?
     };
-    let mut lease_epoch = shared.lease_epoch_tx.subscribe();
     let version = header.version;
     let stream_id = header.stream_id;
     let runtime_id = header.runtime_id;
@@ -1397,6 +1697,284 @@ async fn serve_data(
             }
         }
     }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "redemption validates every authenticated stream claim before consuming the token"
+)]
+fn redeem_data_grant(
+    tokens: &Mutex<TokenState>,
+    lease: &ControllerLease,
+    current_lease_epoch: u64,
+    now_ms: u64,
+    token: &DataToken,
+    header: &FrameHeader,
+    mode: StreamMode,
+    after_offset: Option<u64>,
+    attach: Option<&AttachStart>,
+) -> Result<DataGrant, WorkerError> {
+    let mut tokens = lock(tokens);
+    tokens.redeem(token, now_ms, |grant| {
+        lease
+            .validate(&grant.lease_owner, grant.lease_id.as_str())
+            .map_err(|_error| {
+                WorkerError::Protocol("data token lease is no longer active".to_owned())
+            })?;
+        if grant.lease_epoch != current_lease_epoch {
+            return Err(WorkerError::Protocol(
+                "data token lease generation is stale".to_owned(),
+            ));
+        }
+        if grant.version != header.version
+            || grant.runtime_id != header.runtime_id
+            || grant.stream_id != header.stream_id
+            || grant.mode != mode
+            || grant.after_offset != after_offset
+            || grant.attach.as_ref() != attach
+        {
+            return Err(WorkerError::Protocol(
+                "data open frame does not match its grant".to_owned(),
+            ));
+        }
+        Ok(())
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "observation framing keeps authenticated stream identity explicit"
+)]
+async fn serve_observation_data<R, W>(
+    shared: &Shared,
+    pty: &PtyOwner,
+    reader: &mut R,
+    writer: &mut W,
+    version: Version,
+    stream_id: &StreamId,
+    runtime_id: &RuntimeId,
+    after_offset: Option<u64>,
+    observation: ObservationGrant,
+    expected_lease_epoch: u64,
+    lease_epoch: &mut watch::Receiver<u64>,
+) -> Result<(), WorkerError>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send,
+{
+    let output = pty.output();
+    let outcome = await_observation_page(
+        output,
+        after_offset,
+        observation,
+        &shared.shutdown,
+        expected_lease_epoch,
+        lease_epoch,
+        reader,
+    )
+    .await?;
+    let (page, timed_out) = match outcome {
+        ObservationWaitOutcome::Page { page, timed_out } => (page, timed_out),
+        ObservationWaitOutcome::LeaseReleased => {
+            return write_data_frame(
+                writer,
+                version,
+                stream_id,
+                runtime_id,
+                FrameKind::Close {
+                    reason: CloseReason::LeaseReleased,
+                },
+                Vec::new(),
+            )
+            .await;
+        }
+        ObservationWaitOutcome::Disconnected | ObservationWaitOutcome::Shutdown => return Ok(()),
+        ObservationWaitOutcome::InvalidInput => {
+            return write_data_error(
+                writer,
+                version,
+                stream_id,
+                runtime_id,
+                control_error_message(
+                    ControlCode::InvalidRequest,
+                    "observation stream is output-only",
+                    false,
+                ),
+            )
+            .await;
+        }
+    };
+
+    if *lease_epoch.borrow() != expected_lease_epoch {
+        return write_data_frame(
+            writer,
+            version,
+            stream_id,
+            runtime_id,
+            FrameKind::Close {
+                reason: CloseReason::LeaseReleased,
+            },
+            Vec::new(),
+        )
+        .await;
+    }
+
+    write_observation_page(
+        writer,
+        version,
+        stream_id,
+        runtime_id,
+        shared.config.data_payload_bytes,
+        page,
+        timed_out,
+    )
+    .await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ObservationWaitOutcome {
+    Page {
+        page: crate::ObservationPage,
+        timed_out: bool,
+    },
+    LeaseReleased,
+    Disconnected,
+    Shutdown,
+    InvalidInput,
+}
+
+async fn await_observation_page<R>(
+    output: &crate::OutputHub,
+    after_offset: Option<u64>,
+    observation: ObservationGrant,
+    shutdown: &CancellationToken,
+    expected_lease_epoch: u64,
+    lease_epoch: &mut watch::Receiver<u64>,
+    reader: &mut R,
+) -> Result<ObservationWaitOutcome, WorkerError>
+where
+    R: AsyncRead + Unpin + Send,
+{
+    let deadline = tokio::time::sleep(observation.wait);
+    tokio::pin!(deadline);
+    loop {
+        if *lease_epoch.borrow() != expected_lease_epoch {
+            return Ok(ObservationWaitOutcome::LeaseReleased);
+        }
+        let page = output
+            .observe(after_offset, observation.max_bytes)
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+        let waiting_at_end = after_offset.is_some()
+            && page.start_offset == page.runtime_end_offset
+            && !page.exited
+            && !observation.wait.is_zero();
+        if !waiting_at_end {
+            if *lease_epoch.borrow() != expected_lease_epoch {
+                return Ok(ObservationWaitOutcome::LeaseReleased);
+            }
+            return Ok(ObservationWaitOutcome::Page {
+                page,
+                timed_out: false,
+            });
+        }
+        tokio::select! {
+            () = output.wait_for_observation(page.runtime_end_offset, shutdown) => {
+                if shutdown.is_cancelled() {
+                    return Ok(ObservationWaitOutcome::Shutdown);
+                }
+            }
+            changed = lease_epoch.changed() => {
+                return Ok(if changed.is_ok() {
+                    ObservationWaitOutcome::LeaseReleased
+                } else {
+                    ObservationWaitOutcome::Shutdown
+                });
+            }
+            incoming = protocol::read_frame(reader) => {
+                return match incoming {
+                    Ok(None) => Ok(ObservationWaitOutcome::Disconnected),
+                    Ok(Some(_)) => Ok(ObservationWaitOutcome::InvalidInput),
+                    Err(error) => Err(WorkerError::Protocol(error.to_string())),
+                };
+            }
+            () = &mut deadline => {
+                if *lease_epoch.borrow() != expected_lease_epoch {
+                    return Ok(ObservationWaitOutcome::LeaseReleased);
+                }
+                let final_page = output
+                    .observe(after_offset, observation.max_bytes)
+                    .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+                let timed_out = observation_timed_out(after_offset, &final_page);
+                return Ok(ObservationWaitOutcome::Page { page: final_page, timed_out });
+            }
+        }
+    }
+}
+
+fn observation_timed_out(after_offset: Option<u64>, page: &crate::ObservationPage) -> bool {
+    after_offset.is_some()
+        && page.start_offset == page.runtime_end_offset
+        && page.bytes.is_empty()
+        && !page.exited
+}
+
+async fn write_observation_page<W>(
+    writer: &mut W,
+    version: Version,
+    stream_id: &StreamId,
+    runtime_id: &RuntimeId,
+    payload_limit: usize,
+    page: crate::ObservationPage,
+    timed_out: bool,
+) -> Result<(), WorkerError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    let gap = page.gap.map(|missing| OutputGap {
+        missing_start: missing.start,
+        missing_end: missing.end,
+    });
+    write_data_frame(
+        writer,
+        version,
+        stream_id,
+        runtime_id,
+        FrameKind::ObservationStart {
+            history_start_offset: page.history_start_offset,
+            start_offset: page.start_offset,
+            next_offset: page.next_offset,
+            runtime_end_offset: page.runtime_end_offset,
+            gap,
+            has_more: page.has_more,
+            timed_out,
+        },
+        Vec::new(),
+    )
+    .await?;
+    write_output_chunks(
+        writer,
+        version,
+        stream_id,
+        runtime_id,
+        payload_limit,
+        OutputChunk {
+            offset: page.start_offset,
+            bytes: page.bytes,
+        },
+        true,
+    )
+    .await?;
+    write_data_frame(
+        writer,
+        version,
+        stream_id,
+        runtime_id,
+        FrameKind::Close {
+            reason: CloseReason::ObservationComplete,
+        },
+        Vec::new(),
+    )
+    .await
 }
 
 async fn write_data_error<W>(
@@ -1590,6 +2168,7 @@ where
 #[serde(tag = "type", rename_all = "snake_case")]
 enum HookRequest {
     IdentityReport {
+        runtime_id: String,
         provider: String,
         pid: u32,
         start_identity: u64,
@@ -1599,6 +2178,7 @@ enum HookRequest {
         native_reference: Option<String>,
     },
     IdentityRelease {
+        runtime_id: String,
         provider: String,
         pid: u32,
         start_identity: u64,
@@ -1626,8 +2206,9 @@ where
 {
     let request: HookRequest =
         serde_json::from_value(value).map_err(|error| WorkerError::Protocol(error.to_string()))?;
-    let record = match request {
+    let (accepted, launch_identity_accepted, runtime_id) = match request {
         HookRequest::IdentityReport {
+            runtime_id,
             provider,
             pid,
             start_identity,
@@ -1637,104 +2218,182 @@ where
             native_reference,
         } => {
             let mut state = shared.state.lock().await;
-            let pty = state
-                .pty
-                .as_ref()
-                .ok_or_else(|| WorkerError::Protocol("runtime is not initialized".to_owned()))?;
-            let root_identity = pty.identity().clone();
-            validate_hook_process(pid, start_identity, root_identity.pid)?;
-            let process = ChildIdentity {
-                pid,
-                process_group: root_identity.process_group,
-                start_identity: start_identity.to_string(),
-            };
-            state.journal.active_identity = Some(ActiveIdentity {
-                provider: provider.clone(),
-                process: process.clone(),
-                sequence,
-                expires_at,
-                reference_kind: reference_kind.clone(),
-                native_reference: native_reference.clone(),
-            });
-            let mut launch_identity_accepted = false;
-            if let (Some(reference_kind), Some(native_reference), Some(launch_base)) = (
-                reference_kind,
-                native_reference,
-                state.launch_agent_base.as_ref(),
-            ) {
-                if &provider == launch_base {
-                    if let Some(designated) =
-                        designated_launch_process(root_identity.pid, launch_base)?
-                    {
-                        if designated.pid == pid && designated.start_identity == start_identity {
-                            match state.journal.launch_identity.as_ref() {
-                                None => {
-                                    state.journal.launch_identity = Some(LaunchIdentity {
-                                        provider,
-                                        process,
-                                        reference_kind,
-                                        native_reference,
-                                    });
-                                    launch_identity_accepted = true;
-                                }
-                                Some(existing)
-                                    if existing.process.pid == pid
-                                        && existing.process.start_identity
-                                            == start_identity.to_string()
-                                        && existing.reference_kind == reference_kind
-                                        && existing.native_reference == native_reference =>
+            let current_runtime = state.runtime_id.as_ref().map(ToString::to_string);
+            if !known_identity_provider(&provider)
+                || current_runtime.as_deref() != Some(runtime_id.as_str())
+                || !valid_identity_expiry(&expires_at)
+            {
+                (false, false, current_runtime)
+            } else {
+                let pty = state.pty.as_ref().ok_or_else(|| {
+                    WorkerError::Protocol("runtime is not initialized".to_owned())
+                })?;
+                let root_identity = pty.identity().clone();
+                let process_valid =
+                    validate_hook_process(pid, start_identity, root_identity.pid).is_ok();
+                let sequence_valid = identity_sequence_is_fresh(&state.journal, sequence);
+                if !process_valid || !sequence_valid {
+                    (false, false, current_runtime)
+                } else {
+                    let mut journal = state.journal.clone();
+                    let process = ChildIdentity {
+                        pid,
+                        process_group: root_identity.process_group,
+                        start_identity: start_identity.to_string(),
+                    };
+                    journal.active_identity = Some(ActiveIdentity {
+                        provider: provider.clone(),
+                        process: process.clone(),
+                        sequence,
+                        expires_at,
+                        reference_kind: reference_kind.clone(),
+                        native_reference: native_reference.clone(),
+                    });
+                    journal.active_identity_release = None;
+                    let mut launch_identity_accepted = false;
+                    if let (Some(reference_kind), Some(native_reference), Some(launch_base)) = (
+                        reference_kind,
+                        native_reference,
+                        state.launch_agent_base.as_ref(),
+                    ) {
+                        if &provider == launch_base {
+                            if let Some(designated) =
+                                designated_launch_process(root_identity.pid, launch_base)?
+                            {
+                                if designated.pid == pid
+                                    && designated.start_identity == start_identity
                                 {
-                                    launch_identity_accepted = true;
+                                    match journal.launch_identity.as_ref() {
+                                        None => {
+                                            journal.launch_identity = Some(LaunchIdentity {
+                                                provider,
+                                                process,
+                                                reference_kind,
+                                                native_reference,
+                                            });
+                                            launch_identity_accepted = true;
+                                        }
+                                        Some(existing)
+                                            if existing.process.pid == pid
+                                                && existing.process.start_identity
+                                                    == start_identity.to_string()
+                                                && existing.reference_kind == reference_kind
+                                                && existing.native_reference
+                                                    == native_reference =>
+                                        {
+                                            launch_identity_accepted = true;
+                                        }
+                                        Some(_) => {}
+                                    }
                                 }
-                                Some(_) => {}
                             }
                         }
                     }
+                    journal.updated_at = timestamp();
+                    persist(shared.journal.clone(), journal.clone()).await?;
+                    state.journal = journal;
+                    (true, launch_identity_accepted, current_runtime)
                 }
             }
-            state.journal.updated_at = timestamp();
-            (state.journal.clone(), launch_identity_accepted)
         }
         HookRequest::IdentityRelease {
+            runtime_id,
             provider,
             pid,
             start_identity,
             sequence,
         } => {
             let mut state = shared.state.lock().await;
-            let pty = state
-                .pty
-                .as_ref()
-                .ok_or_else(|| WorkerError::Protocol("runtime is not initialized".to_owned()))?;
-            validate_hook_process(pid, start_identity, pty.identity().pid)?;
-            if state
-                .journal
-                .active_identity
-                .as_ref()
-                .is_some_and(|active| {
-                    active.provider == provider
-                        && active.process.pid == pid
-                        && active.process.start_identity == start_identity.to_string()
-                        && sequence >= active.sequence
-                })
+            let current_runtime = state.runtime_id.as_ref().map(ToString::to_string);
+            if !known_identity_provider(&provider)
+                || current_runtime.as_deref() != Some(runtime_id.as_str())
             {
-                state.journal.active_identity = None;
+                (false, false, current_runtime)
+            } else {
+                let pty = state.pty.as_ref().ok_or_else(|| {
+                    WorkerError::Protocol("runtime is not initialized".to_owned())
+                })?;
+                let process_valid =
+                    validate_hook_process(pid, start_identity, pty.identity().pid).is_ok();
+                let released_process = if process_valid {
+                    state
+                        .journal
+                        .active_identity
+                        .as_ref()
+                        .filter(|active| {
+                            active.provider == provider
+                                && active.process.pid == pid
+                                && active.process.start_identity == start_identity.to_string()
+                                && sequence > active.sequence
+                                && state
+                                    .journal
+                                    .active_identity_release
+                                    .as_ref()
+                                    .is_none_or(|release| sequence > release.sequence)
+                        })
+                        .map(|active| active.process.clone())
+                } else {
+                    None
+                };
+                if let Some(process) = released_process {
+                    let mut journal = state.journal.clone();
+                    journal.active_identity = None;
+                    journal.active_identity_release = Some(ReleasedIdentity {
+                        provider,
+                        process,
+                        sequence,
+                    });
+                    journal.updated_at = timestamp();
+                    persist(shared.journal.clone(), journal.clone()).await?;
+                    state.journal = journal;
+                    (true, false, current_runtime)
+                } else {
+                    (false, false, current_runtime)
+                }
             }
-            state.journal.updated_at = timestamp();
-            (state.journal.clone(), false)
         }
     };
-    persist(shared.journal.clone(), record.0).await?;
-    if let Some(runtime_id) = shared.state.lock().await.runtime_id.clone() {
-        shared.emit(EventKind::IdentityChanged { runtime_id });
+    if accepted {
+        if let Some(runtime_id) = runtime_id.and_then(|value| RuntimeId::new(value).ok()) {
+            shared.emit(EventKind::IdentityChanged { runtime_id });
+        }
     }
     writer
         .write(&HookResponse {
-            ok: true,
-            launch_identity_accepted: record.1,
+            ok: accepted,
+            launch_identity_accepted,
         })
         .await
         .map_err(|error| WorkerError::Protocol(error.to_string()))
+}
+
+fn known_identity_provider(provider: &str) -> bool {
+    matches!(provider, "shell" | "codex" | "claude")
+}
+
+fn identity_sequence_is_fresh(journal: &JournalRecord, sequence: u64) -> bool {
+    let active_is_fresh = journal
+        .active_identity
+        .as_ref()
+        .is_none_or(|active| sequence > active.sequence);
+    active_is_fresh
+        && journal
+            .active_identity_release
+            .as_ref()
+            .is_none_or(|release| sequence > release.sequence)
+}
+
+fn valid_identity_expiry(value: &str) -> bool {
+    let Ok(expires_at) = time::OffsetDateTime::parse(value, &Rfc3339) else {
+        return false;
+    };
+    let now = time::OffsetDateTime::now_utc();
+    let max_expiry = now
+        + time::Duration::seconds(
+            i64::try_from(protocol::MAX_IDENTITY_CLAIM_TTL_SECS)
+                .expect("identity TTL ceiling fits i64"),
+        );
+    expires_at > now && expires_at <= max_expiry
 }
 
 fn validate_hook_process(pid: u32, start_identity: u64, root_pid: u32) -> Result<(), WorkerError> {
@@ -1792,7 +2451,11 @@ fn validate_lease(
         .map_err(lease_control_error)
 }
 
-fn command_from_initialize(shared: &Shared, initialize: &Initialize) -> Command {
+fn command_from_initialize(
+    shared: &Shared,
+    initialize: &Initialize,
+    runtime_id: &RuntimeId,
+) -> Command {
     let mut environment = initialize.environment.clone().into_inner();
     for name in WORKER_ONLY_ENV {
         environment.remove(name);
@@ -1805,6 +2468,7 @@ fn command_from_initialize(shared: &Shared, initialize: &Initialize) -> Command 
             shared.session_id.to_string(),
         ),
         ("POHUNEK_WORKER_ID".to_owned(), shared.worker_id.to_string()),
+        ("POHUNEK_RUNTIME_ID".to_owned(), runtime_id.to_string()),
         (
             "POHUNEK_WORKER_SOCKET_PATH".to_owned(),
             shared.socket_path.to_string_lossy().into_owned(),
@@ -1928,6 +2592,9 @@ fn capabilities(version: Version) -> Vec<Capability> {
     ];
     if version >= ATTACH_SNAPSHOT_VERSION {
         capabilities.push(Capability::AttachSnapshot);
+    }
+    if version >= protocol::CONTROL_PLANE_OBSERVATION_VERSION {
+        capabilities.push(Capability::ControlPlaneObservation);
     }
     capabilities
 }
@@ -2328,20 +2995,129 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
-        control_input_id, parse_stat, random_value, signal_number, validate_attach_write_id,
-        validate_data_start, write_data_error, write_output_chunks, write_terminal_chunks,
-        Connection, ControlInputId, PrefixStream, WireTerminalSnapshot,
+        await_observation_page, capabilities, control_input_id, identity_sequence_is_fresh,
+        observation_timed_out, parse_stat, random_value, redeem_data_grant, signal_number,
+        valid_identity_expiry, validate_attach_write_id, validate_data_start,
+        validate_observation_request, validate_terminal_snapshot_dimensions,
+        validate_terminal_snapshot_response, wait_runtime_exit, write_data_error,
+        write_observation_page, write_output_chunks, write_terminal_chunks, Connection,
+        ControlInputId, DataGrant, ObservationGrant, ObservationWaitOutcome, PrefixStream,
+        TokenState, WireTerminalSnapshot,
     };
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
     use pohunek_worker_protocol::{
-        self as protocol, AttachStart, Capability, ControlCode, ControlError, Cursor, Dimensions,
-        FrameKind, RuntimeId, StreamId, StreamMode, WriteId, CURRENT_VERSION,
+        self as protocol, AttachStart, Capability, ControlCode, ControlError, ControlMessage,
+        ControlResponse, Cursor, DataToken, Dimensions, FrameHeader, FrameKind, LeaseId, RequestId,
+        ResponseKind, RuntimeId, StreamId, StreamMode, Version, WriteId, CURRENT_VERSION,
         MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::{ChildIdentity, JournalRecord, ReleasedIdentity};
 
     /// Extra bytes force exactly one partial frame after a full wire payload.
     const OVERSIZED_PAYLOAD_EXTRA: usize = 257;
+
+    #[test]
+    fn identity_expiry_enforces_the_shared_ttl_ceiling() {
+        let valid = (time::OffsetDateTime::now_utc() + time::Duration::seconds(30))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("format valid expiry");
+        let expired = (time::OffsetDateTime::now_utc() - time::Duration::seconds(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("format expired expiry");
+        let overlong = (time::OffsetDateTime::now_utc()
+            + time::Duration::seconds(
+                i64::try_from(protocol::MAX_IDENTITY_CLAIM_TTL_SECS).expect("TTL fits i64") + 1,
+            ))
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("format overlong expiry");
+
+        assert!(valid_identity_expiry(&valid));
+        assert!(!valid_identity_expiry(&expired));
+        assert!(!valid_identity_expiry(&overlong));
+        assert!(!valid_identity_expiry("not-a-timestamp"));
+    }
+
+    #[test]
+    fn released_identity_sequence_rejects_late_reports_and_allows_reassertion() {
+        let mut journal = JournalRecord::bootstrap(
+            "s-identity".to_owned(),
+            "worker-identity".to_owned(),
+            10,
+            "100".to_owned(),
+            (80, 24),
+            "2026-08-04T00:00:00Z".to_owned(),
+        );
+        journal.active_identity_release = Some(ReleasedIdentity {
+            provider: "claude".to_owned(),
+            process: ChildIdentity {
+                pid: 11,
+                process_group: 11,
+                start_identity: "110".to_owned(),
+            },
+            sequence: 8,
+        });
+
+        assert!(!identity_sequence_is_fresh(&journal, 7));
+        assert!(!identity_sequence_is_fresh(&journal, 8));
+        assert!(identity_sequence_is_fresh(&journal, 9));
+    }
+
+    #[tokio::test]
+    async fn root_exit_wakes_observation_while_a_descendant_holds_the_slave_pty() {
+        let config = crate::WorkerConfig::new();
+        let pty = crate::PtyOwner::spawn(
+            crate::Command {
+                program: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "(trap '' HUP; sleep 30) & printf 'descendant:%s\\n' \"$!\"; sleep 1"
+                        .to_owned(),
+                ],
+                env: Vec::new(),
+                cwd: std::env::temp_dir(),
+                cols: 80,
+                rows: 24,
+            },
+            config.history_bytes,
+            config.subscriber_bytes,
+            config.input_dedup_entries,
+        )
+        .expect("spawn PTY");
+
+        tokio::time::timeout(Duration::from_secs(3), wait_runtime_exit(&pty))
+            .await
+            .expect("root process exit deadline")
+            .expect("root process exit");
+        let page = pty.output().observe(None, 1_024).expect("output page");
+        assert!(page.exited, "root exit must be authoritative for output");
+        let rendered = String::from_utf8_lossy(&page.bytes);
+        let descendant = rendered
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("descendant:"))
+            .and_then(|pid| pid.parse::<i32>().ok())
+            .expect("descendant PID in PTY output");
+        let descendant = Pid::from_raw(descendant);
+        assert!(
+            kill(descendant, None).is_ok(),
+            "descendant must still hold the slave PTY when the root exits"
+        );
+        let _ = kill(descendant, Signal::SIGKILL);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            pty.stop("cleanup-descendant", Duration::from_millis(100)),
+        )
+        .await
+        .expect("descendant cleanup deadline")
+        .expect("descendant cleanup");
+    }
 
     #[test]
     fn proc_stat_parser_handles_spaces_and_parentheses_in_name() {
@@ -2421,10 +3197,462 @@ mod tests {
 
         let mut previous = Connection::new(1, 1);
         previous.selected_version = Some(PREVIOUS_VERSION);
-        validate_data_start(&previous, StreamMode::Attach, None, None)
-            .expect("previous protocol keeps its legacy attach shape");
+        previous.capabilities.push(Capability::AttachSnapshot);
+        validate_data_start(&previous, StreamMode::Attach, None, Some(&attach))
+            .expect("previous protocol preserves the established snapshot attach shape");
+        previous.capabilities.clear();
         assert!(validate_data_start(&previous, StreamMode::Attach, None, Some(&attach)).is_err());
         assert!(validate_data_start(&current, StreamMode::Detector, None, Some(&attach)).is_err());
+    }
+
+    #[test]
+    fn observation_capability_starts_at_private_version_four() {
+        assert!(capabilities(CURRENT_VERSION).contains(&Capability::ControlPlaneObservation));
+        assert!(!capabilities(PREVIOUS_VERSION).contains(&Capability::ControlPlaneObservation));
+        assert!(capabilities(PREVIOUS_VERSION).contains(&Capability::AttachSnapshot));
+    }
+
+    fn data_grant(
+        owner: crate::LeaseOwner,
+        lease_id: LeaseId,
+        lease_epoch: u64,
+        version: Version,
+    ) -> DataGrant {
+        DataGrant {
+            lease_owner: owner,
+            lease_id,
+            lease_epoch,
+            version,
+            expires_at_ms: 100,
+            runtime_id: RuntimeId::new("runtime-token").expect("runtime id"),
+            stream_id: StreamId::new("stream-token").expect("stream id"),
+            mode: StreamMode::Detector,
+            after_offset: None,
+            attach: None,
+            observation: None,
+        }
+    }
+
+    fn insert_grant(tokens: &mut TokenState, token: DataToken, grant: DataGrant) {
+        tokens.insert(token, grant, 0).expect("insert token");
+    }
+
+    fn open_header(grant: &DataGrant, token: DataToken, version: Version) -> FrameHeader {
+        FrameHeader {
+            version,
+            stream_id: grant.stream_id.clone(),
+            runtime_id: grant.runtime_id.clone(),
+            kind: FrameKind::Open {
+                token,
+                mode: grant.mode,
+                after_offset: grant.after_offset,
+                attach: grant.attach.clone(),
+            },
+        }
+    }
+
+    #[test]
+    fn data_token_redemption_rejects_a_released_lease_generation() {
+        let leases = crate::ControllerLease::new();
+        let first_owner = crate::LeaseOwner {
+            daemon_id: "daemon-first".to_owned(),
+            peer_pid: 10,
+            peer_start_identity: "start-first".to_owned(),
+        };
+        let first_lease = LeaseId::new("lease-first").expect("lease id");
+        leases
+            .acquire(first_owner.clone(), first_lease.to_string())
+            .expect("first lease");
+        let stale = data_grant(first_owner.clone(), first_lease.clone(), 0, CURRENT_VERSION);
+        let stale_token = DataToken::new("token-stale").expect("token");
+        let stale_header = open_header(&stale, stale_token.clone(), CURRENT_VERSION);
+        let tokens = std::sync::Mutex::new(TokenState::new());
+        insert_grant(
+            &mut tokens.lock().expect("token lock"),
+            stale_token.clone(),
+            stale,
+        );
+
+        leases.release_connection(&first_owner);
+        let next_owner = crate::LeaseOwner {
+            daemon_id: "daemon-next".to_owned(),
+            peer_pid: 11,
+            peer_start_identity: "start-next".to_owned(),
+        };
+        let next_lease = LeaseId::new("lease-next").expect("lease id");
+        leases
+            .acquire(next_owner.clone(), next_lease.to_string())
+            .expect("replacement lease");
+        redeem_data_grant(
+            &tokens,
+            &leases,
+            1,
+            1,
+            &stale_token,
+            &stale_header,
+            StreamMode::Detector,
+            None,
+            None,
+        )
+        .expect_err("stale lease token");
+        assert_eq!(tokens.lock().expect("token lock").len(), 0);
+    }
+
+    #[test]
+    fn abandoned_expired_grant_releases_the_single_vault_capacity() {
+        let owner = crate::LeaseOwner {
+            daemon_id: "daemon-capacity".to_owned(),
+            peer_pid: 13,
+            peer_start_identity: "start-capacity".to_owned(),
+        };
+        let lease_id = LeaseId::new("lease-capacity").expect("lease id");
+        let mut abandoned = data_grant(owner.clone(), lease_id.clone(), 0, CURRENT_VERSION);
+        abandoned.expires_at_ms = 10;
+        let mut tokens = TokenState::with_maximum(1).expect("bounded token state");
+        tokens
+            .insert(
+                DataToken::new("token-abandoned").expect("token"),
+                abandoned,
+                0,
+            )
+            .expect("issue abandoned token");
+
+        let mut replacement = data_grant(owner, lease_id, 0, CURRENT_VERSION);
+        replacement.expires_at_ms = 20;
+        let replacement_token = DataToken::new("token-replacement").expect("token");
+        let full = tokens
+            .insert(replacement_token.clone(), replacement.clone(), 9)
+            .expect_err("live abandoned token occupies capacity");
+        assert_eq!(full, super::TokenStateError::Full { maximum: 1 });
+
+        tokens
+            .insert(replacement_token, replacement, 10)
+            .expect("expired orphan is purged before replacement issue");
+        assert_eq!(tokens.len(), 1);
+    }
+
+    #[test]
+    fn data_token_redemption_enforces_version_one_shot_and_validity() {
+        let leases = crate::ControllerLease::new();
+        let owner = crate::LeaseOwner {
+            daemon_id: "daemon-current".to_owned(),
+            peer_pid: 12,
+            peer_start_identity: "start-current".to_owned(),
+        };
+        let lease_id = LeaseId::new("lease-current").expect("lease id");
+        leases
+            .acquire(owner.clone(), lease_id.to_string())
+            .expect("current lease");
+        let current = data_grant(owner, lease_id, 0, CURRENT_VERSION);
+        let current_token = DataToken::new("token-current").expect("token");
+        let wrong_version = open_header(&current, current_token.clone(), PREVIOUS_VERSION);
+        let tokens = std::sync::Mutex::new(TokenState::new());
+        insert_grant(
+            &mut tokens.lock().expect("token lock"),
+            current_token.clone(),
+            current.clone(),
+        );
+        redeem_data_grant(
+            &tokens,
+            &leases,
+            0,
+            1,
+            &current_token,
+            &wrong_version,
+            StreamMode::Detector,
+            None,
+            None,
+        )
+        .expect_err("v3 header for v4 grant");
+        assert_eq!(tokens.lock().expect("token lock").len(), 0);
+
+        let valid_token = DataToken::new("token-valid").expect("token");
+        insert_grant(
+            &mut tokens.lock().expect("token lock"),
+            valid_token.clone(),
+            current.clone(),
+        );
+        let current_header = open_header(&current, valid_token.clone(), CURRENT_VERSION);
+        redeem_data_grant(
+            &tokens,
+            &leases,
+            0,
+            1,
+            &valid_token,
+            &current_header,
+            StreamMode::Detector,
+            None,
+            None,
+        )
+        .expect("matching token");
+        redeem_data_grant(
+            &tokens,
+            &leases,
+            0,
+            1,
+            &valid_token,
+            &current_header,
+            StreamMode::Detector,
+            None,
+            None,
+        )
+        .expect_err("one-shot token reuse");
+        let unknown = DataToken::new("token-unknown").expect("token");
+        let unknown_header = open_header(&current, unknown.clone(), CURRENT_VERSION);
+        redeem_data_grant(
+            &tokens,
+            &leases,
+            0,
+            1,
+            &unknown,
+            &unknown_header,
+            StreamMode::Detector,
+            None,
+            None,
+        )
+        .expect_err("unknown token");
+    }
+
+    #[tokio::test]
+    async fn terminal_snapshot_dimension_and_full_response_bounds_are_exact() {
+        let snapshot = WireTerminalSnapshot {
+            watermark: 42,
+            dimensions: Dimensions::new(10, 2).expect("valid dimensions"),
+            cursor: Cursor {
+                column: 1,
+                row: 1,
+                visible: true,
+            },
+            alternate_screen: true,
+            title: Some("Unicode 界".to_owned()),
+            progress: Some("50%".to_owned()),
+            visible_lines: vec!["wide 界".to_owned(), "lossy �".to_owned()],
+        };
+        let response = ControlResponse {
+            request_id: RequestId::new("snapshot-boundary").expect("request id"),
+            kind: ResponseKind::TerminalSnapshot {
+                runtime_id: RuntimeId::new("runtime-snapshot").expect("runtime id"),
+                snapshot: Box::new(snapshot.clone()),
+            },
+        };
+        let serialized = serde_json::to_vec(&response)
+            .expect("serialize response")
+            .len();
+        let exact = crate::WorkerConfig {
+            max_snapshot_rows: 2,
+            max_snapshot_columns: 10,
+            max_snapshot_bytes: serialized,
+            control_line_bytes: serialized,
+            ..crate::WorkerConfig::new()
+        };
+        validate_terminal_snapshot_dimensions(&snapshot, &exact).expect("exact dimensions");
+        validate_terminal_snapshot_response(&response, &exact).expect("exact response bound");
+
+        let (writer, _reader) = tokio::io::duplex(serialized + 1);
+        let mut exact_writer =
+            protocol::ControlWriter::with_maximum(writer, serialized).expect("exact writer limit");
+        exact_writer
+            .write(&ControlMessage::Response(response.clone()))
+            .await
+            .expect("actual writer accepts exact response");
+
+        let row_over = crate::WorkerConfig {
+            max_snapshot_rows: 1,
+            ..exact.clone()
+        };
+        let error = validate_terminal_snapshot_dimensions(&snapshot, &row_over)
+            .expect_err("row above configured maximum");
+        assert_eq!(error.code, ControlCode::ObservationLimitExceeded);
+        assert!(!error.message.contains("Unicode"));
+
+        let column_over = crate::WorkerConfig {
+            max_snapshot_columns: 9,
+            ..exact.clone()
+        };
+        let error = validate_terminal_snapshot_dimensions(&snapshot, &column_over)
+            .expect_err("column above configured maximum");
+        assert_eq!(error.code, ControlCode::ObservationLimitExceeded);
+
+        let mut oversized = response.clone();
+        let ResponseKind::TerminalSnapshot { snapshot, .. } = &mut oversized.kind else {
+            panic!("terminal response");
+        };
+        snapshot.title = Some(format!(
+            "{}x",
+            snapshot.title.as_deref().unwrap_or_default()
+        ));
+        assert_eq!(
+            serde_json::to_vec(&oversized)
+                .expect("serialize oversized response")
+                .len(),
+            serialized + 1
+        );
+        let serialized_over = crate::WorkerConfig {
+            max_snapshot_bytes: serialized,
+            ..exact.clone()
+        };
+        let error = validate_terminal_snapshot_response(&oversized, &serialized_over)
+            .expect_err("serialized size above configured maximum");
+        assert_eq!(error.code, ControlCode::ObservationLimitExceeded);
+        assert!(!error.message.contains("Unicode"));
+
+        let (writer, _reader) = tokio::io::duplex(serialized + 2);
+        let mut bounded_writer =
+            protocol::ControlWriter::with_maximum(writer, serialized).expect("bounded writer");
+        let writer_error = bounded_writer
+            .write(&ControlMessage::Response(oversized))
+            .await
+            .expect_err("actual writer rejects response above limit");
+        assert!(matches!(
+            writer_error,
+            protocol::ControlCodecError::LineTooLong { .. }
+        ));
+    }
+
+    #[test]
+    fn observation_request_wait_and_byte_bounds_are_exact() {
+        let config = crate::WorkerConfig {
+            history_bytes: 1_024,
+            max_observation_wait: Duration::from_millis(250),
+            ..crate::WorkerConfig::new()
+        };
+        assert_eq!(
+            validate_observation_request(1_024, 250, &config).expect("exact observation limits"),
+            (1_024, Duration::from_millis(250))
+        );
+        let bytes = validate_observation_request(1_025, 250, &config)
+            .expect_err("byte limit above maximum");
+        assert_eq!(bytes.code, ControlCode::ObservationLimitExceeded);
+        let wait = validate_observation_request(1_024, 251, &config)
+            .expect_err("wait limit above maximum");
+        assert_eq!(wait.code, ControlCode::ObservationLimitExceeded);
+    }
+
+    #[test]
+    fn timeout_is_derived_from_the_final_observation_page() {
+        let page = crate::ObservationPage {
+            history_start_offset: 0,
+            start_offset: 10,
+            next_offset: 10,
+            runtime_end_offset: 10,
+            bytes: Vec::new(),
+            gap: None,
+            has_more: false,
+            exited: false,
+        };
+        assert!(observation_timed_out(Some(10), &page));
+
+        let with_output = crate::ObservationPage {
+            start_offset: 10,
+            next_offset: 11,
+            runtime_end_offset: 11,
+            bytes: vec![b'x'],
+            ..page.clone()
+        };
+        assert!(!observation_timed_out(Some(10), &with_output));
+
+        let exited = crate::ObservationPage {
+            exited: true,
+            ..page
+        };
+        assert!(!observation_timed_out(Some(10), &exited));
+    }
+
+    #[tokio::test]
+    async fn waiting_observation_releases_on_disconnect_lease_and_shutdown() {
+        let output = crate::OutputHub::new(64, 64, 2, 10).expect("output hub");
+        let shutdown = CancellationToken::new();
+
+        let (mut disconnected_reader, disconnected_writer) = tokio::io::duplex(64);
+        drop(disconnected_writer);
+        let (_lease_tx, mut lease_rx) = watch::channel(0_u64);
+        let disconnected = tokio::time::timeout(
+            Duration::from_millis(100),
+            await_observation_page(
+                &output,
+                Some(0),
+                ObservationGrant {
+                    max_bytes: 64,
+                    wait: Duration::from_secs(10),
+                },
+                &shutdown,
+                0,
+                &mut lease_rx,
+                &mut disconnected_reader,
+            ),
+        )
+        .await
+        .expect("disconnect releases promptly")
+        .expect("wait result");
+        assert_eq!(disconnected, ObservationWaitOutcome::Disconnected);
+
+        let released_output = crate::OutputHub::new(64, 64, 2, 10).expect("released output");
+        released_output
+            .push(b"must-not-cross-lease-death")
+            .expect("retained output");
+        let (mut lease_reader, _lease_writer) = tokio::io::duplex(64);
+        let (lease_tx, mut lease_rx) = watch::channel(0_u64);
+        // The receiver is registered before redemption. Releasing here models
+        // the exact handoff gap before observation wait registration.
+        lease_tx.send_replace(1);
+        let released = await_observation_page(
+            &released_output,
+            Some(0),
+            ObservationGrant {
+                max_bytes: 64,
+                wait: Duration::from_secs(10),
+            },
+            &shutdown,
+            0,
+            &mut lease_rx,
+            &mut lease_reader,
+        )
+        .await
+        .expect("lease result");
+        assert_eq!(released, ObservationWaitOutcome::LeaseReleased);
+
+        let (mut timeout_reader, _timeout_writer) = tokio::io::duplex(64);
+        let (_lease_tx, mut lease_rx) = watch::channel(0_u64);
+        let timed_out = await_observation_page(
+            &output,
+            Some(0),
+            ObservationGrant {
+                max_bytes: 64,
+                wait: Duration::from_millis(1),
+            },
+            &shutdown,
+            0,
+            &mut lease_rx,
+            &mut timeout_reader,
+        )
+        .await
+        .expect("timeout result");
+        assert!(matches!(
+            timed_out,
+            ObservationWaitOutcome::Page {
+                timed_out: true,
+                ..
+            }
+        ));
+
+        let (mut shutdown_reader, _shutdown_writer) = tokio::io::duplex(64);
+        let (_lease_tx, mut lease_rx) = watch::channel(0_u64);
+        shutdown.cancel();
+        let stopped = await_observation_page(
+            &output,
+            Some(0),
+            ObservationGrant {
+                max_bytes: 64,
+                wait: Duration::from_secs(10),
+            },
+            &shutdown,
+            0,
+            &mut lease_rx,
+            &mut shutdown_reader,
+        )
+        .await
+        .expect("shutdown result");
+        assert_eq!(stopped, ObservationWaitOutcome::Shutdown);
     }
 
     #[tokio::test]
@@ -2512,6 +3740,83 @@ mod tests {
         }
 
         assert_eq!(replay, payload);
+    }
+
+    #[tokio::test]
+    async fn observation_page_uses_exact_contiguous_multi_frame_replay() {
+        let payload = (0..MAX_DATA_PAYLOAD_BYTES + OVERSIZED_PAYLOAD_EXTRA)
+            .map(|index| u8::try_from(index % 251).expect("value fits u8"))
+            .collect::<Vec<_>>();
+        let stream_id = StreamId::new("observation-1").expect("valid stream");
+        let runtime_id = RuntimeId::new("runtime-1").expect("valid runtime");
+        let (mut reader, mut writer) = tokio::io::duplex(payload.len() * 2);
+        let end = u64::try_from(payload.len()).expect("payload fits u64");
+
+        write_observation_page(
+            &mut writer,
+            CURRENT_VERSION,
+            &stream_id,
+            &runtime_id,
+            MAX_DATA_PAYLOAD_BYTES,
+            crate::ObservationPage {
+                history_start_offset: 0,
+                start_offset: 0,
+                next_offset: end,
+                runtime_end_offset: end,
+                bytes: payload.clone(),
+                gap: None,
+                has_more: false,
+                exited: false,
+            },
+            false,
+        )
+        .await
+        .expect("write observation page");
+
+        let start = protocol::read_frame(&mut reader)
+            .await
+            .expect("read metadata")
+            .expect("metadata frame");
+        assert!(matches!(
+            start.header().kind,
+            FrameKind::ObservationStart {
+                start_offset: 0,
+                next_offset,
+                timed_out: false,
+                ..
+            } if next_offset == end
+        ));
+        let mut bytes = Vec::with_capacity(payload.len());
+        let mut offset = 0_u64;
+        let mut frame_lengths = Vec::new();
+        while bytes.len() < payload.len() {
+            let frame = protocol::read_frame(&mut reader)
+                .await
+                .expect("read payload")
+                .expect("payload frame");
+            assert!(
+                matches!(frame.header().kind, FrameKind::Replay { offset: actual } if actual == offset)
+            );
+            assert!(frame.payload().len() <= MAX_DATA_PAYLOAD_BYTES);
+            frame_lengths.push(frame.payload().len());
+            offset += u64::try_from(frame.payload().len()).expect("frame length fits u64");
+            bytes.extend_from_slice(frame.payload());
+        }
+        let close = protocol::read_frame(&mut reader)
+            .await
+            .expect("read close")
+            .expect("close frame");
+        assert_eq!(
+            close.header().kind,
+            FrameKind::Close {
+                reason: protocol::CloseReason::ObservationComplete
+            }
+        );
+        assert_eq!(
+            frame_lengths,
+            vec![MAX_DATA_PAYLOAD_BYTES, OVERSIZED_PAYLOAD_EXTRA]
+        );
+        assert_eq!(bytes, payload);
     }
 
     #[tokio::test]

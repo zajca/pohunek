@@ -250,7 +250,7 @@ impl ProjectorState {
         attention: &AttentionCoordinator,
         event: &Event,
     ) -> Vec<PendingNotification> {
-        match event.event.as_str() {
+        match event.event() {
             event::AGENT_STATE => {
                 if let Some(payload) = parse_projector_payload::<AgentStatePayload>(event) {
                     return self
@@ -604,11 +604,11 @@ fn parse_projector_payload<T>(event: &Event) -> Option<T>
 where
     T: DeserializeOwned,
 {
-    match serde_json::from_value(event.payload.clone()) {
+    match serde_json::from_value(event.payload().clone()) {
         Ok(payload) => Some(payload),
         Err(err) => {
             warn!(
-                event = %event.event,
+                event = %event.event(),
                 error = %err,
                 "failed to parse session event for notification projector"
             );
@@ -618,7 +618,10 @@ where
 }
 
 fn session_agent_kind(session: &SessionInfo) -> AgentKind {
-    session.active_agent_base.unwrap_or(session.agent_base)
+    session
+        .active_agent_base
+        .clone()
+        .unwrap_or_else(|| session.agent_base.clone())
 }
 
 #[cfg(test)]
@@ -653,7 +656,7 @@ mod tests {
     /// Advance the paused clock past the default debounce window to force a flush.
     async fn advance_past_debounce() {
         tokio::time::advance(std::time::Duration::from_secs(
-            DEFAULT_ATTENTION_DEBOUNCE_SECS + 1,
+            u64::from(DEFAULT_ATTENTION_DEBOUNCE_SECS) + 1,
         ))
         .await;
     }
@@ -684,7 +687,7 @@ mod tests {
     }
 
     fn agent_state_event(session_id: &str, activity: AgentActivity) -> Event {
-        Event::new(
+        crate::events::event(
             event::AGENT_STATE,
             json!({
                 "session_id": session_id,
@@ -695,7 +698,7 @@ mod tests {
     }
 
     fn session_event(event_name: &str, info: &SessionInfo) -> Event {
-        Event::new(event_name, json!({ "session": info }))
+        crate::events::event(event_name, json!({ "session": info }))
     }
 
     fn session_info(session_id: &str, state: SessionState, exit_code: Option<i32>) -> SessionInfo {
@@ -732,6 +735,7 @@ mod tests {
             created_at: "2026-07-03T10:00:00Z".to_owned(),
             updated_at: "2026-07-03T10:01:00Z".to_owned(),
             exit_code,
+            capabilities: protocol::SessionCapabilities::default(),
         }
     }
 
@@ -741,8 +745,7 @@ mod tests {
             session_finished: true,
             ..policy.enabled
         };
-        policy.codex = None;
-        policy.claude = None;
+        policy.providers.clear();
         service.set_policy(policy).expect("set notification policy");
     }
 
@@ -752,8 +755,7 @@ mod tests {
             turn_completed: true,
             ..policy.enabled
         };
-        policy.codex = None;
-        policy.claude = None;
+        policy.providers.clear();
         service.set_policy(policy).expect("set notification policy");
     }
 

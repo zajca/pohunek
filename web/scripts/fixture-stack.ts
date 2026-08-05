@@ -18,6 +18,9 @@ export const FIXTURE_LOCAL_SESSION_ID = "s-local-seed";
 export const FIXTURE_PEER_SESSION_ID = "s-peer-seed";
 export const FIXTURE_NOTIFICATION_ID = "n-local-seed";
 export const FIXTURE_EXTERNAL_SESSION_ID = "s-external-seed";
+export const FIXTURE_UNKNOWN_ACTIVE_SESSION_ID = "s-unknown-active-seed";
+export const FIXTURE_UNKNOWN_PERSISTED_SESSION_ID = "s-unknown-persisted-seed";
+export const FIXTURE_LEGACY_BASELESS_SESSION_ID = "s-legacy-baseless-seed";
 export const FIXTURE_PROJECT_ID = "p-local-seed";
 export const FIXTURE_OWNED_WORKTREE_PATH = "/tmp/pohunek-testkit/local-worktree";
 
@@ -72,7 +75,13 @@ export async function startFixtureStack(options: FixtureStackOptions = {}): Prom
       },
       daemonVersion: FIXTURE_LOCAL_DAEMON_VERSION,
       host: { discoveredHosts: [peerHostRecord()] },
-      initialSessions: [localSession(), externalSession()],
+      initialSessions: [
+        localSession(),
+        externalSession(),
+        unknownActiveSession(),
+        unknownPersistedSession(),
+        legacyBaselessSession(),
+      ],
       initialNotifications: [localNotification()],
       initialProjects: [localProject()],
     });
@@ -120,6 +129,7 @@ function peerHostRecord(): HostRecord {
 function localSession(): SessionInfo {
   return {
     id: FIXTURE_LOCAL_SESSION_ID,
+    capabilities: { resume: true, fork: true },
     name: "Local coding session",
     agent: "codex",
     agent_base: "codex",
@@ -139,6 +149,7 @@ function localSession(): SessionInfo {
 function peerSession(): SessionInfo {
   return {
     id: FIXTURE_PEER_SESSION_ID,
+    capabilities: { resume: false, fork: false },
     name: "Peer shell session",
     agent: "shell",
     agent_base: "shell",
@@ -163,6 +174,43 @@ function externalSession(): SessionInfo {
     external: true,
     pid: FIXTURE_LOCAL_PID + 2,
   };
+}
+
+function unknownActiveSession(): SessionInfo {
+  return {
+    ...localSession(),
+    id: FIXTURE_UNKNOWN_ACTIVE_SESSION_ID,
+    name: "Unknown active agent session",
+    active_agent: "future-profile",
+    active_agent_base: "future-agent",
+    pid: FIXTURE_LOCAL_PID + 3,
+    updated_at: "2026-07-22T11:59:00Z",
+  };
+}
+
+function unknownPersistedSession(): SessionInfo {
+  return {
+    ...localSession(),
+    id: FIXTURE_UNKNOWN_PERSISTED_SESSION_ID,
+    name: "Unknown persisted agent session",
+    agent: "future-profile",
+    agent_base: "future-agent",
+    pid: FIXTURE_LOCAL_PID + 4,
+    updated_at: "2026-07-22T11:58:00Z",
+  };
+}
+
+function legacyBaselessSession(): SessionInfo {
+  const session = {
+    ...localSession(),
+    id: FIXTURE_LEGACY_BASELESS_SESSION_ID,
+    name: "Legacy baseless profile session",
+    agent: "legacy-profile",
+    pid: FIXTURE_LOCAL_PID + 5,
+    updated_at: "2026-07-22T11:57:00Z",
+  };
+  delete (session as Partial<SessionInfo>).agent_base;
+  return session;
 }
 
 function localProject(): FixtureProject {

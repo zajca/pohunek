@@ -10,7 +10,7 @@ use pohunek_client::protocol::{
 };
 use pohunek_client::{next_request_id, Client, ClientError, ClientOptions};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -91,6 +91,429 @@ async fn request_response_connect_tcp_addr_sends_json_request_line_and_returns_o
     assert_sent_request(&request_line);
 }
 
+#[tokio::test]
+async fn request_response_rejects_a_response_outside_the_selected_protocol_range() {
+    let legacy_response = json!({
+        "v": 1,
+        "id": "req-request-response",
+        "ok": { "status": "ok" },
+    });
+    let (result, _) = run_local(Reply::Line(legacy_response.to_string())).await;
+
+    match result.expect_err("wrong response version must fail") {
+        ClientError::Protocol(source) => assert_eq!(source.code, "version_mismatch"),
+        other => panic!("expected canonical protocol mismatch, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn remote_wrong_version_success_preserves_host_and_canonical_mismatch() {
+    let response = json!({
+        "v": 1,
+        "id": "req-request-response",
+        "ok": { "status": "ok" },
+    });
+    let (result, _) = run_remote(Reply::Line(response.to_string())).await;
+
+    let error = result.expect_err("wrong remote response version must fail");
+    match &error {
+        ClientError::RemoteProtocol { host, source } => {
+            assert_eq!(host, HOST);
+            assert_eq!(source.code, "version_mismatch");
+            assert!(source.msg.contains("2..=2"));
+            assert!(source.msg.contains("1..=1"));
+        }
+        other => panic!("expected remote protocol mismatch, got {other:?}"),
+    }
+    assert_eq!(error.to_protocol_error().code, "version_mismatch");
+}
+
+#[tokio::test]
+async fn remote_wrong_version_noncanonical_error_becomes_canonical_mismatch() {
+    let response = json!({
+        "v": 1,
+        "id": "req-request-response",
+        "err": {
+            "class": "daemon",
+            "code": "bad_request",
+            "msg": "legacy error",
+        },
+    });
+    let (result, _) = run_remote(Reply::Line(response.to_string())).await;
+
+    match result.expect_err("wrong remote error version must fail") {
+        ClientError::RemoteProtocol { host, source } => {
+            assert_eq!(host, HOST);
+            assert_eq!(source.code, "version_mismatch");
+            assert!(source.msg.contains("2..=2"));
+            assert!(source.msg.contains("1..=1"));
+        }
+        other => panic!("expected remote protocol mismatch, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn canonical_negotiation_mismatch_is_not_masked_by_response_version_validation() {
+    let legacy = protocol::ProtocolVersion::new(1).expect("nonzero legacy version");
+    let legacy_range =
+        protocol::ProtocolVersionRange::new(legacy, legacy).expect("valid exact legacy range");
+    let source =
+        ProtocolError::version_mismatch(protocol::SUPPORTED_PROTOCOL_VERSIONS, legacy_range);
+    let response = Response::err(legacy, test_request().id(), source.clone())
+        .expect("valid canonical mismatch response");
+    let line = serde_json::to_string(&response).expect("serialize canonical mismatch");
+
+    let (local, _) = run_local(Reply::Line(line.clone())).await;
+    match local.expect_err("local mismatch must fail") {
+        ClientError::Protocol(error) => assert_eq!(error, source),
+        other => panic!("expected canonical local protocol error, got {other:?}"),
+    }
+
+    let (remote, _) = run_remote(Reply::Line(line)).await;
+    match remote.expect_err("remote mismatch must fail") {
+        ClientError::RemoteProtocol {
+            host,
+            source: error,
+        } => {
+            assert_eq!(host, HOST);
+            assert_eq!(error, source);
+        }
+        other => panic!("expected canonical remote protocol error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the test keeps both accepted connections and their wire assertions adjacent"
+)]
+async fn waiting_output_uses_a_dedicated_connection() {
+    let socket_path = unique_socket_path();
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).expect("bind unix daemon");
+    let socket_file = SocketFile(socket_path.clone());
+
+    let task = tokio::spawn(async move {
+        let (first, _) = listener.accept().await.expect("accept primary connection");
+        let mut first = BufReader::new(first);
+        let mut first_line = String::new();
+        first
+            .read_line(&mut first_line)
+            .await
+            .expect("read primary request");
+        let first_request: Request =
+            serde_json::from_str(trim_line_end(&first_line)).expect("parse primary request");
+        let health = Response::ok(
+            protocol::PROTOCOL_VERSION,
+            first_request.id(),
+            json!({
+                "status": "ok",
+                "daemon_version": "test",
+                "protocol_version": protocol::PROTOCOL_VERSION.get(),
+            }),
+        )
+        .expect("create health response");
+        first
+            .get_mut()
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&health).expect("serialize health")
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write health response");
+
+        let (second, _) = listener
+            .accept()
+            .await
+            .expect("accept dedicated connection");
+        let mut second = BufReader::new(second);
+        let mut second_line = String::new();
+        second
+            .read_line(&mut second_line)
+            .await
+            .expect("read waiting output request");
+        let second_request: Request = serde_json::from_str(trim_line_end(&second_line))
+            .expect("parse waiting output request");
+        let runtime =
+            protocol::SessionRuntimeIdentity::new("runtime-1", protocol::RuntimeGeneration::new(1))
+                .expect("valid runtime identity");
+        let output = protocol::SessionOutputResult::new(
+            protocol::SessionId("s-1".to_owned()),
+            runtime,
+            protocol::OutputOffset::new(0),
+            protocol::OutputOffset::new(0),
+            protocol::OutputOffset::new(0),
+            protocol::OutputOffset::new(0),
+            "",
+            None,
+            false,
+            true,
+        )
+        .expect("valid empty output result");
+        let response = Response::ok(
+            protocol::PROTOCOL_VERSION,
+            second_request.id(),
+            serde_json::to_value(output).expect("serialize output"),
+        )
+        .expect("create output response");
+        second
+            .get_mut()
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&response).expect("serialize output")
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write output response");
+
+        (first_request, second_request)
+    });
+
+    let mut client = Client::connect_local(&socket_path)
+        .await
+        .expect("connect test daemon");
+    client.handshake().await.expect("negotiate protocol");
+    let runtime =
+        protocol::SessionRuntimeIdentity::new("runtime-1", protocol::RuntimeGeneration::new(1))
+            .expect("valid runtime identity");
+    let params = protocol::SessionOutputParams::new(
+        protocol::SessionId("s-1".to_owned()),
+        Some(runtime),
+        Some(protocol::OutputOffset::new(0)),
+        1,
+        Some(1),
+    )
+    .expect("valid waiting output params");
+    let output = client
+        .session_output(params)
+        .await
+        .expect("waiting output succeeds");
+
+    assert!(output.timed_out());
+    let (first_request, second_request) = task.await.expect("daemon task completed");
+    assert_eq!(first_request.method(), protocol::method::DAEMON_HEALTH);
+    assert_eq!(second_request.method(), protocol::method::SESSION_OUTPUT);
+    drop(socket_file);
+}
+
+#[tokio::test]
+async fn waiting_output_uses_a_dedicated_remote_tcp_connection() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind tcp daemon");
+    let addr = listener.local_addr().expect("read tcp daemon address");
+    let task = tokio::spawn(async move {
+        let (first, _) = listener
+            .accept()
+            .await
+            .expect("accept primary tcp connection");
+        let mut first = BufReader::new(first);
+        let mut first_line = String::new();
+        first
+            .read_line(&mut first_line)
+            .await
+            .expect("read handshake");
+        let handshake: Request =
+            serde_json::from_str(trim_line_end(&first_line)).expect("parse handshake");
+        write_health_reply(first.get_mut(), handshake.id()).await;
+
+        let (second, _) = listener
+            .accept()
+            .await
+            .expect("accept dedicated tcp connection");
+        let mut second = BufReader::new(second);
+        let mut second_line = String::new();
+        second
+            .read_line(&mut second_line)
+            .await
+            .expect("read waiting output");
+        let output_request: Request =
+            serde_json::from_str(trim_line_end(&second_line)).expect("parse waiting output");
+        let output = empty_output_result();
+        let response = Response::ok(
+            protocol::PROTOCOL_VERSION,
+            output_request.id(),
+            serde_json::to_value(output).expect("serialize output"),
+        )
+        .expect("create output response");
+        second
+            .get_mut()
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&response).expect("serialize response")
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write output response");
+        (handshake, output_request)
+    });
+
+    let mut client = Client::connect_tcp_addr(HOST, addr)
+        .await
+        .expect("connect tcp daemon");
+    client.handshake().await.expect("negotiate protocol");
+    assert!(client
+        .session_output(waiting_output_params())
+        .await
+        .expect("waiting output succeeds")
+        .timed_out());
+    let (handshake, output) = task.await.expect("daemon task completed");
+    assert_eq!(handshake.method(), protocol::method::DAEMON_HEALTH);
+    assert_eq!(output.method(), protocol::method::SESSION_OUTPUT);
+}
+
+#[tokio::test]
+async fn cancelling_session_wait_keeps_the_shared_connection_usable() {
+    let socket_path = unique_socket_path();
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).expect("bind unix daemon");
+    let socket_file = SocketFile(socket_path.clone());
+
+    let task = tokio::spawn(async move {
+        let (first, _) = listener.accept().await.expect("accept primary connection");
+        let mut first = BufReader::new(first);
+        let mut first_line = String::new();
+        first
+            .read_line(&mut first_line)
+            .await
+            .expect("read handshake request");
+        let handshake: Request =
+            serde_json::from_str(trim_line_end(&first_line)).expect("parse handshake request");
+        write_health_reply(first.get_mut(), handshake.id()).await;
+
+        let (second, _) = listener
+            .accept()
+            .await
+            .expect("accept dedicated connection");
+        let mut second = BufReader::new(second);
+        let mut second_line = String::new();
+        second
+            .read_line(&mut second_line)
+            .await
+            .expect("read waiting output request");
+        let waiting: Request = serde_json::from_str(trim_line_end(&second_line))
+            .expect("parse waiting output request");
+        assert_eq!(waiting.method(), protocol::method::SESSION_WAIT);
+
+        let mut discarded = [0_u8; 1];
+        assert_eq!(
+            second
+                .read(&mut discarded)
+                .await
+                .expect("read cancellation"),
+            0
+        );
+
+        let mut second_primary_line = String::new();
+        first
+            .read_line(&mut second_primary_line)
+            .await
+            .expect("read shared follow-up request");
+        let follow_up: Request = serde_json::from_str(trim_line_end(&second_primary_line))
+            .expect("parse shared follow-up request");
+        write_health_reply(first.get_mut(), follow_up.id()).await;
+        follow_up
+    });
+
+    let mut client = Client::connect_local(&socket_path)
+        .await
+        .expect("connect test daemon");
+    client.handshake().await.expect("negotiate protocol");
+    let params = session_wait_params();
+    tokio::select! {
+        result = client.session_wait(params) => panic!("session wait unexpectedly completed: {result:?}"),
+        () = tokio::time::sleep(Duration::from_millis(10)) => {}
+    }
+
+    client
+        .call::<protocol::method::DaemonHealth>(())
+        .await
+        .expect("shared connection remains usable after cancellation");
+    let follow_up = task.await.expect("daemon task completed");
+    assert_eq!(follow_up.method(), protocol::method::DAEMON_HEALTH);
+    drop(socket_file);
+}
+
+fn waiting_output_params() -> protocol::SessionOutputParams {
+    let runtime =
+        protocol::SessionRuntimeIdentity::new("runtime-1", protocol::RuntimeGeneration::new(1))
+            .expect("valid runtime identity");
+    protocol::SessionOutputParams::new(
+        protocol::SessionId("s-1".to_owned()),
+        Some(runtime),
+        Some(protocol::OutputOffset::new(0)),
+        1,
+        Some(1_000),
+    )
+    .expect("valid waiting output params")
+}
+
+fn empty_output_result() -> protocol::SessionOutputResult {
+    let runtime =
+        protocol::SessionRuntimeIdentity::new("runtime-1", protocol::RuntimeGeneration::new(1))
+            .expect("valid runtime identity");
+    protocol::SessionOutputResult::new(
+        protocol::SessionId("s-1".to_owned()),
+        runtime,
+        protocol::OutputOffset::new(0),
+        protocol::OutputOffset::new(0),
+        protocol::OutputOffset::new(0),
+        protocol::OutputOffset::new(0),
+        "",
+        None,
+        false,
+        true,
+    )
+    .expect("valid empty output result")
+}
+
+fn session_wait_params() -> protocol::SessionWaitParams {
+    protocol::SessionWaitParams::new(
+        protocol::SessionId("s-1".to_owned()),
+        None,
+        Some("2026-08-04T12:00:00Z".to_owned()),
+        None,
+        None,
+        None,
+        None,
+        1_000,
+    )
+    .expect("valid session wait params")
+}
+
+async fn write_health_reply<S>(stream: &mut S, id: &str)
+where
+    S: AsyncWrite + Unpin,
+{
+    let health = Response::ok(
+        protocol::PROTOCOL_VERSION,
+        id,
+        json!({
+            "status": "ok",
+            "daemon_version": "test",
+            "protocol_version": protocol::PROTOCOL_VERSION.get(),
+        }),
+    )
+    .expect("create health response");
+    stream
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::to_string(&health).expect("serialize health response")
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write health response");
+}
+
 #[test]
 fn request_response_client_options_default_timeout_matches_convenience_apis() {
     assert_eq!(
@@ -153,12 +576,12 @@ async fn request_response_typed_call_sends_method_params_and_decodes_output() {
         .expect("test daemon received a request");
     daemon.task.await.expect("test daemon task completed");
     let request: Request = serde_json::from_str(&request_line).expect("parse request");
-    assert_eq!(request.method, protocol::method::HOST_DISCOVER);
-    assert_eq!(request.params, json!({"force": true}));
+    assert_eq!(request.method(), protocol::method::HOST_DISCOVER);
+    assert_eq!(request.params(), &json!({"force": true}));
     assert!(
-        request.id.starts_with("sdk-host.discover-"),
+        request.id().starts_with("sdk-host.discover-"),
         "id: {}",
-        request.id
+        request.id()
     );
 }
 
@@ -208,8 +631,8 @@ async fn request_response_handshake_returns_daemon_protocol_version() {
         .expect("test daemon received a request");
     daemon.task.await.expect("test daemon task completed");
     let request: Request = serde_json::from_str(&request_line).expect("parse request");
-    assert_eq!(request.method, protocol::method::DAEMON_HEALTH);
-    assert_eq!(request.params, Value::Null);
+    assert_eq!(request.method(), protocol::method::DAEMON_HEALTH);
+    assert_eq!(request.params(), &Value::Null);
 }
 
 #[tokio::test]
@@ -458,10 +881,10 @@ async fn request_response_create_notification_sends_method_and_returns_typed_res
 
     assert_eq!(result, expected);
     let sent = parse_sent_request(&daemon.request_line.await.expect("daemon saw request"));
-    assert_eq!(sent.method, protocol::method::NOTIFICATION_CREATE);
+    assert_eq!(sent.method(), protocol::method::NOTIFICATION_CREATE);
     assert_eq!(
-        sent.params,
-        serde_json::to_value(&params).expect("serialize params")
+        sent.params(),
+        &serde_json::to_value(&params).expect("serialize params")
     );
     daemon.task.await.expect("echo daemon completed");
 }
@@ -488,10 +911,10 @@ async fn request_response_list_notifications_sends_method_and_returns_typed_resu
 
     assert_eq!(result, expected);
     let sent = parse_sent_request(&daemon.request_line.await.expect("daemon saw request"));
-    assert_eq!(sent.method, protocol::method::NOTIFICATION_LIST);
+    assert_eq!(sent.method(), protocol::method::NOTIFICATION_LIST);
     assert_eq!(
-        sent.params,
-        serde_json::to_value(&params).expect("serialize params")
+        sent.params(),
+        &serde_json::to_value(&params).expect("serialize params")
     );
     daemon.task.await.expect("echo daemon completed");
 }
@@ -517,10 +940,10 @@ async fn request_response_update_notification_sends_method_and_returns_typed_res
 
     assert_eq!(result, expected);
     let sent = parse_sent_request(&daemon.request_line.await.expect("daemon saw request"));
-    assert_eq!(sent.method, protocol::method::NOTIFICATION_UPDATE);
+    assert_eq!(sent.method(), protocol::method::NOTIFICATION_UPDATE);
     assert_eq!(
-        sent.params,
-        serde_json::to_value(&params).expect("serialize params")
+        sent.params(),
+        &serde_json::to_value(&params).expect("serialize params")
     );
     daemon.task.await.expect("echo daemon completed");
 }
@@ -546,10 +969,10 @@ async fn request_response_delete_notification_sends_method_and_returns_typed_res
 
     assert_eq!(result, expected);
     let sent = parse_sent_request(&daemon.request_line.await.expect("daemon saw request"));
-    assert_eq!(sent.method, protocol::method::NOTIFICATION_DELETE);
+    assert_eq!(sent.method(), protocol::method::NOTIFICATION_DELETE);
     assert_eq!(
-        sent.params,
-        serde_json::to_value(&params).expect("serialize params")
+        sent.params(),
+        &serde_json::to_value(&params).expect("serialize params")
     );
     daemon.task.await.expect("echo daemon completed");
 }
@@ -571,8 +994,8 @@ async fn request_response_get_notification_policy_sends_null_params_and_returns_
 
     assert_eq!(result, expected);
     let sent = parse_sent_request(&daemon.request_line.await.expect("daemon saw request"));
-    assert_eq!(sent.method, protocol::method::NOTIFICATION_POLICY_GET);
-    assert_eq!(sent.params, Value::Null);
+    assert_eq!(sent.method(), protocol::method::NOTIFICATION_POLICY_GET);
+    assert_eq!(sent.params(), &Value::Null);
     daemon.task.await.expect("echo daemon completed");
 }
 
@@ -596,10 +1019,10 @@ async fn request_response_set_notification_policy_sends_method_and_returns_polic
 
     assert_eq!(result, expected);
     let sent = parse_sent_request(&daemon.request_line.await.expect("daemon saw request"));
-    assert_eq!(sent.method, protocol::method::NOTIFICATION_POLICY_SET);
+    assert_eq!(sent.method(), protocol::method::NOTIFICATION_POLICY_SET);
     assert_eq!(
-        sent.params,
-        serde_json::to_value(&params).expect("serialize params")
+        sent.params(),
+        &serde_json::to_value(&params).expect("serialize params")
     );
     daemon.task.await.expect("echo daemon completed");
 }
@@ -628,10 +1051,13 @@ async fn request_response_prune_notifications_sends_method_and_returns_typed_res
 
     assert_eq!(result, expected);
     let sent = parse_sent_request(&daemon.request_line.await.expect("daemon saw request"));
-    assert_eq!(sent.method, protocol::method::NOTIFICATION_RETENTION_PRUNE);
     assert_eq!(
-        sent.params,
-        serde_json::to_value(&params).expect("serialize params")
+        sent.method(),
+        protocol::method::NOTIFICATION_RETENTION_PRUNE
+    );
+    assert_eq!(
+        sent.params(),
+        &serde_json::to_value(&params).expect("serialize params")
     );
     daemon.task.await.expect("echo daemon completed");
 }
@@ -961,6 +1387,7 @@ fn test_request() -> Request {
 
 fn request_with_id(id: &str) -> Request {
     Request::new(id, protocol::method::DAEMON_HEALTH, json!({"ping": true}))
+        .expect("valid test request")
 }
 
 fn ok_payload() -> Value {
@@ -972,11 +1399,18 @@ fn response_ok_line() -> String {
 }
 
 fn response_ok_line_for(request: &Request, ok: Value) -> String {
-    serde_json::to_string(&Response::ok(request.id.clone(), ok)).expect("serialize ok response")
+    serde_json::to_string(
+        &Response::ok(protocol::PROTOCOL_VERSION, request.id(), ok).expect("valid test response"),
+    )
+    .expect("serialize ok response")
 }
 
 fn response_error_line(err: ProtocolError) -> String {
-    serde_json::to_string(&Response::err(test_request().id, err)).expect("serialize err response")
+    serde_json::to_string(
+        &Response::err(protocol::PROTOCOL_VERSION, test_request().id(), err)
+            .expect("valid test response"),
+    )
+    .expect("serialize err response")
 }
 
 fn assert_sent_request(request_line: &str) {
@@ -1052,8 +1486,7 @@ fn sample_policy() -> protocol::NotificationPolicy {
             error: true,
             system: false,
         },
-        codex: None,
-        claude: None,
+        providers: BTreeMap::new(),
     }
 }
 

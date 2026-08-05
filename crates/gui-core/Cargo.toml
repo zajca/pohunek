@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Pure state and SDK bridge logic for the pohunek native GUI."
 
 [dependencies]
+base64 = { workspace = true }
 futures = { workspace = true }
 keyring = { workspace = true }
 pohunek-client = { workspace = true }

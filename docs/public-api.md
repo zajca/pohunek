@@ -14,25 +14,33 @@ Source of truth:
 
 ## Compatibility Model
 
-The current protocol version is `1` (`PROTOCOL_VERSION`).
+The current public protocol version is `2` (`PROTOCOL_VERSION`), and this build
+supports the inclusive range `2..=2` (`SUPPORTED_PROTOCOL_VERSIONS`). Requests
+carry `v: {minimum, maximum}`. The first valid response selects the highest
+overlapping version as an integer `v`, and that selection is fixed for the
+lifetime of the connection. Subscription events use the same selected version.
+A non-overlapping range returns `daemon/version_mismatch`.
 
-Every control request, response, and event carries a numeric `v` field. The
-daemon validates `request.v` before dispatching the method. In v1 negotiation is
-strict equality: a client and daemon interoperate only when both speak the same
-protocol version. A mismatch returns a typed `daemon/version_mismatch` error.
+The former exact integer request envelope is deliberately rejected. Protocol
+v2 is a one-time coordinated pre-1.0 boundary: every CLI, GUI, web backend/SDK,
+custom client, and local or remote daemon that communicates with another peer
+must be upgraded together. There is no v1 envelope or notification-policy
+compatibility shim. After crossing this boundary, future peers negotiate the
+highest overlapping range instead of requiring equal maximum versions.
 
 Clients should call `daemon.health` after opening a control connection to learn
 the daemon build version and protocol version, but `daemon.health` is not a
 special unauthenticated handshake. It is an ordinary request and is negotiated
 like every other method.
 
-Additive changes do not require a version bump:
-
-- New optional fields may be added to params, results, errors, or events.
-- Unknown fields must be ignored by receivers.
-- Omitted optional fields must retain their documented default.
-- New methods and new error codes are additive; older daemons return
-  `daemon/method_not_found` for unknown methods.
+Within a negotiated public version, additive changes do not require a bump only
+where the containing contract is explicitly open. New methods and error codes
+are additive; older daemons return `daemon/method_not_found` for unknown
+methods. Optional fields retain their documented omission behavior. Envelope,
+observation, native-report, capability, and notification-policy objects are
+strict and reject unknown fields, so changing their accepted shape requires the
+appropriate negotiated-version treatment. `AgentKind` and provider-policy map
+keys are deliberately open value namespaces, not open object shapes.
 
 Non-additive wire changes require a protocol version bump. Examples: changing a
 required field name or type, removing a field, changing enum string values,
@@ -85,34 +93,53 @@ center can validate the relay boundary before any stability promise is made.
 ### Request
 
 ```json
-{"v":1,"id":"req-7f3","method":"session.list","params":{}}
+{"v":{"minimum":2,"maximum":2},"id":"req-7f3","method":"session.list","params":{}}
 ```
 
 Fields:
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `v` | integer | yes | Protocol version spoken by the client. |
+| `v` | object | yes | Inclusive `{minimum, maximum}` range. Endpoints are non-zero integers, `minimum <= maximum`, and unknown range fields are rejected. |
 | `id` | string | yes | Correlation id. The response echoes it. |
 | `method` | string | yes | One of the public method names below. |
 | `params` | JSON value | no | Method-specific params. Missing defaults to `null`. |
+| `origin_session_id` | string | no | Session containing the caller process. Must be paired with `origin_daemon_id`. |
+| `origin_daemon_id` | string | no | Daemon instance paired with `origin_session_id`. Must be paired with it. |
 
 For parameterless methods, send `params: null` or omit `params` unless a method
 documents another defaultable object.
+
+Origin markers are either both absent or both present, non-empty, bounded, and
+restricted to unescaped ASCII identifier characters. Managed children inherit
+the pair; the Rust SDK propagates inherited origin and the TypeScript SDK
+propagates an explicitly configured `ConnectOptions.origin` to normal,
+subscription, and dedicated connections. When both markers identify the target
+as the caller's own origin session, the daemon returns
+`runtime/plugin_self_target_denied` for exactly `session.stop`,
+`session.resume`, `session.remove`, `session.fork`, `session.resize`,
+`session.set_metadata`, `session.rename`, and `session.input`. Read-only methods,
+including observation, remain available. The lifecycle reports
+`session.report_agent`, `session.release_agent`, and `session.report_native_id`
+are explicitly allowed because hooks must report their own session; the public
+native-id report is the necessary local fallback when the owner-private worker
+claim cannot be delivered. This is a narrow server-side confused-deputy guard
+inside the existing single-operator trust boundary, not per-session
+authentication or a broader mutation policy.
 
 ### Response
 
 Successful response:
 
 ```json
-{"v":1,"id":"req-7f3","ok":{"status":"ok"}}
+{"v":2,"id":"req-7f3","ok":{"status":"ok"}}
 ```
 
 Error response:
 
 ```json
 {
-  "v": 1,
+  "v": 2,
   "id": "req-7f3",
   "err": {
     "class": "daemon",
@@ -123,6 +150,8 @@ Error response:
 ```
 
 Exactly one of `ok` or `err` is present.
+The integer `v` is the highest overlapping version selected by the first
+response and cannot change on later responses on the same connection.
 
 ### Event
 
@@ -130,7 +159,7 @@ Events are pushed only after a successful `subscribe` request. They are also
 newline-delimited JSON, one event per line:
 
 ```json
-{"v":1,"event":"agent_state","session_id":"s-42","activity":"blocked","source":"osc_title"}
+{"v":2,"event":"agent_state","session_id":"s-42","activity":"blocked","source":"osc_title"}
 ```
 
 Event payload fields are flattened at the top level beside `v`, `event`, and the
@@ -147,21 +176,24 @@ All params and result type names below refer to structs exported by
 | `daemon.doctor` | `null` | `DaemonDoctorResult` | Runs daemon-local checks. Non-null params are `daemon/bad_request`. |
 | `host.inspect` | `null` | `HostCapabilities` | Live capability snapshot for the daemon's host. |
 | `host.discover` | `HostDiscoverParams` or `null` | `Vec<HostRecord>` | Enumerates NetBird peers and classifies daemon reachability. |
-| `session.new` | `SessionNewParams` | `SessionNewResult` | Starts an agent PTY session. Optional `metadata` is written atomically with the session (see the `metadata` field note under `SessionInfo` below); the CLI exposes it as repeatable `--meta key=value`. |
+| `session.new` | `SessionNewParams` | `SessionNewResult` | Starts an agent PTY session. Bare and profile-based Hermes launches first require an executable whose isolated, bounded `--version` probe matches the pinned supported release; failure returns payload-free `agent_runtime_unsupported` before session, worker, or worktree creation. Optional `metadata` is written atomically with the session (see the `metadata` field note under `SessionInfo` below); the CLI exposes it as repeatable `--meta key=value`. |
 | `session.list` | `SessionListParams` or `null` | `Vec<SessionInfo>` | Lists sessions; filters use AND semantics. |
 | `session.inspect` | `SessionId` | `SessionInfo` | `SessionId` is a JSON string, e.g. `"s-1"`. |
 | `session.stop` | `SessionId` | `SessionStopResult` | Stops a live session (the entry stays in `list`). |
-| `session.resume` | `SessionId` | `SessionResumeResult` | Explicitly recovers a terminal or lost logical session from captured native recovery metadata, reusing the logical session id but creating a new worker and runtime generation. Live, reconnecting, conflicting, or incompatible runtimes are rejected; sessions without native metadata return `not_resumable` or `agent_not_resumable`. Daemon restart never calls this method automatically. |
-| `session.fork` | `SessionForkParams` | `SessionForkResult` | Forks a native agent conversation into a new pohunek session id and PTY, using the source session's cwd/worktree for `cwd_mode: "same"`. Live sources are allowed. Unknown ids return `session_not_found`; external sessions return `session_external_read_only`; sources without launch-agent native metadata return `not_resumable` or `agent_not_resumable`; Codex-backed sessions return `agent_fork_unsupported`. A successful fork emits `session_created`. |
+| `session.resume` | `SessionId` | `SessionResumeResult` | Explicitly recovers a terminal or lost logical session from captured native recovery metadata, reusing the logical session id but creating a new worker and runtime generation. Hermes recovery revalidates the frozen executable against the pinned release before any recovery write or worker launch and returns payload-free `agent_runtime_unsupported` when unavailable or incompatible. Live, reconnecting, conflicting, or incompatible runtimes are rejected; sessions without native metadata return `not_resumable` or `agent_not_resumable`. Daemon restart never calls this method automatically. |
+| `session.fork` | `SessionForkParams` | `SessionForkResult` | Forks a native agent conversation into a new pohunek session id and PTY, using the source session's cwd/worktree for `cwd_mode: "same"`. Live sources are allowed. Unknown ids return `session_not_found`; external sessions return `session_external_read_only`; sources without launch-agent native metadata return `not_resumable` or `agent_not_resumable`; Codex- and Hermes-backed sessions return `agent_fork_unsupported`. A successful fork emits `session_created`. |
 | `session.remove` | `SessionId` | `SessionRemoveResult` | Evicts a session from the registry, stopping it first if still live. Unknown id is `session_not_found`. |
 | `session.runtime_inventory` | `null` | `RuntimeInventoryResult` | Returns the durable-worker runtime inventory captured at startup reconciliation: one `RuntimeInventoryEntry` per discovered worker with its runtime slot, claimed session id, worker/runtime ids, and classification (`managed`, `orphaned`, `conflict`, `incompatible`, or `identity_mismatch`). Read-only operator diagnostic; it never mutates or kills a worker. |
 | `session.attach` | `SessionAttachParams` | `SessionAttachResult` | Mints a one-shot attach stream id. |
 | `session.detach` | `SessionDetachParams` | `SessionDetachResult` | Cancels an active attach stream. After a worker stream failure, the first call returns its optional typed `error` and consumes that short-lived result; unknown or already-consumed streams return `detached: false` without `error`. |
 | `session.resize` | `SessionResizeParams` | `SessionResizeResult` | Resizes the PTY on the control connection. |
-| `session.input` | `SessionInputParams` | `SessionInputResult` | Injects text using agent-specific input framing. |
+| `session.input` | `SessionInputParams` | `SessionInputResult` | Injects text using agent-specific input framing. Hermes accepts at most `MAX_SESSION_INPUT_BYTES` UTF-8 bytes, permits LF and tab but rejects other C0/C1 controls without rewriting them, and returns `session_input_blocked` while approval-visible activity is blocked. Unsafe or oversized Hermes text returns `session_input_rejected`. |
+| `session.screen` | `SessionScreenParams` | `SessionScreenResult` | Reads one bounded, rendered, runtime-bound terminal snapshot without acquiring attach ownership or resizing the terminal. |
+| `session.output` | `SessionOutputParams` | `SessionOutputResult` | Reads a newest retained tail or continues from an exact runtime-scoped output cursor. A request with `wait_ms` uses a dedicated connection. |
+| `session.wait` | `SessionWaitParams` | `SessionWaitResult` | Performs one bounded long poll for state, activity, metadata, terminal, output, or runtime change. It always uses a dedicated connection. |
 | `session.report_agent` | `SessionReportAgentParams` | `SessionReportAgentResult` | Hook callback for nested agents running inside an existing session. It records an active-agent claim, optional process binding, and optional active native metadata without changing launch identity or resume binding; ignored reports return `recorded: false`. Claims are reconciled with process facts and can be auto-released when no live backing process remains. |
 | `session.release_agent` | `SessionReleaseAgentParams` | `SessionReleaseAgentResult` | Hook callback that clears a matching active nested-agent report and restores the session's default detector identity. Claude `SessionEnd` hooks use this as the clean-exit fast path; non-current releases return `released: false`; process-backed auto-release uses the same clear path. |
-| `session.report_native_id` | `SessionReportNativeIdParams` | `SessionReportNativeIdResult` | Hook callback for launch-agent resume metadata. The daemon records only reports whose `agent` matches the session profile name or base kind; ignored reports return `recorded: false`. This is not the nested-agent active identity callback. |
+| `session.report_native_id` | `SessionReportNativeIdParams` | `SessionReportNativeIdResult` | Hardened public fallback for launch-agent resume metadata. Reports are runtime- and process-bound, ordered, expiring, and provider-matched; ignored reports return `recorded: false`. The owner-private worker claim path is preferred. This is not the nested-agent active identity callback. |
 | `session.set_metadata` | `SessionSetMetadataParams` | `SessionSetMetadataResult` | Merges owner-controlled metadata. Values must not contain secrets. |
 | `session.rename` | `SessionRenameParams` | `SessionRenameResult` | Sets or clears a session's owner display name (`name: null` clears). Cosmetic; the daemon trims it and rejects a control character or over-long name. |
 | `session.diff` | `SessionDiffParams` | `SessionDiffResult` | Computes a unified diff of a session's worktree against a base ref. `base: null` defers to the worktree binding's recorded base branch, then the repository default. A session without a bound worktree returns `session_no_worktree`; a hostile explicit `base` (empty, leading `-`, or a control character) returns `invalid_branch`; a `base` that cannot be resolved to a merge-base against `HEAD` returns `session_diff_base_unresolved`. See `SessionDiffResult` under Core Payloads for the size cap and truncation semantics. |
@@ -188,6 +220,27 @@ All params and result type names below refer to structs exported by
 `status` exists as a method constant in `crates/protocol` but is not a supported
 daemon method in this API version. It returns `daemon/method_not_found`.
 
+`HostCapabilities` advertises `terminal_read_supported`,
+`output_read_supported`, and `session_wait_supported` independently. Clients
+must check the relevant flag instead of assuming that a reachable daemon or an
+attach-capable session supports every observation method. Its `runtimes` entries
+are live host-local probes: `agent` is the selected profile or base name and
+optional `agent_base` identifies the compiled adapter behind it. Optional
+`version` and `supported` are a provider policy, not generic availability:
+their absence means that no version policy applies. For Hermes, `available:
+false` omits both fields, while an installed unparseable or non-`0.20.0`
+executable reports `supported: false`. The daemon independently enforces the
+same policy immediately before every Hermes launch or recovery rather than
+trusting a potentially stale inventory response. The probe clears ambient
+environment state and uses private temporary HOME, Hermes, XDG, Python-cache,
+and working directories. Its executable is resolved and canonicalized once;
+the exact absolute path is then passed to the worker without a second PATH
+lookup. The single-operator trust boundary still permits the same owner to
+replace that canonical file between probe and exec; eliminating that residual
+would require an fd-based execution contract. An absent `agent_base` is compatible with legacy custom
+profile inventory, but a present unknown base is presentation-only and not
+launchable.
+
 ### Daemon Runtime Configuration
 
 `POHUNEK_OBSERVE_EXTERNAL_AGENTS` is an opt-in daemon environment flag. Accepted
@@ -196,6 +249,15 @@ true values are `1`, `true`, `yes`, and `on`; accepted false values are `0`,
 operator's Claude and Codex transcript trees and same-user process table for
 agents started outside pohunek. The corresponding `SessionRegistryConfig`
 setting is `observe_external_agents`, default `false`.
+
+Observation limits are validated together when the session registry starts.
+Defaults are 783,240 raw output bytes, an 8,000 ms output wait, an 8,000 ms
+session wait, 200 rows, 500 columns, a 1,048,418-byte serialized screen result,
+128 global waiters, and 8 waiters per session. Values must be non-zero, must not
+exceed the shared protocol ceilings, and the per-session waiter cap must not
+exceed the global cap. Invalid combinations fail fast with
+`runtime/observation_limits_invalid`; the daemon does not silently substitute
+defaults.
 
 ## Core Payloads
 
@@ -211,15 +273,20 @@ Important fields:
   `true` means an opt-in observed external agent. External sessions are
   read-only: attach, input, resize, stop, remove, rename, metadata updates, and
   resume return `runtime/session_external_read_only`.
+- `capabilities`: required `SessionCapabilities` object with independent
+  `resume` and `fork` booleans frozen for the logical session. Clients must use
+  these flags instead of inferring provider behavior from `agent` or
+  `agent_base`. Records that predate the field load both flags as `false`.
 - `name`: optional owner-set display name; absent means the session is shown by
   its id. Set at `session.new` and changed via `session.rename`.
 - `agent`: profile name.
-- `agent_base`: `shell`, `codex`, or `claude`.
+- `agent_base`: `shell`, `codex`, `claude`, or `hermes`; unknown wire values
+  remain presentation-only.
 - `active_agent`: optional runtime agent profile currently active inside the
   session. Present for nested agents reported through hooks or inferred from
   process facts.
-- `active_agent_base`: optional runtime base kind (`shell`, `codex`, or
-  `claude`) for `active_agent`.
+- `active_agent_base`: optional runtime base kind (`shell`, `codex`, `claude`,
+  or `hermes`) for `active_agent`.
 - `active_agent_pid`: optional process id backing `active_agent`. When present,
   the daemon auto-releases the active agent if that process exits.
 - `active_agent_session_id` / `active_agent_session_path`: optional native
@@ -234,7 +301,8 @@ Important fields:
   next procwatch tick can overwrite if the focus process disagrees.
 - `pid`: root process id, or the observed external agent process id.
 - `runtime`: optional durable runtime object. It is absent for observed external
-  sessions and peers predating worker-backed sessions. `runtime.state` is
+  sessions and peers predating worker-backed sessions. `runtime_generation` is
+  a canonical unsigned decimal JSON string, not a JSON number. `runtime.state` is
   `starting`, `live`, `reconnecting`, `terminal`, `lost`, `conflict`, or
   `incompatible`; `worker_id` identifies the PTY owner and `runtime_id`
   identifies the PTY generation. `started_at`, `last_connected_at`, and
@@ -250,7 +318,9 @@ Important fields:
   These belong to the immutable launch agent and are written by
   `session.report_native_id`, not by nested active-agent reports. A forked
   session copies the source launch-agent native metadata so the new session is
-  also resumable.
+  also resumable. Hermes resumes only when this valid reference exists, as
+  `hermes chat --resume <reference>`; it never infers an ambient Hermes
+  session.
 - `project_id`, `project_label`, `repo`, `branch`, `worktree_path`: optional git
   and project context for the current `cwd`. A cwd change re-resolves this
   context. When a session leaves every known active worktree, `worktree_path` is
@@ -265,6 +335,135 @@ Important fields:
   is dedicated to it.
 - `created_at`, `updated_at`: RFC3339 timestamps.
 - `exit_code`: optional process exit code.
+
+`AgentKind` wire values are forward-compatible for presentation. An unknown
+string round-trips through Rust and TypeScript clients as a neutral value, but
+it is rejected with `runtime/agent_kind_unsupported` by agent-targeted mutation
+and persistence paths. Unknown values never silently become a supported launch,
+resume, or fork adapter.
+
+### Session Observation
+
+Observation is available only for Pohunek-managed terminals. It does not attach,
+take input ownership, or change terminal dimensions. `runtime_generation`, all
+output offsets, terminal watermarks, process-start identities, and report
+sequences are canonical unsigned decimal strings. They remain exact beyond
+JavaScript's safe-integer range and reject signs, whitespace, overflow, and
+redundant leading zeroes.
+
+`session.screen` accepts:
+
+```json
+{"session_id":"s-42"}
+```
+
+A successful result has this exact shape (optional `title` and `progress` may be
+omitted):
+
+```json
+{
+  "session_id": "s-42",
+  "worker_id": "worker-1",
+  "runtime_id": "runtime-1",
+  "runtime_generation": "3",
+  "watermark": "7",
+  "dimensions": {"cols": 80, "rows": 24},
+  "cursor": {"row": 1, "col": 4, "visible": true},
+  "alternate_screen": false,
+  "title": "terminal",
+  "visible_lines": ["pohunek"]
+}
+```
+
+Visible lines are plain UTF-8 terminal cells with control sequences removed.
+The protocol ceiling for the serialized result is
+`MAX_SESSION_SCREEN_RESPONSE_BYTES` (1,048,418 bytes), derived from the 1 MiB control-line cap
+with response-envelope headroom. The daemon additionally defaults to at most
+200 rows and 500 columns. Oversize results return the payload-free
+`runtime/session_output_limit_exceeded` error.
+
+`session.output` uses an optional nested runtime identity and an exclusive
+cursor. Omitting `after_offset` requests the newest retained tail. A cursor
+requires its exact runtime identity, and `wait_ms` requires a cursor:
+
+```json
+{
+  "session_id": "s-42",
+  "runtime": {"runtime_id": "runtime-1", "runtime_generation": "3"},
+  "after_offset": "2",
+  "max_bytes": 65536,
+  "wait_ms": 5000
+}
+```
+
+The result returns standard base64 and every cursor needed to continue:
+
+```json
+{
+  "session_id": "s-42",
+  "runtime_id": "runtime-1",
+  "runtime_generation": "3",
+  "history_start_offset": "4",
+  "start_offset": "4",
+  "next_offset": "6",
+  "runtime_end_offset": "6",
+  "data_base64": "AJ8=",
+  "gap": {"start_offset": "2", "end_offset": "4"},
+  "has_more": false,
+  "timed_out": false
+}
+```
+
+`gap` is omitted unless the requested retained history was evicted. Continue
+immediately while `has_more` is true. The shared raw-data ceiling is
+`MAX_SESSION_OUTPUT_BYTES` (derived from the 1 MiB line limit after base64 and
+metadata headroom) is 783,240 raw bytes; the daemon may configure a lower
+positive value. `max_bytes`
+must be `1..=MAX_SESSION_OUTPUT_BYTES`. `wait_ms` must be `1..=8000` and is used
+only when the explicit cursor is at the current end. A waiting output read uses
+a dedicated SDK connection.
+
+`session.wait` requires a non-zero `timeout_ms` no greater than 8000 and at
+least one predicate. Runtime-scoped terminal/output cursors require `runtime`;
+`after_updated_at` is RFC 3339; present `states` and `activities` arrays cannot
+be empty:
+
+```json
+{
+  "session_id": "s-42",
+  "runtime": {"runtime_id": "runtime-1", "runtime_generation": "3"},
+  "after_updated_at": "2026-08-04T10:00:00Z",
+  "after_terminal_watermark": "7",
+  "after_output_offset": "8",
+  "states": ["stopped"],
+  "activities": ["blocked"],
+  "timeout_ms": 8000
+}
+```
+
+It returns `reason`, the current redacted `SessionInfo`, and optional current
+`terminal_watermark` / `output_offset`. Reasons are `state_matched`,
+`activity_matched`, `session_updated`, `terminal_changed`, `output_advanced`,
+`runtime_changed`, or `timeout`. Registration follows snapshot-register-recheck
+and holds no registry write lock while sleeping. Each wait uses a dedicated
+connection and consumes one waiter slot; defaults are 128 concurrent waiters
+globally and 8 per session. Disconnect is not promised as immediate daemon-side
+cancellation: the required timeout is the resource-release bound.
+
+| Result field | Type | Notes |
+|---|---|---|
+| `reason` | `SessionWaitReason` string | The first satisfied reason, or `timeout`. |
+| `session` | `SessionInfo` | Current redacted public snapshot, including `capabilities`. |
+| `terminal_watermark` | decimal string, optional | Current rendered-terminal revision when a managed terminal is available. |
+| `output_offset` | decimal string, optional | Current exclusive output end when a managed terminal is available. |
+
+Observation errors are stable and payload-free: `session_terminal_unavailable`,
+`session_has_no_managed_terminal`, `session_runtime_changed`,
+`session_output_limit_exceeded`, `session_wait_limit_exceeded`,
+`session_waiter_limit_reached`, and `worker_feature_unavailable`. Restart from a
+fresh screen/tail after runtime change. A worker on the immediately preceding
+private protocol remains usable for existing lifecycle and attach operations,
+but observation returns `worker_feature_unavailable`.
 
 ### Active-Agent Hook Payloads
 
@@ -283,6 +482,36 @@ hooks continue to use the public daemon socket; notifications produced during a
 daemon outage are not durable. `POHUNEK_DAEMON_ID` remains additive compatibility
 data but is not the stable runtime identity and must not be used for
 self-feedback decisions by new clients.
+
+When the worker-private native-identity claim cannot be delivered, shipped
+Codex and Claude hooks must retain the necessary local fallback to the public
+`session.report_native_id` method. The origin-session guard deliberately allows
+this lifecycle report to target its own session. Its
+strict params are `session_id`, `runtime_id`, `agent`, non-zero `pid`, decimal
+string `pid_start_identity`, decimal string monotonic `sequence`, RFC 3339
+`expires_at`, `native_session_id`, and optional `transcript_path`. The daemon
+records only an unexpired claim for the current logical session/runtime whose
+agent matches the frozen launch profile or base kind, whose PID and kernel
+start identity match the launch process, and whose sequence is newer than the
+last accepted claim. Stale runtime, PID reuse, expired, duplicate/out-of-order,
+wrong-provider, and wrong-session reports are ignored. Native identifiers and
+transcript paths are redacted from `Debug` and must not enter logs or errors.
+The claim lifetime is capped at 60 seconds from receipt.
+
+```json
+{
+  "session_id": "s-42",
+  "runtime_id": "runtime-42",
+  "agent": "codex",
+  "pid": 4242,
+  "pid_start_identity": "7",
+  "sequence": "1",
+  "expires_at": "2026-08-04T10:00:00Z",
+  "native_session_id": "provider-native-id"
+}
+```
+
+The result is exactly `{"recorded":true}` or `{"recorded":false}`.
 
 `session.report_agent` accepts the nested agent `source`, `agent`, optional
 `activity`, optional `seq`, optional `pid`, and optional active native metadata.
@@ -370,12 +599,45 @@ Important fields:
   turn-completion notification is held pending before it is allowed to surface.
   The default is 5 seconds. Additive: a policy JSON written before this field
   existed loads the default.
-- `enabled`: default per-kind flags.
-- `codex` / `claude`: optional provider-specific per-kind overrides.
+- `enabled`: base per-kind flags used when a provider has no explicit entry.
+- `providers`: optional deterministically ordered object mapping provider wire
+  names to complete per-kind overrides. Missing keys fall back to `enabled`.
+
+For example:
+
+```json
+{
+  "attention_dedupe_window_secs": 120,
+  "attention_debounce_secs": 5,
+  "enabled": {
+    "agent_blocked": true,
+    "approval_required": true,
+    "turn_completed": false,
+    "session_finished": false,
+    "error": true,
+    "system": false
+  },
+  "providers": {
+    "claude": {
+      "agent_blocked": true,
+      "approval_required": true,
+      "turn_completed": true,
+      "session_finished": false,
+      "error": true,
+      "system": false
+    }
+  }
+}
+```
+
+Provider names are open strings so adding a provider does not change this wire
+shape. The former fixed `codex` / `claude` fields are not accepted and have no
+compatibility shim.
 
 Default policy enables `agent_blocked`, `approval_required`, and `error`.
 `turn_completed`, `session_finished`, and `system` are implemented but disabled
-by default.
+by default. The daemon materializes complete default entries for `codex`,
+`claude`, and `hermes`; a missing provider key still falls back to `enabled`.
 
 Policy is enforced daemon-side for all notification producers. If a producer
 creates a disabled kind, `notification.create` returns
@@ -513,7 +775,34 @@ Canonical public codes currently emitted include:
 | `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback` |
 | `transport` | `framing`, `host_unreachable` |
 | `discovery` | `netbird_cli_missing`, `netbird_state_unavailable`, `host_unknown`, `remote_discovery_failed` |
-| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor` |
+| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor` |
+
+Protocol v2 additionally emits these runtime codes for provider-neutral agent
+and observation behavior: `agent_kind_unsupported`,
+`agent_fork_unsupported`, `session_terminal_unavailable`,
+`session_has_no_managed_terminal`, `session_runtime_changed`,
+`session_output_limit_exceeded`, `session_wait_limit_exceeded`,
+`session_waiter_limit_reached`, `worker_feature_unavailable`, and
+`plugin_self_target_denied`, `agent_runtime_unsupported`,
+`session_input_rejected`, and `session_input_blocked`. Daemon startup may additionally return
+`observation_limits_invalid`. Observation request errors intentionally carry no terminal
+payload or current-runtime payload; refresh `session.inspect` or restart
+observation from a fresh screen/tail when recovery requires new coordinates.
+
+`session_runtime_commit_stale` means a lifecycle or runtime transition lost a
+concurrent durable commit: another runtime is already authoritative for the
+logical session because the candidate generation is older or a different
+runtime owns the same generation. The losing candidate is not published to the
+in-memory registry or subscribers and emits no success event. Refresh with
+`session.inspect`, then retry only if the operation is still valid against the
+current authoritative runtime identity, generation, and state; never reuse the
+losing candidate's stale runtime coordinates.
+
+This code does not report post-rename durability uncertainty. If the atomic
+rename made a session record authoritative but syncing the parent directory
+then failed, the daemon treats the commit as applied and logs a sanitized
+durability warning internally. That condition is not returned as
+`session_runtime_commit_stale`.
 
 Clients must not parse `msg`. Branch on `class` and `code`, then display `msg`
 and `recover` for unknown codes.
@@ -524,7 +813,7 @@ and `recover` for unknown codes.
 ack:
 
 ```json
-{"v":1,"id":"sub-1","ok":{"subscribed":true}}
+{"v":2,"id":"sub-1","ok":{"subscribed":true}}
 ```
 
 The daemon then writes these events:
@@ -552,6 +841,33 @@ subscriber may miss older events if the daemon's internal event channel lags; it
 should reconcile by calling `session.list`, `session.inspect`, or
 `notification.list`.
 
+## CLI Process API
+
+Commands with `--json` write exactly one pretty-printed document to stdout and
+reserve stderr for diagnostics. Success exits zero with:
+
+```json
+{
+  "cli_version": "0.x.y",
+  "protocol": {"minimum": 2, "maximum": 2},
+  "ok": {}
+}
+```
+
+A typed operational or usage failure exits non-zero and replaces `ok` with the
+standard `err` object. Usage failures retain exit code 2. No human text is
+mixed into stdout. Session output bytes are never logged; non-JSON
+`session output` decodes standard base64 and displays UTF-8 lossily, while JSON
+preserves the exact `SessionOutputResult`.
+
+`session new` accepts either `--input <text>` or bounded UTF-8 stdin through
+`--input-stdin` / `--stdin`, never both. `session input` accepts either
+positional text or `--stdin`, never both. Stdin payloads do not appear in argv,
+diagnostics, or logs. The CLI validates observation byte/wait bounds and paired
+runtime coordinates before dialing. `session wait` and waiting `session output`
+use the Rust SDK's dedicated connections and preserve inherited request-origin
+markers.
+
 ## CLI Notification Surface
 
 The CLI exposes durable notifications through `pohunek notifications`:
@@ -566,7 +882,7 @@ The CLI exposes durable notifications through `pohunek notifications`:
   Targets accept bare `id` or `host/id`; an explicit target host overrides
   `--host`.
 - `pohunek notifications policy get|set`: read policy or toggle one
-  provider/kind flag. `set` accepts `--provider default|codex|claude`,
+  provider/kind flag. `set` accepts `--provider default|codex|claude|hermes`,
   `--kind <kind>`, and exactly one of `--enabled` or `--disabled`.
 - `pohunek notifications retention prune`: explicitly prune records selected by
   `--status`, `--before`, and `--limit`, with exactly one of `--dry-run` or
@@ -578,7 +894,7 @@ notification server is introduced.
 
 ## Attach Stream
 
-The attach byte stream is part of protocol v1. It is not an implementation
+The attach byte stream is part of public protocol v2. It is not an implementation
 detail of the CLI.
 
 Sequence:
@@ -683,7 +999,18 @@ Request APIs:
   method request, pairing the method name, params, and success payload through
   marker types in `protocol::method`.
 - `Client::handshake() -> ProtocolVersion`: calls `daemon.health` and returns the
-  daemon-reported protocol version.
+  version selected by the first valid response on that connection.
+- `Client::selected_version() -> Option<ProtocolVersion>`: returns the fixed
+  per-connection selection after the first response.
+- `Client::session_screen(SessionScreenParams)`: reads one rendered snapshot on
+  the current connection.
+- `Client::session_output(SessionOutputParams)`: uses the current connection for
+  an immediate read and automatically opens a dedicated connection when
+  `wait_ms` is present.
+- `Client::session_wait(SessionWaitParams)`: automatically opens a dedicated
+  connection for the bounded long poll.
+- `Client::session_resume`, `session_resize`, and `session_set_metadata`: typed
+  lifecycle helpers used by automation clients.
 - `Client::request(&Request) -> serde_json::Value`: sends one request and returns
   the raw `ok` payload for low-level callers and framing tests.
 - `Client::subscribe(&Request) -> Subscription`: consumes the client connection
@@ -735,7 +1062,11 @@ Public exports:
   `close()` for one raw attach connection.
 - `ConnectOptions`: TypeScript counterpart to Rust `ClientOptions`; the package
   does not export a separate `ClientOptions` alias. It carries
-  `connectTimeoutMs` and `requestTimeoutMs`, both defaulting to 5000 ms.
+  `connectTimeoutMs` and `requestTimeoutMs`, both defaulting to 5000 ms, plus an
+  optional validated `origin: {sessionId, daemonId}` pair.
+- `RequestOrigin` and `resolveRequestOrigin`: explicit browser-safe origin
+  configuration and atomic identifier validation. Browser and Bun/Node defaults
+  are absent; the SDK never reads `process.env`.
 - `ResolvedConnectOptions`, `DEFAULT_CONNECT_TIMEOUT_MS`,
   `DEFAULT_REQUEST_TIMEOUT_MS`, and `resolveConnectOptions`.
 - `Subscription`: event-line stream after a successful `subscribe`.
@@ -789,13 +1120,14 @@ Connection APIs:
 Request APIs:
 
 - `client.call(method, params)`: typed call keyed by the generated `Methods`
-  map.
+  map. A configured origin is added to the wire request.
 - `client.handshake()`: calls `daemon.health` and enforces strict protocol
   version equality.
-- `client.request(request)`: sends one raw request envelope and returns the
-  `ok` payload.
-- `client.subscribe(request)`: consumes the control connection after the
-  subscribe ack and returns `Subscription`.
+- `client.request(request)`: validates the optional atomic wire origin, applies
+  the client origin when configured, sends one raw request envelope, and returns
+  the `ok` payload.
+- `client.subscribe(request)`: applies the same configured origin, consumes the
+  control connection after the subscribe ack, and returns `Subscription`.
 - `client.close()`: closes the control channel.
 - `subscription.nextLine()`: returns raw event JSON text or `null` on close.
 - `subscription.nextEvent()`: returns `ProtocolEvent | CatchAllEvent | null`.

@@ -136,6 +136,17 @@ pub fn install(agent: Option<AgentKind>) -> Result<IntegrationInstallResult, Pro
                 None,
             ));
         }
+        Some(AgentKind::Hermes) => {
+            return Err(ProtocolError::new(
+                ErrorClass::Runtime,
+                "agent_not_installable",
+                "Hermes integration is not available in this milestone",
+                None,
+            ));
+        }
+        Some(AgentKind::Unknown(agent)) => {
+            return Err(ProtocolError::agent_kind_unsupported(&agent));
+        }
         None => install_all_present()?,
     };
     Ok(IntegrationInstallResult { installed })
@@ -202,7 +213,7 @@ pub fn codex_config_dir() -> Result<PathBuf, ProtocolError> {
 /// any I/O error.
 pub fn install_claude(claude_dir: &Path) -> Result<InstallPaths, ProtocolError> {
     if !claude_dir.is_dir() {
-        return Err(config_dir_missing(AgentKind::Claude, claude_dir));
+        return Err(config_dir_missing(&AgentKind::Claude, claude_dir));
     }
 
     let hooks_dir = claude_dir.join("hooks");
@@ -270,7 +281,7 @@ pub fn install_claude(claude_dir: &Path) -> Result<InstallPaths, ProtocolError> 
 /// I/O error.
 pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
     if !codex_dir.is_dir() {
-        return Err(config_dir_missing(AgentKind::Codex, codex_dir));
+        return Err(config_dir_missing(&AgentKind::Codex, codex_dir));
     }
 
     let hook_path = codex_dir.join(STATE_HOOK_INSTALL_NAME);
@@ -766,11 +777,18 @@ fn make_executable(path: &Path) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-fn config_dir_missing(agent: AgentKind, dir: &Path) -> ProtocolError {
+fn config_dir_missing(agent: &AgentKind, dir: &Path) -> ProtocolError {
     let (name, hint) = match agent {
         AgentKind::Claude => ("claude", "install Claude Code first"),
         AgentKind::Codex => ("codex", "install Codex first"),
         AgentKind::Shell => ("shell", "shells have no hook integration"),
+        AgentKind::Hermes => (
+            "hermes",
+            "Hermes integration is not available in this milestone",
+        ),
+        AgentKind::Unknown(ref value) => {
+            return ProtocolError::agent_kind_unsupported(value);
+        }
     };
     ProtocolError::new(
         ErrorClass::Runtime,
@@ -823,6 +841,12 @@ mod tests {
     const LARGE_HOOK_INPUT_BYTES: usize = 1024 * 1024;
     /// Minimal successful JSON-RPC response expected by notification hook scripts.
     const HOOK_RESPONSE: &[u8] = b"{\"v\":1,\"id\":\"test\",\"result\":{}}\n";
+    /// Successful worker-private identity response expected by state hooks.
+    const WORKER_HOOK_SUCCESS_RESPONSE: &[u8] =
+        b"{\"ok\":true,\"launch_identity_accepted\":true}\n";
+    /// Rejected worker-private identity response that must trigger public fallback.
+    const WORKER_HOOK_FAILURE_RESPONSE: &[u8] =
+        b"{\"ok\":false,\"launch_identity_accepted\":false}\n";
     /// Maximum time a hook test waits for expected Unix-socket callbacks.
     const HOOK_CAPTURE_TIMEOUT_SECS: u64 = 2;
     /// Poll interval for nonblocking hook socket accept loops.
@@ -832,7 +856,7 @@ mod tests {
     /// State-hook requests expected from a successful release callback.
     const STATE_RELEASE_REQUEST_COUNT: usize = 1;
     /// Integration asset version expected after PID-bearing state hooks ship.
-    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=2";
+    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=4";
     /// Action argument for state-hook `SessionStart` reporting.
     const STATE_SESSION_ACTION: &str = "session";
     /// Action argument for state-hook release reporting.
@@ -968,7 +992,11 @@ mod tests {
             .env(ENV_FLAG, "1")
             .env(ENV_SOCKET_PATH, &socket_path)
             .env(ENV_SESSION_ID, "session-123")
-            .env(ENV_PROTOCOL_VERSION, "1")
+            .env(
+                ENV_PROTOCOL_VERSION,
+                protocol::PROTOCOL_VERSION.get().to_string(),
+            )
+            .env("POHUNEK_RUNTIME_ID", "runtime-123")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -992,9 +1020,31 @@ mod tests {
     }
 
     fn run_worker_state_asset(agent: &str, action: &str, input: &Value) -> Value {
+        let (request, public_requests) = run_worker_state_asset_with_response(
+            agent,
+            action,
+            input,
+            WORKER_HOOK_SUCCESS_RESPONSE,
+            0,
+        );
+        assert!(
+            public_requests.is_empty(),
+            "accepted worker request must not use public fallback"
+        );
+        request
+    }
+
+    fn run_worker_state_asset_with_response(
+        agent: &str,
+        action: &str,
+        input: &Value,
+        worker_response: &'static [u8],
+        expected_public_requests: usize,
+    ) -> (Value, Vec<Value>) {
         let asset_path = state_asset(agent);
         let temp = temp_dir(&format!("{agent}-worker-state-run"));
         let worker_socket = temp.join("worker.sock");
+        let daemon_socket = temp.join("daemon.sock");
         let listener = UnixListener::bind(&worker_socket).expect("bind worker hook socket");
         let capture = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept worker hook");
@@ -1006,8 +1056,42 @@ mod tests {
                     break;
                 }
             }
-            write_hook_response(&mut stream);
+            stream
+                .write_all(worker_response)
+                .expect("write worker hook response");
             serde_json::from_slice::<Value>(&raw).expect("worker hook JSON")
+        });
+        let daemon_listener = UnixListener::bind(&daemon_socket).expect("bind daemon hook socket");
+        daemon_listener
+            .set_nonblocking(true)
+            .expect("make daemon hook socket nonblocking");
+        let daemon_capture = thread::spawn(move || {
+            let deadline =
+                std::time::Instant::now() + Duration::from_secs(HOOK_CAPTURE_TIMEOUT_SECS);
+            let mut requests = Vec::new();
+            while requests.len() < expected_public_requests && std::time::Instant::now() < deadline
+            {
+                match daemon_listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        let mut raw = Vec::new();
+                        let mut byte = [0_u8; 1];
+                        while stream.read(&mut byte).expect("read daemon hook") == 1 {
+                            raw.push(byte[0]);
+                            if byte[0] == b'\n' {
+                                break;
+                            }
+                        }
+                        requests
+                            .push(serde_json::from_slice::<Value>(&raw).expect("daemon hook JSON"));
+                        write_hook_response(&mut stream);
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(HOOK_CAPTURE_POLL_MS));
+                    }
+                    Err(err) => panic!("accept daemon hook request: {err}"),
+                }
+            }
+            requests
         });
 
         let mut child = Command::new("sh")
@@ -1019,8 +1103,13 @@ mod tests {
             .env(ENV_FLAG, "1")
             .env("POHUNEK_WORKER_SOCKET_PATH", &worker_socket)
             .env("POHUNEK_NATIVE_REFERENCE_KIND", "id")
-            .env(ENV_SOCKET_PATH, temp.join("missing-daemon.sock"))
+            .env(ENV_SOCKET_PATH, &daemon_socket)
             .env(ENV_SESSION_ID, "session-123")
+            .env(
+                ENV_PROTOCOL_VERSION,
+                protocol::PROTOCOL_VERSION.get().to_string(),
+            )
+            .env("POHUNEK_RUNTIME_ID", "runtime-123")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1039,7 +1128,10 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(output.stdout.is_empty(), "worker hook must be silent");
-        capture.join().expect("worker hook capture")
+        (
+            capture.join().expect("worker hook capture"),
+            daemon_capture.join().expect("daemon hook capture"),
+        )
     }
 
     fn run_notification_asset(
@@ -1416,7 +1508,7 @@ mod tests {
             );
             assert!(
                 asset.contains(STATE_ASSET_VERSION_HEADER),
-                "{agent} hook must carry integration version 2"
+                "{agent} hook must carry integration version 3"
             );
             assert!(
                 asset.contains(method::SESSION_REPORT_AGENT),
@@ -1535,6 +1627,28 @@ mod tests {
 
             let native = &requests[1];
             assert_eq!(native["method"], json!(method::SESSION_REPORT_NATIVE_ID));
+            assert_eq!(
+                native["v"],
+                json!({
+                    "minimum": protocol::PROTOCOL_VERSION.get(),
+                    "maximum": protocol::PROTOCOL_VERSION.get(),
+                })
+            );
+            assert_eq!(native["params"]["session_id"], json!("session-123"));
+            assert_eq!(native["params"]["runtime_id"], json!("runtime-123"));
+            assert_eq!(native["params"]["agent"], json!(agent));
+            assert_eq!(native["params"]["pid"], json!(std::process::id()));
+            assert!(native["params"]["pid_start_identity"].as_str().is_some());
+            assert!(native["params"]["sequence"].as_str().is_some());
+            assert!(native["params"]["expires_at"].as_str().is_some());
+            assert_eq!(
+                native["params"]["native_session_id"],
+                json!(format!("{agent}-native"))
+            );
+            assert_eq!(
+                native["params"]["transcript_path"],
+                json!(format!("/tmp/{agent}-transcript.jsonl"))
+            );
         }
     }
 
@@ -1551,6 +1665,7 @@ mod tests {
                 }),
             );
             assert_eq!(report["type"], "identity_report");
+            assert_eq!(report["runtime_id"], "runtime-123");
             assert_eq!(report["provider"], agent);
             assert_eq!(report["reference_kind"], "id");
             assert_eq!(report["native_reference"], native);
@@ -1566,8 +1681,47 @@ mod tests {
             &json!({"session_id": "claude-native"}),
         );
         assert_eq!(release["type"], "identity_release");
+        assert_eq!(release["runtime_id"], "runtime-123");
         assert_eq!(release["provider"], "claude");
         assert!(release.get("native_reference").is_none());
+    }
+
+    #[test]
+    fn rejected_worker_identity_reports_fall_back_to_public_methods() {
+        for agent in ["claude", "codex"] {
+            let (worker_request, public_requests) = run_worker_state_asset_with_response(
+                agent,
+                STATE_SESSION_ACTION,
+                &json!({"session_id": format!("{agent}-native")}),
+                WORKER_HOOK_FAILURE_RESPONSE,
+                STATE_SESSION_REQUEST_COUNT,
+            );
+
+            assert_eq!(worker_request["type"], "identity_report");
+            assert_eq!(public_requests.len(), STATE_SESSION_REQUEST_COUNT);
+            assert_eq!(
+                public_requests[0]["method"],
+                json!(method::SESSION_REPORT_AGENT)
+            );
+            assert_eq!(
+                public_requests[1]["method"],
+                json!(method::SESSION_REPORT_NATIVE_ID)
+            );
+        }
+
+        let (worker_request, public_requests) = run_worker_state_asset_with_response(
+            "claude",
+            STATE_RELEASE_ACTION,
+            &json!({}),
+            WORKER_HOOK_FAILURE_RESPONSE,
+            STATE_RELEASE_REQUEST_COUNT,
+        );
+        assert_eq!(worker_request["type"], "identity_release");
+        assert_eq!(public_requests.len(), STATE_RELEASE_REQUEST_COUNT);
+        assert_eq!(
+            public_requests[0]["method"],
+            json!(method::SESSION_RELEASE_AGENT)
+        );
     }
 
     #[test]

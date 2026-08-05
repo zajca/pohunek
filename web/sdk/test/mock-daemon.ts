@@ -2,7 +2,7 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer, type AddressInfo, type Server, type Socket } from "node:net";
-import { MAX_CONTROL_LINE_BYTES, type SessionInfo } from "@pohunek/protocol";
+import { MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, type SessionInfo } from "@pohunek/protocol";
 import { ClientError, type ControlChannel, type RawDuplex, type Transport } from "@pohunek/sdk";
 
 export type MockEndpoint =
@@ -95,11 +95,11 @@ export async function startTcpDaemon(steps: ScriptStep[]): Promise<MockDaemon> {
 }
 
 export function okResponseLine(id: string, ok: unknown): string {
-  return JSON.stringify({ v: 1, id, ok });
+  return JSON.stringify({ v: PROTOCOL_VERSION, id, ok });
 }
 
 export function errResponseLine(id: string, err: unknown): string {
-  return JSON.stringify({ v: 1, id, err });
+  return JSON.stringify({ v: PROTOCOL_VERSION, id, err });
 }
 
 export function parseRequestLine(line: string): Record<string, unknown> {
@@ -133,6 +133,7 @@ export function startMemoryDaemon(steps: ScriptStep[]): MockDaemon {
 export function minimalSessionInfo(): SessionInfo {
   return {
     id: "s-test-1",
+    capabilities: { resume: true, fork: true },
     agent: "codex",
     agent_base: "codex",
     cwd: "/workspace/pohunek",

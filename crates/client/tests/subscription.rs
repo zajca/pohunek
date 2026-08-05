@@ -174,7 +174,8 @@ async fn subscription_ack_response_id_mismatch_is_rejected() {
                 "wrong-subscribe-id",
                 protocol::method::SUBSCRIBE,
                 Value::Null,
-            ),
+            )
+            .expect("valid test request"),
             json!({"subscribed": true}),
         ),
         vec![],
@@ -212,9 +213,11 @@ async fn subscription_next_event_decodes_notification_created() {
     let request = subscribe_request("subscribe-notification-created");
     let record = sample_notification_record();
     let event = protocol::Event::new(
+        protocol::PROTOCOL_VERSION,
         protocol::event::NOTIFICATION_CREATED,
         json!({ "record": serde_json::to_value(&record).expect("serialize record") }),
-    );
+    )
+    .expect("valid test event");
     let event_line = serde_json::to_string(&event).expect("serialize event");
     let daemon = spawn_unix_subscription_daemon(
         response_ok_line_for(&request, json!({"subscribed": true})),
@@ -242,9 +245,10 @@ async fn subscription_next_event_decodes_notification_created() {
         .expect("event decodes")
         .expect("event is present");
     assert_eq!(decoded, event);
-    assert_eq!(decoded.event, protocol::event::NOTIFICATION_CREATED);
+    assert_eq!(decoded.event(), protocol::event::NOTIFICATION_CREATED);
     let payload: protocol::NotificationCreatedEvent =
-        serde_json::from_value(decoded.payload).expect("decode notification_created payload");
+        serde_json::from_value(decoded.payload().clone())
+            .expect("decode notification_created payload");
     assert_eq!(payload.record, record);
 
     assert!(subscription
@@ -288,6 +292,82 @@ async fn subscription_next_event_malformed_json_returns_typed_error() {
     {
         ClientError::Json(_) => {}
         other => panic!("expected local Json error, got {other:?}"),
+    }
+    daemon
+        .task
+        .await
+        .expect("subscription daemon task completed");
+}
+
+#[tokio::test]
+async fn subscription_rejects_an_event_with_a_different_selected_version() {
+    let request = subscribe_request("subscribe-version-mismatch");
+    let daemon = spawn_unix_subscription_daemon(
+        response_ok_line_for(&request, json!({"subscribed": true})),
+        vec![json!({
+            "v": 1,
+            "event": "agent_state",
+            "session_id": "s-1",
+            "activity": "working",
+        })
+        .to_string()],
+    );
+
+    let client = Client::connect_local(&daemon.socket_path)
+        .await
+        .expect("connect local subscription daemon");
+    let mut subscription = client
+        .subscribe(&request)
+        .await
+        .expect("subscribe succeeds");
+    match subscription
+        .next_event()
+        .await
+        .expect_err("wrong event version must fail")
+    {
+        ClientError::Protocol(source) => assert_eq!(source.code, "version_mismatch"),
+        other => panic!("expected canonical protocol mismatch, got {other:?}"),
+    }
+    daemon
+        .task
+        .await
+        .expect("subscription daemon task completed");
+}
+
+#[tokio::test]
+async fn remote_subscription_wrong_version_event_preserves_host_context() {
+    let request = subscribe_request("subscribe-remote-version-mismatch");
+    let daemon = spawn_tcp_subscription_daemon(
+        response_ok_line_for(&request, json!({"subscribed": true})),
+        vec![json!({
+            "v": 1,
+            "event": "agent_state",
+            "session_id": "s-1",
+            "activity": "working",
+        })
+        .to_string()],
+    )
+    .await;
+
+    let client = Client::connect_tcp_addr(HOST, daemon.addr)
+        .await
+        .expect("connect remote subscription daemon");
+    let mut subscription = client
+        .subscribe(&request)
+        .await
+        .expect("subscribe succeeds");
+    match subscription
+        .next_event()
+        .await
+        .expect_err("wrong event version must fail")
+    {
+        ClientError::RemoteProtocol { host, source } => {
+            assert_eq!(host, HOST);
+            assert_eq!(source.code, "version_mismatch");
+            assert!(source.msg.contains("2..=2"));
+            assert!(source.msg.contains("1..=1"));
+        }
+        other => panic!("expected remote protocol mismatch, got {other:?}"),
     }
     daemon
         .task
@@ -383,15 +463,21 @@ async fn handle_subscription_connection<S>(
 }
 
 fn subscribe_request(id: &str) -> Request {
-    Request::new(id, protocol::method::SUBSCRIBE, Value::Null)
+    Request::new(id, protocol::method::SUBSCRIBE, Value::Null).expect("valid test request")
 }
 
 fn response_ok_line_for(request: &Request, ok: Value) -> String {
-    serde_json::to_string(&Response::ok(request.id.clone(), ok)).expect("serialize ok response")
+    serde_json::to_string(
+        &Response::ok(protocol::PROTOCOL_VERSION, request.id(), ok).expect("valid test response"),
+    )
+    .expect("serialize ok response")
 }
 
 fn response_error_line_for(request: &Request, err: ProtocolError) -> String {
-    serde_json::to_string(&Response::err(request.id.clone(), err)).expect("serialize err response")
+    serde_json::to_string(
+        &Response::err(protocol::PROTOCOL_VERSION, request.id(), err).expect("valid test response"),
+    )
+    .expect("serialize err response")
 }
 
 fn assert_sent_request(request_line: &str, expected: &Request) {

@@ -1,0 +1,30 @@
+{
+  "attention_debounce_secs": 5,
+  "attention_dedupe_window_secs": 30,
+  "enabled": {
+    "agent_blocked": true,
+    "approval_required": true,
+    "error": true,
+    "session_finished": true,
+    "system": true,
+    "turn_completed": true
+  },
+  "providers": {
+    "codex": {
+      "agent_blocked": true,
+      "approval_required": true,
+      "error": true,
+      "session_finished": true,
+      "system": true,
+      "turn_completed": false
+    },
+    "future-agent": {
+      "agent_blocked": true,
+      "approval_required": true,
+      "error": true,
+      "session_finished": true,
+      "system": false,
+      "turn_completed": true
+    }
+  }
+}

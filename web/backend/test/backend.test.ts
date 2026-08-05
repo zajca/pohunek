@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
-import type { HostRecord } from "@pohunek/protocol";
+import { PROTOCOL_VERSION, type HostRecord } from "@pohunek/protocol";
 import {
   BackendStartupError,
   startBackend,
@@ -55,7 +55,7 @@ describe("@pohunek/backend", () => {
           host: "local",
           reachability: "reachable_daemon",
           daemon_version: LOCAL_DAEMON_VERSION,
-          protocol_version: 1,
+          protocol_version: PROTOCOL_VERSION,
         },
         {
           host: PEER_HOST,
@@ -111,7 +111,7 @@ describe("@pohunek/backend", () => {
           host: "local",
           reachability: "reachable_daemon",
           daemon_version: LOCAL_DAEMON_VERSION,
-          protocol_version: 1,
+          protocol_version: PROTOCOL_VERSION,
         },
         { host: PEER_HOST, reachability: "unreachable" },
       ]);

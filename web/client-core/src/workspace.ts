@@ -112,6 +112,28 @@ export class PohunekWorkspace implements Workspace, ActionCaller, OptimisticNoti
     return connection.call(method, params);
   }
 
+  public sessionOutput(
+    host: string,
+    params: Methods["session.output"]["params"],
+  ): Promise<Methods["session.output"]["output"]> {
+    const connection = this.connections.get(host);
+    if (connection === undefined) {
+      return Promise.reject(ClientError.remoteDaemonUnavailable(host));
+    }
+    return connection.sessionOutput(params);
+  }
+
+  public sessionWait(
+    host: string,
+    params: Methods["session.wait"]["params"],
+  ): Promise<Methods["session.wait"]["output"]> {
+    const connection = this.connections.get(host);
+    if (connection === undefined) {
+      return Promise.reject(ClientError.remoteDaemonUnavailable(host));
+    }
+    return connection.sessionWait(params);
+  }
+
   public attach(
     host: string,
     sessionId: string,

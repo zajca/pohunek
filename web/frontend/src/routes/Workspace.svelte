@@ -6,7 +6,7 @@
   import type { Readable } from "svelte/store";
   import AgentBadge from "../components/AgentBadge.svelte";
   import ConnectionMarker from "../components/ConnectionMarker.svelte";
-  import type { HistoryRouter } from "../lib";
+  import { agentProfileLabel, type HistoryRouter } from "../lib";
 
   interface Props {
     router: HistoryRouter;
@@ -99,7 +99,7 @@
                   </a>
                 </td>
                 <td>{entry.host}</td>
-                <td>{entry.session.agent}</td>
+                <td>{agentProfileLabel(entry.session.agent, entry.session.agent_base)}</td>
                 <td>
                   <AgentBadge
                     activity={entry.session.activity ?? "idle"}

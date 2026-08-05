@@ -337,7 +337,7 @@ impl TranscriptIndex {
     /// Finds the best transcript candidate for `fact` and `cwd`.
     pub(crate) fn best_match(
         &self,
-        agent_base: AgentKind,
+        agent_base: &AgentKind,
         cwd: &Path,
         fact: &ProcessFact,
     ) -> Option<TranscriptCandidate> {
@@ -345,7 +345,7 @@ impl TranscriptIndex {
             .lock()
             .unwrap_or_else(MutexError::into_inner)
             .values()
-            .filter(|candidate| candidate.agent_base == agent_base)
+            .filter(|candidate| &candidate.agent_base == agent_base)
             .filter(|candidate| transcript_matches_process(candidate, cwd, fact))
             .max_by_key(|candidate| candidate.updated_at)
             .cloned()
@@ -372,7 +372,7 @@ impl TranscriptIndex {
                 if file_type.is_dir() {
                     queue.push_back(path);
                 } else if is_jsonl_path(&path) {
-                    self.upsert_path(root.agent_base, &path)?;
+                    self.upsert_path(root.agent_base.clone(), &path)?;
                 }
             }
         }
@@ -652,7 +652,7 @@ fn root_agent_for_path(roots: &[TranscriptRoot], path: &Path) -> Option<AgentKin
     roots
         .iter()
         .find(|root| path.starts_with(&root.path))
-        .map(|root| root.agent_base)
+        .map(|root| root.agent_base.clone())
 }
 
 fn provider_root(env_var: &str, home_relative: &str, transcript_subdir: &str) -> Option<PathBuf> {

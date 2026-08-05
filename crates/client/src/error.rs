@@ -3,12 +3,30 @@
 use std::io;
 use std::path::PathBuf;
 
-use protocol::{ErrorClass, ProtocolError};
+use protocol::{EnvelopeError, ErrorClass, ProtocolError, ProtocolVersion, ProtocolVersionRange};
 
 /// Errors raised by SDK client transport and remote-host discovery.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ClientError {
+    /// Exactly one inherited origin marker was present; the pair is atomic.
+    #[error("incomplete Pohunek session origin environment")]
+    IncompleteOriginEnvironment,
+    /// The inherited origin pair contained an invalid non-secret identifier.
+    #[error("invalid Pohunek session origin environment")]
+    InvalidOriginEnvironment,
+    /// A locally constructed protocol envelope violated its wire contract.
+    #[error("invalid protocol envelope: {0}")]
+    Envelope(#[from] EnvelopeError),
+
+    /// A peer selected a protocol version outside the request's negotiated range.
+    #[error("peer selected protocol version {received}, but the expected range is {expected:?}")]
+    ProtocolVersionMismatch {
+        /// Version that this connection already selected, or the request range on its first reply.
+        expected: ProtocolVersionRange,
+        /// Invalid version returned by the peer.
+        received: ProtocolVersion,
+    },
     /// The local daemon socket could not be reached.
     #[error("cannot reach the daemon at {socket}: {source}")]
     DaemonUnreachable {
@@ -110,8 +128,36 @@ pub enum ClientError {
 impl ClientError {
     /// Structured, serializable representation of this SDK client error.
     #[must_use]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one exhaustive mapping keeps SDK error codes and recovery hints centralized"
+    )]
     pub fn to_protocol_error(&self) -> protocol::ProtocolError {
         match self {
+            ClientError::IncompleteOriginEnvironment => ProtocolError::new(
+                ErrorClass::Configuration,
+                "incomplete_origin_environment",
+                "incomplete Pohunek session origin environment".to_owned(),
+                Some("set both POHUNEK_SESSION_ID and POHUNEK_DAEMON_ID, or unset both".to_owned()),
+            ),
+            ClientError::InvalidOriginEnvironment => ProtocolError::new(
+                ErrorClass::Configuration,
+                "invalid_origin_environment",
+                "invalid Pohunek session origin environment".to_owned(),
+                Some(
+                    "use bounded UTF-8 identifiers without control characters for both origin markers"
+                        .to_owned(),
+                ),
+            ),
+            ClientError::Envelope(error) => ProtocolError::new(
+                ErrorClass::Configuration,
+                "invalid_protocol_envelope",
+                format!("invalid protocol envelope: {error}"),
+                None,
+            ),
+            ClientError::ProtocolVersionMismatch { expected, received } => {
+                ProtocolError::version_mismatch(*expected, exact_version_range(*received))
+            }
             ClientError::DaemonUnreachable { socket, source } => ProtocolError::new(
                 ErrorClass::Daemon,
                 "daemon_unreachable",
@@ -204,6 +250,11 @@ impl ClientError {
     }
 }
 
+fn exact_version_range(version: ProtocolVersion) -> ProtocolVersionRange {
+    ProtocolVersionRange::new(version, version)
+        .expect("a protocol version is always a valid exact range")
+}
+
 fn netbird_error_to_protocol_error(err: &netbird::NetbirdError) -> ProtocolError {
     match err {
         netbird::NetbirdError::CliMissing => ProtocolError::netbird_cli_missing(),
@@ -222,10 +273,8 @@ fn netbird_error_to_protocol_error(err: &netbird::NetbirdError) -> ProtocolError
 
 #[cfg(test)]
 mod tests {
-    use netbird::NetbirdError;
-    use protocol::ProtocolVersion;
-
     use super::*;
+    use netbird::NetbirdError;
 
     #[test]
     fn local_daemon_unreachable_maps_to_daemon_error_with_recovery_hint() {
@@ -428,7 +477,18 @@ mod tests {
 
     #[test]
     fn remote_protocol_preserves_source_contract_and_adds_host_context() {
-        let source = ProtocolError::version_mismatch(ProtocolVersion(1), ProtocolVersion(2));
+        let source = ProtocolError::version_mismatch(
+            ProtocolVersionRange::new(
+                ProtocolVersion::new(1).expect("nonzero version"),
+                ProtocolVersion::new(1).expect("nonzero version"),
+            )
+            .expect("valid exact range"),
+            ProtocolVersionRange::new(
+                ProtocolVersion::new(2).expect("nonzero version"),
+                ProtocolVersion::new(2).expect("nonzero version"),
+            )
+            .expect("valid exact range"),
+        );
         let structured = ClientError::RemoteProtocol {
             host: "build-box".to_owned(),
             source: source.clone(),
@@ -444,7 +504,7 @@ mod tests {
             structured.msg
         );
         assert!(
-            structured.msg.contains("incompatible"),
+            structured.msg.contains("does not overlap"),
             "msg preserves source detail: {}",
             structured.msg
         );

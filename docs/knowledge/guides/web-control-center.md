@@ -54,6 +54,13 @@ focuses search, and `j`/`k` or the arrow keys move focus through session rows.
 valid session selection and rail state persist locally; a selection that is not
 present after the initial session snapshots settle is discarded.
 
+Agent presentation is capability- and inventory-driven. The creation dialog can
+show Hermes and Hermes-based profiles only when the selected host reports a
+known `agent_base` and a supported runtime; an unavailable, unsupported, or
+unknown future base is display-only. Lifecycle controls use each session's
+advertised resume/fork capabilities, so Hermes shows resume only when the
+session can recover and never offers fork.
+
 On mobile and short touch viewports, the rail is an accessible off-canvas
 drawer and the terminal expands to the available visual viewport. A touch
 toolbar focuses the software keyboard and sends Escape, Tab, Control-C, arrow

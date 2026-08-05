@@ -29,6 +29,8 @@ pub struct ProcessFact {
     pub pid: Pid,
     /// Parent process id.
     pub ppid: Pid,
+    /// Kernel process start time, used with `pid` to reject pid reuse.
+    pub start_identity: u64,
     /// Kernel task command name.
     pub comm: String,
     /// NUL-separated argv vector from `/proc/<pid>/cmdline`.
@@ -124,6 +126,13 @@ impl ExitWatch {
 
 /// OS process inspector used by session lifecycle reconciliation.
 pub trait ProcessInspector: Debug + Send + Sync + 'static {
+    /// Returns current facts for one same-user process, or `None` if it exited.
+    ///
+    /// # Errors
+    ///
+    /// Returns OS I/O errors that are not normal process-exit races.
+    fn process(&self, pid: Pid) -> io::Result<Option<ProcessFact>>;
+
     /// Returns process facts for processes owned by the current effective user.
     ///
     /// Implementations should scan the process table once and skip races where a

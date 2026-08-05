@@ -1833,6 +1833,9 @@ mod tests {
             last_agent_state: None,
             last_error: None,
             supported_agents: Vec::new(),
+            runtimes: Vec::new(),
+            notification_providers: Vec::new(),
+            observation_capabilities: pohunek_gui_core::ObservationCapabilities::default(),
         }
     }
 
@@ -1855,6 +1858,10 @@ mod tests {
         SessionInfo {
             id: session_id.clone(),
             external: Some(false),
+            capabilities: protocol::SessionCapabilities {
+                resume: true,
+                fork: true,
+            },
             name: None,
             agent: "codex".to_owned(),
             agent_base: AgentKind::Codex,

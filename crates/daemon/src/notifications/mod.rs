@@ -692,7 +692,11 @@ impl NotificationService {
         record: NotificationRecord,
     ) -> Result<NotificationCreateResult, NotificationError> {
         let window = self.policy().attention_dedupe_window_secs;
-        match self.inner.store.create_or_dedupe(record, window)? {
+        match self
+            .inner
+            .store
+            .create_or_dedupe(record, u64::from(window))?
+        {
             store::CreateOutcome::Created(record) => {
                 self.emit_created(&record);
                 self.emit_turn_supersedes_for_attention(&record)?;
@@ -757,7 +761,7 @@ impl NotificationService {
         let payload = NotificationCreatedEvent {
             record: record.clone(),
         };
-        let event = Event::new(
+        let event = crate::events::event(
             event::NOTIFICATION_CREATED,
             serde_json::to_value(payload).expect("notification_created payload serializes"),
         );
@@ -768,7 +772,7 @@ impl NotificationService {
         let payload = NotificationUpdatedEvent {
             record: record.clone(),
         };
-        let event = Event::new(
+        let event = crate::events::event(
             event::NOTIFICATION_UPDATED,
             serde_json::to_value(payload).expect("notification_updated payload serializes"),
         );
@@ -779,7 +783,7 @@ impl NotificationService {
         let payload = NotificationDeletedEvent {
             notification_id: id.clone(),
         };
-        let event = Event::new(
+        let event = crate::events::event(
             event::NOTIFICATION_DELETED,
             serde_json::to_value(payload).expect("notification_deleted payload serializes"),
         );
@@ -1191,8 +1195,7 @@ mod tests {
     fn enable_all_kinds(service: &NotificationService) {
         let mut policy = default_policy();
         policy.enabled = all_kinds_enabled_policy();
-        policy.codex = None;
-        policy.claude = None;
+        policy.providers.clear();
         service.set_policy(policy).expect("set policy");
     }
 
@@ -1674,25 +1677,27 @@ mod tests {
             .create(provider_turn_params("s-1", "codex:s-1:stop:1"))
             .expect("first turn create");
         let first_event = events.try_recv().expect("first create event");
-        assert_eq!(first_event.event, event::NOTIFICATION_CREATED);
+        assert_eq!(first_event.event(), event::NOTIFICATION_CREATED);
 
         let second = service
             .create(provider_turn_params("s-1", "codex:s-1:stop:2"))
             .expect("second turn create");
 
         let update_event = events.try_recv().expect("supersede update event");
-        assert_eq!(update_event.event, event::NOTIFICATION_UPDATED);
-        let updated =
-            serde_json::from_value::<protocol::NotificationUpdatedEvent>(update_event.payload)
-                .expect("updated payload");
+        assert_eq!(update_event.event(), event::NOTIFICATION_UPDATED);
+        let updated = serde_json::from_value::<protocol::NotificationUpdatedEvent>(
+            update_event.payload().clone(),
+        )
+        .expect("updated payload");
         assert_eq!(updated.record.id, first.record.id);
         assert_eq!(updated.record.superseded_by, Some(second.record.id.clone()));
 
         let create_event = events.try_recv().expect("replacement create event");
-        assert_eq!(create_event.event, event::NOTIFICATION_CREATED);
-        let created =
-            serde_json::from_value::<protocol::NotificationCreatedEvent>(create_event.payload)
-                .expect("created payload");
+        assert_eq!(create_event.event(), event::NOTIFICATION_CREATED);
+        let created = serde_json::from_value::<protocol::NotificationCreatedEvent>(
+            create_event.payload().clone(),
+        )
+        .expect("created payload");
         assert_eq!(created.record.id, second.record.id);
     }
 
@@ -1966,8 +1971,9 @@ mod tests {
     fn default_policy_contains_provider_specific_codex_and_claude_overrides() {
         let policy = default_policy();
 
-        assert!(policy.codex.is_some());
-        assert!(policy.claude.is_some());
+        assert!(policy.providers.contains_key("codex"));
+        assert!(policy.providers.contains_key("claude"));
+        assert!(policy.providers.contains_key("hermes"));
         assert_eq!(
             policy.attention_dedupe_window_secs,
             DEFAULT_ATTENTION_DEDUPE_WINDOW_SECS
@@ -2017,8 +2023,10 @@ mod tests {
             .expect("open service");
         let mut policy = service.policy();
         policy.enabled = only_turn_completed_disabled_policy();
-        policy.codex = Some(all_kinds_enabled_policy());
-        policy.claude = None;
+        policy
+            .providers
+            .insert("codex".to_owned(), all_kinds_enabled_policy());
+        policy.providers.remove("claude");
         service.set_policy(policy).expect("set policy");
 
         let codex_result = service
@@ -2049,8 +2057,7 @@ mod tests {
             NotificationService::open(&temp_data_dir("policy-set-live")).expect("open service");
         let mut disabled = service.policy();
         disabled.enabled = only_turn_completed_disabled_policy();
-        disabled.codex = None;
-        disabled.claude = None;
+        disabled.providers.clear();
         service.set_policy(disabled).expect("set disabled policy");
 
         let disabled_err = service
@@ -2127,8 +2134,7 @@ mod tests {
                 error: true,
                 system: true,
             },
-            codex: None,
-            claude: None,
+            providers: BTreeMap::new(),
         };
 
         service.set_policy(policy.clone()).expect("set policy");

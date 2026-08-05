@@ -299,7 +299,7 @@ impl SessionRegistry {
             let observed = choose_observed_agent(entry)?;
             return self.auto_report_observed_agent(entry, &observed, now);
         };
-        let Some(active_base) = entry.info.active_agent_base else {
+        let Some(active_base) = entry.info.active_agent_base.as_ref() else {
             return Some(clear_active_agent(
                 entry,
                 self.procwatch_tombstone_for(&active, now),
@@ -352,7 +352,7 @@ impl SessionRegistry {
         observed: &ObservedAgent,
         now: Instant,
     ) -> Option<SessionInfo> {
-        let agent = agent_kind_label(observed.agent_base).to_owned();
+        let agent = agent_kind_label(&observed.agent_base).to_owned();
         let seq = Some(self.next_procwatch_seq());
         if !report_is_current(
             entry.last_agent_report.as_ref(),
@@ -374,7 +374,7 @@ impl SessionRegistry {
         entry.active_agent = Some(report.clone());
         entry.last_agent_report = Some(report);
         entry.info.active_agent = Some(agent);
-        entry.info.active_agent_base = Some(observed.agent_base);
+        entry.info.active_agent_base = Some(observed.agent_base.clone());
         entry.info.active_agent_pid = Some(observed.pid);
         // Procwatch rebinds only after the previous pid disappears; the new
         // agent's own hook will republish native identity when available.
@@ -382,7 +382,7 @@ impl SessionRegistry {
         entry.info.active_agent_session_path = None;
         let _ = entry
             .detector_config
-            .send(DetectorConfig::for_agent(observed.agent_base));
+            .send(DetectorConfig::for_agent(&observed.agent_base));
         entry.info.updated_at = timestamp_now();
         Some(entry.info.clone())
     }
@@ -421,29 +421,29 @@ fn choose_observed_agent(entry: &SessionEntry) -> Option<ObservedAgent> {
 
 fn first_observed_agent_for_base(
     entry: &SessionEntry,
-    agent_base: AgentKind,
+    agent_base: &AgentKind,
 ) -> Option<ObservedAgent> {
     entry
         .observed_agents
         .iter()
-        .filter(|observed| observed.agent_base == agent_base)
+        .filter(|observed| &observed.agent_base == agent_base)
         .min_by_key(|observed| observed.first_seen)
         .cloned()
 }
 
-fn single_observed_pid_for_base(entry: &SessionEntry, agent_base: AgentKind) -> Option<Pid> {
+fn single_observed_pid_for_base(entry: &SessionEntry, agent_base: &AgentKind) -> Option<Pid> {
     let mut matching = entry
         .observed_agents
         .iter()
-        .filter(|observed| observed.agent_base == agent_base)
+        .filter(|observed| &observed.agent_base == agent_base)
         .map(|observed| observed.pid);
     let first = matching.next()?;
     matching.next().is_none().then_some(first)
 }
 
-fn observed_pid_matches(entry: &SessionEntry, pid: Pid, agent_base: AgentKind) -> bool {
+fn observed_pid_matches(entry: &SessionEntry, pid: Pid, agent_base: &AgentKind) -> bool {
     entry
         .observed_agents
         .iter()
-        .any(|observed| observed.pid == pid && observed.agent_base == agent_base)
+        .any(|observed| observed.pid == pid && &observed.agent_base == agent_base)
 }

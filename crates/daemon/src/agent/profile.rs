@@ -1,7 +1,7 @@
 //! Per-host agent profiles (Part C).
 //!
 //! A **profile** is a host-authored `~/.config/pohunek/agents/<name>.toml` that
-//! *extends* a compiled **base kind** (`shell`/`codex`/`claude`) with overrides for
+//! *extends* a compiled **base kind** (`shell`/`codex`/`claude`/`hermes`) with overrides for
 //! the launch program/args, the PTY env, and the input rules (resume + manifest
 //! overrides land in C2). The wire/in-repo `agent` is a **name**: it resolves —
 //! charset-guarded, fail-closed — to a host profile or a bare base kind, never to a
@@ -19,7 +19,10 @@ use protocol::{AgentKind, ErrorClass, ProtocolError};
 use serde::Deserialize;
 use tracing::warn;
 
-use super::{base_resume_template, InputRules, ResumeMode, ResumeTemplate, SessionRefKind};
+use super::{
+    adapter_for, base_capabilities, base_fork_template, base_resume_template, AgentCapabilities,
+    ForkTemplate, InputRules, ResumeMode, ResumeTemplate, SessionRefKind,
+};
 use crate::detect::Manifest;
 use crate::project::config::validate_name;
 
@@ -28,7 +31,7 @@ use crate::project::config::validate_name;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProfile {
-    /// Base kind to extend: `shell` | `codex` | `claude`.
+    /// Base kind to extend: `shell` | `codex` | `claude` | `hermes`.
     base: String,
     /// Launch program (PATH name or absolute path); defaults to the base program.
     #[serde(default)]
@@ -46,6 +49,9 @@ struct RawProfile {
     /// resume template (or non-resumable for a shell).
     #[serde(default)]
     resume: Option<RawResume>,
+    /// Fork override. Profiles may only disable a compiled base capability.
+    #[serde(default)]
+    fork: Option<RawFork>,
     /// Detection-manifest override name, resolved from `agents/manifests/<name>.toml`
     /// under the same charset + containment guard as a profile file.
     #[serde(default)]
@@ -77,6 +83,14 @@ struct RawResume {
     resumable: Option<bool>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFork {
+    /// Whether this profile retains its base kind's native fork capability.
+    #[serde(default)]
+    supported: Option<bool>,
+}
+
 /// Host-profile launch overrides. Present on a [`ResolvedAgent`] only when a
 /// profile file backed the name; a bare base kind carries `None` and launches
 /// exactly as the compiled base adapter.
@@ -97,6 +111,9 @@ pub(crate) struct ResolvedProfile {
     /// `None` ⇒ not resumable. Authoritative for a profile (does NOT fall back to
     /// the base kind when `None`).
     pub resume: Option<ResumeTemplate>,
+    /// Effective fork template. `None` means this profile cannot fork, either
+    /// because its base has no compiled fork capability or the profile disabled it.
+    pub fork: Option<ForkTemplate>,
     /// Parsed detection-manifest override; `None` ⇒ inherit the base kind's manifest.
     pub manifest: Option<Manifest>,
 }
@@ -111,6 +128,20 @@ pub(crate) struct ResolvedAgent {
     pub base: AgentKind,
     /// Host-profile overrides; `None` for a bare base kind.
     pub profile: Option<ResolvedProfile>,
+}
+
+impl ResolvedAgent {
+    /// Return the effective native recovery capabilities for this resolved agent.
+    #[must_use]
+    pub(crate) fn capabilities(&self) -> AgentCapabilities {
+        self.profile.as_ref().map_or_else(
+            || base_capabilities(&self.base),
+            |profile| AgentCapabilities {
+                resume: profile.resume,
+                fork: profile.fork,
+            },
+        )
+    }
 }
 
 /// Loads + resolves host agent profiles from `<config_dir>/agents`.
@@ -152,7 +183,7 @@ impl ProfileRegistry {
     /// Resolve an agent name (4-step chain, fail-closed):
     /// 1. A.2.1 single-segment charset guard (`invalid_name`).
     /// 2. `<dir>/<name>.toml` exists → that profile.
-    /// 3. `name ∈ {shell,codex,claude}` → the bare base kind.
+    /// 3. `name ∈ {shell,codex,claude,hermes}` → the bare base kind.
     /// 4. else → `agent_profile_not_found` (no silent fallback).
     pub(crate) fn resolve_agent(&self, name: &str) -> Result<ResolvedAgent, ProtocolError> {
         validate_name("agent", name)?;
@@ -278,17 +309,30 @@ pub(crate) fn base_kind_from_name(name: &str) -> Option<AgentKind> {
         "shell" => Some(AgentKind::Shell),
         "codex" => Some(AgentKind::Codex),
         "claude" => Some(AgentKind::Claude),
+        "hermes" => Some(AgentKind::Hermes),
         _ => None,
     }
 }
 
 /// The default launch program for a bare base kind (used when a profile omits
 /// `program`, and as the frozen snapshot program for a profile-less session).
-pub(crate) fn default_program(base: AgentKind) -> String {
+pub(crate) fn default_program(base: &AgentKind) -> String {
     match base {
         AgentKind::Shell => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned()),
         AgentKind::Codex => "codex".to_owned(),
         AgentKind::Claude => "claude".to_owned(),
+        AgentKind::Hermes => "hermes".to_owned(),
+        AgentKind::Unknown(_) => "pohunek-unsupported-agent".to_owned(),
+    }
+}
+
+/// The compiled launch arguments for a bare base kind.
+pub(crate) fn default_args(base: &AgentKind) -> Vec<String> {
+    match base {
+        AgentKind::Hermes => vec!["chat".to_owned()],
+        AgentKind::Shell | AgentKind::Codex | AgentKind::Claude | AgentKind::Unknown(_) => {
+            Vec::new()
+        }
     }
 }
 
@@ -315,7 +359,7 @@ fn load_profile(name: &str, path: &Path, dir: &Path) -> Result<ResolvedAgent, Pr
             "base = \"shell\" cannot set resume.resumable = true (a shell has no native resume)",
         ));
     }
-    let program = raw.program.unwrap_or_else(|| default_program(base));
+    let program = raw.program.unwrap_or_else(|| default_program(&base));
     let args = raw.args.unwrap_or_default();
     // Every `POHUNEK_`-prefixed key is reserved for the daemon handshake; strip the
     // whole prefix so a profile can never shadow `POHUNEK_ENV`/`_PROTOCOL_VERSION`/…
@@ -325,11 +369,14 @@ fn load_profile(name: &str, path: &Path, dir: &Path) -> Result<ResolvedAgent, Pr
         .into_iter()
         .filter(|(key, _)| !key.starts_with("POHUNEK_"))
         .collect();
-    let input_rules = raw.input_rules.map(|rules| InputRules {
-        bracketed_paste: rules.bracketed_paste.unwrap_or(false),
-        submit_delay: Duration::from_millis(rules.submit_delay_ms.unwrap_or(0)),
+    let input_rules = raw.input_rules.map(|rules| {
+        adapter_for(&base).input_rules().with_framing(
+            rules.bracketed_paste.unwrap_or(false),
+            Duration::from_millis(rules.submit_delay_ms.unwrap_or(0)),
+        )
     });
-    let resume = resolve_resume(name, base, raw.resume.as_ref())?;
+    let resume = resolve_resume(name, &base, raw.resume.as_ref())?;
+    let fork = resolve_fork(name, &base, raw.resume.as_ref(), raw.fork.as_ref())?;
     let manifest = resolve_manifest(name, dir, raw.manifest.as_deref())?;
     Ok(ResolvedAgent {
         name: name.to_owned(),
@@ -340,6 +387,7 @@ fn load_profile(name: &str, path: &Path, dir: &Path) -> Result<ResolvedAgent, Pr
             env,
             input_rules,
             resume,
+            fork,
             manifest,
         }),
     })
@@ -351,7 +399,7 @@ fn load_profile(name: &str, path: &Path, dir: &Path) -> Result<ResolvedAgent, Pr
 /// (authoritative — never falls back to the base kind).
 fn resolve_resume(
     name: &str,
-    base: AgentKind,
+    base: &AgentKind,
     raw: Option<&RawResume>,
 ) -> Result<Option<ResumeTemplate>, ProtocolError> {
     let base_template = base_resume_template(base);
@@ -362,6 +410,15 @@ fn resolve_resume(
     if !raw.resumable.unwrap_or(base_template.is_some()) {
         return Ok(None);
     }
+    resolve_resume_operation(name, base_template, raw).map(Some)
+}
+
+/// Resolve the argv and reference shape independently of resume availability.
+fn resolve_resume_operation(
+    name: &str,
+    base_template: Option<ResumeTemplate>,
+    raw: &RawResume,
+) -> Result<ResumeTemplate, ProtocolError> {
     let mode = match raw.mode.as_deref() {
         Some(value) => parse_resume_mode(name, value)?,
         None => base_template.map(|template| template.mode).ok_or_else(|| {
@@ -375,7 +432,46 @@ fn resolve_resume(
         Some(value) => parse_ref_kind(name, value)?,
         None => base_template.map_or(SessionRefKind::Id, |template| template.ref_kind),
     };
-    Ok(Some(ResumeTemplate { mode, ref_kind }))
+    Ok(ResumeTemplate { mode, ref_kind })
+}
+
+/// Resolve a profile's effective native fork capability.
+///
+/// Profiles inherit the compiled base capability unless they explicitly set
+/// `fork.supported = false`. Any base may state that explicit disable; enabling
+/// is rejected unless the compiled base owns native fork semantics.
+fn resolve_fork(
+    name: &str,
+    base: &AgentKind,
+    raw_resume: Option<&RawResume>,
+    raw_fork: Option<&RawFork>,
+) -> Result<Option<ForkTemplate>, ProtocolError> {
+    let base_template = base_fork_template(base);
+    if raw_fork.and_then(|raw| raw.supported) == Some(false) {
+        return Ok(None);
+    }
+    let Some(base_template) = base_template else {
+        if raw_fork.and_then(|raw| raw.supported) != Some(true) {
+            return Ok(None);
+        }
+        return Err(invalid_profile(
+            name,
+            "fork.supported = true requires a base kind with native fork support",
+        ));
+    };
+    let resume = raw_resume.map_or(Ok(base_template.resume), |raw| {
+        resolve_resume_operation(name, Some(base_template.resume), raw)
+    })?;
+    if resume.mode == ResumeMode::Subcommand {
+        return Err(invalid_profile(
+            name,
+            "resume.mode = \"subcommand\" requires fork.supported = false for this base kind",
+        ));
+    }
+    Ok(Some(ForkTemplate {
+        resume,
+        mode: base_template.mode,
+    }))
 }
 
 fn parse_resume_mode(name: &str, value: &str) -> Result<ResumeMode, ProtocolError> {
@@ -437,7 +533,7 @@ pub(crate) fn agent_profile_not_found(name: &str) -> ProtocolError {
         "agent_profile_not_found",
         format!("no agent profile or base kind named '{name}' on this host"),
         Some(
-            "use shell|codex|claude, or add ~/.config/pohunek/agents/<name>.toml on the target host"
+            "use shell|codex|claude|hermes, or add ~/.config/pohunek/agents/<name>.toml on the target host"
                 .to_owned(),
         ),
     )
@@ -483,6 +579,7 @@ mod tests {
             ("shell", AgentKind::Shell),
             ("codex", AgentKind::Codex),
             ("claude", AgentKind::Claude),
+            ("hermes", AgentKind::Hermes),
         ] {
             let resolved = reg.resolve_agent(name).expect("base kind resolves");
             assert_eq!(resolved.base, base);
@@ -561,6 +658,52 @@ mod tests {
             .resolve_agent("myshell")
             .expect_err("shell+resumable rejected");
         assert_eq!(err.code, "invalid_profile");
+    }
+
+    #[test]
+    fn hermes_profile_resolves_program_args_resume_and_no_fork() {
+        let dir = tmp_agents_dir("hermes-profile");
+        write_profile(
+            &dir,
+            "hermes-work",
+            "base = \"hermes\"\nprogram = \"hermes-wrapper\"\nargs = [\"-p\", \"work\", \"chat\"]\n[input_rules]\nbracketed_paste = false\nsubmit_delay_ms = 25\n",
+        );
+        let resolved = ProfileRegistry::new(Some(dir))
+            .resolve_agent("hermes-work")
+            .expect("Hermes profile resolves");
+
+        assert_eq!(resolved.base, AgentKind::Hermes);
+        let profile = resolved.profile.expect("profile overrides");
+        assert_eq!(profile.program, "hermes-wrapper");
+        assert_eq!(profile.args, vec!["-p", "work", "chat"]);
+        let input_rules = profile.input_rules.expect("framing override");
+        assert!(!input_rules.bracketed_paste);
+        assert_eq!(input_rules.submit_delay, Duration::from_millis(25));
+        assert!(input_rules.validate_text("unsafe\u{1b}[201~").is_err());
+        assert!(!input_rules.allows_while_blocked());
+        assert_eq!(
+            profile.resume,
+            Some(ResumeTemplate {
+                mode: ResumeMode::Flag,
+                ref_kind: SessionRefKind::Id,
+            })
+        );
+        assert_eq!(profile.fork, None);
+    }
+
+    #[test]
+    fn hermes_profile_cannot_enable_unsupported_fork() {
+        let dir = tmp_agents_dir("hermes-fork");
+        write_profile(
+            &dir,
+            "hermes-fork",
+            "base = \"hermes\"\n[fork]\nsupported = true\n",
+        );
+
+        let error = ProfileRegistry::new(Some(dir))
+            .resolve_agent("hermes-fork")
+            .expect_err("Hermes has no compiled fork semantics");
+        assert_eq!(error.code, "invalid_profile");
     }
 
     #[test]
@@ -658,7 +801,7 @@ mod tests {
         write_profile(
             &dir,
             "weird",
-            "base = \"claude\"\n[resume]\nmode = \"subcommand\"\nref_kind = \"path\"\n",
+            "base = \"claude\"\n[resume]\nmode = \"subcommand\"\nref_kind = \"path\"\n[fork]\nsupported = false\n",
         );
         let reg = ProfileRegistry::new(Some(dir));
         let resume = reg
@@ -695,6 +838,105 @@ mod tests {
             resume, None,
             "resumable=false is authoritative, not base-fallback"
         );
+    }
+
+    #[test]
+    fn fork_capability_inherits_or_can_be_explicitly_disabled() {
+        let dir = tmp_agents_dir("fork-capability");
+        write_profile(&dir, "inherits", "base = \"claude\"\n");
+        write_profile(
+            &dir,
+            "disabled",
+            "base = \"claude\"\n[fork]\nsupported = false\n",
+        );
+        let reg = ProfileRegistry::new(Some(dir));
+
+        assert_eq!(
+            reg.resolve_agent("inherits")
+                .expect("inherits profile")
+                .profile
+                .expect("profile")
+                .fork,
+            base_fork_template(&AgentKind::Claude)
+        );
+        assert_eq!(
+            reg.resolve_agent("disabled")
+                .expect("disabled profile")
+                .profile
+                .expect("profile")
+                .fork,
+            None
+        );
+    }
+
+    #[test]
+    fn profile_cannot_enable_fork_for_an_unsupported_base() {
+        let dir = tmp_agents_dir("fork-enable-invalid");
+        write_profile(
+            &dir,
+            "invalid",
+            "base = \"codex\"\n[fork]\nsupported = true\n",
+        );
+        let reg = ProfileRegistry::new(Some(dir));
+
+        let err = reg
+            .resolve_agent("invalid")
+            .expect_err("codex cannot invent fork support");
+        assert_eq!(err.code, "invalid_profile");
+        assert!(err.msg.contains("native fork support"));
+    }
+
+    #[test]
+    fn unsupported_base_may_explicitly_keep_fork_disabled() {
+        let dir = tmp_agents_dir("fork-disable-codex");
+        write_profile(
+            &dir,
+            "codex-no-fork",
+            "base = \"codex\"\n[fork]\nsupported = false\n",
+        );
+        let reg = ProfileRegistry::new(Some(dir));
+
+        let profile = reg
+            .resolve_agent("codex-no-fork")
+            .expect("explicit disable is valid")
+            .profile
+            .expect("profile");
+        assert_eq!(profile.fork, None);
+    }
+
+    #[test]
+    fn claude_may_disable_resume_while_inheriting_fork() {
+        let dir = tmp_agents_dir("fork-without-resume");
+        write_profile(
+            &dir,
+            "fork-only",
+            "base = \"claude\"\n[resume]\nresumable = false\n",
+        );
+        let reg = ProfileRegistry::new(Some(dir));
+
+        let capabilities = reg
+            .resolve_agent("fork-only")
+            .expect("fork-only profile")
+            .capabilities();
+        assert_eq!(capabilities.resume, None);
+        assert_eq!(capabilities.fork, base_fork_template(&AgentKind::Claude));
+    }
+
+    #[test]
+    fn inherited_claude_fork_rejects_subcommand_resume_override() {
+        let dir = tmp_agents_dir("fork-subcommand-invalid");
+        write_profile(
+            &dir,
+            "invalid-fork-shape",
+            "base = \"claude\"\n[resume]\nmode = \"subcommand\"\n",
+        );
+        let reg = ProfileRegistry::new(Some(dir));
+
+        let err = reg
+            .resolve_agent("invalid-fork-shape")
+            .expect_err("subcommand fork shape must be rejected explicitly");
+        assert_eq!(err.code, "invalid_profile");
+        assert!(err.msg.contains("fork.supported = false"));
     }
 
     #[test]

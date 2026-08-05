@@ -339,10 +339,10 @@ async fn drain_buffered_agent_state_events(
 }
 
 fn parse_agent_state_event(event: &Event) -> Option<(SessionId, AgentActivity)> {
-    if event.event != event::AGENT_STATE {
+    if event.event() != event::AGENT_STATE {
         return None;
     }
-    let payload = event.payload.as_object()?;
+    let payload = event.payload().as_object()?;
     let session_id = payload.get("session_id")?.as_str()?;
     let activity_value = payload.get("activity")?;
     let activity = match parse_agent_activity(activity_value) {

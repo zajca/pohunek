@@ -20,9 +20,9 @@ fn notifications_subcommands_parse() {
             "--severity",
             "action_required",
             "--agent",
-            "codex",
+            "hermes",
             "--provider",
-            "codex",
+            "hermes",
             "--session",
             "s-1",
             "--limit",
@@ -50,7 +50,7 @@ fn notifications_subcommands_parse() {
             "policy",
             "set",
             "--provider",
-            "codex",
+            "hermes",
             "--kind",
             "turn_completed",
             "--enabled",
@@ -117,9 +117,9 @@ fn notifications_rejects_host_and_all_hosts() {
     let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
     let doc: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|err| panic!("stdout must be JSON ({err}): {stdout:?}"));
-    assert_eq!(doc["code"], "cli_usage");
+    assert_eq!(doc["err"]["code"], "cli_usage");
     assert!(
-        doc["msg"]
+        doc["err"]["msg"]
             .as_str()
             .is_some_and(|msg| { msg.contains("--host") && msg.contains("--all-hosts") }),
         "usage message should name both arguments: {doc:?}"

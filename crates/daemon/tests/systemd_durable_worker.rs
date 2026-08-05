@@ -4,7 +4,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pohunek_client::{Client, ClientOptions};
-use pohunek_daemon::agent::InputRules;
+use pohunek_daemon::agent::{ForkMode, InputRules};
 use pohunek_daemon::runtime::Worker;
 use pohunek_daemon::store::{
     DesiredState, ResumeBinding, RuntimeRecord, SessionRecord, Store, StoredInputRules,
@@ -15,8 +15,8 @@ use pohunek_worker_protocol::{
 };
 use protocol::{
     method, AgentActivity, AgentKind, AttachHeader, CwdSource, RuntimeState, SessionAttachParams,
-    SessionId, SessionInfo, SessionInputParams, SessionResizeParams, SessionRuntime, SessionState,
-    StateSource, PROTOCOL_VERSION,
+    SessionCapabilities, SessionId, SessionInfo, SessionInputParams, SessionResizeParams,
+    SessionRuntime, SessionState, StateSource, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -534,6 +534,10 @@ impl Fixture {
         let info = SessionInfo {
             id: SessionId(session_id.to_owned()),
             external: Some(false),
+            capabilities: SessionCapabilities {
+                resume: true,
+                fork: true,
+            },
             name: Some("systemd durability e2e".to_owned()),
             agent: "claude".to_owned(),
             agent_base: AgentKind::Claude,
@@ -542,6 +546,7 @@ impl Fixture {
             pid: child_pid,
             runtime: Some(SessionRuntime {
                 state: RuntimeState::Live,
+                runtime_generation: protocol::RuntimeGeneration::new(1),
                 worker_id: Some(worker_id.to_owned()),
                 runtime_id: Some(runtime_id.to_owned()),
                 started_at: Some(now.clone()),
@@ -595,14 +600,19 @@ impl Fixture {
                     metadata: BTreeMap::new(),
                     program: "/bin/sh".to_owned(),
                     args: vec!["-c".to_owned(), "while :; do sleep 1; done".to_owned()],
-                    input_rules: StoredInputRules::from(InputRules {
-                        bracketed_paste: false,
-                        submit_delay: Duration::from_millis(150),
-                    }),
+                    input_rules: StoredInputRules::from(InputRules::unrestricted(
+                        false,
+                        Duration::from_millis(150),
+                    )),
                     resume_mode: Some(pohunek_daemon::agent::ResumeMode::Flag),
                     ref_kind: Some(pohunek_daemon::agent::SessionRefKind::Id),
                     resumable: true,
+                    fork_mode: Some(ForkMode::ClaudeSession),
+                    fork_resume_mode: Some(pohunek_daemon::agent::ResumeMode::Flag),
+                    fork_ref_kind: Some(pohunek_daemon::agent::SessionRefKind::Id),
+                    forkable: true,
                 }),
+                native_identity_ordering: None,
                 runtime: RuntimeRecord {
                     state: RuntimeState::Live,
                     worker_id: Some(worker_id.to_owned()),

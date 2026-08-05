@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { HostedSession, Workspace } from "@pohunek/client-core";
-  import { addErrorToast, addToast } from "../lib";
+  import { addErrorToast, addToast, hasKnownSessionAgentBases } from "../lib";
   import ConfirmDialog from "./ConfirmDialog.svelte";
   import FormDialog from "./FormDialog.svelte";
 
@@ -23,7 +23,12 @@
   let generation = 0;
 
   const session = $derived(entry.session);
-  const writable = $derived(session.external !== true);
+  // Unknown future agents are presentation-only until this client understands
+  // their mutation semantics. Resume and fork remain capability-driven below.
+  const writable = $derived(
+    session.external !== true
+      && hasKnownSessionAgentBases(session.agent_base, session.active_agent_base),
+  );
   const canStop = $derived(
     session.runtime === undefined
       ? session.state === "running" || session.state === "starting"
@@ -31,13 +36,9 @@
         || session.runtime.state === "live"
         || session.runtime.state === "reconnecting",
   );
-  const canRecover = $derived(
-    session.runtime?.state === "lost"
-      || session.runtime?.state === "terminal"
-      || session.state === "done"
-      || session.state === "failed"
-      || session.state === "stopped",
-  );
+  const canRecover = $derived(isResumableState(session));
+  const canResume = $derived(canResumeSession(session));
+  const canFork = $derived(session.capabilities.fork);
 
   function openRename(): void {
     nameDraft = session.name ?? "";
@@ -82,10 +83,30 @@
   }
 
   async function resume(): Promise<void> {
+    const currentSession = entry.session;
+    if (pending || !canResumeSession(currentSession)) {
+      return;
+    }
     await mutate(async (): Promise<void> => {
-      await workspace.actions.sessionResume(entry.host, session.id);
+      await workspace.actions.sessionResume(entry.host, currentSession.id);
       addToast("success", "Session resumed");
     });
+  }
+
+  function isResumableState(candidate: HostedSession["session"]): boolean {
+    if (candidate.runtime !== undefined) {
+      return candidate.runtime.state === "lost" || candidate.runtime.state === "terminal";
+    }
+    return candidate.state === "done" || candidate.state === "failed" || candidate.state === "stopped";
+  }
+
+  function hasNativeReference(candidate: HostedSession["session"]): boolean {
+    return (candidate.native_session_id?.length ?? 0) > 0
+      || (candidate.native_session_path?.length ?? 0) > 0;
+  }
+
+  function canResumeSession(candidate: HostedSession["session"]): boolean {
+    return candidate.capabilities.resume && isResumableState(candidate) && hasNativeReference(candidate);
   }
 
   async function fork(): Promise<void> {
@@ -138,14 +159,27 @@
     {/if}
     {#if canStop}
       <button type="button" onclick={() => { confirmStop = true; }} disabled={pending}>Stop</button>
-    {:else if canRecover}
+    {:else if canResume}
       <button type="button" onclick={() => void resume()} disabled={pending}>Resume</button>
+    {:else if canRecover && !session.capabilities.resume}
+      <button type="button" disabled title="This session's agent adapter does not support native resume">
+        Resume unsupported
+      </button>
+    {:else if canRecover}
+      <button type="button" disabled title="This session has no usable native resume reference">
+        Resume unavailable
+      </button>
     {:else}
       <button type="button" disabled title="Resolve the runtime conflict or incompatibility before recovery">
         Resume unavailable
       </button>
     {/if}
-    <button type="button" onclick={openFork} disabled={pending}>Fork</button>
+    <button
+      type="button"
+      onclick={openFork}
+      disabled={pending || !canFork}
+      title={canFork ? "Fork this native agent conversation" : "This session's agent adapter does not support native fork"}
+    >{canFork ? "Fork" : "Fork unsupported"}</button>
     <button class="button-danger" type="button" onclick={() => { confirmRemove = true; }} disabled={pending}>
       Remove
     </button>

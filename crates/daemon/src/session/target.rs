@@ -12,11 +12,11 @@ use super::{
     build_pty_command, debug, detect_at, event, launch_adapter_for, plan_initial_input_delivery,
     runtime_error, timestamp_now, warn, watch, AgentKind, Arc, CancellationToken, CwdSource,
     DesiredState, DetectedProject, DetectorConfig, InputRules, LaunchCommand, LaunchOpts, Manifest,
-    Notify, PathBuf, ProjectRecord, ProtocolError, ResolvedAgent, ResumeBinding, ResumeSnapshot,
-    RuntimeHandle, RuntimeRecord, RuntimeState, SessionEntry, SessionId, SessionInfo,
-    SessionNewParams, SessionRecord, SessionRefKind, SessionRegistry, SessionRuntime, SessionState,
-    SessionTransaction, SessionWarning, ShellCommand, StateSource, TransactionKind, Worker,
-    WorkerLaunchMode, WorktreeRequest, DEFAULT_WORKER_SUBSCRIBER_BYTES,
+    Notify, Ordering, PathBuf, ProjectRecord, ProtocolError, ResolvedAgent, ResumeBinding,
+    ResumeSnapshot, RuntimeHandle, RuntimeRecord, RuntimeState, RuntimeWatchIdentity, SessionEntry,
+    SessionId, SessionInfo, SessionNewParams, SessionRecord, SessionRefKind, SessionRegistry,
+    SessionRuntime, SessionState, SessionTransaction, SessionWarning, ShellCommand, StateSource,
+    TransactionKind, Worker, WorkerLaunchMode, WorktreeRequest, DEFAULT_WORKER_SUBSCRIBER_BYTES,
     DEFAULT_WORKER_TERMINAL_RETENTION, DEFAULT_WORKER_WRITE_DEDUP_ENTRIES,
     SESSION_RECORD_SCHEMA_VERSION, WORKER_CONNECT_RETRY,
 };
@@ -70,6 +70,29 @@ pub(super) struct PtySessionSpec {
     pub(super) warnings: Vec<SessionWarning>,
 }
 
+fn next_runtime_generation(
+    registration: &PtyRegistration,
+) -> Result<protocol::RuntimeGeneration, ProtocolError> {
+    match registration {
+        PtyRegistration::Create => Ok(protocol::RuntimeGeneration::new(1)),
+        PtyRegistration::Recover {
+            previous_runtime_generation,
+            ..
+        } => previous_runtime_generation
+            .get()
+            .checked_add(1)
+            .map(protocol::RuntimeGeneration::new)
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    protocol::ErrorClass::Runtime,
+                    "runtime_generation_exhausted",
+                    "session runtime generation counter is exhausted",
+                    Some("create a new logical session instead of resuming this one".to_owned()),
+                )
+            }),
+    }
+}
+
 /// Durable lifecycle context for a PTY runtime launch.
 #[derive(Debug, Clone)]
 pub(super) enum PtyRegistration {
@@ -83,6 +106,8 @@ pub(super) enum PtyRegistration {
         previous_worker_id: Option<String>,
         /// Runtime generation being replaced, when known.
         previous_runtime_id: Option<String>,
+        /// Monotonic generation being replaced.
+        previous_runtime_generation: protocol::RuntimeGeneration,
         /// Original logical-session creation time.
         created_at: String,
         /// Cancels reconnect attempts owned by the superseded runtime.
@@ -415,6 +440,11 @@ impl SessionRegistry {
             PtyRegistration::Create => timestamp_now(),
             PtyRegistration::Recover { created_at, .. } => created_at.clone(),
         };
+        let capabilities = protocol::SessionCapabilities {
+            resume: snapshot.resume.is_some(),
+            fork: snapshot.fork.is_some(),
+        };
+        let runtime_generation = next_runtime_generation(&registration)?;
         let (
             transaction_id,
             transaction_kind,
@@ -444,6 +474,7 @@ impl SessionRegistry {
         };
         let preparing_runtime = SessionRuntime {
             state: RuntimeState::Starting,
+            runtime_generation,
             worker_id: None,
             runtime_id: None,
             started_at: None,
@@ -453,9 +484,10 @@ impl SessionRegistry {
         let preparing_info = SessionInfo {
             id: id.clone(),
             external: Some(false),
+            capabilities,
             name: name.clone(),
             agent: agent.clone(),
-            agent_base,
+            agent_base: agent_base.clone(),
             cwd: cwd.clone(),
             cwd_source: Some(CwdSource::Launch),
             pid: 0,
@@ -496,11 +528,12 @@ impl SessionRegistry {
                 previous_runtime_id: previous_runtime_id.clone(),
             }),
             info: preparing_info,
+            native_identity_ordering: None,
             recovery: Some(ResumeBinding {
                 session_id: id.0.clone(),
                 name: name.clone(),
                 agent: agent.clone(),
-                agent_base,
+                agent_base: agent_base.clone(),
                 cwd: cwd.clone(),
                 cols,
                 rows,
@@ -515,6 +548,10 @@ impl SessionRegistry {
                 resume_mode: snapshot.resume.map(|template| template.mode),
                 ref_kind: snapshot.resume.map(|template| template.ref_kind),
                 resumable: snapshot.resume.is_some(),
+                fork_mode: snapshot.fork.map(|template| template.mode),
+                fork_resume_mode: snapshot.fork.map(|template| template.resume.mode),
+                fork_ref_kind: snapshot.fork.map(|template| template.resume.ref_kind),
+                forkable: snapshot.fork.is_some(),
             }),
             runtime: RuntimeRecord {
                 state: RuntimeState::Starting,
@@ -538,12 +575,13 @@ impl SessionRegistry {
             .start_runtime(
                 &id,
                 &agent,
-                agent_base,
-                snapshot.resume.map(|template| template.ref_kind),
+                agent_base.clone(),
+                snapshot.native_ref_kind(),
                 command,
                 &transaction_id,
                 replace_worker,
                 previous_worker_id.as_deref(),
+                runtime_generation,
             )
             .await
         {
@@ -560,7 +598,7 @@ impl SessionRegistry {
         let runtime_watch_cancel = CancellationToken::new();
         let procwatch_rescan = Arc::new(Notify::new());
         let (detector_resize, detector_resize_rx) = watch::channel((rows, cols));
-        let default_detector_config = DetectorConfig::for_profile(agent_base, manifest_override);
+        let default_detector_config = DetectorConfig::for_profile(&agent_base, manifest_override);
         let (detector_config, detector_config_rx) = watch::channel(default_detector_config.clone());
         let root_pid = started.root_pid;
 
@@ -568,6 +606,7 @@ impl SessionRegistry {
         let info = SessionInfo {
             id: id.clone(),
             external: Some(false),
+            capabilities,
             name,
             agent,
             agent_base,
@@ -601,36 +640,29 @@ impl SessionRegistry {
             exit_code: None,
         };
 
-        let committed = {
-            let mut sessions = self.inner.sessions.lock().await;
-            sessions.insert(
-                id.clone(),
-                SessionEntry {
-                    info: info.clone(),
-                    runtime: started.handle.clone(),
-                    desired_state: DesiredState::Running,
-                    detector_cancel: detector_cancel.clone(),
-                    detector_resize,
-                    detector_config,
-                    default_detector_config,
-                    procwatch_cancel: procwatch_cancel.clone(),
-                    runtime_watch_cancel: runtime_watch_cancel.clone(),
-                    procwatch_rescan: Arc::clone(&procwatch_rescan),
-                    stopping: false,
-                    input_rules,
-                    snapshot,
-                    active_agent: None,
-                    last_agent_report: None,
-                    observed_agents: Vec::new(),
-                },
-            );
-            let entry = sessions
-                .get(&id)
-                .expect("session was inserted immediately above");
-            Self::session_record(&id, entry, DesiredState::Running, None)
+        let entry = SessionEntry {
+            info: info.clone(),
+            runtime: started.handle.clone(),
+            desired_state: DesiredState::Running,
+            detector_cancel: detector_cancel.clone(),
+            detector_resize,
+            detector_config,
+            default_detector_config,
+            procwatch_cancel: procwatch_cancel.clone(),
+            runtime_watch_cancel: runtime_watch_cancel.clone(),
+            procwatch_rescan: Arc::clone(&procwatch_rescan),
+            stopping: false,
+            input_rules,
+            snapshot,
+            active_agent: None,
+            last_agent_report: None,
+            last_native_report: None,
+            observed_agents: Vec::new(),
         };
-
-        self.write_session_record(committed).await?;
+        if let Err(error) = self.commit_session_entry(&id, entry).await {
+            self.stop_uncommitted_runtime(&id, &started.handle).await;
+            return Err(error);
+        }
         match registration {
             PtyRegistration::Create => self.emit(event::SESSION_CREATED, &info),
             PtyRegistration::Recover {
@@ -647,15 +679,48 @@ impl SessionRegistry {
             detector_config_rx,
         );
         self.spawn_procwatch(id.clone(), root_pid, procwatch_cancel, procwatch_rescan);
+        let expected = RuntimeWatchIdentity::from_info(&info)
+            .expect("committed live runtime has a complete watcher identity");
         match started.handle {
             RuntimeHandle::Worker(worker) => {
-                self.spawn_worker_exit_watcher(id, worker, runtime_watch_cancel);
+                self.spawn_worker_exit_watcher(id, worker, expected, runtime_watch_cancel);
             }
             RuntimeHandle::Unavailable(state) => {
                 return Err(super::unavailable_runtime_error(&id, state));
             }
         }
         Ok(info)
+    }
+
+    pub(super) async fn commit_session_entry(
+        &self,
+        id: &SessionId,
+        entry: SessionEntry,
+    ) -> Result<(), ProtocolError> {
+        let committed = Self::session_record(id, &entry, DesiredState::Running, None);
+        self.write_session_record(committed).await?;
+        self.inner.sessions.lock().await.insert(id.clone(), entry);
+        Ok(())
+    }
+
+    async fn stop_uncommitted_runtime(&self, id: &SessionId, runtime: &RuntimeHandle) {
+        let RuntimeHandle::Worker(worker) = runtime else {
+            return;
+        };
+        let transaction = format!(
+            "rollback-{}",
+            self.inner.next_write_id.fetch_add(1, Ordering::Relaxed)
+        );
+        let Ok(transaction) = TransactionId::new(transaction) else {
+            return;
+        };
+        if let Err(error) = worker.stop(transaction).await {
+            warn!(
+                session_id = %id.0,
+                error = %error,
+                "failed to stop an uncommitted session runtime"
+            );
+        }
     }
 
     #[expect(
@@ -676,6 +741,7 @@ impl SessionRegistry {
         transaction_id: &str,
         replace_worker: bool,
         previous_worker_id: Option<&str>,
+        runtime_generation: protocol::RuntimeGeneration,
     ) -> Result<StartedRuntime, ProtocolError> {
         let Some(worker_root) = self.inner.config.worker_runtime_root.as_ref() else {
             return Err(runtime_error(
@@ -776,7 +842,7 @@ impl SessionRegistry {
                 expected_worker_id: worker_id.clone(),
                 launch: WorkerLaunchIdentity {
                     agent: agent.to_owned(),
-                    agent_base: super::agent_kind_label(agent_base).to_owned(),
+                    agent_base: super::agent_kind_label(&agent_base).to_owned(),
                     reference_kind: reference_kind.map(|kind| match kind {
                         SessionRefKind::Id => "id".to_owned(),
                         SessionRefKind::Path => "path".to_owned(),
@@ -813,6 +879,7 @@ impl SessionRegistry {
             root_pid: child.pid,
             runtime_info: Some(SessionRuntime {
                 state: RuntimeState::Live,
+                runtime_generation,
                 worker_id: Some(worker_id.to_string()),
                 runtime_id: Some(runtime_id.to_string()),
                 started_at: Some(connected_at.clone()),
@@ -860,6 +927,7 @@ pub(super) async fn open_detector_output(
                         | FrameKind::Close { .. } => {}
                         FrameKind::Open { .. }
                         | FrameKind::AttachReady { .. }
+                        | FrameKind::ObservationStart { .. }
                         | FrameKind::Input { .. } => {
                             warn!("worker detector received an invalid server frame");
                             break;
@@ -880,31 +948,44 @@ pub(super) async fn open_detector_output(
 pub(super) fn build_launch_command(
     resolved: &ResolvedAgent,
     shell_command: &ShellCommand,
-    cwd: PathBuf,
-    cols: u16,
-    rows: u16,
-    env_extra: Vec<(String, String)>,
+    opts: &LaunchOpts,
     initial_input: Option<String>,
 ) -> Result<LaunchCommandPlan, ProtocolError> {
     // Shell carries no agent-hook handshake, but it does carry the universal
     // `POHUNEK_SESSION_ID` marker (see `session_pty_env`) so a `pohunek attach`
     // launched inside it is still caught as a self-feeding loop.
-    let opts = LaunchOpts {
-        cwd,
-        cols,
-        rows,
-        env_extra,
-    };
     let command = match &resolved.profile {
         // A host profile overrides the launch program/args; build via the shared
-        // PATH-resolving primitive (the same one the base adapters use).
-        Some(profile) => build_pty_command(&profile.program, profile.args.clone(), &opts)?,
+        // PATH-resolving primitive (the same one the base adapters use). When the
+        // options carry a validated program, that exact path bypasses resolution.
+        Some(profile) => build_pty_command(&profile.program, profile.args.clone(), opts)?,
         // A bare base kind launches exactly as the compiled adapter.
-        None => launch_adapter_for(resolved.base, shell_command).launch(&opts)?,
+        None => launch_adapter_for(&resolved.base, shell_command).launch(opts)?,
     };
     Ok(plan_initial_input_delivery(
         resolved,
         command,
         initial_input,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_generation_increment_fails_closed_at_u64_max() {
+        let registration = PtyRegistration::Recover {
+            transaction_id: "recover-overflow".to_owned(),
+            previous_worker_id: None,
+            previous_runtime_id: None,
+            previous_runtime_generation: protocol::RuntimeGeneration::new(u64::MAX),
+            created_at: "2026-08-04T00:00:00Z".to_owned(),
+            runtime_watch_cancel: CancellationToken::new(),
+        };
+
+        let error = next_runtime_generation(&registration)
+            .expect_err("runtime generation must never wrap or saturate");
+        assert_eq!(error.code, "runtime_generation_exhausted");
+    }
 }

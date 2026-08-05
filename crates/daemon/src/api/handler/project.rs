@@ -14,7 +14,7 @@ use protocol::{
     ProjectShowParams, ProtocolError, Request, Response,
 };
 
-use super::util::{ok_value, parse_optional_params, parse_params};
+use super::util::{error_value, ok_value, parse_optional_params, parse_params};
 use crate::project::{LiveSession, ProjectConfigResolver, ProjectManager};
 use crate::session::SessionRegistry;
 
@@ -25,8 +25,8 @@ fn require_projects(
     sessions: &SessionRegistry,
 ) -> Result<Arc<ProjectManager>, Response> {
     sessions.projects().ok_or_else(|| {
-        Response::err(
-            request.id.clone(),
+        error_value(
+            request,
             ProtocolError::new(
                 protocol::ErrorClass::Daemon,
                 "projects_not_configured",
@@ -77,7 +77,7 @@ pub(super) fn live_sessions(infos: Vec<protocol::SessionInfo>) -> Vec<LiveSessio
 pub(super) async fn handle_project_list(request: &Request, sessions: &SessionRegistry) -> Response {
     let params = match parse_optional_params::<ProjectListParams>(request) {
         Ok(params) => params,
-        Err(err) => return Response::err(request.id.clone(), err),
+        Err(err) => return error_value(request, err),
     };
     let pm = match require_projects(request, sessions) {
         Ok(pm) => pm,
@@ -91,7 +91,7 @@ pub(super) async fn handle_project_list(request: &Request, sessions: &SessionReg
 pub(super) async fn handle_project_add(request: &Request, sessions: &SessionRegistry) -> Response {
     let params = match parse_params::<ProjectAddParams>(request) {
         Ok(params) => params,
-        Err(err) => return Response::err(request.id.clone(), err),
+        Err(err) => return error_value(request, err),
     };
     let pm = match require_projects(request, sessions) {
         Ok(pm) => pm,
@@ -100,8 +100,8 @@ pub(super) async fn handle_project_add(request: &Request, sessions: &SessionRegi
     // The path is host-local; the CLI sends its own cwd for a local `add` with no
     // PATH, so a missing path here is a contract violation, not a default.
     let Some(path) = params.path else {
-        return Response::err(
-            request.id.clone(),
+        return error_value(
+            request,
             ProtocolError::bad_request("project.add requires a host-local path"),
         );
     };
@@ -114,7 +114,7 @@ pub(super) async fn handle_project_add(request: &Request, sessions: &SessionRegi
 pub(super) async fn handle_project_show(request: &Request, sessions: &SessionRegistry) -> Response {
     let params = match parse_params::<ProjectShowParams>(request) {
         Ok(params) => params,
-        Err(err) => return Response::err(request.id.clone(), err),
+        Err(err) => return error_value(request, err),
     };
     let pm = match require_projects(request, sessions) {
         Ok(pm) => pm,
@@ -135,7 +135,7 @@ pub(super) async fn handle_project_prompt(
 ) -> Response {
     let params = match parse_params::<ProjectPromptParams>(request) {
         Ok(params) => params,
-        Err(err) => return Response::err(request.id.clone(), err),
+        Err(err) => return error_value(request, err),
     };
     let pm = match require_projects(request, sessions) {
         Ok(pm) => pm,
@@ -163,7 +163,7 @@ pub(super) async fn handle_project_action(
 ) -> Response {
     let params = match parse_params::<ProjectActionParams>(request) {
         Ok(params) => params,
-        Err(err) => return Response::err(request.id.clone(), err),
+        Err(err) => return error_value(request, err),
     };
     let pm = match require_projects(request, sessions) {
         Ok(pm) => pm,
@@ -187,7 +187,7 @@ pub(super) async fn handle_project_actions(
 ) -> Response {
     let params = match parse_params::<ProjectActionsParams>(request) {
         Ok(params) => params,
-        Err(err) => return Response::err(request.id.clone(), err),
+        Err(err) => return error_value(request, err),
     };
     let pm = match require_projects(request, sessions) {
         Ok(pm) => pm,
@@ -212,7 +212,7 @@ pub(super) async fn handle_project_rename(
 ) -> Response {
     let params = match parse_params::<ProjectRenameParams>(request) {
         Ok(params) => params,
-        Err(err) => return Response::err(request.id.clone(), err),
+        Err(err) => return error_value(request, err),
     };
     let pm = match require_projects(request, sessions) {
         Ok(pm) => pm,
@@ -231,13 +231,13 @@ pub(super) async fn handle_project_remove(
 ) -> Response {
     let params = match parse_params::<ProjectRemoveParams>(request) {
         Ok(params) => params,
-        Err(err) => return Response::err(request.id.clone(), err),
+        Err(err) => return error_value(request, err),
     };
     // The registry owns both the project store and the worktree manager, so the
     // prune-then-forget orchestration lives there; this guards the no-store case.
     if sessions.projects().is_none() {
-        return Response::err(
-            request.id.clone(),
+        return error_value(
+            request,
             ProtocolError::new(
                 protocol::ErrorClass::Daemon,
                 "projects_not_configured",
@@ -251,6 +251,6 @@ pub(super) async fn handle_project_remove(
         .await
     {
         Ok(result) => ok_value(request, &result),
-        Err(err) => Response::err(request.id.clone(), err),
+        Err(err) => error_value(request, err),
     }
 }

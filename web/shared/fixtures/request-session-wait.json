@@ -1,0 +1,17 @@
+{
+  "id": "req-wait-fixture-1",
+  "method": "session.wait",
+  "params": {
+    "after_output_offset": "6",
+    "runtime": {
+      "runtime_generation": "3",
+      "runtime_id": "runtime-fixture-1"
+    },
+    "session_id": "s-fixture-1",
+    "timeout_ms": 1000
+  },
+  "v": {
+    "maximum": 2,
+    "minimum": 2
+  }
+}
