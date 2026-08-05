@@ -16,7 +16,9 @@ test("keeps the session rail visible while attaching and switching terminals", a
   await sessionRow(page, FIXTURE_LOCAL_HOST, FIXTURE_LOCAL_SESSION_ID).click();
   await expect(page.getByTestId("terminal-status")).toContainText("Attached");
   await expect(page.getByRole("complementary", { name: "Sessions" })).toBeVisible();
-  await expect.poll(() => stack.local.scenario.resizes(FIXTURE_LOCAL_SESSION_ID).length)
+  await expect.poll(
+    () => stack.local.scenario.initialAttachDimensions(FIXTURE_LOCAL_SESSION_ID).length,
+  )
     .toBeGreaterThan(0);
 
   const terminal = page.getByTestId("terminal");

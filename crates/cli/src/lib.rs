@@ -352,6 +352,9 @@ enum ProjectAction {
 enum HostAction {
     /// Enumerate `NetBird` peers and probe their daemons.
     Discover {
+        /// Re-probe peers even when a fresh standalone discovery cache exists.
+        #[arg(long)]
+        refresh: bool,
         /// Emit machine-readable JSON instead of a table.
         #[arg(long)]
         json: bool,
@@ -359,6 +362,9 @@ enum HostAction {
 
     /// List known hosts (live `NetBird` peers) with their classification.
     List {
+        /// Re-probe peers even when a fresh standalone discovery cache exists.
+        #[arg(long)]
+        refresh: bool,
         /// Emit machine-readable JSON instead of a table.
         #[arg(long)]
         json: bool,
@@ -884,8 +890,8 @@ impl SetupAction {
 impl HostAction {
     fn wants_json(&self) -> bool {
         match self {
-            HostAction::Discover { json }
-            | HostAction::List { json }
+            HostAction::Discover { json, .. }
+            | HostAction::List { json, .. }
             | HostAction::Inspect { json, .. } => *json,
         }
     }
@@ -1210,16 +1216,14 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Host { action } => match action {
-            // discover/list enumerate the local host's mesh view via the local
-            // daemon (which caches the probe); they ignore `--host`.
-            HostAction::Discover { json } => {
-                let paths = Paths::resolve()?;
-                commands::host::run_discover(&paths, json).await?;
+            // Discovery is local NetBird state plus the CLI cache; no local
+            // daemon connection is needed.
+            HostAction::Discover { refresh, json } => {
+                commands::host::run_discover(refresh, json).await?;
                 Ok(ExitCode::SUCCESS)
             }
-            HostAction::List { json } => {
-                let paths = Paths::resolve()?;
-                commands::host::run_list(&paths, json).await?;
+            HostAction::List { refresh, json } => {
+                commands::host::run_list(refresh, json).await?;
                 Ok(ExitCode::SUCCESS)
             }
             HostAction::Inspect { host, json } => {
@@ -2061,19 +2065,22 @@ mod tests {
 
     #[test]
     fn parses_host_discover_and_list() {
-        let discover =
-            Cli::try_parse_from(["pohunek", "host", "discover", "--json"]).expect("parse");
+        let discover = Cli::try_parse_from(["pohunek", "host", "discover", "--refresh", "--json"])
+            .expect("parse");
         assert!(matches!(
             discover.command,
             Commands::Host {
-                action: HostAction::Discover { json: true }
+                action: HostAction::Discover {
+                    refresh: true,
+                    json: true,
+                }
             }
         ));
         let list = Cli::try_parse_from(["pohunek", "host", "list"]).expect("parse");
         assert!(matches!(
             list.command,
             Commands::Host {
-                action: HostAction::List { json: false }
+                action: HostAction::List { json: false, .. }
             }
         ));
     }

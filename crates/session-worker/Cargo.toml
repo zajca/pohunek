@@ -15,12 +15,14 @@ name = "pohunek-sessiond"
 path = "src/main.rs"
 
 [dependencies]
+pohunek-logging = { workspace = true }
 pohunek-paths = { workspace = true }
 pohunek-terminal = { workspace = true }
 pohunek-worker-protocol = { path = "../worker-protocol" }
 libc = { workspace = true }
-nix = { version = "0.29", features = ["process", "signal", "socket", "user"] }
+nix = { version = "0.29", features = ["event", "process", "signal", "socket", "user"] }
 portable-pty = { workspace = true }
+rustix = { version = "1", features = ["fs", "termios"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

@@ -162,7 +162,9 @@ identity; Pohunek quarantines it and does not kill a worker automatically.
 `incompatible` means the worker is alive but has no compatible private protocol
 version, so the daemon leaves it running. Attach, input, and resize are not
 available in these degraded states, but list and inspect retain the logical
-record and diagnostic `loss_reason`.
+record and diagnostic `loss_reason`. After preserving diagnostic evidence, the
+operator can remove a degraded logical record with `session rm`; this does not
+stop or signal an unavailable or ambiguous worker.
 
 External observer mode is opt-in with `POHUNEK_OBSERVE_EXTERNAL_AGENTS=1` (or
 `SessionRegistryConfig.observe_external_agents = true`) and defaults off because
@@ -182,7 +184,18 @@ and controller sockets, but the worker keeps the same PTY and process group,
 continues draining bounded output, and accepts the replacement daemon after
 reconciliation. `pohunek attach` reconnects to the same runtime id. Reconnection
 emits `session_runtime_reconnected`; it does not emit `session_created`, report
-child exit, or invoke native resume.
+child exit, or invoke native resume. Detector reconnection can replay retained
+raw output from its last processed offset. A fresh interactive attach instead
+applies the client's initial dimensions when known and starts from one complete
+current terminal repaint, followed atomically by live output. It never rebuilds
+the screen from raw bytes emitted at historical terminal sizes.
+Workers negotiated below private protocol v3 cannot guarantee that ordering;
+the daemon returns `attach_snapshot_unsupported`, and the session must be
+restarted on an upgraded worker or forked into a new session.
+Interactive attach input is ordered by a stream-scoped sequence and does not
+consume the worker's bounded control-input deduplication capacity. A typed
+worker stream failure is retained by the daemon for the attaching CLI, which
+surfaces it instead of repeatedly treating it as an ordinary reconnect.
 
 Native recovery metadata is accepted only from the immutable launch agent
 process, so a nested different or same-provider agent cannot overwrite the
@@ -193,6 +206,9 @@ prefer the worker endpoint so accepted state survives daemon outage. Nested
 active-agent reports remain runtime evidence only: they can expose the active
 agent and active native metadata while that process runs, but never populate or
 replace `native_session_id` / `native_session_path` for the parent session.
+Startup reconciliation merges the worker's immutable launch identity into the
+persisted session and recovery binding; it does not replace an already captured
+native reference with an empty worker field.
 Procwatch can auto-report a matching nested agent when hooks are missing, and
 auto-release clears stale active fields when the backing process exits or an
 unbound claim exceeds the active-agent claim TTL.

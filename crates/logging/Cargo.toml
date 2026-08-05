@@ -1,0 +1,10 @@
+[package]
+name = "pohunek-logging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Bounded owner-private file logging for pohunek processes."
+
+[lints]
+workspace = true

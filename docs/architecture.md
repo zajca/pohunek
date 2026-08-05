@@ -163,6 +163,22 @@ connections for output and attach traffic. A worker accepts one leased daemon
 controller and one-use, short-lived data tokens. The daemon and worker support
 the current and immediately preceding worker protocol versions; an incompatible
 worker remains alive and is exposed as `runtime.state=incompatible`.
+When a new attach capability is unavailable on the preceding version, the
+daemon uses that version's bounded replay attach path. A daemon upgrade must
+never make an otherwise live PTY unreachable merely because it cannot provide a
+newer terminal snapshot feature.
+
+Retained replay and terminal repaint payloads are split into contiguous frames
+bounded by the negotiated worker data payload. History capacity is independent
+of the per-frame allocation limit: increasing retained history must never
+require one proportionally large frame.
+
+Control input uses a bounded exact recent-result map and a monotonic watermark
+scoped to the active controller lease. A reconnect acquires a fresh lease and
+can safely restart its sequence. Raw attach input instead uses the ordered
+stream's monotonic sequence and never consumes lifetime dedup capacity. This
+keeps retries conservative without allowing a probabilistic structure to reject
+fresh interactive input.
 
 ## Transport and Control Protocol
 
@@ -196,11 +212,14 @@ incompatible pair fails with a clear, typed error instead of undefined behavior.
 Raw terminal bytes are never multiplexed onto the newline-delimited JSON control
 connection. Attach uses a **separate connection**:
 
-1. On the control connection the client sends `attach { session_id }`.
+1. On the control connection the client sends
+   `attach { session_id, initial_dimensions? }`.
 2. The daemon replies with a `stream_id` (and, for TCP, the port/token to dial).
 3. The client opens a second connection, sends a small header identifying
-   `stream_id`, and the connection becomes a raw, bidirectional byte pipe:
-   terminal output flows down, the client's keystrokes flow up.
+   `stream_id`. The worker applies the initial dimensions when supplied, emits
+   one complete ANSI repaint of the current screen, and atomically continues
+   with live PTY output. The connection then remains a raw, bidirectional byte
+   pipe: terminal output flows down, the client's keystrokes flow up.
 4. `resize`, `detach`, and other control actions are sent on the **control**
    connection, referencing `session_id` / `stream_id`, so they work while
    attached without escaping the byte stream.
@@ -209,6 +228,12 @@ This keeps JSON as JSON and bytes as bytes, is trivial to debug, and maps cleanl
 onto both the Unix socket and the NetBird TCP transport. Multiple clients may
 attach to one session; resize policy when sizes differ is defined by the daemon
 (last attach wins, with explicit resize control available).
+
+If the private worker stream reports a typed failure, the daemon closes the raw
+pipe and retains that sanitized failure in a short-lived bounded result mailbox.
+The client consumes it once through `session.detach` and stops reconnecting that
+deterministic failure. Raw PTY bytes therefore remain unframed without losing
+the worker's root cause.
 
 ## PTY/TUI Agent Runtime
 
@@ -307,6 +332,9 @@ Discovery is tokenless and NetBird-local. There is no signed manifest exchange.
 1. The daemon/CLI reads local NetBird state via `netbird status --json` (no
    management-API token) to enumerate peers, NetBird addresses, and names.
 2. Candidate peers are probed to see which run a reachable `pohunek` daemon.
+   A complete discovery, including local status loading, has a bounded deadline;
+   each health exchange is separately bounded and the status subprocess is
+   cancelled when that deadline expires.
 3. Capabilities are obtained by a **live query** to the target daemon over the
    direct NetBird connection (`host inspect`), not from a cached manifest.
 
@@ -403,8 +431,23 @@ Structured logs under the user state directory:
 
 ```text
 ~/.local/state/pohunek/logs/
+  pohunekd.jsonl[.1-.7]                 # 32 MiB each, 256 MiB daemon cap
+  pohunek-session-<session-id>.jsonl    # active worker log
+  pohunek-session-<session-id>.jsonl[.1-.3]
+                                         # 4 MiB each, 16 MiB per-session cap
 ~/.local/state/pohunek/workers/<session-id>/<worker-id>.json
 ```
+
+Daemon and session-worker logs rotate before a complete JSON event would exceed
+the per-file limit. All worker generations for one logical session serialize
+through one owner-private file lock and share the 16 MiB family cap. Removing a
+session first stops its worker and then removes that session's regular log
+files. Startup pruning removes owned oversized rotations and the daemon's
+legacy `pohunekd.log.YYYY-MM-DD` files, but never follows or deletes symlinks.
+An individual event larger than one file is replaced by a small valid JSON
+warning (or dropped when even that warning cannot fit), never partially
+written. There is intentionally no machine-wide cap across simultaneously live
+sessions; each live session has an independent bounded diagnostic history.
 
 The metadata store is a **single** owner-private JSON-lines file whose lines are
 internally tagged by `kind` — `session` (logical intent, launch and runtime
@@ -457,8 +500,9 @@ to the control plane.
 
 ## Observability
 
-Structured logs under `~/.local/state/pohunek/logs/`, redacting secrets and
-sensitive terminal content. Useful signals:
+Structured logs under `~/.local/state/pohunek/logs/` use the bounded retention
+described in "Persistence and Local Data" and redact secrets and sensitive
+terminal content. Useful signals:
 
 - Daemon startup/shutdown, reconciliation, and single-instance/socket recovery.
 - Worker bootstrap, controller lease, runtime identity, output-gap, child-exit,
@@ -468,7 +512,8 @@ sensitive terminal content. Useful signals:
   loss/conflict, and explicit native recovery.
 - PTY allocation, resize, stream errors, worker protocol versions, and
   controller reconnect latency.
-- NetBird discovery runs and candidate/capability results.
+- NetBird discovery runs and candidate/capability results. The CLI can discover
+  locally without `pohunekd`; daemon discovery remains available for GUI/web RPC consumers.
 - Agent state transitions with their `source`.
 - Latency for CLI commands, attach, discovery, and remote connections.
 

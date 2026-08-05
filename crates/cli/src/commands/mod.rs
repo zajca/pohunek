@@ -12,6 +12,7 @@ use crate::error::CliError;
 pub(crate) mod assistant;
 pub(crate) mod attach;
 pub(crate) mod daemon;
+pub(crate) mod discovery_cache;
 pub(crate) mod doctor;
 pub(crate) mod health;
 pub(crate) mod host;

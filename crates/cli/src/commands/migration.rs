@@ -1,5 +1,7 @@
 //! Explicit one-time migration preflight for daemon-owned PTYs.
 
+// Rust guideline compliant 2026-07-28
+
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
@@ -13,8 +15,6 @@ use sha2::{Digest, Sha256};
 use crate::client::Client;
 use crate::error::CliError;
 use crate::paths::Paths;
-
-// Rust guideline compliant 2026-07-23
 
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
 const OWNER_PRIVATE_FILE_MODE: u32 = 0o600;
@@ -103,12 +103,7 @@ pub(crate) async fn run_preflight(
 }
 
 fn classify_sessions(sessions: &[SessionInfo]) -> SessionClassification {
-    let live = sessions.iter().filter(|session| {
-        matches!(
-            session.state,
-            SessionState::Starting | SessionState::Running
-        )
-    });
+    let live = sessions.iter().filter(|session| is_live_legacy(session));
     let mut classification = SessionClassification {
         live: Vec::new(),
         recoverable: Vec::new(),
@@ -123,6 +118,15 @@ fn classify_sessions(sessions: &[SessionInfo]) -> SessionClassification {
         }
     }
     classification
+}
+
+fn is_live_legacy(session: &SessionInfo) -> bool {
+    session.external != Some(true)
+        && session.runtime.is_none()
+        && matches!(
+            session.state,
+            SessionState::Starting | SessionState::Running
+        )
 }
 
 fn fingerprint(path: &Path) -> Result<String, CliError> {
@@ -159,14 +163,14 @@ fn write_manifest(path: &Path, manifest: &MigrationManifest) -> Result<(), CliEr
 
 fn render_human(manifest: &MigrationManifest, paths: &Paths) -> String {
     let mut output = format!(
-        "migration manifest: {}\nlive sessions: {}\n",
+        "migration manifest: {}\nlegacy live sessions: {}\n",
         paths.worker_migration_manifest().display(),
         manifest.live_session_ids.len()
     );
     if !manifest.live_session_ids.is_empty() {
         writeln!(
             &mut output,
-            "affected: {}",
+            "affected legacy sessions: {}",
             manifest.live_session_ids.join(", ")
         )
         .expect("writing to String is infallible");
@@ -186,7 +190,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    use protocol::{AgentKind, CwdSource, SessionId, StateSource};
+    use protocol::{AgentKind, CwdSource, RuntimeState, SessionId, SessionRuntime, StateSource};
 
     use super::*;
 
@@ -215,6 +219,32 @@ mod tests {
                 live: vec!["recoverable".to_owned(), "unrecoverable".to_owned()],
                 recoverable: vec!["recoverable".to_owned()],
                 unrecoverable: vec!["unrecoverable".to_owned()],
+            }
+        );
+    }
+
+    #[test]
+    fn classification_ignores_worker_backed_and_external_live_sessions() {
+        let mut worker = session("worker", SessionState::Running);
+        worker.runtime = Some(SessionRuntime {
+            state: RuntimeState::Live,
+            worker_id: Some("worker-1".to_owned()),
+            runtime_id: Some("runtime-1".to_owned()),
+            started_at: None,
+            last_connected_at: None,
+            loss_reason: None,
+        });
+        worker.native_session_id = Some("native-worker".to_owned());
+        let mut external = session("external", SessionState::Running);
+        external.external = Some(true);
+        let legacy = session("legacy", SessionState::Starting);
+
+        assert_eq!(
+            classify_sessions(&[worker, external, legacy]),
+            SessionClassification {
+                live: vec!["legacy".to_owned()],
+                recoverable: Vec::new(),
+                unrecoverable: vec!["legacy".to_owned()],
             }
         );
     }

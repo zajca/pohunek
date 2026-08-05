@@ -41,7 +41,7 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | Crate | Role |
 |-------|------|
 | `crates/protocol` | Shared control-protocol envelopes + version negotiation. The wire contract. |
-| `crates/client`   | SDK client: typed errors, daemon transport. |
+| `crates/client`   | SDK client: typed errors, daemon transport, standalone host discovery with bounded NetBird probing. |
 | `crates/daemon`   | Host control plane (`pohunekd`): logical registry, worker reconciliation, public protocol, detection/hooks. |
 | `crates/worker-protocol` | Private versioned daemon-to-worker protocol and framing. |
 | `crates/session-worker` | Durable per-session PTY owner (`pohunek-sessiond`). |
@@ -52,6 +52,7 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | `crates/netbird`  | NetBird status parsing, host resolution, bind-address validation. |
 | `crates/paths`    | Shared XDG path and local socket contract for daemon, CLI, and GUI clients. |
 | `crates/hostcheck`| Host environment probes shared by `doctor` and the daemon's `doctor` RPC. |
+| `crates/logging` | Process-safe size rotation and retention for daemon and per-session worker logs. |
 | `crates/gui-core` | Pure, headless state + SDK bridge for the GUI (no Iced dependency; fully unit-testable). |
 | `crates/gui`      | Native Iced shell that wraps `gui-core` in `Task`/`Subscription`. |
 | `crates/xtask`    | Workspace automation (docs build/validate/check). |

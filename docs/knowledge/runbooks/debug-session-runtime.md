@@ -27,7 +27,9 @@ Start with public, non-destructive inspection:
    pohunek-session@<session-id>.service`.
 5. Inspect daemon and worker structured logs under
    `~/.local/state/pohunek/logs/`. Do not copy prompt, input, or raw terminal
-   content into reports.
+   content into reports. `pohunekd.jsonl` plus seven rotations retain at most
+   256 MiB; `pohunek-session-<session-id>.jsonl` plus three rotations retain at
+   most 16 MiB across all worker generations for that session.
 
 Interpret runtime states as follows:
 
@@ -42,7 +44,8 @@ Interpret runtime states as follows:
   recovery reference.
 - `conflict`: multiple or mismatched identities claim the session. Do not stop,
   unlink, or kill either candidate automatically. Preserve the unit, journal,
-  and socket evidence for diagnosis.
+  and socket evidence for diagnosis. Afterward, `pohunek session rm <id>` can
+  remove only the quarantined logical record; it does not signal a worker.
 - `incompatible`: the worker is alive but private protocol negotiation failed.
   Leave it alive and use a compatible daemon release.
 
@@ -64,8 +67,10 @@ the runtime generation. Use `pohunek session stop <session-id>` for an
 intentional session stop.
 
 For the first worker-aware installation, let all legacy sessions finish or stop
-them explicitly. The archive installer lists visible live sessions and refuses
-replacement. `packaging/install-daemon.sh --accept-runtime-loss` is destructive
-consent: existing legacy PTYs cannot be transferred into workers. Use it only
-after recording the affected ids and accepting that shell and uncaptured agent
-sessions cannot be reconstructed.
+them explicitly. The archive installer lists live sessions that lack durable
+`runtime` metadata and refuses replacement. Sessions with a runtime binding are
+already worker-owned, are excluded from this one-time guard, and survive the
+daemon restart. `packaging/install-daemon.sh --accept-runtime-loss` is
+destructive consent: existing legacy PTYs cannot be transferred into workers.
+Use it only after recording the affected ids and accepting that shell and
+uncaptured agent sessions cannot be reconstructed.

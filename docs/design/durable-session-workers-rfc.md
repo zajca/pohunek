@@ -664,8 +664,8 @@ The first control request is:
   "type": "negotiate",
   "request_id": "…",
   "daemon_instance_id": "…",
-  "minimum_version": 1,
-  "maximum_version": 2
+  "minimum_version": 2,
+  "maximum_version": 3
 }
 ```
 
@@ -826,13 +826,25 @@ Opening an output stream is one operation in the worker actor:
 No PTY byte can exist between snapshot and subscription without being either in
 the captured replay range or queued as live output.
 
-If the requested `after_offset` is within the retained ring, the worker sends
+If a detector's requested `after_offset` is within the retained ring, the worker sends
 `Replay` frames beginning exactly at that offset, then `Output` frames beginning
 at the captured `next_offset`.
 
-If no offset is supplied, a new raw attach receives the retained ring followed
-by live output. A daemon detector reconnection requests its last processed
-offset.
+A fresh raw attach never requests historical replay. Its v3 `AttachStart`
+contains optional client dimensions. The worker serializes PTY resize, terminal
+model resize, snapshot capture, and live-subscriber registration against PTY
+output parsing. Normal output reads release that ordering gate after a bounded
+batch. Snapshot and resize operations temporarily suspend slave output, drain
+the finite bytes already queued on the master, apply the new geometry, capture
+the snapshot, and resume output on every success or error path. A continuously
+writing child cannot make one ordering-gate hold unbounded, although acquisition
+fairness remains scheduler-dependent. Once the gate is acquired, no
+old-geometry bytes can cross the snapshot boundary. The worker sends a complete
+`TerminalSnapshot`, then `Output` beginning exactly at the snapshot watermark.
+Omitting dimensions keeps the current worker geometry. A metadata-only
+`AttachReady` frame confirms the resize and subscription succeeded before the
+daemon switches the public connection to raw mode; failure remains a typed
+control error and opens no public byte stream.
 
 If the requested offset precedes `history_start_offset`, the worker sends:
 
@@ -870,8 +882,9 @@ An existing public Unix or TCP attach connection ends when `pohunekd` exits.
 This is not a session exit. CLI, GUI, and web clients reconnect to the new
 daemon and attach to the same logical session and runtime ID.
 
-The daemon translates private frames to the existing raw public byte stream. It
-uses the ANSI terminal snapshot on a gap and never exposes private headers.
+The daemon translates private frames to the existing raw public byte stream. A
+fresh attach begins with the ANSI terminal snapshot; a detector replay gap also
+uses the snapshot recovery path. Private headers are never exposed.
 Client-side automatic reconnect must compare runtime ID: the same runtime may
 be repainted; a changed runtime is presented as explicit recovery, not seamless
 continuation.
@@ -880,41 +893,57 @@ continuation.
 
 ### 13.1 Deduplicated input plans
 
-Every daemon-generated input operation has a `write_id` unique within the
-runtime. For public `session.input`, it is derived from the runtime ID and
-public request ID so retrying the same request produces the same value.
+Every daemon-generated control input operation has a `write_id` containing the
+controller-lease namespace and a sequence allocated while the worker client's
+control mutex is held. Requests from one lease therefore reach a worker in
+strictly increasing sequence order.
 
 `WritePlan` contains ordered byte fragments and configured delays. The worker,
 not the daemon, performs delayed TUI framing such as bracketed paste and a later
 submit byte. Therefore a daemon crash between fragments does not leave a new
 daemon guessing which fragments were written.
 
-The worker keeps a bounded map of in-progress and completed write IDs:
+The worker keeps a bounded map of in-progress and completed write IDs plus an
+exact high watermark for the active controller lease:
 
 - first receipt starts the plan;
 - a duplicate while in progress joins the same result;
 - a duplicate after completion returns the prior acknowledgement;
 - reuse of a write ID with different content is rejected;
+- an unretained ID at or below the lease watermark returns
+  `write_outcome_unknown`;
+- an ID above the watermark is provably fresh and cannot be rejected by a
+  probabilistic membership test;
 - completion is acknowledged only after every fragment is written and flushed.
 
-The dedup map lives for the worker lifetime and therefore survives daemon
-restart. Its capacity and retention are configured and bounded. Eviction never
-causes an automatic retry; an expired ambiguous write returns
-`write_outcome_unknown`.
+The dedup map and watermark rotate with the validated controller `lease_id`.
+This includes a reconnect by the same daemon instance: the new lease may safely
+restart its sequence at one. Requests carrying an old lease are rejected before
+input handling, so an old namespace cannot recur after rotation. The capacity
+remains configured and bounded. Older daemons emitted unordered `input-N`
+identifiers; the worker retains their previous bounded conservative
+deduplication behavior for rollback compatibility.
 
-Raw attach input is chunked by the daemon into write plans with stream-scoped
-monotonic IDs. The daemon does not retry a raw chunk after losing its worker
-connection. This gives at-most-once retry behavior: a final chunk may be lost
-during simultaneous connection failure, but it is never duplicated by
-reconnection.
+Raw attach input uses stream-scoped monotonic IDs on one ordered framed
+connection. The worker validates the next sequence and executes the bytes
+through the shared PTY write serializer without inserting them into the
+lifetime control dedup map. The daemon does not retry a raw chunk after losing
+its worker connection. This gives at-most-once retry behavior: a final chunk may
+be lost during simultaneous connection failure, but it is never duplicated by
+reconnection. A stream-local input failure is sent as a typed `Error` frame
+before close when the connection remains writable.
 
 ### 13.2 Resize
 
 Resize requests carry a runtime ID, attachment or control source ID, and
 monotonic source sequence. Duplicate or older source sequences are ignored.
-The daemon retains the public last-attach-wins policy and sends the resulting
-dimensions to the worker. `Inspect` returns actual PTY dimensions, allowing a
-replacement daemon to restore its public snapshot.
+Initial attach dimensions are bound to the one-shot stream grant and applied
+when that grant is redeemed. The daemon retains the public last-attach-wins
+policy: the last serialized attach redemption or later explicit resize wins. A
+single daemon-side ordering gate spans both the worker operation and the
+corresponding session-registry metadata commit, so a delayed older completion
+cannot overwrite newer dimensions. `Inspect` returns actual PTY dimensions,
+allowing a replacement daemon to restore its public snapshot.
 
 ## 14. Creation Transaction and Crash Windows
 

@@ -4,7 +4,7 @@
 //! connection. Unknown additive object fields are ignored by serde, while
 //! unknown operations fail deserialization and affect only that connection.
 
-// Rust guideline compliant 2026-07-24
+// Rust guideline compliant 2026-07-29
 
 use std::fmt::{Debug, Formatter};
 use std::path::PathBuf;
@@ -29,6 +29,8 @@ pub enum Capability {
     DeduplicatedInput,
     /// Worker-local agent identity hook reports.
     IdentityHook,
+    /// Atomic initial resize, terminal repaint, and live attach subscription.
+    AttachSnapshot,
 }
 
 /// Describes the worker runtime lifecycle.
@@ -507,6 +509,17 @@ pub enum StreamMode {
     Detector,
 }
 
+/// Defines the atomic start state for a public terminal attachment.
+///
+/// The worker applies `dimensions`, when present, before creating the complete
+/// terminal snapshot and subscribing the stream to subsequent PTY output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachStart {
+    /// Initial client terminal dimensions, when the client can determine them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<Dimensions>,
+}
+
 /// Carries an ordered terminal resize.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResizeRequest {
@@ -630,6 +643,9 @@ pub enum RequestKind {
         mode: StreamMode,
         /// Last processed output offset, when reconnecting.
         after_offset: Option<u64>,
+        /// Atomic terminal state requested by a fresh public attachment.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attach: Option<AttachStart>,
     },
     /// Executes one deduplicated input plan.
     WritePlan {
@@ -926,6 +942,16 @@ mod tests {
 
         assert_eq!(decoded, message);
         assert!(json.contains(r#""type":"negotiate""#));
+    }
+
+    #[test]
+    fn attach_start_without_dimensions_is_additive() {
+        let start = AttachStart { dimensions: None };
+
+        assert_eq!(
+            serde_json::to_value(start).expect("serialize attach start"),
+            serde_json::json!({})
+        );
     }
 
     #[test]

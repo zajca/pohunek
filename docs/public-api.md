@@ -156,7 +156,7 @@ All params and result type names below refer to structs exported by
 | `session.remove` | `SessionId` | `SessionRemoveResult` | Evicts a session from the registry, stopping it first if still live. Unknown id is `session_not_found`. |
 | `session.runtime_inventory` | `null` | `RuntimeInventoryResult` | Returns the durable-worker runtime inventory captured at startup reconciliation: one `RuntimeInventoryEntry` per discovered worker with its runtime slot, claimed session id, worker/runtime ids, and classification (`managed`, `orphaned`, `conflict`, `incompatible`, or `identity_mismatch`). Read-only operator diagnostic; it never mutates or kills a worker. |
 | `session.attach` | `SessionAttachParams` | `SessionAttachResult` | Mints a one-shot attach stream id. |
-| `session.detach` | `SessionDetachParams` | `SessionDetachResult` | Cancels an active attach stream. Unknown streams return `detached: false`. |
+| `session.detach` | `SessionDetachParams` | `SessionDetachResult` | Cancels an active attach stream. After a worker stream failure, the first call returns its optional typed `error` and consumes that short-lived result; unknown or already-consumed streams return `detached: false` without `error`. |
 | `session.resize` | `SessionResizeParams` | `SessionResizeResult` | Resizes the PTY on the control connection. |
 | `session.input` | `SessionInputParams` | `SessionInputResult` | Injects text using agent-specific input framing. |
 | `session.report_agent` | `SessionReportAgentParams` | `SessionReportAgentResult` | Hook callback for nested agents running inside an existing session. It records an active-agent claim, optional process binding, and optional active native metadata without changing launch identity or resume binding; ignored reports return `recorded: false`. Claims are reconciled with process facts and can be auto-released when no live backing process remains. |
@@ -509,11 +509,11 @@ Canonical public codes currently emitted include:
 
 | Class | Codes |
 |---|---|
-| `configuration` | `paths_unavailable` |
+| `configuration` | `paths_unavailable`, `netbird_invalid_config`, `invalid_discovery_options` |
 | `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback` |
 | `transport` | `framing`, `host_unreachable` |
 | `discovery` | `netbird_cli_missing`, `netbird_state_unavailable`, `host_unknown`, `remote_discovery_failed` |
-| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `attach_not_found`, `attach_expired`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor` |
+| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor` |
 
 Clients must not parse `msg`. Branch on `class` and `code`, then display `msg`
 and `recover` for unknown codes.
@@ -557,7 +557,8 @@ should reconcile by calling `session.list`, `session.inspect`, or
 The CLI exposes durable notifications through `pohunek notifications`:
 
 - `pohunek notifications list`: list records on one host; `--all-hosts` includes
-  local plus all reachable daemon hosts discovered by the local daemon.
+  local plus reachable daemon hosts from the standalone local-NetBird discovery
+  cache. It does not need a local daemon to expand remote targets.
 - `pohunek notifications watch`: stream `notification_created`,
   `notification_updated`, and `notification_deleted`; `--all-hosts` opens one
   subscription per reachable host.
@@ -583,7 +584,8 @@ detail of the CLI.
 Sequence:
 
 1. On a normal control connection, send `session.attach` with
-   `SessionAttachParams`.
+   `SessionAttachParams`. Interactive clients should include validated
+   `initial_dimensions` when their terminal geometry is known.
 2. The daemon returns `SessionAttachResult` with a one-shot `stream_id`.
 3. Open a second connection to the same daemon and transport family.
 4. Send exactly one newline-delimited attach prelude:
@@ -592,9 +594,11 @@ Sequence:
    {"attach":"a-1"}
    ```
 
-5. After the prelude newline, the connection switches to raw bidirectional PTY
-   bytes. Terminal output flows daemon-to-client; user input flows
-   client-to-daemon.
+5. After the prelude newline, the worker applies `initial_dimensions` when
+   present and the connection switches to raw bidirectional PTY bytes. The
+   daemon first sends one complete ANSI repaint of the current terminal state,
+   followed atomically by live PTY output at the repaint watermark. User input
+   flows client-to-daemon.
 6. Send `session.resize` and `session.detach` on the control connection, not on
    the raw byte stream.
 
@@ -608,8 +612,19 @@ Attach stream rules:
 - If redemption fails, the daemon replies with a normal error response on the
   second connection and does not switch to raw byte mode.
 - After successful redemption, bytes are opaque. Clients must not assume UTF-8.
+- A fresh attach never reconstructs the screen by replaying raw output emitted
+  at historical terminal sizes. It starts from the current terminal snapshot,
+  then receives live bytes without a gap or overlap.
+- `initial_dimensions` is optional for non-terminal clients. Omitting it keeps
+  the worker's current geometry while preserving snapshot-first attach.
+- Workers negotiated below private worker protocol v3 cannot provide the
+  atomic resize-and-snapshot guarantee. The daemon rejects such an attach with
+  `runtime/attach_snapshot_unsupported`; restart the session on the upgraded
+  worker or fork it into a new session.
 - `session.detach` cancels an active stream by `stream_id`; closing the raw
-  socket also ends the attach.
+  socket also ends the attach. If the worker ended the raw stream with a typed
+  failure, the first detach call after EOF returns that failure in the optional
+  `error` field. The result is bounded, short-lived, and consumed once.
 - `session.attach` may include `origin_session_id`, `origin_worker_id`, and the
   additive legacy `origin_daemon_id`. New clients read the stable worker id from
   their managed PTY environment. When the session and worker identify the
@@ -647,6 +662,10 @@ Public exports:
   rendering.
 - `next_request_id(method)`: shared correlation-id generator used by SDK-backed
   clients.
+- `discover_hosts()`: local-NetBird peer discovery with default bounded probes.
+- `discover_hosts_with_options(options)`: the same discovery with an explicit
+  non-zero daemon port, per-probe timeout, overall deadline, and concurrency
+  bound. It needs local NetBird state but no local `pohunekd`.
 - Raw and attach helpers: `connect_raw*` and `attach_raw*`.
 
 Connection APIs:

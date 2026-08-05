@@ -1,6 +1,6 @@
 //! Serves the private daemon-worker Unix protocol.
 
-// Rust guideline compliant 2026-07-24
+// Rust guideline compliant 2026-07-29
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -16,13 +16,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use pohunek_worker_protocol as protocol;
 use protocol::{
-    ActiveIdentityClaim, Capability, CloseReason, ControlCode, ControlError, ControlEvent,
-    ControlMessage, ControlReader, ControlRequest, ControlResponse, ControlWriter, Cursor,
-    DaemonId, DataFrame, DataToken, Dimensions, EventKind, ExitStatus, FrameHeader, FrameKind,
-    Initialize, InspectSnapshot, LeaseChallenge, LeaseId, ProcessIdentity as WireProcessIdentity,
-    ReportedLaunchIdentity, RequestKind, ResponseKind, RuntimeId, RuntimePhase as WireRuntimePhase,
-    RuntimeScope, SessionId, StreamId, StreamMode, TerminalSnapshot as WireTerminalSnapshot,
-    TokenClaims, TokenVault, TransactionId, Version, WorkerId, WriteAck, SUPPORTED_RANGE,
+    ActiveIdentityClaim, AttachStart, Capability, CloseReason, ControlCode, ControlError,
+    ControlEvent, ControlMessage, ControlReader, ControlRequest, ControlResponse, ControlWriter,
+    Cursor, DaemonId, DataFrame, DataToken, Dimensions, EventKind, ExitStatus, FrameHeader,
+    FrameKind, Initialize, InspectSnapshot, LeaseChallenge, LeaseId,
+    ProcessIdentity as WireProcessIdentity, ReportedLaunchIdentity, RequestKind, ResponseKind,
+    RuntimeId, RuntimePhase as WireRuntimePhase, RuntimeScope, SessionId, StreamId, StreamMode,
+    TerminalSnapshot as WireTerminalSnapshot, TokenClaims, TokenVault, TransactionId, Version,
+    WorkerId, WriteAck, WriteId, ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
 };
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
@@ -38,7 +39,7 @@ use crate::journal::{
 };
 use crate::{
     Command, ControllerLease, Exit, InputFragment, InputPlan, Journal, LeaseError, LeaseOwner,
-    OutputEvent, ProcessIdentity, PtyOwner, WorkerConfig, WorkerError,
+    OutputChunk, OutputEvent, ProcessIdentity, PtyOwner, WorkerConfig, WorkerError,
 };
 
 /// Number of worker events buffered per control connection.
@@ -47,6 +48,10 @@ const EVENT_BUFFER: usize = 256;
 const DATA_TOKEN_CAPACITY: usize = 4_096;
 /// Entropy bytes used for opaque worker credentials and runtime IDs.
 const RANDOM_BYTES: usize = 16;
+/// Prefix shared by daemon-generated control input identifiers.
+const CONTROL_INPUT_PREFIX: &str = "input-";
+/// Prefix shared by stream-scoped raw attach input identifiers.
+const ATTACH_INPUT_PREFIX: &str = "attach-";
 /// Environment variables inherited from the systemd worker but never the child.
 const WORKER_ONLY_ENV: [&str; 5] = [
     "NOTIFY_SOCKET",
@@ -320,6 +325,7 @@ struct DataGrant {
     stream_id: StreamId,
     mode: StreamMode,
     after_offset: Option<u64>,
+    attach: Option<AttachStart>,
 }
 
 #[derive(Debug)]
@@ -328,6 +334,7 @@ struct Connection {
     peer_start: u64,
     daemon_id: Option<DaemonId>,
     selected_version: Option<Version>,
+    capabilities: Vec<Capability>,
     challenge: Option<LeaseChallenge>,
     owner: Option<LeaseOwner>,
     lease_id: Option<LeaseId>,
@@ -340,6 +347,7 @@ impl Connection {
             peer_start,
             daemon_id: None,
             selected_version: None,
+            capabilities: Vec::new(),
             challenge: None,
             owner: None,
             lease_id: None,
@@ -549,7 +557,19 @@ async fn handle_request(
             stream_id,
             mode,
             after_offset,
-        } => open_data_request(shared, connection, &scope, stream_id, mode, after_offset).await,
+            attach,
+        } => {
+            open_data_request(
+                shared,
+                connection,
+                &scope,
+                stream_id,
+                mode,
+                after_offset,
+                attach,
+            )
+            .await
+        }
         RequestKind::WritePlan { scope, plan } => {
             write_request(shared, connection, &scope, plan).await
         }
@@ -600,7 +620,7 @@ async fn negotiate_request(
         runtime_id: state.runtime_id.clone(),
         worker_process: shared.worker_process,
         phase: state.phase,
-        capabilities: capabilities(),
+        capabilities: capabilities(selected),
         challenge,
     })
 }
@@ -635,14 +655,17 @@ fn acquire_request(
         .lease
         .acquire(owner.clone(), lease_id.to_string())
         .map_err(lease_control_error)?;
+    let selected = connection.selected_version.ok_or_else(identity_mismatch)?;
+    let granted_capabilities = capabilities(selected)
+        .into_iter()
+        .filter(|capability| requested.contains(capability))
+        .collect::<Vec<_>>();
     connection.owner = Some(owner);
     connection.lease_id = Some(lease_id.clone());
+    connection.capabilities.clone_from(&granted_capabilities);
     Ok(ResponseKind::ControllerAcquired {
         lease_id,
-        capabilities: capabilities()
-            .into_iter()
-            .filter(|capability| requested.contains(capability))
-            .collect(),
+        capabilities: granted_capabilities,
     })
 }
 
@@ -731,8 +754,7 @@ async fn initialize_request(
     effective_config
         .validate()
         .map_err(|error| control_error(ControlCode::InvalidRequest, error, false))?;
-    let pty = PtyOwner::spawn(command, history_bytes, subscriber_bytes, dedup_entries)
-        .map_err(|error| control_error(ControlCode::RuntimeFault, error, false))?;
+    let pty = spawn_pty(command, &effective_config)?;
     let child_process = wire_identity(pty.identity())?;
     let live = {
         let mut state = shared.state.lock().await;
@@ -765,6 +787,16 @@ async fn initialize_request(
     })
 }
 
+fn spawn_pty(command: Command, config: &WorkerConfig) -> Result<PtyOwner, ControlError> {
+    PtyOwner::spawn(
+        command,
+        config.history_bytes,
+        config.subscriber_bytes,
+        config.input_dedup_entries,
+    )
+    .map_err(|error| control_error(ControlCode::RuntimeFault, error, false))
+}
+
 async fn open_data_request(
     shared: &Shared,
     connection: &Connection,
@@ -772,8 +804,10 @@ async fn open_data_request(
     stream_id: StreamId,
     mode: StreamMode,
     after_offset: Option<u64>,
+    attach: Option<AttachStart>,
 ) -> Result<ResponseKind, ControlError> {
     validate_scope(shared, connection, scope).await?;
+    validate_data_start(connection, mode, after_offset, attach.as_ref())?;
     let token_value = random_value("data")
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
     let token = DataToken::new(token_value)
@@ -787,6 +821,7 @@ async fn open_data_request(
         stream_id: stream_id.clone(),
         mode,
         after_offset,
+        attach,
     };
     let mut tokens = lock(&shared.tokens);
     let _ = tokens.vault.purge_expired(now);
@@ -810,6 +845,43 @@ async fn open_data_request(
     })
 }
 
+fn validate_data_start(
+    connection: &Connection,
+    mode: StreamMode,
+    after_offset: Option<u64>,
+    attach: Option<&AttachStart>,
+) -> Result<(), ControlError> {
+    let selected = connection.selected_version.ok_or_else(identity_mismatch)?;
+    match (mode, attach) {
+        (StreamMode::Attach, Some(_))
+            if after_offset.is_none()
+                && selected >= ATTACH_SNAPSHOT_VERSION
+                && connection
+                    .capabilities
+                    .contains(&Capability::AttachSnapshot) =>
+        {
+            Ok(())
+        }
+        (StreamMode::Attach, None) if selected < ATTACH_SNAPSHOT_VERSION => Ok(()),
+        (StreamMode::Detector, None) => Ok(()),
+        (StreamMode::Attach, Some(_)) if after_offset.is_some() => Err(control_error_message(
+            ControlCode::InvalidRequest,
+            "snapshot attachment cannot request an output replay offset",
+            false,
+        )),
+        (StreamMode::Attach, _) => Err(control_error_message(
+            ControlCode::InvalidRequest,
+            "atomic attach snapshot was not negotiated",
+            false,
+        )),
+        (StreamMode::Detector, Some(_)) => Err(control_error_message(
+            ControlCode::InvalidRequest,
+            "detector streams cannot request an attach snapshot",
+            false,
+        )),
+    }
+}
+
 async fn write_request(
     shared: &Shared,
     connection: &Connection,
@@ -819,6 +891,13 @@ async fn write_request(
     let pty = scoped_pty(shared, connection, scope).await?;
     let byte_len = u64::try_from(plan.byte_len()).unwrap_or(u64::MAX);
     let (write_id, fragments) = plan.into_parts();
+    let producer_id = connection
+        .owner
+        .as_ref()
+        .ok_or_else(identity_mismatch)?
+        .daemon_id
+        .clone();
+    let lease_id = connection.lease_id.as_ref().ok_or_else(identity_mismatch)?;
     let local = InputPlan {
         write_id: write_id.to_string(),
         fragments: fragments
@@ -829,10 +908,15 @@ async fn write_request(
             })
             .collect(),
     };
-    pty.input()
-        .execute(local)
-        .await
-        .map_err(input_control_error)?;
+    match control_input_id(&write_id, lease_id.as_str())? {
+        ControlInputId::Namespaced { sequence } => {
+            pty.input()
+                .execute_control(lease_id.as_str(), sequence, local)
+                .await
+        }
+        ControlInputId::Legacy => pty.input().execute_legacy(&producer_id, local).await,
+    }
+    .map_err(input_control_error)?;
     Ok(ResponseKind::WriteCompleted {
         acknowledgement: WriteAck {
             write_id,
@@ -995,7 +1079,7 @@ fn spawn_runtime_monitors(shared: Arc<Shared>, pty: PtyOwner, runtime_id: Runtim
         if let Ok(mut subscriber) = output_pty.subscribe_output(Some(0)) {
             while let Some(event) = subscriber.recv().await {
                 match event {
-                    OutputEvent::Replay(_) => {}
+                    OutputEvent::Replay(_) | OutputEvent::TerminalSnapshot(_) => {}
                     OutputEvent::Output(chunk) => {
                         output_shared.emit(EventKind::OutputAdvanced {
                             runtime_id: output_runtime.clone(),
@@ -1004,10 +1088,10 @@ fn spawn_runtime_monitors(shared: Arc<Shared>, pty: PtyOwner, runtime_id: Runtim
                             ),
                         });
                     }
-                    OutputEvent::Gap { terminal, .. } => {
+                    OutputEvent::Gap { watermark, .. } => {
                         output_shared.emit(EventKind::TerminalChanged {
                             runtime_id: output_runtime.clone(),
-                            watermark: terminal.watermark,
+                            watermark,
                         });
                     }
                     OutputEvent::Exit { next_offset } => {
@@ -1108,6 +1192,7 @@ async fn serve_data(
         token,
         mode,
         after_offset,
+        attach,
     } = header.kind
     else {
         return Err(WorkerError::Protocol(
@@ -1136,6 +1221,7 @@ async fn serve_data(
         || grant.stream_id != header.stream_id
         || grant.mode != mode
         || grant.after_offset != after_offset
+        || grant.attach != attach
     {
         return Err(WorkerError::Protocol(
             "data open frame does not match its grant".to_owned(),
@@ -1148,13 +1234,48 @@ async fn serve_data(
             .clone()
             .ok_or_else(|| WorkerError::Protocol("runtime is not live".to_owned()))?
     };
-    let mut subscriber = pty
-        .subscribe_output(after_offset)
-        .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+    let mut subscriber = if let Some(attach) = attach {
+        let dimensions = attach
+            .dimensions
+            .map(|dimensions| (dimensions.columns(), dimensions.rows()));
+        let (subscriber, (cols, rows)) = match pty.attach_snapshot(dimensions).await {
+            Ok(result) => result,
+            Err(error) => {
+                return write_data_error(
+                    &mut write_half,
+                    header.version,
+                    &header.stream_id,
+                    &header.runtime_id,
+                    control_error(ControlCode::RuntimeFault, error, true),
+                )
+                .await;
+            }
+        };
+        let dimensions = Dimensions::new(cols, rows)
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+        let mut state = shared.state.lock().await;
+        state.journal.cols = Some(cols);
+        state.journal.rows = Some(rows);
+        drop(state);
+        write_data_frame(
+            &mut write_half,
+            header.version,
+            &header.stream_id,
+            &header.runtime_id,
+            FrameKind::AttachReady { dimensions },
+            Vec::new(),
+        )
+        .await?;
+        subscriber
+    } else {
+        pty.subscribe_output(after_offset)
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?
+    };
     let mut lease_epoch = shared.lease_epoch_tx.subscribe();
     let version = header.version;
     let stream_id = header.stream_id;
     let runtime_id = header.runtime_id;
+    let mut next_input_sequence = 1_u64;
 
     loop {
         tokio::select! {
@@ -1181,32 +1302,71 @@ async fn serve_data(
                     version,
                     &stream_id,
                     &runtime_id,
+                    shared.config.data_payload_bytes,
                     output,
                 ).await?;
             }
             input = protocol::read_frame(&mut read_half), if mode == StreamMode::Attach => {
-                let input = input
-                    .map_err(|error| WorkerError::Protocol(error.to_string()))?
-                    .ok_or_else(|| WorkerError::Protocol("attach data stream closed".to_owned()))?;
+                let input = match input {
+                    Ok(Some(input)) => input,
+                    Ok(None) => return Ok(()),
+                    Err(error) => {
+                        return write_data_error(
+                            &mut write_half,
+                            version,
+                            &stream_id,
+                            &runtime_id,
+                            control_error(ControlCode::InvalidRequest, error, false),
+                        ).await;
+                    }
+                };
                 let (input_header, bytes) = input.into_parts();
                 let FrameKind::Input { write_id } = input_header.kind else {
-                    return Err(WorkerError::Protocol(
-                        "attach data stream received a non-input frame".to_owned(),
-                    ));
+                    return write_data_error(
+                        &mut write_half,
+                        version,
+                        &stream_id,
+                        &runtime_id,
+                        control_error_message(
+                            ControlCode::InvalidRequest,
+                            "attach data stream received a non-input frame",
+                            false,
+                        ),
+                    ).await;
                 };
                 if input_header.runtime_id != runtime_id || input_header.stream_id != stream_id {
-                    return Err(WorkerError::Protocol(
-                        "attach input scope does not match stream".to_owned(),
-                    ));
+                    return write_data_error(
+                        &mut write_half,
+                        version,
+                        &stream_id,
+                        &runtime_id,
+                        identity_mismatch(),
+                    ).await;
+                }
+                if let Err(error) =
+                    validate_attach_write_id(&write_id, &stream_id, next_input_sequence)
+                {
+                    return write_data_error(
+                        &mut write_half,
+                        version,
+                        &stream_id,
+                        &runtime_id,
+                        error,
+                    ).await;
                 }
                 let byte_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                pty.input().execute(InputPlan {
-                    write_id: write_id.to_string(),
-                    fragments: vec![InputFragment {
+                if let Err(error) = pty.input().execute_stream(vec![InputFragment {
                         bytes,
                         delay_after: Duration::ZERO,
-                    }],
-                }).await.map_err(|error| WorkerError::Protocol(error.to_string()))?;
+                    }]).await {
+                    return write_data_error(
+                        &mut write_half,
+                        version,
+                        &stream_id,
+                        &runtime_id,
+                        input_control_error(error),
+                    ).await;
+                }
                 write_data_frame(
                     &mut write_half,
                     version,
@@ -1218,9 +1378,46 @@ async fn serve_data(
                     },
                     Vec::new(),
                 ).await?;
+                next_input_sequence = match next_input_sequence.checked_add(1) {
+                    Some(sequence) => sequence,
+                    None => {
+                        return write_data_error(
+                            &mut write_half,
+                            version,
+                            &stream_id,
+                            &runtime_id,
+                            control_error_message(
+                                ControlCode::InvalidRequest,
+                                "attach input sequence was exhausted",
+                                false,
+                            ),
+                        ).await;
+                    }
+                };
             }
         }
     }
+}
+
+async fn write_data_error<W>(
+    writer: &mut W,
+    version: Version,
+    stream_id: &StreamId,
+    runtime_id: &RuntimeId,
+    error: ControlError,
+) -> Result<(), WorkerError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    write_data_frame(
+        writer,
+        version,
+        stream_id,
+        runtime_id,
+        FrameKind::Error { error },
+        Vec::new(),
+    )
+    .await
 }
 
 async fn write_output_event<W>(
@@ -1228,6 +1425,7 @@ async fn write_output_event<W>(
     version: Version,
     stream_id: &StreamId,
     runtime_id: &RuntimeId,
+    payload_limit: usize,
     output: OutputEvent,
 ) -> Result<(), WorkerError>
 where
@@ -1236,32 +1434,30 @@ where
     match output {
         OutputEvent::Replay(chunk) if chunk.bytes.is_empty() => Ok(()),
         OutputEvent::Replay(chunk) => {
-            write_data_frame(
+            write_output_chunks(
                 writer,
                 version,
                 stream_id,
                 runtime_id,
-                FrameKind::Replay {
-                    offset: chunk.offset,
-                },
-                chunk.bytes,
+                payload_limit,
+                chunk,
+                true,
             )
             .await
         }
         OutputEvent::Output(chunk) => {
-            write_data_frame(
+            write_output_chunks(
                 writer,
                 version,
                 stream_id,
                 runtime_id,
-                FrameKind::Output {
-                    offset: chunk.offset,
-                },
-                chunk.bytes,
+                payload_limit,
+                chunk,
+                false,
             )
             .await
         }
-        OutputEvent::Gap { missing, terminal } => {
+        OutputEvent::Gap { missing, watermark } => {
             write_data_frame(
                 writer,
                 version,
@@ -1270,21 +1466,22 @@ where
                 FrameKind::Gap {
                     missing_start: missing.start,
                     missing_end: missing.end,
-                    watermark: terminal.watermark,
+                    watermark,
                 },
                 Vec::new(),
             )
-            .await?;
-            let ansi = terminal.ansi.clone();
-            write_data_frame(
+            .await
+        }
+        OutputEvent::TerminalSnapshot(chunk) => {
+            let snapshot = wire_terminal(chunk.terminal())?;
+            write_terminal_chunks(
                 writer,
                 version,
                 stream_id,
                 runtime_id,
-                FrameKind::TerminalSnapshot {
-                    snapshot: wire_terminal(terminal)?,
-                },
-                ansi,
+                payload_limit,
+                &snapshot,
+                &chunk.bytes,
             )
             .await
         }
@@ -1302,6 +1499,65 @@ where
             .await
         }
     }
+}
+
+async fn write_output_chunks<W>(
+    writer: &mut W,
+    version: Version,
+    stream_id: &StreamId,
+    runtime_id: &RuntimeId,
+    payload_limit: usize,
+    chunk: OutputChunk,
+    replay: bool,
+) -> Result<(), WorkerError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    let mut chunk_offset = chunk.offset;
+    for bytes in chunk.bytes.chunks(payload_limit) {
+        let kind = if replay {
+            FrameKind::Replay {
+                offset: chunk_offset,
+            }
+        } else {
+            FrameKind::Output {
+                offset: chunk_offset,
+            }
+        };
+        write_data_frame(writer, version, stream_id, runtime_id, kind, bytes.to_vec()).await?;
+        chunk_offset = chunk_offset
+            .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            .ok_or_else(|| WorkerError::Protocol("output frame offset overflowed".to_owned()))?;
+    }
+    Ok(())
+}
+
+async fn write_terminal_chunks<W>(
+    writer: &mut W,
+    version: Version,
+    stream_id: &StreamId,
+    runtime_id: &RuntimeId,
+    payload_limit: usize,
+    snapshot: &WireTerminalSnapshot,
+    ansi: &[u8],
+) -> Result<(), WorkerError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    for bytes in ansi.chunks(payload_limit) {
+        write_data_frame(
+            writer,
+            version,
+            stream_id,
+            runtime_id,
+            FrameKind::TerminalSnapshot {
+                snapshot: snapshot.clone(),
+            },
+            bytes.to_vec(),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn write_data_frame<W>(
@@ -1621,7 +1877,7 @@ fn journal_identity(identity: &ProcessIdentity) -> ChildIdentity {
     }
 }
 
-fn wire_terminal(snapshot: crate::TerminalSnapshot) -> Result<WireTerminalSnapshot, WorkerError> {
+fn wire_terminal(snapshot: &crate::TerminalSnapshot) -> Result<WireTerminalSnapshot, WorkerError> {
     let dimensions = Dimensions::new(snapshot.cols, snapshot.rows)
         .map_err(|error| WorkerError::Protocol(error.to_string()))?;
     Ok(WireTerminalSnapshot {
@@ -1633,8 +1889,8 @@ fn wire_terminal(snapshot: crate::TerminalSnapshot) -> Result<WireTerminalSnapsh
             visible: snapshot.cursor_visible,
         },
         alternate_screen: snapshot.alternate_screen,
-        title: snapshot.title,
-        progress: snapshot.progress,
+        title: snapshot.title.clone(),
+        progress: snapshot.progress.clone(),
         visible_lines: snapshot.visible_text.lines().map(str::to_owned).collect(),
     })
 }
@@ -1663,13 +1919,17 @@ fn signal_number(name: &str) -> Option<i32> {
     }
 }
 
-fn capabilities() -> Vec<Capability> {
-    vec![
+fn capabilities(version: Version) -> Vec<Capability> {
+    let mut capabilities = vec![
         Capability::AtomicReplay,
         Capability::TerminalSnapshot,
         Capability::DeduplicatedInput,
         Capability::IdentityHook,
-    ]
+    ];
+    if version >= ATTACH_SNAPSHOT_VERSION {
+        capabilities.push(Capability::AttachSnapshot);
+    }
+    capabilities
 }
 
 fn lease_control_error(error: LeaseError) -> ControlError {
@@ -1695,6 +1955,66 @@ fn input_control_error(error: crate::InputError) -> ControlError {
         ),
         other => control_error(ControlCode::RuntimeFault, other, true),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlInputId {
+    Namespaced { sequence: u64 },
+    Legacy,
+}
+
+fn control_input_id(write_id: &WriteId, lease_id: &str) -> Result<ControlInputId, ControlError> {
+    let value = write_id
+        .as_str()
+        .strip_prefix(CONTROL_INPUT_PREFIX)
+        .ok_or_else(|| invalid_control_write_id(write_id))?;
+    let Some((namespace, sequence)) = value.rsplit_once('-') else {
+        // Older daemons emitted `input-N` and could deliver two freshly
+        // allocated IDs out of order. Preserve their bounded conservative
+        // deduplication rather than applying the namespaced monotonic invariant.
+        let sequence = value
+            .parse::<u64>()
+            .map_err(|_error| invalid_control_write_id(write_id))?;
+        if sequence == 0 {
+            return Err(invalid_control_write_id(write_id));
+        }
+        return Ok(ControlInputId::Legacy);
+    };
+    if namespace != lease_id {
+        return Err(identity_mismatch());
+    }
+    let sequence = sequence
+        .parse::<u64>()
+        .map_err(|_error| invalid_control_write_id(write_id))?;
+    if sequence == 0 {
+        return Err(invalid_control_write_id(write_id));
+    }
+    Ok(ControlInputId::Namespaced { sequence })
+}
+
+fn validate_attach_write_id(
+    write_id: &WriteId,
+    stream_id: &StreamId,
+    sequence: u64,
+) -> Result<(), ControlError> {
+    let expected = format!("{ATTACH_INPUT_PREFIX}{stream_id}-{sequence}");
+    if write_id.as_str() == expected {
+        Ok(())
+    } else {
+        Err(control_error_message(
+            ControlCode::InvalidRequest,
+            "attach input id is not the next stream-scoped sequence",
+            false,
+        ))
+    }
+}
+
+fn invalid_control_write_id(write_id: &WriteId) -> ControlError {
+    control_error_message(
+        ControlCode::InvalidRequest,
+        &format!("control input id `{write_id}` is not lease-scoped and monotonic"),
+        false,
+    )
 }
 
 fn identity_mismatch() -> ControlError {
@@ -2008,8 +2328,20 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_stat, random_value, signal_number, PrefixStream};
+    use super::{
+        control_input_id, parse_stat, random_value, signal_number, validate_attach_write_id,
+        validate_data_start, write_data_error, write_output_chunks, write_terminal_chunks,
+        Connection, ControlInputId, PrefixStream, WireTerminalSnapshot,
+    };
+    use pohunek_worker_protocol::{
+        self as protocol, AttachStart, Capability, ControlCode, ControlError, Cursor, Dimensions,
+        FrameKind, RuntimeId, StreamId, StreamMode, WriteId, CURRENT_VERSION,
+        MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Extra bytes force exactly one partial frame after a full wire payload.
+    const OVERSIZED_PAYLOAD_EXTRA: usize = 257;
 
     #[test]
     fn proc_stat_parser_handles_spaces_and_parentheses_in_name() {
@@ -2038,6 +2370,63 @@ mod tests {
         assert_eq!(signal_number("unknown"), None);
     }
 
+    #[test]
+    fn control_input_ids_are_scoped_to_the_active_lease() {
+        let namespaced = WriteId::new("input-lease-a-42").expect("namespaced input id");
+        assert_eq!(
+            control_input_id(&namespaced, "lease-a").expect("matching lease"),
+            ControlInputId::Namespaced { sequence: 42 }
+        );
+        let mismatch = control_input_id(&namespaced, "lease-b").expect_err("old lease mismatch");
+        assert_eq!(mismatch.code, ControlCode::IdentityMismatch);
+
+        let legacy = WriteId::new("input-17").expect("legacy input id");
+        assert_eq!(
+            control_input_id(&legacy, "lease-a").expect("legacy compatibility"),
+            ControlInputId::Legacy
+        );
+    }
+
+    #[test]
+    fn attach_input_ids_remain_monotonic_past_dedup_capacity() {
+        let stream_id = StreamId::new("a-8192").expect("stream id");
+        for sequence in 1..=8_192 {
+            let write_id =
+                WriteId::new(format!("attach-{stream_id}-{sequence}")).expect("attach input id");
+            validate_attach_write_id(&write_id, &stream_id, sequence)
+                .expect("next attach sequence");
+        }
+
+        let duplicate = WriteId::new(format!("attach-{stream_id}-8192")).expect("duplicate id");
+        let error =
+            validate_attach_write_id(&duplicate, &stream_id, 8_193).expect_err("old sequence");
+        assert_eq!(error.code, ControlCode::InvalidRequest);
+    }
+
+    #[test]
+    fn attach_snapshot_requires_current_negotiated_capability() {
+        let attach = AttachStart {
+            dimensions: Some(Dimensions::new(120, 40).expect("dimensions")),
+        };
+        let mut current = Connection::new(1, 1);
+        current.selected_version = Some(CURRENT_VERSION);
+        current.capabilities.push(Capability::AttachSnapshot);
+        validate_data_start(&current, StreamMode::Attach, None, Some(&attach))
+            .expect("negotiated snapshot attach");
+
+        current.capabilities.clear();
+        let unsupported = validate_data_start(&current, StreamMode::Attach, None, Some(&attach))
+            .expect_err("missing capability");
+        assert_eq!(unsupported.code, ControlCode::InvalidRequest);
+
+        let mut previous = Connection::new(1, 1);
+        previous.selected_version = Some(PREVIOUS_VERSION);
+        validate_data_start(&previous, StreamMode::Attach, None, None)
+            .expect("previous protocol keeps its legacy attach shape");
+        assert!(validate_data_start(&previous, StreamMode::Attach, None, Some(&attach)).is_err());
+        assert!(validate_data_start(&current, StreamMode::Detector, None, Some(&attach)).is_err());
+    }
+
     #[tokio::test]
     async fn prefix_stream_replays_consumed_classifier_byte() {
         let (left, mut right) = tokio::io::duplex(16);
@@ -2047,5 +2436,135 @@ mod tests {
         let mut output = [0_u8; 3];
         stream.read_exact(&mut output).await.expect("read");
         assert_eq!(&output, b"abc");
+    }
+
+    #[tokio::test]
+    async fn data_stream_failure_is_emitted_as_a_typed_error_frame() {
+        let stream_id = StreamId::new("a-error").expect("stream id");
+        let runtime_id = RuntimeId::new("runtime-error").expect("runtime id");
+        let (mut reader, mut writer) = tokio::io::duplex(4_096);
+        let expected = ControlError {
+            code: ControlCode::RuntimeFault,
+            message: "PTY input write failed".to_owned(),
+            retryable: true,
+        };
+
+        write_data_error(
+            &mut writer,
+            CURRENT_VERSION,
+            &stream_id,
+            &runtime_id,
+            expected.clone(),
+        )
+        .await
+        .expect("write typed stream error");
+        let frame = protocol::read_frame(&mut reader)
+            .await
+            .expect("read error frame")
+            .expect("error frame");
+
+        assert_eq!(frame.header().stream_id, stream_id);
+        assert_eq!(frame.header().runtime_id, runtime_id);
+        assert_eq!(frame.header().kind, FrameKind::Error { error: expected });
+    }
+
+    #[tokio::test]
+    async fn oversized_replay_is_framed_with_exact_contiguous_offsets() {
+        let payload = (0..MAX_DATA_PAYLOAD_BYTES + OVERSIZED_PAYLOAD_EXTRA)
+            .map(|index| u8::try_from(index % 251).expect("value fits u8"))
+            .collect::<Vec<_>>();
+        let stream_id = StreamId::new("stream-1").expect("valid stream");
+        let runtime_id = RuntimeId::new("runtime-1").expect("valid runtime");
+        let (mut reader, mut writer) = tokio::io::duplex(payload.len() * 2);
+
+        write_output_chunks(
+            &mut writer,
+            CURRENT_VERSION,
+            &stream_id,
+            &runtime_id,
+            MAX_DATA_PAYLOAD_BYTES,
+            crate::OutputChunk {
+                offset: 41,
+                bytes: payload.clone(),
+            },
+            true,
+        )
+        .await
+        .expect("write bounded replay");
+
+        let mut expected_offset = 41_u64;
+        let mut replay = Vec::with_capacity(payload.len());
+        while replay.len() < payload.len() {
+            let frame = protocol::read_frame(&mut reader)
+                .await
+                .expect("read replay frame")
+                .expect("replay frame");
+            let (header, bytes) = frame.into_parts();
+            assert_eq!(
+                header.kind,
+                FrameKind::Replay {
+                    offset: expected_offset
+                }
+            );
+            assert!(bytes.len() <= MAX_DATA_PAYLOAD_BYTES);
+            expected_offset += u64::try_from(bytes.len()).expect("frame length fits u64");
+            replay.extend_from_slice(&bytes);
+        }
+
+        assert_eq!(replay, payload);
+    }
+
+    #[tokio::test]
+    async fn oversized_terminal_repaint_is_framed_without_byte_changes() {
+        let ansi = (0..MAX_DATA_PAYLOAD_BYTES + OVERSIZED_PAYLOAD_EXTRA)
+            .map(|index| u8::try_from(index % 251).expect("value fits u8"))
+            .collect::<Vec<_>>();
+        let snapshot = WireTerminalSnapshot {
+            watermark: 42,
+            dimensions: Dimensions::new(10, 2).expect("valid dimensions"),
+            cursor: Cursor {
+                column: 0,
+                row: 0,
+                visible: true,
+            },
+            alternate_screen: false,
+            title: None,
+            progress: None,
+            visible_lines: vec!["bounded repaint".to_owned()],
+        };
+        let stream_id = StreamId::new("stream-1").expect("valid stream");
+        let runtime_id = RuntimeId::new("runtime-1").expect("valid runtime");
+        let (mut reader, mut writer) = tokio::io::duplex(ansi.len() * 2);
+
+        write_terminal_chunks(
+            &mut writer,
+            CURRENT_VERSION,
+            &stream_id,
+            &runtime_id,
+            MAX_DATA_PAYLOAD_BYTES,
+            &snapshot,
+            &ansi,
+        )
+        .await
+        .expect("write bounded terminal repaint");
+
+        let mut repaint = Vec::with_capacity(ansi.len());
+        while repaint.len() < ansi.len() {
+            let frame = protocol::read_frame(&mut reader)
+                .await
+                .expect("read terminal snapshot frame")
+                .expect("terminal snapshot frame");
+            let (header, bytes) = frame.into_parts();
+            assert!(matches!(
+                header.kind,
+                FrameKind::TerminalSnapshot {
+                    snapshot: ref framed
+                } if framed == &snapshot
+            ));
+            assert!(bytes.len() <= MAX_DATA_PAYLOAD_BYTES);
+            repaint.extend_from_slice(&bytes);
+        }
+
+        assert_eq!(repaint, ansi);
     }
 }

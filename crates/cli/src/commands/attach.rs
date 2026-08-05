@@ -6,6 +6,8 @@
 //! Press Ctrl-] (0x1d) while attached to detach from the session without
 //! stopping the PTY process.
 
+mod shortcut;
+
 use std::os::fd::RawFd;
 use std::path::Path;
 use std::time::Duration;
@@ -13,24 +15,62 @@ use std::time::Duration;
 use pohunek_terminal::{step, Compositor, MenuEffect, MenuEvent, MenuKey, MenuOutcome, MenuState};
 use protocol::{
     event, method, ForkCwdMode, Request, SessionAttachParams, SessionAttachResult,
-    SessionDetachParams, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
-    SessionNewParams, SessionNewResult, SessionRenameParams, SessionRenameResult,
-    SessionResizeParams, SessionState, ENV_DAEMON_ID, ENV_SESSION_ID, ENV_WORKER_ID,
+    SessionDetachParams, SessionDetachResult, SessionForkParams, SessionForkResult, SessionId,
+    SessionInfo, SessionNewParams, SessionNewResult, SessionRenameParams, SessionRenameResult,
+    SessionResizeParams, SessionState, TerminalDimensions, ENV_DAEMON_ID, ENV_SESSION_ID,
+    ENV_WORKER_ID,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time;
 
+use self::shortcut::{MenuInputMode, Shortcut, ShortcutDecoder};
 use crate::client::{attach_raw, Client, RawStream};
 use crate::commands::{request_id, request_with_params};
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::Target;
 
-const DETACH_BYTE: u8 = 0x1d;
 const IO_BUFFER_BYTES: usize = 8192;
+/// Maximum ambiguity delay for a split terminal shortcut sequence.
+///
+/// Physical stdin is local, so bytes from one key report normally arrive in a
+/// single read. Twenty-five milliseconds still accommodates a split CSI-u
+/// report without making a standalone Escape key perceptibly sluggish.
+const SHORTCUT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
+/// Selective terminal reset emitted whenever raw attach passthrough ends.
+///
+/// Agent TUIs may enable these DEC modes through ordinary PTY output. Termios
+/// restoration does not disable them, so an unexpected stream close would make
+/// the parent shell receive mouse, focus, or paste reports as text. This reset
+/// returns to the main screen and normal shell-oriented modes without using the
+/// destructive full-terminal RIS sequence.
+const ATTACH_TERMINAL_MODE_CLEANUP: &[u8] = concat!(
+    "\x1b[?1000l", // X10 mouse tracking.
+    "\x1b[?1001l", // Mouse highlight tracking.
+    "\x1b[?1002l", // Button-event mouse tracking.
+    "\x1b[?1003l", // Any-event mouse tracking.
+    "\x1b[?1004l", // Focus reporting.
+    "\x1b[?1005l", // UTF-8 mouse coordinates.
+    "\x1b[?1006l", // SGR mouse coordinates.
+    "\x1b[?1015l", // urxvt mouse coordinates.
+    "\x1b[?1016l", // SGR pixel mouse coordinates.
+    "\x1b[?2004l", // Bracketed paste.
+    "\x1b[?2026l", // Synchronized terminal updates.
+    "\x1b[?1049l", // Alternate screen with saved cursor.
+    "\x1b[?1047l", // Alternate screen fallback.
+    "\x1b[?47l",   // Legacy alternate screen fallback.
+    "\x1b[?1l",    // Normal cursor keys.
+    "\x1b>",       // Normal numeric keypad.
+    "\x1b[?6l",    // Absolute cursor addressing.
+    "\x1b[?7h",    // Normal automatic line wrapping.
+    "\x1b[r",      // Full-height scroll region.
+    "\x1b[0m",     // Default character attributes.
+    "\x1b[?25h",   // Visible cursor.
+)
+.as_bytes();
 /// Maximum agent output retained while the attach menu is open.
 ///
 /// Four MiB covers sustained repaint bursts while preventing an unattended
@@ -42,9 +82,6 @@ const MIN_ROWS_WITH_BANNER: u16 = 3;
 const BANNER_MENU_LABEL: &str = "[menu:Ctrl-\\]";
 // Two spaces keep dense banner fields readable in monospace terminals.
 const BANNER_FIELD_SEPARATOR: &str = "  ";
-// Ctrl-\ emits ASCII File Separator. Raw mode prevents the terminal driver from
-// turning it into SIGQUIT, and the shortcut stays adjacent to Ctrl-] detach.
-const BANNER_MENU_BYTE: u8 = 0x1c;
 /// Starting diagnostic generation for menu RPCs.
 ///
 /// Result delivery is governed by the single in-flight task slot and current
@@ -89,17 +126,24 @@ const MENU_BACKSPACE_CTRL_H: u8 = 0x08;
 /// does not leave a dead attach terminal hanging indefinitely. Operators can
 /// override it in `launcher.conf`; zero disables reconnect.
 const DEFAULT_ATTACH_RECONNECT_WINDOW: Duration = Duration::from_secs(20);
-/// Poll interval while waiting for a daemon restart/resume after attach EOF.
+/// Base delay for attach retry backoff and runtime-readiness polling.
 ///
 /// A half-second cadence keeps reconnect responsive without turning a restart
 /// outage into a tight socket-dial loop. Operators can override it in
 /// `launcher.conf`.
 const DEFAULT_ATTACH_RECONNECT_INTERVAL: Duration = Duration::from_millis(500);
+/// Maximum automatic attach attempts after one unexpected stream closure.
+///
+/// Three attempts cover a normal daemon replacement without letting a
+/// deterministic stream failure reopen control and subscription sockets
+/// indefinitely. Operators can override the cap in `launcher.conf`.
+const DEFAULT_ATTACH_RECONNECT_MAX_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AttachReconnectConfig {
     window: Duration,
     interval: Duration,
+    max_attempts: usize,
 }
 
 impl Default for AttachReconnectConfig {
@@ -107,6 +151,48 @@ impl Default for AttachReconnectConfig {
         Self {
             window: DEFAULT_ATTACH_RECONNECT_WINDOW,
             interval: DEFAULT_ATTACH_RECONNECT_INTERVAL,
+            max_attempts: DEFAULT_ATTACH_RECONNECT_MAX_ATTEMPTS,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct AttachReconnectBudget {
+    deadline: Option<time::Instant>,
+    attempts: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachReconnectPermit {
+    Retry {
+        deadline: time::Instant,
+        attempt: usize,
+    },
+    Disabled,
+    WindowExpired,
+    AttemptsExhausted,
+}
+
+impl AttachReconnectBudget {
+    fn next(
+        &mut self,
+        config: &AttachReconnectConfig,
+        now: time::Instant,
+    ) -> AttachReconnectPermit {
+        if config.window.is_zero() {
+            return AttachReconnectPermit::Disabled;
+        }
+        let deadline = *self.deadline.get_or_insert_with(|| now + config.window);
+        if now >= deadline {
+            return AttachReconnectPermit::WindowExpired;
+        }
+        if self.attempts >= config.max_attempts {
+            return AttachReconnectPermit::AttemptsExhausted;
+        }
+        self.attempts += 1;
+        AttachReconnectPermit::Retry {
+            deadline,
+            attempt: self.attempts,
         }
     }
 }
@@ -160,6 +246,14 @@ impl AttachConfig {
                         number + 1,
                     )?;
                 }
+                "attach_reconnect_max_attempts" => {
+                    config.reconnect.max_attempts = parse_positive_usize(
+                        "attach_reconnect_max_attempts",
+                        value.trim(),
+                        &path,
+                        number + 1,
+                    )?;
+                }
                 _ => {}
             }
         }
@@ -197,17 +291,6 @@ struct ModalState {
     cols: u16,
     pending_output: Vec<u8>,
     active: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MenuShortcutAction {
-    OpenMenu,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MenuShortcutMatch {
-    start: usize,
-    action: MenuShortcutAction,
 }
 
 #[derive(Debug)]
@@ -270,6 +353,13 @@ struct AttachControlContext {
 }
 
 #[derive(Debug)]
+struct BannerUpdates {
+    receiver: mpsc::UnboundedReceiver<AttachStatusSnapshot>,
+    cancel: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
+#[derive(Debug)]
 struct MenuEffectContext<'a> {
     client: &'a mut Client,
     stream_id: &'a str,
@@ -289,7 +379,32 @@ struct StdinInputContext<'a, W, O> {
     terminal: &'a mut Option<RawTerminal>,
     modal: &'a mut Option<ModalState>,
     menu: &'a mut MenuRuntime,
+    shortcuts: &'a mut ShortcutDecoder,
+    shortcut_deadline: &'a mut Option<time::Instant>,
     control: &'a AttachControlContext,
+}
+
+impl<W, O> StdinInputContext<'_, W, O> {
+    fn reborrow(&mut self) -> StdinInputContext<'_, W, O> {
+        StdinInputContext {
+            socket_write: self.socket_write,
+            stdout: self.stdout,
+            client: self.client,
+            stream_id: self.stream_id,
+            terminal: self.terminal,
+            modal: self.modal,
+            menu: self.menu,
+            shortcuts: self.shortcuts,
+            shortcut_deadline: self.shortcut_deadline,
+            control: self.control,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdinEvent {
+    Input(usize),
+    ShortcutTimeout,
 }
 
 impl AttachStatusSnapshot {
@@ -396,6 +511,7 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
     // different daemon that reuses the same session-id string.
     let (origin_session_id, origin_daemon_id, origin_worker_id) = self_feedback_origin();
     let attach_config = AttachConfig::load(paths)?;
+    let mut reconnect = AttachReconnectBudget::default();
 
     loop {
         let end = run_attach_once(
@@ -407,11 +523,40 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
             origin_worker_id.clone(),
         )
         .await?;
-        if end != AttachStreamEnd::StreamClosed || attach_config.reconnect.window.is_zero() {
+        if end != AttachStreamEnd::StreamClosed {
             return Ok(());
         }
-        if !wait_for_attach_reconnect(host, paths, target, &attach_config.reconnect).await? {
-            return Ok(());
+        match reconnect.next(&attach_config.reconnect, time::Instant::now()) {
+            AttachReconnectPermit::Retry { deadline, attempt } => {
+                if !wait_for_attach_reconnect(
+                    host,
+                    paths,
+                    target,
+                    &attach_config.reconnect,
+                    deadline,
+                    attempt,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+            }
+            AttachReconnectPermit::Disabled => return Ok(()),
+            AttachReconnectPermit::WindowExpired => {
+                eprintln!(
+                    "[pohunek] attach reconnect window expired for session {}",
+                    target.session_id
+                );
+                return Ok(());
+            }
+            AttachReconnectPermit::AttemptsExhausted => {
+                eprintln!(
+                    "[pohunek] attach stream closed after {} automatic reattach attempts for \
+                     session {}; giving up",
+                    attach_config.reconnect.max_attempts, target.session_id
+                );
+                return Ok(());
+            }
         }
     }
 }
@@ -424,8 +569,10 @@ async fn run_attach_once(
     origin_daemon_id: Option<String>,
     origin_worker_id: Option<String>,
 ) -> Result<AttachStreamEnd, CliError> {
+    let initial_dimensions = current_terminal_dimensions();
     let attach_request = build_attach_request(
         target,
+        initial_dimensions,
         origin_session_id,
         origin_daemon_id,
         origin_worker_id,
@@ -447,6 +594,7 @@ async fn run_attach_once(
                 host,
                 paths,
                 target,
+                initial_dimensions,
             ))
             .await
         }
@@ -458,6 +606,7 @@ async fn run_attach_once(
                 host,
                 paths,
                 target,
+                initial_dimensions,
             ))
             .await
         }
@@ -473,11 +622,7 @@ enum AttachStreamEnd {
     StreamClosed,
 }
 
-/// Push an initial resize, then bridge the terminal and the stream until
-/// detach/EOF — generic over the transport.
-///
-/// Mirrors the original local sequence after SDK attach negotiation: best-effort
-/// resize on the control connection, then the forward loop.
+/// Bridges the terminal and stream after attach negotiation.
 async fn attach_over_stream<S>(
     stream: S,
     mut client: Client,
@@ -485,19 +630,13 @@ async fn attach_over_stream<S>(
     host: &str,
     paths: &Paths,
     target: &Target,
+    initial_dimensions: Option<TerminalDimensions>,
 ) -> Result<AttachStreamEnd, CliError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let terminal_size = terminal_size(libc::STDOUT_FILENO);
-    if let Some((cols, rows)) = terminal_size {
-        if let Ok(request) = build_resize_request(target, cols, rows) {
-            let _ = client.request(&request).await;
-        }
-    }
-
     let (modal, status_updates) = if let Some((cols, rows)) =
-        terminal_size.filter(|&(_, rows)| rows >= MIN_ROWS_WITH_BANNER)
+        terminal_size(libc::STDOUT_FILENO).filter(|&(_, rows)| rows >= MIN_ROWS_WITH_BANNER)
     {
         let snapshot = load_initial_banner_snapshot(&mut client, host, &target.session_id).await;
         // Best-effort live status updates keep the transient modal current. A
@@ -532,6 +671,7 @@ where
         },
         modal,
         status_updates,
+        initial_dimensions,
     )
     .await
 }
@@ -560,6 +700,7 @@ async fn load_initial_banner_snapshot(
 // self-feeding attach (see [`self_feedback_origin`]).
 fn build_attach_request(
     target: &Target,
+    initial_dimensions: Option<TerminalDimensions>,
     origin_session_id: Option<SessionId>,
     origin_daemon_id: Option<String>,
     origin_worker_id: Option<String>,
@@ -568,6 +709,7 @@ fn build_attach_request(
         method::SESSION_ATTACH,
         &SessionAttachParams {
             session_id: SessionId(target.session_id.clone()),
+            initial_dimensions,
             origin_session_id,
             origin_daemon_id,
             origin_worker_id,
@@ -752,43 +894,108 @@ fn spawn_banner_updates(
     paths: Paths,
     session_id: String,
     initial: AttachStatusSnapshot,
-) -> mpsc::UnboundedReceiver<AttachStatusSnapshot> {
+) -> BannerUpdates {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        let mut snapshot = initial;
-        let Ok(mut client) = Client::connect(&host, &paths).await else {
-            return;
-        };
-
-        if let Ok(request) =
-            request_with_params(method::SESSION_INSPECT, &SessionId(session_id.clone()))
-        {
-            if let Ok(info) = client.request(&request).await {
-                snapshot.update_from_session_value(&info);
-                let _ = tx.send(snapshot.clone());
-            }
-        }
-
-        let request = Request::new(
-            request_id(method::SUBSCRIBE),
-            method::SUBSCRIBE,
-            serde_json::Value::Null,
-        );
-        let Ok(mut subscription) = client.into_sdk().subscribe(&request).await else {
-            return;
-        };
-        while let Ok(Some(line)) = subscription.next_line().await {
-            let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-            let before = snapshot.clone();
-            snapshot.update_from_event_value(&event);
-            if snapshot != before {
-                let _ = tx.send(snapshot.clone());
-            }
+    let (cancel_tx, mut cancel_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        tokio::select! {
+            _ = &mut cancel_rx => {}
+            () = run_banner_updates(host, paths, session_id, initial, tx) => {}
         }
     });
-    rx
+    BannerUpdates {
+        receiver: rx,
+        cancel: Some(cancel_tx),
+        task,
+    }
+}
+
+async fn run_banner_updates(
+    host: String,
+    paths: Paths,
+    session_id: String,
+    mut snapshot: AttachStatusSnapshot,
+    tx: mpsc::UnboundedSender<AttachStatusSnapshot>,
+) {
+    let Ok(mut client) = Client::connect(&host, &paths).await else {
+        return;
+    };
+
+    if let Ok(request) =
+        request_with_params(method::SESSION_INSPECT, &SessionId(session_id.clone()))
+    {
+        if let Ok(info) = client.request(&request).await {
+            snapshot.update_from_session_value(&info);
+            if tx.send(snapshot.clone()).is_err() {
+                return;
+            }
+        }
+    }
+
+    let request = Request::new(
+        request_id(method::SUBSCRIBE),
+        method::SUBSCRIBE,
+        serde_json::Value::Null,
+    );
+    let Ok(mut subscription) = client.into_sdk().subscribe(&request).await else {
+        return;
+    };
+    while let Ok(Some(line)) = subscription.next_line().await {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let before = snapshot.clone();
+        snapshot.update_from_event_value(&event);
+        if snapshot != before && tx.send(snapshot.clone()).is_err() {
+            return;
+        }
+    }
+}
+
+impl BannerUpdates {
+    async fn shutdown(mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        let _ = self.task.await;
+    }
+}
+
+async fn shutdown_banner_updates(updates: &mut Option<BannerUpdates>) {
+    if let Some(updates) = updates.take() {
+        updates.shutdown().await;
+    }
+}
+
+async fn prepare_attach_terminal(
+    updates: &mut Option<BannerUpdates>,
+) -> Result<
+    (
+        Option<RawTerminal>,
+        TerminalOutputGuard,
+        tokio::signal::unix::Signal,
+    ),
+    CliError,
+> {
+    let terminal = match RawTerminal::enable(libc::STDIN_FILENO) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            shutdown_banner_updates(updates).await;
+            return Err(error);
+        }
+    };
+    let winch = match signal(SignalKind::window_change()) {
+        Ok(winch) => winch,
+        Err(error) => {
+            shutdown_banner_updates(updates).await;
+            return Err(CliError::Io(error));
+        }
+    };
+    // Output cleanup follows the physical output terminal independently of
+    // whether stdin could enter raw mode (for example, piped stdin with a TTY
+    // stdout can still receive mode-enabling agent output).
+    let output = TerminalOutputGuard::new(is_tty(libc::STDOUT_FILENO));
+    Ok((terminal, output, winch))
 }
 
 /// Renders the active modal and its status banner.
@@ -822,6 +1029,15 @@ where
     Ok(())
 }
 
+async fn restore_terminal_output_modes<W>(writer: &mut W) -> Result<(), CliError>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(ATTACH_TERMINAL_MODE_CLEANUP).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
 /// Opens the modal and paints its frozen background immediately.
 async fn open_modal<W>(writer: &mut W, modal: Option<&mut ModalState>) -> Result<(), CliError>
 where
@@ -838,11 +1054,9 @@ where
 ///
 /// Kept as a named future so the `select!` arm stays a single line and the loop
 /// body fits its line budget.
-async fn recv_banner_update(
-    updates: &mut Option<mpsc::UnboundedReceiver<AttachStatusSnapshot>>,
-) -> Option<AttachStatusSnapshot> {
+async fn recv_banner_update(updates: &mut Option<BannerUpdates>) -> Option<AttachStatusSnapshot> {
     match updates.as_mut() {
-        Some(updates) => updates.recv().await,
+        Some(updates) => updates.receiver.recv().await,
         None => None,
     }
 }
@@ -860,6 +1074,31 @@ async fn wait_for_menu_task(task: &mut Option<MenuTask>) -> Option<MenuTaskResul
         action: task.action,
         outcome,
     })
+}
+
+fn update_shortcut_deadline(decoder: &ShortcutDecoder, deadline: &mut Option<time::Instant>) {
+    if decoder.has_pending() {
+        *deadline = Some(time::Instant::now() + SHORTCUT_SEQUENCE_TIMEOUT);
+    } else {
+        *deadline = None;
+    }
+}
+
+async fn read_stdin_event<R>(
+    stdin: &mut R,
+    buffer: &mut [u8],
+    shortcut_deadline: Option<time::Instant>,
+) -> std::io::Result<StdinEvent>
+where
+    R: AsyncRead + Unpin,
+{
+    let Some(deadline) = shortcut_deadline else {
+        return stdin.read(buffer).await.map(StdinEvent::Input);
+    };
+    tokio::select! {
+        read = stdin.read(buffer) => read.map(StdinEvent::Input),
+        () = time::sleep_until(deadline) => Ok(StdinEvent::ShortcutTimeout),
+    }
 }
 
 impl MenuRuntime {
@@ -1061,18 +1300,10 @@ where
     Ok(None)
 }
 
-fn handle_status_update(
-    update: Option<AttachStatusSnapshot>,
-    modal: &mut Option<ModalState>,
-    status_updates: &mut Option<mpsc::UnboundedReceiver<AttachStatusSnapshot>>,
-) -> bool {
-    if let Some(snapshot) = update {
-        if let Some(modal) = modal.as_mut() {
-            modal.snapshot = snapshot;
-            return modal.active;
-        }
-    } else {
-        *status_updates = None;
+fn handle_status_update(snapshot: AttachStatusSnapshot, modal: &mut Option<ModalState>) -> bool {
+    if let Some(modal) = modal.as_mut() {
+        modal.snapshot = snapshot;
+        return modal.active;
     }
     false
 }
@@ -1119,6 +1350,27 @@ fn parse_nonnegative_duration_seconds(
     Ok(Duration::from_secs_f64(seconds))
 }
 
+fn parse_positive_usize(
+    key: &str,
+    value: &str,
+    path: &Path,
+    number: usize,
+) -> Result<usize, CliError> {
+    let count = value.parse::<usize>().map_err(|err| {
+        config_error(format!(
+            "{}:{number}: invalid positive integer value {value:?}: {err}",
+            path.display()
+        ))
+    })?;
+    if count == 0 {
+        return Err(config_error(format!(
+            "{}:{number}: {key} must be greater than zero",
+            path.display()
+        )));
+    }
+    Ok(count)
+}
+
 fn config_error(message: String) -> CliError {
     CliError::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
@@ -1139,9 +1391,28 @@ async fn apply_terminal_resize<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let Some((cols, rows)) = terminal_size(libc::STDOUT_FILENO) else {
+    let Some(dimensions) = current_terminal_dimensions() else {
         return Ok(());
     };
+    apply_terminal_dimensions(client, target, modal, menu, stdout, dimensions).await
+}
+
+/// Applies known dimensions to the shadow grid and daemon PTY.
+///
+/// An open modal is closed first because its background uses the old geometry.
+async fn apply_terminal_dimensions<W>(
+    client: &mut Client,
+    target: &Target,
+    modal: &mut Option<ModalState>,
+    menu: &mut MenuRuntime,
+    stdout: &mut W,
+    dimensions: TerminalDimensions,
+) -> Result<(), CliError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let cols = dimensions.cols();
+    let rows = dimensions.rows();
     close_modal(stdout, modal.as_mut()).await?;
     if let Some(state) = menu.state.as_mut() {
         *state = MenuState::Closed;
@@ -1156,7 +1427,79 @@ where
     Ok(())
 }
 
+fn current_terminal_dimensions() -> Option<TerminalDimensions> {
+    terminal_size(libc::STDOUT_FILENO)
+        .and_then(|(cols, rows)| TerminalDimensions::new(cols, rows).ok())
+}
+
+fn resize_after_signal_registration(
+    initial: Option<TerminalDimensions>,
+    current: Option<TerminalDimensions>,
+) -> Option<TerminalDimensions> {
+    current.filter(|dimensions| Some(*dimensions) != initial)
+}
+
+async fn apply_resize_after_signal_registration<W>(
+    client: &mut Client,
+    target: &Target,
+    ui: (&mut Option<ModalState>, &mut MenuRuntime, &mut W),
+    initial_dimensions: Option<TerminalDimensions>,
+) -> Result<(), CliError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let (modal, menu, stdout) = ui;
+    let Some(dimensions) =
+        resize_after_signal_registration(initial_dimensions, current_terminal_dimensions())
+    else {
+        return Ok(());
+    };
+    apply_terminal_dimensions(client, target, modal, menu, stdout, dimensions).await
+}
+
 async fn handle_stdin_input<W, O>(
+    input: &[u8],
+    mut ctx: StdinInputContext<'_, W, O>,
+) -> Result<Option<AttachStreamEnd>, CliError>
+where
+    W: AsyncWrite + Unpin,
+    O: AsyncWrite + Unpin,
+{
+    let menu_mode = match ctx.menu.state.as_ref() {
+        None => MenuInputMode::Unavailable,
+        Some(MenuState::Closed) => MenuInputMode::Closed,
+        Some(_) => MenuInputMode::Open,
+    };
+    let decoded = ctx.shortcuts.push(input, menu_mode);
+    update_shortcut_deadline(ctx.shortcuts, ctx.shortcut_deadline);
+
+    if let Some(shortcut) = decoded.shortcut {
+        // Process only the prefix before the first local shortcut. Its suffix
+        // is intentionally discarded to preserve the historical behavior.
+        if let Some(end) = route_stdin_input(&decoded.bytes, ctx.reborrow()).await? {
+            return Ok(Some(end));
+        }
+        match shortcut {
+            Shortcut::Detach => {
+                ctx.terminal.take();
+                let _ = send_detach(ctx.client, ctx.stream_id).await;
+                return Ok(Some(AttachStreamEnd::Detached));
+            }
+            Shortcut::Menu => {
+                ctx.menu.generation = next_menu_generation(ctx.menu.generation);
+                if let Some(state) = ctx.menu.state.as_mut() {
+                    *state = MenuState::open_root();
+                    sync_menu_view(state, ctx.modal, ctx.stdout).await?;
+                }
+                return Ok(None);
+            }
+        }
+    }
+
+    route_stdin_input(&decoded.bytes, ctx).await
+}
+
+async fn route_stdin_input<W, O>(
     input: &[u8],
     ctx: StdinInputContext<'_, W, O>,
 ) -> Result<Option<AttachStreamEnd>, CliError>
@@ -1164,16 +1507,8 @@ where
     W: AsyncWrite + Unpin,
     O: AsyncWrite + Unpin,
 {
-    if let Some(end) = handle_detach_input(
-        input,
-        ctx.socket_write,
-        ctx.client,
-        ctx.stream_id,
-        ctx.terminal,
-    )
-    .await?
-    {
-        return Ok(Some(end));
+    if input.is_empty() {
+        return Ok(None);
     }
 
     if let Some(state) = ctx
@@ -1201,23 +1536,57 @@ where
         .await;
     }
 
-    if let Some(action) = handle_menu_shortcut(input, ctx.socket_write, ctx.modal.is_some()).await?
-    {
-        match action {
-            MenuShortcutAction::OpenMenu => {
-                ctx.menu.generation = next_menu_generation(ctx.menu.generation);
-                if let Some(state) = ctx.menu.state.as_mut() {
-                    *state = MenuState::open_root();
-                    sync_menu_view(state, ctx.modal, ctx.stdout).await?;
-                }
-            }
-        }
-        return Ok(None);
-    }
-
     ctx.socket_write.write_all(input).await?;
     ctx.socket_write.flush().await?;
     Ok(None)
+}
+
+async fn handle_stdin_read<W, O>(
+    bytes_read: usize,
+    buffer: &mut [u8],
+    mut ctx: StdinInputContext<'_, W, O>,
+) -> Result<Option<AttachStreamEnd>, CliError>
+where
+    W: AsyncWrite + Unpin,
+    O: AsyncWrite + Unpin,
+{
+    if bytes_read == 0 {
+        *ctx.shortcut_deadline = None;
+        let pending = ctx.shortcuts.flush();
+        if let Some(end) = route_stdin_input(&pending, ctx.reborrow()).await? {
+            return Ok(Some(end));
+        }
+        ctx.socket_write.shutdown().await?;
+        return Ok(Some(AttachStreamEnd::InputClosed));
+    }
+    handle_stdin_input(&buffer[..bytes_read], ctx).await
+}
+
+async fn flush_shortcut_input<W, O>(
+    ctx: StdinInputContext<'_, W, O>,
+) -> Result<Option<AttachStreamEnd>, CliError>
+where
+    W: AsyncWrite + Unpin,
+    O: AsyncWrite + Unpin,
+{
+    *ctx.shortcut_deadline = None;
+    let pending = ctx.shortcuts.flush();
+    route_stdin_input(&pending, ctx).await
+}
+
+async fn handle_stdin_event<W, O>(
+    event: StdinEvent,
+    buffer: &mut [u8],
+    ctx: StdinInputContext<'_, W, O>,
+) -> Result<Option<AttachStreamEnd>, CliError>
+where
+    W: AsyncWrite + Unpin,
+    O: AsyncWrite + Unpin,
+{
+    match event {
+        StdinEvent::Input(bytes_read) => handle_stdin_read(bytes_read, buffer, ctx).await,
+        StdinEvent::ShortcutTimeout => flush_shortcut_input(ctx).await,
+    }
 }
 
 /// Bidirectionally bridge the terminal and the attach byte stream until detach
@@ -1232,19 +1601,28 @@ async fn forward_attached_stream<S>(
     stream_id: String,
     control: AttachControlContext,
     mut modal: Option<ModalState>,
-    mut status_updates: Option<mpsc::UnboundedReceiver<AttachStatusSnapshot>>,
+    mut status_updates: Option<BannerUpdates>,
+    initial_dimensions: Option<TerminalDimensions>,
 ) -> Result<AttachStreamEnd, CliError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut terminal = RawTerminal::enable(libc::STDIN_FILENO)?;
+    let (mut terminal, mut terminal_output, mut winch) =
+        prepare_attach_terminal(&mut status_updates).await?;
     let (mut socket_read, mut socket_write) = tokio::io::split(stream);
-    let mut winch = signal(SignalKind::window_change())?;
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    let mut stdin_buf = [0_u8; IO_BUFFER_BYTES];
-    let mut socket_buf = [0_u8; IO_BUFFER_BYTES];
+    let (mut stdin, mut stdout) = (tokio::io::stdin(), tokio::io::stdout());
+    let (mut stdin_buf, mut socket_buf) = ([0_u8; IO_BUFFER_BYTES], [0_u8; IO_BUFFER_BYTES]);
     let mut menu = MenuRuntime::new(modal.is_some());
+    let mut shortcuts = ShortcutDecoder::new();
+    let mut shortcut_deadline = None;
+
+    apply_resize_after_signal_registration(
+        &mut client,
+        &control.target,
+        (&mut modal, &mut menu, &mut stdout),
+        initial_dimensions,
+    )
+    .await?;
 
     let outcome: Result<AttachStreamEnd, CliError> = async {
         loop {
@@ -1262,27 +1640,25 @@ where
                         return Ok(end);
                     }
                 }
-                read = stdin.read(&mut stdin_buf) => {
-                    let bytes_read = read?;
-                    if bytes_read == 0 {
-                        socket_write.shutdown().await?;
-                        return Ok(AttachStreamEnd::InputClosed);
-                    }
-                    if let Some(end) = handle_stdin_input(
-                        &stdin_buf[..bytes_read],
-                        StdinInputContext {
-                            socket_write: &mut socket_write,
-                            stdout: &mut stdout,
-                            client: &mut client,
-                            stream_id: &stream_id,
-                            terminal: &mut terminal,
-                            modal: &mut modal,
-                            menu: &mut menu,
-                            control: &control,
-                        },
-                    )
-                    .await?
-                    {
+                event = read_stdin_event(
+                    &mut stdin,
+                    &mut stdin_buf,
+                    shortcut_deadline,
+                ) => {
+                    let ctx = StdinInputContext {
+                        socket_write: &mut socket_write,
+                        stdout: &mut stdout,
+                        client: &mut client,
+                        stream_id: &stream_id,
+                        terminal: &mut terminal,
+                        modal: &mut modal,
+                        menu: &mut menu,
+                        shortcuts: &mut shortcuts,
+                        shortcut_deadline: &mut shortcut_deadline,
+                        control: &control,
+                    };
+                    let end = handle_stdin_event(event?, &mut stdin_buf, ctx).await?;
+                    if let Some(end) = end {
                         return Ok(end);
                     }
                 }
@@ -1299,15 +1675,15 @@ where
                     ).await?;
                 }
                 update = recv_banner_update(&mut status_updates), if status_updates.is_some() => {
-                    if handle_status_update(
-                        update,
-                        &mut modal,
-                        &mut status_updates,
-                    ) {
-                        paint_modal(
-                            &mut stdout,
-                            modal.as_mut().expect("active modal state exists"),
-                        ).await?;
+                    if let Some(update) = update {
+                        if handle_status_update(update, &mut modal) {
+                            paint_modal(
+                                &mut stdout,
+                                modal.as_mut().expect("active modal state exists"),
+                            ).await?;
+                        }
+                    } else {
+                        shutdown_banner_updates(&mut status_updates).await;
                     }
                 }
                 task = wait_for_menu_task(&mut menu.task), if menu.task.is_some() => {
@@ -1331,7 +1707,32 @@ where
     // Best-effort restore; do not mask the loop's real outcome with a teardown
     // write error.
     let _ = close_modal(&mut stdout, modal.as_mut()).await;
+    let _ = terminal_output.restore(&mut stdout).await;
+    shutdown_banner_updates(&mut status_updates).await;
+    finish_attach_outcome(&mut client, &stream_id, outcome).await
+}
+
+async fn finish_attach_outcome(
+    client: &mut Client,
+    stream_id: &str,
+    outcome: Result<AttachStreamEnd, CliError>,
+) -> Result<AttachStreamEnd, CliError> {
+    if !matches!(outcome, Ok(AttachStreamEnd::StreamClosed)) {
+        return outcome;
+    }
+    // The raw stream cannot carry a typed terminal failure. Ask the daemon once
+    // through the still-open control connection. A daemon replacement may have
+    // closed that connection too, so only a typed result overrides reconnect.
+    if let Ok(detach) = send_detach(client, stream_id).await {
+        if let Some(error) = stream_error_from_detach(detach) {
+            return Err(error);
+        }
+    }
     outcome
+}
+
+fn stream_error_from_detach(detach: SessionDetachResult) -> Option<CliError> {
+    detach.error.map(CliError::Protocol)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1347,13 +1748,24 @@ async fn wait_for_attach_reconnect(
     paths: &Paths,
     target: &Target,
     config: &AttachReconnectConfig,
+    deadline: time::Instant,
+    attempt: usize,
 ) -> Result<bool, CliError> {
-    let deadline = time::Instant::now() + config.window;
+    let now = time::Instant::now();
+    if now >= deadline {
+        return Ok(false);
+    }
+    let delay = reconnect_attempt_delay(config.interval, attempt, deadline - now);
     eprintln!(
-        "[pohunek] attach stream closed; waiting up to {:.1}s for session {} to resume",
-        config.window.as_secs_f64(),
-        target.session_id
+        "[pohunek] attach stream closed; retrying session {} in {:.1}s \
+         (attempt {} of {}, {:.1}s window remaining)",
+        target.session_id,
+        delay.as_secs_f64(),
+        attempt,
+        config.max_attempts,
+        (deadline - now).as_secs_f64()
     );
+    time::sleep(delay).await;
 
     loop {
         match probe_attach_reconnect(host, paths, target).await {
@@ -1373,13 +1785,18 @@ async fn wait_for_attach_reconnect(
         let now = time::Instant::now();
         if now >= deadline {
             eprintln!(
-                "[pohunek] session {} did not resume before reconnect timeout",
+                "[pohunek] attach reconnect window expired for session {}",
                 target.session_id
             );
             return Ok(false);
         }
         time::sleep(std::cmp::min(config.interval, deadline - now)).await;
     }
+}
+
+fn reconnect_attempt_delay(interval: Duration, attempt: usize, remaining: Duration) -> Duration {
+    let factor = u32::try_from(attempt).unwrap_or(u32::MAX);
+    std::cmp::min(interval.saturating_mul(factor), remaining)
 }
 
 async fn probe_attach_reconnect(
@@ -1580,10 +1997,13 @@ fn log_abandoned_menu_task_result(target: &Target, result: &MenuTaskResult) {
     }
 }
 
-async fn send_detach(client: &mut Client, stream_id: &str) -> Result<(), CliError> {
+async fn send_detach(
+    client: &mut Client,
+    stream_id: &str,
+) -> Result<SessionDetachResult, CliError> {
     let request = build_detach_request(stream_id)?;
-    let _ = client.request(&request).await?;
-    Ok(())
+    let value = client.request(&request).await?;
+    Ok(serde_json::from_value(value)?)
 }
 
 async fn send_menu_new_session(
@@ -1680,51 +2100,6 @@ enum MenuTaskArgs {
     Rename { name: String },
 }
 
-async fn handle_detach_input<W>(
-    input: &[u8],
-    socket_write: &mut W,
-    client: &mut Client,
-    stream_id: &str,
-    terminal: &mut Option<RawTerminal>,
-) -> Result<Option<AttachStreamEnd>, CliError>
-where
-    W: AsyncWrite + Unpin,
-{
-    let Some(detach_at) = input.iter().position(|byte| *byte == DETACH_BYTE) else {
-        return Ok(None);
-    };
-    if detach_at > 0 {
-        socket_write.write_all(&input[..detach_at]).await?;
-        socket_write.flush().await?;
-    }
-    terminal.take();
-    let _ = send_detach(client, stream_id).await;
-    Ok(Some(AttachStreamEnd::Detached))
-}
-
-async fn handle_menu_shortcut<W>(
-    input: &[u8],
-    socket_write: &mut W,
-    menu_available: bool,
-) -> Result<Option<MenuShortcutAction>, CliError>
-where
-    W: AsyncWrite + Unpin,
-{
-    // Non-interactive or extremely short terminals cannot render the modal.
-    if !menu_available {
-        return Ok(None);
-    }
-    let Some(input_match) = find_menu_shortcut(input) else {
-        return Ok(None);
-    };
-
-    if input_match.start > 0 {
-        socket_write.write_all(&input[..input_match.start]).await?;
-        socket_write.flush().await?;
-    }
-    Ok(Some(input_match.action))
-}
-
 async fn send_stop(client: &mut Client, target: &Target) -> Result<(), CliError> {
     let request = build_stop_request(target)?;
     let _ = client.request(&request).await?;
@@ -1733,18 +2108,6 @@ async fn send_stop(client: &mut Client, target: &Target) -> Result<(), CliError>
 
 fn build_stop_request(target: &Target) -> Result<Request, CliError> {
     request_with_params(method::SESSION_STOP, &SessionId(target.session_id.clone()))
-}
-
-fn parse_menu_shortcut(input: &[u8]) -> Option<MenuShortcutAction> {
-    input
-        .contains(&BANNER_MENU_BYTE)
-        .then_some(MenuShortcutAction::OpenMenu)
-}
-
-fn find_menu_shortcut(input: &[u8]) -> Option<MenuShortcutMatch> {
-    let start = input.iter().position(|byte| *byte == BANNER_MENU_BYTE)?;
-    let action = parse_menu_shortcut(&input[start..=start])?;
-    Some(MenuShortcutMatch { start, action })
 }
 
 #[derive(Debug)]
@@ -1772,6 +2135,44 @@ impl RawTerminal {
 impl Drop for RawTerminal {
     fn drop(&mut self) {
         let _ = tcsetattr(self.fd, &self.original);
+    }
+}
+
+#[derive(Debug)]
+struct TerminalOutputGuard {
+    enabled: bool,
+    restored: bool,
+}
+
+impl TerminalOutputGuard {
+    const fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            restored: false,
+        }
+    }
+
+    async fn restore<W>(&mut self, writer: &mut W) -> Result<(), CliError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        if self.restored || !self.enabled {
+            self.restored = true;
+            return Ok(());
+        }
+        restore_terminal_output_modes(writer).await?;
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalOutputGuard {
+    fn drop(&mut self) {
+        if self.enabled && !self.restored {
+            let mut stdout = std::io::stdout().lock();
+            let _ = std::io::Write::write_all(&mut stdout, ATTACH_TERMINAL_MODE_CLEANUP);
+            let _ = std::io::Write::flush(&mut stdout);
+        }
     }
 }
 
@@ -1856,9 +2257,457 @@ fn terminal_size(fd: RawFd) -> Option<(u16, u16)> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use protocol::Response;
     use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, BufReader, DuplexStream};
+    use tokio::net::{UnixListener, UnixStream};
 
     use super::*;
+
+    static NEXT_BANNER_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug)]
+    struct BannerConnectionControl {
+        release_event: oneshot::Sender<()>,
+        closed: oneshot::Receiver<()>,
+    }
+
+    #[derive(Debug)]
+    struct BannerTestDaemon {
+        paths: Paths,
+        controls: mpsc::UnboundedReceiver<BannerConnectionControl>,
+        active: Arc<AtomicUsize>,
+        task: JoinHandle<()>,
+        socket: PathBuf,
+    }
+
+    #[derive(Debug)]
+    struct StdinTestSocket {
+        path: PathBuf,
+    }
+
+    impl Drop for StdinTestSocket {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[derive(Debug)]
+    struct StdinTestState {
+        client: Client,
+        stream_id: String,
+        terminal: Option<RawTerminal>,
+        modal: Option<ModalState>,
+        menu: MenuRuntime,
+        shortcuts: ShortcutDecoder,
+        shortcut_deadline: Option<time::Instant>,
+        control: AttachControlContext,
+    }
+
+    impl StdinTestState {
+        fn new(client: Client, paths: Paths, menu_active: bool) -> Self {
+            Self {
+                client,
+                stream_id: "stream-test".to_owned(),
+                terminal: None,
+                modal: None,
+                menu: MenuRuntime::new(menu_active),
+                shortcuts: ShortcutDecoder::new(),
+                shortcut_deadline: None,
+                control: AttachControlContext {
+                    host: "local".to_owned(),
+                    paths,
+                    target: "local/s-42".parse().expect("test target"),
+                },
+            }
+        }
+
+        fn context<'a>(
+            &'a mut self,
+            socket_write: &'a mut DuplexStream,
+            stdout: &'a mut Vec<u8>,
+        ) -> StdinInputContext<'a, DuplexStream, Vec<u8>> {
+            StdinInputContext {
+                socket_write,
+                stdout,
+                client: &mut self.client,
+                stream_id: &self.stream_id,
+                terminal: &mut self.terminal,
+                modal: &mut self.modal,
+                menu: &mut self.menu,
+                shortcuts: &mut self.shortcuts,
+                shortcut_deadline: &mut self.shortcut_deadline,
+                control: &self.control,
+            }
+        }
+    }
+
+    async fn connect_stdin_test_client() -> (Client, UnixStream, Paths, StdinTestSocket) {
+        let id = NEXT_BANNER_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "pohunek-cli-stdin-{}-{id}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind stdin test daemon");
+        let paths = banner_test_paths(path.clone());
+        let client = Client::connect("local", &paths)
+            .await
+            .expect("connect stdin test client");
+        let (server, _) = listener.accept().await.expect("accept stdin test client");
+        (
+            client,
+            server,
+            paths,
+            StdinTestSocket { path: path.clone() },
+        )
+    }
+
+    #[tokio::test]
+    async fn stdin_event_returns_available_input() {
+        let (mut stdin, mut writer) = tokio::io::duplex(8);
+        writer.write_all(b"x").await.expect("write stdin byte");
+        let mut buffer = [0_u8; 8];
+
+        let event = read_stdin_event(&mut stdin, &mut buffer, None)
+            .await
+            .expect("read stdin event");
+
+        assert_eq!(event, StdinEvent::Input(1));
+        assert_eq!(&buffer[..1], b"x");
+    }
+
+    #[tokio::test]
+    async fn stdin_event_reports_expired_shortcut_timeout() {
+        let (mut stdin, _writer) = tokio::io::duplex(8);
+        let mut buffer = [0_u8; 8];
+
+        let event = read_stdin_event(&mut stdin, &mut buffer, Some(time::Instant::now()))
+            .await
+            .expect("wait for shortcut timeout");
+
+        assert_eq!(event, StdinEvent::ShortcutTimeout);
+    }
+
+    #[test]
+    fn shortcut_deadline_refreshes_after_each_pending_chunk() {
+        let mut decoder = ShortcutDecoder::new();
+        let first = decoder.push(b"\x1b[92;", MenuInputMode::Closed);
+        assert!(first.bytes.is_empty());
+        assert!(decoder.has_pending());
+        let stale_deadline = time::Instant::now();
+        let mut deadline = Some(stale_deadline);
+
+        let second = decoder.push(b"5", MenuInputMode::Closed);
+        update_shortcut_deadline(&decoder, &mut deadline);
+
+        assert!(second.bytes.is_empty());
+        assert!(decoder.has_pending());
+        assert!(deadline.is_some_and(|deadline| deadline > stale_deadline));
+    }
+
+    #[tokio::test]
+    async fn stdin_eof_routes_pending_input_before_shutdown() {
+        let (client, _server, paths, _socket) = connect_stdin_test_client().await;
+        let mut state = StdinTestState::new(client, paths, false);
+        let decoded = state
+            .shortcuts
+            .push(b"\x1b[92;", MenuInputMode::Unavailable);
+        assert!(decoded.bytes.is_empty());
+        state.shortcut_deadline = Some(time::Instant::now());
+        let (mut socket_write, mut socket_read) = tokio::io::duplex(64);
+        let mut stdout = Vec::new();
+        let mut buffer = [];
+
+        let end = handle_stdin_read(
+            0,
+            &mut buffer,
+            state.context(&mut socket_write, &mut stdout),
+        )
+        .await
+        .expect("handle stdin EOF");
+        let mut forwarded = Vec::new();
+        socket_read
+            .read_to_end(&mut forwarded)
+            .await
+            .expect("read forwarded pending bytes");
+
+        assert_eq!(end, Some(AttachStreamEnd::InputClosed));
+        assert_eq!(forwarded, b"\x1b[92;");
+        assert!(!state.shortcuts.has_pending());
+        assert_eq!(state.shortcut_deadline, None);
+    }
+
+    #[tokio::test]
+    async fn shortcut_timeout_routes_pending_input() {
+        let (client, _server, paths, _socket) = connect_stdin_test_client().await;
+        let mut state = StdinTestState::new(client, paths, false);
+        let decoded = state
+            .shortcuts
+            .push(b"\x1b[92;", MenuInputMode::Unavailable);
+        assert!(decoded.bytes.is_empty());
+        state.shortcut_deadline = Some(time::Instant::now());
+        let (mut socket_write, mut socket_read) = tokio::io::duplex(64);
+        let mut stdout = Vec::new();
+
+        let end = flush_shortcut_input(state.context(&mut socket_write, &mut stdout))
+            .await
+            .expect("flush timed-out shortcut input");
+        let mut forwarded = [0_u8; 5];
+        socket_read
+            .read_exact(&mut forwarded)
+            .await
+            .expect("read timed-out input");
+
+        assert_eq!(end, None);
+        assert_eq!(&forwarded, b"\x1b[92;");
+        assert!(!state.shortcuts.has_pending());
+        assert_eq!(state.shortcut_deadline, None);
+    }
+
+    #[tokio::test]
+    async fn csi_u_detach_ends_attach_and_sends_control_request() {
+        let (client, server, paths, _socket) = connect_stdin_test_client().await;
+        let server_task = tokio::spawn(async move {
+            let mut server = BufReader::new(server);
+            let request = read_banner_test_request(&mut server).await;
+            assert_request(
+                &request,
+                method::SESSION_DETACH,
+                json!({"stream_id": "stream-test"}),
+            );
+            write_banner_test_response(
+                &mut server,
+                &request,
+                json!({"detached": true, "error": null}),
+            )
+            .await;
+        });
+        let mut state = StdinTestState::new(client, paths, false);
+        let (mut socket_write, _socket_read) = tokio::io::duplex(64);
+        let mut stdout = Vec::new();
+
+        let end = handle_stdin_input(b"\x1b[93;5u", state.context(&mut socket_write, &mut stdout))
+            .await
+            .expect("handle CSI-u detach");
+        server_task.await.expect("detach test daemon");
+
+        assert_eq!(end, Some(AttachStreamEnd::Detached));
+        assert!(!state.shortcuts.has_pending());
+    }
+
+    #[tokio::test]
+    async fn csi_u_escape_closes_open_menu_without_leaking_text() {
+        let (client, _server, paths, _socket) = connect_stdin_test_client().await;
+        let mut state = StdinTestState::new(client, paths, true);
+        state.menu.state = Some(MenuState::open_root());
+        let (mut socket_write, mut socket_read) = tokio::io::duplex(64);
+        let mut stdout = Vec::new();
+
+        let end = handle_stdin_input(b"\x1b[27u", state.context(&mut socket_write, &mut stdout))
+            .await
+            .expect("handle CSI-u Escape");
+        drop(socket_write);
+        let mut leaked = Vec::new();
+        socket_read
+            .read_to_end(&mut leaked)
+            .await
+            .expect("read attached PTY input");
+
+        assert_eq!(end, None);
+        assert_eq!(state.menu.state, Some(MenuState::Closed));
+        assert!(leaked.is_empty());
+    }
+
+    #[test]
+    fn csi_u_escape_cancels_rename_without_appending_report_text() {
+        let mut decoder = ShortcutDecoder::new();
+        let mut state = MenuState::RenameInput {
+            buffer: "kept".to_owned(),
+        };
+
+        let escape = decoder.push(b"\x1b[27u", MenuInputMode::Open);
+        let effects = handle_menu_input_chunk(&mut state, &escape.bytes);
+
+        assert_eq!(state, MenuState::open_root());
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn csi_u_enter_and_backspace_are_canonical_menu_keys() {
+        let mut decoder = ShortcutDecoder::new();
+        let mut state = MenuState::RenameInput {
+            buffer: "ab".to_owned(),
+        };
+
+        let backspace = decoder.push(b"\x1b[127u", MenuInputMode::Open);
+        let backspace_effects = handle_menu_input_chunk(&mut state, &backspace.bytes);
+        assert_eq!(
+            state,
+            MenuState::RenameInput {
+                buffer: "a".to_owned()
+            }
+        );
+        assert!(backspace_effects.is_empty());
+
+        let enter = decoder.push(b"\x1b[13u", MenuInputMode::Open);
+        let enter_effects = handle_menu_input_chunk(&mut state, &enter.bytes);
+        assert_eq!(
+            state,
+            MenuState::Busy {
+                label: "Renaming session".to_owned()
+            }
+        );
+        assert_eq!(enter_effects, vec![MenuEffect::RunRename("a".to_owned())]);
+    }
+
+    impl Drop for BannerTestDaemon {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+
+    fn banner_test_paths(socket: PathBuf) -> Paths {
+        let root = socket
+            .parent()
+            .expect("test socket has a parent")
+            .to_path_buf();
+        Paths {
+            runtime_dir: root.clone(),
+            socket,
+            data_dir: root.join("data"),
+            log_dir: root.join("logs"),
+            cache_dir: root.join("cache"),
+            config_home: root.join("config-home"),
+            config_dir: root.join("config"),
+        }
+    }
+
+    fn spawn_banner_test_daemon(connection_count: usize) -> BannerTestDaemon {
+        let id = NEXT_BANNER_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
+        let socket = std::env::temp_dir().join(format!(
+            "pohunek-cli-banner-{}-{id}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).expect("bind banner test daemon");
+        let (controls_tx, controls) = mpsc::unbounded_channel();
+        let active = Arc::new(AtomicUsize::new(0));
+        let task_active = Arc::clone(&active);
+        let task = tokio::spawn(async move {
+            let mut connections = Vec::with_capacity(connection_count);
+            for _ in 0..connection_count {
+                let (stream, _) = listener.accept().await.expect("accept banner client");
+                let tx = controls_tx.clone();
+                let active = Arc::clone(&task_active);
+                connections.push(tokio::spawn(async move {
+                    handle_banner_test_connection(stream, tx, active).await;
+                }));
+            }
+            drop(controls_tx);
+            for connection in connections {
+                connection.await.expect("banner connection task");
+            }
+        });
+
+        BannerTestDaemon {
+            paths: banner_test_paths(socket.clone()),
+            controls,
+            active,
+            task,
+            socket,
+        }
+    }
+
+    async fn handle_banner_test_connection(
+        stream: UnixStream,
+        controls: mpsc::UnboundedSender<BannerConnectionControl>,
+        active: Arc<AtomicUsize>,
+    ) {
+        let mut stream = BufReader::new(stream);
+        let inspect = read_banner_test_request(&mut stream).await;
+        write_banner_test_response(
+            &mut stream,
+            &inspect,
+            json!({
+                "id": "s-42",
+                "name": "test",
+                "agent": "claude",
+                "state": "running",
+                "activity": "idle"
+            }),
+        )
+        .await;
+        let subscribe = read_banner_test_request(&mut stream).await;
+        write_banner_test_response(&mut stream, &subscribe, json!({"subscribed": true})).await;
+
+        let (release_event, release_rx) = oneshot::channel();
+        let (closed_tx, closed) = oneshot::channel();
+        active.fetch_add(1, Ordering::SeqCst);
+        controls
+            .send(BannerConnectionControl {
+                release_event,
+                closed,
+            })
+            .expect("send banner connection control");
+
+        let mut eof = String::new();
+        tokio::select! {
+            _ = release_rx => {
+                let event = serde_json::to_string(&json!({
+                    "v": 1,
+                    "event": event::AGENT_STATE,
+                    "session_id": "s-42",
+                    "activity": "working"
+                }))
+                .expect("serialize banner event");
+                let _ = stream.get_mut().write_all(event.as_bytes()).await;
+                let _ = stream.get_mut().write_all(b"\n").await;
+                let _ = stream.get_mut().flush().await;
+                let _ = stream.read_line(&mut eof).await;
+            }
+            _ = stream.read_line(&mut eof) => {}
+        }
+        active.fetch_sub(1, Ordering::SeqCst);
+        let _ = closed_tx.send(());
+    }
+
+    async fn read_banner_test_request(stream: &mut BufReader<UnixStream>) -> Request {
+        let mut line = String::new();
+        stream
+            .read_line(&mut line)
+            .await
+            .expect("read banner request");
+        serde_json::from_str(&line).expect("decode banner request")
+    }
+
+    async fn write_banner_test_response(
+        stream: &mut BufReader<UnixStream>,
+        request: &Request,
+        value: serde_json::Value,
+    ) {
+        let line = serde_json::to_string(&Response::ok(request.id.clone(), value))
+            .expect("serialize banner response");
+        stream
+            .get_mut()
+            .write_all(line.as_bytes())
+            .await
+            .expect("write banner response");
+        stream
+            .get_mut()
+            .write_all(b"\n")
+            .await
+            .expect("write banner response newline");
+        stream
+            .get_mut()
+            .flush()
+            .await
+            .expect("flush banner response");
+    }
 
     #[expect(
         clippy::needless_pass_by_value,
@@ -1880,7 +2729,7 @@ mod tests {
     #[test]
     fn attach_request_sends_session_id() {
         let target: Target = "local/s-42".parse().expect("target");
-        let request = build_attach_request(&target, None, None, None).expect("request");
+        let request = build_attach_request(&target, None, None, None, None).expect("request");
 
         assert_request(
             &request,
@@ -1896,6 +2745,7 @@ mod tests {
         let target: Target = "local/s-42".parse().expect("target");
         let request = build_attach_request(
             &target,
+            Some(TerminalDimensions::new(120, 40).expect("valid dimensions")),
             Some(SessionId("s-42".to_owned())),
             Some("daemon-xyz".to_owned()),
             Some("worker-xyz".to_owned()),
@@ -1907,6 +2757,7 @@ mod tests {
             method::SESSION_ATTACH,
             json!({
                 "session_id": "s-42",
+                "initial_dimensions": { "cols": 120, "rows": 40 },
                 "origin_session_id": "s-42",
                 "origin_daemon_id": "daemon-xyz",
                 "origin_worker_id": "worker-xyz"
@@ -1984,7 +2835,7 @@ mod tests {
         // Remote is now supported: the attach request carries only the session
         // id; the host selects the transport, it never enters the request body.
         let remote: Target = "host-b/s-42".parse().expect("target");
-        let request = build_attach_request(&remote, None, None, None).expect("request");
+        let request = build_attach_request(&remote, None, None, None, None).expect("request");
 
         assert_request(
             &request,
@@ -2012,6 +2863,26 @@ mod tests {
     }
 
     #[test]
+    fn resize_after_signal_registration_only_applies_changed_dimensions() {
+        let initial = TerminalDimensions::new(120, 40).expect("initial dimensions");
+        let changed = TerminalDimensions::new(100, 30).expect("changed dimensions");
+
+        assert_eq!(
+            resize_after_signal_registration(Some(initial), Some(initial)),
+            None
+        );
+        assert_eq!(
+            resize_after_signal_registration(Some(initial), Some(changed)),
+            Some(changed)
+        );
+        assert_eq!(
+            resize_after_signal_registration(None, Some(changed)),
+            Some(changed)
+        );
+        assert_eq!(resize_after_signal_registration(Some(initial), None), None);
+    }
+
+    #[test]
     fn attach_config_reads_reconnect_values() {
         let root = std::env::temp_dir().join(format!(
             "pohunek-attach-banner-config-{}",
@@ -2022,7 +2893,8 @@ mod tests {
         std::fs::write(
             root.join("launcher.conf"),
             "attach_reconnect_seconds=12\n\
-             attach_reconnect_interval_seconds=0.75\n",
+             attach_reconnect_interval_seconds=0.75\n\
+             attach_reconnect_max_attempts=7\n",
         )
         .expect("write config");
 
@@ -2032,6 +2904,106 @@ mod tests {
         assert_eq!(
             config.reconnect.interval,
             std::time::Duration::from_millis(750)
+        );
+        assert_eq!(config.reconnect.max_attempts, 7);
+    }
+
+    #[test]
+    fn attach_config_rejects_zero_reconnect_attempts() {
+        let root = std::env::temp_dir().join(format!(
+            "pohunek-attach-reconnect-attempts-config-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create config dir");
+        std::fs::write(
+            root.join("launcher.conf"),
+            "attach_reconnect_max_attempts=0\n",
+        )
+        .expect("write config");
+
+        let err = AttachConfig::load_from_config_dir(&root)
+            .expect_err("zero reconnect attempts must fail configuration validation");
+
+        assert!(
+            err.to_string().contains("must be greater than zero"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn attach_reconnect_budget_keeps_one_deadline_and_caps_attempts() {
+        let config = AttachReconnectConfig {
+            window: Duration::from_secs(20),
+            interval: Duration::from_millis(500),
+            max_attempts: 3,
+        };
+        let now = time::Instant::now();
+        let mut budget = AttachReconnectBudget::default();
+
+        let first = budget.next(&config, now);
+        let deadline = match first {
+            AttachReconnectPermit::Retry {
+                deadline,
+                attempt: 1,
+            } => deadline,
+            other => panic!("expected first retry permit, got {other:?}"),
+        };
+        assert_eq!(
+            budget.next(&config, now + Duration::from_secs(1)),
+            AttachReconnectPermit::Retry {
+                deadline,
+                attempt: 2
+            }
+        );
+        assert_eq!(
+            budget.next(&config, now + Duration::from_secs(2)),
+            AttachReconnectPermit::Retry {
+                deadline,
+                attempt: 3
+            }
+        );
+        assert_eq!(
+            budget.next(&config, now + Duration::from_secs(3)),
+            AttachReconnectPermit::AttemptsExhausted
+        );
+    }
+
+    #[test]
+    fn attach_reconnect_budget_expires_original_window() {
+        let config = AttachReconnectConfig {
+            window: Duration::from_secs(2),
+            interval: Duration::from_millis(500),
+            max_attempts: 10,
+        };
+        let now = time::Instant::now();
+        let mut budget = AttachReconnectBudget::default();
+        assert!(matches!(
+            budget.next(&config, now),
+            AttachReconnectPermit::Retry { attempt: 1, .. }
+        ));
+
+        assert_eq!(
+            budget.next(&config, now + config.window),
+            AttachReconnectPermit::WindowExpired
+        );
+    }
+
+    #[test]
+    fn attach_reconnect_delay_backs_off_and_stays_within_window() {
+        let interval = Duration::from_millis(500);
+
+        assert_eq!(
+            reconnect_attempt_delay(interval, 1, Duration::from_secs(20)),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            reconnect_attempt_delay(interval, 3, Duration::from_secs(20)),
+            Duration::from_millis(1_500)
+        );
+        assert_eq!(
+            reconnect_attempt_delay(interval, 3, Duration::from_millis(800)),
+            Duration::from_millis(800)
         );
     }
 
@@ -2060,6 +3032,102 @@ mod tests {
             reconnect_decision_from_error(&CliError::Protocol(missing)),
             AttachReconnectDecision::Retry
         );
+    }
+
+    #[test]
+    fn detach_stream_error_is_typed_and_not_reconnectable() {
+        let source = protocol::ProtocolError::new(
+            protocol::ErrorClass::Transport,
+            "worker_stream_failed",
+            "worker data payload exceeded the frame limit",
+            None,
+        );
+        let err = stream_error_from_detach(SessionDetachResult {
+            detached: false,
+            error: Some(source.clone()),
+        })
+        .expect("stream failure must surface");
+
+        assert!(matches!(
+            &err,
+            CliError::Protocol(protocol_error) if protocol_error == &source
+        ));
+        assert_eq!(
+            reconnect_decision_from_error(&err),
+            AttachReconnectDecision::Fail
+        );
+    }
+
+    #[tokio::test]
+    async fn banner_shutdown_returns_subscription_connections_to_baseline() {
+        const ATTEMPTS: usize = 3;
+        let mut daemon = spawn_banner_test_daemon(ATTEMPTS);
+
+        for _ in 0..ATTEMPTS {
+            let updates = spawn_banner_updates(
+                "local".to_owned(),
+                daemon.paths.clone(),
+                "s-42".to_owned(),
+                AttachStatusSnapshot::unknown("local", "s-42"),
+            );
+            let control = time::timeout(Duration::from_secs(2), daemon.controls.recv())
+                .await
+                .expect("banner subscription established promptly")
+                .expect("banner daemon control remains open");
+            assert_eq!(daemon.active.load(Ordering::SeqCst), 1);
+
+            updates.shutdown().await;
+            time::timeout(Duration::from_secs(2), control.closed)
+                .await
+                .expect("banner connection closes after shutdown")
+                .expect("banner connection reports close");
+            assert_eq!(daemon.active.load(Ordering::SeqCst), 0);
+        }
+
+        time::timeout(Duration::from_secs(2), &mut daemon.task)
+            .await
+            .expect("banner daemon exits after all attempts")
+            .expect("banner daemon task succeeds");
+    }
+
+    #[tokio::test]
+    async fn dropping_banner_receiver_terminates_subscription_task() {
+        let mut daemon = spawn_banner_test_daemon(1);
+        let updates = spawn_banner_updates(
+            "local".to_owned(),
+            daemon.paths.clone(),
+            "s-42".to_owned(),
+            AttachStatusSnapshot::unknown("local", "s-42"),
+        );
+        let control = time::timeout(Duration::from_secs(2), daemon.controls.recv())
+            .await
+            .expect("banner subscription established promptly")
+            .expect("banner daemon control remains open");
+        let BannerUpdates {
+            receiver,
+            cancel,
+            task,
+        } = updates;
+        drop(receiver);
+        control
+            .release_event
+            .send(())
+            .expect("release banner event");
+
+        time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("dropped receiver terminates banner task")
+            .expect("banner task exits normally");
+        drop(cancel);
+        time::timeout(Duration::from_secs(2), control.closed)
+            .await
+            .expect("banner connection closes after receiver drop")
+            .expect("banner connection reports close");
+        assert_eq!(daemon.active.load(Ordering::SeqCst), 0);
+        time::timeout(Duration::from_secs(2), &mut daemon.task)
+            .await
+            .expect("banner daemon exits")
+            .expect("banner daemon task succeeds");
     }
 
     #[test]
@@ -2105,31 +3173,6 @@ mod tests {
             text.chars().count() <= 80,
             "banner text must fit the declared terminal width: {text:?}"
         );
-    }
-
-    #[test]
-    fn attach_menu_shortcut_is_parsed_from_input() {
-        assert_eq!(
-            parse_menu_shortcut(&[BANNER_MENU_BYTE]),
-            Some(MenuShortcutAction::OpenMenu),
-            "the Ctrl-\\ byte must map to the open-menu action"
-        );
-    }
-
-    #[test]
-    fn attach_menu_trigger_splits_prefix_and_drops_suffix() {
-        let input = b"echo prefix\x1ctail dropped";
-        let input_match = find_menu_shortcut(input).expect("menu trigger");
-
-        assert_eq!(input_match.start, "echo prefix".len());
-        assert_eq!(input_match.action, MenuShortcutAction::OpenMenu);
-    }
-
-    #[test]
-    fn attach_non_menu_input_is_forwarded() {
-        let input = b"\x1b[<64;7;1M";
-
-        assert_eq!(parse_menu_shortcut(input), None);
     }
 
     #[test]
@@ -2410,6 +3453,75 @@ mod tests {
         );
         assert!(state.pending_output.is_empty());
         assert!(!state.active);
+    }
+
+    #[tokio::test]
+    async fn unexpected_attach_eof_emits_terminal_mode_cleanup() {
+        let mut stdout = Vec::new();
+        let mut modal = None;
+        let mut menu = MenuRuntime::new(false);
+        let mut output = TerminalOutputGuard::new(true);
+
+        let end = handle_socket_output(&[], &mut stdout, &mut modal, &mut menu)
+            .await
+            .expect("handle attach EOF");
+        assert_eq!(end, Some(AttachStreamEnd::StreamClosed));
+        output
+            .restore(&mut stdout)
+            .await
+            .expect("restore terminal modes");
+
+        assert_eq!(stdout, ATTACH_TERMINAL_MODE_CLEANUP);
+        for disabled_mode in [
+            b"\x1b[?1003l".as_slice(),
+            b"\x1b[?1006l".as_slice(),
+            b"\x1b[?1004l".as_slice(),
+            b"\x1b[?2004l".as_slice(),
+            b"\x1b[?1049l".as_slice(),
+        ] {
+            assert!(
+                stdout
+                    .windows(disabled_mode.len())
+                    .any(|window| window == disabled_mode),
+                "cleanup must contain {disabled_mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_detach_cleanup_follows_buffered_modal_output() {
+        let mut stdout = Vec::new();
+        let mut modal = ModalState {
+            compositor: Compositor::new(80, 24),
+            snapshot: AttachStatusSnapshot::unknown("local", "s-42"),
+            cols: 80,
+            pending_output: b"\x1b[?1003h\x1b[?1049hbuffered".to_vec(),
+            active: true,
+        };
+        let mut output = TerminalOutputGuard::new(true);
+
+        close_modal(&mut stdout, Some(&mut modal))
+            .await
+            .expect("replay modal output");
+        output
+            .restore(&mut stdout)
+            .await
+            .expect("restore after detach");
+
+        assert!(
+            stdout.ends_with(ATTACH_TERMINAL_MODE_CLEANUP),
+            "terminal cleanup must follow buffered mode-enabling output"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_tty_output_guard_emits_no_cleanup() {
+        let mut stdout = Vec::new();
+        let mut output = TerminalOutputGuard::new(false);
+
+        output.restore(&mut stdout).await.expect("non-TTY no-op");
+
+        assert!(stdout.is_empty());
     }
 
     #[tokio::test]

@@ -37,7 +37,9 @@ done
 # The first worker-aware upgrade cannot preserve PTYs owned by a legacy daemon.
 # Use the CLI shipped in this archive so the preflight command is guaranteed to
 # exist even when the installed CLI predates durable workers. A fresh install
-# has no legacy daemon to interrogate.
+# has no legacy daemon to interrogate. The preflight excludes sessions that
+# already expose durable runtime bindings, so later worker-aware upgrades remain
+# non-destructive while mixed legacy/worker states still fail closed.
 if [ -e "$bin_dir/pohunekd" ] || [ -L "$bin_dir/pohunekd" ]; then
     if [ "$accept_runtime_loss" -eq 1 ]; then
         "$archive_dir/pohunek" migration preflight --accept-runtime-loss

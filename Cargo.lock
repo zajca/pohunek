@@ -1850,7 +1850,6 @@ dependencies = [
  "iced_core",
  "log",
  "rustc-hash 2.1.2",
- "tokio",
  "wasm-bindgen-futures",
  "wasmtimer",
 ]
@@ -3238,11 +3237,12 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "pohunek-cli"
-version = "0.27.0"
+version = "0.29.3"
 dependencies = [
  "clap",
  "futures",
  "libc",
+ "nix 0.29.0",
  "pohunek-client",
  "pohunek-gui-core",
  "pohunek-hostcheck",
@@ -3264,9 +3264,10 @@ dependencies = [
 
 [[package]]
 name = "pohunek-client"
-version = "0.27.0"
+version = "0.29.3"
 dependencies = [
  "futures",
+ "libc",
  "pohunek-netbird",
  "pohunek-protocol",
  "serde_json",
@@ -3277,13 +3278,14 @@ dependencies = [
 
 [[package]]
 name = "pohunek-daemon"
-version = "0.27.0"
+version = "0.29.3"
 dependencies = [
  "futures",
  "libc",
  "pohunek-client",
  "pohunek-hostcheck",
  "pohunek-knowledge",
+ "pohunek-logging",
  "pohunek-netbird",
  "pohunek-paths",
  "pohunek-protocol",
@@ -3309,7 +3311,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-gui"
-version = "0.27.0"
+version = "0.29.3"
 dependencies = [
  "futures",
  "iced",
@@ -3325,7 +3327,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-gui-core"
-version = "0.27.0"
+version = "0.29.3"
 dependencies = [
  "futures",
  "keyring",
@@ -3347,7 +3349,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-hostcheck"
-version = "0.27.0"
+version = "0.29.3"
 dependencies = [
  "pohunek-netbird",
  "pohunek-protocol",
@@ -3355,7 +3357,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-knowledge"
-version = "0.27.0"
+version = "0.29.3"
 dependencies = [
  "include_dir",
  "pohunek-protocol",
@@ -3366,8 +3368,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pohunek-logging"
+version = "0.29.3"
+
+[[package]]
 name = "pohunek-netbird"
-version = "0.27.0"
+version = "0.29.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -3377,14 +3383,14 @@ dependencies = [
 
 [[package]]
 name = "pohunek-paths"
-version = "0.27.0"
+version = "0.29.3"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "pohunek-prompt"
-version = "0.27.0"
+version = "0.29.3"
 dependencies = [
  "serde_json",
  "thiserror 2.0.18",
@@ -3392,7 +3398,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-protocol"
-version = "0.27.0"
+version = "0.29.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -3402,14 +3408,16 @@ dependencies = [
 
 [[package]]
 name = "pohunek-session-worker"
-version = "0.27.0"
+version = "0.29.3"
 dependencies = [
  "libc",
  "nix 0.29.0",
+ "pohunek-logging",
  "pohunek-paths",
  "pohunek-terminal",
  "pohunek-worker-protocol",
  "portable-pty",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2",
@@ -3424,7 +3432,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-terminal"
-version = "0.27.0"
+version = "0.29.3"
 dependencies = [
  "serde",
  "vt100",
@@ -3432,7 +3440,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-worker-protocol"
-version = "0.27.0"
+version = "0.29.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -6141,7 +6149,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.27.0"
+version = "0.29.3"
 dependencies = [
  "clap",
  "pohunek-cli",

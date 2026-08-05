@@ -8,7 +8,10 @@
   import { Terminal, type IDisposable } from "@xterm/xterm";
   import { onMount } from "svelte";
   import { addErrorToast } from "../lib";
-  import { canRetryTerminal } from "../lib/terminal-connection";
+  import {
+    canRetryTerminal,
+    terminalDimensionsChanged,
+  } from "../lib/terminal-connection";
   import {
     encodeTerminalToolbarKey,
     type TerminalModifiers,
@@ -116,6 +119,7 @@
     visualViewport?.addEventListener("scroll", syncVisualViewport);
     mobileMedia.addEventListener("change", syncVisualViewport);
     syncVisualViewport();
+    fitAddon.fit();
 
     const inputSubscription = activeTerminal.onData((data): void => {
       const activeWriter = writer;
@@ -166,7 +170,11 @@
     failed = false;
     let activeAttachment: SessionAttachment | undefined;
     try {
-      activeAttachment = await workspace.attach(host, sessionId);
+      const initialDimensions = {
+        cols: activeTerminal.cols,
+        rows: activeTerminal.rows,
+      };
+      activeAttachment = await workspace.attach(host, sessionId, initialDimensions);
       if (closing) {
         await activeAttachment.detach();
         return;
@@ -175,7 +183,13 @@
       reader = activeAttachment.stream.readable.getReader();
       writer = activeAttachment.stream.writable.getWriter();
       status = "Attached";
-      queueResize(activeTerminal.cols, activeTerminal.rows);
+      const currentDimensions = {
+        cols: activeTerminal.cols,
+        rows: activeTerminal.rows,
+      };
+      if (terminalDimensionsChanged(initialDimensions, currentDimensions)) {
+        queueResize(currentDimensions.cols, currentDimensions.rows);
+      }
       await readTerminalOutput(activeTerminal, reader);
       await releaseEndedAttachment(activeAttachment);
     } catch (error: unknown) {

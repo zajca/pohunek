@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,9 +22,11 @@ use crate::integration::{
 };
 use crate::procwatch::{ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessInspector};
 use crate::project::detect::project_id;
+use crate::runtime::WorkerError;
 
 use super::{
-    RuntimeExit, SessionRegistry, SessionRegistryConfig, ShellCommand, MAX_SESSION_NAME_BYTES,
+    worker_error_to_protocol, RuntimeExit, SessionRegistry, SessionRegistryConfig, ShellCommand,
+    MAX_SESSION_NAME_BYTES,
 };
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -91,10 +94,24 @@ fn metadata_patch(entries: &[(&str, Option<&str>)]) -> BTreeMap<String, Option<S
 fn attach_params(id: &SessionId) -> SessionAttachParams {
     SessionAttachParams {
         session_id: id.clone(),
+        initial_dimensions: None,
         origin_session_id: None,
         origin_daemon_id: None,
         origin_worker_id: None,
     }
+}
+
+#[test]
+fn old_worker_attach_failure_has_an_actionable_recovery_hint() {
+    let error = worker_error_to_protocol(WorkerError::AttachSnapshotUnsupported {
+        selected_version: pohunek_worker_protocol::PREVIOUS_VERSION,
+    });
+
+    assert_eq!(error.code, "attach_snapshot_unsupported");
+    assert!(error
+        .recover
+        .as_deref()
+        .is_some_and(|hint| hint.contains("restart") && hint.contains("fork")));
 }
 
 fn temp_store_path(tag: &str) -> PathBuf {
@@ -2280,6 +2297,73 @@ async fn remove_stops_a_live_session_then_evicts() {
 }
 
 #[tokio::test]
+async fn remove_evicts_a_conflicted_runtime_without_stopping_it() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+
+    let created = registry.create(params()).await.expect("create session");
+    registry.stop(&created.id).await.expect("stop session");
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&created.id).expect("stopped session");
+    entry.info.state = SessionState::Running;
+    entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Conflict);
+    drop(sessions);
+
+    let removed = registry
+        .remove(&created.id)
+        .await
+        .expect("remove conflicted session");
+
+    assert!(removed.removed);
+    assert!(
+        !removed.stopped,
+        "an unavailable runtime must not be signaled"
+    );
+    let error = registry
+        .inspect(&created.id)
+        .await
+        .expect_err("removed session is gone");
+    assert_eq!(error.code, "session_not_found");
+}
+
+#[tokio::test]
+async fn delete_session_logs_removes_the_worker_log_family() {
+    let log_dir = temp_dir("remove-worker-logs");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        log_dir: Some(log_dir.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let session_id = SessionId("s-cleanup".to_owned());
+    let files =
+        pohunek_logging::config::worker_files(&session_id.0).expect("safe managed session id");
+    let mut writer = pohunek_logging::Writer::open(
+        &log_dir,
+        files,
+        pohunek_logging::config::worker_policy().expect("valid application policy"),
+    )
+    .expect("open worker log family");
+    writer.write_all(b"{\"worker\":\"running\"}\n").unwrap();
+    drop(writer);
+
+    registry
+        .delete_session_logs(&session_id)
+        .await
+        .expect("delete session logs");
+
+    assert!(
+        fs::read_dir(&log_dir)
+            .expect("read log directory")
+            .next()
+            .is_none(),
+        "session removal must delete its worker log and lock files"
+    );
+    fs::remove_dir_all(log_dir).expect("remove test log directory");
+}
+
+#[tokio::test]
 async fn remove_unknown_session_is_session_not_found() {
     let registry = SessionRegistry::default();
 
@@ -2333,9 +2417,84 @@ async fn attach_tokens_are_one_shot_and_expired_tokens_are_pruned() {
         .expect_err("stream id is one-shot");
     assert_eq!(second_redeem.code, "attach_not_found");
 
-    registry.finish_attach(&redeemed.stream_id).await;
+    registry.finish_attach(&redeemed.stream_id, None).await;
     let stopped = registry.stop(&created.id).await.expect("stop session");
     assert!(stopped.stopped);
+}
+
+#[tokio::test]
+async fn failed_attach_results_are_bounded_and_consumed_once() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        attach_result_capacity: 2,
+        ..SessionRegistryConfig::default()
+    });
+    for stream_id in ["a-oldest", "a-middle", "a-newest"] {
+        registry
+            .finish_attach(
+                stream_id,
+                Some(protocol::ProtocolError::new(
+                    protocol::ErrorClass::Runtime,
+                    "worker_runtime_fault",
+                    format!("failure for {stream_id}"),
+                    None,
+                )),
+            )
+            .await;
+    }
+
+    assert_eq!(
+        registry.inner.recent_attach_failures.lock().await.len(),
+        2,
+        "failed attach mailbox must never exceed its configured capacity"
+    );
+    let evicted = registry.detach("a-oldest").await;
+    assert!(!evicted.detached);
+    assert_eq!(evicted.error, None, "oldest result must be evicted first");
+
+    let first = registry.detach("a-middle").await;
+    assert!(!first.detached);
+    assert_eq!(
+        first.error.as_ref().map(|error| error.code.as_str()),
+        Some("worker_runtime_fault")
+    );
+    let consumed = registry.detach("a-middle").await;
+    assert_eq!(
+        consumed.error, None,
+        "a failed attach outcome is returned at most once"
+    );
+}
+
+#[tokio::test]
+async fn failed_attach_results_expire_before_lookup() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        attach_result_ttl: Duration::from_millis(1),
+        ..SessionRegistryConfig::default()
+    });
+    registry
+        .finish_attach(
+            "a-expired",
+            Some(protocol::ProtocolError::new(
+                protocol::ErrorClass::Runtime,
+                "worker_attach_stream_failed",
+                "expired failure",
+                None,
+            )),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let result = registry.detach("a-expired").await;
+    assert!(!result.detached);
+    assert_eq!(result.error, None);
+    assert!(
+        registry
+            .inner
+            .recent_attach_failures
+            .lock()
+            .await
+            .is_empty(),
+        "lookup must prune expired attach outcomes"
+    );
 }
 
 #[tokio::test]
@@ -2355,6 +2514,7 @@ async fn attach_from_inside_the_same_session_is_rejected() {
 
     let self_feed = |session: &SessionId, worker: Option<&str>| SessionAttachParams {
         session_id: session.clone(),
+        initial_dimensions: None,
         origin_session_id: Some(session.clone()),
         origin_daemon_id: Some(daemon_id.clone()),
         origin_worker_id: worker.map(str::to_owned),
@@ -2386,6 +2546,7 @@ async fn attach_from_inside_the_same_session_is_rejected() {
     let err = registry
         .attach(&SessionAttachParams {
             session_id: created.id.clone(),
+            initial_dimensions: None,
             origin_session_id: Some(created.id.clone()),
             origin_daemon_id: Some("some-other-daemon".to_owned()),
             origin_worker_id: Some(worker_id.clone()),
@@ -2410,6 +2571,7 @@ async fn attach_from_inside_the_same_session_is_rejected() {
     registry
         .attach(&SessionAttachParams {
             session_id: created.id.clone(),
+            initial_dimensions: None,
             origin_session_id: Some(SessionId("s-other".to_owned())),
             origin_daemon_id: Some(daemon_id.clone()),
             origin_worker_id: Some(worker_id.clone()),

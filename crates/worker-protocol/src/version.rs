@@ -4,7 +4,7 @@
 //! ranges. Every worker-aware release supports the current protocol and the
 //! immediately preceding protocol.
 
-// Rust guideline compliant 2026-06-26
+// Rust guideline compliant 2026-07-29
 
 use std::fmt::{Display, Formatter};
 
@@ -12,10 +12,17 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 /// Current worker protocol version.
-pub const CURRENT_VERSION: Version = Version(2);
+pub const CURRENT_VERSION: Version = Version(3);
 
 /// Immediately preceding worker protocol version.
-pub const PREVIOUS_VERSION: Version = Version(1);
+pub const PREVIOUS_VERSION: Version = Version(2);
+
+/// First version with atomic attach snapshots.
+///
+/// Version three adds an attach-start grant that combines the initial terminal
+/// dimensions with a forced terminal repaint. Older workers can replay output,
+/// but cannot safely reconstruct a TUI across historical resizes.
+pub const ATTACH_SNAPSHOT_VERSION: Version = Version(3);
 
 /// Versions supported by this crate release.
 pub const SUPPORTED_RANGE: VersionRange = VersionRange {
@@ -197,11 +204,7 @@ mod tests {
 
     #[test]
     fn negotiation_selects_highest_common_version() {
-        let remote = VersionRange::new(
-            Version::new(1).expect("valid version"),
-            Version::new(1).expect("valid version"),
-        )
-        .expect("ordered range");
+        let remote = VersionRange::new(PREVIOUS_VERSION, PREVIOUS_VERSION).expect("ordered range");
 
         assert_eq!(
             negotiate(SUPPORTED_RANGE, remote).expect("compatible ranges"),
@@ -212,8 +215,8 @@ mod tests {
     #[test]
     fn negotiation_rejects_disjoint_ranges() {
         let remote = VersionRange::new(
-            Version::new(3).expect("valid version"),
             Version::new(4).expect("valid version"),
+            Version::new(5).expect("valid version"),
         )
         .expect("ordered range");
 

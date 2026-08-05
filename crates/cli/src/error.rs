@@ -376,6 +376,22 @@ mod tests {
     }
 
     #[test]
+    fn sdk_descriptor_exhaustion_renders_specific_non_daemon_hint() {
+        let err = CliError::Client(
+            pohunek_client::ClientError::ClientFileDescriptorsExhausted {
+                socket: PathBuf::from("/run/pohunek/daemon.sock"),
+                source: io::Error::from_raw_os_error(libc::EMFILE),
+            },
+        );
+
+        let text = human_error_text(&err);
+
+        assert!(text.contains("client process"), "text: {text}");
+        assert!(text.contains("RLIMIT_NOFILE"), "text: {text}");
+        assert!(!text.contains("daemon start"), "text: {text}");
+    }
+
+    #[test]
     fn daemon_unreachable_maps_to_structured_error_with_hint() {
         let err = CliError::DaemonUnreachable {
             socket: PathBuf::from("/run/pohunek/daemon.sock"),

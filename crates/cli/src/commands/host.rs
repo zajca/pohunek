@@ -2,10 +2,9 @@
 //!
 //! `discover` and `list` enumerate the local host's `NetBird` peers and classify
 //! each by probing its daemon control port, so the operator (and the rofi
-//! switcher) sees which peers run a compatible daemon. That work now lives in the
-//! **local daemon**, which caches the result for a short TTL so repeated calls
-//! (e.g. every launcher keypress) return instantly; this command is a thin client
-//! that asks the local daemon and renders the records. `inspect <host>` is a
+//! switcher) sees which peers run a compatible daemon. Discovery is performed
+//! directly by the CLI and uses its owner-private persistent cache, so it does
+//! not require a local daemon. `inspect <host>` is a
 //! *live* query against a specific host's daemon for its [`HostCapabilities`].
 //!
 //! Without a persistence store (out of scope for this milestone), the set of
@@ -14,25 +13,21 @@
 
 use std::fmt::Write as _;
 
-use protocol::{method, HostCapabilities, HostClass, HostDiscoverParams, HostRecord};
+use protocol::{method, HostCapabilities, HostClass, HostRecord};
 
 use crate::client::Client;
 use crate::error::CliError;
 use crate::paths::Paths;
-use crate::target::LOCAL_HOST;
 
-/// Run `host discover`: ask the local daemon for its classified `NetBird` peers.
-///
-/// Discovery is inherently a *local* operation (it enumerates this machine's
-/// mesh view), so it always dials the local daemon regardless of any `--host`
-/// flag — the same rule `integration install` follows.
+/// Run `host discover` using local `NetBird` state and the standalone cache.
 ///
 /// # Errors
 ///
-/// Returns [`CliError`] when the local daemon is unreachable, rejects the request
-/// (e.g. `NetBird` state cannot be read), or returns an unexpected payload.
-pub(crate) async fn run_discover(paths: &Paths, json: bool) -> Result<(), CliError> {
-    let records = fetch_records(paths).await?;
+/// Returns [`CliError`] when `NetBird` state cannot be read, remote-port
+/// configuration is invalid, or the persistent cache cannot be safely used.
+pub(crate) async fn run_discover(refresh: bool, json: bool) -> Result<(), CliError> {
+    let cache_dir = Paths::cache_dir_only()?;
+    let records = fetch_records(&cache_dir, refresh).await?;
     if json {
         print!("{}", crate::commands::render_json(&records)?);
     } else {
@@ -50,18 +45,16 @@ pub(crate) async fn run_discover(paths: &Paths, json: bool) -> Result<(), CliErr
 /// # Errors
 ///
 /// Same as [`run_discover`].
-pub(crate) async fn run_list(paths: &Paths, json: bool) -> Result<(), CliError> {
-    run_discover(paths, json).await
+pub(crate) async fn run_list(refresh: bool, json: bool) -> Result<(), CliError> {
+    run_discover(refresh, json).await
 }
 
-/// Ask the local daemon to enumerate and classify `NetBird` peers.
-async fn fetch_records(paths: &Paths) -> Result<Vec<HostRecord>, CliError> {
-    let mut client = Client::connect(LOCAL_HOST, paths).await?;
-    // `force: false` uses the daemon's cached snapshot when fresh; the launcher
-    // calls discover on every keypress, so the cache is what keeps it instant.
-    client
-        .call::<method::HostDiscover>(HostDiscoverParams { force: false })
-        .await
+/// Enumerate peers through standalone discovery without a local control socket.
+pub(crate) async fn fetch_records(
+    cache_dir: &std::path::Path,
+    refresh: bool,
+) -> Result<Vec<HostRecord>, CliError> {
+    crate::commands::discovery_cache::records(cache_dir, refresh).await
 }
 
 /// Run `host inspect <host>`: a live capability query against the host's daemon.

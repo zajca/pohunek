@@ -12,10 +12,12 @@ provider process later, but it cannot preserve the same PTY, PID, shell, or
 in-flight terminal state.
 
 The first worker-aware installation therefore fails closed when the legacy
-daemon exposes live sessions. This limitation applies only to the boundary
-migration. Sessions created by a worker-aware release subsequently survive
-daemon restart, daemon crash, and daemon binary upgrade with the same worker,
-PTY, child PID, and runtime id.
+daemon exposes live sessions without durable runtime metadata. Sessions that
+already report a `runtime` binding are worker-owned and are excluded from this
+one-time guard. This limitation applies only to the boundary migration.
+Sessions created by a worker-aware release subsequently survive daemon restart,
+daemon crash, and daemon binary upgrade with the same worker, PTY, child PID,
+and runtime id.
 
 ## Preferred Migration
 
@@ -26,9 +28,10 @@ PTY, child PID, and runtime id.
    pohunek session inspect <session-id> --json
    ```
 
-2. Record which sessions are `starting` or `running`. Note which agent sessions
-   have a valid native resume reference. Shell sessions and uncaptured agents
-   cannot be reconstructed after the boundary.
+2. Record which sessions are `starting` or `running` without a `runtime`
+   binding. Note which agent sessions have a valid native resume reference.
+   Shell sessions and uncaptured agents cannot be reconstructed after the
+   boundary. Existing worker-bound sessions are not legacy migration targets.
 3. Let live work finish, or stop each session intentionally through
    `pohunek session stop <session-id>`.
 4. Repeat `pohunek session list --json` and require zero `starting` or `running`

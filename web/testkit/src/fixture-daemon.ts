@@ -55,6 +55,7 @@ import {
   type SessionStopResult,
   type WorktreeRemoveParams,
   type StateSource,
+  type TerminalDimensions,
 } from "@pohunek/protocol";
 import { ActivePtyAttach, FixturePtyRegistry, type FixturePtyEvents, type FixturePtyOptions } from "./pty";
 import {
@@ -173,6 +174,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
   private readonly notifications = new Map<string, NotificationRecord>();
   private readonly projects = new Map<string, ProjectInfo>();
   private readonly projectWorktrees = new Map<string, ProjectWorktree[]>();
+  private readonly sessionInitialAttachDimensions = new Map<string, TerminalDimensions[]>();
   private readonly sessionResizes = new Map<string, ScenarioResize[]>();
   private endpointsValue: FixtureDaemonEndpoint[] = [];
   private discoveredHosts: HostRecord[];
@@ -302,6 +304,10 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
 
   public resizes(sessionId: string): ReadonlyArray<ScenarioResize> {
     return (this.sessionResizes.get(sessionId) ?? []).map((resize) => ({ ...resize }));
+  }
+
+  public initialAttachDimensions(sessionId: string): ReadonlyArray<TerminalDimensions> {
+    return (this.sessionInitialAttachDimensions.get(sessionId) ?? []).map((dimensions) => ({ ...dimensions }));
   }
 
   public writeToPty(sessionId: string, bytes: Uint8Array): number {
@@ -663,7 +669,11 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
 
   private handleSessionAttach(request: ControlRequest): ControlResponse {
     const params = readObjectParams<SessionAttachParams>(request);
-    if (params === undefined || typeof params.session_id !== "string") {
+    if (
+      params === undefined ||
+      typeof params.session_id !== "string" ||
+      !isOptionalTerminalDimensions(params.initial_dimensions)
+    ) {
       return errResponse(request.id, invalidParams(request.method));
     }
     const session = this.sessions.get(params.session_id);
@@ -672,6 +682,16 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     }
     if (session.state !== "running") {
       return errResponse(request.id, sessionNotRunning(params.session_id));
+    }
+
+    if (params.initial_dimensions !== undefined) {
+      const dimensions = { ...params.initial_dimensions } satisfies TerminalDimensions;
+      const attachments = this.sessionInitialAttachDimensions.get(params.session_id);
+      if (attachments === undefined) {
+        this.sessionInitialAttachDimensions.set(params.session_id, [dimensions]);
+      } else {
+        attachments.push(dimensions);
+      }
     }
 
     const streamId = this.pty.mint(params.session_id);
@@ -1487,6 +1507,14 @@ function isPositiveInteger(value: unknown): value is number {
 
 function optionalPositiveInteger(value: unknown): boolean {
   return value === undefined || isPositiveInteger(value);
+}
+
+function isOptionalTerminalDimensions(value: unknown): value is TerminalDimensions | undefined {
+  return value === undefined || (
+    isRecord(value) &&
+    isPositiveInteger(value.cols) &&
+    isPositiveInteger(value.rows)
+  );
 }
 
 function optionalString(value: unknown): boolean {

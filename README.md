@@ -68,9 +68,11 @@ where they are doing it, and when they need you.
 - Remote transport is a TCP listener bound **only** to the host's
   NetBird/WireGuard address, never `0.0.0.0`. Reachability and encryption come
   from the mesh; local access is an owner-only Unix socket.
-- **Tokenless discovery**: `pohunek host discover` enumerates NetBird peers
-  and probes which of them run a reachable daemon; `host inspect` queries live
-  capabilities (supported agents, worktree support) straight from the daemon.
+- **Tokenless discovery**: `pohunek host discover` enumerates local NetBird
+  peers and probes which run a reachable daemon. It needs local NetBird but not
+  local `pohunekd`, and uses a short owner-private cache; `--refresh` re-probes.
+  Status loading and peer probing have explicit bounded deadlines.
+  `host inspect` queries live capabilities straight from the selected daemon.
 
 **Projects and worktree isolation**
 
@@ -129,8 +131,10 @@ where they are doing it, and when they need you.
   (kill, detach, new session in the same worktree, fork, rename), then restores
   the agent screen and raw passthrough when the menu closes.
 - Attach auto-reconnects after a daemon restart to the same worker, PTY, child
-  PID, and runtime generation. A changed runtime generation is shown as
-  explicit native recovery, not seamless continuation.
+  PID, and runtime generation. Retries use a minimum interval and consecutive
+  attempt cap, while typed worker-stream failures stop immediately. A changed
+  runtime generation is shown as explicit native recovery, not seamless
+  continuation.
 
 **Built to be driven by agents, not just humans**
 
@@ -187,10 +191,12 @@ be recovered explicitly when it has valid native recovery metadata.
 
 ## Install
 
-Each release publishes per-component archives for x86_64 Linux (glibc and
-MUSL): `pohunek-cli-*`, `pohunek-daemon-*`, and `pohunek-gui-*`. Every archive
-contains its license and offline documentation under `docs/offline/`. Daemon
-archives contain `pohunekd`, `pohunek-sessiond`, the daemon service, the
+Each release publishes `pohunek-cli-*` and `pohunek-daemon-*` archives for
+x86_64 Linux with both glibc and MUSL. The native `pohunek-gui-*` archive is
+published for glibc because its Wayland client and graphics stack are dynamic
+runtime dependencies; there is no self-contained MUSL GUI archive. Every
+archive contains its license and offline documentation under `docs/offline/`.
+Daemon archives contain `pohunekd`, `pohunek-sessiond`, the daemon service, the
 per-session worker template, the worker slice, and the installer.
 
 Releases also publish `pohunek-web-*-linux-x86_64.tar.gz`: a standalone web
@@ -270,7 +276,7 @@ them `--json` for machine-readable output (the exceptions are `attach`,
 | `pohunek session rename / stop / rm` | Rename, stop, or evict a session. |
 | `pohunek project add / list / show / rename / rm` | Manage git-repo-aware project records. |
 | `pohunek project actions / action / prompt` | Resolve per-project launch recipes and prompt templates. |
-| `pohunek host discover / list / inspect` | Find NetBird peers running daemons and query live capabilities. |
+| `pohunek host discover / list / inspect` | Find NetBird peers running daemons (standalone cache; `--refresh`) and query live capabilities. |
 | `pohunek notifications list / watch` | Inspect or stream the durable inbox; `--all-hosts` fans out. |
 | `pohunek notifications read / ack / archive / delete` | Drive one record's lifecycle (`host/id` targets a specific host). |
 | `pohunek notifications policy / retention` | Per-kind/provider policy, retention pruning (`--dry-run` / `--apply`). |
@@ -599,9 +605,10 @@ cargo xtask ts check      # CI gate
 ### Release
 
 `scripts/release` bumps the workspace version, tags `vX.Y.Z`, and pushes; the
-Release workflow re-runs the gates on the tag, then builds and publishes the
-glibc and MUSL x86_64 component archives with the offline docs bundled in, plus
-a self-contained Linux x86_64 web-control-center archive.
+Release workflow re-runs the gates on the tag, then builds and publishes glibc
+and MUSL x86_64 CLI and daemon archives, a glibc x86_64 GUI archive, and a
+self-contained Linux x86_64 web-control-center archive. The offline docs are
+bundled into every native component archive.
 
 ## License
 

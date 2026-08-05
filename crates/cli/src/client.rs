@@ -87,6 +87,21 @@ mod tests {
     }
 
     #[test]
+    fn preserves_local_descriptor_exhaustion_as_typed_sdk_error() {
+        let err = map_connect_error(
+            pohunek_client::ClientError::ClientFileDescriptorsExhausted {
+                socket: PathBuf::from("/run/pohunek/daemon.sock"),
+                source: io::Error::from_raw_os_error(libc::EMFILE),
+            },
+        );
+
+        assert!(matches!(
+            err,
+            CliError::Client(pohunek_client::ClientError::ClientFileDescriptorsExhausted { .. })
+        ));
+    }
+
+    #[test]
     fn maps_local_sdk_protocol_error_to_cli_protocol_error() {
         let err = map_client_error(pohunek_client::ClientError::Protocol(
             protocol::ProtocolError::method_not_found("assistant.materialize"),

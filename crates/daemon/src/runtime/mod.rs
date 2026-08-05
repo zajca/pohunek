@@ -10,7 +10,7 @@ mod client;
 mod launcher;
 mod systemd;
 
-pub use client::{DataStream, Worker, WorkerError};
+pub use client::{DataStream, DimensionUpdate, Worker, WorkerError};
 #[cfg(test)]
 pub use launcher::InProcessWorkerLauncher;
 pub use launcher::{

@@ -294,6 +294,7 @@ where
         method::SESSION_ATTACH,
         serde_json::to_value(SessionAttachParams {
             session_id: id.clone(),
+            initial_dimensions: None,
             origin_session_id: None,
             origin_daemon_id: None,
             origin_worker_id: None,

@@ -19,6 +19,32 @@ pub enum ClientError {
         source: io::Error,
     },
 
+    /// This client process exhausted its file-descriptor limit.
+    #[error(
+        "cannot open a daemon connection at {socket}: \
+         this client process exhausted its file-descriptor limit: {source}"
+    )]
+    ClientFileDescriptorsExhausted {
+        /// The socket path that was dialed.
+        socket: PathBuf,
+        /// Underlying `EMFILE` connection error.
+        #[source]
+        source: io::Error,
+    },
+
+    /// The host exhausted its system-wide open-file table.
+    #[error(
+        "cannot open a daemon connection at {socket}: \
+         the host exhausted its system-wide open-file table: {source}"
+    )]
+    SystemFileDescriptorsExhausted {
+        /// The socket path that was dialed.
+        socket: PathBuf,
+        /// Underlying `ENFILE` connection error.
+        #[source]
+        source: io::Error,
+    },
+
     /// A control line could not be framed or parsed.
     #[error("protocol framing error: {0}")]
     Framing(String),
@@ -31,10 +57,17 @@ pub enum ClientError {
     #[error(transparent)]
     Netbird(#[from] netbird::NetbirdError),
 
-    /// Remote-host discovery failed inside the async blocking boundary.
+    /// Bounded remote-host discovery or its overall deadline failed.
     #[error("remote host discovery failed: {detail}")]
     RemoteDiscoveryFailed {
         /// Non-secret detail describing the discovery failure.
+        detail: String,
+    },
+
+    /// Caller-supplied standalone discovery settings violate required bounds.
+    #[error("invalid discovery options: {detail}")]
+    InvalidDiscoveryOptions {
+        /// Non-secret detail describing the violated local invariant.
         detail: String,
     },
 
@@ -85,6 +118,34 @@ impl ClientError {
                 format!("cannot reach the daemon at {}: {source}", socket.display()),
                 Some("start the daemon with `pohunek daemon start`".to_owned()),
             ),
+            ClientError::ClientFileDescriptorsExhausted { socket, source } => ProtocolError::new(
+                ErrorClass::Runtime,
+                "client_file_descriptors_exhausted",
+                format!(
+                    "cannot open a daemon connection at {}: this client process exhausted \
+                         its file-descriptor limit: {source}",
+                    socket.display()
+                ),
+                Some(
+                    "close unused connections in this client process or raise its \
+                         RLIMIT_NOFILE, then retry; the daemon may still be running"
+                        .to_owned(),
+                ),
+            ),
+            ClientError::SystemFileDescriptorsExhausted { socket, source } => ProtocolError::new(
+                ErrorClass::Runtime,
+                "system_file_descriptors_exhausted",
+                format!(
+                    "cannot open a daemon connection at {}: the host exhausted its \
+                         system-wide open-file table: {source}",
+                    socket.display()
+                ),
+                Some(
+                    "free system-wide file descriptors or raise the host file-table limit, \
+                         then retry; the daemon may still be running"
+                        .to_owned(),
+                ),
+            ),
             ClientError::Framing(msg) => ProtocolError::new(
                 ErrorClass::Transport,
                 "framing",
@@ -101,6 +162,12 @@ impl ClientError {
                     "retry the remote request; if it persists, check the local NetBird state"
                         .to_owned(),
                 ),
+            ),
+            ClientError::InvalidDiscoveryOptions { detail } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "invalid_discovery_options",
+                format!("invalid discovery options: {detail}"),
+                Some("fix the invalid discovery option before running discovery".to_owned()),
             ),
             ClientError::HostUnreachable { host, source } => {
                 let mut err = ProtocolError::host_unreachable(host);
@@ -179,6 +246,50 @@ mod tests {
     }
 
     #[test]
+    fn client_descriptor_exhaustion_does_not_recommend_starting_daemon() {
+        let err = ClientError::ClientFileDescriptorsExhausted {
+            socket: PathBuf::from("/run/pohunek/daemon.sock"),
+            source: io::Error::from_raw_os_error(libc::EMFILE),
+        };
+
+        let structured = err.to_protocol_error();
+
+        assert_eq!(structured.class, ErrorClass::Runtime);
+        assert_eq!(structured.code, "client_file_descriptors_exhausted");
+        let recover = structured
+            .recover
+            .as_deref()
+            .expect("descriptor exhaustion carries a recovery hint");
+        assert!(recover.contains("RLIMIT_NOFILE"), "recover: {recover}");
+        assert!(
+            !recover.contains("daemon start"),
+            "recover must not imply the daemon stopped: {recover}"
+        );
+    }
+
+    #[test]
+    fn system_descriptor_exhaustion_has_distinct_diagnostic() {
+        let err = ClientError::SystemFileDescriptorsExhausted {
+            socket: PathBuf::from("/run/pohunek/daemon.sock"),
+            source: io::Error::from_raw_os_error(libc::ENFILE),
+        };
+
+        let structured = err.to_protocol_error();
+
+        assert_eq!(structured.class, ErrorClass::Runtime);
+        assert_eq!(structured.code, "system_file_descriptors_exhausted");
+        let recover = structured
+            .recover
+            .as_deref()
+            .expect("system descriptor exhaustion carries a recovery hint");
+        assert!(recover.contains("system-wide"), "recover: {recover}");
+        assert!(
+            !recover.contains("daemon start"),
+            "recover must not imply the daemon stopped: {recover}"
+        );
+    }
+
+    #[test]
     fn local_framing_maps_to_transport_framing() {
         let structured = ClientError::Framing("invalid line".to_owned()).to_protocol_error();
 
@@ -245,6 +356,21 @@ mod tests {
             structured.msg.contains("blocking task"),
             "msg includes detail: {}",
             structured.msg
+        );
+    }
+
+    #[test]
+    fn invalid_discovery_options_maps_to_non_retry_configuration_error() {
+        let structured = ClientError::InvalidDiscoveryOptions {
+            detail: "discovery concurrency must be non-zero".to_owned(),
+        }
+        .to_protocol_error();
+
+        assert_eq!(structured.class, ErrorClass::Configuration);
+        assert_eq!(structured.code, "invalid_discovery_options");
+        assert_eq!(
+            structured.recover.as_deref(),
+            Some("fix the invalid discovery option before running discovery")
         );
     }
 

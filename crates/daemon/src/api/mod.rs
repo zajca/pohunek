@@ -31,9 +31,9 @@ use std::path::{Path, PathBuf};
 
 use futures::{SinkExt, StreamExt};
 use pohunek_worker_protocol::{
-    read_frame, write_frame, DataFrame, FrameHeader, FrameKind, WriteId,
+    read_frame, write_frame, ControlCode, ControlError, DataFrame, FrameHeader, FrameKind, WriteId,
 };
-use protocol::{Event, Response, MAX_CONTROL_LINE_BYTES};
+use protocol::{ErrorClass, Event, ProtocolError, Response, MAX_CONTROL_LINE_BYTES};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::broadcast;
@@ -373,15 +373,19 @@ where
     let parts = framed.into_parts();
     let mut stream = parts.io;
     let bridge_result = run_attach_bridge(&mut stream, &mut attach, parts.read_buf.to_vec()).await;
-    registry.finish_attach(&attach.stream_id).await;
-    bridge_result
+    let failure = bridge_result
+        .as_ref()
+        .err()
+        .and_then(AttachBridgeError::protocol_error);
+    registry.finish_attach(&attach.stream_id, failure).await;
+    bridge_result.map_err(AttachBridgeError::into_io)
 }
 
 async fn run_attach_bridge<S>(
     stream: &mut S,
     attach: &mut RedeemedAttach,
     initial_input: Vec<u8>,
-) -> Result<(), io::Error>
+) -> Result<(), AttachBridgeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -410,7 +414,7 @@ async fn run_worker_attach_bridge<S>(
     cancel: &tokio_util::sync::CancellationToken,
     data: &mut crate::runtime::DataStream,
     initial_input: Vec<u8>,
-) -> Result<(), io::Error>
+) -> Result<(), AttachBridgeError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -428,31 +432,45 @@ where
             write_sequence,
             initial_input,
         )
-        .await?;
-        write_sequence = write_sequence.saturating_add(1);
+        .await
+        .map_err(AttachBridgeError::worker_stream)?;
+        write_sequence = next_attach_sequence(write_sequence)?;
     }
     let mut input = [0_u8; 8 * 1024];
+    let mut snapshot_started = false;
 
     loop {
         tokio::select! {
             frame = read_frame(&mut worker_read) => {
-                let Some(frame) = frame.map_err(io::Error::other)? else {
+                let Some(frame) = frame.map_err(AttachBridgeError::worker_stream)? else {
                     break;
                 };
                 let (header, payload) = frame.into_parts();
                 if header.stream_id != stream_id || header.runtime_id != runtime_id {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
+                    return Err(AttachBridgeError::worker_message(
                         "worker attach frame identity mismatch",
                     ));
                 }
                 match header.kind {
-                    FrameKind::Replay { .. }
-                    | FrameKind::Output { .. }
-                    | FrameKind::TerminalSnapshot { .. } => {
-                        stream.write_all(&payload).await?;
+                    FrameKind::Replay { .. } => {
+                        return Err(AttachBridgeError::worker_message(
+                            "snapshot attachment received historical replay",
+                        ));
                     }
-                    FrameKind::Gap { .. } | FrameKind::InputAck { .. } => {}
+                    FrameKind::Output { .. } if !snapshot_started => {
+                        return Err(AttachBridgeError::worker_message(
+                            "snapshot attachment received live output before its repaint",
+                        ));
+                    }
+                    FrameKind::Output { .. } | FrameKind::TerminalSnapshot { .. } => {
+                        snapshot_started = true;
+                        stream
+                            .write_all(&payload)
+                            .await
+                            .map_err(AttachBridgeError::client_io)?;
+                    }
+                    FrameKind::Gap { .. } => snapshot_started = false,
+                    FrameKind::InputAck { .. } => {}
                     FrameKind::Exit { .. } | FrameKind::Close { .. } => break,
                     FrameKind::Error { error } => {
                         warn!(
@@ -461,18 +479,19 @@ where
                             code = ?error.code,
                             "worker attach stream reported an error"
                         );
-                        break;
+                        return Err(AttachBridgeError::worker_control(error));
                     }
-                    FrameKind::Open { .. } | FrameKind::Input { .. } => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
+                    FrameKind::Open { .. }
+                    | FrameKind::AttachReady { .. }
+                    | FrameKind::Input { .. } => {
+                        return Err(AttachBridgeError::worker_message(
                             "worker sent an invalid attach frame",
                         ));
                     }
                 }
             }
             read = stream.read(&mut input) => {
-                let count = read?;
+                let count = read.map_err(AttachBridgeError::client_io)?;
                 if count == 0 {
                     break;
                 }
@@ -484,13 +503,82 @@ where
                     write_sequence,
                     input[..count].to_vec(),
                 )
-                .await?;
-                write_sequence = write_sequence.saturating_add(1);
+                .await
+                .map_err(AttachBridgeError::worker_stream)?;
+                write_sequence = next_attach_sequence(write_sequence)?;
             }
             () = cancel.cancelled() => break,
         }
     }
     Ok(())
+}
+
+fn next_attach_sequence(sequence: u64) -> Result<u64, AttachBridgeError> {
+    sequence
+        .checked_add(1)
+        .ok_or_else(|| AttachBridgeError::worker_message("attach input sequence was exhausted"))
+}
+
+#[derive(Debug)]
+struct AttachBridgeError {
+    source: io::Error,
+    protocol: Option<ProtocolError>,
+}
+
+impl AttachBridgeError {
+    fn client_io(source: io::Error) -> Self {
+        Self {
+            source,
+            protocol: None,
+        }
+    }
+
+    fn worker_stream(error: impl std::fmt::Display) -> Self {
+        Self::worker_message(error.to_string())
+    }
+
+    fn worker_message(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            source: io::Error::other(message.clone()),
+            protocol: Some(ProtocolError::new(
+                ErrorClass::Runtime,
+                "worker_attach_stream_failed",
+                message,
+                None,
+            )),
+        }
+    }
+
+    fn worker_control(error: ControlError) -> Self {
+        let code = match error.code {
+            ControlCode::WorkerProtocolIncompatible => "worker_protocol_incompatible",
+            ControlCode::ControllerBusy => "worker_controller_busy",
+            ControlCode::IdentityMismatch => "worker_identity_mismatch",
+            ControlCode::InvalidState => "worker_invalid_state",
+            ControlCode::InvalidRequest => "worker_invalid_request",
+            ControlCode::InvalidDataToken => "worker_invalid_data_token",
+            ControlCode::WriteOutcomeUnknown => "worker_write_outcome_unknown",
+            ControlCode::RuntimeFault => "worker_runtime_fault",
+        };
+        Self {
+            source: io::Error::other(error.message.clone()),
+            protocol: Some(ProtocolError::new(
+                ErrorClass::Runtime,
+                code,
+                error.message,
+                None,
+            )),
+        }
+    }
+
+    fn protocol_error(&self) -> Option<ProtocolError> {
+        self.protocol.clone()
+    }
+
+    fn into_io(self) -> io::Error {
+        self.source
+    }
 }
 
 async fn send_worker_attach_input<W>(
@@ -643,4 +731,141 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), DaemonError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use pohunek_worker_protocol::{
+        ControlCode, ControlError, DataFrame, FrameHeader, FrameKind, RuntimeId, StreamId, Version,
+    };
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixStream;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{run_worker_attach_bridge, write_frame};
+    use crate::runtime::DataStream;
+
+    fn data_stream(stream: UnixStream) -> DataStream {
+        DataStream {
+            stream,
+            version: Version::new(1).expect("version"),
+            stream_id: StreamId::new("a-typed-error").expect("stream id"),
+            runtime_id: RuntimeId::new("runtime-typed-error").expect("runtime id"),
+            dimension_update: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_attach_bridge_preserves_typed_worker_error() {
+        let (daemon_worker, mut fake_worker) = UnixStream::pair().expect("worker stream pair");
+        let mut data = data_stream(daemon_worker);
+        let frame = DataFrame::new(
+            FrameHeader {
+                version: data.version,
+                stream_id: data.stream_id.clone(),
+                runtime_id: data.runtime_id.clone(),
+                kind: FrameKind::Error {
+                    error: ControlError {
+                        code: ControlCode::RuntimeFault,
+                        message: "retained replay could not be framed".to_owned(),
+                        retryable: false,
+                    },
+                },
+            },
+            Vec::new(),
+        )
+        .expect("error frame");
+        write_frame(&mut fake_worker, &frame)
+            .await
+            .expect("write worker error");
+        let (mut public_stream, _public_peer) = tokio::io::duplex(64);
+
+        let failure = run_worker_attach_bridge(
+            &mut public_stream,
+            "a-typed-error",
+            &protocol::SessionId("s-typed-error".to_owned()),
+            &CancellationToken::new(),
+            &mut data,
+            Vec::new(),
+        )
+        .await
+        .expect_err("worker error frame must fail the raw bridge");
+        let error = failure
+            .protocol_error()
+            .expect("typed worker error must survive bridge");
+        assert_eq!(error.class, protocol::ErrorClass::Runtime);
+        assert_eq!(error.code, "worker_runtime_fault");
+        assert_eq!(error.msg, "retained replay could not be framed");
+    }
+
+    #[tokio::test]
+    async fn worker_attach_bridge_types_frame_read_failure() {
+        let (daemon_worker, mut fake_worker) = UnixStream::pair().expect("worker stream pair");
+        let mut data = data_stream(daemon_worker);
+        fake_worker
+            .write_all(&[1])
+            .await
+            .expect("write partial worker frame");
+        fake_worker
+            .shutdown()
+            .await
+            .expect("close partial worker frame");
+        let (mut public_stream, _public_peer) = tokio::io::duplex(64);
+
+        let failure = run_worker_attach_bridge(
+            &mut public_stream,
+            "a-frame-error",
+            &protocol::SessionId("s-frame-error".to_owned()),
+            &CancellationToken::new(),
+            &mut data,
+            Vec::new(),
+        )
+        .await
+        .expect_err("partial worker frame must fail the raw bridge");
+        let error = failure
+            .protocol_error()
+            .expect("frame read failure must be typed");
+        assert_eq!(error.class, protocol::ErrorClass::Runtime);
+        assert_eq!(error.code, "worker_attach_stream_failed");
+        assert!(
+            error.msg.contains("ended partway"),
+            "worker frame cause must remain visible: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_attach_bridge_rejects_historical_replay() {
+        let (daemon_worker, mut fake_worker) = UnixStream::pair().expect("worker stream pair");
+        let mut data = data_stream(daemon_worker);
+        let frame = DataFrame::new(
+            FrameHeader {
+                version: data.version,
+                stream_id: data.stream_id.clone(),
+                runtime_id: data.runtime_id.clone(),
+                kind: FrameKind::Replay { offset: 0 },
+            },
+            b"historical bytes".to_vec(),
+        )
+        .expect("replay frame");
+        write_frame(&mut fake_worker, &frame)
+            .await
+            .expect("write replay frame");
+        let (mut public_stream, _public_peer) = tokio::io::duplex(64);
+
+        let failure = run_worker_attach_bridge(
+            &mut public_stream,
+            "a-replay",
+            &protocol::SessionId("s-replay".to_owned()),
+            &CancellationToken::new(),
+            &mut data,
+            Vec::new(),
+        )
+        .await
+        .expect_err("fresh attach must reject retained history replay");
+        let error = failure
+            .protocol_error()
+            .expect("replay contract failure must be typed");
+        assert_eq!(error.code, "worker_attach_stream_failed");
+        assert!(error.msg.contains("historical replay"));
+    }
 }

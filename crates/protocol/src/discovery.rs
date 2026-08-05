@@ -5,10 +5,10 @@
 //! peers and classifies each by probing its daemon control port, so the operator
 //! (and the rofi switcher) sees which peers run a compatible daemon.
 //!
-//! The work — peer enumeration plus concurrent probing — is performed by the
-//! local daemon, which caches the result for a short TTL so repeated calls (e.g.
-//! every launcher keypress) return instantly. The CLI is a thin client: it asks
-//! the local daemon and renders the returned records.
+//! The CLI performs peer enumeration plus bounded concurrent probing directly,
+//! using a short owner-private persistent cache; it therefore needs local
+//! `NetBird` state but not a local daemon. The daemon retains this RPC and its
+//! own memory cache for GUI, web, and other protocol clients.
 //!
 //! Like every other protocol payload these are additive: unknown fields are
 //! ignored and absent optional fields default, so a newer peer and an older peer

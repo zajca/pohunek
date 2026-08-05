@@ -7,8 +7,9 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
-use crate::envelope::StateSource;
+use crate::{envelope::StateSource, ProtocolError};
 
 /// The kind of agent backing a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -235,6 +236,71 @@ fn base_kind_label(agent: AgentKind) -> &'static str {
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionId.ts"))]
 pub struct SessionId(pub String);
 
+/// Validated terminal dimensions for an interactive attach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "TerminalDimensions.ts"))]
+pub struct TerminalDimensions {
+    cols: u16,
+    rows: u16,
+}
+
+impl TerminalDimensions {
+    /// Creates nonzero terminal dimensions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TerminalDimensionsError::Zero`] when either axis is zero.
+    pub const fn new(cols: u16, rows: u16) -> Result<Self, TerminalDimensionsError> {
+        if cols == 0 || rows == 0 {
+            Err(TerminalDimensionsError::Zero { cols, rows })
+        } else {
+            Ok(Self { cols, rows })
+        }
+    }
+
+    /// Returns the terminal width in columns.
+    #[must_use]
+    pub const fn cols(self) -> u16 {
+        self.cols
+    }
+
+    /// Returns the terminal height in rows.
+    #[must_use]
+    pub const fn rows(self) -> u16 {
+        self.rows
+    }
+}
+
+impl<'de> Deserialize<'de> for TerminalDimensions {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireTerminalDimensions {
+            cols: u16,
+            rows: u16,
+        }
+
+        let dimensions = WireTerminalDimensions::deserialize(deserializer)?;
+        Self::new(dimensions.cols, dimensions.rows).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Reports invalid interactive terminal dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum TerminalDimensionsError {
+    /// One or both terminal axes were zero.
+    #[error("terminal dimensions must be nonzero, got {cols}x{rows}")]
+    Zero {
+        /// Requested terminal width in columns.
+        cols: u16,
+        /// Requested terminal height in rows.
+        rows: u16,
+    },
+}
+
 /// Parameters for `session.attach`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -242,6 +308,15 @@ pub struct SessionId(pub String);
 pub struct SessionAttachParams {
     /// Session to attach to.
     pub session_id: SessionId,
+    /// Physical terminal geometry observed before attach negotiation, when known.
+    ///
+    /// The daemon binds these dimensions to the one-shot attach token so the
+    /// worker can resize and capture the initial terminal snapshot before it
+    /// emits any bytes on the raw stream. `None` represents a non-terminal or
+    /// unknown client geometry; the worker retains its current geometry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub initial_dimensions: Option<TerminalDimensions>,
     /// Session the attaching client is itself running inside, when known.
     ///
     /// Set by the CLI from `POHUNEK_SESSION_ID` (see
@@ -436,6 +511,13 @@ pub struct SessionDetachParams {
 pub struct SessionDetachResult {
     /// Whether an active attach stream was detached.
     pub detached: bool,
+    /// Stream-local failure recorded before the raw connection closed.
+    ///
+    /// Clients should surface this error instead of treating the closure as a
+    /// transient daemon or runtime replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub error: Option<ProtocolError>,
 }
 
 /// Parameters for `session.resize`.
@@ -1198,6 +1280,7 @@ mod tests {
         // older daemon still parses it and a newer daemon sees `None` for both.
         let bare = SessionAttachParams {
             session_id: SessionId("s-1".to_owned()),
+            initial_dimensions: None,
             origin_session_id: None,
             origin_daemon_id: None,
             origin_worker_id: None,
@@ -1214,6 +1297,7 @@ mod tests {
     fn attach_params_origin_round_trips_when_present() {
         let with_origin = SessionAttachParams {
             session_id: SessionId("s-1".to_owned()),
+            initial_dimensions: Some(TerminalDimensions::new(120, 40).expect("valid dimensions")),
             origin_session_id: Some(SessionId("s-1".to_owned())),
             origin_daemon_id: Some("daemon-abc".to_owned()),
             origin_worker_id: Some("worker-abc".to_owned()),
@@ -1223,6 +1307,7 @@ mod tests {
             value,
             serde_json::json!({
                 "session_id": "s-1",
+                "initial_dimensions": { "cols": 120, "rows": 40 },
                 "origin_session_id": "s-1",
                 "origin_daemon_id": "daemon-abc",
                 "origin_worker_id": "worker-abc",
@@ -1230,6 +1315,19 @@ mod tests {
         );
         let parsed: SessionAttachParams = serde_json::from_value(value).expect("parse");
         assert_eq!(parsed, with_origin);
+    }
+
+    #[test]
+    fn attach_dimensions_reject_zero_axes() {
+        assert!(matches!(
+            TerminalDimensions::new(0, 24),
+            Err(TerminalDimensionsError::Zero { cols: 0, rows: 24 })
+        ));
+        serde_json::from_value::<TerminalDimensions>(serde_json::json!({
+            "cols": 80,
+            "rows": 0,
+        }))
+        .expect_err("wire dimensions with a zero axis must be rejected");
     }
 
     #[test]

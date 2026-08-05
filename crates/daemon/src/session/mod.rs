@@ -44,7 +44,7 @@ use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessInspector};
 use crate::project::detect::{project_id, DetectedProject};
 use crate::project::{detect_at, ProjectManager};
 use crate::runtime::{
-    SystemdWorkerLauncher, Worker, WorkerError, WorkerLaunchMode, WorkerLauncher,
+    DimensionUpdate, SystemdWorkerLauncher, Worker, WorkerError, WorkerLaunchMode, WorkerLauncher,
 };
 use crate::store::{
     DesiredState, ProjectRecord, ResumeBinding, RuntimeRecord, SessionRecord, SessionTransaction,
@@ -80,6 +80,16 @@ use resume::ResumeSnapshot;
 use target::{build_launch_command, LaunchCommandPlan, PtySessionSpec, TargetResolution};
 
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
+/// Time to retain a failed raw attach outcome for one control-plane lookup.
+///
+/// Clients query the outcome immediately after observing raw EOF. One minute
+/// tolerates scheduler stalls without retaining stale stream errors indefinitely.
+const DEFAULT_ATTACH_RESULT_TTL: Duration = Duration::from_mins(1);
+/// Maximum number of failed raw attach outcomes retained between EOF and detach.
+///
+/// Attach failures are exceptional and consumed once. This bound prevents a
+/// disconnected or malicious client from accumulating daemon memory.
+const DEFAULT_ATTACH_RESULT_CAPACITY: usize = 128;
 /// Maximum time to wait for a newly activated worker bootstrap socket.
 const DEFAULT_WORKER_CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 /// Initial retry interval while a systemd worker binds its bootstrap socket.
@@ -209,6 +219,10 @@ pub struct SessionRegistryConfig {
     pub stop_grace: Duration,
     /// How long a one-shot attach token may remain pending before redemption.
     pub attach_token_ttl: Duration,
+    /// How long a failed attach outcome remains available to `session.detach`.
+    pub attach_result_ttl: Duration,
+    /// Maximum failed attach outcomes retained for one-shot retrieval.
+    pub attach_result_capacity: usize,
     /// Per-session cap on the raw-output history buffer replayed on attach.
     pub output_history_limit_bytes: usize,
     /// Delay before sending Claude Code's Ink submit byte as a separate write.
@@ -242,6 +256,9 @@ pub struct SessionRegistryConfig {
     /// Directory for the append-only event log (`<data_dir>/events`). `None`
     /// disables event logging. Started via [`SessionRegistry::spawn_event_log`].
     pub event_log_dir: Option<PathBuf>,
+    /// Directory containing bounded structured logs. When set, removing a
+    /// stopped session also removes its owner-private worker log family.
+    pub log_dir: Option<PathBuf>,
     /// Host config directory (`<config_dir>` = `$XDG_CONFIG_HOME/pohunek` or
     /// `~/.config/pohunek`). The host-default layer for templates/actions/prompts
     /// (Part A), lifecycle hooks (Part B), and agent profiles (Part C). `None`
@@ -282,6 +299,8 @@ impl Default for SessionRegistryConfig {
             shell_command: ShellCommand::default(),
             stop_grace: Duration::from_millis(500),
             attach_token_ttl: DEFAULT_ATTACH_TOKEN_TTL,
+            attach_result_ttl: DEFAULT_ATTACH_RESULT_TTL,
+            attach_result_capacity: DEFAULT_ATTACH_RESULT_CAPACITY,
             output_history_limit_bytes: DEFAULT_OUTPUT_HISTORY_LIMIT_BYTES,
             claude_submit_delay: crate::agent::DEFAULT_CLAUDE_SUBMIT_DELAY,
             initial_input_startup_grace: DEFAULT_INITIAL_INPUT_STARTUP_GRACE,
@@ -290,6 +309,7 @@ impl Default for SessionRegistryConfig {
             worktree_root: None,
             hook_timeout: DEFAULT_HOOK_TIMEOUT,
             event_log_dir: None,
+            log_dir: None,
             config_dir: None,
             agents_dir: None,
             detector_lag_warn_interval: DEFAULT_DETECTOR_LAG_WARN_INTERVAL,
@@ -316,6 +336,7 @@ struct SessionRegistryInner {
     runtime_inventory: Mutex<Vec<RuntimeInventoryEntry>>,
     pending_attaches: Mutex<HashMap<String, PendingAttach>>,
     active_attaches: Mutex<HashMap<String, ActiveAttach>>,
+    recent_attach_failures: Mutex<VecDeque<attach::RecentAttachFailure>>,
     next_stream_id: AtomicU64,
     next_write_id: AtomicU64,
     next_resize_sequence: AtomicU64,
@@ -496,6 +517,30 @@ impl SessionRegistry {
                     format!("failed to remove session record {}: {error}", id.0),
                 )
             })
+    }
+
+    async fn delete_session_logs(&self, id: &SessionId) -> Result<(), ProtocolError> {
+        let Some(log_dir) = self.inner.config.log_dir.clone() else {
+            return Ok(());
+        };
+        let session_id = id.0.clone();
+        tokio::task::spawn_blocking(move || {
+            let files = pohunek_logging::config::worker_files(&session_id)?;
+            pohunek_logging::remove_family(&log_dir, &files)
+        })
+        .await
+        .map_err(|_join_error| {
+            runtime_error(
+                "session_log_cleanup_failed",
+                format!("session log cleanup task panicked for {}", id.0),
+            )
+        })?
+        .map_err(|error| {
+            runtime_error(
+                "session_log_cleanup_failed",
+                format!("failed to clean worker logs for {}: {error}", id.0),
+            )
+        })
     }
 
     async fn cleanup_owned_worktrees_for_removal(
@@ -690,6 +735,7 @@ impl SessionRegistry {
                 runtime_inventory: Mutex::new(Vec::new()),
                 pending_attaches: Mutex::new(HashMap::new()),
                 active_attaches: Mutex::new(HashMap::new()),
+                recent_attach_failures: Mutex::new(VecDeque::new()),
                 next_stream_id: AtomicU64::new(1),
                 next_write_id: AtomicU64::new(1),
                 next_resize_sequence: AtomicU64::new(1),
@@ -1759,7 +1805,7 @@ impl SessionRegistry {
             entry.runtime.clone()
         };
 
-        match runtime {
+        let update = match runtime {
             RuntimeHandle::Worker(worker) => {
                 let sequence = self
                     .inner
@@ -1772,13 +1818,25 @@ impl SessionRegistry {
                 worker
                     .resize(source_id, sequence, dimensions)
                     .await
-                    .map_err(worker_error_to_protocol)?;
+                    .map_err(worker_error_to_protocol)?
             }
             RuntimeHandle::Unavailable(state) => {
                 return Err(unavailable_runtime_error(id, state));
             }
-        }
+        };
 
+        let info = self.record_dimensions(id, &update).await?;
+        Ok(protocol::SessionResizeResult { session: info })
+    }
+
+    async fn record_dimensions(
+        &self,
+        id: &SessionId,
+        update: &DimensionUpdate,
+    ) -> Result<SessionInfo, ProtocolError> {
+        let dimensions = update.dimensions();
+        let cols = dimensions.columns();
+        let rows = dimensions.rows();
         let (info, detector_resize, has_native) = {
             let mut sessions = self.inner.sessions.lock().await;
             let entry = sessions
@@ -1811,7 +1869,7 @@ impl SessionRegistry {
         }
 
         self.emit(event::SESSION_UPDATED, &info);
-        Ok(protocol::SessionResizeResult { session: info })
+        Ok(info)
     }
 
     /// Stop a running session.
@@ -1920,10 +1978,13 @@ impl SessionRegistry {
     /// `stop` only flips a live session to a terminal state; the entry stays in
     /// the registry so `list`/`inspect` keep showing it, which is why a stopped
     /// session otherwise lingers forever. `remove` is the eviction step. A
-    /// still-live session is stopped first (so removal never orphans a live PTY),
-    /// then the entry is dropped and its resume binding cleared so a daemon
-    /// restart cannot resurrect it. A `session_removed` event is emitted with the
-    /// final snapshot so subscribed clients drop their view of the session.
+    /// still-live worker-backed session is stopped first (so removal never
+    /// orphans a live PTY), then the entry is dropped and its resume binding
+    /// cleared so a daemon restart cannot resurrect it. An unavailable runtime
+    /// is already outside the daemon's control, so removal evicts only its
+    /// logical record and deliberately does not signal an ambiguous worker. A
+    /// `session_removed` event is emitted with the final snapshot so subscribed
+    /// clients drop their view of the session.
     ///
     /// # Errors
     ///
@@ -1931,13 +1992,13 @@ impl SessionRegistry {
     /// surfaces any PTY shutdown error from the implied stop of a live session.
     pub async fn remove(&self, id: &SessionId) -> Result<SessionRemoveResult, ProtocolError> {
         self.ensure_not_external(id).await?;
-        let was_live = {
+        let should_stop = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
-            !is_terminal(entry.info.state)
+            !is_terminal(entry.info.state) && matches!(entry.runtime, RuntimeHandle::Worker(_))
         };
 
-        let stopped = if was_live {
+        let stopped = if should_stop {
             self.stop_with_intent(id, DesiredState::Removed, TransactionKind::Remove)
                 .await?
                 .stopped
@@ -1975,6 +2036,11 @@ impl SessionRegistry {
                 entry.info.warnings.extend(cleanup_warnings);
             }
         }
+
+        // The PTY has stopped above, so cleanup removes the accumulated family.
+        // A retained terminal worker may still emit a final control diagnostic,
+        // but the shared writer keeps any such file within the same hard cap.
+        self.delete_session_logs(id).await?;
 
         let info = {
             let mut sessions = self.inner.sessions.lock().await;
@@ -2907,12 +2973,19 @@ fn session_external_read_only(id: &SessionId) -> ProtocolError {
     )
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "map_err adapters receive WorkerError by value and immediately render it"
-)]
 fn worker_error_to_protocol(err: WorkerError) -> ProtocolError {
-    runtime_error("worker_operation_failed", err.to_string())
+    match err {
+        unsupported @ WorkerError::AttachSnapshotUnsupported { .. } => ProtocolError::new(
+            ErrorClass::Runtime,
+            "attach_snapshot_unsupported",
+            unsupported.to_string(),
+            Some(
+                "restart the session on the upgraded worker, or fork it into a new session"
+                    .to_owned(),
+            ),
+        ),
+        other => runtime_error("worker_operation_failed", other.to_string()),
+    }
 }
 
 fn unavailable_runtime_error(id: &SessionId, state: RuntimeState) -> ProtocolError {
