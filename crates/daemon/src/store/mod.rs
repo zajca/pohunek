@@ -600,6 +600,29 @@ impl Store {
             .store(writes, std::sync::atomic::Ordering::SeqCst);
     }
 
+    #[cfg(test)]
+    fn should_fail_write_before_rename(&self) -> bool {
+        let mut remaining = self
+            .fail_before_rename_countdown
+            .load(std::sync::atomic::Ordering::SeqCst);
+
+        loop {
+            let Some(next) = remaining.checked_sub(1) else {
+                return false;
+            };
+
+            match self.fail_before_rename_countdown.compare_exchange_weak(
+                remaining,
+                next,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(previous) => return previous == 1,
+                Err(actual) => remaining = actual,
+            }
+        }
+    }
+
     /// The backing file path.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -1027,14 +1050,7 @@ impl Store {
 
         let tmp = self.temp_path();
         #[cfg(test)]
-        let should_fail = self
-            .fail_before_rename_countdown
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |remaining| remaining.checked_sub(1),
-            )
-            .is_ok_and(|previous| previous == 1);
+        let should_fail = self.should_fail_write_before_rename();
         #[cfg(test)]
         if should_fail {
             return Err(io::Error::other("injected pre-rename write failure"));
