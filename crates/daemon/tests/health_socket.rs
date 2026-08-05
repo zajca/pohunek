@@ -22,12 +22,12 @@ use protocol::{
     NotificationKindPolicy, NotificationListParams, NotificationListResult, NotificationPolicy,
     NotificationPolicyParams, NotificationPolicyResult, NotificationRetentionParams,
     NotificationRetentionResult, NotificationSeverity, NotificationSource, NotificationStatus,
-    NotificationUpdateParams, NotificationUpdateResult, Request, Response, SessionAttachParams,
-    SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId, SessionInfo,
-    SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
-    SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult, SessionResizeParams,
-    SessionResizeResult, SessionState, SessionStopResult, StateSource, TerminalDimensions,
-    PROTOCOL_VERSION,
+    NotificationUpdateParams, NotificationUpdateResult, ReportSequence, Request as ProtocolRequest,
+    Response, SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult,
+    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter,
+    SessionListParams, SessionNewParams, SessionRemoveResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionResizeParams, SessionResizeResult, SessionState,
+    SessionStopResult, StateSource, TerminalDimensions, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -46,6 +46,14 @@ use pohunek_daemon::store::{ResumeBinding, Store, WorktreeBinding};
 static PATH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static XDG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct Request;
+
+impl Request {
+    fn make(id: &str, method: &str, params: Value) -> ProtocolRequest {
+        ProtocolRequest::new(id, method, params).expect("valid test request")
+    }
+}
 
 struct PathGuard {
     _guard: MutexGuard<'static, ()>,
@@ -351,7 +359,10 @@ async fn connect_raw(socket: &std::path::Path) -> UnixStream {
 }
 
 /// Send a request line and read one response line.
-async fn exchange(framed: &mut Framed<UnixStream, LinesCodec>, request: &Request) -> Response {
+async fn exchange(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    request: &ProtocolRequest,
+) -> Response {
     let line = serde_json::to_string(request).expect("serialize request");
     framed.send(line).await.expect("send");
     let reply = framed
@@ -364,11 +375,13 @@ async fn exchange(framed: &mut Framed<UnixStream, LinesCodec>, request: &Request
 
 /// Map a base kind to its wire name (the `agent` field is a free string since
 /// Part C; the helpers below still take an `AgentKind` for convenience).
-fn agent_name(agent: AgentKind) -> &'static str {
+fn agent_name(agent: &AgentKind) -> &'static str {
     match agent {
         AgentKind::Shell => "shell",
         AgentKind::Codex => "codex",
         AgentKind::Claude => "claude",
+        AgentKind::Hermes => "hermes",
+        AgentKind::Unknown(_) => "unknown",
     }
 }
 
@@ -388,7 +401,7 @@ fn session_params() -> SessionNewParams {
     }
 }
 
-fn session_params_for_agent(agent: AgentKind, cwd: PathBuf) -> SessionNewParams {
+fn session_params_for_agent(agent: &AgentKind, cwd: PathBuf) -> SessionNewParams {
     SessionNewParams {
         name: None,
         agent: agent_name(agent).to_owned(),
@@ -405,7 +418,7 @@ fn session_params_for_agent(agent: AgentKind, cwd: PathBuf) -> SessionNewParams 
 }
 
 /// `session.new` params binding a worktree for `repo` + `branch`.
-fn session_params_for_worktree(agent: AgentKind, repo: PathBuf, branch: &str) -> SessionNewParams {
+fn session_params_for_worktree(agent: &AgentKind, repo: PathBuf, branch: &str) -> SessionNewParams {
     SessionNewParams {
         name: None,
         agent: agent_name(agent).to_owned(),
@@ -428,10 +441,10 @@ async fn create_worktree_session(
     repo: PathBuf,
     branch: &str,
 ) -> Response {
-    let req = Request::new(
+    let req = Request::make(
         "session-new-worktree",
         method::SESSION_NEW,
-        serde_json::to_value(session_params_for_worktree(agent, repo, branch))
+        serde_json::to_value(session_params_for_worktree(&agent, repo, branch))
             .expect("serialize params"),
     );
     exchange(framed, &req).await
@@ -481,21 +494,17 @@ fn init_git_repo(tag: &str) -> PathBuf {
 }
 
 fn ok_payload(response: Response) -> Value {
-    match response {
-        Response::Ok { ok, .. } => ok,
-        Response::Err { err, .. } => panic!("expected ok, got error: {err}"),
-    }
+    response
+        .into_result()
+        .unwrap_or_else(|error| panic!("expected ok, got error: {error}"))
 }
 
 fn err_payload(response: Response) -> protocol::ProtocolError {
-    match response {
-        Response::Ok { ok, .. } => panic!("expected error, got ok: {ok}"),
-        Response::Err { err, .. } => err,
-    }
+    response.into_result().expect_err("expected error response")
 }
 
 async fn create_session(framed: &mut Framed<UnixStream, LinesCodec>) -> SessionInfo {
-    let req = Request::new(
+    let req = Request::make(
         "session-new",
         method::SESSION_NEW,
         serde_json::to_value(session_params()).expect("serialize params"),
@@ -507,7 +516,7 @@ async fn create_session_with_params(
     framed: &mut Framed<UnixStream, LinesCodec>,
     params: SessionNewParams,
 ) -> Response {
-    let req = Request::new(
+    let req = Request::make(
         "session-new-custom",
         method::SESSION_NEW,
         serde_json::to_value(params).expect("serialize params"),
@@ -520,10 +529,10 @@ async fn create_session_with_agent(
     agent: AgentKind,
     cwd: PathBuf,
 ) -> Response {
-    let req = Request::new(
+    let req = Request::make(
         "session-new-agent",
         method::SESSION_NEW,
-        serde_json::to_value(session_params_for_agent(agent, cwd)).expect("serialize params"),
+        serde_json::to_value(session_params_for_agent(&agent, cwd)).expect("serialize params"),
     );
     exchange(framed, &req).await
 }
@@ -540,7 +549,7 @@ async fn attach_session_with_dimensions(
     id: &SessionId,
     initial_dimensions: Option<TerminalDimensions>,
 ) -> SessionAttachResult {
-    let req = Request::new(
+    let req = Request::make(
         "session-attach",
         method::SESSION_ATTACH,
         serde_json::to_value(SessionAttachParams {
@@ -559,7 +568,7 @@ async fn detach_stream(
     framed: &mut Framed<UnixStream, LinesCodec>,
     stream_id: &str,
 ) -> SessionDetachResult {
-    let req = Request::new(
+    let req = Request::make(
         "session-detach",
         method::SESSION_DETACH,
         serde_json::to_value(SessionDetachParams {
@@ -576,7 +585,7 @@ async fn resize_session(
     cols: u16,
     rows: u16,
 ) -> SessionResizeResult {
-    let req = Request::new(
+    let req = Request::make(
         "session-resize",
         method::SESSION_RESIZE,
         serde_json::to_value(SessionResizeParams {
@@ -594,7 +603,7 @@ async fn input_session(
     id: &SessionId,
     text: &str,
 ) -> SessionInputResult {
-    let req = Request::new(
+    let req = Request::make(
         "session-input",
         method::SESSION_INPUT,
         serde_json::to_value(SessionInputParams {
@@ -633,7 +642,7 @@ async fn create_notification(
     framed: &mut Framed<UnixStream, LinesCodec>,
     params: NotificationCreateParams,
 ) -> NotificationCreateResult {
-    let req = Request::new(
+    let req = Request::make(
         "notification-create",
         method::NOTIFICATION_CREATE,
         serde_json::to_value(params).expect("serialize notification params"),
@@ -646,7 +655,7 @@ async fn update_notification(
     framed: &mut Framed<UnixStream, LinesCodec>,
     params: NotificationUpdateParams,
 ) -> NotificationUpdateResult {
-    let req = Request::new(
+    let req = Request::make(
         "notification-update",
         method::NOTIFICATION_UPDATE,
         serde_json::to_value(params).expect("serialize notification update"),
@@ -659,7 +668,7 @@ async fn delete_notification(
     framed: &mut Framed<UnixStream, LinesCodec>,
     params: NotificationDeleteParams,
 ) -> NotificationDeleteResult {
-    let req = Request::new(
+    let req = Request::make(
         "notification-delete",
         method::NOTIFICATION_DELETE,
         serde_json::to_value(params).expect("serialize notification delete"),
@@ -672,7 +681,7 @@ async fn list_notifications(
     framed: &mut Framed<UnixStream, LinesCodec>,
     params: NotificationListParams,
 ) -> NotificationListResult {
-    let req = Request::new(
+    let req = Request::make(
         "notification-list",
         method::NOTIFICATION_LIST,
         serde_json::to_value(params).expect("serialize list params"),
@@ -684,7 +693,7 @@ async fn list_notifications(
 async fn get_notification_policy(
     framed: &mut Framed<UnixStream, LinesCodec>,
 ) -> NotificationPolicyResult {
-    let req = Request::new(
+    let req = Request::make(
         "notification-policy-get",
         method::NOTIFICATION_POLICY_GET,
         Value::Null,
@@ -697,7 +706,7 @@ async fn set_notification_policy(
     framed: &mut Framed<UnixStream, LinesCodec>,
     policy: NotificationPolicy,
 ) -> NotificationPolicyResult {
-    let req = Request::new(
+    let req = Request::make(
         "notification-policy-set",
         method::NOTIFICATION_POLICY_SET,
         serde_json::to_value(NotificationPolicyParams { policy }).expect("serialize policy params"),
@@ -718,8 +727,7 @@ fn all_enabled_notification_policy() -> NotificationPolicy {
             error: true,
             system: true,
         },
-        codex: None,
-        claude: None,
+        providers: BTreeMap::new(),
     }
 }
 
@@ -789,7 +797,7 @@ async fn inspect_session(
     framed: &mut Framed<UnixStream, LinesCodec>,
     id: &SessionId,
 ) -> SessionInfo {
-    let req = Request::new(
+    let req = Request::make(
         "session-inspect",
         method::SESSION_INSPECT,
         serde_json::to_value(id).expect("serialize id"),
@@ -839,12 +847,12 @@ async fn wait_for_agent_state_event(
             .expect("a streamed event line")
             .expect("event framing ok");
         let streamed: Event = serde_json::from_str(&line).expect("parse event");
-        if streamed.event == event::AGENT_STATE
-            && streamed.payload["session_id"].as_str() == Some(id.0.as_str())
+        if streamed.event() == event::AGENT_STATE
+            && streamed.payload()["session_id"].as_str() == Some(id.0.as_str())
         {
-            seen.push(streamed.payload.clone());
-            if streamed.payload["activity"] == expected_activity
-                && streamed.payload["source"] == expected_source
+            seen.push(streamed.payload().clone());
+            if streamed.payload()["activity"] == expected_activity
+                && streamed.payload()["source"] == expected_source
             {
                 return streamed;
             }
@@ -883,17 +891,17 @@ async fn wait_for_notification_event(
             .expect("a streamed event line")
             .expect("event framing ok");
         let streamed: Event = serde_json::from_str(&line).expect("parse event");
-        if streamed.event != expected_event {
+        if streamed.event() != expected_event {
             continue;
         }
-        seen.push(streamed.payload.clone());
+        seen.push(streamed.payload().clone());
         if expected_event == event::NOTIFICATION_DELETED {
-            if streamed.payload["notification_id"].as_str() == Some(id.0.as_str()) {
+            if streamed.payload()["notification_id"].as_str() == Some(id.0.as_str()) {
                 return streamed;
             }
             continue;
         }
-        let record = &streamed.payload["record"];
+        let record = &streamed.payload()["record"];
         if record["id"].as_str() != Some(id.0.as_str()) {
             continue;
         }
@@ -914,23 +922,43 @@ async fn wait_for_notification_event(
 const STUB_REPORTER_PY: &str = r#"import json
 import os
 import socket
+import time
+from datetime import datetime, timedelta, timezone
 
 session_id = os.environ.get("POHUNEK_SESSION_ID")
 socket_path = os.environ.get("POHUNEK_SOCKET_PATH")
 protocol_raw = os.environ.get("POHUNEK_PROTOCOL_VERSION")
 native = os.environ.get("POHUNEK_STUB_NATIVE_ID")
 agent = os.environ.get("POHUNEK_STUB_AGENT")
+runtime_id = os.environ.get("POHUNEK_RUNTIME_ID")
 
-if not (session_id and socket_path and protocol_raw and native and agent):
+if not (session_id and socket_path and protocol_raw and native and agent and runtime_id):
     raise SystemExit(0)
 
+pid = os.getppid()
+try:
+    with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+        stat = handle.read()
+    start_identity = int(stat[stat.rfind(")") + 2:].split()[19])
+except Exception:
+    raise SystemExit(0)
+
+sequence = int(time.time() * 1000)
+
 request = {
-    "v": int(protocol_raw),
+    "v": {"minimum": int(protocol_raw), "maximum": int(protocol_raw)},
     "id": "stub-report",
     "method": "session.report_native_id",
     "params": {
         "session_id": session_id,
+        "runtime_id": runtime_id,
         "agent": agent,
+        "pid": pid,
+        "pid_start_identity": str(start_identity),
+        "sequence": str(sequence),
+        "expires_at": (
+            datetime.now(timezone.utc) + timedelta(seconds=30)
+        ).isoformat().replace("+00:00", "Z"),
         "native_session_id": native,
     },
 }
@@ -1021,19 +1049,15 @@ async fn health_returns_versions() {
     let (shutdown, handle) = spawn_server(&socket, "9.9.9-test").await;
 
     let mut client = connect(&socket).await;
-    let req = Request::new("t-1", method::DAEMON_HEALTH, Value::Null);
+    let req = Request::make("t-1", method::DAEMON_HEALTH, Value::Null);
     let resp = exchange(&mut client, &req).await;
 
-    match resp {
-        Response::Ok { v, id, ok } => {
-            assert_eq!(v, PROTOCOL_VERSION);
-            assert_eq!(id, "t-1");
-            assert_eq!(ok["status"], Value::from("ok"));
-            assert_eq!(ok["daemon_version"], Value::from("9.9.9-test"));
-            assert_eq!(ok["protocol_version"], Value::from(PROTOCOL_VERSION.get()));
-        }
-        Response::Err { err, .. } => panic!("expected ok, got error: {err}"),
-    }
+    assert_eq!(resp.version(), PROTOCOL_VERSION);
+    assert_eq!(resp.id(), "t-1");
+    let ok = ok_payload(resp);
+    assert_eq!(ok["status"], Value::from("ok"));
+    assert_eq!(ok["daemon_version"], Value::from("9.9.9-test"));
+    assert_eq!(ok["protocol_version"], Value::from(PROTOCOL_VERSION.get()));
 
     let _ = shutdown.send(());
     let _ = handle.await;
@@ -1049,27 +1073,22 @@ async fn assistant_materialize_returns_readable_paths_over_socket() {
     let params = AssistantMaterializeParams {
         snapshot: r#"{"source":"socket"}"#.to_owned(),
     };
-    let req = Request::new(
+    let req = Request::make(
         "assistant-materialize-socket",
         method::ASSISTANT_MATERIALIZE,
         serde_json::to_value(params).expect("params serialize"),
     );
     let resp = exchange(&mut client, &req).await;
 
-    match resp {
-        Response::Ok { ok, .. } => {
-            let result: AssistantMaterializeResult =
-                serde_json::from_value(ok).expect("result deserializes");
-            assert!(Path::new(&result.bundle_path).join("index.md").is_file());
-            assert_eq!(
-                std::fs::read_to_string(&result.snapshot_path).expect("snapshot"),
-                r#"{"source":"socket"}"#
-            );
-            assert!(result.content_hash.starts_with("sha256:"));
-            assert!(!result.concepts.is_empty());
-        }
-        Response::Err { err, .. } => panic!("expected ok, got error: {err}"),
-    }
+    let result: AssistantMaterializeResult =
+        serde_json::from_value(ok_payload(resp)).expect("result deserializes");
+    assert!(Path::new(&result.bundle_path).join("index.md").is_file());
+    assert_eq!(
+        std::fs::read_to_string(&result.snapshot_path).expect("snapshot"),
+        r#"{"source":"socket"}"#
+    );
+    assert!(result.content_hash.starts_with("sha256:"));
+    assert!(!result.concepts.is_empty());
 
     let _ = shutdown.send(());
     let _ = handle.await;
@@ -1081,16 +1100,11 @@ async fn unknown_method_returns_typed_error() {
     let (shutdown, handle) = spawn_server(&socket, "0.0.0").await;
 
     let mut client = connect(&socket).await;
-    let req = Request::new("t-2", "no.such.method", Value::Null);
+    let req = Request::make("t-2", "no.such.method", Value::Null);
     let resp = exchange(&mut client, &req).await;
 
-    match resp {
-        Response::Err { id, err, .. } => {
-            assert_eq!(id, "t-2");
-            assert_eq!(err.code, "method_not_found");
-        }
-        Response::Ok { .. } => panic!("expected an error for an unknown method"),
-    }
+    assert_eq!(resp.id(), "t-2");
+    assert_eq!(err_payload(resp).code, "method_not_found");
 
     let _ = shutdown.send(());
     let _ = handle.await;
@@ -1107,36 +1121,24 @@ async fn session_list_with_malformed_filter_returns_typed_error() {
     let mut client = connect(&socket).await;
 
     // Unknown filter key.
-    let unknown_key = Request::new(
+    let unknown_key = Request::make(
         "bad-filter-key",
         method::SESSION_LIST,
         serde_json::json!({ "filters": [{ "key": "cwd", "value": "/workspace" }] }),
     );
-    match exchange(&mut client, &unknown_key).await {
-        Response::Err { id, err, .. } => {
-            assert_eq!(id, "bad-filter-key");
-            assert_eq!(err.code, "bad_request");
-        }
-        Response::Ok { ok, .. } => {
-            panic!("an unknown filter key must be a typed usage error, got ok: {ok:?}")
-        }
-    }
+    let response = exchange(&mut client, &unknown_key).await;
+    assert_eq!(response.id(), "bad-filter-key");
+    assert_eq!(err_payload(response).code, "bad_request");
 
     // Known key, value outside the closed state enum.
-    let bad_value = Request::new(
+    let bad_value = Request::make(
         "bad-filter-value",
         method::SESSION_LIST,
         serde_json::json!({ "filters": [{ "key": "state", "value": "paused" }] }),
     );
-    match exchange(&mut client, &bad_value).await {
-        Response::Err { id, err, .. } => {
-            assert_eq!(id, "bad-filter-value");
-            assert_eq!(err.code, "bad_request");
-        }
-        Response::Ok { ok, .. } => {
-            panic!("an out-of-range filter value must be a typed usage error, got ok: {ok:?}")
-        }
-    }
+    let response = exchange(&mut client, &bad_value).await;
+    assert_eq!(response.id(), "bad-filter-value");
+    assert_eq!(err_payload(response).code, "bad_request");
 
     let _ = shutdown.send(());
     let _ = handle.await;
@@ -1165,7 +1167,7 @@ async fn attach_reporting_its_own_session_as_origin_is_rejected_over_the_socket(
         .and_then(|runtime| runtime.worker_id.clone())
         .expect("worker-backed session reports a worker id");
 
-    let self_attach = Request::new(
+    let self_attach = Request::make(
         "attach-self",
         method::SESSION_ATTACH,
         serde_json::json!({
@@ -1174,23 +1176,18 @@ async fn attach_reporting_its_own_session_as_origin_is_rejected_over_the_socket(
             "origin_worker_id": worker_id,
         }),
     );
-    match exchange(&mut control, &self_attach).await {
-        Response::Err { id, err, .. } => {
-            assert_eq!(id, "attach-self");
-            assert_eq!(err.code, "attach_self_feedback");
-            assert!(
-                err.recover.is_some(),
-                "self-feedback error must carry a recovery hint: {err:?}"
-            );
-        }
-        Response::Ok { ok, .. } => {
-            panic!("a self-feeding attach must be a typed error, got ok: {ok:?}")
-        }
-    }
+    let response = exchange(&mut control, &self_attach).await;
+    assert_eq!(response.id(), "attach-self");
+    let error = err_payload(response);
+    assert_eq!(error.code, "attach_self_feedback");
+    assert!(
+        error.recover.is_some(),
+        "self-feedback error must carry a recovery hint: {error:?}"
+    );
 
     // Same session id reported from a DIFFERENT worker (a colliding id or a stale
     // env from a prior process): no loop, so it must be accepted.
-    let other_worker = Request::new(
+    let other_worker = Request::make(
         "attach-other-worker",
         method::SESSION_ATTACH,
         serde_json::json!({
@@ -1206,7 +1203,7 @@ async fn attach_reporting_its_own_session_as_origin_is_rejected_over_the_socket(
     );
 
     // An attach from a different terminal (no origin reported) still works.
-    let plain_attach = Request::new(
+    let plain_attach = Request::make(
         "attach-plain",
         method::SESSION_ATTACH,
         serde_json::json!({ "session_id": created.id }),
@@ -1237,21 +1234,17 @@ async fn session_new_for_missing_agent_binary_returns_typed_error() {
         create_session_with_agent(&mut control, AgentKind::Claude, cwd).await
     };
 
-    match resp {
-        Response::Err { err, .. } => {
-            assert_eq!(err.class, ErrorClass::Runtime);
-            assert_eq!(err.code, "agent_binary_missing");
-            assert!(
-                err.msg.contains("claude"),
-                "error must name the missing binary: {err:?}"
-            );
-            assert!(
-                err.recover.is_some(),
-                "missing-binary error must carry a recover hint: {err:?}"
-            );
-        }
-        Response::Ok { .. } => panic!("expected agent_binary_missing error, got ok"),
-    }
+    let err = err_payload(resp);
+    assert_eq!(err.class, ErrorClass::Runtime);
+    assert_eq!(err.code, "agent_binary_missing");
+    assert!(
+        err.msg.contains("claude"),
+        "error must name the missing binary: {err:?}"
+    );
+    assert!(
+        err.recover.is_some(),
+        "missing-binary error must carry a recover hint: {err:?}"
+    );
 
     let _ = shutdown.send(());
     let _ = handle.await;
@@ -1298,12 +1291,9 @@ async fn stale_socket_is_recovered_on_bind() {
     let (shutdown, handle) = spawn_server(&socket, "0.0.0").await;
 
     let mut client = connect(&socket).await;
-    let req = Request::new("t-3", method::DAEMON_HEALTH, Value::Null);
+    let req = Request::make("t-3", method::DAEMON_HEALTH, Value::Null);
     let resp = exchange(&mut client, &req).await;
-    assert!(
-        matches!(resp, Response::Ok { .. }),
-        "health works after recovery"
-    );
+    assert!(resp.is_ok(), "health works after recovery");
 
     let _ = shutdown.send(());
     let _ = handle.await;
@@ -1327,7 +1317,7 @@ async fn session_lifecycle_over_socket() {
     assert_eq!(created.rows, 24);
     assert!(created.pid > 0);
 
-    let list_req = Request::new("session-list", method::SESSION_LIST, Value::Null);
+    let list_req = Request::make("session-list", method::SESSION_LIST, Value::Null);
     let list: Vec<SessionInfo> =
         serde_json::from_value(ok_payload(exchange(&mut client, &list_req).await))
             .expect("session list");
@@ -1338,7 +1328,7 @@ async fn session_lifecycle_over_socket() {
     );
 
     let second = create_session(&mut client).await;
-    let filtered_list_req = Request::new(
+    let filtered_list_req = Request::make(
         "session-list-filtered",
         method::SESSION_LIST,
         serde_json::to_value(SessionListParams {
@@ -1366,7 +1356,7 @@ async fn session_lifecycle_over_socket() {
     assert_eq!(inspected.cwd, created.cwd);
     assert_eq!(inspected.pid, created.pid);
 
-    let stop_req = Request::new(
+    let stop_req = Request::make(
         "session-stop",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),
@@ -1380,7 +1370,7 @@ async fn session_lifecycle_over_socket() {
     assert_eq!(stopped_info.state, SessionState::Stopped);
 
     let list_after_stop_req =
-        Request::new("session-list-after-stop", method::SESSION_LIST, Value::Null);
+        Request::make("session-list-after-stop", method::SESSION_LIST, Value::Null);
     let list_after_stop: Vec<SessionInfo> = serde_json::from_value(ok_payload(
         exchange(&mut client, &list_after_stop_req).await,
     ))
@@ -1391,7 +1381,7 @@ async fn session_lifecycle_over_socket() {
             .any(|session| session.id == created.id && session.state == SessionState::Stopped),
         "stopped session should be reflected in list: {list_after_stop:?}"
     );
-    let stop_second_req = Request::new(
+    let stop_second_req = Request::make(
         "session-stop-second",
         method::SESSION_STOP,
         serde_json::to_value(&second.id).expect("serialize second id"),
@@ -1436,7 +1426,7 @@ async fn session_input_writes_text_to_shell_pty() {
     );
 
     let _ = detach_stream(&mut client, &attach.stream_id).await;
-    let stop_req = Request::new(
+    let stop_req = Request::make(
         "session-input-stop",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),
@@ -1490,7 +1480,7 @@ async fn session_new_with_input_writes_text_to_shell_pty() {
     );
 
     let _ = detach_stream(&mut client, &attach.stream_id).await;
-    let stop_req = Request::new(
+    let stop_req = Request::make(
         "session-new-input-stop",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),
@@ -1523,9 +1513,9 @@ async fn codex_stub_session_publishes_blocked_and_receives_bracketed_input() {
         spawn_server_with_config(&socket, "0.0.0", SessionRegistryConfig::default()).await;
 
     let mut subscriber = connect(&socket).await;
-    let subscribe_req = Request::new("subscribe-codex-stub", method::SUBSCRIBE, Value::Null);
+    let subscribe_req = Request::make("subscribe-codex-stub", method::SUBSCRIBE, Value::Null);
     let ack = exchange(&mut subscriber, &subscribe_req).await;
-    assert!(matches!(ack, Response::Ok { .. }), "subscribe should ack");
+    assert!(ack.is_ok(), "subscribe should ack");
 
     let mut control = connect(&socket).await;
     let created: SessionInfo = {
@@ -1544,8 +1534,8 @@ async fn codex_stub_session_publishes_blocked_and_receives_bracketed_input() {
         StateSource::OscTitle,
     )
     .await;
-    assert_eq!(streamed.payload["activity"], Value::from("blocked"));
-    assert_eq!(streamed.payload["source"], Value::from("osc_title"));
+    assert_eq!(streamed.payload()["activity"], Value::from("blocked"));
+    assert_eq!(streamed.payload()["source"], Value::from("osc_title"));
 
     let input = input_session(&mut control, &created.id, "run tests").await;
     assert!(input.accepted);
@@ -1557,7 +1547,7 @@ async fn codex_stub_session_publishes_blocked_and_receives_bracketed_input() {
         .expect("read cwd log");
     assert_eq!(launched_cwd.trim(), cwd.display().to_string());
 
-    let stop_req = Request::new(
+    let stop_req = Request::make(
         "session-stop-codex-stub",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),
@@ -1588,9 +1578,9 @@ async fn claude_stub_session_publishes_screen_blocked_and_receives_plain_input()
         spawn_server_with_config(&socket, "0.0.0", SessionRegistryConfig::default()).await;
 
     let mut subscriber = connect(&socket).await;
-    let subscribe_req = Request::new("subscribe-claude-stub", method::SUBSCRIBE, Value::Null);
+    let subscribe_req = Request::make("subscribe-claude-stub", method::SUBSCRIBE, Value::Null);
     let ack = exchange(&mut subscriber, &subscribe_req).await;
-    assert!(matches!(ack, Response::Ok { .. }), "subscribe should ack");
+    assert!(ack.is_ok(), "subscribe should ack");
 
     let mut control = connect(&socket).await;
     let created: SessionInfo = {
@@ -1609,15 +1599,15 @@ async fn claude_stub_session_publishes_screen_blocked_and_receives_plain_input()
         StateSource::Screen,
     )
     .await;
-    assert_eq!(streamed.payload["activity"], Value::from("blocked"));
-    assert_eq!(streamed.payload["source"], Value::from("screen"));
+    assert_eq!(streamed.payload()["activity"], Value::from("blocked"));
+    assert_eq!(streamed.payload()["source"], Value::from("screen"));
 
     let input = input_session(&mut control, &created.id, "hello Claude").await;
     assert!(input.accepted);
     let bytes = read_file_until(&input_log, b"hello Claude").await;
     assert_eq!(bytes, b"hello Claude");
 
-    let stop_req = Request::new(
+    let stop_req = Request::make(
         "session-stop-claude-stub",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),
@@ -1646,7 +1636,7 @@ async fn session_survives_requesting_client_exit() {
     };
 
     let mut fresh_client = connect(&socket).await;
-    let list_req = Request::new("session-list-fresh", method::SESSION_LIST, Value::Null);
+    let list_req = Request::make("session-list-fresh", method::SESSION_LIST, Value::Null);
     let list: Vec<SessionInfo> =
         serde_json::from_value(ok_payload(exchange(&mut fresh_client, &list_req).await))
             .expect("session list");
@@ -1656,7 +1646,7 @@ async fn session_survives_requesting_client_exit() {
         "fresh client should see daemon-owned session: {list:?}"
     );
 
-    let stop_req = Request::new(
+    let stop_req = Request::make(
         "session-stop-fresh",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),
@@ -1715,15 +1705,10 @@ async fn subscribe_streams_session_created_event() {
     // A subscriber connection: send `subscribe`, expect an OK ack, then keep the
     // connection open to receive unsolicited event lines.
     let mut subscriber = connect(&socket).await;
-    let subscribe_req = Request::new("subscribe-1", method::SUBSCRIBE, Value::Null);
+    let subscribe_req = Request::make("subscribe-1", method::SUBSCRIBE, Value::Null);
     let ack = exchange(&mut subscriber, &subscribe_req).await;
-    match ack {
-        Response::Ok { id, ok, .. } => {
-            assert_eq!(id, "subscribe-1");
-            assert_eq!(ok["subscribed"], Value::from(true));
-        }
-        Response::Err { err, .. } => panic!("expected subscribe ack, got error: {err}"),
-    }
+    assert_eq!(ack.id(), "subscribe-1");
+    assert_eq!(ok_payload(ack)["subscribed"], Value::from(true));
 
     // A second, independent connection creates a session.
     let mut creator = connect(&socket).await;
@@ -1738,9 +1723,9 @@ async fn subscribe_streams_session_created_event() {
         .expect("event framing ok");
     let streamed: Event = serde_json::from_str(&event_line).expect("parse event");
 
-    assert_eq!(streamed.event, event::SESSION_CREATED);
+    assert_eq!(streamed.event(), event::SESSION_CREATED);
     assert_eq!(
-        streamed.payload["session"]["id"],
+        streamed.payload()["session"]["id"],
         Value::from(created.id.0.as_str()),
         "streamed event should carry the created session id"
     );
@@ -1846,7 +1831,7 @@ async fn notification_retention_prune_dry_run_and_apply_methods_work() {
         },
     )
     .await;
-    let retention_dry_run_req = Request::new(
+    let retention_dry_run_req = Request::make(
         "notification-retention-dry-run",
         method::NOTIFICATION_RETENTION_PRUNE,
         serde_json::to_value(NotificationRetentionParams {
@@ -1879,7 +1864,7 @@ async fn notification_retention_prune_dry_run_and_apply_methods_work() {
     .await;
     assert_eq!(archived.record.status, NotificationStatus::Archived);
 
-    let retention_apply_req = Request::new(
+    let retention_apply_req = Request::make(
         "notification-retention-apply",
         method::NOTIFICATION_RETENTION_PRUNE,
         serde_json::to_value(NotificationRetentionParams {
@@ -1912,7 +1897,7 @@ async fn notification_update_returns_typed_errors_for_missing_invalid_and_malfor
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
     let mut control = connect(&socket).await;
 
-    let missing_req = Request::new(
+    let missing_req = Request::make(
         "notification-update-missing",
         method::NOTIFICATION_UPDATE,
         serde_json::to_value(NotificationUpdateParams {
@@ -1934,7 +1919,7 @@ async fn notification_update_returns_typed_errors_for_missing_invalid_and_malfor
         },
     )
     .await;
-    let invalid_req = Request::new(
+    let invalid_req = Request::make(
         "notification-update-invalid-transition",
         method::NOTIFICATION_UPDATE,
         serde_json::to_value(NotificationUpdateParams {
@@ -1954,7 +1939,7 @@ async fn notification_update_returns_typed_errors_for_missing_invalid_and_malfor
         },
     )
     .await;
-    let update_deleted_req = Request::new(
+    let update_deleted_req = Request::make(
         "notification-update-deleted",
         method::NOTIFICATION_UPDATE,
         serde_json::to_value(NotificationUpdateParams {
@@ -1966,7 +1951,7 @@ async fn notification_update_returns_typed_errors_for_missing_invalid_and_malfor
     let update_deleted = err_payload(exchange(&mut control, &update_deleted_req).await);
     assert_eq!(update_deleted.code, "invalid_notification_transition");
 
-    let malformed_list_req = Request::new(
+    let malformed_list_req = Request::make(
         "notification-list-malformed",
         method::NOTIFICATION_LIST,
         serde_json::json!({ "created_after": "not-rfc3339" }),
@@ -2034,13 +2019,13 @@ async fn subscribe_streams_notification_created_event() {
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut subscriber = connect(&socket).await;
-    let subscribe_req = Request::new(
+    let subscribe_req = Request::make(
         "subscribe-notification-created",
         method::SUBSCRIBE,
         Value::Null,
     );
     let ack = exchange(&mut subscriber, &subscribe_req).await;
-    assert!(matches!(ack, Response::Ok { .. }), "subscribe should ack");
+    assert!(ack.is_ok(), "subscribe should ack");
 
     let mut control = connect(&socket).await;
     let created = create_notification(&mut control, notification_params(None)).await;
@@ -2053,7 +2038,7 @@ async fn subscribe_streams_notification_created_event() {
     .await;
 
     assert_eq!(
-        streamed.payload["record"]["title"],
+        streamed.payload()["record"]["title"],
         Value::from("Approval required")
     );
 
@@ -2074,13 +2059,13 @@ async fn subscribe_streams_notification_updated_events_for_read_ack_and_archive(
     let created = create_notification(&mut control, notification_params(None)).await;
 
     let mut subscriber = connect(&socket).await;
-    let subscribe_req = Request::new(
+    let subscribe_req = Request::make(
         "subscribe-notification-updated",
         method::SUBSCRIBE,
         Value::Null,
     );
     let ack = exchange(&mut subscriber, &subscribe_req).await;
-    assert!(matches!(ack, Response::Ok { .. }), "subscribe should ack");
+    assert!(ack.is_ok(), "subscribe should ack");
 
     for status in [
         NotificationStatus::Read,
@@ -2104,7 +2089,7 @@ async fn subscribe_streams_notification_updated_events_for_read_ack_and_archive(
         )
         .await;
         assert_eq!(
-            streamed.payload["record"]["id"],
+            streamed.payload()["record"]["id"],
             Value::from(created.record.id.0.as_str())
         );
     }
@@ -2126,13 +2111,13 @@ async fn subscribe_streams_notification_deleted_event() {
     let created = create_notification(&mut control, notification_params(None)).await;
 
     let mut subscriber = connect(&socket).await;
-    let subscribe_req = Request::new(
+    let subscribe_req = Request::make(
         "subscribe-notification-deleted",
         method::SUBSCRIBE,
         Value::Null,
     );
     let ack = exchange(&mut subscriber, &subscribe_req).await;
-    assert!(matches!(ack, Response::Ok { .. }), "subscribe should ack");
+    assert!(ack.is_ok(), "subscribe should ack");
 
     let deleted = delete_notification(
         &mut control,
@@ -2151,7 +2136,7 @@ async fn subscribe_streams_notification_deleted_event() {
     .await;
 
     assert_eq!(
-        streamed.payload["notification_id"],
+        streamed.payload()["notification_id"],
         Value::from(created.record.id.0.as_str())
     );
 
@@ -2170,13 +2155,13 @@ async fn report_agent_api_records_active_agent_and_streams_report_state() {
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut subscriber = connect(&socket).await;
-    let subscribe_req = Request::new("subscribe-report-agent", method::SUBSCRIBE, Value::Null);
+    let subscribe_req = Request::make("subscribe-report-agent", method::SUBSCRIBE, Value::Null);
     let ack = exchange(&mut subscriber, &subscribe_req).await;
-    assert!(matches!(ack, Response::Ok { .. }), "subscribe should ack");
+    assert!(ack.is_ok(), "subscribe should ack");
 
     let mut control = connect(&socket).await;
     let created = create_session(&mut control).await;
-    let report_req = Request::new(
+    let report_req = Request::make(
         "session-report-agent",
         method::SESSION_REPORT_AGENT,
         serde_json::to_value(SessionReportAgentParams {
@@ -2184,7 +2169,7 @@ async fn report_agent_api_records_active_agent_and_streams_report_state() {
             source: "pohunek:codex".to_owned(),
             agent: "codex".to_owned(),
             activity: Some(AgentActivity::Blocked),
-            seq: Some(1),
+            seq: Some(ReportSequence::new(1)),
             pid: None,
             agent_session_id: None,
             agent_session_path: None,
@@ -2203,9 +2188,9 @@ async fn report_agent_api_records_active_agent_and_streams_report_state() {
         StateSource::Report,
     )
     .await;
-    assert_eq!(streamed.payload["source"], Value::from("report"));
+    assert_eq!(streamed.payload()["source"], Value::from("report"));
 
-    let stop_req = Request::new(
+    let stop_req = Request::make(
         "session-stop-report-agent",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),
@@ -2296,7 +2281,7 @@ async fn attach_raw_stream_round_trips_resizes_detaches_and_reattaches() {
         String::from_utf8_lossy(&output)
     );
 
-    let stop_req = Request::new(
+    let stop_req = Request::make(
         "session-stop-after-attach",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),
@@ -2382,7 +2367,7 @@ async fn reattach_starts_from_current_snapshot_after_historical_resizes() {
         String::from_utf8_lossy(&snapshot)
     );
 
-    let stop_req = Request::new(
+    let stop_req = Request::make(
         "session-stop-after-current-snapshot",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),
@@ -2438,7 +2423,7 @@ async fn multiple_attach_clients_receive_output_and_disconnect_independently() {
         .windows(b"m4-still-attached".len())
         .any(|window| window == b"m4-still-attached"));
 
-    let stopped = Request::new(
+    let stopped = Request::make(
         "session-stop-after-multi-attach",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),
@@ -2486,7 +2471,7 @@ async fn dropping_an_attach_connection_detaches_without_stopping_the_session() {
         SessionState::Running,
         "dropping an attach connection must not stop the session"
     );
-    let list_req = Request::new("list-after-attach-drop", method::SESSION_LIST, Value::Null);
+    let list_req = Request::make("list-after-attach-drop", method::SESSION_LIST, Value::Null);
     let list: Vec<SessionInfo> =
         serde_json::from_value(ok_payload(exchange(&mut control, &list_req).await))
             .expect("session list");
@@ -2512,7 +2497,7 @@ async fn dropping_an_attach_connection_detaches_without_stopping_the_session() {
         "re-attached stream should receive live output from the surviving session"
     );
 
-    let stop_req = Request::new(
+    let stop_req = Request::make(
         "stop-after-attach-drop",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),
@@ -2542,9 +2527,9 @@ async fn detector_publishes_osc_title_activity_while_attach_receives_output() {
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut subscriber = connect(&socket).await;
-    let subscribe_req = Request::new("subscribe-detector", method::SUBSCRIBE, Value::Null);
+    let subscribe_req = Request::make("subscribe-detector", method::SUBSCRIBE, Value::Null);
     let ack = exchange(&mut subscriber, &subscribe_req).await;
-    assert!(matches!(ack, Response::Ok { .. }), "subscribe should ack");
+    assert!(ack.is_ok(), "subscribe should ack");
 
     let mut control = connect(&socket).await;
     let created = create_session(&mut control).await;
@@ -2571,14 +2556,14 @@ async fn detector_publishes_osc_title_activity_while_attach_receives_output() {
         StateSource::OscTitle,
     )
     .await;
-    assert_eq!(streamed.payload["activity"], Value::from("working"));
-    assert_eq!(streamed.payload["source"], Value::from("osc_title"));
+    assert_eq!(streamed.payload()["activity"], Value::from("working"));
+    assert_eq!(streamed.payload()["source"], Value::from("osc_title"));
 
     let inspected = inspect_session(&mut control, &created.id).await;
     assert_eq!(inspected.activity, Some(AgentActivity::Working));
     assert_eq!(inspected.state_source, StateSource::OscTitle);
 
-    let stop_req = Request::new(
+    let stop_req = Request::make(
         "session-stop-after-detector",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),
@@ -2609,13 +2594,13 @@ async fn detector_tick_publishes_debounced_static_osc_title_activity() {
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut subscriber = connect(&socket).await;
-    let subscribe_req = Request::new(
+    let subscribe_req = Request::make(
         "subscribe-detector-debounce",
         method::SUBSCRIBE,
         Value::Null,
     );
     let ack = exchange(&mut subscriber, &subscribe_req).await;
-    assert!(matches!(ack, Response::Ok { .. }), "subscribe should ack");
+    assert!(ack.is_ok(), "subscribe should ack");
 
     let mut control = connect(&socket).await;
     let created = create_session(&mut control).await;
@@ -2627,14 +2612,14 @@ async fn detector_tick_publishes_debounced_static_osc_title_activity() {
         StateSource::OscTitle,
     )
     .await;
-    assert_eq!(streamed.payload["activity"], Value::from("blocked"));
-    assert_eq!(streamed.payload["source"], Value::from("osc_title"));
+    assert_eq!(streamed.payload()["activity"], Value::from("blocked"));
+    assert_eq!(streamed.payload()["source"], Value::from("osc_title"));
 
     let inspected = inspect_session(&mut control, &created.id).await;
     assert_eq!(inspected.activity, Some(AgentActivity::Blocked));
     assert_eq!(inspected.state_source, StateSource::OscTitle);
 
-    let stop_req = Request::new(
+    let stop_req = Request::make(
         "session-stop-after-detector-debounce",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),
@@ -2742,7 +2727,7 @@ async fn two_sessions_on_one_repo_get_distinct_worktrees() {
     );
 
     for id in [&alpha.id, &beta.id] {
-        let remove_req = Request::new(
+        let remove_req = Request::make(
             "session-remove-worktree",
             method::SESSION_REMOVE,
             serde_json::to_value(id).expect("serialize id"),
@@ -2793,7 +2778,7 @@ async fn event_log_records_lifecycle_and_never_terminal_bytes() {
     let created = create_session(&mut control).await;
     // Drive a second lifecycle event, then stop to produce session_stopped.
     let _ = resize_session(&mut control, &created.id, 100, 40).await;
-    let stop_req = Request::new(
+    let stop_req = Request::make(
         "stop-eventlog",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),
@@ -2935,7 +2920,7 @@ async fn worktree_session_persists_recovery_and_worktree_metadata() {
     assert_eq!(resume_before[0].session_id, created.id.0);
     assert_eq!(worktrees_before[0].session_id, created.id.0);
 
-    let stop_req = Request::new(
+    let stop_req = Request::make(
         "session-stop-wt-resume",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),

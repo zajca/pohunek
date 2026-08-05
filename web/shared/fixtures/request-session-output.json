@@ -1,0 +1,18 @@
+{
+  "id": "req-output-fixture-1",
+  "method": "session.output",
+  "params": {
+    "after_offset": "2",
+    "max_bytes": 128,
+    "runtime": {
+      "runtime_generation": "3",
+      "runtime_id": "runtime-fixture-1"
+    },
+    "session_id": "s-fixture-1",
+    "wait_ms": 1000
+  },
+  "v": {
+    "maximum": 2,
+    "minimum": 2
+  }
+}

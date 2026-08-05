@@ -14,6 +14,7 @@ import {
 import {
   Client,
   PROTOCOL_VERSION,
+  SUPPORTED_PROTOCOL_VERSIONS,
   attachRawWs,
   type CatchAllEvent,
   type ProtocolEvent,
@@ -429,7 +430,7 @@ function selectSafeAgent(
 
 function subscribeRequest(id: string): Request {
   return {
-    v: PROTOCOL_VERSION,
+    v: SUPPORTED_PROTOCOL_VERSIONS,
     id,
     method: "subscribe",
     params: null,

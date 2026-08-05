@@ -24,14 +24,14 @@ before pohunek 1.0. Consume it from the Bun workspace or a local checkout.
 Use the direct socket transport from Bun or Node:
 
 ```ts
-import { Client } from "@pohunek/sdk";
+import { connectLocal } from "@pohunek/sdk";
 
 const socketPath = process.env["POHUNEK_SOCKET"];
 if (socketPath === undefined) {
   throw new Error("set POHUNEK_SOCKET to the pohunek daemon socket path");
 }
 
-const client = await Client.connectLocal(socketPath);
+const client = await connectLocal(socketPath);
 
 try {
   const protocolVersion = await client.handshake();
@@ -47,9 +47,9 @@ For a direct NetBird TCP daemon address, preserve the logical host name in the
 first argument and pass the dial address separately:
 
 ```ts
-import { Client } from "@pohunek/sdk";
+import { connectTcp } from "@pohunek/sdk";
 
-const client = await Client.connectTcp("build-box", {
+const client = await connectTcp("build-box", {
   host: "100.64.10.20",
   port: 7878,
 });
@@ -61,7 +61,7 @@ const client = await Client.connectTcp("build-box", {
 separate client when you also need ordinary requests:
 
 ```ts
-import { Client, PROTOCOL_VERSION, type Request } from "@pohunek/sdk";
+import { SUPPORTED_PROTOCOL_VERSIONS, connectLocal, type Request } from "@pohunek/sdk";
 
 const socketPath = process.env["POHUNEK_SOCKET"];
 if (socketPath === undefined) {
@@ -69,13 +69,13 @@ if (socketPath === undefined) {
 }
 
 const request: Request = {
-  v: PROTOCOL_VERSION,
+  v: SUPPORTED_PROTOCOL_VERSIONS,
   id: "readme-subscribe-1",
   method: "subscribe",
   params: null,
 };
 
-const eventClient = await Client.connectLocal(socketPath);
+const eventClient = await connectLocal(socketPath);
 
 try {
   const subscription = await eventClient.subscribe(request);
@@ -93,20 +93,40 @@ try {
 `CatchAllEvent` for unknown event names, and `null` when the stream closes.
 Use `nextLine()` when a caller needs raw event JSON text.
 
+## Request Origin
+
+A TypeScript client hosted inside a managed Pohunek session supplies its origin
+explicitly. The browser-safe SDK never reads `process.env`:
+
+```ts
+import { connectLocal } from "@pohunek/sdk";
+
+const client = await connectLocal(socketPath, {
+  origin: { sessionId: "s-origin", daemonId: "daemon-origin" },
+});
+```
+
+The origin is an atomic pair of bounded safe identifiers. The SDK copies it to
+ordinary calls, subscriptions, waiting `session.output`, and `session.wait`,
+including their dedicated connections. A partial, unsafe, oversized, or
+conflicting pair is rejected before a control line is written. Omit `origin`
+for ordinary browser or host-side clients that are not running inside a managed
+session.
+
 ## Attach
 
 First request an attach stream over the control connection, then redeem it on a
 raw socket stream:
 
 ```ts
-import { Client, attachRawLocal } from "@pohunek/sdk";
+import { attachRawLocal, connectLocal } from "@pohunek/sdk";
 
 const socketPath = process.env["POHUNEK_SOCKET"];
 if (socketPath === undefined) {
   throw new Error("set POHUNEK_SOCKET to the pohunek daemon socket path");
 }
 
-const client = await Client.connectLocal(socketPath);
+const client = await connectLocal(socketPath);
 const session = await client.call("session.new", {
   agent: "shell",
   cols: 80,

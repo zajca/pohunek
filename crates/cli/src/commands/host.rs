@@ -137,9 +137,13 @@ fn render_capabilities_human(host: &str, caps: &HostCapabilities) -> String {
     output.push_str("  runtimes:\n");
     for rt in &caps.runtimes {
         let path = rt.path.as_deref().unwrap_or("-");
+        let version = rt.version.as_deref().unwrap_or("-");
+        let supported = rt
+            .supported
+            .map_or("-", |supported| if supported { "true" } else { "false" });
         let _ = writeln!(
             output,
-            "    {:<8} available={:<5} path={path}",
+            "    {:<8} available={:<5} supported={supported:<5} version={version} path={path}",
             rt.agent, rt.available,
         );
     }
@@ -148,7 +152,7 @@ fn render_capabilities_human(host: &str, caps: &HostCapabilities) -> String {
 
 #[cfg(test)]
 mod tests {
-    use protocol::{AgentRuntime, ProtocolVersion};
+    use protocol::{AgentKind, AgentRuntime, ProtocolVersion};
 
     use super::*;
 
@@ -156,18 +160,40 @@ mod tests {
     fn renders_capabilities_table() {
         let caps = HostCapabilities {
             daemon_version: "0.1.0".to_owned(),
-            protocol_version: ProtocolVersion(1),
-            supported_agents: vec!["shell".to_owned(), "codex".to_owned(), "claude".to_owned()],
+            protocol_version: ProtocolVersion::new(1).expect("valid protocol version"),
+            terminal_read_supported: true,
+            output_read_supported: true,
+            session_wait_supported: true,
+            supported_agents: vec![
+                "shell".to_owned(),
+                "codex".to_owned(),
+                "claude".to_owned(),
+                "hermes".to_owned(),
+            ],
             runtimes: vec![
                 AgentRuntime {
                     agent: "shell".to_owned(),
+                    agent_base: Some(AgentKind::Shell),
                     available: true,
                     path: None,
+                    version: None,
+                    supported: None,
                 },
                 AgentRuntime {
                     agent: "claude".to_owned(),
+                    agent_base: Some(AgentKind::Claude),
                     available: true,
                     path: Some("/usr/bin/claude".to_owned()),
+                    version: None,
+                    supported: None,
+                },
+                AgentRuntime {
+                    agent: "hermes".to_owned(),
+                    agent_base: Some(AgentKind::Hermes),
+                    available: true,
+                    path: Some("/usr/bin/hermes".to_owned()),
+                    version: Some("0.20.0".to_owned()),
+                    supported: Some(true),
                 },
             ],
             git_available: true,
@@ -177,9 +203,13 @@ mod tests {
         assert!(output.contains("host host-b capabilities"));
         assert!(output.contains("daemon_version:     0.1.0"));
         assert!(output.contains("protocol_version:   1"));
-        assert!(output.contains("shell, codex, claude"));
-        assert!(output.contains("claude   available=true  path=/usr/bin/claude"));
-        assert!(output.contains("shell    available=true  path=-"));
+        assert!(output.contains("shell, codex, claude, hermes"));
+        assert!(output
+            .contains("claude   available=true  supported=-     version=- path=/usr/bin/claude"));
+        assert!(output.contains("shell    available=true  supported=-     version=- path=-"));
+        assert!(output.contains(
+            "hermes   available=true  supported=true  version=0.20.0 path=/usr/bin/hermes"
+        ));
     }
 
     #[test]

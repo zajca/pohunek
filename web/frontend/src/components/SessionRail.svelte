@@ -6,6 +6,7 @@
   } from "@pohunek/client-core";
   import { SvelteMap } from "svelte/reactivity";
   import type { Readable } from "svelte/store";
+  import { agentProfileLabel } from "../lib";
   import { selectPrimaryHosts } from "../lib/host-presentation";
 
   interface Props {
@@ -86,7 +87,9 @@
       session.repo,
       session.branch,
       session.agent,
+      session.agent_base,
       session.active_agent,
+      session.active_agent_base,
       session.cwd,
       entry.host,
     ].some((value) => value?.toLocaleLowerCase().includes(normalizedQuery) === true);
@@ -284,7 +287,7 @@
                   {:else}
                     <span class="session-item-main">
                       <strong>{sessionLabel(entry)}</strong>
-                      <span>{entry.session.branch ?? entry.session.agent} · {entry.host}</span>
+                      <span>{entry.session.branch ?? agentProfileLabel(entry.session.agent, entry.session.agent_base)} · {entry.host}</span>
                     </span>
                     <span class="session-item-state">
                       <span

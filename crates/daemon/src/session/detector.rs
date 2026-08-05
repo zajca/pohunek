@@ -3,7 +3,7 @@
 use super::{
     broadcast, debug, event, event_payload, is_terminal, log_lag_warn, timestamp_now, watch,
     ActivityTransition, AgentActivity, AgentStateEvent, CancellationToken, Detector,
-    DetectorConfig, Event, Instant, LagWarnThrottle, SessionId, SessionRegistry,
+    DetectorConfig, Instant, LagWarnThrottle, SessionId, SessionRegistry,
 };
 
 fn detection_interval(config: &DetectorConfig) -> tokio::time::Interval {
@@ -125,7 +125,7 @@ impl SessionRegistry {
             rescan.notify_one();
         }
 
-        let event = Event::new(
+        let event = crate::events::event(
             event::AGENT_STATE,
             event_payload(AgentStateEvent {
                 session_id: id.clone(),

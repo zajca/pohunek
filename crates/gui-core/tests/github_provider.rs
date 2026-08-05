@@ -7,6 +7,8 @@ use std::future::Future;
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pohunek_gui_core::providers::github::{
@@ -14,6 +16,9 @@ use pohunek_gui_core::providers::github::{
     GitHubLabel, GitHubPullRequest, PullRequestStatus, ReviewDecision,
 };
 use serde_json::json;
+
+#[cfg(unix)]
+static NEXT_FAKE_GH_DIR: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecordedGhCall {
@@ -570,36 +575,12 @@ async fn invalid_json_error_is_typed() {
 #[tokio::test]
 async fn command_runner_uses_fake_gh_script_for_provider_commands() {
     let dir = fake_gh_dir("gh-provider");
-    let script = dir.join("gh");
     let repo = dir.join("repo");
     let seen_cwd = dir.join("seen-cwd");
     std::fs::create_dir_all(&repo).expect("create fake repo cwd");
-    let script_body = r#"#!/bin/sh
-set -eu
-pwd > __SEEN_CWD__
-case "$*" in
-  "pr list --json number,title,body,headRefName,url,author,isDraft,labels,reviewDecision,statusCheckRollup,additions,deletions,updatedAt")
-    printf '%s' '[{"number":7,"title":"Fix filters","body":"Body text","headRefName":"feature/filters","url":"https://github.example/repo/pull/7"}]'
-    ;;
-  "issue list --json number,title,body,url")
-    printf '%s' '[{"number":11,"title":"Crash on launch","body":"Issue body","url":"https://github.example/repo/issues/11"}]'
-    ;;
-  "pr view 7 --json reviewDecision")
-    printf '%s' '{"reviewDecision":"APPROVED"}'
-    ;;
-  "pr checks 7 --json name,state,bucket,link")
-    printf '%s' '[{"name":"test","state":"SUCCESS","bucket":"pass","link":"https://github.example/checks/1"}]'
-    ;;
-  *)
-    printf 'unexpected gh args: %s\n' "$*" >&2
-    exit 64
-    ;;
-esac
-"#
-    .replace("__SEEN_CWD__", &shell_quote(&seen_cwd));
-    write_fake_gh(&script, &script_body);
-
-    let client = GitHubClient::with_config(GitHubConfig::new(&script).with_repo_cwd(&repo));
+    let client = GitHubClient::with_config(
+        GitHubConfig::new(fake_gh_script("fake-gh")).with_repo_cwd(&repo),
+    );
 
     let prs = client
         .list_pull_requests(&[])
@@ -634,17 +615,7 @@ esac
 #[cfg(unix)]
 #[tokio::test]
 async fn command_runner_fake_gh_error_path_is_typed() {
-    let dir = fake_gh_dir("gh-provider-error");
-    let script = dir.join("gh");
-    write_fake_gh(
-        &script,
-        r"#!/bin/sh
-printf 'authentication required\n' >&2
-exit 1
-",
-    );
-
-    let client = GitHubClient::with_config(GitHubConfig::new(&script));
+    let client = GitHubClient::with_config(GitHubConfig::new(fake_gh_script("fake-gh-error")));
 
     let err = client
         .list_pull_requests(&[])
@@ -676,40 +647,27 @@ async fn command_runner_missing_gh_is_typed() {
 }
 
 #[cfg(unix)]
-fn write_fake_gh(path: &Path, body: &str) {
-    use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt as _;
-
-    std::fs::create_dir_all(path.parent().expect("fake gh path has parent"))
-        .expect("create fake gh dir");
-    let tmp_path = path.with_extension(format!("tmp-{}", std::process::id()));
-    let mut file = std::fs::File::create(&tmp_path).expect("create temporary fake gh script");
-    file.write_all(body.as_bytes())
-        .expect("write temporary fake gh script");
-    file.sync_all().expect("sync temporary fake gh script");
-    drop(file);
-    let mut permissions = std::fs::metadata(&tmp_path)
-        .expect("fake gh metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&tmp_path, permissions).expect("chmod fake gh script");
-    std::fs::rename(&tmp_path, path).expect("install fake gh script");
+fn fake_gh_script(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("assets")
+        .join(name)
 }
 
 /// Creates a unique temporary directory for one fake GitHub CLI fixture.
 #[cfg(unix)]
 fn fake_gh_dir(name: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock is after the Unix epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "pohunek-gui-core-{name}-{}-{nanos}",
-        std::process::id()
-    ))
-}
-
-#[cfg(unix)]
-fn shell_quote(path: &Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+    loop {
+        // The counter reserves names only; it does not synchronize fixture data.
+        let sequence = NEXT_FAKE_GH_DIR.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "pohunek-gui-core-{name}-{}-{sequence}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return path,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("create unique fake gh dir {}: {error}", path.display()),
+        }
+    }
 }

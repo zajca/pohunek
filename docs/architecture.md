@@ -45,7 +45,8 @@ Key consequences of that scope, decided explicitly:
   and worktrees.
 - Support durable detach and reattach by giving every live session a dedicated
   worker whose PTY and child lifecycle is independent of the restartable daemon.
-- Use real PTY/TUI agent sessions for both Codex and Claude Code, with agent
+- Use real PTY/TUI agent sessions for Codex, Claude Code, and the local
+  interactive Hermes Agent backend, with agent
   state derived from OSC terminal titles first, screen-content pattern matching
   as fallback, and PTY activity for the working signal. Hooks capture only the
   native session ID for resume (Codex/Claude Code do not report live state via
@@ -87,7 +88,7 @@ Key consequences of that scope, decided explicitly:
  | PTY master | child handle | output ring | terminal tracker |
  +-----------------------------------------------------------+
        |
-   Codex / Claude Code running in worker-owned PTYs
+   Codex / Claude Code / Hermes Agent running in worker-owned PTYs
        |
    identity hooks --> worker; notifications --> daemon
 ```
@@ -121,8 +122,10 @@ Core responsibilities:
   - a **TCP listener bound to the NetBird interface** for remote clients.
 
 The daemon must not depend on libghostty and never owns or receives a PTY file
-descriptor. It proxies attach, input, resize, inspect, and stop operations to
-the worker that owns the runtime.
+descriptor. It proxies attach, input, resize, bounded screen/output observation,
+inspect, and stop operations to the worker that owns the runtime. It also owns
+the race-free `session.wait` resource model: snapshot, register, recheck, then
+sleep without holding the registry write lock.
 
 Daemon startup loads configuration and session metadata before accepting
 commands. Missing or invalid required configuration fails startup with a clear
@@ -173,6 +176,26 @@ bounded by the negotiated worker data payload. History capacity is independent
 of the per-frame allocation limit: increasing retained history must never
 require one proportionally large frame.
 
+Private worker protocol v4 adds `ControlPlaneObservation` without changing
+attach capabilities. A dedicated one-use data stream returns a runtime-bound
+rendered terminal snapshot or a bounded retained-output replay, including
+multi-frame responses, exact cursors, newest-tail reads, retained-history gaps,
+and waits at the current end. Observation never acquires attach ownership or
+changes terminal geometry. A v3 worker remains valid for existing lifecycle and
+attach operations but reports observation unavailable; the daemon maps private
+failures to stable payload-free public errors.
+
+Public observation is bounded by the 1 MiB control-line ceiling. Output accounts
+for base64 expansion and response metadata; screen snapshots are measured after
+JSON serialization. The default maximum wait is eight seconds. Waiting
+`session.output` and every `session.wait` occupy dedicated public connections
+and one daemon waiter slot, capped by default at 128 globally and 8 per session.
+The timeout is the guaranteed release bound: disconnect is not promised as
+immediate cancellation because one connection dispatches one request at a time.
+Runtime generations, output offsets, terminal watermarks, process-start
+identities, and report sequences are canonical unsigned decimal strings on the
+public wire so JavaScript clients preserve exact values beyond 53 bits.
+
 Control input uses a bounded exact recent-result map and a monotonic watermark
 scoped to the active controller lease. A reconnect acquires a fresh lease and
 can safely restart its sequence. Raw attach input instead uses the ordered
@@ -197,15 +220,19 @@ one JSON response line for ordinary requests. Long-lived subscriptions keep the
 connection open and stream event envelopes as newline-delimited JSON. Requests,
 responses, errors, and events are typed Rust structs serialized with Serde.
 
-Every control request carries a `request_id`; responses and related events echo
-it so cross-host operations are traceable in both hosts' logs.
+Every control request carries an `id`; responses and related events echo it so
+cross-host operations are traceable in both hosts' logs.
 
 ### Protocol versioning
 
-Control envelopes carry a protocol version. New fields are additive and unknown
-fields are ignored, so a newer CLI and an older daemon interoperate for the
-common subset. On connect, client and daemon exchange versions; a genuinely
-incompatible pair fails with a clear, typed error instead of undefined behavior.
+Public protocol v2 requests carry an explicit inclusive
+`{minimum, maximum}` version range. The daemon selects the highest overlap in
+the first response; that integer version remains fixed for every later response
+or event on the connection. A genuinely incompatible pair fails with
+`daemon/version_mismatch`. The legacy integer request envelope is rejected: v2
+is a one-time coordinated pre-1.0 boundary with no compatibility shim. Once all
+clients and local/remote daemons cross it, later peers can overlap on an older
+common version instead of requiring exact maximum-version equality.
 
 ## Attach Streaming
 
@@ -237,9 +264,11 @@ the worker's root cause.
 
 ## PTY/TUI Agent Runtime
 
-The runtime path is real PTY/TUI agent sessions. **Codex and Claude Code are both
-first-class from the start**; supporting both immediately validates the agent
-adapter boundary.
+The runtime path is real PTY/TUI agent sessions. **Codex, Claude Code, and the
+local interactive Hermes Agent backend are first-class**. Hermes support is
+pinned to version 0.20.0 and deliberately excludes its remote, browser,
+desktop, gateway, ACP, and other non-local backends: Pohunek must own the PTY,
+process, worktree, and diff on the same host.
 
 Runtime responsibilities:
 
@@ -290,7 +319,12 @@ Hooks have two separate roles:
   validates process ancestry and accepts this binding only for the designated
   immutable launch agent; it journals the accepted value before forwarding it
   to the daemon. This keeps recovery tied to the original launch identity and
-  retains the claim across daemon outage.
+  retains the claim across daemon outage. If the private endpoint cannot be
+  reached, the hook uses the local public daemon as a hardened fallback. That
+  report carries the exact runtime id, PID plus kernel start identity, a
+  monotonic sequence, and a short RFC 3339 expiry. The daemon rejects stale
+  runtime/session/provider identity, PID reuse, expired claims, and duplicate or
+  out-of-order sequence values. Native identifiers remain redacted.
 - **Nested active-agent reporting.** Shell sessions inherit the pohunek hook
   environment, so Codex or Claude Code started inside a shell PTY can report its
   active runtime identity through the worker. This sets
@@ -320,6 +354,13 @@ Kandev's hard-won handling:
   `ESC[201~`) so embedded newlines are not treated as premature Enter; send
   the submit byte (`\r`) as a separate write after a short delay so newer TUIs
   do not absorb Enter into paste handling.
+- **Hermes Agent 0.20.0:** the adapter uses bracketed paste and sends submit as
+  a separate `\r` write after 150 ms. The release compatibility gate must
+  contain reviewed real-PTY evidence for the classic interface and either a
+  capture or a recognized local-unavailable diagnosis for the alternate-screen
+  TUI before this support is released. Programmatic input accepts LF and tab
+  but rejects other terminal controls; it is refused while a visible
+  owner-approval prompt is blocked.
 - **Other agents:** use the agent adapter's framing rules.
 
 These per-agent input rules live in the agent adapter next to its launch command,
@@ -483,6 +524,21 @@ cheap, free-by-default, or inherited:
 - **Remote listener bound only to the NetBird interface**, never `0.0.0.0`.
   NetBird/WireGuard provides encryption and network authentication; NetBird
   policies decide which peers can reach the daemon port.
+- **Origin-session guard.** Requests from managed children carry paired
+  `origin_session_id` and `origin_daemon_id` envelope markers. When both identify
+  the target as the caller's origin, the daemon rejects exactly `session.stop`,
+  `session.resume`, `session.remove`, `session.fork`, `session.resize`,
+  `session.set_metadata`, `session.rename`, and `session.input` with
+  `plugin_self_target_denied`. Read-only observation is allowed. The lifecycle
+  reports `session.report_agent`, `session.release_agent`, and
+  `session.report_native_id` are also deliberately allowed: managed hooks must
+  report their own session, and the public native-id method is the necessary
+  local fallback when the owner-private worker claim cannot be delivered. The
+  pair is atomic and is copied to dedicated wait connections. This narrowly
+  prevents an in-session automation client from invoking those eight mutations
+  against the PTY that hosts it, but it is not authentication: any same-user
+  process able to reach the owner socket remains inside the trusted
+  single-operator boundary.
 - **Prompt-injection / confused-deputy risk is inherited from the agents.** An
   operator agent that reads attacker-influenced text (a malicious issue, PR, or
   repository content) and then acts is a risk you already accept by running Codex
@@ -507,7 +563,7 @@ terminal content. Useful signals:
 - Daemon startup/shutdown, reconciliation, and single-instance/socket recovery.
 - Worker bootstrap, controller lease, runtime identity, output-gap, child-exit,
   terminal acknowledgement, and shutdown outcomes.
-- Control request summaries (with `request_id`) and response status.
+- Control request summaries (with correlation `id`) and response status.
 - Session start, attach, detach, stop, process exit, daemon reconnection, worker
   loss/conflict, and explicit native recovery.
 - PTY allocation, resize, stream errors, worker protocol versions, and
@@ -597,4 +653,4 @@ Integration tests:
 | Providers | In-tree Linear/GitHub adapters | Deferred, shell-out (`gh`, Linear GraphQL/MCP) in the client surfaces, not the chassis |
 | GUI | libghostty client (MVP5) + spike (MVP0) | Deferred; SDK first, native Rust desktop primary, browser control center later/optional. libghostty client dropped |
 | Attach framing | "separate stream mode" (unspecified) | Separate connection per PTY (specified) |
-| Agents | Codex + Claude Code | Codex + Claude Code (unchanged) |
+| Agents | Codex + Claude Code | Codex + Claude Code + local-terminal Hermes Agent 0.20.0 |

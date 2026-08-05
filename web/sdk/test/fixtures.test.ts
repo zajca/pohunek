@@ -9,17 +9,20 @@ import {
   isOkResponse,
   isRequest,
   type Event,
-  type Request,
   type Response,
 } from "@pohunek/sdk";
 import type {
   AgentStateEvent,
   AttachEvent,
   NotificationRecord,
+  NotificationPolicy,
   ProtocolError,
   SessionEvent,
   SessionInfo,
   SessionListFilter,
+  SessionOutputResult,
+  SessionScreenResult,
+  SessionWaitResult,
 } from "@pohunek/protocol";
 
 const fixturesDir = join(dirname(fileURLToPath(import.meta.url)), "../../shared/fixtures");
@@ -66,8 +69,10 @@ function readFixture(file: string): unknown {
 function assertFixtureRepresentable(file: string, value: unknown): void {
   switch (file) {
     case "request-session-list.json":
+    case "request-session-output.json":
+    case "request-session-screen.json":
+    case "request-session-wait.json":
       expect(isRequest(value)).toBe(true);
-      expect((value as Request).method).toBe("session.list");
       return;
     case "response-ok-session-list.json": {
       const response: Response = decodeResponse(value);
@@ -100,6 +105,12 @@ function assertFixtureRepresentable(file: string, value: unknown): void {
     case "notification-record.json":
       expect((value as NotificationRecord).id).toBe("n-fixture-1");
       return;
+    case "notification-policy-provider-keyed.json": {
+      const policy = value as NotificationPolicy;
+      expect(policy.providers?.["future-agent"]?.system).toBe(false);
+      expect(policy.enabled.system).toBe(true);
+      return;
+    }
     case "protocol-error-with-recover.json":
       expect((value as ProtocolError).recover).toContain("pohunek doctor");
       return;
@@ -115,6 +126,24 @@ function assertFixtureRepresentable(file: string, value: unknown): void {
     case "session-list-filter-state.json":
       expect((value as SessionListFilter).key).toBe("state");
       return;
+    case "response-ok-session-screen.json": {
+      const response = decodeResponse(value);
+      if (!isOkResponse(response)) throw new Error("screen fixture was not successful");
+      expect((response.ok as SessionScreenResult).runtime_generation).toBe("3");
+      return;
+    }
+    case "response-ok-session-output-gap.json": {
+      const response = decodeResponse(value);
+      if (!isOkResponse(response)) throw new Error("output fixture was not successful");
+      expect((response.ok as SessionOutputResult).gap?.end_offset).toBe("4");
+      return;
+    }
+    case "response-ok-session-wait.json": {
+      const response = decodeResponse(value);
+      if (!isOkResponse(response)) throw new Error("wait fixture was not successful");
+      expect((response.ok as SessionWaitResult).reason).toBe("runtime_changed");
+      return;
+    }
     default:
       throw new Error(`unhandled fixture: ${file}`);
   }

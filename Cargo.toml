@@ -31,6 +31,7 @@ members = [
 # Crates shared across implemented milestones and current state-engine work are
 # declared here as individual crates opt in.
 [workspace.dependencies]
+base64 = "0.22"
 cli = { package = "pohunek-cli", path = "crates/cli" }
 knowledge = { package = "pohunek-knowledge", path = "crates/knowledge" }
 pohunek-cli = { path = "crates/cli" }
@@ -74,6 +75,7 @@ nix = { version = "0.29", features = ["fs", "user"] }
 time = { version = "0.3", features = ["formatting"] }
 vt100 = "0.16.2"
 portable-pty = "0.9"
+tempfile = "3"
 zbus = { version = "5.16", default-features = false, features = ["tokio"] }
 pulldown-cmark = "0.12"
 # Session identifiers need durable, globally collision-resistant generation.

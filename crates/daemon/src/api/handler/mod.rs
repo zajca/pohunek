@@ -24,7 +24,10 @@ mod session;
 mod util;
 mod worktree;
 
-use protocol::{method, negotiate, ProtocolError, Request, Response, PROTOCOL_VERSION};
+use protocol::{
+    method, negotiate, ProtocolError, Request, Response, PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
+};
 use serde_json::json;
 use tracing::{debug, warn};
 
@@ -114,7 +117,7 @@ pub(crate) enum Dispatch {
     Reply(String),
     /// The client asked to subscribe; send this OK ack line, then the caller
     /// streams session events on this connection until the client disconnects.
-    Subscribe(String),
+    Subscribe(String, protocol::ProtocolVersion),
     /// The client sent an attach prelude; the caller switches to raw PTY bytes.
     Attach(String),
 }
@@ -130,7 +133,12 @@ pub(crate) async fn dispatch_line(line: &str, state: &DaemonState) -> Dispatch {
     if trimmed.is_empty() {
         // Tolerate blank keep-alive lines; reply with a framing error tied to a
         // synthetic id so the client still gets a parseable line.
-        let resp = Response::err("", ProtocolError::bad_request("empty request line"));
+        let resp = Response::err(
+            PROTOCOL_VERSION,
+            "invalid-request",
+            ProtocolError::bad_request("empty request line"),
+        )
+        .expect("synthetic response id is valid");
         return Dispatch::Reply(serialize_response(&resp));
     }
 
@@ -144,16 +152,19 @@ pub(crate) async fn dispatch_line(line: &str, state: &DaemonState) -> Dispatch {
             warn!(error = %err, "failed to parse control request");
             // We cannot recover the request id from unparseable JSON; use empty.
             let resp = Response::err(
-                "",
+                PROTOCOL_VERSION,
+                "invalid-request",
                 ProtocolError::bad_request(format!("invalid request JSON: {err}")),
-            );
+            )
+            .expect("synthetic response id is valid");
             return Dispatch::Reply(serialize_response(&resp));
         }
     };
 
     let resp = handle_request(&request, state).await;
-    if request.method == method::SUBSCRIBE && matches!(resp, Response::Ok { .. }) {
-        return Dispatch::Subscribe(serialize_response(&resp));
+    if request.method() == method::SUBSCRIBE && resp.is_ok() {
+        let version = resp.version();
+        return Dispatch::Subscribe(serialize_response(&resp), version);
     }
     Dispatch::Reply(serialize_response(&resp))
 }
@@ -163,18 +174,53 @@ pub(crate) async fn dispatch_line(line: &str, state: &DaemonState) -> Dispatch {
 /// Exposed within the crate (and re-exported) so integration tests can exercise
 /// dispatch without a live socket.
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the public method table stays centralized so version and origin guards apply uniformly"
+)]
 pub async fn handle_request(request: &Request, state: &DaemonState) -> Response {
-    debug!(id = %request.id, method = %request.method, "control request");
+    debug!(id = %request.id(), method = %request.method(), "control request");
 
     // Version negotiation first: an incompatible client gets a typed error
     // rather than a confusingly-shaped success.
-    if let Err(err) = negotiate(request.v, PROTOCOL_VERSION) {
-        return Response::err(request.id.clone(), err);
+    let selected_version = match negotiate(request.version_range(), SUPPORTED_PROTOCOL_VERSIONS) {
+        Ok(version) => version,
+        Err(err) => {
+            return Response::err(PROTOCOL_VERSION, request.id(), err)
+                .expect("deserialized request ids satisfy response validation");
+        }
+    };
+
+    if mutation_target(request).is_some_and(|target| {
+        state.sessions.is_origin_session(
+            request.origin_session_id(),
+            request.origin_daemon_id(),
+            target,
+        )
+    }) {
+        return Response::err(
+            selected_version,
+            request.id(),
+            ProtocolError::plugin_self_target_denied(),
+        )
+        .expect("deserialized request ids satisfy response validation");
     }
 
-    match request.method.as_str() {
+    if let Some(target) = mutation_target(request) {
+        if let Err(error) = state.sessions.ensure_known_agent(target).await {
+            return Response::err(selected_version, request.id(), error)
+                .expect("deserialized request ids satisfy response validation");
+        }
+    }
+
+    match request.method() {
         method::DAEMON_HEALTH => daemon::handle_health(request, &state.health),
-        method::SUBSCRIBE => Response::ok(request.id.clone(), json!({ "subscribed": true })),
+        method::SUBSCRIBE => Response::ok(
+            selected_version,
+            request.id(),
+            json!({ "subscribed": true }),
+        )
+        .expect("deserialized request ids satisfy response validation"),
         method::SESSION_NEW => session::handle_session_new(request, &state.sessions).await,
         method::SESSION_LIST => session::handle_session_list(request, &state.sessions).await,
         method::SESSION_RUNTIME_INVENTORY => {
@@ -194,6 +240,9 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::SESSION_RENAME => session::handle_session_rename(request, &state.sessions).await,
         method::SESSION_DIFF => session::handle_session_diff(request, &state.sessions).await,
         method::SESSION_INPUT => session::handle_session_input(request, &state.sessions).await,
+        method::SESSION_SCREEN => session::handle_session_screen(request, &state.sessions).await,
+        method::SESSION_OUTPUT => session::handle_session_output(request, &state.sessions).await,
+        method::SESSION_WAIT => session::handle_session_wait(request, &state.sessions).await,
         method::SESSION_REPORT_NATIVE_ID => {
             session::handle_session_report_native_id(request, &state.sessions).await
         }
@@ -246,7 +295,37 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::PROJECT_ACTION => project::handle_project_action(request, &state.sessions).await,
         method::PROJECT_ACTIONS => project::handle_project_actions(request, &state.sessions).await,
         method::WORKTREE_REMOVE => worktree::handle_worktree_remove(request, &state.sessions).await,
-        other => Response::err(request.id.clone(), ProtocolError::method_not_found(other)),
+        other => Response::err(
+            selected_version,
+            request.id(),
+            ProtocolError::method_not_found(other),
+        )
+        .expect("deserialized request ids satisfy response validation"),
+    }
+}
+
+fn mutation_target(request: &Request) -> Option<&str> {
+    let direct = matches!(
+        request.method(),
+        method::SESSION_STOP | method::SESSION_RESUME | method::SESSION_REMOVE
+    );
+    let nested = matches!(
+        request.method(),
+        method::SESSION_FORK
+            | method::SESSION_RESIZE
+            | method::SESSION_SET_METADATA
+            | method::SESSION_RENAME
+            | method::SESSION_INPUT
+    );
+    if direct {
+        request.params().as_str()
+    } else if nested {
+        request
+            .params()
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+    } else {
+        None
     }
 }
 
@@ -273,8 +352,9 @@ mod tests {
 
     use protocol::{
         method, AgentKind, AssistantMaterializeParams, AssistantMaterializeResult,
-        DaemonDoctorResult, Request, SessionId, SessionInfo, SessionNewParams,
-        SessionSetMetadataParams, SessionSetMetadataResult, SessionState, StateSource,
+        DaemonDoctorResult, ForkCwdMode, ProtocolError, Request, SessionForkParams, SessionId,
+        SessionInfo, SessionNewParams, SessionSetMetadataParams, SessionSetMetadataResult,
+        SessionState, StateSource,
     };
 
     use super::assistant::run_assistant_materialize_blocking;
@@ -320,7 +400,24 @@ mod tests {
             created_at: "2026-06-23T00:00:00Z".to_owned(),
             updated_at: "2026-06-23T00:00:00Z".to_owned(),
             exit_code: None,
+            capabilities: protocol::SessionCapabilities::default(),
         }
+    }
+
+    fn request(id: &str, method: &str, params: serde_json::Value) -> Request {
+        Request::new(id, method, params).expect("valid test request")
+    }
+
+    fn ok_value(response: protocol::Response, context: &str) -> serde_json::Value {
+        response
+            .into_result()
+            .unwrap_or_else(|error| panic!("expected {context} success response: {error:?}"))
+    }
+
+    fn error_value(response: protocol::Response, context: &str) -> protocol::ProtocolError {
+        response
+            .into_result()
+            .expect_err(&format!("expected {context} error response"))
     }
 
     fn metadata(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -328,6 +425,103 @@ mod tests {
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn origin_guard_denies_every_targeted_session_mutation() {
+        let sessions = SessionRegistry::new(SessionRegistryConfig::default());
+        let daemon_id = sessions.daemon_instance_id().to_owned();
+        let state = DaemonState::new(HealthInfo::new("test"), sessions);
+        let target = SessionId("s-origin".to_owned());
+        let mutations = [
+            (method::SESSION_STOP, serde_json::json!(target)),
+            (method::SESSION_RESUME, serde_json::json!(target)),
+            (method::SESSION_REMOVE, serde_json::json!(target)),
+            (
+                method::SESSION_FORK,
+                serde_json::json!({"session_id": target}),
+            ),
+            (
+                method::SESSION_RESIZE,
+                serde_json::json!({"session_id": target}),
+            ),
+            (
+                method::SESSION_SET_METADATA,
+                serde_json::json!({"session_id": target}),
+            ),
+            (
+                method::SESSION_RENAME,
+                serde_json::json!({"session_id": target}),
+            ),
+            (
+                method::SESSION_INPUT,
+                serde_json::json!({"session_id": target}),
+            ),
+        ];
+
+        for (index, (method, params)) in mutations.into_iter().enumerate() {
+            let request = request(&format!("origin-{index}"), method, params)
+                .with_origin(Some(target.clone()), Some(daemon_id.clone()))
+                .expect("valid origin markers");
+            let error = error_value(handle_request(&request, &state).await, method);
+            assert_eq!(error.code, "plugin_self_target_denied", "method {method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn origin_guard_allows_other_origins_and_read_only_methods() {
+        let sessions = SessionRegistry::new(SessionRegistryConfig::default());
+        let daemon_id = sessions.daemon_instance_id().to_owned();
+        let state = DaemonState::new(HealthInfo::new("test"), sessions);
+        let target = SessionId("s-origin".to_owned());
+        let cases = [
+            (
+                method::SESSION_STOP,
+                serde_json::json!(target),
+                SessionId("s-other".to_owned()),
+                daemon_id.clone(),
+            ),
+            (
+                method::SESSION_STOP,
+                serde_json::json!(target),
+                target.clone(),
+                "d-other".to_owned(),
+            ),
+            (
+                method::SESSION_INSPECT,
+                serde_json::json!(target),
+                target.clone(),
+                daemon_id.clone(),
+            ),
+            (
+                method::SESSION_REPORT_AGENT,
+                serde_json::json!({"session_id": target}),
+                target.clone(),
+                daemon_id.clone(),
+            ),
+            (
+                method::SESSION_RELEASE_AGENT,
+                serde_json::json!({"session_id": target}),
+                target.clone(),
+                daemon_id.clone(),
+            ),
+            (
+                method::SESSION_REPORT_NATIVE_ID,
+                serde_json::json!({"session_id": target}),
+                target.clone(),
+                daemon_id,
+            ),
+        ];
+
+        for (index, (method, params, origin_session, origin_daemon)) in
+            cases.into_iter().enumerate()
+        {
+            let request = request(&format!("allowed-origin-{index}"), method, params)
+                .with_origin(Some(origin_session), Some(origin_daemon))
+                .expect("valid origin markers");
+            let error = error_value(handle_request(&request, &state).await, method);
+            assert_ne!(error.code, "plugin_self_target_denied", "method {method}");
+        }
     }
 
     #[tokio::test]
@@ -361,7 +555,7 @@ mod tests {
                 ("ticket".to_owned(), Some("DMD-1356".to_owned())),
             ]),
         };
-        let request = Request::new(
+        let request = request(
             "set-metadata",
             method::SESSION_SET_METADATA,
             serde_json::to_value(params).expect("params serialize"),
@@ -369,9 +563,7 @@ mod tests {
 
         let response = handle_request(&request, &state).await;
 
-        let protocol::Response::Ok { ok, .. } = response else {
-            panic!("expected session.set_metadata ok response: {response:?}");
-        };
+        let ok = ok_value(response, "session.set_metadata");
         let result: SessionSetMetadataResult =
             serde_json::from_value(ok).expect("result deserializes");
         assert_eq!(
@@ -387,6 +579,55 @@ mod tests {
             result.session.metadata
         );
 
+        let _ = sessions.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn session_fork_dispatch_returns_canonical_error_without_child_session() {
+        let sessions = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let created = sessions
+            .create(SessionNewParams {
+                agent: "shell".to_owned(),
+                name: None,
+                cwd: Some(PathBuf::from("/tmp")),
+                cols: 80,
+                rows: 24,
+                project: None,
+                repo: None,
+                branch: None,
+                base_branch: None,
+                input: None,
+                metadata: BTreeMap::new(),
+            })
+            .await
+            .expect("create non-forkable session");
+        let state = DaemonState::new(HealthInfo::new("test"), sessions.clone());
+        let params = SessionForkParams {
+            session_id: created.id.clone(),
+            name: Some("must-not-exist".to_owned()),
+            cwd_mode: ForkCwdMode::Same,
+            cols: 80,
+            rows: 24,
+        };
+        let request = request(
+            "fork-unsupported",
+            method::SESSION_FORK,
+            serde_json::to_value(params).expect("params serialize"),
+        );
+
+        let error = error_value(
+            handle_request(&request, &state).await,
+            "session.fork unsupported",
+        );
+
+        assert_eq!(error, ProtocolError::agent_fork_unsupported());
+        let remaining = sessions.list().await;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, created.id);
         let _ = sessions.stop(&created.id).await;
     }
 
@@ -423,7 +664,7 @@ mod tests {
             dedupe_key: Some("attention:s-1".to_owned()),
             project_id: Some("p-1".to_owned()),
         };
-        Request::new(
+        request(
             id,
             method::NOTIFICATION_CREATE,
             serde_json::to_value(params).expect("params serialize"),
@@ -448,7 +689,7 @@ mod tests {
             dedupe_key: None,
             project_id: Some("p-1".to_owned()),
         };
-        Request::new(
+        request(
             id,
             method::NOTIFICATION_CREATE,
             serde_json::to_value(params).expect("params serialize"),
@@ -473,7 +714,7 @@ mod tests {
             dedupe_key: Some("turn:s-1".to_owned()),
             project_id: Some("p-1".to_owned()),
         };
-        Request::new(
+        request(
             id,
             method::NOTIFICATION_CREATE,
             serde_json::to_value(params).expect("params serialize"),
@@ -490,8 +731,7 @@ mod tests {
             error: true,
             system: true,
         };
-        policy.codex = None;
-        policy.claude = None;
+        policy.providers.clear();
         notifications.set_policy(policy).expect("set policy");
     }
 
@@ -500,23 +740,19 @@ mod tests {
         request: &Request,
     ) -> protocol::NotificationCreateResult {
         let response = handle_request(request, state).await;
-        let protocol::Response::Ok { ok, .. } = response else {
-            panic!("expected notification.create ok response: {response:?}");
-        };
+        let ok = ok_value(response, "notification.create");
         serde_json::from_value(ok).expect("create result deserializes")
     }
 
     async fn list_records(state: &DaemonState) -> Vec<protocol::NotificationRecord> {
-        let request = Request::new(
+        let request = request(
             "notification-list",
             method::NOTIFICATION_LIST,
             serde_json::to_value(protocol::NotificationListParams::default())
                 .expect("list params serialize"),
         );
         let response = handle_request(&request, state).await;
-        let protocol::Response::Ok { ok, .. } = response else {
-            panic!("expected notification.list ok response: {response:?}");
-        };
+        let ok = ok_value(response, "notification.list");
         let result: protocol::NotificationListResult =
             serde_json::from_value(ok).expect("list result");
         result.notifications
@@ -574,7 +810,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         tokio::time::advance(Duration::from_secs(
-            crate::notifications::DEFAULT_ATTENTION_DEBOUNCE_SECS + 1,
+            u64::from(crate::notifications::DEFAULT_ATTENTION_DEBOUNCE_SECS) + 1,
         ))
         .await;
         for _ in 0..64 {
@@ -605,7 +841,7 @@ mod tests {
         let params = AssistantMaterializeParams {
             snapshot: r#"{"daemon":"running"}"#.to_owned(),
         };
-        let request = Request::new(
+        let request = request(
             "assistant-materialize",
             method::ASSISTANT_MATERIALIZE,
             serde_json::to_value(params).expect("params serialize"),
@@ -613,9 +849,7 @@ mod tests {
 
         let response = handle_request(&request, &state).await;
 
-        let protocol::Response::Ok { ok, .. } = response else {
-            panic!("expected assistant.materialize ok response: {response:?}");
-        };
+        let ok = ok_value(response, "assistant.materialize");
         let result: AssistantMaterializeResult =
             serde_json::from_value(ok).expect("result deserializes");
         assert!(std::path::Path::new(&result.bundle_path)
@@ -661,7 +895,7 @@ mod tests {
             HealthInfo::new("test"),
             SessionRegistry::new(SessionRegistryConfig::default()),
         );
-        let request = Request::new(
+        let request = request(
             "daemon-doctor",
             method::DAEMON_DOCTOR,
             serde_json::Value::Null,
@@ -669,9 +903,7 @@ mod tests {
 
         let response = handle_request(&request, &state).await;
 
-        let protocol::Response::Ok { ok, .. } = response else {
-            panic!("expected daemon.doctor ok response: {response:?}");
-        };
+        let ok = ok_value(response, "daemon.doctor");
         let result: DaemonDoctorResult =
             serde_json::from_value(ok).expect("doctor result deserializes");
         assert!(result
@@ -683,7 +915,7 @@ mod tests {
 
     #[tokio::test]
     async fn assistant_materialize_blocking_task_panic_returns_daemon_error() {
-        let request = Request::new(
+        let request = request(
             "assistant-materialize-panic",
             method::ASSISTANT_MATERIALIZE,
             serde_json::json!({ "snapshot": "{}" }),
@@ -692,9 +924,7 @@ mod tests {
         let response =
             run_assistant_materialize_blocking(&request, || panic!("materialize panic")).await;
 
-        let protocol::Response::Err { err, .. } = response else {
-            panic!("expected assistant.materialize error response: {response:?}");
-        };
+        let err = error_value(response, "assistant.materialize");
         assert_eq!(err.class, protocol::ErrorClass::Daemon);
         assert_eq!(err.code, "assistant_materialize_task_panicked");
     }
@@ -707,15 +937,13 @@ mod tests {
         let params = AssistantMaterializeParams {
             snapshot: snapshot.to_owned(),
         };
-        let request = Request::new(
+        let request = request(
             id,
             method::ASSISTANT_MATERIALIZE,
             serde_json::to_value(params).expect("params serialize"),
         );
         let response = handle_request(&request, state).await;
-        let protocol::Response::Ok { ok, .. } = response else {
-            panic!("expected assistant.materialize ok response: {response:?}");
-        };
+        let ok = ok_value(response, "assistant.materialize");
         serde_json::from_value(ok).expect("result deserializes")
     }
 

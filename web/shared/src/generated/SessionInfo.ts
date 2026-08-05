@@ -3,6 +3,7 @@
 import type { AgentActivity } from "./AgentActivity";
 import type { AgentKind } from "./AgentKind";
 import type { CwdSource } from "./CwdSource";
+import type { SessionCapabilities } from "./SessionCapabilities";
 import type { SessionId } from "./SessionId";
 import type { SessionRuntime } from "./SessionRuntime";
 import type { SessionState } from "./SessionState";
@@ -26,6 +27,10 @@ export type SessionInfo = {
    * peer predates this additive field.
    */
   external?: boolean;
+  /**
+   * Session-specific mutation capabilities frozen when the session started.
+   */
+  capabilities: SessionCapabilities;
   /**
    * Owner-set display name, or `None` when the session is shown by its id.
    * Set at `session.new` and changed via `session.rename`; cosmetic only.

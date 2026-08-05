@@ -3239,6 +3239,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 name = "pohunek-cli"
 version = "0.29.3"
 dependencies = [
+ "base64",
  "clap",
  "futures",
  "libc",
@@ -3246,6 +3247,7 @@ dependencies = [
  "pohunek-client",
  "pohunek-gui-core",
  "pohunek-hostcheck",
+ "pohunek-logging",
  "pohunek-netbird",
  "pohunek-paths",
  "pohunek-prompt",
@@ -3280,6 +3282,7 @@ dependencies = [
 name = "pohunek-daemon"
 version = "0.29.3"
 dependencies = [
+ "base64",
  "futures",
  "libc",
  "pohunek-client",
@@ -3329,6 +3332,7 @@ dependencies = [
 name = "pohunek-gui-core"
 version = "0.29.3"
 dependencies = [
+ "base64",
  "futures",
  "keyring",
  "pohunek-client",
@@ -3400,9 +3404,11 @@ dependencies = [
 name = "pohunek-protocol"
 version = "0.29.3"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "time",
  "ts-rs",
 ]
 
@@ -6152,14 +6158,17 @@ name = "xtask"
 version = "0.29.3"
 dependencies = [
  "clap",
+ "nix 0.29.0",
  "pohunek-cli",
  "pohunek-knowledge",
  "pohunek-protocol",
+ "portable-pty",
  "pulldown-cmark",
  "regex",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]

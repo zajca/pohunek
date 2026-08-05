@@ -660,7 +660,7 @@ enum DaemonAction {
 enum SessionAction {
     /// Start a new session.
     New {
-        /// Agent name to start: a base kind (`shell`/`codex`/`claude`) or a host
+        /// Agent name to start: a base kind (`shell`/`codex`/`claude`/`hermes`) or a host
         /// profile, resolved daemon-side on the target host.
         #[arg(long, default_value = "shell")]
         agent: String,
@@ -702,6 +702,9 @@ enum SessionAction {
         /// Initial text to inject into the session after the PTY is spawned.
         #[arg(long)]
         input: Option<String>,
+        /// Read initial text from stdin. Alias: `--stdin`.
+        #[arg(long = "input-stdin", alias = "stdin", conflicts_with = "input")]
+        input_stdin: bool,
         /// Session metadata in key=value form (repeatable). Split on the first
         /// `=` only, so a value may itself contain `=`. Each key may be set at
         /// most once; the daemon enforces size limits on the values.
@@ -775,8 +778,97 @@ enum SessionAction {
         /// Session target: `session-id` or `local/session-id`.
         target: Target,
         /// Text to inject into the session.
-        text: String,
+        #[arg(
+            required_unless_present = "input_stdin",
+            conflicts_with = "input_stdin"
+        )]
+        text: Option<String>,
+        /// Read text from stdin instead of argv. Alias: `--input-stdin`.
+        #[arg(long = "stdin", alias = "input-stdin")]
+        input_stdin: bool,
         /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Read the current rendered terminal screen.
+    Screen {
+        target: Target,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Read bounded retained terminal output.
+    Output {
+        target: Target,
+        #[arg(long, requires = "runtime_generation")]
+        runtime_id: Option<String>,
+        #[arg(long, requires = "runtime_id")]
+        runtime_generation: Option<u64>,
+        #[arg(long)]
+        after_offset: Option<u64>,
+        #[arg(long, default_value_t = commands::session::DEFAULT_OUTPUT_BYTES, value_parser = commands::session::parse_output_bytes)]
+        max_bytes: u32,
+        #[arg(long)]
+        wait_ms: Option<u32>,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Wait for one bounded session change.
+    Wait {
+        target: Target,
+        #[arg(long, requires = "runtime_generation")]
+        runtime_id: Option<String>,
+        #[arg(long, requires = "runtime_id")]
+        runtime_generation: Option<u64>,
+        #[arg(long)]
+        after_updated_at: Option<String>,
+        #[arg(long)]
+        after_terminal_watermark: Option<u64>,
+        #[arg(long)]
+        after_output_offset: Option<u64>,
+        #[arg(long = "state", value_parser = commands::session::parse_state_filter)]
+        states: Vec<protocol::SessionState>,
+        #[arg(long = "activity", value_parser = commands::session::parse_activity_filter)]
+        activities: Vec<protocol::AgentActivity>,
+        #[arg(long, value_parser = commands::session::parse_wait_timeout_ms)]
+        timeout_ms: u32,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Resume a stopped logical session.
+    Resume {
+        target: Target,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Resize a managed session terminal.
+    Resize {
+        target: Target,
+        #[arg(long)]
+        cols: u16,
+        #[arg(long)]
+        rows: u16,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Merge or clear owner-controlled session metadata.
+    Metadata {
+        target: Target,
+        #[arg(long = "set", value_name = "key=value", value_parser = commands::session::parse_meta_pair)]
+        set: Vec<(String, String)>,
+        #[arg(long = "clear", value_name = "key")]
+        clear: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List durable worker runtime endpoints.
+    RuntimeInventory {
         #[arg(long)]
         json: bool,
     },
@@ -965,6 +1057,13 @@ impl SessionAction {
             | SessionAction::Fork { json, .. }
             | SessionAction::Rm { json, .. }
             | SessionAction::Input { json, .. }
+            | SessionAction::Screen { json, .. }
+            | SessionAction::Output { json, .. }
+            | SessionAction::Wait { json, .. }
+            | SessionAction::Resume { json, .. }
+            | SessionAction::Resize { json, .. }
+            | SessionAction::Metadata { json, .. }
+            | SessionAction::RuntimeInventory { json }
             | SessionAction::Rename { json, .. }
             | SessionAction::Diff { json, .. } => *json,
         }
@@ -1070,11 +1169,17 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     branch,
                     base_branch,
                     input,
+                    input_stdin,
                     meta,
                     yes,
                     json,
                 } => {
                     let host = effective_host(&global_host, None);
+                    let input = if input_stdin {
+                        Some(commands::session::read_stdin_input()?)
+                    } else {
+                        input
+                    };
                     commands::session::run_new(
                         &host,
                         &paths,
@@ -1113,23 +1218,139 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 }
                 SessionAction::Inspect { target, json } => {
                     let host = effective_host(&global_host, Some(&target));
+                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
                     commands::session::run_inspect(&host, &paths, &target, json).await?;
                 }
                 SessionAction::Stop { target, json } => {
                     let host = effective_host(&global_host, Some(&target));
+                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
                     commands::session::run_stop(&host, &paths, &target, json).await?;
                 }
                 SessionAction::Fork { target, name, json } => {
                     let host = effective_host(&global_host, Some(&target));
+                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
                     commands::session::run_fork(&host, &paths, &target, name, json).await?;
                 }
                 SessionAction::Rm { target, json } => {
                     let host = effective_host(&global_host, Some(&target));
+                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
                     commands::session::run_remove(&host, &paths, &target, json).await?;
                 }
-                SessionAction::Input { target, text, json } => {
+                SessionAction::Input {
+                    target,
+                    text,
+                    input_stdin,
+                    json,
+                } => {
                     let host = effective_host(&global_host, Some(&target));
+                    let text = if input_stdin {
+                        commands::session::read_stdin_input()?
+                    } else {
+                        text.expect("clap requires positional text or --stdin")
+                    };
+                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
                     commands::session::run_input(&host, &paths, &target, &text, json).await?;
+                }
+                SessionAction::Screen { target, json } => {
+                    let host = effective_host(&global_host, Some(&target));
+                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    commands::session::run_screen(&host, &paths, &target, json).await?;
+                }
+                SessionAction::Output {
+                    target,
+                    runtime_id,
+                    runtime_generation,
+                    after_offset,
+                    max_bytes,
+                    wait_ms,
+                    json,
+                } => {
+                    let host = effective_host(&global_host, Some(&target));
+                    commands::session::run_output(
+                        &host,
+                        &paths,
+                        &target,
+                        commands::session::OutputArgs {
+                            runtime_id,
+                            runtime_generation,
+                            after_offset,
+                            max_bytes,
+                            wait_ms,
+                        },
+                        json,
+                    )
+                    .await?;
+                }
+                SessionAction::Wait {
+                    target,
+                    runtime_id,
+                    runtime_generation,
+                    after_updated_at,
+                    after_terminal_watermark,
+                    after_output_offset,
+                    states,
+                    activities,
+                    timeout_ms,
+                    json,
+                } => {
+                    let host = effective_host(&global_host, Some(&target));
+                    commands::session::run_wait(
+                        &host,
+                        &paths,
+                        &target,
+                        commands::session::WaitArgs {
+                            runtime_id,
+                            runtime_generation,
+                            after_updated_at,
+                            after_terminal_watermark,
+                            after_output_offset,
+                            states,
+                            activities,
+                            timeout_ms,
+                        },
+                        json,
+                    )
+                    .await?;
+                }
+                SessionAction::Resume { target, json } => {
+                    let host = effective_host(&global_host, Some(&target));
+                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    commands::session::run_resume(&host, &paths, &target, json).await?;
+                }
+                SessionAction::Resize {
+                    target,
+                    cols,
+                    rows,
+                    json,
+                } => {
+                    let host = effective_host(&global_host, Some(&target));
+                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    commands::session::run_resize(&host, &paths, &target, cols, rows, json).await?;
+                }
+                SessionAction::Metadata {
+                    target,
+                    set,
+                    clear,
+                    json,
+                } => {
+                    let host = effective_host(&global_host, Some(&target));
+                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    let mut metadata = std::collections::BTreeMap::new();
+                    for (key, value) in set {
+                        if metadata.insert(key.clone(), Some(value)).is_some() {
+                            return Err(CliError::DuplicateMetaKey { key });
+                        }
+                    }
+                    for key in clear {
+                        if metadata.insert(key.clone(), None).is_some() {
+                            return Err(CliError::DuplicateMetaKey { key });
+                        }
+                    }
+                    commands::session::run_metadata(&host, &paths, &target, metadata, json).await?;
+                }
+                SessionAction::RuntimeInventory { json } => {
+                    let host = effective_host(&global_host, None);
+                    commands::session::run_runtime_inventory(&host, &paths, json).await?;
                 }
                 SessionAction::Rename {
                     target,
@@ -1138,12 +1359,14 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     json,
                 } => {
                     let host = effective_host(&global_host, Some(&target));
+                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
                     // `--clear` (or no name) clears it; a positional name sets it.
                     let new_name = if clear { None } else { name };
                     commands::session::run_rename(&host, &paths, &target, new_name, json).await?;
                 }
                 SessionAction::Diff { target, base, json } => {
                     let host = effective_host(&global_host, Some(&target));
+                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
                     commands::session::run_diff(&host, &paths, &target, base, json).await?;
                 }
             }
@@ -1160,7 +1383,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 commands::request_id(method::SUBSCRIBE),
                 method::SUBSCRIBE,
                 serde_json::Value::Null,
-            );
+            )
+            .map_err(pohunek_client::ClientError::from)?;
             let mut subscription = client.into_sdk().subscribe(&request).await?;
             while let Some(line) = subscription.next_line().await? {
                 println!("{line}");
@@ -1582,6 +1806,7 @@ mod tests {
                         branch,
                         base_branch,
                         input,
+                        input_stdin,
                         meta,
                         yes,
                         json,
@@ -1597,6 +1822,7 @@ mod tests {
                 assert_eq!(branch, None);
                 assert_eq!(base_branch, None);
                 assert_eq!(input, None);
+                assert!(!input_stdin);
                 assert!(meta.is_empty(), "meta defaults to empty");
                 assert!(!yes, "yes defaults to false");
                 assert!(!json, "json defaults to false");
@@ -1631,6 +1857,19 @@ mod tests {
             } => {
                 assert_eq!(agent, "claude");
             }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_session_new_hermes_agent() {
+        let cli =
+            Cli::try_parse_from(["pohunek", "session", "new", "--agent", "hermes"]).expect("parse");
+
+        match cli.command {
+            Commands::Session {
+                action: SessionAction::New { agent, .. },
+            } => assert_eq!(agent, "hermes"),
             other => panic!("unexpected command: {other:?}"),
         }
     }
@@ -1782,15 +2021,155 @@ mod tests {
 
         match cli.command {
             Commands::Session {
-                action: SessionAction::Input { target, text, json },
+                action:
+                    SessionAction::Input {
+                        target,
+                        text,
+                        input_stdin,
+                        json,
+                    },
             } => {
                 assert_eq!(target.session_id, "s-42");
                 assert_eq!(target.host.as_deref(), Some("local"));
-                assert_eq!(text, "write tests first");
+                assert_eq!(text.as_deref(), Some("write tests first"));
+                assert!(!input_stdin);
                 assert!(!json, "json defaults to false");
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_session_input_from_stdin_without_argv_payload() {
+        let cli = Cli::try_parse_from([
+            "pohunek",
+            "session",
+            "input",
+            "host-a/s-42",
+            "--stdin",
+            "--json",
+        ])
+        .expect("parse stdin input");
+
+        match cli.command {
+            Commands::Session {
+                action:
+                    SessionAction::Input {
+                        target,
+                        text,
+                        input_stdin,
+                        json,
+                    },
+            } => {
+                assert_eq!(target.host.as_deref(), Some("host-a"));
+                assert!(text.is_none());
+                assert!(input_stdin);
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn input_rejects_mixed_positional_and_stdin_sources() {
+        let error =
+            Cli::try_parse_from(["pohunek", "session", "input", "s-42", "secret", "--stdin"])
+                .expect_err("mixed sources");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn new_rejects_mixed_option_and_stdin_sources() {
+        let error = Cli::try_parse_from([
+            "pohunek",
+            "session",
+            "new",
+            "--input",
+            "secret",
+            "--input-stdin",
+        ])
+        .expect_err("mixed sources");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn parses_observation_commands_and_runtime_cursors() {
+        let output = Cli::try_parse_from([
+            "pohunek",
+            "session",
+            "output",
+            "s-42",
+            "--runtime-id",
+            "r-1",
+            "--runtime-generation",
+            "7",
+            "--after-offset",
+            "11",
+            "--wait-ms",
+            "500",
+            "--json",
+        ])
+        .expect("parse output");
+        assert!(matches!(
+            output.command,
+            Commands::Session {
+                action: SessionAction::Output {
+                    runtime_generation: Some(7),
+                    after_offset: Some(11),
+                    wait_ms: Some(500),
+                    json: true,
+                    ..
+                }
+            }
+        ));
+
+        let wait = Cli::try_parse_from([
+            "pohunek",
+            "session",
+            "wait",
+            "s-42",
+            "--state",
+            "done",
+            "--activity",
+            "blocked",
+            "--timeout-ms",
+            "1000",
+        ])
+        .expect("parse wait");
+        assert!(matches!(
+            wait.command,
+            Commands::Session {
+                action: SessionAction::Wait {
+                    timeout_ms: 1000,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn session_wait_requires_timeout_and_enforces_shared_maximum() {
+        let missing =
+            Cli::try_parse_from(["pohunek", "session", "wait", "s-42", "--state", "done"])
+                .expect_err("timeout is required");
+        assert_eq!(
+            missing.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        let above = (protocol::MAX_SESSION_WAIT_MS + 1).to_string();
+        let invalid = Cli::try_parse_from([
+            "pohunek",
+            "session",
+            "wait",
+            "s-42",
+            "--state",
+            "done",
+            "--timeout-ms",
+            &above,
+        ])
+        .expect_err("timeout above shared maximum");
+        assert_eq!(invalid.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]

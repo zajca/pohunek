@@ -11,7 +11,13 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-07-29
+// Rust guideline compliant 2026-08-04
+
+/// Maximum lifetime accepted for a worker-private identity claim.
+///
+/// This intentionally matches the public protocol ceiling so neither ingress
+/// path can create a longer-lived claim.
+pub const MAX_IDENTITY_CLAIM_TTL_SECS: u64 = 60;
 
 mod codec;
 mod control;
@@ -28,8 +34,9 @@ pub use control::{
     ActiveIdentityClaim, AttachStart, Capability, ControlCode, ControlError, ControlEvent,
     ControlMessage, ControlRequest, ControlResponse, ControlTypeError, Dimensions, EventKind,
     ExitStatus, Initialize, InitializeLimits, InputFragment, InputPlan, InspectSnapshot,
-    LaunchIdentity, ProcessIdentity, ReportedLaunchIdentity, RequestKind, ResizeRequest,
-    ResponseKind, RuntimePhase, RuntimeScope, StopPolicy, StopRequest, StreamMode, WriteAck,
+    LaunchIdentity, OutputGap, ProcessIdentity, ReleasedIdentityClaim, ReportedLaunchIdentity,
+    RequestKind, ResizeRequest, ResponseKind, RuntimePhase, RuntimeScope, StopPolicy, StopRequest,
+    StreamMode, WriteAck,
 };
 #[doc(inline)]
 pub use data::{
@@ -47,6 +54,6 @@ pub use secret::{DataToken, LeaseChallenge, SecretBytes, SecretEnv, SecretError}
 pub use token::{TokenClaims, TokenError, TokenVault};
 #[doc(inline)]
 pub use version::{
-    negotiate, Version, VersionError, VersionRange, ATTACH_SNAPSHOT_VERSION, CURRENT_VERSION,
-    PREVIOUS_VERSION, SUPPORTED_RANGE,
+    negotiate, Version, VersionError, VersionRange, ATTACH_SNAPSHOT_VERSION,
+    CONTROL_PLANE_OBSERVATION_VERSION, CURRENT_VERSION, PREVIOUS_VERSION, SUPPORTED_RANGE,
 };

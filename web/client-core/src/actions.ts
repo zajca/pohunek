@@ -6,6 +6,8 @@ import type {
 
 type ActionMethod =
   | "host.inspect"
+  | "notification.policy.get"
+  | "notification.policy.set"
   | "notification.update"
   | "project.add"
   | "project.list"
@@ -17,6 +19,7 @@ type ActionMethod =
   | "session.inspect"
   | "session.new"
   | "session.remove"
+  | "session.screen"
   | "session.rename"
   | "session.resume"
   | "session.resize"
@@ -30,6 +33,14 @@ export interface ActionCaller {
     method: K,
     params: Methods[K]["params"],
   ): Promise<Methods[K]["output"]>;
+  sessionOutput(
+    host: string,
+    params: Methods["session.output"]["params"],
+  ): Promise<Methods["session.output"]["output"]>;
+  sessionWait(
+    host: string,
+    params: Methods["session.wait"]["params"],
+  ): Promise<Methods["session.wait"]["output"]>;
 }
 
 export interface NotificationRollback {
@@ -68,6 +79,27 @@ export class WorkspaceActions {
     return this.caller.call(host, "session.inspect", params);
   }
 
+  public sessionScreen(
+    host: string,
+    params: Methods["session.screen"]["params"],
+  ): Promise<Methods["session.screen"]["output"]> {
+    return this.caller.call(host, "session.screen", params);
+  }
+
+  public sessionOutput(
+    host: string,
+    params: Methods["session.output"]["params"],
+  ): Promise<Methods["session.output"]["output"]> {
+    return this.caller.sessionOutput(host, params);
+  }
+
+  public sessionWait(
+    host: string,
+    params: Methods["session.wait"]["params"],
+  ): Promise<Methods["session.wait"]["output"]> {
+    return this.caller.sessionWait(host, params);
+  }
+
   public sessionStop(
     host: string,
     params: Methods["session.stop"]["params"],
@@ -102,6 +134,19 @@ export class WorkspaceActions {
       this.notifications.rollback(rollback);
       throw error;
     }
+  }
+
+  public notificationPolicyGet(
+    host: string,
+  ): Promise<Methods["notification.policy.get"]["output"]> {
+    return this.caller.call(host, "notification.policy.get", null);
+  }
+
+  public notificationPolicySet(
+    host: string,
+    params: Methods["notification.policy.set"]["params"],
+  ): Promise<Methods["notification.policy.set"]["output"]> {
+    return this.caller.call(host, "notification.policy.set", params);
   }
 
   public hostInspect(

@@ -1,6 +1,6 @@
 //! Defines validated worker runtime policy.
 
-// Rust guideline compliant 2026-07-27
+// Rust guideline compliant 2026-08-04
 
 use std::time::Duration;
 
@@ -24,6 +24,17 @@ pub(crate) const DEFAULT_INPUT_DEDUP_ENTRIES: usize = 4_096;
 pub(crate) const DEFAULT_STOP_GRACE: Duration = Duration::from_millis(500);
 /// Default final-screen retention while the daemon is unavailable.
 pub(crate) const DEFAULT_TERMINAL_RETENTION: Duration = Duration::from_hours(24);
+/// Default maximum time occupied by one stalled observation request.
+///
+/// Disconnect is observed on the dedicated stream, while this deliberately
+/// short ceiling bounds peers that remain connected without making progress.
+pub(crate) const DEFAULT_MAX_OBSERVATION_WAIT: Duration = Duration::from_secs(10);
+/// Default maximum terminal rows serialized on the private control plane.
+pub(crate) const DEFAULT_MAX_SNAPSHOT_ROWS: u16 = 512;
+/// Default maximum terminal columns serialized on the private control plane.
+pub(crate) const DEFAULT_MAX_SNAPSHOT_COLUMNS: u16 = 512;
+/// Default maximum serialized terminal-snapshot control response.
+pub(crate) const DEFAULT_MAX_SNAPSHOT_BYTES: usize = DEFAULT_CONTROL_LINE_BYTES;
 
 /// Hard cap preventing one worker from consuming excessive output memory.
 const MAX_HISTORY_BYTES: usize = 256 * 1024 * 1024;
@@ -33,6 +44,8 @@ const MAX_SUBSCRIBER_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CONTROL_LINE_BYTES: usize = 1024 * 1024;
 /// Hard cap for retained completed input plans.
 const MAX_INPUT_DEDUP_ENTRIES: usize = 65_536;
+/// Hard maximum keeps abandoned observation waits short and retry-oriented.
+const MAX_OBSERVATION_WAIT: Duration = Duration::from_secs(10);
 
 /// Invalid worker policy.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -63,6 +76,16 @@ pub enum ConfigError {
         /// Configuration field name.
         field: &'static str,
     },
+    /// A duration exceeds its safe maximum.
+    #[error("{field} must not exceed {maximum:?}, got {actual:?}")]
+    DurationMaximum {
+        /// Configuration field name.
+        field: &'static str,
+        /// Rejected duration.
+        actual: Duration,
+        /// Inclusive upper bound.
+        maximum: Duration,
+    },
 }
 
 /// Frozen policy for one worker process.
@@ -86,6 +109,14 @@ pub struct WorkerConfig {
     pub stop_grace: Duration,
     /// Retention after terminal outcome when unacknowledged.
     pub terminal_retention: Duration,
+    /// Maximum duration of one control-plane output wait.
+    pub max_observation_wait: Duration,
+    /// Maximum terminal rows returned by control-plane snapshots.
+    pub max_snapshot_rows: u16,
+    /// Maximum terminal columns returned by control-plane snapshots.
+    pub max_snapshot_columns: u16,
+    /// Maximum serialized terminal-snapshot control response bytes.
+    pub max_snapshot_bytes: usize,
 }
 
 impl WorkerConfig {
@@ -102,6 +133,10 @@ impl WorkerConfig {
             input_dedup_entries: DEFAULT_INPUT_DEDUP_ENTRIES,
             stop_grace: DEFAULT_STOP_GRACE,
             terminal_retention: DEFAULT_TERMINAL_RETENTION,
+            max_observation_wait: DEFAULT_MAX_OBSERVATION_WAIT,
+            max_snapshot_rows: DEFAULT_MAX_SNAPSHOT_ROWS,
+            max_snapshot_columns: DEFAULT_MAX_SNAPSHOT_COLUMNS,
+            max_snapshot_bytes: DEFAULT_MAX_SNAPSHOT_BYTES,
         }
     }
 
@@ -135,7 +170,30 @@ impl WorkerConfig {
             MAX_INPUT_DEDUP_ENTRIES,
         )?;
         validate_duration("stop_grace", self.stop_grace)?;
-        validate_duration("terminal_retention", self.terminal_retention)
+        validate_duration("terminal_retention", self.terminal_retention)?;
+        validate_duration("max_observation_wait", self.max_observation_wait)?;
+        if self.max_observation_wait > MAX_OBSERVATION_WAIT {
+            return Err(ConfigError::DurationMaximum {
+                field: "max_observation_wait",
+                actual: self.max_observation_wait,
+                maximum: MAX_OBSERVATION_WAIT,
+            });
+        }
+        validate_count(
+            "max_snapshot_rows",
+            usize::from(self.max_snapshot_rows),
+            usize::from(u16::MAX),
+        )?;
+        validate_count(
+            "max_snapshot_columns",
+            usize::from(self.max_snapshot_columns),
+            usize::from(u16::MAX),
+        )?;
+        validate_bytes(
+            "max_snapshot_bytes",
+            self.max_snapshot_bytes,
+            self.control_line_bytes,
+        )
     }
 }
 
@@ -231,5 +289,41 @@ mod tests {
                 maximum: MAX_DATA_PAYLOAD_BYTES,
             })
         );
+    }
+
+    #[test]
+    fn observation_wait_is_short_and_bounded() {
+        let exact = WorkerConfig {
+            max_observation_wait: Duration::from_secs(10),
+            ..WorkerConfig::new()
+        };
+        exact.validate().expect("exact wait maximum");
+
+        let above = WorkerConfig {
+            max_observation_wait: Duration::from_secs(10) + Duration::from_millis(1),
+            ..WorkerConfig::new()
+        };
+        assert!(matches!(
+            above.validate(),
+            Err(ConfigError::DurationMaximum {
+                field: "max_observation_wait",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn snapshot_bounds_are_nonzero() {
+        let config = WorkerConfig {
+            max_snapshot_rows: 0,
+            ..WorkerConfig::new()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::Count {
+                field: "max_snapshot_rows",
+                ..
+            })
+        ));
     }
 }

@@ -24,8 +24,9 @@ Hard constraints, decided on purpose — respect them in every change:
   trust boundary is owner-only socket/file permissions plus the NetBird network.
 - **No central server.** The CLI talks directly to each host's daemon; each host
   is authoritative for its own PTYs, state, logs, and worktrees.
-- **PTY/TUI-first.** Agents run in real terminals (Codex and Claude Code are
-  both first-class). Not a re-rendered control plane.
+- **PTY/TUI-first.** Agents run in real terminals (Codex, Claude Code, and the
+  pinned local Hermes Agent runtime are first-class). Not a re-rendered control
+  plane.
 - **Remote transport is direct over NetBird**, never SSH bridging.
 - **Providers (Linear/GitHub) are shell-out based** (`gh`, Linear GraphQL) and
   live only in client surfaces (CLI scripts, gui-core), never in the daemon.
@@ -55,11 +56,12 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | `crates/logging` | Process-safe size rotation and retention for daemon and per-session worker logs. |
 | `crates/gui-core` | Pure, headless state + SDK bridge for the GUI (no Iced dependency; fully unit-testable). |
 | `crates/gui`      | Native Iced shell that wraps `gui-core` in `Task`/`Subscription`. |
-| `crates/xtask`    | Workspace automation (docs build/validate/check). |
+| `crates/xtask`    | Workspace automation (docs, TypeScript generation, and pinned Hermes compatibility evidence). |
 | `web/`            | Bun workspace: generated protocol types, SDK runtime, control-center backend/client core/SPA, and testkit. |
 
-Other top-level: `docs/` (architecture, roadmap, phases, knowledge source),
-`scripts/` (rofi/sway launchers, release helper).
+Other top-level: `compat/` (pinned upstream compatibility locks and sanitized
+goldens), `docs/` (architecture, roadmap, phases, knowledge source), `scripts/`
+(rofi/sway launchers, release helper).
 
 ## Build, test, lint — the gates that must pass
 
@@ -73,6 +75,7 @@ cargo build -p pohunek-session-worker --bin pohunek-sessiond  # daemon tests spa
 cargo test --workspace --all-features
 cargo build --workspace --release                        # release profile must build
 cargo xtask docs check                                   # schema/drift/source-map/secrets/runbooks
+cargo xtask hermes compatibility                         # pinned, model-free Hermes CLI/golden gate
 ```
 
 Web workspace gates:
@@ -113,6 +116,28 @@ cargo test -p pohunek-gui-core                # one crate
 cargo test -p pohunek-cli some_test_name      # one test
 cargo clippy -p pohunek-daemon --all-targets  # lint one crate
 ```
+
+Hermes M2 supports only the pinned local interactive Hermes Agent `0.20.0`
+runtime. Hermes PTY goldens are refreshed explicitly and are never regenerated
+by CI. `cargo xtask hermes compatibility` is expected to fail while any checked-
+in golden remains `pending`; do not report that gate green until all required
+captures or a legitimate alternate-TUI `unsupported` diagnosis are committed.
+The executable path must be absolute. Provider credentials are passed only by
+naming each required environment variable; repeat `--provider-env` when needed:
+
+```bash
+cargo xtask hermes refresh-goldens \
+  --hermes-bin /absolute/path/to/hermes \
+  --provider-env OPENAI_API_KEY
+```
+
+Only credential names in the pinned Hermes provider allowlist are accepted;
+path and interpreter-control variables are rejected. The refresh uses isolated
+temporary `HOME`, `HERMES_HOME`, XDG, and Python locations, bounded semantic
+state waits, and process-group cleanup. Never point it at or copy from the
+operator's real Hermes home.
+It performs real provider turns and may incur cost, so run it only with explicit
+operator authorization and named provider environment variables.
 
 Extra CI jobs (run if your change touches deps/features): `cargo audit`,
 `cargo hack --feature-powerset --workspace clippy --all-targets`,

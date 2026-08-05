@@ -100,6 +100,8 @@ pub(crate) enum PolicyProvider {
     Codex,
     /// Claude provider override.
     Claude,
+    /// Hermes provider override.
+    Hermes,
 }
 
 /// Arguments accepted by `retention prune`.
@@ -225,6 +227,7 @@ pub(crate) fn parse_agent_kind(value: &str) -> Result<protocol::AgentKind, Strin
         "shell" => Ok(protocol::AgentKind::Shell),
         "codex" => Ok(protocol::AgentKind::Codex),
         "claude" => Ok(protocol::AgentKind::Claude),
+        "hermes" => Ok(protocol::AgentKind::Hermes),
         other => Err(format!("invalid agent kind '{other}'")),
     }
 }
@@ -235,6 +238,7 @@ pub(crate) fn parse_policy_provider(value: &str) -> Result<PolicyProvider, Strin
         "default" => Ok(PolicyProvider::Default),
         "codex" => Ok(PolicyProvider::Codex),
         "claude" => Ok(PolicyProvider::Claude),
+        "hermes" => Ok(PolicyProvider::Hermes),
         other => Err(format!("invalid notification policy provider '{other}'")),
     }
 }
@@ -258,6 +262,7 @@ pub(crate) async fn run_list(
         let agent = filters.agent;
         let results = fan_out(targets, |target| {
             let params = params.clone();
+            let agent = agent.clone();
             async move { list_on_target(paths, target, params, agent).await }
         })
         .await;
@@ -558,9 +563,11 @@ async fn list_on_target(
         .await
         .map_err(CliError::from)
         .map_err(error_details)?;
-    result
-        .notifications
-        .retain(|record| agent.is_none_or(|wanted| record.agent_kind == Some(wanted)));
+    result.notifications.retain(|record| {
+        agent
+            .as_ref()
+            .is_none_or(|wanted| record.agent_kind.as_ref() == Some(wanted))
+    });
     sort_notifications(&mut result.notifications);
     Ok(result)
 }
@@ -631,7 +638,10 @@ async fn watch_one(
         crate::commands::request_id(method::SUBSCRIBE),
         method::SUBSCRIBE,
         serde_json::Value::Null,
-    );
+    )
+    .map_err(pohunek_client::ClientError::from)
+    .map_err(CliError::from)
+    .map_err(error_details)?;
     let mut subscription = client
         .into_sdk()
         .subscribe(&request)
@@ -690,11 +700,24 @@ fn apply_policy_toggle(
     match provider {
         PolicyProvider::Default => set_kind_enabled(&mut policy.enabled, kind, enabled),
         PolicyProvider::Codex => {
-            let kinds = policy.codex.get_or_insert_with(|| policy.enabled.clone());
+            let kinds = policy
+                .providers
+                .entry("codex".to_owned())
+                .or_insert_with(|| policy.enabled.clone());
             set_kind_enabled(kinds, kind, enabled);
         }
         PolicyProvider::Claude => {
-            let kinds = policy.claude.get_or_insert_with(|| policy.enabled.clone());
+            let kinds = policy
+                .providers
+                .entry("claude".to_owned())
+                .or_insert_with(|| policy.enabled.clone());
+            set_kind_enabled(kinds, kind, enabled);
+        }
+        PolicyProvider::Hermes => {
+            let kinds = policy
+                .providers
+                .entry("hermes".to_owned())
+                .or_insert_with(|| policy.enabled.clone());
             set_kind_enabled(kinds, kind, enabled);
         }
     }
@@ -718,10 +741,10 @@ fn set_kind_enabled(
 #[cfg(test)]
 fn filter_rows_by_agent(
     rows: &[HostedNotification],
-    agent: Option<protocol::AgentKind>,
+    agent: Option<&protocol::AgentKind>,
 ) -> Vec<HostedNotification> {
     rows.iter()
-        .filter(|row| agent.is_none_or(|wanted| row.record.agent_kind == Some(wanted)))
+        .filter(|row| agent.is_none_or(|wanted| row.record.agent_kind.as_ref() == Some(wanted)))
         .cloned()
         .collect()
 }
@@ -849,17 +872,20 @@ fn render_watch_event(
     event: &Event,
     mode: WatchOutputMode,
 ) -> Result<String, CliError> {
-    match event.event.as_str() {
+    match event.event() {
         event::NOTIFICATION_CREATED => {
-            let payload: NotificationCreatedEvent = serde_json::from_value(event.payload.clone())?;
+            let payload: NotificationCreatedEvent =
+                serde_json::from_value(event.payload().clone())?;
             render_watch_record(host_id, event::NOTIFICATION_CREATED, &payload.record, mode)
         }
         event::NOTIFICATION_UPDATED => {
-            let payload: NotificationUpdatedEvent = serde_json::from_value(event.payload.clone())?;
+            let payload: NotificationUpdatedEvent =
+                serde_json::from_value(event.payload().clone())?;
             render_watch_record(host_id, event::NOTIFICATION_UPDATED, &payload.record, mode)
         }
         event::NOTIFICATION_DELETED => {
-            let payload: NotificationDeletedEvent = serde_json::from_value(event.payload.clone())?;
+            let payload: NotificationDeletedEvent =
+                serde_json::from_value(event.payload().clone())?;
             match mode {
                 WatchOutputMode::Human => Ok(format!(
                     "{host_id} notification_deleted {} deleted\n",
@@ -958,11 +984,8 @@ fn render_policy_human(host: &str, policy: &NotificationPolicy) -> String {
         policy.attention_debounce_secs
     );
     render_kind_policy(&mut output, "default", &policy.enabled);
-    if let Some(codex) = &policy.codex {
-        render_kind_policy(&mut output, "codex", codex);
-    }
-    if let Some(claude) = &policy.claude {
-        render_kind_policy(&mut output, "claude", claude);
+    for (provider, provider_policy) in &policy.providers {
+        render_kind_policy(&mut output, provider, provider_policy);
     }
     output
 }
@@ -1083,8 +1106,10 @@ mod tests {
             attention_dedupe_window_secs: 120,
             attention_debounce_secs: 5,
             enabled: enabled.clone(),
-            codex: Some(enabled.clone()),
-            claude: Some(enabled),
+            providers: std::collections::BTreeMap::from([
+                ("claude".to_owned(), enabled.clone()),
+                ("codex".to_owned(), enabled),
+            ]),
         }
     }
 
@@ -1166,35 +1191,44 @@ mod tests {
         let output = render_all_hosts_list_json(&results).expect("render");
         let doc: serde_json::Value = serde_json::from_str(&output).expect("json");
 
-        assert_eq!(doc["hosts"][0]["host_id"], "host-b");
-        assert_eq!(doc["hosts"][0]["ok"], true);
-        assert_eq!(doc["hosts"][0]["value"]["notifications"][0]["id"], "n-1");
-        assert_eq!(doc["hosts"][0]["value"]["next_cursor"], "cursor-2");
+        assert_eq!(doc["ok"]["hosts"][0]["host_id"], "host-b");
+        assert_eq!(doc["ok"]["hosts"][0]["ok"], true);
+        assert_eq!(
+            doc["ok"]["hosts"][0]["value"]["notifications"][0]["id"],
+            "n-1"
+        );
+        assert_eq!(doc["ok"]["hosts"][0]["value"]["next_cursor"], "cursor-2");
     }
 
     #[test]
     fn watch_render_handles_notification_events() {
         let created = Event::new(
+            protocol::PROTOCOL_VERSION,
             event::NOTIFICATION_CREATED,
             serde_json::to_value(NotificationCreatedEvent {
                 record: record("n-1", NotificationStatus::Unread),
             })
             .expect("payload"),
-        );
+        )
+        .expect("created event");
         let updated = Event::new(
+            protocol::PROTOCOL_VERSION,
             event::NOTIFICATION_UPDATED,
             serde_json::to_value(NotificationUpdatedEvent {
                 record: record("n-1", NotificationStatus::Read),
             })
             .expect("payload"),
-        );
+        )
+        .expect("updated event");
         let deleted = Event::new(
+            protocol::PROTOCOL_VERSION,
             event::NOTIFICATION_DELETED,
             serde_json::to_value(NotificationDeletedEvent {
                 notification_id: NotificationId("n-1".to_owned()),
             })
             .expect("payload"),
-        );
+        )
+        .expect("deleted event");
 
         assert!(
             render_watch_event("host-b", &created, WatchOutputMode::Human)
@@ -1221,8 +1255,8 @@ mod tests {
         let output = crate::commands::render_json(&result).expect("render");
         let doc: serde_json::Value = serde_json::from_str(&output).expect("json");
 
-        assert_eq!(doc["policy"]["attention_debounce_secs"], 5);
-        assert_eq!(doc["policy"]["attention_dedupe_window_secs"], 120);
+        assert_eq!(doc["ok"]["policy"]["attention_debounce_secs"], 5);
+        assert_eq!(doc["ok"]["policy"]["attention_dedupe_window_secs"], 120);
     }
 
     #[test]
@@ -1242,7 +1276,7 @@ mod tests {
             NotificationKind::TurnCompleted,
             true,
         );
-        assert!(policy.codex.as_ref().expect("codex").turn_completed);
+        assert!(policy.providers["codex"].turn_completed);
 
         apply_policy_toggle(
             &mut policy,
@@ -1250,7 +1284,23 @@ mod tests {
             NotificationKind::TurnCompleted,
             false,
         );
-        assert!(!policy.codex.as_ref().expect("codex").turn_completed);
+        assert!(!policy.providers["codex"].turn_completed);
+    }
+
+    #[test]
+    fn hermes_is_a_selectable_agent_and_policy_provider() {
+        assert_eq!(parse_agent_kind("hermes"), Ok(protocol::AgentKind::Hermes));
+        assert_eq!(parse_policy_provider("hermes"), Ok(PolicyProvider::Hermes));
+
+        let mut policy = policy();
+        apply_policy_toggle(
+            &mut policy,
+            PolicyProvider::Hermes,
+            NotificationKind::TurnCompleted,
+            true,
+        );
+
+        assert!(policy.providers["hermes"].turn_completed);
     }
 
     #[test]
@@ -1306,7 +1356,7 @@ mod tests {
             },
         ];
 
-        let filtered = filter_rows_by_agent(&rows, Some(protocol::AgentKind::Codex));
+        let filtered = filter_rows_by_agent(&rows, Some(&protocol::AgentKind::Codex));
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].record.id, NotificationId("n-1".to_owned()));
@@ -1323,7 +1373,7 @@ mod tests {
         let doc: serde_json::Value = serde_json::from_str(&output).expect("json");
 
         assert_eq!(
-            doc,
+            doc["ok"],
             json!({
                 "notifications": [{
                     "id": "n-1",

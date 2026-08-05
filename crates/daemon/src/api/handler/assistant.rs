@@ -4,18 +4,18 @@ use protocol::{
     AssistantMaterializeParams, AssistantMaterializeResult, ProtocolError, Request, Response,
 };
 
-use super::util::parse_params;
+use super::util::{error_value, parse_params};
 
 pub(super) async fn handle_assistant_materialize(request: &Request) -> Response {
     let params = match parse_params::<AssistantMaterializeParams>(request) {
         Ok(params) => params,
-        Err(err) => return Response::err(request.id.clone(), err),
+        Err(err) => return error_value(request, err),
     };
     let paths = match crate::Paths::resolve() {
         Ok(paths) => paths,
         Err(err) => {
-            return Response::err(
-                request.id.clone(),
+            return error_value(
+                request,
                 ProtocolError::materialization_failed("assistant paths", &err.to_string()),
             );
         }

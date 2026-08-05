@@ -14,13 +14,16 @@ use knowledge::{
 };
 use pohunek_client::Client;
 use protocol::{
-    method, AssistantMaterializeParams, AssistantMaterializeResult, ConceptIntent, ConceptMeta,
-    HostCapabilities, ProtocolError, SessionInfo, SessionNewParams,
+    method, AgentKind, AssistantMaterializeParams, AssistantMaterializeResult, ConceptIntent,
+    ConceptMeta, HostCapabilities, ProtocolError, SessionInfo, SessionNewParams,
 };
 use serde::Serialize;
 
 use crate::connection::connect_client;
-use crate::{ConnectionOptions, CoreError, HostConfig, HostTransport};
+use crate::{
+    runtime_is_assistant_capable, runtime_is_launchable, ConnectionOptions, CoreError, HostConfig,
+    HostTransport,
+};
 
 const SNAPSHOT_FILE: &str = "snapshot.json";
 /// Assistant launch intent.
@@ -175,13 +178,13 @@ pub struct AgentSelection {
 ///
 /// A user profile named `pohunek-assistant` is intentionally first so the
 /// operator can specialize the assistant without changing launch code.
-const RANKED_AGENTS: [&str; 3] = ["pohunek-assistant", "codex", "claude"];
+const RANKED_AGENTS: [&str; 4] = ["pohunek-assistant", "codex", "claude", "hermes"];
 
 /// Resolve which agent should run the assistant.
 ///
-/// Explicit agent names are trusted and passed to the daemon for final profile
-/// resolution. Without an explicit name, only available non-shell runtimes are
-/// considered.
+/// Explicit Hermes choices must be available with positive support confirmation.
+/// Other explicit names remain daemon-authoritative for profile resolution.
+/// Automatic choices must be available supported non-shell runtimes.
 ///
 /// # Errors
 ///
@@ -192,14 +195,18 @@ pub fn select_agent(
     requested: Option<&str>,
 ) -> Result<AgentSelection, ProtocolError> {
     if let Some(agent) = requested {
-        return Ok(AgentSelection {
-            name: agent.to_owned(),
-            reason: "selected explicitly".to_owned(),
-        });
+        if explicit_agent_is_allowed(capabilities, agent) {
+            return Ok(AgentSelection {
+                name: agent.to_owned(),
+                reason: "selected explicitly".to_owned(),
+            });
+        }
+
+        return Err(ProtocolError::no_capable_agent());
     }
 
     for candidate in RANKED_AGENTS {
-        if is_available(capabilities, candidate) {
+        if is_assistant_runtime(capabilities, candidate) {
             return Ok(AgentSelection {
                 name: candidate.to_owned(),
                 reason: format!("highest-ranked available runtime ({candidate})"),
@@ -210,7 +217,7 @@ pub fn select_agent(
     if let Some(runtime) = capabilities
         .runtimes
         .iter()
-        .find(|runtime| runtime.available && runtime.agent != "shell")
+        .find(|runtime| is_assistant_runtime(capabilities, &runtime.agent))
     {
         return Ok(AgentSelection {
             name: runtime.agent.clone(),
@@ -348,11 +355,31 @@ pub async fn launch_with_options(
     start_prepared_with_options(config, prepared, options).await
 }
 
-fn is_available(capabilities: &HostCapabilities, agent: &str) -> bool {
+fn is_assistant_runtime(capabilities: &HostCapabilities, agent: &str) -> bool {
     capabilities
         .runtimes
         .iter()
-        .any(|runtime| runtime.agent == agent && runtime.available)
+        .any(|runtime| runtime.agent == agent && runtime_is_assistant_capable(runtime))
+}
+
+fn explicit_agent_is_allowed(capabilities: &HostCapabilities, agent: &str) -> bool {
+    let runtime = capabilities
+        .runtimes
+        .iter()
+        .find(|runtime| runtime.agent == agent);
+    if runtime
+        .is_some_and(|runtime| matches!(runtime.agent_base.as_ref(), Some(AgentKind::Unknown(_))))
+    {
+        return false;
+    }
+
+    if agent == "hermes"
+        || runtime.is_some_and(|runtime| runtime.agent_base.as_ref() == Some(&AgentKind::Hermes))
+    {
+        return runtime.is_some_and(runtime_is_launchable);
+    }
+
+    true
 }
 
 fn validate_target(config: &HostConfig, params: &LaunchParams) -> Result<(), CoreError> {

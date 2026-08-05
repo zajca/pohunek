@@ -177,8 +177,7 @@ async fn run() -> Result<(), DaemonError> {
 
     // 7. Adopt exact surviving worker runtimes before exposing the public API.
     //    Reconciliation never invokes provider-native resume.
-    sessions
-        .reconcile_workers()
+    Box::pin(sessions.reconcile_workers())
         .await
         .map_err(DaemonError::Reconcile)?;
 
@@ -715,9 +714,9 @@ mod tests {
         let mut stream = TcpStream::connect(addr)
             .await
             .expect("remote listener accepts a connection after retry");
-        let request =
-            serde_json::to_string(&Request::new("health", method::DAEMON_HEALTH, Value::Null))
-                .expect("serialize remote health request");
+        let request = Request::new("health", method::DAEMON_HEALTH, Value::Null)
+            .expect("valid remote health request");
+        let request = serde_json::to_string(&request).expect("serialize remote health request");
         stream
             .write_all(request.as_bytes())
             .await
@@ -733,7 +732,7 @@ mod tests {
             .expect("read remote health response");
         let response = std::str::from_utf8(&response[..read]).expect("health response is UTF-8");
         let response: Response = serde_json::from_str(response).expect("parse health response");
-        assert!(matches!(response, Response::Ok { .. }));
+        assert!(response.is_ok());
         assert_eq!(attempts.load(Ordering::Relaxed), 2);
 
         shutdown.cancel();

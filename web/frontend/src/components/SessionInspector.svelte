@@ -7,7 +7,13 @@
   } from "@pohunek/client-core";
   import { onDestroy, tick } from "svelte";
   import type { Readable } from "svelte/store";
-  import { addErrorToast, addToast } from "../lib";
+  import {
+    addErrorToast,
+    addToast,
+    agentProfileLabel,
+    LatestRequest,
+    structuredErrorDetails,
+  } from "../lib";
   import AgentBadge from "./AgentBadge.svelte";
   import FormDialog from "./FormDialog.svelte";
   import SessionLifecycleActions from "./SessionLifecycleActions.svelte";
@@ -23,9 +29,22 @@
   }
 
   type Detail = Awaited<ReturnType<Workspace["actions"]["sessionInspect"]>>;
+  type Capabilities = Awaited<ReturnType<Workspace["actions"]["hostInspect"]>>;
+  type Screen = Awaited<ReturnType<Workspace["actions"]["sessionScreen"]>>;
+  type Output = Awaited<ReturnType<Workspace["actions"]["sessionOutput"]>>;
+
+  const OUTPUT_READ_BYTES = 16_384;
 
   let { open, workspace, sessions, host, sessionId, onclose, onopenterminal }: Props = $props();
   let detail: Detail | undefined = $state();
+  let capabilities: Capabilities | undefined = $state();
+  let screen: Screen | undefined = $state();
+  let outputCursor: Pick<Output, "runtime_id" | "runtime_generation" | "next_offset"> | undefined = $state();
+  let outputText = $state("");
+  let outputNotice: string | undefined = $state();
+  let observationLoading = $state(false);
+  let observationKey = "";
+  let capabilityKey = "";
   let detailKey = "";
   let runtimeContinuity: RuntimeContinuity = $state("initial");
   let loading = $state(false);
@@ -36,6 +55,8 @@
   let mutating = $state(false);
   let inspectGeneration = 0;
   let actionGeneration = 0;
+  const observationRequests = new LatestRequest();
+  const capabilityRequests = new LatestRequest();
   let drawer = $state<HTMLDivElement>();
   let closeButton = $state<HTMLButtonElement>();
   let previouslyFocused: HTMLElement | undefined;
@@ -55,11 +76,26 @@
       return;
     }
     const key = hostResourceKey(host, sessionId);
+    if (observationKey !== key) {
+      observationRequests.invalidate();
+      observationKey = key;
+      observationLoading = false;
+      screen = undefined;
+      outputCursor = undefined;
+      outputText = "";
+      outputNotice = undefined;
+    }
     if (detailKey !== key) {
       detail = undefined;
       detailKey = key;
     }
+    if (capabilityKey !== host) {
+      capabilityRequests.invalidate();
+      capabilityKey = host;
+      capabilities = undefined;
+    }
     void inspect(host, sessionId);
+    void loadCapabilities(host);
   });
 
   $effect((): void => {
@@ -74,6 +110,9 @@
     } else if (!open) {
       inspectGeneration += 1;
       actionGeneration += 1;
+      observationRequests.invalidate();
+      capabilityRequests.invalidate();
+      observationLoading = false;
       loading = false;
       restoreFocus();
     }
@@ -82,6 +121,8 @@
   onDestroy((): void => {
     inspectGeneration += 1;
     actionGeneration += 1;
+    observationRequests.invalidate();
+    capabilityRequests.invalidate();
     restoreFocus();
   });
 
@@ -105,6 +146,95 @@
         loading = false;
       }
     }
+  }
+
+  async function loadCapabilities(inspectHost: string): Promise<void> {
+    const token = capabilityRequests.begin(inspectHost);
+    try {
+      const inspected = await workspace.actions.hostInspect(inspectHost);
+      if (open && capabilityRequests.isCurrent(token, host)) {
+        capabilities = inspected;
+      }
+    } catch (error: unknown) {
+      if (open && capabilityRequests.isCurrent(token, host)) {
+        capabilities = undefined;
+        addErrorToast(error);
+      }
+    }
+  }
+
+  async function loadScreen(): Promise<void> {
+    const requestHost = host;
+    const requestSessionId = sessionId;
+    const requestKey = hostResourceKey(requestHost, requestSessionId);
+    const token = observationRequests.begin(requestKey);
+    observationLoading = true;
+    try {
+      const result = await workspace.actions.sessionScreen(requestHost, { session_id: requestSessionId });
+      if (!open || !observationRequests.isCurrent(token, observationKey)) return;
+      screen = result;
+    } catch (error: unknown) {
+      if (open && observationRequests.isCurrent(token, observationKey)) {
+        addErrorToast(error);
+      }
+    } finally {
+      if (observationRequests.isCurrent(token, observationKey)) {
+        observationLoading = false;
+      }
+    }
+  }
+
+  async function loadOutput(): Promise<void> {
+    const requestHost = host;
+    const requestSessionId = sessionId;
+    const requestKey = hostResourceKey(requestHost, requestSessionId);
+    const requestCursor = outputCursor;
+    const token = observationRequests.begin(requestKey);
+    observationLoading = true;
+    outputNotice = undefined;
+    try {
+      const result = await workspace.actions.sessionOutput(requestHost, {
+        session_id: requestSessionId,
+        ...(requestCursor === undefined ? {} : {
+          runtime: {
+            runtime_id: requestCursor.runtime_id,
+            runtime_generation: requestCursor.runtime_generation,
+          },
+          after_offset: requestCursor.next_offset,
+        }),
+        max_bytes: OUTPUT_READ_BYTES,
+      });
+      if (!open || !observationRequests.isCurrent(token, observationKey)) return;
+      if (result.gap !== undefined) {
+        outputNotice = `Output ${result.gap.start_offset}–${result.gap.end_offset} is no longer retained.`;
+        outputText = "";
+      }
+      outputText += decodeOutput(result.data_base64);
+      outputCursor = {
+        runtime_id: result.runtime_id,
+        runtime_generation: result.runtime_generation,
+        next_offset: result.next_offset,
+      };
+    } catch (error: unknown) {
+      if (!open || !observationRequests.isCurrent(token, observationKey)) return;
+      if (structuredErrorDetails(error)?.code === "session_runtime_changed") {
+        outputCursor = undefined;
+        outputText = "";
+        outputNotice = "The runtime changed. Output cursor was reset; read again from the current runtime.";
+      } else {
+        addErrorToast(error);
+      }
+    } finally {
+      if (observationRequests.isCurrent(token, observationKey)) {
+        observationLoading = false;
+      }
+    }
+  }
+
+  function decodeOutput(encoded: string): string {
+    const binary = atob(encoded);
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
   }
 
   async function updateMetadata(value: string | null): Promise<void> {
@@ -267,7 +397,9 @@
           {#if detail.branch !== undefined}<div><dt>Branch</dt><dd>{detail.branch}</dd></div>{/if}
           {#if detail.repo !== undefined}<div><dt>Repository</dt><dd>{detail.repo}</dd></div>{/if}
           {#if detail.worktree_path !== undefined}<div><dt>Worktree</dt><dd>{detail.worktree_path}</dd></div>{/if}
-          <div><dt>Agent</dt><dd>{detail.active_agent ?? detail.agent}</dd></div>
+          <div><dt>Agent</dt><dd>{detail.active_agent !== undefined && detail.active_agent_base !== undefined
+            ? agentProfileLabel(detail.active_agent, detail.active_agent_base)
+            : agentProfileLabel(detail.agent, detail.agent_base)}</dd></div>
           <div><dt>Host</dt><dd>{host}</dd></div>
         </dl>
 
@@ -297,6 +429,39 @@
             </button>
           {/if}
         </div>
+
+        {#if capabilities?.terminal_read_supported === true || capabilities?.output_read_supported === true}
+          <section class="observation" aria-label="Session observation">
+            <div class="observation-heading">
+              <h3>Terminal observation</h3>
+              <div>
+                {#if capabilities.terminal_read_supported}
+                  <button type="button" disabled={observationLoading} onclick={() => void loadScreen()}>
+                    Read screen
+                  </button>
+                {/if}
+                {#if capabilities.output_read_supported}
+                  <button type="button" disabled={observationLoading} onclick={() => void loadOutput()}>
+                    {outputCursor === undefined ? "Read output" : "Read new output"}
+                  </button>
+                {/if}
+              </div>
+            </div>
+            {#if outputNotice !== undefined}<p class="observation-notice">{outputNotice}</p>{/if}
+            {#if screen !== undefined}
+              <div class="terminal-snapshot" data-testid="terminal-screen">
+                <span>Screen {screen.dimensions.cols} × {screen.dimensions.rows} · watermark {screen.watermark}</span>
+                <pre>{screen.visible_lines.join("\n")}</pre>
+              </div>
+            {/if}
+            {#if outputText.length > 0}
+              <div class="terminal-snapshot" data-testid="terminal-output">
+                <span>Output through offset {outputCursor?.next_offset}</span>
+                <pre>{outputText}</pre>
+              </div>
+            {/if}
+          </section>
+        {/if}
 
         {#if detail.external !== true}
           <section class="management-actions" aria-label="Session management">
@@ -514,6 +679,50 @@
 
   .primary-actions {
     justify-content: flex-start;
+  }
+
+  .observation,
+  .terminal-snapshot {
+    display: grid;
+    gap: 0.75rem;
+  }
+
+  .observation-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+  }
+
+  .observation-heading div {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .observation-notice {
+    color: var(--warning);
+  }
+
+  .terminal-snapshot {
+    min-width: 0;
+    padding: 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    background: var(--surface);
+  }
+
+  .terminal-snapshot span {
+    color: var(--muted);
+    font-size: 0.75rem;
+  }
+
+  .terminal-snapshot pre {
+    overflow: auto;
+    max-height: 18rem;
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
 
   .warnings,

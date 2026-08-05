@@ -22,11 +22,12 @@ use crate::{
     SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionDiffParams,
     SessionDiffResult, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
     SessionInputParams, SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult,
-    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams,
-    SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
-    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
-    SessionResizeResult, SessionResumeResult, SessionSetMetadataParams, SessionSetMetadataResult,
-    SessionStopResult, WorktreeRemoveParams, WorktreeRemoveResult,
+    SessionOutputParams, SessionOutputResult, SessionReleaseAgentParams, SessionReleaseAgentResult,
+    SessionRemoveResult, SessionRenameParams, SessionRenameResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionResumeResult, SessionScreenParams,
+    SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult,
+    SessionWaitParams, SessionWaitResult, WorktreeRemoveParams, WorktreeRemoveResult,
 };
 
 /// A typed control-protocol method contract.
@@ -236,6 +237,33 @@ method_table!(
     SessionInputResult,
     "SessionInputParams",
     "SessionInputResult";
+
+    /// Read a bounded point-in-time rendered terminal snapshot.
+    SessionScreen,
+    SESSION_SCREEN,
+    "session.screen",
+    SessionScreenParams,
+    SessionScreenResult,
+    "SessionScreenParams",
+    "SessionScreenResult";
+
+    /// Read bounded retained PTY output without taking attach ownership.
+    SessionOutput,
+    SESSION_OUTPUT,
+    "session.output",
+    SessionOutputParams,
+    SessionOutputResult,
+    "SessionOutputParams",
+    "SessionOutputResult";
+
+    /// Wait on a bounded dedicated connection for session activity.
+    SessionWait,
+    SESSION_WAIT,
+    "session.wait",
+    SessionWaitParams,
+    SessionWaitResult,
+    "SessionWaitParams",
+    "SessionWaitResult";
 
     /// Subscribe to daemon events.
     Subscribe,

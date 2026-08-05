@@ -18,10 +18,7 @@ impl AgentAdapter for ClaudeAdapter {
     }
 
     fn input_rules(&self) -> InputRules {
-        InputRules {
-            bracketed_paste: false,
-            submit_delay: DEFAULT_CLAUDE_SUBMIT_DELAY,
-        }
+        InputRules::unrestricted(false, DEFAULT_CLAUDE_SUBMIT_DELAY)
     }
 
     fn manifest(&self) -> &Manifest {

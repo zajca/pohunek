@@ -23,7 +23,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use pohunek_client::ClientOptions;
-use protocol::{DaemonHealthResult, NotificationRecord, ProjectInfo, ProtocolVersion, SessionInfo};
+use protocol::{
+    AgentKind, AgentRuntime, DaemonHealthResult, NotificationRecord, ProjectInfo, ProtocolVersion,
+    SessionInfo,
+};
 use serde::{Deserialize, Serialize};
 
 pub use pohunek_prompt::{
@@ -56,17 +59,21 @@ pub use review::{
 pub use sdk::{
     add_project, add_project_with_options, create_session, create_session_with_options,
     delete_notification, delete_notification_with_options, diff_session, diff_session_with_options,
-    fork_session, fork_session_with_options, inspect_session, inspect_session_with_options,
-    launch_action_prompt_with_options, launch_provider_item_with_options, list_notifications,
-    list_notifications_with_options, list_project_actions, list_project_actions_with_options,
-    list_projects, list_projects_with_options, load_host, load_host_snapshot, remove_project,
-    remove_project_with_options, remove_session, remove_session_with_options, remove_worktree,
-    remove_worktree_with_options, rename_project, rename_project_with_options, rename_session,
-    rename_session_with_options, resolve_project_action, resolve_project_action_with_options,
-    resolve_project_prompt, resolve_project_prompt_with_options, resume_session,
-    resume_session_with_options, set_session_metadata, set_session_metadata_with_options,
+    fork_session, fork_session_with_options, get_notification_policy_with_options, inspect_session,
+    inspect_session_with_options, launch_action_prompt_with_options,
+    launch_provider_item_with_options, list_notifications, list_notifications_with_options,
+    list_project_actions, list_project_actions_with_options, list_projects,
+    list_projects_with_options, load_host, load_host_snapshot, read_session_output,
+    read_session_output_with_options, read_session_screen, read_session_screen_with_options,
+    remove_project, remove_project_with_options, remove_session, remove_session_with_options,
+    remove_worktree, remove_worktree_with_options, rename_project, rename_project_with_options,
+    rename_session, rename_session_with_options, resolve_project_action,
+    resolve_project_action_with_options, resolve_project_prompt,
+    resolve_project_prompt_with_options, resume_session, resume_session_with_options,
+    set_notification_policy_with_options, set_session_metadata, set_session_metadata_with_options,
     show_project, show_project_with_options, stop_session, stop_session_with_options,
-    update_notification, update_notification_with_options,
+    update_notification, update_notification_with_options, wait_for_session,
+    wait_for_session_with_options,
 };
 #[doc(inline)]
 pub use state::{
@@ -74,7 +81,8 @@ pub use state::{
     GitHubPullRequestStatusKey, HostEvent, HostView, LinearProviderState, NotificationFilter,
     NotificationIntent, NotificationRow, NotificationScope, PromptState, ProviderOperation,
     ProviderPanel, ProviderRequestId, ProviderState, ReviewCommentEditor, ReviewDiffStatus,
-    ReviewDispatchModal, ReviewLineTarget, ReviewTabState, RuntimeContinuity, Toast, Workspace,
+    ReviewDispatchModal, ReviewLineTarget, ReviewTabState, RuntimeContinuity, SessionObservation,
+    Toast, Workspace,
 };
 #[doc(inline)]
 pub use ui_state::{
@@ -261,11 +269,57 @@ pub struct HostSnapshot {
     /// Empty when the host daemon does not implement notifications; seeding is
     /// non-fatal so a host without the notification surface still connects.
     pub notifications: Vec<NotificationRecord>,
-    /// Agent kinds this host can launch, seeded from `host.inspect`.
+    /// Agent and profile names known to the daemon, seeded from `host.inspect`.
     ///
-    /// Contains the compiled base kinds (`shell`, `codex`, `claude`) plus any
-    /// resolvable host agent profile. Falls back to just the base kinds when
-    /// `host.inspect` fails; seeding is non-fatal so an older daemon still
-    /// connects.
+    /// This compatibility-oriented name list is not evidence that a runtime is
+    /// installed or version-compatible. Launch decisions must use `runtimes`.
     pub supported_agents: Vec<String>,
+    /// Full runtime inventory reported by `host.inspect`.
+    pub runtimes: Vec<AgentRuntime>,
+    /// Provider names reported by the host's runtime inventory.
+    pub notification_providers: Vec<String>,
+    /// Provider-neutral observation features advertised by `host.inspect`.
+    pub observation_capabilities: ObservationCapabilities,
+}
+
+/// Returns whether a runtime can be selected for a new session.
+///
+/// Hermes requires positive version-policy confirmation. Legacy profiles that
+/// predate `agent_base` remain selectable when available, while a future
+/// unknown compiled base fails closed.
+#[must_use]
+pub fn runtime_is_launchable(runtime: &AgentRuntime) -> bool {
+    if !runtime.available {
+        return false;
+    }
+
+    match runtime.agent_base.as_ref() {
+        Some(AgentKind::Hermes) => runtime.supported == Some(true),
+        Some(AgentKind::Unknown(_)) => false,
+        None if runtime.agent == "hermes" => runtime.supported == Some(true),
+        Some(_) | None => true,
+    }
+}
+
+/// Returns whether a launchable runtime can host the assistant.
+///
+/// Shell-backed profiles are excluded even when their profile name is not the
+/// built-in `shell` name. Legacy custom profiles without `agent_base` retain
+/// the name-based behavior used before the field existed.
+#[must_use]
+pub fn runtime_is_assistant_capable(runtime: &AgentRuntime) -> bool {
+    runtime.agent != "shell"
+        && runtime.agent_base.as_ref() != Some(&AgentKind::Shell)
+        && runtime_is_launchable(runtime)
+}
+
+/// Host-level provider-neutral terminal observation capabilities.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ObservationCapabilities {
+    /// Whether the host can return a parsed terminal screen snapshot.
+    pub terminal_read: bool,
+    /// Whether the host can return raw session output by byte cursor.
+    pub output_read: bool,
+    /// Whether the host can wait for provider-neutral session predicates.
+    pub session_wait: bool,
 }

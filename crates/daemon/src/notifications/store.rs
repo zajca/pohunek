@@ -687,7 +687,7 @@ fn upgrade_projector(
     existing.body.clone_from(&replacement.body);
     existing.metadata.clone_from(&replacement.metadata);
     existing.session_id.clone_from(&replacement.session_id);
-    existing.agent_kind = replacement.agent_kind;
+    existing.agent_kind.clone_from(&replacement.agent_kind);
     existing.source_id.clone_from(&replacement.source_id);
     existing.dedupe_key.clone_from(&replacement.dedupe_key);
     existing.project_id.clone_from(&replacement.project_id);

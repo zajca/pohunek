@@ -78,6 +78,11 @@ fn assistant_agent_flag_parses() {
 }
 
 #[test]
+fn assistant_hermes_agent_flag_parses() {
+    try_parse(["assistant", "--agent", "hermes"]).expect("--agent hermes parses");
+}
+
+#[test]
 fn assistant_project_flag_parses() {
     try_parse(["assistant", "--project", "ui"]).expect("--project parses");
 }

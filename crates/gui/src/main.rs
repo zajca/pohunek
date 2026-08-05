@@ -342,7 +342,9 @@ mod tests {
     use protocol::{ProjectInfo, SessionInfo};
 
     use super::*;
-    use crate::attach::session_requires_resume_before_attach;
+    use crate::attach::{
+        session_can_open, session_is_ready_to_resume, session_requires_resume_before_attach,
+    };
     use crate::config::{
         non_empty_config_path, validate_http_endpoint, RawGuiConfig, RawLinearProviderConfig,
     };
@@ -373,6 +375,10 @@ mod tests {
             name: None,
             id: SessionId(id.to_owned()),
             external: Some(false),
+            capabilities: protocol::SessionCapabilities {
+                resume: true,
+                fork: true,
+            },
             agent: "codex".to_owned(),
             agent_base: protocol::AgentKind::Codex,
             cwd: PathBuf::from("/tmp/project"),
@@ -419,6 +425,9 @@ mod tests {
             last_agent_state: None,
             last_error: None,
             supported_agents: Vec::new(),
+            runtimes: Vec::new(),
+            notification_providers: Vec::new(),
+            observation_capabilities: pohunek_gui_core::ObservationCapabilities::default(),
         };
         host.sessions.insert(session.id.0.clone(), session);
 
@@ -463,6 +472,7 @@ mod tests {
         let mut lost = test_session("s-3", protocol::SessionState::Running);
         lost.runtime = Some(protocol::SessionRuntime {
             state: protocol::RuntimeState::Lost,
+            runtime_generation: protocol::RuntimeGeneration::new(1),
             worker_id: Some("worker-old".to_owned()),
             runtime_id: Some("runtime-old".to_owned()),
             started_at: None,
@@ -485,6 +495,67 @@ mod tests {
             &host_id,
             &lost.id
         ));
+    }
+
+    #[test]
+    fn terminal_session_without_resume_capability_fails_closed() {
+        let host_id = HostId::new("local");
+        let mut stopped = test_session("s-1", protocol::SessionState::Stopped);
+        stopped.capabilities.resume = false;
+        let result = crate::attach::attach_task(
+            &app_with_session(&host_id, stopped.clone()),
+            &host_id,
+            &stopped.id,
+        );
+
+        assert!(matches!(result, Err(error) if error == "session does not support resume"));
+    }
+
+    #[test]
+    fn terminal_session_resume_requires_nonempty_native_metadata() {
+        let host_id = HostId::new("local");
+        let mut hermes = test_session("s-hermes", protocol::SessionState::Done);
+        hermes.agent = "hermes".to_owned();
+        hermes.agent_base = protocol::AgentKind::Hermes;
+        hermes.native_session_id = None;
+        hermes.native_session_path = None;
+
+        assert!(!session_is_ready_to_resume(&hermes));
+        assert!(!session_can_open(&hermes));
+        let result = crate::attach::attach_task(
+            &app_with_session(&host_id, hermes.clone()),
+            &host_id,
+            &hermes.id,
+        );
+        assert!(
+            matches!(result, Err(error) if error == "session does not have native resume metadata"),
+            "a stale OpenSession action must be rejected before resume"
+        );
+
+        hermes.native_session_id = Some(String::new());
+        hermes.native_session_path = Some(String::new());
+        assert!(!session_is_ready_to_resume(&hermes));
+        assert!(!session_can_open(&hermes));
+
+        hermes.native_session_path = Some("/tmp/hermes-session.json".to_owned());
+        assert!(session_is_ready_to_resume(&hermes));
+        assert!(session_can_open(&hermes));
+
+        hermes.capabilities.resume = false;
+        assert!(!session_is_ready_to_resume(&hermes));
+        assert!(!session_can_open(&hermes));
+    }
+
+    #[test]
+    fn live_session_without_native_metadata_remains_attachable() {
+        let mut hermes = test_session("s-hermes-live", protocol::SessionState::Running);
+        hermes.agent = "hermes".to_owned();
+        hermes.agent_base = protocol::AgentKind::Hermes;
+        hermes.native_session_id = None;
+        hermes.native_session_path = None;
+
+        assert!(!session_is_ready_to_resume(&hermes));
+        assert!(session_can_open(&hermes));
     }
 
     #[test]
@@ -515,6 +586,9 @@ mod tests {
             last_agent_state: None,
             last_error: None,
             supported_agents: Vec::new(),
+            runtimes: Vec::new(),
+            notification_providers: Vec::new(),
+            observation_capabilities: pohunek_gui_core::ObservationCapabilities::default(),
         };
         host.projects.insert(project.id.clone(), project.clone());
 
@@ -603,6 +677,9 @@ mod tests {
             last_agent_state: None,
             last_error: None,
             supported_agents: Vec::new(),
+            runtimes: Vec::new(),
+            notification_providers: Vec::new(),
+            observation_capabilities: pohunek_gui_core::ObservationCapabilities::default(),
         };
         host.projects.insert(project.id.clone(), project.clone());
         host.sessions.insert(session.id.0.clone(), session.clone());

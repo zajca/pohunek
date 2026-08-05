@@ -5,19 +5,21 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pohunek_worker_protocol::{ControlCode, InspectSnapshot, RuntimePhase};
+use pohunek_worker_protocol::{ControlCode, InspectSnapshot, ReleasedIdentityClaim, RuntimePhase};
 use protocol::{RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryStatus};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::{
-    event, event_payload, runtime_error, timestamp_now, watch, ActiveAgentReport,
-    CancellationToken, DesiredState, DetectorConfig, Notify, ObservedAgent, ProtocolError,
-    ResumeSnapshot, RuntimeHandle, RuntimeState, SessionEntry, SessionId, SessionRecord,
-    SessionRef, SessionRefKind, SessionRegistry, SessionRuntime, SessionState, StateSource, Worker,
-    WorkerError, WORKER_CONNECT_RETRY,
+    event, event_payload, identity_claim_expiry_is_valid, runtime_error, timestamp_now, watch,
+    ActiveAgentReport, CancellationToken, DesiredState, DetectorConfig, Notify, ObservedAgent,
+    ProtocolError, ResumeSnapshot, RuntimeHandle, RuntimeState, RuntimeWatchIdentity, SessionEntry,
+    SessionId, SessionRecord, SessionRef, SessionRefKind, SessionRegistry, SessionRuntime,
+    SessionState, StateSource, Worker, WorkerError, WORKER_CONNECT_RETRY,
 };
+use crate::procwatch::ProcessInspector;
 use crate::session::target::open_detector_output;
+use crate::store::{ResumeBinding, SessionWriteOutcome};
 
 // Rust guideline compliant 2026-07-29
 
@@ -63,7 +65,94 @@ struct JournalOutcome {
     success: bool,
 }
 
+#[derive(Debug)]
+struct WorkerIdentityProjection {
+    active: Option<ActiveAgentReport>,
+    release: Option<ReleasedIdentityClaim>,
+    privately_reported: bool,
+}
+
+impl WorkerIdentityProjection {
+    fn unreported() -> Self {
+        Self {
+            active: None,
+            release: None,
+            privately_reported: false,
+        }
+    }
+}
+
 impl SessionRegistry {
+    pub(super) async fn apply_worker_identity_snapshot(
+        &self,
+        id: &SessionId,
+        snapshot: &InspectSnapshot,
+    ) -> bool {
+        let expected_worker_id = snapshot.worker_id.to_string();
+        let expected_runtime_id = snapshot.runtime_id.as_ref().map(ToString::to_string);
+        {
+            let sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get(id) else {
+                return false;
+            };
+            let Some(runtime) = entry.info.runtime.as_ref() else {
+                return false;
+            };
+            if runtime.state != RuntimeState::Live
+                || runtime.worker_id.as_deref() != Some(expected_worker_id.as_str())
+                || runtime.runtime_id != expected_runtime_id
+            {
+                return false;
+            }
+        }
+        if let Err(reason) = validate_worker_identity_processes(&*self.inner.inspector, snapshot) {
+            tracing::warn!(session_id = %id.0, reason, "rejected worker identity process claim");
+            return false;
+        }
+
+        let updated = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get_mut(id) else {
+                return false;
+            };
+            let Some(runtime) = entry.info.runtime.as_ref() else {
+                return false;
+            };
+            if runtime.state != RuntimeState::Live
+                || runtime.worker_id.as_deref() != Some(expected_worker_id.as_str())
+                || runtime.runtime_id != expected_runtime_id
+            {
+                return false;
+            }
+            let mut candidate = Self::session_record(id, entry, entry.desired_state, None);
+            let projection = match import_worker_identities(&mut candidate, snapshot) {
+                Ok(projection) => projection,
+                Err(reason) => {
+                    tracing::warn!(session_id = %id.0, reason, "rejected worker identity snapshot");
+                    return false;
+                }
+            };
+            let changed = apply_identity_projection(entry, &candidate, &projection, snapshot);
+            if changed {
+                entry.info.updated_at = timestamp_now();
+            }
+            (
+                changed,
+                entry.info.clone(),
+                Self::session_record(id, entry, entry.desired_state, None),
+            )
+        };
+        if let Err(error) = self.write_session_record(updated.2).await {
+            tracing::warn!(session_id = %id.0, error = %error, "failed to persist worker identity snapshot");
+            return false;
+        }
+        if updated.0 {
+            self.persist_resume_binding(id).await;
+            self.emit(event::SESSION_UPDATED, &updated.1);
+        }
+        true
+    }
+
     /// Loads logical records and adopts their exact surviving workers.
     ///
     /// This never invokes provider-native resume. An absent, conflicting, or
@@ -117,7 +206,7 @@ impl SessionRegistry {
             .iter()
             .filter(|entry| entry.status != RuntimeInventoryStatus::Managed)
         {
-            let event = protocol::Event::new(
+            let event = crate::events::event(
                 event::SESSION_RUNTIME_DISCOVERED,
                 event_payload(RuntimeInventoryEvent {
                     entry: entry.clone(),
@@ -138,10 +227,10 @@ impl SessionRegistry {
             let candidates = discovered.remove(&record.session_id).unwrap_or_default();
             match candidates.as_slice() {
                 [candidate] if candidate.slot == record.session_id => {
-                    self.reconcile_record(
+                    Box::pin(self.reconcile_record(
                         record,
                         Some((candidate.worker.clone(), candidate.snapshot.clone())),
-                    )
+                    ))
                     .await;
                 }
                 [] => {
@@ -221,6 +310,13 @@ impl SessionRegistry {
     }
 
     async fn import_terminal_journal(&self, mut record: SessionRecord, evidence: JournalEvidence) {
+        let runtime_generation = record
+            .info
+            .runtime
+            .as_ref()
+            .map_or(protocol::RuntimeGeneration::new(1), |runtime| {
+                runtime.runtime_generation
+            });
         record.transaction = None;
         record.info.pid = evidence.child.as_ref().map_or(0, |child| child.pid);
         if let Some(cols) = evidence.cols {
@@ -253,6 +349,7 @@ impl SessionRegistry {
         record.runtime.reason = None;
         record.info.runtime = Some(SessionRuntime {
             state: RuntimeState::Terminal,
+            runtime_generation,
             worker_id: Some(evidence.worker_id),
             runtime_id: evidence.runtime_id,
             started_at: record
@@ -522,19 +619,27 @@ impl SessionRegistry {
             (transaction.kind == crate::store::TransactionKind::Recover)
                 .then(|| transaction.previous_runtime_id.clone())
         });
-        let active_agent = match import_worker_identities(&mut record, &snapshot) {
-            Ok(active_agent) => active_agent,
+        let Some(child) = snapshot.child_process else {
+            self.insert_unavailable_record(record, RuntimeState::Lost, "worker_child_missing")
+                .await;
+            return;
+        };
+        if let Err(reason) = validate_worker_identity_processes(&*self.inner.inspector, &snapshot) {
+            self.insert_unavailable_record(record, RuntimeState::Conflict, reason)
+                .await;
+            return;
+        }
+        let identity_projection = match import_worker_identities(&mut record, &snapshot) {
+            Ok(projection) => projection,
             Err(reason) => {
                 self.insert_unavailable_record(record, RuntimeState::Conflict, reason)
                     .await;
                 return;
             }
         };
-        let Some(child) = snapshot.child_process else {
-            self.insert_unavailable_record(record, RuntimeState::Lost, "worker_child_missing")
-                .await;
-            return;
-        };
+        let active_agent = identity_projection
+            .active
+            .or_else(|| active_report_from_info(&record.info));
         let detector_output = match open_detector_output(&worker, &id).await {
             Ok(output) => output,
             Err(error) => {
@@ -549,6 +654,13 @@ impl SessionRegistry {
         };
         let now = timestamp_now();
         let runtime_id = snapshot.runtime_id.as_ref().map(ToString::to_string);
+        let runtime_generation = record
+            .info
+            .runtime
+            .as_ref()
+            .map_or(protocol::RuntimeGeneration::new(1), |runtime| {
+                runtime.runtime_generation
+            });
         record.info.pid = child.pid;
         if let Some(dimensions) = snapshot.dimensions {
             record.info.cols = dimensions.columns();
@@ -558,6 +670,7 @@ impl SessionRegistry {
         record.info.state_source = StateSource::Process;
         record.info.runtime = Some(SessionRuntime {
             state: RuntimeState::Live,
+            runtime_generation,
             worker_id: Some(snapshot.worker_id.to_string()),
             runtime_id: runtime_id.clone(),
             started_at: record
@@ -578,14 +691,15 @@ impl SessionRegistry {
 
         let recovery = record.recovery.clone();
         let input_rules = recovery.as_ref().map_or_else(
-            || super::input_rules_for_agent(record.info.agent_base, &self.inner.config),
-            |binding| binding.input_rules.to_input_rules(),
+            || super::input_rules_for_agent(&record.info.agent_base, &self.inner.config),
+            |binding| binding.input_rules.to_input_rules(&binding.agent_base),
         );
         let snapshot = recovery.as_ref().map_or_else(
             || ResumeSnapshot {
                 program: String::new(),
                 args: Vec::new(),
                 resume: None,
+                fork: None,
             },
             |binding| ResumeSnapshot {
                 program: binding.program.clone(),
@@ -594,6 +708,22 @@ impl SessionRegistry {
                     .resume_mode
                     .zip(binding.ref_kind)
                     .map(|(mode, ref_kind)| super::ResumeTemplate { mode, ref_kind }),
+                fork: binding
+                    .forkable
+                    .then(|| {
+                        binding
+                            .fork_mode
+                            .zip(binding.fork_resume_mode)
+                            .zip(binding.fork_ref_kind)
+                    })
+                    .flatten()
+                    .map(|((mode, resume_mode), ref_kind)| super::ForkTemplate {
+                        resume: super::ResumeTemplate {
+                            mode: resume_mode,
+                            ref_kind,
+                        },
+                        mode,
+                    }),
             },
         );
         let manifest_override = self
@@ -603,7 +733,7 @@ impl SessionRegistry {
             .ok()
             .and_then(|resolved| resolved.profile.and_then(|profile| profile.manifest));
         let default_detector_config =
-            DetectorConfig::for_profile(record.info.agent_base, manifest_override);
+            DetectorConfig::for_profile(&record.info.agent_base, manifest_override);
         let detector_cancel = CancellationToken::new();
         let procwatch_cancel = CancellationToken::new();
         let runtime_watch_cancel = CancellationToken::new();
@@ -612,33 +742,30 @@ impl SessionRegistry {
             watch::channel((record.info.rows, record.info.cols));
         let (detector_config, detector_config_rx) = watch::channel(default_detector_config.clone());
         let info = record.info.clone();
-        {
-            let mut sessions = self.inner.sessions.lock().await;
-            sessions.insert(
-                id.clone(),
-                SessionEntry {
-                    info: info.clone(),
-                    runtime: RuntimeHandle::Worker(worker.clone()),
-                    desired_state: DesiredState::Running,
-                    detector_cancel: detector_cancel.clone(),
-                    detector_resize,
-                    detector_config,
-                    default_detector_config,
-                    procwatch_cancel: procwatch_cancel.clone(),
-                    runtime_watch_cancel: runtime_watch_cancel.clone(),
-                    procwatch_rescan: Arc::clone(&procwatch_rescan),
-                    stopping: false,
-                    input_rules,
-                    snapshot,
-                    active_agent: active_agent.clone(),
-                    last_agent_report: active_agent,
-                    observed_agents: Vec::<ObservedAgent>::new(),
-                },
-            )
+        let entry = SessionEntry {
+            info: info.clone(),
+            runtime: RuntimeHandle::Worker(worker.clone()),
+            desired_state: DesiredState::Running,
+            detector_cancel: detector_cancel.clone(),
+            detector_resize,
+            detector_config,
+            default_detector_config,
+            procwatch_cancel: procwatch_cancel.clone(),
+            runtime_watch_cancel: runtime_watch_cancel.clone(),
+            procwatch_rescan: Arc::clone(&procwatch_rescan),
+            stopping: false,
+            input_rules,
+            snapshot,
+            active_agent: active_agent.clone(),
+            last_agent_report: active_agent,
+            last_native_report: record.native_identity_ordering.clone(),
+            observed_agents: Vec::<ObservedAgent>::new(),
         };
         if let Err(error) = self.write_session_record(record).await {
             tracing::warn!(session_id = %id.0, error = %error, "failed to commit reconciled worker");
+            return;
         }
+        self.inner.sessions.lock().await.insert(id.clone(), entry);
         self.spawn_detector(
             id.clone(),
             detector_output,
@@ -648,7 +775,9 @@ impl SessionRegistry {
             detector_config_rx,
         );
         self.spawn_procwatch(id.clone(), child.pid, procwatch_cancel, procwatch_rescan);
-        self.spawn_worker_exit_watcher(id, worker, runtime_watch_cancel);
+        let expected = RuntimeWatchIdentity::from_info(&info)
+            .expect("reconciled live runtime has a complete watcher identity");
+        self.spawn_worker_exit_watcher(id, worker, expected, runtime_watch_cancel);
         if let Some(previous_runtime_id) = native_recovery {
             self.emit_native_recovered(&info, previous_runtime_id);
         } else {
@@ -666,6 +795,7 @@ impl SessionRegistry {
         let now = timestamp_now();
         let runtime = record.info.runtime.get_or_insert(SessionRuntime {
             state,
+            runtime_generation: protocol::RuntimeGeneration::new(1),
             worker_id: record.runtime.worker_id.clone(),
             runtime_id: record.runtime.runtime_id.clone(),
             started_at: None,
@@ -679,14 +809,15 @@ impl SessionRegistry {
         record.info.updated_at = now;
         let recovery = record.recovery.clone();
         let input_rules = recovery.as_ref().map_or_else(
-            || super::input_rules_for_agent(record.info.agent_base, &self.inner.config),
-            |binding| binding.input_rules.to_input_rules(),
+            || super::input_rules_for_agent(&record.info.agent_base, &self.inner.config),
+            |binding| binding.input_rules.to_input_rules(&binding.agent_base),
         );
         let relaunch = recovery.as_ref().map_or_else(
             || ResumeSnapshot {
                 program: String::new(),
                 args: Vec::new(),
                 resume: None,
+                fork: None,
             },
             |binding| ResumeSnapshot {
                 program: binding.program.clone(),
@@ -695,39 +826,52 @@ impl SessionRegistry {
                     .resume_mode
                     .zip(binding.ref_kind)
                     .map(|(mode, ref_kind)| super::ResumeTemplate { mode, ref_kind }),
+                fork: binding
+                    .forkable
+                    .then(|| {
+                        binding
+                            .fork_mode
+                            .zip(binding.fork_resume_mode)
+                            .zip(binding.fork_ref_kind)
+                    })
+                    .flatten()
+                    .map(|((mode, resume_mode), ref_kind)| super::ForkTemplate {
+                        resume: super::ResumeTemplate {
+                            mode: resume_mode,
+                            ref_kind,
+                        },
+                        mode,
+                    }),
             },
         );
-        let default_detector_config = DetectorConfig::for_agent(record.info.agent_base);
+        let default_detector_config = DetectorConfig::for_agent(&record.info.agent_base);
         let (detector_resize, _) = watch::channel((record.info.rows, record.info.cols));
         let (detector_config, _) = watch::channel(default_detector_config.clone());
         let info = record.info.clone();
-        {
-            let mut sessions = self.inner.sessions.lock().await;
-            sessions.insert(
-                id.clone(),
-                SessionEntry {
-                    info: info.clone(),
-                    runtime: RuntimeHandle::Unavailable(state),
-                    desired_state: record.desired_state,
-                    detector_cancel: CancellationToken::new(),
-                    detector_resize,
-                    detector_config,
-                    default_detector_config,
-                    procwatch_cancel: CancellationToken::new(),
-                    runtime_watch_cancel: CancellationToken::new(),
-                    procwatch_rescan: Arc::new(Notify::new()),
-                    stopping: false,
-                    input_rules,
-                    snapshot: relaunch,
-                    active_agent: None,
-                    last_agent_report: None,
-                    observed_agents: Vec::new(),
-                },
-            )
+        let entry = SessionEntry {
+            info: info.clone(),
+            runtime: RuntimeHandle::Unavailable(state),
+            desired_state: record.desired_state,
+            detector_cancel: CancellationToken::new(),
+            detector_resize,
+            detector_config,
+            default_detector_config,
+            procwatch_cancel: CancellationToken::new(),
+            runtime_watch_cancel: CancellationToken::new(),
+            procwatch_rescan: Arc::new(Notify::new()),
+            stopping: false,
+            input_rules,
+            snapshot: relaunch,
+            active_agent: None,
+            last_agent_report: None,
+            last_native_report: record.native_identity_ordering.clone(),
+            observed_agents: Vec::new(),
         };
         if let Err(error) = self.write_session_record(record).await {
             tracing::warn!(session_id = %id.0, error = %error, "failed to persist runtime classification");
+            return;
         }
+        self.inner.sessions.lock().await.insert(id.clone(), entry);
         let event_name = match state {
             RuntimeState::Conflict => event::SESSION_RUNTIME_CONFLICT,
             RuntimeState::Lost | RuntimeState::Incompatible => event::SESSION_RUNTIME_LOST,
@@ -767,6 +911,7 @@ impl SessionRegistry {
                     .runtime
                     .get_or_insert(SessionRuntime {
                         state: RuntimeState::Terminal,
+                        runtime_generation: protocol::RuntimeGeneration::new(1),
                         worker_id: terminal.runtime.worker_id.clone(),
                         runtime_id: terminal.runtime.runtime_id.clone(),
                         started_at: None,
@@ -823,7 +968,7 @@ impl SessionRegistry {
 
 fn merge_persisted_recovery(
     record: &mut SessionRecord,
-    binding: crate::store::ResumeBinding,
+    mut binding: crate::store::ResumeBinding,
 ) -> Result<(), &'static str> {
     if binding.agent != record.info.agent || binding.agent_base != record.info.agent_base {
         return Err("resume_binding_agent_mismatch");
@@ -832,17 +977,40 @@ fn merge_persisted_recovery(
         if recovery.agent != binding.agent
             || recovery.agent_base != binding.agent_base
             || recovery.ref_kind != binding.ref_kind
+            || recovery.fork_mode != binding.fork_mode
+            || recovery.fork_resume_mode != binding.fork_resume_mode
+            || recovery.fork_ref_kind != binding.fork_ref_kind
+            || recovery.forkable != binding.forkable
         {
             return Err("resume_binding_shape_mismatch");
         }
     }
 
-    let kind = binding.ref_kind.or_else(|| {
-        record
-            .recovery
-            .as_ref()
-            .and_then(|recovery| recovery.ref_kind)
-    });
+    // A sequenced native identity in the session record is authoritative over
+    // the separately persisted resume projection. The session write commits
+    // first, so a crash or I/O failure can legitimately leave the resume
+    // projection one report behind.
+    if record.native_identity_ordering.is_some() {
+        if let Some(recovery) = record.recovery.as_ref().filter(|recovery| {
+            recovery.native_session_id.is_some() || recovery.native_session_path.is_some()
+        }) {
+            binding
+                .native_session_id
+                .clone_from(&recovery.native_session_id);
+            binding
+                .native_session_path
+                .clone_from(&recovery.native_session_path);
+        }
+    }
+
+    let persisted_kind = recovery_ref_kind(&binding)?;
+    let record_kind = record
+        .recovery
+        .as_ref()
+        .map(recovery_ref_kind)
+        .transpose()?
+        .flatten();
+    let kind = persisted_kind.or(record_kind);
     let (native_id, native_path) = match (
         kind,
         binding.native_session_id.as_deref(),
@@ -904,58 +1072,182 @@ fn merge_persisted_recovery(
 fn import_worker_identities(
     record: &mut SessionRecord,
     snapshot: &pohunek_worker_protocol::InspectSnapshot,
-) -> Result<Option<ActiveAgentReport>, &'static str> {
-    if let Some(identity) = &snapshot.launch_identity {
-        let expected_provider = super::agent_kind_label(record.info.agent_base);
-        if identity.provider != expected_provider {
-            return Err("launch_identity_provider_mismatch");
-        }
-        let kind = parse_reference_kind(&identity.reference_kind)
-            .ok_or("launch_identity_reference_kind_invalid")?;
-        let binding = record
-            .recovery
-            .as_mut()
-            .ok_or("launch_identity_recovery_missing")?;
-        if binding.ref_kind != Some(kind) {
-            return Err("launch_identity_reference_kind_mismatch");
-        }
-        let native = validate_native_reference(kind, &identity.native_reference)
-            .ok_or("launch_identity_reference_invalid")?;
-        match kind {
-            SessionRefKind::Id => {
-                if record
-                    .info
-                    .native_session_id
-                    .as_deref()
-                    .is_some_and(|existing| existing != native.as_str())
-                {
-                    return Err("launch_identity_reference_mismatch");
-                }
-                record.info.native_session_id = Some(native.clone());
-                record.info.native_session_path = None;
-                binding.native_session_id = Some(native);
-                binding.native_session_path = None;
-            }
-            SessionRefKind::Path => {
-                if record
-                    .info
-                    .native_session_path
-                    .as_deref()
-                    .is_some_and(|existing| existing != native.as_str())
-                {
-                    return Err("launch_identity_reference_mismatch");
-                }
-                record.info.native_session_path = Some(native.clone());
-                record.info.native_session_id = None;
-                binding.native_session_path = Some(native);
-                binding.native_session_id = None;
-            }
-        }
+) -> Result<WorkerIdentityProjection, &'static str> {
+    let mut candidate = record.clone();
+    let projection = apply_worker_identities(&mut candidate, snapshot)?;
+    *record = candidate;
+    Ok(projection)
+}
+
+fn apply_identity_projection(
+    entry: &mut SessionEntry,
+    candidate: &SessionRecord,
+    projection: &WorkerIdentityProjection,
+    snapshot: &InspectSnapshot,
+) -> bool {
+    let native_changed = entry.info.native_session_id != candidate.info.native_session_id
+        || entry.info.native_session_path != candidate.info.native_session_path;
+    let active_changed = projection.privately_reported
+        && (entry.info.active_agent != candidate.info.active_agent
+            || entry.info.active_agent_base != candidate.info.active_agent_base
+            || entry.info.active_agent_pid != candidate.info.active_agent_pid
+            || entry.info.active_agent_session_id != candidate.info.active_agent_session_id
+            || entry.info.active_agent_session_path != candidate.info.active_agent_session_path);
+    if !native_changed && !active_changed {
+        return false;
     }
+    entry
+        .info
+        .native_session_id
+        .clone_from(&candidate.info.native_session_id);
+    entry
+        .info
+        .native_session_path
+        .clone_from(&candidate.info.native_session_path);
+    if active_changed {
+        entry
+            .info
+            .active_agent
+            .clone_from(&candidate.info.active_agent);
+        entry
+            .info
+            .active_agent_base
+            .clone_from(&candidate.info.active_agent_base);
+        entry.info.active_agent_pid = candidate.info.active_agent_pid;
+        entry
+            .info
+            .active_agent_session_id
+            .clone_from(&candidate.info.active_agent_session_id);
+        entry
+            .info
+            .active_agent_session_path
+            .clone_from(&candidate.info.active_agent_session_path);
+        entry.active_agent.clone_from(&projection.active);
+        entry.last_agent_report = projection.active.clone().or_else(|| {
+            projection
+                .release
+                .as_ref()
+                .map(|release| release_tombstone(snapshot, release))
+        });
+    }
+    true
+}
+
+fn validate_worker_identity_processes(
+    inspector: &dyn ProcessInspector,
+    snapshot: &InspectSnapshot,
+) -> Result<(), &'static str> {
+    let root = snapshot
+        .child_process
+        .as_ref()
+        .ok_or("worker_child_missing")?;
+    let current_root = inspector
+        .process(root.pid)
+        .map_err(|_error| "identity_process_inspection_failed")?
+        .ok_or("identity_process_root_missing")?;
+    let descendants = inspector
+        .descendants(root.pid)
+        .map_err(|_error| "identity_process_inspection_failed")?;
+    validate_worker_identity_process_facts(snapshot, &current_root, &descendants)
+}
+
+fn validate_worker_identity_process_facts(
+    snapshot: &InspectSnapshot,
+    current_root: &crate::procwatch::ProcessFact,
+    descendants: &[crate::procwatch::ProcessFact],
+) -> Result<(), &'static str> {
+    let root = snapshot
+        .child_process
+        .as_ref()
+        .ok_or("worker_child_missing")?;
+    if current_root.pid != root.pid || current_root.start_identity != root.start_identity {
+        return Err("identity_process_root_reused");
+    }
+    let matches = |process: &pohunek_worker_protocol::ProcessIdentity| {
+        (process.pid == root.pid && process.start_identity == root.start_identity)
+            || descendants.iter().any(|fact| {
+                fact.pid == process.pid && fact.start_identity == process.start_identity
+            })
+    };
+    if snapshot
+        .launch_identity
+        .as_ref()
+        .is_some_and(|identity| !matches(&identity.process))
+    {
+        return Err("launch_identity_process_invalid");
+    }
+    if snapshot
+        .active_identity
+        .as_ref()
+        .is_some_and(|identity| !matches(&identity.process))
+    {
+        return Err("active_identity_process_invalid");
+    }
+    // A release is validated against the live PTY tree before the worker
+    // commits it. It is durable history after that point: the released process
+    // may legitimately be gone before the daemon observes or reloads it.
+    Ok(())
+}
+
+fn active_report_from_info(info: &protocol::SessionInfo) -> Option<ActiveAgentReport> {
+    Some(ActiveAgentReport {
+        source: "persisted".to_owned(),
+        agent: info.active_agent.clone()?,
+        seq: None,
+        pid: info.active_agent_pid,
+        reported_at: std::time::Instant::now(),
+        activity_reported: false,
+    })
+}
+
+fn release_tombstone(
+    snapshot: &InspectSnapshot,
+    release: &ReleasedIdentityClaim,
+) -> ActiveAgentReport {
+    ActiveAgentReport {
+        source: format!("worker:{}", snapshot.worker_id),
+        agent: release.provider.clone(),
+        seq: Some(release.sequence),
+        pid: Some(release.process.pid),
+        reported_at: std::time::Instant::now(),
+        activity_reported: false,
+    }
+}
+
+fn apply_worker_identities(
+    record: &mut SessionRecord,
+    snapshot: &pohunek_worker_protocol::InspectSnapshot,
+) -> Result<WorkerIdentityProjection, &'static str> {
+    if snapshot.active_identity.is_some() && snapshot.active_identity_release.is_some() {
+        return Err("active_identity_state_ambiguous");
+    }
+    apply_worker_launch_identity(record, snapshot.launch_identity.as_ref())?;
 
     let Some(identity) = &snapshot.active_identity else {
-        return Ok(None);
+        let Some(release) = snapshot.active_identity_release.clone() else {
+            return Ok(WorkerIdentityProjection::unreported());
+        };
+        if parse_provider(&release.provider).is_none() {
+            return Err("active_identity_release_provider_invalid");
+        }
+        let release_matches = record.info.active_agent.as_deref() == Some(&release.provider)
+            && record.info.active_agent_pid == Some(release.process.pid);
+        if release_matches {
+            record.info.active_agent = None;
+            record.info.active_agent_base = None;
+            record.info.active_agent_pid = None;
+            record.info.active_agent_session_id = None;
+            record.info.active_agent_session_path = None;
+        }
+        return Ok(WorkerIdentityProjection {
+            active: None,
+            release: Some(release),
+            privately_reported: true,
+        });
     };
+    if !identity_claim_expiry_is_valid(&identity.expires_at) {
+        return Err("active_identity_expired_or_overlong");
+    }
     let Some(agent_base) = parse_provider(&identity.provider) else {
         return Err("active_identity_provider_invalid");
     };
@@ -981,14 +1273,76 @@ fn import_worker_identities(
     record.info.active_agent_pid = Some(identity.process.pid);
     record.info.active_agent_session_id = active_id;
     record.info.active_agent_session_path = active_path;
-    Ok(Some(ActiveAgentReport {
-        source: format!("worker:{}", snapshot.worker_id),
-        agent: identity.provider.clone(),
-        seq: Some(identity.sequence),
-        pid: Some(identity.process.pid),
-        reported_at: std::time::Instant::now(),
-        activity_reported: false,
-    }))
+    Ok(WorkerIdentityProjection {
+        active: Some(ActiveAgentReport {
+            source: format!("worker:{}", snapshot.worker_id),
+            agent: identity.provider.clone(),
+            seq: Some(identity.sequence),
+            pid: Some(identity.process.pid),
+            reported_at: std::time::Instant::now(),
+            activity_reported: false,
+        }),
+        release: None,
+        privately_reported: true,
+    })
+}
+
+fn apply_worker_launch_identity(
+    record: &mut SessionRecord,
+    identity: Option<&pohunek_worker_protocol::ReportedLaunchIdentity>,
+) -> Result<(), &'static str> {
+    let Some(identity) = identity else {
+        return Ok(());
+    };
+    let expected_provider = super::agent_kind_label(&record.info.agent_base);
+    if identity.provider != expected_provider {
+        return Err("launch_identity_provider_mismatch");
+    }
+    let kind = parse_reference_kind(&identity.reference_kind)
+        .ok_or("launch_identity_reference_kind_invalid")?;
+    let binding = record
+        .recovery
+        .as_mut()
+        .ok_or("launch_identity_recovery_missing")?;
+    if recovery_ref_kind(binding)? != Some(kind) {
+        return Err("launch_identity_reference_kind_mismatch");
+    }
+    let native = validate_native_reference(kind, &identity.native_reference)
+        .ok_or("launch_identity_reference_invalid")?;
+    let existing = match kind {
+        SessionRefKind::Id => record.info.native_session_id.as_deref(),
+        SessionRefKind::Path => record.info.native_session_path.as_deref(),
+    };
+    if existing.is_some_and(|existing| existing != native) {
+        return Err("launch_identity_reference_mismatch");
+    }
+    match kind {
+        SessionRefKind::Id => {
+            record.info.native_session_id = Some(native.clone());
+            record.info.native_session_path = None;
+            binding.native_session_id = Some(native);
+            binding.native_session_path = None;
+        }
+        SessionRefKind::Path => {
+            record.info.native_session_path = Some(native.clone());
+            record.info.native_session_id = None;
+            binding.native_session_path = Some(native);
+            binding.native_session_id = None;
+        }
+    }
+    Ok(())
+}
+
+fn recovery_ref_kind(binding: &ResumeBinding) -> Result<Option<SessionRefKind>, &'static str> {
+    let resume_kind = binding.resumable.then_some(binding.ref_kind).flatten();
+    let fork_kind = binding.forkable.then_some(binding.fork_ref_kind).flatten();
+    match (resume_kind, fork_kind) {
+        (Some(resume), Some(fork)) if resume != fork => {
+            Err("resume_binding_reference_kind_mismatch")
+        }
+        (Some(kind), _) | (_, Some(kind)) => Ok(Some(kind)),
+        (None, None) => Ok(None),
+    }
 }
 
 fn parse_provider(provider: &str) -> Option<protocol::AgentKind> {
@@ -996,6 +1350,7 @@ fn parse_provider(provider: &str) -> Option<protocol::AgentKind> {
         "shell" => Some(protocol::AgentKind::Shell),
         "codex" => Some(protocol::AgentKind::Codex),
         "claude" => Some(protocol::AgentKind::Claude),
+        "hermes" => Some(protocol::AgentKind::Hermes),
         _ => None,
     }
 }
@@ -1124,6 +1479,18 @@ fn import_legacy_manifest(store: &crate::store::Store) -> Result<(), ProtocolErr
         })
         .map(|session| session.id.0.as_str())
         .collect();
+    if manifest.sessions.iter().any(|session| {
+        !session.agent_base.is_known()
+            || session
+                .active_agent_base
+                .as_ref()
+                .is_some_and(|active| !active.is_known())
+    }) {
+        return Err(runtime_error(
+            "migration_import_failed",
+            "migration manifest contains an unsupported agent kind",
+        ));
+    }
     if expected_live != actual_live {
         return Err(runtime_error(
             "migration_manifest_mismatch",
@@ -1145,6 +1512,7 @@ fn import_legacy_manifest(store: &crate::store::Store) -> Result<(), ProtocolErr
         };
         info.runtime = Some(protocol::SessionRuntime {
             state: runtime_state,
+            runtime_generation: protocol::RuntimeGeneration::new(1),
             worker_id: None,
             runtime_id: None,
             started_at: None,
@@ -1155,7 +1523,8 @@ fn import_legacy_manifest(store: &crate::store::Store) -> Result<(), ProtocolErr
             .iter()
             .find(|binding| binding.session_id == info.id.0)
             .cloned();
-        store
+        let session_id = info.id.0.clone();
+        let outcome = store
             .record_session(&SessionRecord {
                 schema_version: 1,
                 session_id: info.id.0.clone(),
@@ -1167,6 +1536,7 @@ fn import_legacy_manifest(store: &crate::store::Store) -> Result<(), ProtocolErr
                 transaction: None,
                 info,
                 recovery,
+                native_identity_ordering: None,
                 runtime: crate::store::RuntimeRecord {
                     state: runtime_state,
                     worker_id: None,
@@ -1181,6 +1551,28 @@ fn import_legacy_manifest(store: &crate::store::Store) -> Result<(), ProtocolErr
                     format!("failed to import logical session: {error}"),
                 )
             })?;
+        match outcome {
+            SessionWriteOutcome::Applied => {}
+            SessionWriteOutcome::AppliedDurabilityUncertain { error } => {
+                tracing::warn!(
+                    session_id,
+                    durability_error = %error,
+                    "legacy session import is visible but directory durability is uncertain"
+                );
+            }
+            SessionWriteOutcome::StaleRuntime => {
+                return Err(runtime_error(
+                    "migration_import_stale",
+                    "legacy session import lost a concurrent runtime commit",
+                ));
+            }
+            SessionWriteOutcome::StaleSnapshot => {
+                return Err(runtime_error(
+                    "migration_import_stale",
+                    "legacy session import lost a concurrent record commit",
+                ));
+            }
+        }
     }
     archive_imported_manifest(&path, &manifest)
 }
@@ -1432,6 +1824,9 @@ fn classify_connect_error(error: &WorkerError) -> (RuntimeState, &'static str) {
         WorkerError::AttachSnapshotUnsupported { .. } => {
             (RuntimeState::Incompatible, "attach_snapshot_unsupported")
         }
+        WorkerError::ObservationUnsupported { .. } => {
+            (RuntimeState::Incompatible, "observation_unsupported")
+        }
         WorkerError::Socket { .. }
         | WorkerError::Protocol(_)
         | WorkerError::Rejected { .. }
@@ -1444,7 +1839,7 @@ fn classify_connect_error(error: &WorkerError) -> (RuntimeState, &'static str) {
 mod tests {
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use pohunek_session_worker::{
@@ -1455,22 +1850,31 @@ mod tests {
     use pohunek_worker_protocol::{
         ActiveIdentityClaim, ControlCode, ControlError, ControlMessage, ControlReader,
         ControlResponse, ControlWriter, Dimensions, Initialize, InitializeLimits, InspectSnapshot,
-        LaunchIdentity, ProcessIdentity, ReportedLaunchIdentity, ResponseKind, RuntimeId,
-        RuntimePhase as WorkerRuntimePhase, SecretEnv, SessionId as WorkerSessionId, StopPolicy,
-        TransactionId, Version, WorkerId,
+        LaunchIdentity, ProcessIdentity, ReleasedIdentityClaim, ReportedLaunchIdentity,
+        ResponseKind, RuntimeId, RuntimePhase as WorkerRuntimePhase, SecretEnv,
+        SessionId as WorkerSessionId, StopPolicy, TransactionId, Version, WorkerId,
     };
     use protocol::{
-        AgentKind, CwdSource, ForkCwdMode, RuntimeInventoryStatus, RuntimeState, SessionForkParams,
-        SessionId, SessionInfo, SessionNewParams, SessionRuntime, SessionState, StateSource,
+        AgentKind, CwdSource, ForkCwdMode, ProcessStartIdentity, ReportSequence,
+        RuntimeInventoryStatus, RuntimeState, SessionForkParams, SessionId, SessionInfo,
+        SessionNewParams, SessionReportNativeIdParams, SessionRuntime, SessionState, StateSource,
     };
     use sha2::{Digest, Sha256};
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
+    use tokio::net::UnixStream;
 
-    use super::{import_legacy_manifest, import_worker_identities, SessionRegistry};
-    use crate::agent::{InputRules, ResumeMode, SessionRefKind};
+    use super::{
+        import_legacy_manifest, import_worker_identities, merge_persisted_recovery,
+        validate_worker_identity_process_facts, SessionRegistry,
+    };
+    use crate::agent::{ForkMode, InputRules, ResumeMode, SessionRefKind};
     use crate::session::SessionRegistryConfig;
     use crate::store::{
-        DesiredState, ResumeBinding, RuntimeRecord, SessionRecord, Store, StoredInputRules,
+        DesiredState, NativeIdentityOrdering, ResumeBinding, RuntimeRecord, SessionRecord,
+        SessionWriteOutcome, Store, StoredInputRules,
     };
 
     fn temp_root() -> PathBuf {
@@ -1478,7 +1882,48 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("pohunek-reconcile-{}-{nanos}", std::process::id()))
+        std::env::temp_dir().join(format!("ph-rec-{}-{nanos}", std::process::id()))
+    }
+
+    async fn send_identity_hook(socket: &Path, request: serde_json::Value) -> bool {
+        let stream = UnixStream::connect(socket).await.expect("connect hook");
+        let (reader, mut writer) = stream.into_split();
+        let mut encoded = serde_json::to_vec(&request).expect("encode hook");
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await.expect("write hook");
+        let mut response = String::new();
+        BufReader::new(reader)
+            .read_line(&mut response)
+            .await
+            .expect("read hook response");
+        serde_json::from_str::<serde_json::Value>(&response)
+            .expect("decode hook response")
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    async fn wait_for_pid_file(path: &Path) -> u32 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                return contents.trim().parse().expect("nested pid");
+            }
+            assert!(tokio::time::Instant::now() < deadline, "nested pid timeout");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn process_start_identity(pid: u32) -> u64 {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read proc stat");
+        stat.rsplit_once(')')
+            .expect("proc stat command")
+            .1
+            .split_whitespace()
+            .nth(19)
+            .expect("proc stat start identity")
+            .parse()
+            .expect("numeric start identity")
     }
 
     #[test]
@@ -1506,7 +1951,7 @@ mod tests {
             record.info.active_agent_session_id.as_deref(),
             Some("nested-native")
         );
-        assert_eq!(active.expect("active report").pid, Some(60));
+        assert_eq!(active.active.expect("active report").pid, Some(60));
 
         let conflict =
             import_worker_identities(&mut record, &identity_snapshot("different-launch"))
@@ -1517,6 +1962,130 @@ mod tests {
             Some("native-launch"),
             "conflicting hook must not replace the accepted launch identity"
         );
+    }
+
+    #[test]
+    fn reconciliation_rejects_stale_or_overlong_active_identity_and_clears_release() {
+        assert_eq!(
+            protocol::MAX_IDENTITY_CLAIM_TTL_SECS,
+            pohunek_worker_protocol::MAX_IDENTITY_CLAIM_TTL_SECS
+        );
+        let mut expired = identity_snapshot("native-launch");
+        expired
+            .active_identity
+            .as_mut()
+            .expect("active identity")
+            .expires_at = (OffsetDateTime::now_utc() - time::Duration::seconds(1))
+            .format(&Rfc3339)
+            .expect("format expiry");
+        assert_eq!(
+            import_worker_identities(&mut identity_record(), &expired)
+                .expect_err("expired identity"),
+            "active_identity_expired_or_overlong"
+        );
+
+        let mut overlong = identity_snapshot("native-launch");
+        overlong
+            .active_identity
+            .as_mut()
+            .expect("active identity")
+            .expires_at = (OffsetDateTime::now_utc()
+            + time::Duration::seconds(
+                i64::try_from(protocol::MAX_IDENTITY_CLAIM_TTL_SECS).expect("TTL fits i64") + 1,
+            ))
+        .format(&Rfc3339)
+        .expect("format expiry");
+        assert_eq!(
+            import_worker_identities(&mut identity_record(), &overlong)
+                .expect_err("overlong identity"),
+            "active_identity_expired_or_overlong"
+        );
+
+        let mut record = identity_record();
+        import_worker_identities(&mut record, &identity_snapshot("native-launch"))
+            .expect("initial active identity");
+        let mut released = identity_snapshot("native-launch");
+        released.active_identity = None;
+        let unreported = import_worker_identities(&mut record, &released).expect("empty identity");
+        assert!(!unreported.privately_reported);
+        assert_eq!(record.info.active_agent.as_deref(), Some("claude"));
+        released.active_identity_release = Some(ReleasedIdentityClaim {
+            provider: "claude".to_owned(),
+            process: ProcessIdentity {
+                pid: 60,
+                start_identity: 600,
+            },
+            sequence: 8,
+        });
+        let projection =
+            import_worker_identities(&mut record, &released).expect("released identity");
+        assert!(projection.privately_reported);
+        assert!(projection.active.is_none());
+        assert_eq!(projection.release.expect("release").sequence, 8);
+        assert!(record.info.active_agent.is_none());
+        assert!(record.info.active_agent_base.is_none());
+        assert!(record.info.active_agent_pid.is_none());
+        assert!(record.info.active_agent_session_id.is_none());
+        assert!(record.info.active_agent_session_path.is_none());
+    }
+
+    #[test]
+    fn invalid_worker_snapshot_does_not_partially_mutate_record() {
+        let mut record = identity_record();
+        let original = record.clone();
+        let mut snapshot = identity_snapshot("new-native-launch");
+        snapshot
+            .active_identity
+            .as_mut()
+            .expect("active identity")
+            .reference_kind = Some("invalid".to_owned());
+
+        assert_eq!(
+            import_worker_identities(&mut record, &snapshot).expect_err("invalid active reference"),
+            "active_identity_reference_kind_invalid"
+        );
+        assert_eq!(record, original);
+    }
+
+    #[test]
+    fn restart_identity_requires_current_descendant_pid_and_start_identity() {
+        let snapshot = identity_snapshot("native-launch");
+        let root = crate::procwatch::ProcessFact {
+            pid: 50,
+            ppid: 1,
+            start_identity: 500,
+            comm: "codex".to_owned(),
+            cmdline: vec!["codex".to_owned()],
+        };
+        let descendant = crate::procwatch::ProcessFact {
+            pid: 60,
+            ppid: 50,
+            start_identity: 600,
+            comm: "claude".to_owned(),
+            cmdline: vec!["claude".to_owned()],
+        };
+        validate_worker_identity_process_facts(&snapshot, &root, std::slice::from_ref(&descendant))
+            .expect("current descendant identity");
+
+        let reused = crate::procwatch::ProcessFact {
+            start_identity: 601,
+            ..descendant
+        };
+        assert_eq!(
+            validate_worker_identity_process_facts(&snapshot, &root, &[reused])
+                .expect_err("reused descendant pid"),
+            "active_identity_process_invalid"
+        );
+
+        let mut released = snapshot;
+        let active = released.active_identity.take().expect("active identity");
+        released.active_identity_release = Some(ReleasedIdentityClaim {
+            provider: active.provider,
+            process: active.process,
+            sequence: active.sequence + 1,
+        });
+        validate_worker_identity_process_facts(&released, &root, &[])
+            .expect("validated release remains history after its process exits");
     }
 
     #[test]
@@ -1562,7 +2131,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_and_claude_same_provider_nested_identity_keeps_launch_reference_immutable() {
+    fn same_provider_nested_identity_keeps_launch_reference_immutable() {
         for (provider, agent_base, kind, launch_reference, nested_reference) in [
             (
                 "codex",
@@ -1578,10 +2147,17 @@ mod tests {
                 "/tmp/claude-launch.jsonl",
                 "/tmp/claude-nested.jsonl",
             ),
+            (
+                "hermes",
+                AgentKind::Hermes,
+                SessionRefKind::Id,
+                "hermes-launch",
+                "hermes-nested",
+            ),
         ] {
             let mut record = identity_record();
             record.info.agent = provider.to_owned();
-            record.info.agent_base = agent_base;
+            record.info.agent_base = agent_base.clone();
             let binding = record.recovery.as_mut().expect("recovery");
             binding.agent = provider.to_owned();
             binding.agent_base = agent_base;
@@ -1667,6 +2243,8 @@ mod tests {
             .expect("first controller");
         let wire_worker_id = first_controller.worker_id().await;
         let wire_session_id = WorkerSessionId::new(session_id).expect("session id");
+        let released_pid_path = root.join("released.pid");
+        let reassert_pid_path = root.join("reassert.pid");
         let runtime_id = first_controller
             .initialize(Initialize {
                 session_id: wire_session_id,
@@ -1678,7 +2256,11 @@ mod tests {
                     reference_kind: Some("id".to_owned()),
                 },
                 executable: PathBuf::from("/bin/sh"),
-                arguments: vec!["-c".to_owned(), "printf ready; sleep 30".to_owned()],
+                arguments: vec![
+                    "-c".to_owned(),
+                    "sleep 30 & echo $! > released.pid; sleep 30 & echo $! > reassert.pid; printf ready; while :; do sleep 1; done"
+                        .to_owned(),
+                ],
                 cwd: root.clone(),
                 dimensions: Dimensions::new(80, 24).expect("dimensions"),
                 environment: SecretEnv::new(BTreeMap::new()).expect("environment"),
@@ -1690,7 +2272,51 @@ mod tests {
             .await
             .expect("initialize worker");
         let before = first_controller.inspect().await.expect("inspect before");
-        let child_pid = before.child_process.expect("child identity").pid;
+        let child = before.child_process.expect("child identity");
+        let child_pid = child.pid;
+        let released_pid = wait_for_pid_file(&released_pid_path).await;
+        let released_start = process_start_identity(released_pid);
+        let reassert_pid = wait_for_pid_file(&reassert_pid_path).await;
+        let reassert_start = process_start_identity(reassert_pid);
+        let claim_expiry = (OffsetDateTime::now_utc() + time::Duration::seconds(30))
+            .format(&Rfc3339)
+            .expect("format private claim expiry");
+        assert!(
+            send_identity_hook(
+                &socket,
+                serde_json::json!({
+                    "type": "identity_report",
+                    "runtime_id": runtime_id.as_str(),
+                    "provider": "claude",
+                    "pid": released_pid,
+                    "start_identity": released_start,
+                    "sequence": 7,
+                    "expires_at": claim_expiry,
+                    "reference_kind": "id",
+                    "native_reference": "nested-before-release"
+                }),
+            )
+            .await
+        );
+        assert!(
+            send_identity_hook(
+                &socket,
+                serde_json::json!({
+                    "type": "identity_release",
+                    "runtime_id": runtime_id.as_str(),
+                    "provider": "claude",
+                    "pid": released_pid,
+                    "start_identity": released_start,
+                    "sequence": 8
+                }),
+            )
+            .await
+        );
+        assert!(std::process::Command::new("kill")
+            .args(["-KILL", &released_pid.to_string()])
+            .status()
+            .expect("kill released child")
+            .success());
 
         let created_at = "2026-07-23T00:00:00Z".to_owned();
         let info = SessionInfo {
@@ -1704,6 +2330,7 @@ mod tests {
             pid: child_pid,
             runtime: Some(SessionRuntime {
                 state: RuntimeState::Live,
+                runtime_generation: protocol::RuntimeGeneration::new(1),
                 worker_id: Some(worker_id.to_owned()),
                 runtime_id: Some(runtime_id.to_string()),
                 started_at: Some(created_at.clone()),
@@ -1715,10 +2342,10 @@ mod tests {
             state: SessionState::Running,
             state_source: StateSource::Process,
             activity: None,
-            active_agent: None,
-            active_agent_base: None,
-            active_agent_pid: None,
-            active_agent_session_id: None,
+            active_agent: Some("claude".to_owned()),
+            active_agent_base: Some(AgentKind::Claude),
+            active_agent_pid: Some(released_pid),
+            active_agent_session_id: Some("nested-before-release".to_owned()),
             active_agent_session_path: None,
             native_session_id: None,
             native_session_path: None,
@@ -1733,6 +2360,10 @@ mod tests {
             created_at: created_at.clone(),
             updated_at: created_at,
             exit_code: None,
+            capabilities: protocol::SessionCapabilities {
+                resume: true,
+                fork: true,
+            },
         };
         let store_path = root.join("data/metadata.jsonl");
         let store = Store::new(store_path.clone());
@@ -1751,13 +2382,14 @@ mod tests {
             metadata: BTreeMap::new(),
             program: "/bin/sh".to_owned(),
             args: vec!["-c".to_owned(), "printf ready; sleep 30".to_owned()],
-            input_rules: StoredInputRules::from(InputRules {
-                bracketed_paste: false,
-                submit_delay: Duration::ZERO,
-            }),
+            input_rules: StoredInputRules::from(InputRules::unrestricted(false, Duration::ZERO)),
             resume_mode: Some(ResumeMode::Flag),
             ref_kind: Some(SessionRefKind::Id),
             resumable: true,
+            fork_mode: Some(ForkMode::ClaudeSession),
+            fork_resume_mode: Some(ResumeMode::Flag),
+            fork_ref_kind: Some(SessionRefKind::Id),
+            forkable: true,
         };
         store
             .record_session(&SessionRecord {
@@ -1771,11 +2403,18 @@ mod tests {
                     previous_worker_id: None,
                     previous_runtime_id: None,
                 }),
+                native_identity_ordering: Some(NativeIdentityOrdering {
+                    runtime_id: runtime_id.to_string(),
+                    pid: child.pid,
+                    pid_start_identity: child.start_identity,
+                    sequence: 100,
+                }),
                 info: SessionInfo {
                     pid: 0,
                     state: SessionState::Starting,
                     runtime: Some(SessionRuntime {
                         state: RuntimeState::Starting,
+                        runtime_generation: protocol::RuntimeGeneration::new(1),
                         worker_id: None,
                         runtime_id: None,
                         started_at: None,
@@ -1807,8 +2446,7 @@ mod tests {
             worker_runtime_root: Some(runtime_root),
             ..SessionRegistryConfig::default()
         });
-        replacement
-            .reconcile_workers()
+        Box::pin(replacement.reconcile_workers())
             .await
             .expect("reconcile replacement daemon");
         let adopted = replacement
@@ -1816,6 +2454,10 @@ mod tests {
             .await
             .expect("inspect adopted session");
         assert_eq!(adopted.pid, child_pid);
+        assert!(
+            adopted.active_agent.is_none(),
+            "restart must apply a durable release after the released process exits"
+        );
         assert_eq!(
             adopted
                 .runtime
@@ -1827,6 +2469,60 @@ mod tests {
             adopted.native_session_id.as_deref(),
             Some("native-restart-test"),
             "replacement daemon must merge the latest persisted native binding"
+        );
+        let reassert_expiry = (OffsetDateTime::now_utc() + time::Duration::seconds(30))
+            .format(&Rfc3339)
+            .expect("format reassert expiry");
+        let reassert_request = |sequence: u64| {
+            serde_json::json!({
+                "type": "identity_report",
+                "runtime_id": runtime_id.as_str(),
+                "provider": "claude",
+                "pid": reassert_pid,
+                "start_identity": reassert_start,
+                "sequence": sequence,
+                "expires_at": reassert_expiry,
+                "reference_kind": "id",
+                "native_reference": "nested-after-restart"
+            })
+        };
+        assert!(
+            !send_identity_hook(&socket, reassert_request(8)).await,
+            "release sequence must reject a late report after restart"
+        );
+        assert!(
+            send_identity_hook(&socket, reassert_request(9)).await,
+            "higher sequence may reassert after restart"
+        );
+        let stale_native_report = SessionReportNativeIdParams::new(
+            SessionId(session_id.to_owned()),
+            runtime_id.as_str(),
+            "claude",
+            child.pid,
+            ProcessStartIdentity::new(child.start_identity),
+            ReportSequence::new(99),
+            (OffsetDateTime::now_utc() + time::Duration::seconds(30))
+                .format(&Rfc3339)
+                .expect("format claim expiry"),
+            "native-stale-after-restart",
+            None,
+        )
+        .expect("valid stale native report");
+        assert!(
+            !replacement
+                .report_native_id(stale_native_report)
+                .await
+                .recorded,
+            "replacement daemon must reject a sequence below the persisted ordering tombstone"
+        );
+        assert_eq!(
+            replacement
+                .inspect(&SessionId(session_id.to_owned()))
+                .await
+                .expect("inspect after stale report")
+                .native_session_id
+                .as_deref(),
+            Some("native-restart-test")
         );
         let committed = Store::new(root.join("data/metadata.jsonl"))
             .load_sessions()
@@ -1896,6 +2592,157 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "restart adoption test keeps worker setup, durable state, and continuity assertions together"
+    )]
+    async fn replacement_registry_adopts_same_live_hermes_worker() {
+        let root = temp_root();
+        let runtime_root = root.join("runtime/workers");
+        let session_id = "s-92";
+        let worker_id = "worker-hermes-restart";
+        let socket = runtime_root
+            .join(session_id)
+            .join(pohunek_paths::WORKER_SOCKET_NAME);
+        let journal = root.join("state/workers/s-92/worker.json");
+        let mut worker_config = WorkerConfig::new();
+        worker_config.initialize_deadline = Duration::from_secs(5);
+        worker_config.terminal_retention = Duration::from_secs(1);
+        let server = Server::bind(ServerArgs {
+            session_id: session_id.to_owned(),
+            worker_id: worker_id.to_owned(),
+            socket_path: socket.clone(),
+            journal_path: journal,
+            daemon_socket_path: root.join("runtime/daemon.sock"),
+            config: worker_config,
+        })
+        .await
+        .expect("bind Hermes worker");
+        std::fs::set_permissions(&runtime_root, std::fs::Permissions::from_mode(0o700))
+            .expect("private worker runtime root");
+        let server_task = tokio::spawn(server.serve());
+
+        let first_controller = crate::runtime::Worker::connect(&socket, session_id, "daemon-old")
+            .await
+            .expect("first controller");
+        let wire_worker_id = first_controller.worker_id().await;
+        let runtime_id = first_controller
+            .initialize(Initialize {
+                session_id: WorkerSessionId::new(session_id).expect("session id"),
+                transaction_id: TransactionId::new("create-hermes-restart")
+                    .expect("transaction id"),
+                expected_worker_id: wire_worker_id,
+                launch: LaunchIdentity {
+                    agent: "hermes".to_owned(),
+                    agent_base: "hermes".to_owned(),
+                    reference_kind: Some("id".to_owned()),
+                },
+                executable: PathBuf::from("/bin/sh"),
+                arguments: vec![
+                    "-c".to_owned(),
+                    "printf ready; while :; do sleep 1; done".to_owned(),
+                ],
+                cwd: root.clone(),
+                dimensions: Dimensions::new(80, 24).expect("dimensions"),
+                environment: SecretEnv::new(BTreeMap::new()).expect("environment"),
+                limits: InitializeLimits::new(1_000_000, 100_000, 128, 60_000).expect("limits"),
+                stop_policy: StopPolicy::new(100).expect("stop policy"),
+                hook_protocol_version: Version::new(1).expect("version"),
+                public_protocol_version: protocol::PROTOCOL_VERSION.get(),
+            })
+            .await
+            .expect("initialize Hermes worker");
+        let child_pid = first_controller
+            .inspect()
+            .await
+            .expect("inspect Hermes worker")
+            .child_process
+            .expect("child identity")
+            .pid;
+
+        let mut record = identity_record();
+        record.session_id = session_id.to_owned();
+        record.info.id = SessionId(session_id.to_owned());
+        record.info.agent = "hermes".to_owned();
+        record.info.agent_base = AgentKind::Hermes;
+        record.info.cwd = root.clone();
+        record.info.pid = child_pid;
+        record.info.capabilities = protocol::SessionCapabilities {
+            resume: true,
+            fork: false,
+        };
+        let info_runtime = record.info.runtime.as_mut().expect("runtime info");
+        info_runtime.worker_id = Some(worker_id.to_owned());
+        info_runtime.runtime_id = Some(runtime_id.to_string());
+        let recovery = record.recovery.as_mut().expect("recovery binding");
+        recovery.session_id = session_id.to_owned();
+        recovery.agent = "hermes".to_owned();
+        recovery.agent_base = AgentKind::Hermes;
+        recovery.cwd = root.clone();
+        recovery.program = "hermes".to_owned();
+        recovery.args = vec!["chat".to_owned()];
+        recovery.input_rules =
+            StoredInputRules::from(InputRules::hermes(true, Duration::from_millis(150)));
+        recovery.resume_mode = Some(ResumeMode::Flag);
+        recovery.ref_kind = Some(SessionRefKind::Id);
+        recovery.resumable = true;
+        recovery.fork_mode = None;
+        recovery.fork_resume_mode = None;
+        recovery.fork_ref_kind = None;
+        recovery.forkable = false;
+        record.runtime.worker_id = Some(worker_id.to_owned());
+        record.runtime.runtime_id = Some(runtime_id.to_string());
+
+        let store_path = root.join("data/metadata.jsonl");
+        Store::new(store_path.clone())
+            .record_session(&record)
+            .expect("persist Hermes logical record");
+        drop(first_controller);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let replacement = SessionRegistry::new(SessionRegistryConfig {
+            store_path: Some(store_path),
+            worker_runtime_root: Some(runtime_root),
+            ..SessionRegistryConfig::default()
+        });
+        Box::pin(replacement.reconcile_workers())
+            .await
+            .expect("replacement daemon adopts Hermes worker");
+        let adopted = replacement
+            .inspect(&SessionId(session_id.to_owned()))
+            .await
+            .expect("inspect adopted Hermes session");
+        assert_eq!(adopted.id, SessionId(session_id.to_owned()));
+        assert_eq!(adopted.agent, "hermes");
+        assert_eq!(adopted.agent_base, AgentKind::Hermes);
+        assert_eq!(adopted.pid, child_pid);
+        assert_eq!(
+            adopted
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.runtime_id.as_deref()),
+            Some(runtime_id.as_str())
+        );
+        assert_eq!(
+            adopted.capabilities,
+            protocol::SessionCapabilities {
+                resume: true,
+                fork: false,
+            }
+        );
+
+        replacement
+            .resize(&SessionId(session_id.to_owned()), 100, 30)
+            .await
+            .expect("resize adopted Hermes worker");
+        replacement
+            .stop(&SessionId(session_id.to_owned()))
+            .await
+            .expect("stop adopted Hermes worker");
+        server_task.abort();
+    }
+
+    #[tokio::test]
     async fn replacement_registry_allocates_a_new_ulid_session_id() {
         let root = temp_root();
         let store_path = root.join("data/metadata.jsonl");
@@ -1914,8 +2761,7 @@ mod tests {
             store_path: Some(store_path),
             ..SessionRegistryConfig::default()
         });
-        replacement
-            .reconcile_workers()
+        Box::pin(replacement.reconcile_workers())
             .await
             .expect("replacement daemon reconciles store");
         let created = replacement
@@ -1982,8 +2828,7 @@ mod tests {
             ..SessionRegistryConfig::default()
         });
 
-        registry
-            .reconcile_workers()
+        Box::pin(registry.reconcile_workers())
             .await
             .expect("compensate abandoned create");
 
@@ -2049,8 +2894,7 @@ mod tests {
             ..SessionRegistryConfig::default()
         });
 
-        registry
-            .reconcile_workers()
+        Box::pin(registry.reconcile_workers())
             .await
             .expect("import terminal journal");
 
@@ -2076,10 +2920,12 @@ mod tests {
         let registry = empty_registry(&root, &runtime_root);
         let mut events = registry.subscribe();
 
-        registry.reconcile_workers().await.expect("discover orphan");
+        Box::pin(registry.reconcile_workers())
+            .await
+            .expect("discover orphan");
 
         let event = events.recv().await.expect("orphan discovery event");
-        assert_eq!(event.event, protocol::event::SESSION_RUNTIME_DISCOVERED);
+        assert_eq!(event.event(), protocol::event::SESSION_RUNTIME_DISCOVERED);
         let inventory = registry.runtime_inventory().await;
         assert_eq!(inventory.entries.len(), 1);
         assert_eq!(
@@ -2107,8 +2953,7 @@ mod tests {
         persist_identity_record(&root, "s-202", "worker-mismatch");
         let registry = empty_registry(&root, &runtime_root);
 
-        registry
-            .reconcile_workers()
+        Box::pin(registry.reconcile_workers())
             .await
             .expect("discover mismatch");
 
@@ -2154,8 +2999,7 @@ mod tests {
         persist_identity_record(&root, "s-203", "worker-duplicate-a");
         let registry = empty_registry(&root, &runtime_root);
 
-        registry
-            .reconcile_workers()
+        Box::pin(registry.reconcile_workers())
             .await
             .expect("discover duplicate");
 
@@ -2190,8 +3034,7 @@ mod tests {
         let fake_task = spawn_incompatible_worker(&runtime_root, "s-incompatible");
         let registry = empty_registry(&root, &runtime_root);
 
-        registry
-            .reconcile_workers()
+        Box::pin(registry.reconcile_workers())
             .await
             .expect("discover incompatible endpoint");
 
@@ -2226,7 +3069,9 @@ mod tests {
         drop(controller);
         let registry = empty_registry(&root, &runtime_root);
 
-        registry.reconcile_workers().await.expect("replay stop");
+        Box::pin(registry.reconcile_workers())
+            .await
+            .expect("replay stop");
 
         let stopped = registry
             .inspect(&SessionId("s-206".to_owned()))
@@ -2264,7 +3109,9 @@ mod tests {
         drop(controller);
         let registry = empty_registry(&root, &runtime_root);
 
-        registry.reconcile_workers().await.expect("replay removal");
+        Box::pin(registry.reconcile_workers())
+            .await
+            .expect("replay removal");
 
         registry
             .inspect(&SessionId("s-207".to_owned()))
@@ -2540,6 +3387,7 @@ mod tests {
             session_id: "s-identity".to_owned(),
             desired_state: DesiredState::Running,
             transaction: None,
+            native_identity_ordering: None,
             info: SessionInfo {
                 id: SessionId("s-identity".to_owned()),
                 external: Some(false),
@@ -2551,6 +3399,7 @@ mod tests {
                 pid: 50,
                 runtime: Some(SessionRuntime {
                     state: RuntimeState::Live,
+                    runtime_generation: protocol::RuntimeGeneration::new(1),
                     worker_id: Some("worker-identity".to_owned()),
                     runtime_id: Some("runtime-identity".to_owned()),
                     started_at: Some(created_at.clone()),
@@ -2580,6 +3429,10 @@ mod tests {
                 created_at: created_at.clone(),
                 updated_at: created_at,
                 exit_code: None,
+                capabilities: protocol::SessionCapabilities {
+                    resume: true,
+                    fork: false,
+                },
             },
             recovery: Some(ResumeBinding {
                 session_id: "s-identity".to_owned(),
@@ -2600,6 +3453,10 @@ mod tests {
                 resume_mode: None,
                 ref_kind: Some(SessionRefKind::Id),
                 resumable: true,
+                fork_mode: None,
+                fork_resume_mode: None,
+                fork_ref_kind: None,
+                forkable: false,
             }),
             runtime: RuntimeRecord {
                 state: RuntimeState::Live,
@@ -2609,6 +3466,281 @@ mod tests {
                 reason: None,
             },
         }
+    }
+
+    #[test]
+    fn sequenced_session_identity_wins_over_stale_resume_projection() {
+        let mut record = identity_record();
+        record.native_identity_ordering = Some(NativeIdentityOrdering {
+            runtime_id: "runtime-identity".to_owned(),
+            pid: 50,
+            pid_start_identity: 500,
+            sequence: 2,
+        });
+        record.info.native_session_id = Some("native-newer".to_owned());
+        let recovery = record.recovery.as_mut().expect("recovery binding");
+        recovery.native_session_id = Some("native-newer".to_owned());
+        let mut stale = recovery.clone();
+        stale.native_session_id = Some("native-older".to_owned());
+
+        merge_persisted_recovery(&mut record, stale).expect("merge stale resume projection");
+
+        assert_eq!(
+            record.info.native_session_id.as_deref(),
+            Some("native-newer")
+        );
+        assert_eq!(
+            record
+                .recovery
+                .as_ref()
+                .and_then(|binding| binding.native_session_id.as_deref()),
+            Some("native-newer")
+        );
+    }
+
+    #[test]
+    fn equal_native_ordering_fills_only_missing_durable_reference() {
+        let store = Store::new(temp_root().join("metadata.jsonl"));
+        let mut existing = identity_record();
+        existing.native_identity_ordering = Some(NativeIdentityOrdering {
+            runtime_id: "runtime-identity".to_owned(),
+            pid: 50,
+            pid_start_identity: 500,
+            sequence: 7,
+        });
+        assert_eq!(
+            store.record_session(&existing).expect("seed session"),
+            SessionWriteOutcome::Applied
+        );
+
+        let mut merged = existing;
+        merged.info.native_session_id = Some("native-from-binding".to_owned());
+        merged
+            .recovery
+            .as_mut()
+            .expect("recovery")
+            .native_session_id = Some("native-from-binding".to_owned());
+        assert_eq!(
+            store
+                .record_session(&merged)
+                .expect("fill missing native reference"),
+            SessionWriteOutcome::Applied
+        );
+        let committed = store
+            .load_sessions()
+            .expect("load committed session")
+            .pop()
+            .expect("committed session");
+        assert_eq!(
+            committed.info.native_session_id.as_deref(),
+            Some("native-from-binding")
+        );
+        assert_eq!(
+            committed
+                .recovery
+                .and_then(|binding| binding.native_session_id),
+            Some("native-from-binding".to_owned())
+        );
+    }
+
+    #[test]
+    fn equal_native_ordering_preserves_conflicting_durable_reference() {
+        let store = Store::new(temp_root().join("metadata.jsonl"));
+        let mut existing = identity_record();
+        existing.native_identity_ordering = Some(NativeIdentityOrdering {
+            runtime_id: "runtime-identity".to_owned(),
+            pid: 50,
+            pid_start_identity: 500,
+            sequence: 7,
+        });
+        existing.info.native_session_id = Some("native-authoritative".to_owned());
+        existing
+            .recovery
+            .as_mut()
+            .expect("recovery")
+            .native_session_id = Some("native-authoritative".to_owned());
+        store.record_session(&existing).expect("seed session");
+
+        let mut conflicting = existing;
+        conflicting.info.native_session_id = Some("native-conflict".to_owned());
+        conflicting
+            .recovery
+            .as_mut()
+            .expect("recovery")
+            .native_session_id = Some("native-conflict".to_owned());
+        store
+            .record_session(&conflicting)
+            .expect("reject equal-sequence conflict by preservation");
+        let committed = store
+            .load_sessions()
+            .expect("load committed session")
+            .pop()
+            .expect("committed session");
+        assert_eq!(
+            committed.info.native_session_id.as_deref(),
+            Some("native-authoritative")
+        );
+        assert_eq!(
+            committed
+                .recovery
+                .and_then(|binding| binding.native_session_id),
+            Some("native-authoritative".to_owned())
+        );
+    }
+
+    #[test]
+    fn runtime_record_identity_authorizes_reconciliation_normalization() {
+        let store = Store::new(temp_root().join("metadata.jsonl"));
+        let mut inconsistent = identity_record();
+        inconsistent.runtime.runtime_id = Some("runtime-journal".to_owned());
+        store
+            .record_session(&inconsistent)
+            .expect("seed denormalized runtime mismatch");
+
+        let mut normalized = inconsistent;
+        normalized
+            .info
+            .runtime
+            .as_mut()
+            .expect("runtime info")
+            .runtime_id = Some("runtime-journal".to_owned());
+        normalized.info.state = SessionState::Done;
+        normalized.runtime.state = RuntimeState::Terminal;
+        assert_eq!(
+            store
+                .record_session(&normalized)
+                .expect("normalize from authoritative runtime record"),
+            SessionWriteOutcome::Applied
+        );
+        let committed = store
+            .load_sessions()
+            .expect("load normalized session")
+            .pop()
+            .expect("normalized session");
+        assert_eq!(committed.info.state, SessionState::Done);
+        assert_eq!(
+            committed
+                .info
+                .runtime
+                .and_then(|runtime| runtime.runtime_id),
+            Some("runtime-journal".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_profile_keeps_frozen_fork_disable_after_restart() {
+        let root = temp_root();
+        let store_path = root.join("data/metadata.jsonl");
+        let mut record = identity_record();
+        record.info.agent = "deleted-profile".to_owned();
+        record.info.agent_base = AgentKind::Claude;
+        record.info.native_session_id = Some("native-before-restart".to_owned());
+        let recovery = record.recovery.as_mut().expect("recovery binding");
+        recovery.agent = "deleted-profile".to_owned();
+        recovery.agent_base = AgentKind::Claude;
+        recovery.native_session_id = Some("native-before-restart".to_owned());
+        recovery.program = "/bin/sh".to_owned();
+        recovery.resume_mode = Some(ResumeMode::Flag);
+        recovery.ref_kind = Some(SessionRefKind::Id);
+        recovery.resumable = true;
+        recovery.fork_mode = None;
+        recovery.fork_resume_mode = None;
+        recovery.fork_ref_kind = None;
+        recovery.forkable = false;
+        Store::new(store_path.clone())
+            .record_session(&record)
+            .expect("persist deleted-profile session");
+
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            store_path: Some(store_path),
+            worker_runtime_root: Some(root.join("runtime")),
+            ..SessionRegistryConfig::default()
+        });
+        Box::pin(registry.reconcile_workers())
+            .await
+            .expect("rehydrate session without its profile");
+
+        let error = registry
+            .fork(SessionForkParams {
+                session_id: SessionId("s-identity".to_owned()),
+                name: None,
+                cwd_mode: ForkCwdMode::Same,
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .expect_err("frozen fork disable survives profile deletion and restart");
+        assert_eq!(error.code, "agent_fork_unsupported");
+        assert_eq!(registry.list().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_record_without_fork_fields_stays_fail_closed_after_restart() {
+        let root = temp_root();
+        let store_path = root.join("data/metadata.jsonl");
+        let mut record = identity_record();
+        record.info.agent = "claude".to_owned();
+        record.info.agent_base = AgentKind::Claude;
+        record.info.native_session_id = Some("legacy-native".to_owned());
+        let recovery = record.recovery.as_mut().expect("recovery binding");
+        recovery.agent = "claude".to_owned();
+        recovery.agent_base = AgentKind::Claude;
+        recovery.native_session_id = Some("legacy-native".to_owned());
+        recovery.program = "claude".to_owned();
+        recovery.resume_mode = Some(ResumeMode::Flag);
+        recovery.ref_kind = Some(SessionRefKind::Id);
+        recovery.resumable = true;
+        Store::new(store_path.clone())
+            .record_session(&record)
+            .expect("persist pre-migration record shape");
+
+        let line = std::fs::read_to_string(&store_path).expect("read stored record");
+        let mut value: serde_json::Value = serde_json::from_str(line.trim()).expect("parse record");
+        let recovery = value
+            .get_mut("recovery")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("serialized recovery object");
+        for field in ["fork_mode", "fork_resume_mode", "fork_ref_kind", "forkable"] {
+            recovery.remove(field);
+        }
+        value
+            .get_mut("info")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("serialized session info")
+            .remove("capabilities");
+        let legacy = format!(
+            "{}\n",
+            serde_json::to_string(&value).expect("serialize legacy record")
+        );
+        std::fs::write(&store_path, legacy).expect("write legacy record");
+
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            store_path: Some(store_path),
+            worker_runtime_root: Some(root.join("runtime")),
+            ..SessionRegistryConfig::default()
+        });
+        Box::pin(registry.reconcile_workers())
+            .await
+            .expect("rehydrate legacy record");
+
+        let resume_error = registry
+            .resume(&SessionId("s-identity".to_owned()))
+            .await
+            .expect_err("legacy session capabilities must not infer current resume support");
+        assert_eq!(resume_error.code, "agent_not_resumable");
+
+        let error = registry
+            .fork(SessionForkParams {
+                session_id: SessionId("s-identity".to_owned()),
+                name: None,
+                cwd_mode: ForkCwdMode::Same,
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .expect_err("legacy binding must not infer current Claude fork support");
+        assert_eq!(error.code, "agent_fork_unsupported");
+        assert_eq!(registry.list().await.len(), 1);
     }
 
     fn identity_snapshot(native_launch: &str) -> InspectSnapshot {
@@ -2645,10 +3777,13 @@ mod tests {
                     start_identity: 600,
                 },
                 sequence: 7,
-                expires_at: "2026-07-23T00:00:30Z".to_owned(),
+                expires_at: (OffsetDateTime::now_utc() + time::Duration::seconds(30))
+                    .format(&Rfc3339)
+                    .expect("format expiry"),
                 reference_kind: Some("id".to_owned()),
                 native_reference: Some("nested-native".to_owned()),
             }),
+            active_identity_release: None,
         }
     }
 
@@ -2691,6 +3826,7 @@ mod tests {
             created_at: created_at.clone(),
             updated_at: created_at,
             exit_code: None,
+            capabilities: protocol::SessionCapabilities::default(),
         }
     }
 
@@ -2766,6 +3902,10 @@ mod tests {
             resume_mode: None,
             ref_kind: Some(SessionRefKind::Id),
             resumable: true,
+            fork_mode: None,
+            fork_resume_mode: None,
+            fork_ref_kind: None,
+            forkable: false,
         };
         store
             .record_resume(&recoverable_binding)
@@ -2837,6 +3977,35 @@ mod tests {
         assert!(
             !manifest_path.exists(),
             "imported manifest must be archived, not left pending"
+        );
+    }
+
+    #[test]
+    fn import_archives_manifest_after_uncertain_post_rename_commit() {
+        let root = temp_root();
+        let data_dir = root.join("data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let store_path = data_dir.join("metadata.jsonl");
+        let store = Store::new(store_path.clone());
+        let fingerprint = store_fingerprint(&store_path);
+        let sessions = vec![manifest_session_info("s-uncertain", SessionState::Done)];
+        let manifest = legacy_manifest_json(&fingerprint, true, &sessions, &[]);
+        let manifest_path = write_legacy_manifest(&data_dir, &manifest);
+        store.fail_next_parent_sync_after_rename();
+
+        import_legacy_manifest(&store).expect("import committed uncertain session");
+
+        assert_eq!(
+            store
+                .load_sessions()
+                .expect("load uncertain import")
+                .first()
+                .map(|record| record.session_id.as_str()),
+            Some("s-uncertain")
+        );
+        assert!(
+            !manifest_path.exists(),
+            "visible committed import may archive its manifest after warning"
         );
     }
 

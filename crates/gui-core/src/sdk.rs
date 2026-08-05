@@ -5,14 +5,16 @@ use std::collections::BTreeMap;
 use pohunek_client::Client;
 use protocol::{
     method, NotificationDeleteParams, NotificationDeleteResult, NotificationListParams,
-    NotificationListResult, NotificationRecord, NotificationStatus, NotificationUpdateParams,
-    NotificationUpdateResult, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
-    ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams, ProjectPromptParams,
-    ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
-    ProjectShowParams, ProjectShowResult, SessionDiffParams, SessionDiffResult, SessionForkParams,
-    SessionForkResult, SessionId, SessionInfo, SessionListParams, SessionNewParams,
-    SessionNewResult, SessionRemoveResult, SessionRenameParams, SessionRenameResult,
-    SessionResumeResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult,
+    NotificationListResult, NotificationPolicyParams, NotificationPolicyResult, NotificationRecord,
+    NotificationStatus, NotificationUpdateParams, NotificationUpdateResult, ProjectActionParams,
+    ProjectActionResult, ProjectActionsParams, ProjectActionsResult, ProjectAddParams, ProjectInfo,
+    ProjectListParams, ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams,
+    ProjectRemoveResult, ProjectRenameParams, ProjectShowParams, ProjectShowResult,
+    SessionDiffParams, SessionDiffResult, SessionForkParams, SessionForkResult, SessionId,
+    SessionInfo, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
+    SessionOutputResult, SessionRemoveResult, SessionRenameParams, SessionRenameResult,
+    SessionResumeResult, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
+    SessionSetMetadataResult, SessionStopResult, SessionWaitParams, SessionWaitResult,
     WorktreeRemoveParams, WorktreeRemoveResult,
 };
 
@@ -71,6 +73,87 @@ pub async fn inspect_session_with_options(
     options: ConnectionOptions,
 ) -> Result<SessionInfo, CoreError> {
     call_host::<method::SessionInspect>(config, options, session_id.clone()).await
+}
+
+/// Read one provider-neutral terminal screen from a managed session.
+pub async fn read_session_screen(
+    config: &HostConfig,
+    params: SessionScreenParams,
+) -> Result<SessionScreenResult, CoreError> {
+    read_session_screen_with_options(config, params, ConnectionOptions::default()).await
+}
+
+/// Read one terminal screen with explicit connection options.
+pub async fn read_session_screen_with_options(
+    config: &HostConfig,
+    params: SessionScreenParams,
+    options: ConnectionOptions,
+) -> Result<SessionScreenResult, CoreError> {
+    let mut client = connect_client(config, options).await?;
+    client.session_screen(params).await.map_err(CoreError::from)
+}
+
+/// Read bounded retained output from a managed session.
+pub async fn read_session_output(
+    config: &HostConfig,
+    params: SessionOutputParams,
+) -> Result<SessionOutputResult, CoreError> {
+    read_session_output_with_options(config, params, ConnectionOptions::default()).await
+}
+
+/// Read retained output with explicit connection options.
+///
+/// Waiting requests inherit the Rust SDK's dedicated-transport behavior.
+pub async fn read_session_output_with_options(
+    config: &HostConfig,
+    params: SessionOutputParams,
+    options: ConnectionOptions,
+) -> Result<SessionOutputResult, CoreError> {
+    let mut client = connect_client(config, options).await?;
+    client.session_output(params).await.map_err(CoreError::from)
+}
+
+/// Wait for one bounded session observation predicate.
+pub async fn wait_for_session(
+    config: &HostConfig,
+    params: SessionWaitParams,
+) -> Result<SessionWaitResult, CoreError> {
+    wait_for_session_with_options(config, params, ConnectionOptions::default()).await
+}
+
+/// Wait for a session with explicit connection options on a dedicated transport.
+pub async fn wait_for_session_with_options(
+    config: &HostConfig,
+    params: SessionWaitParams,
+    options: ConnectionOptions,
+) -> Result<SessionWaitResult, CoreError> {
+    let mut client = connect_client(config, options).await?;
+    client.session_wait(params).await.map_err(CoreError::from)
+}
+
+/// Read the provider-keyed notification policy from a host.
+pub async fn get_notification_policy_with_options(
+    config: &HostConfig,
+    options: ConnectionOptions,
+) -> Result<NotificationPolicyResult, CoreError> {
+    let mut client = connect_client(config, options).await?;
+    client
+        .get_notification_policy()
+        .await
+        .map_err(CoreError::from)
+}
+
+/// Replace the provider-keyed notification policy on a host.
+pub async fn set_notification_policy_with_options(
+    config: &HostConfig,
+    params: NotificationPolicyParams,
+    options: ConnectionOptions,
+) -> Result<NotificationPolicyResult, CoreError> {
+    let mut client = connect_client(config, options).await?;
+    client
+        .set_notification_policy(params)
+        .await
+        .map_err(CoreError::from)
 }
 
 /// Resume a terminal session on a host through the SDK.
@@ -510,22 +593,50 @@ pub(crate) async fn load_host_snapshot_with_options(
         Err(err) => (Vec::new(), Some(format!("project.list failed: {err}"))),
     };
     let notifications = load_host_notifications(&mut client, &config.id).await;
-    let supported_agents = match call_client::<method::HostInspect>(&mut client, ()).await {
-        Ok(caps) => caps.supported_agents,
-        Err(err) => {
-            // Non-fatal: an older daemon may not answer `host.inspect` yet, or the
-            // call may otherwise fail. Fall back to the compiled base kinds so the
-            // agent picker still has something to show.
-            tracing::event!(
-                name: "gui.host_inspect.failed",
-                tracing::Level::WARN,
-                host_id = %config.id,
-                error = %err,
-                "host.inspect failed while seeding snapshot; falling back to base agent kinds"
-            );
-            vec!["shell".to_owned(), "codex".to_owned(), "claude".to_owned()]
-        }
-    };
+    let (supported_agents, runtimes, notification_providers, observation_capabilities) =
+        match call_client::<method::HostInspect>(&mut client, ()).await {
+            Ok(caps) => {
+                let notification_providers = caps
+                    .runtimes
+                    .iter()
+                    .map(|runtime| runtime.agent.clone())
+                    .collect();
+                (
+                    caps.supported_agents,
+                    caps.runtimes,
+                    notification_providers,
+                    crate::ObservationCapabilities {
+                        terminal_read: caps.terminal_read_supported,
+                        output_read: caps.output_read_supported,
+                        session_wait: caps.session_wait_supported,
+                    },
+                )
+            }
+            Err(err) => {
+                // Non-fatal: an older daemon may not answer `host.inspect` yet, or the
+                // call may otherwise fail. Retain the compatibility name list, but keep
+                // the runtime inventory empty so launch surfaces fail closed.
+                tracing::event!(
+                    name: "gui.host_inspect.failed",
+                    tracing::Level::WARN,
+                    host_id = %config.id,
+                    error = %err,
+                    "host.inspect failed while seeding snapshot; runtime launch inventory unavailable"
+                );
+                let base_agents = vec![
+                    "shell".to_owned(),
+                    "codex".to_owned(),
+                    "claude".to_owned(),
+                    "hermes".to_owned(),
+                ];
+                (
+                    base_agents.clone(),
+                    Vec::new(),
+                    base_agents,
+                    crate::ObservationCapabilities::default(),
+                )
+            }
+        };
     Ok(HostSnapshot {
         host_id: config.id.clone(),
         health,
@@ -534,6 +645,9 @@ pub(crate) async fn load_host_snapshot_with_options(
         project_error: combine_seed_errors(projects.1, notifications.1),
         notifications: notifications.0,
         supported_agents,
+        runtimes,
+        notification_providers,
+        observation_capabilities,
     })
 }
 

@@ -1,4 +1,17 @@
 export { createHistoryRouter } from "./router";
+export {
+  agentKindLabel,
+  agentProfileLabel,
+  agentRuntimeLabel,
+  agentRuntimeStatus,
+  hasAttachableSessionAgentBases,
+  hasKnownSessionAgentBases,
+  isLaunchableAgentKind,
+  isLaunchableRuntime,
+  sessionAgentLabel,
+} from "./agent-presentation";
+export { LatestRequest } from "./latest-request";
+export type { RequestToken } from "./latest-request";
 export type { HistoryRouter, NavigateOptions } from "./router";
 export { formatStructuredError, structuredErrorDetails } from "./errors";
 export type { StructuredErrorDetails } from "./errors";

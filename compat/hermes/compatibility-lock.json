@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "release": "0.20.0",
+  "tag": "v2026.8.3",
+  "published": "2026-08-03",
+  "repository": "https://github.com/NousResearch/hermes-agent",
+  "commit": "3c27eb6234bf91b8ceee9e9071591b31e9b148cb",
+  "tree": "b217767ccb994605dad522e693fa1b4cdbc2f352",
+  "source_archive": {
+    "format": "git archive --format=tar",
+    "sha256": "1e9319c58a7f5e95808546af1091d58472be7437adc63fae0cbb53316e2711aa"
+  },
+  "runtime": {
+    "program": "hermes",
+    "fresh_argv": ["chat"],
+    "resume_argv": ["chat", "--resume", "<reference>"],
+    "default_display_mode": "classic",
+    "local_display_modes": ["classic", "alternate_screen_tui"]
+  },
+  "cli_checks": [
+    {
+      "id": "version",
+      "args": ["--version"],
+      "required_text": ["Hermes Agent v0.20.0 (2026.8.3)"]
+    },
+    {
+      "id": "help",
+      "args": ["--help"],
+      "required_text": ["usage: hermes", "chat", "profile", "--version"]
+    },
+    {
+      "id": "chat-help",
+      "args": ["chat", "--help"],
+      "required_text": ["usage: hermes chat", "--resume", "--pass-session-id", "--tui", "--cli"]
+    },
+    {
+      "id": "profile-help",
+      "args": ["profile", "--help"],
+      "required_text": ["usage: hermes profile", "list", "create", "show", "rename"]
+    },
+    {
+      "id": "profile-list-help",
+      "args": ["profile", "list", "--help"],
+      "required_text": ["usage: hermes profile list [-h]"]
+    },
+    {
+      "id": "profile-create-help",
+      "args": ["profile", "create", "--help"],
+      "required_text": ["usage: hermes profile create", "[--clone-from SOURCE]", "profile_name"]
+    },
+    {
+      "id": "profile-show-help",
+      "args": ["profile", "show", "--help"],
+      "required_text": ["usage: hermes profile show [-h] profile_name"]
+    },
+    {
+      "id": "profile-rename-help",
+      "args": ["profile", "rename", "--help"],
+      "required_text": ["usage: hermes profile rename [-h] old_name new_name"]
+    }
+  ],
+  "golden_states": [
+    "prompt-ready",
+    "short-input",
+    "multiline-input",
+    "working",
+    "approval-blocked",
+    "completion",
+    "interruption",
+    "exit",
+    "resume",
+    "alternate-screen-tui"
+  ]
+}

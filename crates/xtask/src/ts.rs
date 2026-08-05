@@ -19,10 +19,16 @@ use std::process::Command;
 
 use protocol::{
     event, method, AgentActivity, AgentKind, AgentStateEvent, AttachEvent, CwdSource, Event,
-    NotificationId, NotificationKind, NotificationRecord, NotificationSeverity, NotificationSource,
-    NotificationStatus, ProtocolError, Request, Response, SessionEvent, SessionId, SessionInfo,
-    SessionListFilter, SessionListParams, SessionState, SessionWarning, SessionWarningKind,
-    StateSource, MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION,
+    NotificationId, NotificationKind, NotificationKindPolicy, NotificationPolicy,
+    NotificationRecord, NotificationSeverity, NotificationSource, NotificationStatus, OutputOffset,
+    ProtocolError, Request, Response, RuntimeGeneration, SessionCapabilities, SessionEvent,
+    SessionId, SessionInfo, SessionListFilter, SessionListParams, SessionOutputGap,
+    SessionOutputParams, SessionOutputResult, SessionRuntimeIdentity, SessionScreenParams,
+    SessionScreenResult, SessionState, SessionWaitParams, SessionWaitReason, SessionWaitResult,
+    SessionWarning, SessionWarningKind, StateSource, TerminalCursor, TerminalDimensions,
+    TerminalWatermark, MAX_CONTROL_LINE_BYTES, MAX_RUNTIME_ID_BYTES, MAX_SESSION_INPUT_BYTES,
+    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_WAIT_MS, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -65,6 +71,16 @@ struct TsPaths {
 struct NamedFixture {
     file_name: &'static str,
     value: Value,
+}
+
+#[derive(Clone, Debug)]
+struct FixtureValues {
+    session_full: SessionInfo,
+    session_minimal: SessionInfo,
+    error_with_recover: ProtocolError,
+    error_without_recover: ProtocolError,
+    session_filter: SessionListFilter,
+    notification: NotificationRecord,
 }
 
 pub(crate) fn generate(root: &Path) -> Result<TsSummary, XtaskError> {
@@ -220,7 +236,40 @@ fn emit_constants(dir: &Path) -> Result<(), XtaskError> {
     .expect("writing to a String cannot fail");
     writeln!(
         body,
-        "export const MAX_CONTROL_LINE_BYTES = {MAX_CONTROL_LINE_BYTES} as const;\n"
+        "export const MIN_PROTOCOL_VERSION = {} as const;",
+        MIN_PROTOCOL_VERSION.get()
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        body,
+        "export const SUPPORTED_PROTOCOL_VERSIONS = {{ minimum: {}, maximum: {} }} as const;",
+        SUPPORTED_PROTOCOL_VERSIONS.minimum().get(),
+        SUPPORTED_PROTOCOL_VERSIONS.maximum().get()
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        body,
+        "export const MAX_CONTROL_LINE_BYTES = {MAX_CONTROL_LINE_BYTES} as const;"
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        body,
+        "export const MAX_RUNTIME_ID_BYTES = {MAX_RUNTIME_ID_BYTES} as const;"
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        body,
+        "export const MAX_SESSION_INPUT_BYTES = {MAX_SESSION_INPUT_BYTES} as const;"
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        body,
+        "export const MAX_SESSION_OUTPUT_BYTES = {MAX_SESSION_OUTPUT_BYTES} as const;"
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        body,
+        "export const MAX_SESSION_WAIT_MS = {MAX_SESSION_WAIT_MS} as const;\n"
     )
     .expect("writing to a String cannot fail");
 
@@ -282,13 +331,25 @@ fn emit_fixtures(dir: &Path) -> Result<(), XtaskError> {
 }
 
 fn fixtures() -> Result<Vec<NamedFixture>, XtaskError> {
-    let session_full = session_full();
-    let session_minimal = session_minimal();
-    let error_with_recover = ProtocolError::agent_binary_missing("codex");
-    let error_without_recover = ProtocolError::method_not_found("session.unknown");
-    let session_filter = SessionListFilter::State(SessionState::Running);
-    let notification = notification_record();
+    let values = fixture_values();
+    let mut fixtures = base_fixtures(&values)?;
+    fixtures.extend(observation_fixtures(&values.session_full)?);
+    fixtures.extend(model_fixtures(&values)?);
+    Ok(fixtures)
+}
 
+fn fixture_values() -> FixtureValues {
+    FixtureValues {
+        session_full: session_full(),
+        session_minimal: session_minimal(),
+        error_with_recover: ProtocolError::agent_binary_missing("codex"),
+        error_without_recover: ProtocolError::method_not_found("session.unknown"),
+        session_filter: SessionListFilter::State(SessionState::Running),
+        notification: notification_record(),
+    }
+}
+
+fn base_fixtures(values: &FixtureValues) -> Result<Vec<NamedFixture>, XtaskError> {
     Ok(vec![
         fixture(
             "request-session-list.json",
@@ -296,42 +357,209 @@ fn fixtures() -> Result<Vec<NamedFixture>, XtaskError> {
                 REQUEST_FIXTURE_ID,
                 method::SESSION_LIST,
                 json_value(&SessionListParams {
-                    filters: vec![session_filter.clone()],
+                    filters: vec![values.session_filter.clone()],
                 })?,
-            ),
+            )
+            .expect("fixture request id and method are valid"),
         )?,
         fixture(
             "response-ok-session-list.json",
-            &Response::ok(REQUEST_FIXTURE_ID, json_value(&vec![session_full.clone()])?),
+            &Response::ok(
+                PROTOCOL_VERSION,
+                REQUEST_FIXTURE_ID,
+                json_value(&vec![values.session_full.clone()])?,
+            )
+            .expect("fixture response id is valid"),
         )?,
         fixture(
             "response-err-with-recover.json",
-            &Response::err(REQUEST_FIXTURE_ID, error_with_recover.clone()),
+            &Response::err(
+                PROTOCOL_VERSION,
+                REQUEST_FIXTURE_ID,
+                values.error_with_recover.clone(),
+            )
+            .expect("fixture response id is valid"),
         )?,
         fixture(
             "event-agent-state.json",
             &Event::new(
+                PROTOCOL_VERSION,
                 event::AGENT_STATE,
                 json_value(&AgentStateEvent {
                     session_id: SessionId(SESSION_FIXTURE_ID.to_owned()),
                     activity: AgentActivity::Blocked,
                     source: StateSource::Report,
                 })?,
-            ),
+            )
+            .expect("fixture event name and payload are valid"),
         )?,
-        fixture("session-info-full.json", &session_full)?,
-        fixture("session-info-minimal.json", &session_minimal)?,
-        fixture("protocol-error-with-recover.json", &error_with_recover)?,
+    ])
+}
+
+fn observation_fixtures(session: &SessionInfo) -> Result<Vec<NamedFixture>, XtaskError> {
+    let runtime = SessionRuntimeIdentity::new("runtime-fixture-1", RuntimeGeneration::new(3))
+        .expect("fixture runtime identity is valid");
+    let mut fixtures = screen_fixtures(&runtime)?;
+    fixtures.extend(output_fixtures(&runtime)?);
+    fixtures.extend(wait_fixtures(session, runtime)?);
+    Ok(fixtures)
+}
+
+fn screen_fixtures(runtime: &SessionRuntimeIdentity) -> Result<Vec<NamedFixture>, XtaskError> {
+    Ok(vec![
+        fixture(
+            "request-session-screen.json",
+            &Request::new(
+                "req-screen-fixture-1",
+                method::SESSION_SCREEN,
+                json_value(&SessionScreenParams::new(SessionId(
+                    SESSION_FIXTURE_ID.to_owned(),
+                )))?,
+            )
+            .expect("fixture request id and method are valid"),
+        )?,
+        fixture(
+            "response-ok-session-screen.json",
+            &Response::ok(
+                PROTOCOL_VERSION,
+                "req-screen-fixture-1",
+                json_value(&SessionScreenResult {
+                    session_id: SessionId(SESSION_FIXTURE_ID.to_owned()),
+                    worker_id: "worker-fixture-1".to_owned(),
+                    runtime: runtime.clone(),
+                    watermark: TerminalWatermark::new(7),
+                    dimensions: TerminalDimensions::new(80, 24)
+                        .expect("fixture dimensions are valid"),
+                    cursor: TerminalCursor {
+                        row: 1,
+                        col: 4,
+                        visible: true,
+                    },
+                    alternate_screen: false,
+                    title: Some("fixture terminal".to_owned()),
+                    progress: None,
+                    visible_lines: vec!["pohunek fixture".to_owned()],
+                })?,
+            )
+            .expect("fixture response id is valid"),
+        )?,
+    ])
+}
+
+fn output_fixtures(runtime: &SessionRuntimeIdentity) -> Result<Vec<NamedFixture>, XtaskError> {
+    Ok(vec![
+        fixture(
+            "request-session-output.json",
+            &Request::new(
+                "req-output-fixture-1",
+                method::SESSION_OUTPUT,
+                json_value(
+                    &SessionOutputParams::new(
+                        SessionId(SESSION_FIXTURE_ID.to_owned()),
+                        Some(runtime.clone()),
+                        Some(OutputOffset::new(2)),
+                        128,
+                        Some(1_000),
+                    )
+                    .expect("fixture output params are valid"),
+                )?,
+            )
+            .expect("fixture request id and method are valid"),
+        )?,
+        fixture(
+            "response-ok-session-output-gap.json",
+            &Response::ok(
+                PROTOCOL_VERSION,
+                "req-output-fixture-1",
+                json_value(
+                    &SessionOutputResult::new(
+                        SessionId(SESSION_FIXTURE_ID.to_owned()),
+                        runtime.clone(),
+                        OutputOffset::new(4),
+                        OutputOffset::new(4),
+                        OutputOffset::new(6),
+                        OutputOffset::new(6),
+                        "b2s=",
+                        Some(
+                            SessionOutputGap::new(OutputOffset::new(2), OutputOffset::new(4))
+                                .expect("fixture output gap is valid"),
+                        ),
+                        false,
+                        false,
+                    )
+                    .expect("fixture output result is valid"),
+                )?,
+            )
+            .expect("fixture response id is valid"),
+        )?,
+    ])
+}
+
+fn wait_fixtures(
+    session: &SessionInfo,
+    runtime: SessionRuntimeIdentity,
+) -> Result<Vec<NamedFixture>, XtaskError> {
+    Ok(vec![
+        fixture(
+            "request-session-wait.json",
+            &Request::new(
+                "req-wait-fixture-1",
+                method::SESSION_WAIT,
+                json_value(
+                    &SessionWaitParams::new(
+                        SessionId(SESSION_FIXTURE_ID.to_owned()),
+                        Some(runtime),
+                        None,
+                        None,
+                        Some(OutputOffset::new(6)),
+                        None,
+                        None,
+                        1_000,
+                    )
+                    .expect("fixture wait params are valid"),
+                )?,
+            )
+            .expect("fixture request id and method are valid"),
+        )?,
+        fixture(
+            "response-ok-session-wait.json",
+            &Response::ok(
+                PROTOCOL_VERSION,
+                "req-wait-fixture-1",
+                json_value(&SessionWaitResult {
+                    reason: SessionWaitReason::RuntimeChanged,
+                    session: session.clone(),
+                    terminal_watermark: Some(TerminalWatermark::new(8)),
+                    output_offset: Some(OutputOffset::new(9)),
+                })?,
+            )
+            .expect("fixture response id is valid"),
+        )?,
+    ])
+}
+
+fn model_fixtures(values: &FixtureValues) -> Result<Vec<NamedFixture>, XtaskError> {
+    Ok(vec![
+        fixture(
+            "notification-policy-provider-keyed.json",
+            &notification_policy(),
+        )?,
+        fixture("session-info-full.json", &values.session_full)?,
+        fixture("session-info-minimal.json", &values.session_minimal)?,
+        fixture(
+            "protocol-error-with-recover.json",
+            &values.error_with_recover,
+        )?,
         fixture(
             "protocol-error-without-recover.json",
-            &error_without_recover,
+            &values.error_without_recover,
         )?,
-        fixture("session-list-filter-state.json", &session_filter)?,
-        fixture("notification-record.json", &notification)?,
+        fixture("session-list-filter-state.json", &values.session_filter)?,
+        fixture("notification-record.json", &values.notification)?,
         fixture(
             "event-session-created-payload.json",
             &SessionEvent {
-                session: session_minimal,
+                session: values.session_minimal.clone(),
             },
         )?,
         fixture(
@@ -342,6 +570,38 @@ fn fixtures() -> Result<Vec<NamedFixture>, XtaskError> {
             },
         )?,
     ])
+}
+
+fn notification_policy() -> NotificationPolicy {
+    let enabled = NotificationKindPolicy {
+        agent_blocked: true,
+        approval_required: true,
+        turn_completed: true,
+        session_finished: true,
+        error: true,
+        system: true,
+    };
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        "codex".to_owned(),
+        NotificationKindPolicy {
+            turn_completed: false,
+            ..enabled.clone()
+        },
+    );
+    providers.insert(
+        "future-agent".to_owned(),
+        NotificationKindPolicy {
+            system: false,
+            ..enabled.clone()
+        },
+    );
+    NotificationPolicy {
+        attention_dedupe_window_secs: 30,
+        attention_debounce_secs: 5,
+        enabled,
+        providers,
+    }
 }
 
 fn fixture<T>(file_name: &'static str, value: &T) -> Result<NamedFixture, XtaskError>
@@ -365,6 +625,7 @@ fn session_minimal() -> SessionInfo {
     SessionInfo {
         id: SessionId(SESSION_FIXTURE_ID.to_owned()),
         external: None,
+        capabilities: SessionCapabilities::default(),
         name: None,
         agent: "codex".to_owned(),
         agent_base: AgentKind::Codex,
@@ -406,6 +667,10 @@ fn session_full() -> SessionInfo {
     SessionInfo {
         id: SessionId(SESSION_FIXTURE_ID.to_owned()),
         external: Some(false),
+        capabilities: SessionCapabilities {
+            resume: true,
+            fork: true,
+        },
         name: Some("TypeScript SDK phase 1".to_owned()),
         agent: "codex".to_owned(),
         agent_base: AgentKind::Codex,

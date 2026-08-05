@@ -13,7 +13,7 @@ use crate::selection::{project_is_selected, session_is_selected};
 use crate::view::provider::linked_pr_status_label;
 use crate::PohunekApp;
 
-use super::{caret, conn_dot, indent, list_button, push_meta, STATUS_DOT};
+use super::{caret, conn_dot, indent, list_button, push_meta, session_agent_label, STATUS_DOT};
 
 pub(crate) fn inbox_entry_button(app: &PohunekApp) -> Element<'_, Message> {
     let unread = app.workspace.unread_notification_count();
@@ -223,11 +223,12 @@ fn session_tree_row(
     let label = match &session.name {
         Some(name) => format!(
             "{name}  {}{origin}{provider_status}{runtime_status}",
-            session.agent
+            session_agent_label(session)
         ),
         None => format!(
             "{}  {}{origin}{provider_status}{runtime_status}",
-            session.id.0, session.agent
+            session.id.0,
+            session_agent_label(session)
         ),
     };
     indent(

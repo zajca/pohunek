@@ -231,12 +231,14 @@ the session id when unset. The name is cosmetic and never changes targeting.
 
 The native `Start session` modal creates a session on the selected host and
 project through `session.new`. Its runtime picker sends the selected wire
-string as `agent`; the options come from the selected host's `supported_agents`
-(seeded from `host.inspect`), which lists the three compiled base kinds
-(`shell`, `codex`, `claude`) plus every resolvable host agent profile (e.g.
-`claude-otel`) — see [Agent Profiles](../concepts/agent-profiles.md). If the
-snapshot hasn't loaded `supported_agents` yet (or an older daemon doesn't
-answer `host.inspect`), the picker falls back to just the three base kinds.
+string as `agent`; the options come from the selected host's full runtime
+inventory returned by `host.inspect`, not from its `supported_agents` name
+list. The picker includes only available launchable runtimes. A Hermes entry
+is selectable only when its runtime probe reports `supported: true`; an absent
+`agent_base` still preserves available legacy custom profiles, while a present
+unknown base is display-only. If `host.inspect` fails or an older daemon does
+not provide the runtime inventory, the picker and launch action fail closed;
+there is no base-kind fallback.
 `shell` starts the daemon host's configured default shell and uses the same
 plain-shell runtime path as `pohunek session new` without `--agent`.
 
@@ -247,8 +249,9 @@ It opens a native `Start assistant` modal rather than shelling out to the CLI.
 The modal chooses:
 
 - assistant intent: `help`, `setup`, `project`, `update`, or `debug`;
-- agent runtime/profile: `Auto`, `pohunek-assistant`, `codex`, `claude`, or a
-  profile name observed in existing sessions;
+- agent runtime/profile: `Auto` or a launchable non-shell runtime reported by
+  `host.inspect`; profiles whose `agent_base` is `shell` are excluded even when
+  their profile name differs from `shell`;
 - request text, sent as the assistant's initial prompt request;
 - advanced branch/base-branch overrides;
 - explicit snapshot options (`No snapshot`, `Degraded`).
@@ -519,9 +522,9 @@ session's or pull request's review later (see above) picks the comments back
 up.
 
 Dispatch: the tray's "Dispatch as session…" action opens a modal with an
-agent picker (the same host `supported_agents` list as the Start modal,
-including host agent profiles, seeded with the source session's current agent
-and freely overridable), a rendered prompt preview (or the
+agent picker (the same launchable host runtime inventory as the Start modal,
+including host agent profiles, defaulting to the source session's current
+agent when that runtime remains launchable), a rendered prompt preview (or the
 render error, e.g. a missing `review.tmpl`), and — when the source session's
 agent is currently `working` — a warning that dispatching now may interrupt
 it. Confirming dispatch calls `session.new` with the picked agent, `cwd` set

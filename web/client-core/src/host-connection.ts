@@ -7,6 +7,7 @@ import {
 } from "@pohunek/sdk/browser";
 import {
   PROTOCOL_VERSION,
+  SUPPORTED_PROTOCOL_VERSIONS,
   type Methods,
   type NotificationRecord,
   type ProtocolEvent,
@@ -101,6 +102,21 @@ export class HostConnection {
     }
   }
 
+  public sessionOutput(
+    params: Methods["session.output"]["params"],
+  ): Promise<Methods["session.output"]["output"]> {
+    if (params.wait_ms === undefined) {
+      return this.call("session.output", params);
+    }
+    return this.requireActiveClient().client.sessionOutput(params);
+  }
+
+  public sessionWait(
+    params: Methods["session.wait"]["params"],
+  ): Promise<Methods["session.wait"]["output"]> {
+    return this.requireActiveClient().client.sessionWait(params);
+  }
+
   public async close(): Promise<void> {
     if (this.closed) {
       await this.runTask;
@@ -110,6 +126,14 @@ export class HostConnection {
     this.cancelRetryWait();
     this.invalidateActiveConnection();
     await this.runTask;
+  }
+
+  private requireActiveClient(): ActiveRequestClient {
+    const active = this.activeRequest;
+    if (active === undefined || this.closed) {
+      throw ClientError.remoteDaemonUnavailable(this.host);
+    }
+    return active;
   }
 
   private async run(): Promise<void> {
@@ -129,7 +153,7 @@ export class HostConnection {
         const subscriptionHealth = await subscriptionClient.call("daemon.health", null);
         assertCompatibleVersion(subscriptionHealth.protocol_version);
         const subscription = await subscriptionClient.subscribe({
-          v: PROTOCOL_VERSION,
+          v: SUPPORTED_PROTOCOL_VERSIONS,
           id: nextRequestId("subscribe"),
           method: "subscribe",
           params: null,

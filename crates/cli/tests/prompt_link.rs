@@ -123,10 +123,10 @@ fn prompt_link_invalid_json_honors_json_error_output() {
     let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
     let doc: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|err| panic!("stdout must be JSON ({err}): {stdout:?}"));
-    assert_eq!(doc["code"], "prompt_render_failed");
-    assert_eq!(doc["class"], "configuration");
+    assert_eq!(doc["err"]["code"], "prompt_render_failed");
+    assert_eq!(doc["err"]["class"], "configuration");
     assert!(
-        doc["msg"]
+        doc["err"]["msg"]
             .as_str()
             .is_some_and(|msg| msg.contains("provider returned invalid JSON")),
         "error should describe invalid provider JSON: {doc:?}"

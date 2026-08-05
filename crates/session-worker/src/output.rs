@@ -1,6 +1,6 @@
 //! Maintains bounded output history and atomic subscriptions.
 
-// Rust guideline compliant 2026-07-29
+// Rust guideline compliant 2026-08-04
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -66,6 +66,27 @@ pub enum OutputSnapshot {
         /// Complete terminal state at the recovery watermark.
         terminal: TerminalSnapshot,
     },
+}
+
+/// One bounded page of retained PTY output for a control-plane observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservationPage {
+    /// First retained byte offset.
+    pub history_start_offset: u64,
+    /// Offset of the first returned byte.
+    pub start_offset: u64,
+    /// Offset immediately after returned bytes.
+    pub next_offset: u64,
+    /// Current output end for the runtime.
+    pub runtime_end_offset: u64,
+    /// Returned opaque PTY bytes.
+    pub bytes: Vec<u8>,
+    /// Missing prefix when an explicit cursor was evicted.
+    pub gap: Option<Range<u64>>,
+    /// More retained bytes are immediately available.
+    pub has_more: bool,
+    /// Whether the output source has reached EOF.
+    pub exited: bool,
 }
 
 /// Event delivered to one bounded subscriber.
@@ -135,6 +156,7 @@ impl TerminalChunk {
 pub struct OutputHub {
     inner: Arc<Mutex<HubState>>,
     subscriber_limit: usize,
+    observation: Arc<Notify>,
 }
 
 impl OutputHub {
@@ -170,6 +192,7 @@ impl OutputHub {
                 exited: false,
             })),
             subscriber_limit,
+            observation: Arc::new(Notify::new()),
         })
     }
 
@@ -195,6 +218,8 @@ impl OutputHub {
             }
         }
         state.subscribers = retained;
+        drop(state);
+        self.observation.notify_waiters();
         Ok(chunk)
     }
 
@@ -242,6 +267,43 @@ impl OutputHub {
         lock(&self.inner).snapshot(after_offset)
     }
 
+    /// Returns one bounded page without registering an attach subscriber.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RingError::OffsetAhead`] for a cursor beyond produced output.
+    pub fn observe(
+        &self,
+        after_offset: Option<u64>,
+        max_bytes: usize,
+    ) -> Result<ObservationPage, RingError> {
+        lock(&self.inner).observe(after_offset, max_bytes)
+    }
+
+    /// Waits for output, exit, or cancellation without retaining the ring lock.
+    ///
+    /// The waiter registers before it rechecks `observed_end`, closing the
+    /// snapshot-to-wait race when a PTY reader appends output concurrently.
+    pub async fn wait_for_observation(
+        &self,
+        observed_end: u64,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) {
+        let notified = self.observation.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        {
+            let state = lock(&self.inner);
+            if state.ring.next_offset != observed_end || state.exited {
+                return;
+            }
+        }
+        tokio::select! {
+            () = &mut notified => {}
+            () = cancellation.cancelled() => {}
+        }
+    }
+
     /// Resizes the terminal model after a successful PTY resize.
     pub fn resize(&self, rows: u16, cols: u16) {
         let mut state = lock(&self.inner);
@@ -259,6 +321,8 @@ impl OutputHub {
                 queue.push_terminal(next_offset);
             }
         }
+        drop(state);
+        self.observation.notify_waiters();
     }
 
     /// Returns the next output offset.
@@ -291,6 +355,46 @@ struct HubState {
 }
 
 impl HubState {
+    fn observe(
+        &self,
+        after_offset: Option<u64>,
+        max_bytes: usize,
+    ) -> Result<ObservationPage, RingError> {
+        if max_bytes == 0 {
+            return Err(RingError::InvalidLimit { field: "max_bytes" });
+        }
+        let requested = self.validate_offset(after_offset)?;
+        let history_start_offset = self.ring.start_offset;
+        let runtime_end_offset = self.ring.next_offset;
+        let (start_offset, gap) = match after_offset {
+            Some(_) if requested < history_start_offset => {
+                (history_start_offset, Some(requested..history_start_offset))
+            }
+            Some(_) => (requested, None),
+            None => {
+                let bounded = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+                (
+                    runtime_end_offset
+                        .saturating_sub(bounded)
+                        .max(history_start_offset),
+                    None,
+                )
+            }
+        };
+        let bytes = self.ring.bytes_from_limited(start_offset, max_bytes);
+        let next_offset =
+            start_offset.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        Ok(ObservationPage {
+            history_start_offset,
+            start_offset,
+            next_offset,
+            runtime_end_offset,
+            bytes,
+            gap,
+            has_more: next_offset < runtime_end_offset,
+            exited: self.exited,
+        })
+    }
     fn subscription_seed(&self, after_offset: Option<u64>) -> Result<QueueSeed, RingError> {
         let requested = self.validate_offset(after_offset)?;
         if requested < self.ring.start_offset {
@@ -607,6 +711,17 @@ impl OutputRing {
         self.bytes.iter().skip(relative).copied().collect()
     }
 
+    fn bytes_from_limited(&self, offset: u64, limit: usize) -> Vec<u8> {
+        let relative =
+            usize::try_from(offset.saturating_sub(self.start_offset)).unwrap_or(self.bytes.len());
+        self.bytes
+            .iter()
+            .skip(relative)
+            .take(limit)
+            .copied()
+            .collect()
+    }
+
     fn chunk(&self, offset: u64, end: u64, limit: usize) -> Option<OutputChunk> {
         if offset < self.start_offset || offset >= end || end > self.next_offset {
             return None;
@@ -652,6 +767,125 @@ mod tests {
             OutputSnapshot::Replay { chunk, watermark: 6 }
                 if chunk.offset == 2 && chunk.bytes == b"cdef"
         ));
+    }
+
+    #[test]
+    fn observation_returns_newest_tail_exact_pages_and_retention_gaps() {
+        let hub = OutputHub::new(6, 64, 2, 10).expect("hub");
+        hub.push(b"abcdefgh").expect("push");
+
+        let tail = hub.observe(None, 3).expect("newest tail");
+        assert_eq!(tail.history_start_offset, 2);
+        assert_eq!(tail.start_offset, 5);
+        assert_eq!(tail.next_offset, 8);
+        assert_eq!(tail.bytes, b"fgh");
+        assert!(!tail.has_more);
+
+        let page = hub.observe(Some(3), 2).expect("exact page");
+        assert_eq!(page.start_offset, 3);
+        assert_eq!(page.next_offset, 5);
+        assert_eq!(page.bytes, b"de");
+        assert!(page.has_more);
+        assert_eq!(page.gap, None);
+
+        let gap = hub.observe(Some(0), 2).expect("retention gap");
+        assert_eq!(gap.gap, Some(0..2));
+        assert_eq!(gap.start_offset, 2);
+        assert_eq!(gap.bytes, b"cd");
+        assert!(gap.has_more);
+    }
+
+    #[test]
+    fn empty_and_exited_observations_report_runtime_state() {
+        let hub = OutputHub::new(64, 64, 2, 10).expect("hub");
+        let live = hub.observe(Some(0), 64).expect("empty live page");
+        assert!(live.bytes.is_empty());
+        assert!(!live.exited);
+
+        hub.mark_exit();
+        let exited = hub.observe(Some(0), 64).expect("empty exited page");
+        assert!(exited.bytes.is_empty());
+        assert!(exited.exited);
+    }
+
+    #[test]
+    fn observed_terminal_preserves_main_and_alternate_unicode_state() {
+        let hub = OutputHub::new(4_096, 4_096, 4, 20).expect("hub");
+        hub.push(b"main ").expect("main text");
+        hub.push("界".as_bytes()).expect("wide unicode");
+        hub.push(&[0xff]).expect("invalid utf-8");
+        hub.push(b"\x1b]0;worker-title\x07\x1b]9;building\x07")
+            .expect("terminal metadata");
+        hub.push(b"\x1b[2;3H\x1b[?25l").expect("cursor state");
+        let main = hub.terminal_snapshot();
+        assert!(!main.alternate_screen);
+        assert_eq!(main.title.as_deref(), Some("worker-title"));
+        assert_eq!(main.progress.as_deref(), Some("building"));
+        assert_eq!((main.cursor_row, main.cursor_col), (1, 2));
+        assert!(!main.cursor_visible);
+        assert!(main.visible_text.contains("界"));
+        assert!(main.visible_text.is_char_boundary(main.visible_text.len()));
+
+        hub.push(b"\x1b[?1049halternate")
+            .expect("enter alternate screen");
+        let alternate = hub.terminal_snapshot();
+        assert!(alternate.alternate_screen);
+        assert!(alternate.visible_text.contains("alternate"));
+
+        hub.push(b"\x1b[?1049l").expect("leave alternate screen");
+        let restored = hub.terminal_snapshot();
+        assert!(!restored.alternate_screen);
+        assert!(restored.visible_text.contains("main"));
+    }
+
+    #[test]
+    fn observation_reads_the_full_retention_capacity_without_eviction() {
+        let retention = 4_096;
+        let bytes = (0..retention)
+            .map(|index| u8::try_from(index % 251).expect("value fits u8"))
+            .collect::<Vec<_>>();
+        let hub = OutputHub::new(retention, retention, 2, 20).expect("hub");
+        hub.push(&bytes).expect("fill retention");
+
+        let page = hub.observe(Some(0), retention).expect("full page");
+        assert_eq!(page.history_start_offset, 0);
+        assert_eq!(page.start_offset, 0);
+        assert_eq!(page.next_offset, retention as u64);
+        assert_eq!(page.bytes, bytes);
+        assert!(!page.has_more);
+    }
+
+    #[tokio::test]
+    async fn observation_wait_wakes_for_output_exit_and_cancellation() {
+        let hub = OutputHub::new(64, 64, 2, 10).expect("hub");
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let output_wait = {
+            let hub = hub.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move { hub.wait_for_observation(0, &cancellation).await })
+        };
+        tokio::task::yield_now().await;
+        hub.push(b"output").expect("push");
+        output_wait.await.expect("waiter task");
+
+        let exit_wait = {
+            let hub = hub.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move { hub.wait_for_observation(6, &cancellation).await })
+        };
+        tokio::task::yield_now().await;
+        hub.mark_exit();
+        exit_wait.await.expect("exit waiter task");
+
+        let cancellable_hub = OutputHub::new(64, 64, 2, 10).expect("cancellable hub");
+        let cancelled_wait = {
+            let hub = cancellable_hub.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move { hub.wait_for_observation(0, &cancellation).await })
+        };
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        cancelled_wait.await.expect("cancelled waiter task");
     }
 
     #[tokio::test]

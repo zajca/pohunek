@@ -10,7 +10,7 @@ use pohunek_gui_core::{
     DomainEvent as CoreEvent, HostConfig, HostId, NotificationScope, ReviewLineTarget, RightTab,
     TreeNodeId,
 };
-use protocol::{AgentActivity, NotificationId, SessionId};
+use protocol::{AgentActivity, NotificationId, NotificationKind, SessionId};
 
 // Sentinel option in the Start template picker meaning "no template, blank session".
 pub(crate) const BLANK_TEMPLATE_LABEL: &str = "— blank —";
@@ -64,13 +64,6 @@ pub(crate) struct ResolvedTemplate {
     pub(crate) recipe: TemplateRecipe,
 }
 
-/// Compiled base agent kinds, used as the picker fallback when a host's
-/// `supported_agents` (seeded from `host.inspect`) is unavailable — e.g. the
-/// snapshot has not loaded yet, or an older daemon does not answer the
-/// method. Mirrors the daemon's own base-kind list
-/// (`crates/daemon/src/capabilities.rs`).
-pub(crate) const BASE_AGENT_KINDS: [&str; 3] = ["shell", "codex", "claude"];
-
 /// State for the intent-driven "Start session" panel. The project, repo, cwd and
 /// terminal size are derived from the selected project and config rather than
 /// typed; only the runtime, an optional initial input and (under Advanced) branch
@@ -78,7 +71,7 @@ pub(crate) const BASE_AGENT_KINDS: [&str; 3] = ["shell", "codex", "claude"];
 #[derive(Debug, Clone)]
 pub(crate) struct StartForm {
     /// Wire agent string (`session new --agent`), one of the selected host's
-    /// `supported_agents` or a `BASE_AGENT_KINDS` fallback.
+    /// launchable runtime inventory entries.
     pub(crate) agent: String,
     /// Owner-set display name to stamp on the session, shared by the manual Start
     /// modal and the provider-launch modal (only one is open at a time). Empty
@@ -237,6 +230,9 @@ pub(crate) enum Message {
     OpenGitHubPullRequest(u64),
     OpenGitHubIssue(u64),
     InspectSelectedSession,
+    ReadSelectedSessionScreen,
+    ReadSelectedSessionOutput,
+    WaitForSelectedSession,
     ForkSelectedSession,
     StopSelectedSession,
     /// Remove the selected session from the daemon, stopping it first if live.
@@ -245,6 +241,14 @@ pub(crate) enum Message {
     MetadataValueChanged(String),
     SetMetadata,
     ClearMetadata,
+    LoadNotificationPolicy(HostId),
+    SetNotificationPolicyKind {
+        host_id: HostId,
+        provider: Option<String>,
+        kind: NotificationKind,
+        enabled: bool,
+    },
+    SaveNotificationPolicy(HostId),
     ProjectPathChanged(String),
     ProjectNameChanged(String),
     ProjectBaseBranchChanged(String),

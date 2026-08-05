@@ -156,6 +156,17 @@ impl Debug for ActiveIdentity {
     }
 }
 
+/// Durable ordering tombstone for an accepted active-identity release.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleasedIdentity {
+    /// Provider base released by the hook.
+    pub provider: String,
+    /// Released process identity.
+    pub process: ChildIdentity,
+    /// Monotonic release sequence.
+    pub sequence: u64,
+}
+
 /// Durable non-secret worker state.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalRecord {
@@ -191,6 +202,9 @@ pub struct JournalRecord {
     pub launch_identity: Option<LaunchIdentity>,
     /// Latest sanitized active identity.
     pub active_identity: Option<ActiveIdentity>,
+    /// Latest accepted release, distinguishing explicit release from no report.
+    #[serde(default)]
+    pub active_identity_release: Option<ReleasedIdentity>,
     /// Next raw-output byte offset.
     pub next_output_offset: u64,
     /// Whether a daemon durably imported terminal state.
@@ -218,6 +232,7 @@ impl Debug for JournalRecord {
             .field("outcome", &self.outcome)
             .field("launch_identity", &self.launch_identity)
             .field("active_identity", &self.active_identity)
+            .field("active_identity_release", &self.active_identity_release)
             .field("next_output_offset", &self.next_output_offset)
             .field("terminal_acknowledged", &self.terminal_acknowledged)
             .field("updated_at", &self.updated_at)
@@ -253,6 +268,7 @@ impl JournalRecord {
             outcome: None,
             launch_identity: None,
             active_identity: None,
+            active_identity_release: None,
             next_output_offset: 0,
             terminal_acknowledged: false,
             updated_at,
@@ -450,7 +466,7 @@ fn temp_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{Journal, JournalError, JournalRecord, LaunchIdentity};
+    use super::{Journal, JournalError, JournalRecord, LaunchIdentity, ReleasedIdentity};
     use crate::ChildIdentity;
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
@@ -485,6 +501,15 @@ mod tests {
             },
             reference_kind: "thread_id".to_owned(),
             native_reference: secret.to_owned(),
+        });
+        record.active_identity_release = Some(ReleasedIdentity {
+            provider: "claude".to_owned(),
+            process: ChildIdentity {
+                pid: 12,
+                process_group: 12,
+                start_identity: "start-3".to_owned(),
+            },
+            sequence: 8,
         });
         record
     }

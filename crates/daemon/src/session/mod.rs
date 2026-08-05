@@ -5,9 +5,11 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use protocol::{
     event, AgentActivity, AgentKind, AgentStateEvent, AttachEvent, CwdSource, ErrorClass, Event,
@@ -28,9 +30,10 @@ use ulid::Ulid;
 
 use crate::agent::{
     adapter_for, agent_fork_unsupported, agent_not_resumable, base_resume_template,
-    build_pty_command, default_program, fork_pty_command_from_template, launch_adapter_for,
-    resume_pty_command_from_template, AgentAdapter, InputRules, LaunchCommand, LaunchOpts,
-    ProfileRegistry, ResolvedAgent, ResumeTemplate, SessionRef, SessionRefKind,
+    build_pty_command, default_args, default_program, fork_pty_command_from_template,
+    launch_adapter_for, resume_pty_command_from_template, AgentAdapter, ForkTemplate, InputRules,
+    LaunchCommand, LaunchOpts, ProfileRegistry, ResolvedAgent, ResumeTemplate, SessionRef,
+    SessionRefKind, ValidatedLaunchProgram,
 };
 use crate::detect::{identify_agent, ActivityTransition, Detector, DetectorConfig, Manifest};
 use crate::external::{
@@ -48,7 +51,7 @@ use crate::runtime::{
 };
 use crate::store::{
     DesiredState, ProjectRecord, ResumeBinding, RuntimeRecord, SessionRecord, SessionTransaction,
-    Store, TransactionKind, WorktreeStatus,
+    SessionWriteOutcome, Store, TransactionKind, WorktreeStatus,
 };
 use crate::time::now_rfc3339;
 use crate::worktree::{
@@ -61,6 +64,7 @@ mod diff;
 mod hooks;
 mod input;
 mod lag;
+mod observation;
 mod procwatch;
 mod reconcile;
 mod resume;
@@ -94,6 +98,8 @@ const DEFAULT_ATTACH_RESULT_CAPACITY: usize = 128;
 const DEFAULT_WORKER_CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 /// Initial retry interval while a systemd worker binds its bootstrap socket.
 const WORKER_CONNECT_RETRY: Duration = Duration::from_millis(100);
+/// Bounds optimistic terminal-state CAS retries before surfacing contention.
+const MAX_RUNTIME_TRANSITION_COMMIT_ATTEMPTS: usize = 8;
 /// Per-subscriber worker output queue. It absorbs repaint bursts without
 /// duplicating the larger raw-history budget for every subscriber.
 const DEFAULT_WORKER_SUBSCRIBER_BYTES: u64 = 1_000_000;
@@ -149,6 +155,18 @@ const DEFAULT_PROCWATCH_POLL: Duration = Duration::from_secs(1);
 /// `active_agent` forever.
 const DEFAULT_ACTIVE_AGENT_CLAIM_TTL: Duration = Duration::from_secs(30);
 
+/// Short observation waits bound abandoned dedicated connections.
+pub const DEFAULT_OBSERVATION_WAIT: Duration =
+    Duration::from_millis(protocol::MAX_SESSION_WAIT_MS as u64);
+/// Default maximum number of concurrent bounded waits across the daemon.
+pub const DEFAULT_GLOBAL_WAITERS: usize = 128;
+/// Default maximum number of concurrent bounded waits for one session.
+pub const DEFAULT_SESSION_WAITERS: usize = 8;
+/// Default maximum rendered terminal row count accepted by the daemon.
+pub const DEFAULT_SCREEN_ROWS: u16 = 200;
+/// Default maximum rendered terminal column count accepted by the daemon.
+pub const DEFAULT_SCREEN_COLS: u16 = 500;
+
 const MAX_SESSION_METADATA_KEYS: usize = 32;
 const MAX_SESSION_METADATA_KEY_BYTES: usize = 64;
 const MAX_SESSION_METADATA_VALUE_BYTES: usize = 4096;
@@ -199,10 +217,7 @@ impl AgentAdapter for ShellCommand {
     }
 
     fn input_rules(&self) -> InputRules {
-        InputRules {
-            bracketed_paste: false,
-            submit_delay: Duration::ZERO,
-        }
+        InputRules::unrestricted(false, Duration::ZERO)
     }
 
     fn manifest(&self) -> &crate::detect::Manifest {
@@ -225,6 +240,22 @@ pub struct SessionRegistryConfig {
     pub attach_result_capacity: usize,
     /// Per-session cap on the raw-output history buffer replayed on attach.
     pub output_history_limit_bytes: usize,
+    /// Maximum raw bytes returned by one `session.output` response.
+    pub observation_output_bytes: usize,
+    /// Maximum bounded wait accepted by `session.output`.
+    pub observation_output_wait: Duration,
+    /// Maximum bounded wait accepted by `session.wait`.
+    pub session_wait: Duration,
+    /// Maximum terminal rows accepted in a screen snapshot.
+    pub observation_screen_rows: u16,
+    /// Maximum terminal columns accepted in a screen snapshot.
+    pub observation_screen_cols: u16,
+    /// Maximum serialized `session.screen` result size.
+    pub observation_screen_bytes: usize,
+    /// Maximum concurrent bounded observation waiters.
+    pub observation_global_waiters: usize,
+    /// Maximum concurrent bounded waiters for one session.
+    pub observation_session_waiters: usize,
     /// Delay before sending Claude Code's Ink submit byte as a separate write.
     pub claude_submit_delay: Duration,
     /// Upper bound on how long [`SessionRegistry::create`] waits for a freshly
@@ -302,6 +333,14 @@ impl Default for SessionRegistryConfig {
             attach_result_ttl: DEFAULT_ATTACH_RESULT_TTL,
             attach_result_capacity: DEFAULT_ATTACH_RESULT_CAPACITY,
             output_history_limit_bytes: DEFAULT_OUTPUT_HISTORY_LIMIT_BYTES,
+            observation_output_bytes: protocol::MAX_SESSION_OUTPUT_BYTES,
+            observation_output_wait: DEFAULT_OBSERVATION_WAIT,
+            session_wait: DEFAULT_OBSERVATION_WAIT,
+            observation_screen_rows: DEFAULT_SCREEN_ROWS,
+            observation_screen_cols: DEFAULT_SCREEN_COLS,
+            observation_screen_bytes: protocol::MAX_SESSION_SCREEN_RESPONSE_BYTES,
+            observation_global_waiters: DEFAULT_GLOBAL_WAITERS,
+            observation_session_waiters: DEFAULT_SESSION_WAITERS,
             claude_submit_delay: crate::agent::DEFAULT_CLAUDE_SUBMIT_DELAY,
             initial_input_startup_grace: DEFAULT_INITIAL_INPUT_STARTUP_GRACE,
             socket_path: None,
@@ -340,6 +379,10 @@ struct SessionRegistryInner {
     next_stream_id: AtomicU64,
     next_write_id: AtomicU64,
     next_resize_sequence: AtomicU64,
+    /// Number of active bounded observation waits across all sessions.
+    observation_waiters: AtomicUsize,
+    /// Per-session active bounded observation waits.
+    observation_session_waiters: std::sync::Mutex<HashMap<SessionId, usize>>,
     /// Set when daemon process shutdown starts. Natural PTY exits observed after
     /// this point are treated as restart fallout, not terminal session state.
     daemon_shutdown_started: AtomicBool,
@@ -419,6 +462,7 @@ struct SessionEntry {
     snapshot: ResumeSnapshot,
     active_agent: Option<ActiveAgentReport>,
     last_agent_report: Option<ActiveAgentReport>,
+    last_native_report: Option<NativeIdentityReport>,
     observed_agents: Vec<ObservedAgent>,
 }
 
@@ -439,6 +483,8 @@ struct ActiveAgentReport {
     activity_reported: bool,
 }
 
+type NativeIdentityReport = crate::store::NativeIdentityOrdering;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ObservedAgent {
     pid: Pid,
@@ -451,6 +497,103 @@ struct ObservedAgent {
 struct RuntimeExit {
     exit_code: Option<i32>,
     success: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeWatchIdentity {
+    worker_id: String,
+    runtime_id: String,
+    generation: protocol::RuntimeGeneration,
+}
+
+impl RuntimeWatchIdentity {
+    fn from_info(info: &SessionInfo) -> Option<Self> {
+        let runtime = info.runtime.as_ref()?;
+        Some(Self {
+            worker_id: runtime.worker_id.clone()?,
+            runtime_id: runtime.runtime_id.clone()?,
+            generation: runtime.runtime_generation,
+        })
+    }
+
+    fn matches(&self, entry: &SessionEntry) -> bool {
+        entry.info.runtime.as_ref().is_some_and(|runtime| {
+            runtime.worker_id.as_deref() == Some(self.worker_id.as_str())
+                && runtime.runtime_id.as_deref() == Some(self.runtime_id.as_str())
+                && runtime.runtime_generation == self.generation
+        })
+    }
+}
+
+#[derive(Debug)]
+enum RuntimeTransitionOutcome {
+    Applied(Box<SessionInfo>),
+    IdentityMismatch,
+    RetryablePersistenceFailure(ProtocolError),
+    RetryableConcurrentChange,
+}
+
+struct ExitTransition {
+    event: &'static str,
+    stop_reason: &'static str,
+    detector_cancel: CancellationToken,
+    procwatch_cancel: CancellationToken,
+    expected: RuntimeWatchIdentity,
+    base: SessionRecord,
+    candidate: SessionEntry,
+}
+
+fn exit_transition(
+    id: &SessionId,
+    entry: &SessionEntry,
+    expected: RuntimeWatchIdentity,
+    exit: RuntimeExit,
+    stopped_by_user: bool,
+) -> ExitTransition {
+    let base = SessionRegistry::session_record(id, entry, entry.desired_state, None);
+    let mut candidate = entry.clone();
+    let stopped =
+        stopped_by_user || candidate.stopping || candidate.info.state == SessionState::Stopped;
+    candidate.stopping = false;
+    let stop_reason = if stopped {
+        candidate.info.state = SessionState::Stopped;
+        "stopped"
+    } else if exit.success {
+        candidate.info.state = SessionState::Done;
+        "done"
+    } else {
+        candidate.info.state = SessionState::Failed;
+        "failed"
+    };
+    candidate.info.state_source = StateSource::Process;
+    candidate.info.activity = None;
+    candidate.active_agent = None;
+    candidate.last_agent_report = None;
+    candidate.info.active_agent = None;
+    candidate.info.active_agent_base = None;
+    candidate.info.active_agent_pid = None;
+    candidate.info.active_agent_session_id = None;
+    candidate.info.active_agent_session_path = None;
+    candidate.observed_agents.clear();
+    candidate.info.exit_code = exit.exit_code;
+    if let Some(runtime) = candidate.info.runtime.as_mut() {
+        runtime.state = RuntimeState::Terminal;
+        runtime.loss_reason = None;
+    }
+    candidate.info.updated_at = timestamp_now();
+    ExitTransition {
+        event: if stopped {
+            event::SESSION_STOPPED
+        } else {
+            event::SESSION_UPDATED
+        },
+        stop_reason,
+        detector_cancel: candidate.detector_cancel.clone(),
+        procwatch_cancel: candidate.procwatch_cancel.clone(),
+        expected,
+        base,
+        candidate,
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -469,6 +612,18 @@ impl Default for SessionRegistry {
 }
 
 impl SessionRegistry {
+    /// Reports whether inherited origin markers target this daemon's same session.
+    #[must_use]
+    pub(crate) fn is_origin_session(
+        &self,
+        origin_session_id: Option<&SessionId>,
+        origin_daemon_id: Option<&str>,
+        target: &str,
+    ) -> bool {
+        origin_session_id.is_some_and(|origin| origin.0 == target)
+            && origin_daemon_id == Some(self.inner.daemon_instance_id.as_str())
+    }
+
     /// Returns the latest fail-closed durable-worker discovery inventory.
     pub async fn runtime_inventory(&self) -> RuntimeInventoryResult {
         RuntimeInventoryResult {
@@ -495,6 +650,101 @@ impl SessionRegistry {
                     format!("failed to write session record {session_id}: {error}"),
                 )
             })
+            .and_then(|outcome| match outcome {
+                SessionWriteOutcome::Applied => Ok(()),
+                SessionWriteOutcome::AppliedDurabilityUncertain { error } => {
+                    warn!(
+                        session_id,
+                        durability_error = %error,
+                        "session record commit is visible but directory durability is uncertain"
+                    );
+                    Ok(())
+                }
+                SessionWriteOutcome::StaleRuntime => Err(runtime_error(
+                    "session_runtime_commit_stale",
+                    format!("session record {session_id} was superseded by another runtime commit"),
+                )),
+                SessionWriteOutcome::StaleSnapshot => Err(runtime_error(
+                    "session_record_commit_stale",
+                    format!("session record {session_id} changed before its conditional commit"),
+                )),
+            })
+    }
+
+    async fn write_session_record_if_current(
+        &self,
+        expected: SessionRecord,
+        record: SessionRecord,
+    ) -> Result<(), ProtocolError> {
+        let Some(store) = self.inner.store.clone() else {
+            return Ok(());
+        };
+        let session_id = record.session_id.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            store.record_session_if_current(&expected, &record)
+        })
+        .await
+        .map_err(|_join_error| {
+            runtime_error(
+                "session_store_failed",
+                format!("conditional session write task panicked for {session_id}"),
+            )
+        })?
+        .map_err(|error| {
+            runtime_error(
+                "session_store_failed",
+                format!("failed to conditionally write session record {session_id}: {error}"),
+            )
+        })?;
+        match outcome {
+            SessionWriteOutcome::Applied => Ok(()),
+            SessionWriteOutcome::AppliedDurabilityUncertain { error } => {
+                warn!(
+                    session_id,
+                    durability_error = %error,
+                    "conditional session commit is visible but directory durability is uncertain"
+                );
+                Ok(())
+            }
+            SessionWriteOutcome::StaleRuntime => Err(runtime_error(
+                "session_runtime_commit_stale",
+                format!("session record {session_id} was superseded by another runtime commit"),
+            )),
+            SessionWriteOutcome::StaleSnapshot => Err(runtime_error(
+                "session_record_commit_stale",
+                format!("session record {session_id} changed before its conditional commit"),
+            )),
+        }
+    }
+
+    async fn load_durable_session_record(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<SessionRecord>, ProtocolError> {
+        let Some(store) = self.inner.store.clone() else {
+            return Ok(None);
+        };
+        let session_id = id.0.clone();
+        tokio::task::spawn_blocking(move || {
+            store.load_sessions().map(|sessions| {
+                sessions
+                    .into_iter()
+                    .find(|record| record.session_id == session_id)
+            })
+        })
+        .await
+        .map_err(|_join_error| {
+            runtime_error(
+                "session_store_failed",
+                format!("session record read task panicked for {}", id.0),
+            )
+        })?
+        .map_err(|error| {
+            runtime_error(
+                "session_store_failed",
+                format!("failed to read session record {}: {error}", id.0),
+            )
+        })
     }
 
     async fn delete_session_record(&self, id: &SessionId) -> Result<(), ProtocolError> {
@@ -594,6 +844,7 @@ impl SessionRegistry {
             transaction,
             info: entry.info.clone(),
             recovery: Some(Self::resume_binding_from_entry(id, entry)),
+            native_identity_ordering: entry.last_native_report.clone(),
             runtime,
         }
     }
@@ -641,6 +892,7 @@ impl SessionRegistry {
     /// Returns `worker_backend_required` when the per-session worker runtime
     /// root is absent. Production never falls back to daemon-owned PTYs.
     pub fn new_production(config: SessionRegistryConfig) -> Result<Self, ProtocolError> {
+        validate_observation_config(&config)?;
         if config.worker_runtime_root.is_none() || config.worker_state_root.is_none() {
             return Err(runtime_error(
                 "worker_backend_required",
@@ -739,6 +991,8 @@ impl SessionRegistry {
                 next_stream_id: AtomicU64::new(1),
                 next_write_id: AtomicU64::new(1),
                 next_resize_sequence: AtomicU64::new(1),
+                observation_waiters: AtomicUsize::new(0),
+                observation_session_waiters: std::sync::Mutex::new(HashMap::new()),
                 daemon_shutdown_started: AtomicBool::new(false),
                 daemon_instance_id: generate_daemon_instance_id(),
                 config,
@@ -1074,6 +1328,16 @@ impl SessionRegistry {
     pub async fn create(&self, params: SessionNewParams) -> Result<SessionInfo, ProtocolError> {
         validate_new_params(&params)?;
         let initial_input = params.input.clone();
+        // Resolve and validate the runtime before allocating a logical id or
+        // resolving a target: target resolution may bind a git worktree.
+        let resolved = self.inner.profiles.resolve_agent(&params.agent)?;
+        let base = resolved.base.clone();
+        let configured_program = resolved
+            .profile
+            .as_ref()
+            .map_or_else(|| default_program(&base), |profile| profile.program.clone());
+        let validated_program =
+            crate::capabilities::validate_launch_runtime(&base, &configured_program)?;
         // Fallback launch dir for a no-project (plain shell) session: the CLI's
         // own cwd for a local session, else the daemon's. A resolved project
         // overrides this with its checkout (or worktree) path.
@@ -1110,16 +1374,12 @@ impl SessionRegistry {
         // `register_pty_session`, which `resume_binding` shares and where the
         // worktree must be kept.
         let launch = async {
-            // Resolve the free-string agent name to a base kind + optional host
-            // profile (Part C). A bad name / missing profile fails here and rolls
-            // back any bound worktree, like any other launch failure.
-            let resolved = self.inner.profiles.resolve_agent(&params.agent)?;
-            let base = resolved.base;
+            let capabilities = resolved.capabilities();
             let input_rules = resolved
                 .profile
                 .as_ref()
                 .and_then(|profile| profile.input_rules)
-                .unwrap_or_else(|| input_rules_for_agent(base, &self.inner.config));
+                .unwrap_or_else(|| input_rules_for_agent(&base, &self.inner.config));
             // Freeze the structural relaunch snapshot (C.4) from the resolved agent:
             // the launch program/args plus the resume template (a profile's override,
             // else the base kind's). Cloned/copied so `resolved` stays usable below.
@@ -1127,15 +1387,13 @@ impl SessionRegistry {
                 program: resolved
                     .profile
                     .as_ref()
-                    .map_or_else(|| default_program(base), |profile| profile.program.clone()),
+                    .map_or_else(|| default_program(&base), |profile| profile.program.clone()),
                 args: resolved
                     .profile
                     .as_ref()
-                    .map_or_else(Vec::new, |profile| profile.args.clone()),
-                resume: match &resolved.profile {
-                    Some(profile) => profile.resume,
-                    None => base_resume_template(base),
-                },
+                    .map_or_else(|| default_args(&base), |profile| profile.args.clone()),
+                resume: capabilities.resume,
+                fork: capabilities.fork,
             };
             // The detection-manifest override is consumed only by the detector, on
             // both the launch and resume paths; never persisted (re-resolved by name).
@@ -1151,14 +1409,18 @@ impl SessionRegistry {
                 .as_ref()
                 .map(|profile| profile.env.clone())
                 .unwrap_or_default();
-            env_extra.extend(self.session_pty_env(base, &id));
+            env_extra.extend(self.session_pty_env(base.clone(), &id));
+            let opts = LaunchOpts {
+                cwd: launch_cwd.clone(),
+                cols: params.cols,
+                rows: params.rows,
+                env_extra,
+                validated_program,
+            };
             let plan = build_launch_command(
                 &resolved,
                 &self.inner.config.shell_command,
-                launch_cwd.clone(),
-                params.cols,
-                params.rows,
-                env_extra,
+                &opts,
                 initial_input.clone(),
             )?;
 
@@ -1168,7 +1430,7 @@ impl SessionRegistry {
                     registration: target::PtyRegistration::Create,
                     name: validate_session_name(params.name.as_deref())?,
                     agent: resolved.name.clone(),
-                    agent_base: base,
+                    agent_base: base.clone(),
                     input_rules,
                     snapshot,
                     manifest_override,
@@ -1287,84 +1549,132 @@ impl SessionRegistry {
         }
     }
 
-    /// Record an agent's native session id as the session's resume binding.
+    /// Record an agent's native session id for resume or fork recovery.
     ///
     /// Called from the `session.report_native_id` handler when a `SessionStart`
     /// hook fires. Validates the native id, updates the in-memory session info
-    /// (so `inspect`/`list` show it), and persists a minimal resume binding.
+    /// (so `inspect`/`list` show it), and persists native recovery metadata.
     /// Reports for an unknown or already-terminal session are ignored, not
     /// errors (the hook fires-and-forgets).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "ordered identity validation is kept linear so every rejection precedes persistence"
+    )]
     pub async fn report_native_id(
         &self,
         params: SessionReportNativeIdParams,
     ) -> SessionReportNativeIdResult {
         let not_recorded = SessionReportNativeIdResult { recorded: false };
-
-        let info = {
-            let mut sessions = self.inner.sessions.lock().await;
-            let Some(entry) = sessions.get_mut(&params.session_id) else {
-                debug!(
-                    session_id = %params.session_id.0,
-                    "native-id report for an unknown session; ignoring"
-                );
+        let session_id = params.session_id().clone();
+        if !identity_claim_expiry_is_valid(params.expires_at()) {
+            debug!(session_id = %session_id.0, "expired or overlong native-id report; ignoring");
+            return not_recorded;
+        }
+        let (worker, expected_agent, expected_base, ref_kind) = {
+            let sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get(&session_id) else {
+                debug!(session_id = %session_id.0, "native-id report for an unknown session; ignoring");
                 return not_recorded;
             };
             if is_terminal(entry.info.state) {
-                debug!(
-                    session_id = %params.session_id.0,
-                    "native-id report for a terminal session; ignoring"
-                );
+                debug!(session_id = %session_id.0, "native-id report for a terminal session; ignoring");
                 return not_recorded;
             }
-            let expected_base = agent_kind_label(entry.info.agent_base);
-            if params.agent != entry.info.agent && params.agent != expected_base {
-                debug!(
-                    session_id = %params.session_id.0,
-                    report_agent = %params.agent,
-                    session_agent = %entry.info.agent,
-                    session_agent_base = %expected_base,
-                    "native-id report for a different agent; ignoring"
-                );
+            let RuntimeHandle::Worker(worker) = &entry.runtime else {
+                debug!(session_id = %session_id.0, "native-id report for an unavailable runtime; ignoring");
+                return not_recorded;
+            };
+            let Some(ref_kind) = entry.snapshot.native_ref_kind() else {
+                debug!(session_id = %session_id.0, "native-id report for a session without recovery support; ignoring");
+                return not_recorded;
+            };
+            (
+                worker.clone(),
+                entry.info.agent.clone(),
+                agent_kind_label(&entry.info.agent_base).to_owned(),
+                ref_kind,
+            )
+        };
+        if params.agent() != expected_agent && params.agent() != expected_base {
+            debug!(session_id = %session_id.0, "native-id report provider mismatch; ignoring");
+            return not_recorded;
+        }
+        let worker_snapshot = match worker.inspect().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                debug!(session_id = %session_id.0, error = %error, "native-id runtime validation failed");
                 return not_recorded;
             }
+        };
+        let runtime_matches = worker_snapshot.session_id.as_str() == session_id.0
+            && worker_snapshot
+                .runtime_id
+                .as_ref()
+                .is_some_and(|runtime| runtime.as_str() == params.runtime_id());
+        let process_matches = worker_snapshot
+            .child_process
+            .as_ref()
+            .is_some_and(|process| {
+                process.pid == params.pid()
+                    && process.start_identity == params.pid_start_identity().get()
+            });
+        if !runtime_matches || !process_matches {
+            debug!(session_id = %session_id.0, "native-id runtime or process identity mismatch; ignoring");
+            return not_recorded;
+        }
 
-            // The native reference KIND is frozen at launch (a profile's `ref_kind`,
-            // or `id` for a base kind). The SessionStart hook bakes a base-kind
-            // literal into the wire `agent` and carries no profile identity, so the
-            // wire value is ignored for kind selection — the snapshot is authoritative.
-            let Some(template) = entry.snapshot.resume else {
-                debug!(
-                    session_id = %params.session_id.0,
-                    "native-id report for a non-resumable session; ignoring"
-                );
+        let validated = match ref_kind {
+            SessionRefKind::Id => SessionRef::id(params.native_session_id()),
+            SessionRefKind::Path => params
+                .transcript_path()
+                .ok_or_else(|| {
+                    runtime_error(
+                        "native_reference_missing",
+                        "path recovery report omitted its path",
+                    )
+                })
+                .and_then(SessionRef::path),
+        };
+        let session_ref = match validated {
+            Ok(session_ref) => session_ref,
+            Err(error) => {
+                debug!(session_id = %session_id.0, error = %error, "invalid native-id reference; ignoring");
+                return not_recorded;
+            }
+        };
+
+        let (info, record, previous_ordering, previous_native_id, previous_native_path) = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get_mut(&session_id) else {
                 return not_recorded;
             };
-            let ref_kind = template.ref_kind;
-            let validated = match ref_kind {
-                SessionRefKind::Id => SessionRef::id(&params.native_session_id),
-                SessionRefKind::Path => {
-                    if let Some(path) = params.transcript_path.as_deref() {
-                        SessionRef::path(path)
-                    } else {
-                        debug!(
-                            session_id = %params.session_id.0,
-                            "ignoring path-kind native-id report without transcript_path"
-                        );
-                        return not_recorded;
-                    }
-                }
-            };
-            let session_ref = match validated {
-                Ok(session_ref) => session_ref,
-                Err(err) => {
-                    debug!(
-                        session_id = %params.session_id.0,
-                        error = %err,
-                        "ignoring native-id report with an invalid native reference"
-                    );
-                    return not_recorded;
-                }
-            };
+            let current_runtime_matches = entry
+                .info
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.runtime_id.as_deref())
+                == Some(params.runtime_id());
+            if is_terminal(entry.info.state) || !current_runtime_matches {
+                return not_recorded;
+            }
+            let incoming_sequence = params.sequence().get();
+            if !native_report_is_current(
+                entry.last_native_report.as_ref(),
+                params.runtime_id(),
+                incoming_sequence,
+            ) {
+                debug!(session_id = %session_id.0, "stale native-id report; ignoring");
+                return not_recorded;
+            }
+            let previous_ordering = entry.last_native_report.clone();
+            let previous_native_id = entry.info.native_session_id.clone();
+            let previous_native_path = entry.info.native_session_path.clone();
+            entry.last_native_report = Some(NativeIdentityReport {
+                runtime_id: params.runtime_id().to_owned(),
+                pid: params.pid(),
+                pid_start_identity: params.pid_start_identity().get(),
+                sequence: incoming_sequence,
+            });
             // Store into the field chosen by kind, clearing the other so a session
             // resumes by exactly one mechanism (the persist literal copies both).
             match ref_kind {
@@ -1378,11 +1688,35 @@ impl SessionRegistry {
                 }
             }
             entry.info.updated_at = timestamp_now();
-            entry.info.clone()
+            (
+                entry.info.clone(),
+                Self::session_record(&session_id, entry, entry.desired_state, None),
+                previous_ordering,
+                previous_native_id,
+                previous_native_path,
+            )
         };
+        if let Err(error) = self.write_session_record(record).await {
+            debug!(session_id = %session_id.0, error = %error, "failed to persist native-id ordering; ignoring report");
+            let mut sessions = self.inner.sessions.lock().await;
+            if let Some(entry) = sessions.get_mut(&session_id) {
+                let accepted = NativeIdentityReport {
+                    runtime_id: params.runtime_id().to_owned(),
+                    pid: params.pid(),
+                    pid_start_identity: params.pid_start_identity().get(),
+                    sequence: params.sequence().get(),
+                };
+                if entry.last_native_report.as_ref() == Some(&accepted) {
+                    entry.last_native_report = previous_ordering;
+                    entry.info.native_session_id = previous_native_id;
+                    entry.info.native_session_path = previous_native_path;
+                }
+            }
+            return not_recorded;
+        }
         // Persist from the now-current in-memory state (a resize that landed
         // first is reflected, not clobbered).
-        self.persist_resume_binding(&params.session_id).await;
+        self.persist_resume_binding(&session_id).await;
         self.emit(event::SESSION_UPDATED, &info);
         SessionReportNativeIdResult { recorded: true }
     }
@@ -1408,6 +1742,7 @@ impl SessionRegistry {
         let valid_session_path =
             validate_agent_session_path(&params.session_id, params.agent_session_path.as_deref());
         let reported_activity = params.activity;
+        let report_sequence = params.seq.map(protocol::ReportSequence::get);
         let active_detector_config = detector_config_for_resolved_agent(&resolved);
         let (info, rescan) = {
             let mut sessions = self.inner.sessions.lock().await;
@@ -1429,7 +1764,7 @@ impl SessionRegistry {
                 entry.last_agent_report.as_ref(),
                 &params.source,
                 &resolved.name,
-                params.seq,
+                report_sequence,
             ) {
                 debug!(
                     session_id = %params.session_id.0,
@@ -1441,11 +1776,11 @@ impl SessionRegistry {
                 return not_recorded;
             }
 
-            let pid = bind_report_pid(entry, params.pid, resolved.base);
+            let pid = bind_report_pid(entry, params.pid, &resolved.base);
             let report = ActiveAgentReport {
                 source: params.source.clone(),
                 agent: resolved.name.clone(),
-                seq: params.seq,
+                seq: report_sequence,
                 pid,
                 reported_at: Instant::now(),
                 activity_reported: reported_activity.is_some(),
@@ -1469,7 +1804,7 @@ impl SessionRegistry {
         self.emit(event::SESSION_UPDATED, &info);
         rescan.notify_one();
         if let Some(activity) = reported_activity {
-            let event = Event::new(
+            let event = crate::events::event(
                 event::AGENT_STATE,
                 event_payload(AgentStateEvent {
                     session_id: params.session_id.clone(),
@@ -1488,6 +1823,7 @@ impl SessionRegistry {
         params: SessionReleaseAgentParams,
     ) -> SessionReleaseAgentResult {
         let not_released = SessionReleaseAgentResult { released: false };
+        let report_sequence = params.seq.map(protocol::ReportSequence::get);
         let resolved = match self.inner.profiles.resolve_agent(&params.agent) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -1520,7 +1856,7 @@ impl SessionRegistry {
             let Some(active) = entry.active_agent.as_ref() else {
                 return not_released;
             };
-            if !release_matches(active, &params.source, &resolved.name, params.seq) {
+            if !release_matches(active, &params.source, &resolved.name, report_sequence) {
                 debug!(
                     session_id = %params.session_id.0,
                     source = %params.source,
@@ -1533,7 +1869,7 @@ impl SessionRegistry {
             let tombstone = ActiveAgentReport {
                 source: params.source.clone(),
                 agent: resolved.name.clone(),
-                seq: params.seq,
+                seq: report_sequence,
                 pid: None,
                 reported_at: Instant::now(),
                 activity_reported: false,
@@ -1611,6 +1947,15 @@ impl SessionRegistry {
     /// Inspect a session by raw id string.
     pub async fn inspect_str(&self, id: &str) -> Result<SessionInfo, ProtocolError> {
         self.inspect(&SessionId(id.to_owned())).await
+    }
+
+    pub(crate) async fn ensure_known_agent(&self, id: &str) -> Result<(), ProtocolError> {
+        let info = self.inspect_str(id).await?;
+        info.agent_base.validate_mutation()?;
+        if let Some(active) = &info.active_agent_base {
+            active.validate_mutation()?;
+        }
+        Ok(())
     }
 
     pub(super) async fn record_cwd_hint(&self, id: &SessionId, path: String) {
@@ -1923,6 +2268,7 @@ impl SessionRegistry {
                 ),
             )
         };
+        let terminal_base = durable_intent.clone();
         if let Err(error) = self.write_session_record(durable_intent).await {
             self.clear_stopping(id).await;
             return Err(error);
@@ -1961,8 +2307,8 @@ impl SessionRegistry {
                 return Err(unavailable_runtime_error(id, state));
             }
         };
+        self.commit_user_stop_exit(id, exit, &terminal_base).await?;
         runtime_watch_cancel.cancel();
-        self.record_exit(id, exit, true).await;
         // `stop` is the user-owned terminal transition and must be the final
         // word on native-recovery eligibility. A concurrent exit watcher can race
         // through `record_exit` first, making our later `record_exit(..., true)`
@@ -1971,6 +2317,41 @@ impl SessionRegistry {
         // `stop()` returns.
         self.persist_resume_binding(id).await;
         Ok(SessionStopResult { stopped: true })
+    }
+
+    async fn commit_user_stop_exit(
+        &self,
+        id: &SessionId,
+        exit: RuntimeExit,
+        terminal_base: &SessionRecord,
+    ) -> Result<(), ProtocolError> {
+        let mut use_terminal_base = true;
+        let mut last_persistence_error = None;
+        for _ in 0..MAX_RUNTIME_TRANSITION_COMMIT_ATTEMPTS {
+            let expected_record = use_terminal_base.then_some(terminal_base);
+            match self
+                .record_exit(id, exit, true, None, expected_record)
+                .await
+            {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    use_terminal_base = false;
+                    last_persistence_error = None;
+                }
+                Err(error) => last_persistence_error = Some(error),
+            }
+            tokio::task::yield_now().await;
+        }
+        if let Some(error) = last_persistence_error {
+            return Err(error);
+        }
+        Err(runtime_error(
+            "session_runtime_transition_busy",
+            format!(
+                "session {} kept changing while committing its terminal state",
+                id.0
+            ),
+        ))
     }
 
     /// Evict a session from the registry, stopping it first if still live.
@@ -2094,12 +2475,14 @@ impl SessionRegistry {
         &self,
         id: SessionId,
         initial_worker: Worker,
+        expected: RuntimeWatchIdentity,
         cancel: CancellationToken,
     ) {
         let registry = self.clone();
         tokio::spawn(async move {
             let socket_path = initial_worker.socket_path().to_path_buf();
             let mut worker = initial_worker;
+            let mut last_worker_identity = None;
             loop {
                 let inspected = tokio::select! {
                     () = cancel.cancelled() => return,
@@ -2107,6 +2490,21 @@ impl SessionRegistry {
                 };
                 match inspected {
                     Ok(snapshot) => {
+                        let worker_identity = worker_identity_fingerprint(&snapshot);
+                        let initial_empty_identity = last_worker_identity.is_none()
+                            && worker_identity_is_empty(&worker_identity);
+                        if !initial_empty_identity
+                            && last_worker_identity.as_ref() != Some(&worker_identity)
+                        {
+                            if registry
+                                .apply_worker_identity_snapshot(&id, &snapshot)
+                                .await
+                            {
+                                last_worker_identity = Some(worker_identity.clone());
+                            }
+                        } else {
+                            last_worker_identity = Some(worker_identity.clone());
+                        }
                         if snapshot.phase == pohunek_worker_protocol::RuntimePhase::Exited {
                             let exit = snapshot.exit.map_or(
                                 RuntimeExit {
@@ -2118,58 +2516,24 @@ impl SessionRegistry {
                                     success: status.code == Some(0) && status.signal.is_none(),
                                 },
                             );
-                            registry.record_exit(&id, exit, false).await;
-                            break;
+                            if matches!(
+                                registry
+                                    .record_exit(&id, exit, false, Some(&expected), None)
+                                    .await,
+                                Ok(true)
+                            ) {
+                                break;
+                            }
                         }
                     }
                     Err(error) => {
-                        registry.mark_worker_reconnecting(&id, &error).await;
-                        let reconnect_deadline = tokio::time::Instant::now()
-                            + registry.inner.config.worker_connect_deadline;
-                        loop {
-                            if cancel.is_cancelled() {
-                                return;
-                            }
-                            if registry
-                                .inner
-                                .daemon_shutdown_started
-                                .load(Ordering::Relaxed)
-                            {
-                                return;
-                            }
-                            let connected = tokio::select! {
-                                () = cancel.cancelled() => return,
-                                connected = Worker::connect(
-                                    &socket_path,
-                                    &id.0,
-                                    registry.daemon_instance_id(),
-                                ) => connected,
-                            };
-                            match connected {
-                                Ok(reconnected) => {
-                                    registry
-                                        .adopt_reconnected_worker(&id, reconnected.clone())
-                                        .await;
-                                    worker = reconnected;
-                                    break;
-                                }
-                                Err(reconnect_error) => {
-                                    if tokio::time::Instant::now() >= reconnect_deadline {
-                                        registry.mark_worker_lost(&id, &reconnect_error).await;
-                                        return;
-                                    }
-                                    debug!(
-                                        session_id = %id.0,
-                                        error = %reconnect_error,
-                                        "session worker is not reconnectable yet"
-                                    );
-                                    tokio::select! {
-                                        () = cancel.cancelled() => return,
-                                        () = tokio::time::sleep(WORKER_CONNECT_RETRY) => {}
-                                    }
-                                }
-                            }
-                        }
+                        let Some(reconnected) = registry
+                            .reconnect_worker(&id, &expected, &socket_path, &cancel, &error)
+                            .await
+                        else {
+                            return;
+                        };
+                        worker = reconnected;
                     }
                 }
                 tokio::select! {
@@ -2180,11 +2544,80 @@ impl SessionRegistry {
         });
     }
 
-    async fn mark_worker_reconnecting(&self, id: &SessionId, error: &WorkerError) {
+    async fn reconnect_worker(
+        &self,
+        id: &SessionId,
+        expected: &RuntimeWatchIdentity,
+        socket_path: &Path,
+        cancel: &CancellationToken,
+        error: &WorkerError,
+    ) -> Option<Worker> {
+        if !self.mark_worker_reconnecting(id, expected, error).await {
+            return None;
+        }
+        let mut deadline = tokio::time::Instant::now() + self.inner.config.worker_connect_deadline;
+        loop {
+            if cancel.is_cancelled() || self.inner.daemon_shutdown_started.load(Ordering::Relaxed) {
+                return None;
+            }
+            let connected = tokio::select! {
+                () = cancel.cancelled() => return None,
+                connected = Worker::connect(socket_path, &id.0, self.daemon_instance_id()) => connected,
+            };
+            match connected {
+                Ok(worker) => match self
+                    .adopt_reconnected_worker(id, expected, worker.clone())
+                    .await
+                {
+                    RuntimeTransitionOutcome::Applied(_) => return Some(worker),
+                    RuntimeTransitionOutcome::IdentityMismatch => return None,
+                    RuntimeTransitionOutcome::RetryablePersistenceFailure(_)
+                    | RuntimeTransitionOutcome::RetryableConcurrentChange => {
+                        tokio::select! {
+                            () = cancel.cancelled() => return None,
+                            () = tokio::time::sleep(WORKER_CONNECT_RETRY) => {}
+                        }
+                    }
+                },
+                Err(reconnect_error) if tokio::time::Instant::now() >= deadline => {
+                    match self.mark_worker_lost(id, expected, &reconnect_error).await {
+                        RuntimeTransitionOutcome::Applied(_)
+                        | RuntimeTransitionOutcome::IdentityMismatch => return None,
+                        RuntimeTransitionOutcome::RetryablePersistenceFailure(_)
+                        | RuntimeTransitionOutcome::RetryableConcurrentChange => {
+                            deadline = tokio::time::Instant::now()
+                                + self.inner.config.worker_connect_deadline;
+                        }
+                    }
+                }
+                Err(reconnect_error) => {
+                    debug!(
+                        session_id = %id.0,
+                        error = %reconnect_error,
+                        "session worker is not reconnectable yet"
+                    );
+                    tokio::select! {
+                        () = cancel.cancelled() => return None,
+                        () = tokio::time::sleep(WORKER_CONNECT_RETRY) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    async fn mark_worker_reconnecting(
+        &self,
+        id: &SessionId,
+        expected: &RuntimeWatchIdentity,
+        error: &WorkerError,
+    ) -> bool {
         let mut sessions = self.inner.sessions.lock().await;
         let Some(entry) = sessions.get_mut(id) else {
-            return;
+            return false;
         };
+        if !expected.matches(entry) {
+            return false;
+        }
         if let Some(runtime) = entry.info.runtime.as_mut() {
             runtime.state = RuntimeState::Reconnecting;
             runtime.loss_reason = Some("worker_connection_lost".to_owned());
@@ -2196,68 +2629,182 @@ impl SessionRegistry {
             error = %error,
             "worker control connection lost; runtime remains alive while reconnecting"
         );
+        true
     }
 
-    async fn mark_worker_lost(&self, id: &SessionId, error: &WorkerError) {
-        let record = {
-            let mut sessions = self.inner.sessions.lock().await;
-            let Some(entry) = sessions.get_mut(id) else {
-                return;
+    async fn mark_worker_lost(
+        &self,
+        id: &SessionId,
+        expected: &RuntimeWatchIdentity,
+        error: &WorkerError,
+    ) -> RuntimeTransitionOutcome {
+        let (base, candidate) = {
+            let sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get(id) else {
+                return RuntimeTransitionOutcome::IdentityMismatch;
             };
-            entry.runtime = RuntimeHandle::Unavailable(RuntimeState::Lost);
-            if let Some(runtime) = entry.info.runtime.as_mut() {
+            if !expected.matches(entry) {
+                return RuntimeTransitionOutcome::IdentityMismatch;
+            }
+            let base = Self::session_record(id, entry, entry.desired_state, None);
+            let mut candidate = entry.clone();
+            candidate.runtime = RuntimeHandle::Unavailable(RuntimeState::Lost);
+            if let Some(runtime) = candidate.info.runtime.as_mut() {
                 runtime.state = RuntimeState::Lost;
                 runtime.loss_reason = Some("worker_process_lost".to_owned());
             }
-            entry.info.updated_at = timestamp_now();
-            let info = entry.info.clone();
-            let record = Self::session_record(id, entry, entry.desired_state, None);
-            (info, record)
+            candidate.info.updated_at = timestamp_now();
+            (base, candidate)
         };
-        if let Err(store_error) = self.write_session_record(record.1).await {
+        let durable_base = match self.load_durable_session_record(id).await {
+            Ok(Some(record)) => record,
+            Ok(None) => base.clone(),
+            Err(error) => return RuntimeTransitionOutcome::RetryablePersistenceFailure(error),
+        };
+        let outcome = self
+            .commit_runtime_transition(id, expected, &base, &durable_base, candidate)
+            .await;
+        if let RuntimeTransitionOutcome::RetryablePersistenceFailure(store_error) = &outcome {
             warn!(
                 session_id = %id.0,
                 error = %store_error,
                 "failed to persist lost worker classification"
             );
         }
-        warn!(
-            session_id = %id.0,
-            error = %error,
-            "session worker could not be reconnected; PTY runtime is lost"
-        );
-        self.emit(event::SESSION_RUNTIME_LOST, &record.0);
+        if let RuntimeTransitionOutcome::Applied(info) = &outcome {
+            warn!(
+                session_id = %id.0,
+                error = %error,
+                "session worker could not be reconnected; PTY runtime is lost"
+            );
+            self.emit(event::SESSION_RUNTIME_LOST, info.as_ref());
+        }
+        outcome
     }
 
-    async fn adopt_reconnected_worker(&self, id: &SessionId, worker: Worker) {
+    async fn adopt_reconnected_worker(
+        &self,
+        id: &SessionId,
+        expected: &RuntimeWatchIdentity,
+        worker: Worker,
+    ) -> RuntimeTransitionOutcome {
         let worker_id = worker.worker_id().await.to_string();
-        let runtime_id = worker.runtime_id().await.map(|value| value.to_string());
-        let updated = {
-            let mut sessions = self.inner.sessions.lock().await;
-            let Some(entry) = sessions.get_mut(id) else {
-                return;
+        let Some(runtime_id) = worker.runtime_id().await.map(|value| value.to_string()) else {
+            return RuntimeTransitionOutcome::IdentityMismatch;
+        };
+        if worker_id != expected.worker_id || runtime_id != expected.runtime_id {
+            return RuntimeTransitionOutcome::IdentityMismatch;
+        }
+        let (base, candidate) = {
+            let sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get(id) else {
+                return RuntimeTransitionOutcome::IdentityMismatch;
             };
-            entry.runtime = RuntimeHandle::Worker(worker);
-            if let Some(runtime) = entry.info.runtime.as_mut() {
+            if !expected.matches(entry) {
+                return RuntimeTransitionOutcome::IdentityMismatch;
+            }
+            let base = Self::session_record(id, entry, entry.desired_state, None);
+            let mut candidate = entry.clone();
+            candidate.runtime = RuntimeHandle::Worker(worker);
+            if let Some(runtime) = candidate.info.runtime.as_mut() {
                 runtime.state = RuntimeState::Live;
                 runtime.worker_id = Some(worker_id);
-                runtime.runtime_id = runtime_id;
+                runtime.runtime_id = Some(runtime_id);
                 runtime.last_connected_at = Some(timestamp_now());
                 runtime.loss_reason = None;
             }
-            entry.info.updated_at = timestamp_now();
-            entry.info.clone()
+            candidate.info.updated_at = timestamp_now();
+            (base, candidate)
         };
-        self.emit(event::SESSION_RUNTIME_RECONNECTED, &updated);
+        let durable_base = match self.load_durable_session_record(id).await {
+            Ok(Some(record)) => record,
+            Ok(None) => base.clone(),
+            Err(error) => return RuntimeTransitionOutcome::RetryablePersistenceFailure(error),
+        };
+        let outcome = self
+            .commit_runtime_transition(id, expected, &base, &durable_base, candidate)
+            .await;
+        if let RuntimeTransitionOutcome::RetryablePersistenceFailure(error) = &outcome {
+            warn!(session_id = %id.0, error = %error, "failed to persist reconnected worker");
+        }
+        if let RuntimeTransitionOutcome::Applied(info) = &outcome {
+            self.emit(event::SESSION_RUNTIME_RECONNECTED, info.as_ref());
+        }
+        outcome
     }
 
-    async fn record_exit(&self, id: &SessionId, exit: RuntimeExit, stopped_by_user: bool) {
-        let updated = {
-            let mut sessions = self.inner.sessions.lock().await;
-            let Some(entry) = sessions.get_mut(id) else {
-                debug!(session_id = %id.0, "PTY exit arrived for unknown session");
-                return;
+    async fn commit_runtime_transition(
+        &self,
+        id: &SessionId,
+        expected: &RuntimeWatchIdentity,
+        memory_base: &SessionRecord,
+        durable_base: &SessionRecord,
+        mut candidate: SessionEntry,
+    ) -> RuntimeTransitionOutcome {
+        let mut record = Self::session_record(id, &candidate, candidate.desired_state, None);
+        crate::store::preserve_newer_native_identity(durable_base, &mut record);
+        candidate
+            .info
+            .native_session_id
+            .clone_from(&record.info.native_session_id);
+        candidate
+            .info
+            .native_session_path
+            .clone_from(&record.info.native_session_path);
+        candidate
+            .last_native_report
+            .clone_from(&record.native_identity_ordering);
+        if let Err(error) = self
+            .write_session_record_if_current(durable_base.clone(), record)
+            .await
+        {
+            return match error.code.as_str() {
+                "session_runtime_commit_stale" => RuntimeTransitionOutcome::IdentityMismatch,
+                "session_record_commit_stale" => {
+                    RuntimeTransitionOutcome::RetryableConcurrentChange
+                }
+                _ => RuntimeTransitionOutcome::RetryablePersistenceFailure(error),
             };
+        }
+        let mut sessions = self.inner.sessions.lock().await;
+        let Some(current) = sessions.get(id) else {
+            return RuntimeTransitionOutcome::IdentityMismatch;
+        };
+        if !expected.matches(current) {
+            return RuntimeTransitionOutcome::IdentityMismatch;
+        }
+        let current_record = Self::session_record(id, current, current.desired_state, None);
+        if &current_record != memory_base {
+            return RuntimeTransitionOutcome::RetryableConcurrentChange;
+        }
+        let info = candidate.info.clone();
+        sessions.insert(id.clone(), candidate);
+        RuntimeTransitionOutcome::Applied(Box::new(info))
+    }
+
+    async fn record_exit(
+        &self,
+        id: &SessionId,
+        exit: RuntimeExit,
+        stopped_by_user: bool,
+        expected: Option<&RuntimeWatchIdentity>,
+        expected_record: Option<&SessionRecord>,
+    ) -> Result<bool, ProtocolError> {
+        let updated = Box::new({
+            let sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get(id) else {
+                debug!(session_id = %id.0, "PTY exit arrived for unknown session");
+                return Ok(true);
+            };
+            let expected = expected
+                .cloned()
+                .or_else(|| RuntimeWatchIdentity::from_info(&entry.info));
+            let Some(expected) = expected else {
+                return Ok(true);
+            };
+            if !expected.matches(entry) {
+                return Ok(true);
+            }
 
             if self.inner.daemon_shutdown_started.load(Ordering::Relaxed)
                 && !stopped_by_user
@@ -2267,67 +2814,64 @@ impl SessionRegistry {
                     session_id = %id.0,
                     "ignoring PTY exit observed after daemon shutdown started"
                 );
-                return;
+                return Ok(true);
             }
 
             if entry.info.state == SessionState::Stopped && stopped_by_user && !entry.stopping {
-                return;
+                return Ok(true);
             }
 
             if is_terminal(entry.info.state) && !stopped_by_user && !entry.stopping {
-                return;
+                return Ok(true);
             }
 
-            let stopped =
-                stopped_by_user || entry.stopping || entry.info.state == SessionState::Stopped;
-            entry.stopping = false;
-
-            let stop_reason = if stopped {
-                entry.info.state = SessionState::Stopped;
-                "stopped"
-            } else if exit.success {
-                entry.info.state = SessionState::Done;
-                "done"
-            } else {
-                entry.info.state = SessionState::Failed;
-                "failed"
+            exit_transition(id, entry, expected, exit, stopped_by_user)
+        });
+        let loaded_durable_base;
+        let durable_base = if let Some(expected_record) = expected_record {
+            expected_record
+        } else {
+            loaded_durable_base = match Box::pin(self.load_durable_session_record(id)).await {
+                Ok(Some(record)) => record,
+                Ok(None) => updated.base.clone(),
+                Err(error) => return Err(error),
             };
-            entry.info.state_source = StateSource::Process;
-            entry.info.activity = None;
-            entry.active_agent = None;
-            entry.last_agent_report = None;
-            entry.info.active_agent = None;
-            entry.info.active_agent_base = None;
-            entry.info.active_agent_pid = None;
-            entry.info.active_agent_session_id = None;
-            entry.info.active_agent_session_path = None;
-            entry.observed_agents.clear();
-            entry.info.exit_code = exit.exit_code;
-            if let Some(runtime) = entry.info.runtime.as_mut() {
-                runtime.state = RuntimeState::Terminal;
-                runtime.loss_reason = None;
-            }
-            entry.info.updated_at = timestamp_now();
-            entry.detector_cancel.cancel();
-            entry.procwatch_cancel.cancel();
-            let event = if stopped {
-                event::SESSION_STOPPED
-            } else {
-                event::SESSION_UPDATED
-            };
-            let record = Self::session_record(id, entry, entry.desired_state, None);
-            (event, entry.info.clone(), stop_reason, record)
+            &loaded_durable_base
         };
+        let updated = *updated;
 
+        let committed_info = match Box::pin(self.commit_runtime_transition(
+            id,
+            &updated.expected,
+            &updated.base,
+            durable_base,
+            updated.candidate,
+        ))
+        .await
+        {
+            RuntimeTransitionOutcome::Applied(info) => info,
+            RuntimeTransitionOutcome::IdentityMismatch => return Ok(true),
+            RuntimeTransitionOutcome::RetryablePersistenceFailure(error) => {
+                warn!(
+                    session_id = %id.0,
+                    error = %error,
+                    "failed to persist terminal session outcome"
+                );
+                return Err(error);
+            }
+            RuntimeTransitionOutcome::RetryableConcurrentChange => return Ok(false),
+        };
+        updated.detector_cancel.cancel();
+        updated.procwatch_cancel.cancel();
         self.cancel_session_attaches(id).await;
         self.remove_pending_attaches_for_session(id).await;
         self.spawn_session_hook(SessionHookRequest {
             event: HookEvent::SessionStop,
-            cwd: updated.1.cwd.clone(),
-            session_id: updated.1.id.0.clone(),
-            project_id: updated.1.project_id.clone(),
-            agent: updated.1.agent.clone(),
-            stop_reason: Some(updated.2),
+            cwd: committed_info.cwd.clone(),
+            session_id: committed_info.id.0.clone(),
+            project_id: committed_info.project_id.clone(),
+            agent: committed_info.agent.clone(),
+            stop_reason: Some(updated.stop_reason),
             activity: None,
         });
         // A terminal session must not resurrect on the next daemon restart:
@@ -2336,14 +2880,8 @@ impl SessionRegistry {
         // `persist_resume_binding` re-reads it as terminal and removes its
         // binding (serialized against any racing resize/capture write).
         self.persist_resume_binding(id).await;
-        if let Err(error) = self.write_session_record(updated.3).await {
-            warn!(
-                session_id = %id.0,
-                error = %error,
-                "failed to persist terminal session outcome"
-            );
-        }
-        self.emit(updated.0, &updated.1);
+        self.emit(updated.event, committed_info.as_ref());
+        Ok(true)
     }
 
     async fn clear_stopping(&self, id: &SessionId) {
@@ -2368,10 +2906,16 @@ impl SessionRegistry {
 
     async fn ensure_not_external(&self, id: &SessionId) -> Result<(), ProtocolError> {
         if self.inner.external.contains_id(id).await {
-            Err(session_external_read_only(id))
-        } else {
-            Ok(())
+            return Err(session_external_read_only(id));
         }
+        let sessions = self.inner.sessions.lock().await;
+        if let Some(entry) = sessions.get(id) {
+            entry.info.agent_base.validate_mutation()?;
+            if let Some(active) = &entry.info.active_agent_base {
+                active.validate_mutation()?;
+            }
+        }
+        Ok(())
     }
 
     /// Rescan same-user processes for external agents.
@@ -2424,7 +2968,7 @@ impl SessionRegistry {
                 }
             };
             observed_pids.insert(fact.pid);
-            let candidate = transcripts.best_match(agent_base, &cwd, &fact);
+            let candidate = transcripts.best_match(&agent_base, &cwd, &fact);
             let association = self
                 .resolve_external_cwd_association(fact.pid, cwd.clone())
                 .await;
@@ -2554,7 +3098,7 @@ impl SessionRegistry {
     }
 
     fn emit(&self, name: &str, info: &SessionInfo) {
-        let event = Event::new(
+        let event = crate::events::event(
             name,
             event_payload(SessionEvent {
                 session: info.clone(),
@@ -2568,7 +3112,7 @@ impl SessionRegistry {
             .runtime
             .as_ref()
             .and_then(|runtime| runtime.runtime_id.clone());
-        let event = Event::new(
+        let event = crate::events::event(
             event::SESSION_NATIVE_RECOVERED,
             event_payload(SessionNativeRecoveredEvent {
                 session: info.clone(),
@@ -2578,6 +3122,39 @@ impl SessionRegistry {
         );
         let _ = self.inner.events.send(event);
     }
+}
+
+type WorkerIdentityFingerprint = (
+    Option<pohunek_worker_protocol::ReportedLaunchIdentity>,
+    Option<pohunek_worker_protocol::ActiveIdentityClaim>,
+    Option<pohunek_worker_protocol::ReleasedIdentityClaim>,
+);
+
+fn worker_identity_fingerprint(
+    snapshot: &pohunek_worker_protocol::InspectSnapshot,
+) -> WorkerIdentityFingerprint {
+    (
+        snapshot.launch_identity.clone(),
+        snapshot.active_identity.clone(),
+        snapshot.active_identity_release.clone(),
+    )
+}
+
+fn worker_identity_is_empty(identity: &WorkerIdentityFingerprint) -> bool {
+    identity.0.is_none() && identity.1.is_none() && identity.2.is_none()
+}
+
+fn identity_claim_expiry_is_valid(value: &str) -> bool {
+    let Ok(expires_at) = OffsetDateTime::parse(value, &Rfc3339) else {
+        return false;
+    };
+    let now = OffsetDateTime::now_utc();
+    let max_expiry = now
+        + time::Duration::seconds(
+            i64::try_from(protocol::MAX_IDENTITY_CLAIM_TTL_SECS)
+                .expect("identity TTL ceiling fits i64"),
+        );
+    expires_at > now && expires_at <= max_expiry
 }
 
 fn event_payload<T>(payload: T) -> Value
@@ -2615,7 +3192,7 @@ fn external_session_info(
     association: Option<CwdAssociation>,
 ) -> SessionInfo {
     let now = timestamp_now();
-    let agent = agent_kind_label(agent_base).to_owned();
+    let agent = agent_kind_label(&agent_base).to_owned();
     let (native_session_id, native_session_path) = candidate.map_or((None, None), |candidate| {
         (
             candidate.native_session_id,
@@ -2626,6 +3203,7 @@ fn external_session_info(
     SessionInfo {
         id: external_session_id(fact.pid),
         external: Some(true),
+        capabilities: protocol::SessionCapabilities::default(),
         name: None,
         agent,
         agent_base,
@@ -2820,17 +3398,19 @@ fn is_terminal(state: SessionState) -> bool {
     state.is_terminal()
 }
 
-fn agent_kind_label(agent: AgentKind) -> &'static str {
+fn agent_kind_label(agent: &AgentKind) -> &str {
     match agent {
         AgentKind::Shell => "shell",
         AgentKind::Codex => "codex",
         AgentKind::Claude => "claude",
+        AgentKind::Hermes => "hermes",
+        AgentKind::Unknown(value) => value,
     }
 }
 
 fn detector_config_for_resolved_agent(resolved: &ResolvedAgent) -> DetectorConfig {
     DetectorConfig::for_profile(
-        resolved.base,
+        &resolved.base,
         resolved
             .profile
             .as_ref()
@@ -2841,7 +3421,7 @@ fn detector_config_for_resolved_agent(resolved: &ResolvedAgent) -> DetectorConfi
 fn bind_report_pid(
     entry: &SessionEntry,
     reported_pid: Option<Pid>,
-    agent_base: AgentKind,
+    agent_base: &AgentKind,
 ) -> Option<Pid> {
     if let Some(pid) = reported_pid {
         // PID-bearing hooks are exact claims. If procwatch has not observed the
@@ -2853,7 +3433,7 @@ fn bind_report_pid(
     let mut matching = entry
         .observed_agents
         .iter()
-        .filter(|observed| observed.agent_base == agent_base)
+        .filter(|observed| &observed.agent_base == agent_base)
         .map(|observed| observed.pid);
     let first = matching.next()?;
     matching.next().is_none().then_some(first)
@@ -2894,6 +3474,14 @@ fn report_is_current(
         return true;
     }
     seq_is_current(current.seq, seq)
+}
+
+fn native_report_is_current(
+    current: Option<&NativeIdentityReport>,
+    runtime_id: &str,
+    sequence: u64,
+) -> bool {
+    current.is_none_or(|current| current.runtime_id != runtime_id || sequence > current.sequence)
 }
 
 fn release_matches(
@@ -3017,6 +3605,32 @@ fn runtime_state_label(state: RuntimeState) -> &'static str {
 
 fn runtime_error(code: impl Into<String>, msg: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ErrorClass::Runtime, code, msg, None)
+}
+
+fn validate_observation_config(config: &SessionRegistryConfig) -> Result<(), ProtocolError> {
+    let hard_wait_ceiling = Duration::from_millis(u64::from(protocol::MAX_SESSION_WAIT_MS));
+    let invalid = config.observation_output_bytes == 0
+        || config.observation_output_bytes > protocol::MAX_SESSION_OUTPUT_BYTES
+        || config.observation_output_wait.is_zero()
+        || config.observation_output_wait > hard_wait_ceiling
+        || config.session_wait.is_zero()
+        || config.session_wait > hard_wait_ceiling
+        || config.observation_screen_rows == 0
+        || config.observation_screen_cols == 0
+        || config.observation_screen_bytes == 0
+        || config.observation_screen_bytes > protocol::MAX_SESSION_SCREEN_RESPONSE_BYTES
+        || config.observation_global_waiters == 0
+        || config.observation_session_waiters == 0
+        || config.observation_session_waiters > config.observation_global_waiters;
+    if invalid {
+        return Err(ProtocolError::new(
+            ErrorClass::Configuration,
+            "observation_limits_invalid",
+            "daemon observation limits are zero, exceed protocol bounds, or conflict",
+            Some("fix the daemon observation configuration and restart".to_owned()),
+        ));
+    }
+    Ok(())
 }
 
 fn timestamp_now() -> String {

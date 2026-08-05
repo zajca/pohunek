@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "bun:test";
-import { PROTOCOL_VERSION, type ProtocolEvent } from "@pohunek/protocol";
+import { PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, type ProtocolEvent } from "@pohunek/protocol";
 import { startRelay, type RelayHandle } from "@pohunek/backend";
 import { startDurableWorkerFixture } from "@pohunek/testkit";
 import {
@@ -393,7 +393,7 @@ function daemonBinaryPath(): string {
 
 function subscribeRequest(id: string): Request {
   return {
-    v: PROTOCOL_VERSION,
+    v: SUPPORTED_PROTOCOL_VERSIONS,
     id,
     method: "subscribe",
     params: null,

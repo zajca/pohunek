@@ -3,4 +3,4 @@
 /**
  * The kind of agent backing a session.
  */
-export type AgentKind = "shell" | "codex" | "claude";
+export type AgentKind = string;

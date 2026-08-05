@@ -66,6 +66,31 @@ pub(crate) enum CliError {
         key: String,
     },
 
+    /// Input provided through stdin violated the CLI's bounded text contract.
+    #[error("invalid stdin input: {detail}")]
+    InvalidStdinInput {
+        /// Payload-free explanation suitable for diagnostics and logs.
+        detail: String,
+    },
+
+    /// Observation arguments failed the protocol's strict constructor checks.
+    #[error("invalid observation arguments: {detail}")]
+    InvalidObservation {
+        /// Payload-free validation message.
+        detail: String,
+    },
+
+    /// An exact display name identified more than one logical session.
+    #[error("session name is ambiguous; matching session ids: {candidates}")]
+    AmbiguousSessionName {
+        /// Stable, sorted comma-separated candidate ids.
+        candidates: String,
+    },
+
+    /// A long-running observation was cancelled by a local process signal.
+    #[error("operation cancelled by process signal")]
+    Cancelled,
+
     /// A remote `session new` named no target. No filesystem path crosses the
     /// wire to another host, so a remote session must be referenced by `--project`
     /// (or, for first-introduction, `--repo` with a path valid on that host). Fails
@@ -130,6 +155,10 @@ impl CliError {
     /// Every variant maps to a stable `{class, code, msg, recover?}` shape so a
     /// script can branch on `code`; a daemon-returned [`CliError::Protocol`]
     /// passes through unchanged (its class/code/recover are already canonical).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one exhaustive mapping keeps every CLI error code and recovery hint centralized"
+    )]
     pub(crate) fn to_protocol_error(&self) -> ProtocolError {
         match self {
             CliError::Protocol(err) => err.clone(),
@@ -160,6 +189,32 @@ impl CliError {
                 "cli_usage",
                 format!("duplicate --meta key {key:?} (each key may be set once)"),
                 Some("pass --meta only once per key; a repeated key would be ambiguous".to_owned()),
+            ),
+            CliError::InvalidStdinInput { detail } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "cli_usage",
+                format!("invalid stdin input: {detail}"),
+                Some("pass bounded UTF-8 text without disallowed control characters".to_owned()),
+            ),
+            CliError::InvalidObservation { detail } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "cli_usage",
+                format!("invalid observation arguments: {detail}"),
+                Some(
+                    "check cursor/runtime pairing, nonzero limits, and wait predicates".to_owned(),
+                ),
+            ),
+            CliError::AmbiguousSessionName { candidates } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "ambiguous_session_name",
+                format!("session name is ambiguous; matching session ids: {candidates}"),
+                Some("retry with one of the listed full session ids".to_owned()),
+            ),
+            CliError::Cancelled => ProtocolError::new(
+                ErrorClass::Runtime,
+                "cancelled",
+                "operation cancelled by process signal".to_owned(),
+                Some("retry the bounded operation when ready".to_owned()),
             ),
             CliError::RemoteTargetRequired => ProtocolError::new(
                 ErrorClass::Configuration,
@@ -261,12 +316,21 @@ pub(crate) fn render(err: &CliError, json: bool) {
 /// and clap usage errors alike) funnels through here so automation always
 /// receives exactly one parseable document on stdout and nothing human leaks.
 fn print_json_error(err: &ProtocolError) {
-    match serde_json::to_string_pretty(err) {
-        Ok(doc) => println!("{doc}"),
+    match crate::commands::render_json_error(err) {
+        Ok(doc) => print!("{doc}"),
         // Serializing our own typed error cannot fail in practice; fall back
         // to a minimal hand-built document rather than printing nothing.
         Err(_) => println!(
-            r#"{{"class":"daemon","code":"serialize_failed","msg":"failed to serialize error"}}"#
+            "{}",
+            serde_json::json!({
+                "cli_version": env!("CARGO_PKG_VERSION"),
+                "protocol": protocol::SUPPORTED_PROTOCOL_VERSIONS,
+                "err": {
+                    "class": "daemon",
+                    "code": "serialize_failed",
+                    "msg": "failed to serialize error"
+                }
+            })
         ),
     }
 }
@@ -352,13 +416,24 @@ pub(crate) fn render_clap_error(err: &clap::Error, json: bool) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use protocol::ProtocolVersion;
+    use protocol::{ProtocolVersion, ProtocolVersionRange};
 
     use super::*;
 
     #[test]
     fn protocol_error_passes_through_for_json() {
-        let pe = ProtocolError::version_mismatch(ProtocolVersion(1), ProtocolVersion(2));
+        let pe = ProtocolError::version_mismatch(
+            ProtocolVersionRange::new(
+                ProtocolVersion::new(1).expect("valid version"),
+                ProtocolVersion::new(1).expect("valid version"),
+            )
+            .expect("valid range"),
+            ProtocolVersionRange::new(
+                ProtocolVersion::new(2).expect("valid version"),
+                ProtocolVersion::new(2).expect("valid version"),
+            )
+            .expect("valid range"),
+        );
         let structured = CliError::Protocol(pe.clone()).to_protocol_error();
         assert_eq!(structured, pe);
         assert_eq!(structured.code, "version_mismatch");
@@ -448,8 +523,16 @@ mod tests {
     #[test]
     fn human_error_renders_recover_hint_for_version_mismatch() {
         let err = CliError::Protocol(ProtocolError::version_mismatch(
-            ProtocolVersion(1),
-            ProtocolVersion(2),
+            ProtocolVersionRange::new(
+                ProtocolVersion::new(1).expect("valid version"),
+                ProtocolVersion::new(1).expect("valid version"),
+            )
+            .expect("valid range"),
+            ProtocolVersionRange::new(
+                ProtocolVersion::new(2).expect("valid version"),
+                ProtocolVersion::new(2).expect("valid version"),
+            )
+            .expect("valid range"),
         ));
         let text = human_error_text(&err);
         // Names both versions (from the message) and the upgrade hint.

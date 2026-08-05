@@ -28,10 +28,7 @@ impl AgentAdapter for CodexAdapter {
     }
 
     fn input_rules(&self) -> InputRules {
-        InputRules {
-            bracketed_paste: true,
-            submit_delay: CODEX_SUBMIT_DELAY,
-        }
+        InputRules::unrestricted(true, CODEX_SUBMIT_DELAY)
     }
 
     fn manifest(&self) -> &Manifest {

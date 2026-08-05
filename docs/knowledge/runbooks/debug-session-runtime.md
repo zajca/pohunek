@@ -20,7 +20,8 @@ Start with public, non-destructive inspection:
    ready. Readiness follows worker discovery and reconciliation.
 2. Run `pohunek session inspect <target> --json`.
 3. Record `runtime.state`, `runtime.worker_id`, `runtime.runtime_id`,
-   `runtime.last_connected_at`, and `runtime.loss_reason`.
+   decimal-string `runtime.runtime_generation`, `runtime.last_connected_at`,
+   and `runtime.loss_reason`.
 4. On the session's host, inspect the unit without changing it:
    `systemctl --user status pohunek-session@<session-id>.service` and
    `systemctl --user show -p ActiveState -p SubState -p MainPID
@@ -60,11 +61,49 @@ After health returns, the same `worker_id`, `runtime_id`, worker `MainPID`, and
 agent child PID demonstrate reconnection. A new runtime id means explicit
 recovery or a defect; it is not normal daemon restart behavior.
 
+If a lifecycle or runtime operation returns
+`runtime/session_runtime_commit_stale`, it lost a concurrent durable runtime
+commit. Its candidate was not published to the session registry or event
+stream. Run `pohunek session inspect <target> --json` again and treat the
+returned runtime identity, decimal generation, and state as authoritative.
+Retry only when the operation is still valid from that current runtime; do not
+reuse the losing operation's runtime coordinates.
+
+Do not interpret this error as a failed atomic rename or uncertain disk commit.
+When rename succeeds but the parent-directory durability sync fails, the daemon
+keeps the visible commit applied and writes a sanitized internal warning. It
+does not return `session_runtime_commit_stale` for that condition.
+
+For non-destructive terminal diagnosis, start without a historical cursor:
+
+```bash
+pohunek session screen <target> --json
+pohunek session output <target> --max-bytes 65536 --json
+```
+
+Carry the returned `runtime_id`, `runtime_generation`, and `next_offset` into a
+continued output read or `session wait`. `session_runtime_changed` means the
+cursor belongs to an older PTY generation; restart from a fresh screen/tail.
+`session_terminal_unavailable` means the managed worker cannot currently serve
+the terminal; `session_has_no_managed_terminal` identifies an external observer
+entry. `worker_feature_unavailable` means a previous-version worker remains
+usable for lifecycle/attach but cannot provide control-plane observation.
+`session_waiter_limit_reached` is temporary bounded resource pressure; wait no
+longer than eight seconds and retry instead of opening unbounded parallel waits.
+
 Do not run `systemctl --user restart pohunek-session@<id>.service`. Worker units
 use `Restart=no` because once a worker exits its PTY cannot be recreated. An
 administrative worker stop kills that unit's process group and therefore loses
 the runtime generation. Use `pohunek session stop <session-id>` for an
 intentional session stop.
+
+For a Hermes runtime, first run `pohunek host inspect local --json`. The runtime
+must identify `agent_base: "hermes"`, `version: "0.20.0"`, and
+`supported: true` before starting a new Hermes session. A missing executable
+has no version-policy fields; an installed but unparseable or wrong version is
+`supported: false`. Do not diagnose by opening, copying, or editing Hermes
+`state.db` or the operator's real `HERMES_HOME`. The compatibility commands use
+their own temporary homes.
 
 For the first worker-aware installation, let all legacy sessions finish or stop
 them explicitly. The archive installer lists live sessions that lack durable

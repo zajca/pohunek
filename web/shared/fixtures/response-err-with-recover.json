@@ -6,5 +6,5 @@
     "recover": "install the codex CLI and ensure it is on PATH; run `pohunek doctor` to verify"
   },
   "id": "req-fixture-1",
-  "v": 1
+  "v": 2
 }

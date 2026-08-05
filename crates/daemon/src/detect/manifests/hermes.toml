@@ -1,0 +1,90 @@
+# Hermes Agent 0.20.0 activity manifest for both local terminal interfaces.
+
+[process]
+comm = ["^hermes$"]
+cmdline = [
+  '^(?:[^ ]*/)?hermes(?: .*)?$',
+  '^(?:[^ ]*/)?(?:python|python3(?:\.\d+)?) -m hermes_cli(?:\.main)?(?: .*)?$',
+  '^(?:[^ ]*/)?(?:python|python3(?:\.\d+)?) (?:[^ ]*/)?hermes_cli/main\.py(?: .*)?$',
+]
+
+# Startup failures leave the process at a visible terminal error that requires
+# owner intervention. Keep these signatures specific to Hermes startup paths.
+[[rules]]
+id = "fatal_startup"
+state = "blocked"
+priority = 1000
+region = "whole_recent"
+visible_blocker = true
+any = [
+  { contains = ["Failed to initialize agent:"] },
+  { contains = ["required API key(s) missing:"] },
+]
+
+# The prompt_toolkit approval panel remains visible until the owner selects a
+# choice. Requiring both the title and a concrete choice avoids matching prose.
+[[rules]]
+id = "dangerous_command_approval"
+state = "blocked"
+priority = 950
+region = "bottom_non_empty_lines(16)"
+visible_blocker = true
+contains = ["Dangerous Command", "Allow once", "Deny"]
+
+# The alternate-screen Ink TUI renders a different heading but shares the
+# concrete choices and remains visible until the owner selects one.
+[[rules]]
+id = "tui_approval"
+state = "blocked"
+priority = 950
+region = "bottom_non_empty_lines(16)"
+visible_blocker = true
+contains = ["approval required", "Allow once", "Deny"]
+
+# During a model turn the classic prompt changes from the idle arrow to the
+# Hermes staff symbol. The bottom-lines bound prevents old transcript chrome
+# from keeping the session working after the prompt returns to idle.
+[[rules]]
+id = "active_turn_prompt"
+state = "working"
+priority = 700
+region = "bottom_non_empty_lines(8)"
+line_regex = ['^\s*⚕\s+(?:❯|>|\$|#|›|»|→)\s*$']
+
+# Reasoning and tool progress are painted immediately above the prompt while a
+# turn is active. These bounded signatures cover narrow terminals where the
+# prompt line itself is temporarily displaced.
+[[rules]]
+id = "active_turn_progress"
+state = "working"
+priority = 650
+region = "bottom_non_empty_lines(8)"
+any = [
+  { line_regex = ['^\s*\[thinking\]\s+\S'] },
+  { contains = ["◆ aggregating"] },
+]
+
+# The alternate-screen TUI replaces an empty composer hint while a turn runs.
+[[rules]]
+id = "tui_active_turn"
+state = "working"
+priority = 650
+region = "bottom_non_empty_lines(8)"
+contains = ["Ctrl+C to interrupt…"]
+
+# The classic idle prompt is an arrow, optionally prefixed by the active Hermes
+# profile name. It must lose to approval and working signatures above.
+[[rules]]
+id = "idle_prompt"
+state = "idle"
+priority = 300
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^\s*(?:[A-Za-z0-9._-]+\s+)?(?:❯|>|\$|#|›|»|→)\s*$']
+
+# The alternate-screen TUI pins its stable readiness state in the bottom rule.
+[[rules]]
+id = "tui_idle_status"
+state = "idle"
+priority = 300
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^\s*─\s+ready(?:\s|│|$)']

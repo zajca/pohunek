@@ -1,0 +1,20 @@
+{
+  "id": "req-output-fixture-1",
+  "ok": {
+    "data_base64": "b2s=",
+    "gap": {
+      "end_offset": "4",
+      "start_offset": "2"
+    },
+    "has_more": false,
+    "history_start_offset": "4",
+    "next_offset": "6",
+    "runtime_end_offset": "6",
+    "runtime_generation": "3",
+    "runtime_id": "runtime-fixture-1",
+    "session_id": "s-fixture-1",
+    "start_offset": "4",
+    "timed_out": false
+  },
+  "v": 2
+}

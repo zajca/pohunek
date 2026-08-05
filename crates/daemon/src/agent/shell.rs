@@ -21,10 +21,7 @@ impl AgentAdapter for ShellAdapter {
     }
 
     fn input_rules(&self) -> InputRules {
-        InputRules {
-            bracketed_paste: false,
-            submit_delay: Duration::ZERO,
-        }
+        InputRules::unrestricted(false, Duration::ZERO)
     }
 
     fn manifest(&self) -> &Manifest {

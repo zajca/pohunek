@@ -1,10 +1,13 @@
-import type { ProtocolError, ProtocolVersion } from "@pohunek/protocol";
+import type { ProtocolError, ProtocolVersion, ProtocolVersionRange } from "@pohunek/protocol";
+import { hasValidWireOrigin } from "./origin";
 
 export interface Request {
-  v: ProtocolVersion;
+  v: ProtocolVersionRange;
   id: string;
   method: string;
   params: unknown;
+  origin_session_id?: string;
+  origin_daemon_id?: string;
 }
 
 export interface OkResponse {
@@ -32,10 +35,28 @@ export function isRequest(value: unknown): value is Request {
     return false;
   }
   return (
-    typeof value["v"] === "number" &&
+    isProtocolVersionRange(value["v"]) &&
     typeof value["id"] === "string" &&
     typeof value["method"] === "string" &&
-    hasOwn(value, "params")
+    hasOwn(value, "params") &&
+    hasValidWireOrigin(value["origin_session_id"], value["origin_daemon_id"])
+  );
+}
+
+export function isProtocolVersionRange(value: unknown): value is ProtocolVersionRange {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const keys = Object.keys(value);
+  const minimum = value["minimum"];
+  const maximum = value["maximum"];
+  return (
+    keys.length === 2
+    && keys.includes("minimum")
+    && keys.includes("maximum")
+    && isProtocolVersion(minimum)
+    && isProtocolVersion(maximum)
+    && minimum <= maximum
   );
 }
 
@@ -44,7 +65,7 @@ export function isOkResponse(value: unknown): value is OkResponse {
     return false;
   }
   return (
-    typeof value["v"] === "number" &&
+    isProtocolVersion(value["v"]) &&
     typeof value["id"] === "string" &&
     hasOwn(value, "ok") &&
     !hasOwn(value, "err")
@@ -56,7 +77,7 @@ export function isErrResponse(value: unknown): value is ErrResponse {
     return false;
   }
   return (
-    typeof value["v"] === "number" &&
+    isProtocolVersion(value["v"]) &&
     typeof value["id"] === "string" &&
     !hasOwn(value, "ok") &&
     isProtocolError(value["err"])
@@ -79,10 +100,14 @@ export function isEvent(value: unknown): value is Event {
   }
   const id = value["id"];
   return (
-    typeof value["v"] === "number" &&
+    isProtocolVersion(value["v"]) &&
     typeof value["event"] === "string" &&
     (id === undefined || typeof id === "string")
   );
+}
+
+function isProtocolVersion(value: unknown): value is ProtocolVersion {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
 function isProtocolError(value: unknown): value is ProtocolError {

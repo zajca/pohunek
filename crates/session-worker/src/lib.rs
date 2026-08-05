@@ -8,7 +8,7 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-07-23
+// Rust guideline compliant 2026-08-04
 
 mod config;
 mod error;
@@ -28,13 +28,14 @@ pub use input::{InputError, InputFragment, InputPlan, WriteCoordinator};
 #[doc(inline)]
 pub use journal::{
     ActiveIdentity, ChildIdentity, Journal, JournalError, JournalRecord, LaunchIdentity,
-    RuntimeOutcome, RuntimePhase,
+    ReleasedIdentity, RuntimeOutcome, RuntimePhase,
 };
 #[doc(inline)]
 pub use lease::{ControllerLease, LeaseError, LeaseOwner};
 #[doc(inline)]
 pub use output::{
-    OutputChunk, OutputEvent, OutputHub, OutputSnapshot, OutputSubscriber, RingError, TerminalChunk,
+    ObservationPage, OutputChunk, OutputEvent, OutputHub, OutputSnapshot, OutputSubscriber,
+    RingError, TerminalChunk,
 };
 #[doc(inline)]
 pub use pohunek_terminal::TerminalSnapshot;

@@ -44,10 +44,11 @@ impl SessionRegistry {
             if entry.info.state != SessionState::Running {
                 return Err(session_not_running(session_id));
             }
+            entry.input_rules.validate_activity(entry.info.activity)?;
             (entry.runtime.clone(), entry.input_rules)
         };
 
-        let writes = build_input_writes(text, rules);
+        let writes = build_input_writes(text, rules)?;
         match runtime {
             RuntimeHandle::Worker(worker) => {
                 let mut fragments = Vec::with_capacity(2);
@@ -83,7 +84,7 @@ pub(super) fn plan_initial_input_delivery(
     mut command: LaunchCommand,
     initial_input: Option<String>,
 ) -> LaunchCommandPlan {
-    if resolved.profile.is_none() && prompt_arg_supported(resolved.base) {
+    if resolved.profile.is_none() && prompt_arg_supported(&resolved.base) {
         if let Some(input) = initial_input {
             command.args.push(input);
         }
@@ -99,22 +100,26 @@ pub(super) fn plan_initial_input_delivery(
     }
 }
 
-pub(super) fn prompt_arg_supported(agent: AgentKind) -> bool {
+pub(super) fn prompt_arg_supported(agent: &AgentKind) -> bool {
     matches!(agent, AgentKind::Codex | AgentKind::Claude)
 }
 
 pub(super) fn input_rules_for_agent(
-    agent: AgentKind,
+    agent: &AgentKind,
     config: &SessionRegistryConfig,
 ) -> InputRules {
     let mut rules = adapter_for(agent).input_rules();
-    if agent == AgentKind::Claude {
+    if *agent == AgentKind::Claude {
         rules.submit_delay = config.claude_submit_delay;
     }
     rules
 }
 
-pub(super) fn build_input_writes(text: &str, rules: InputRules) -> InputWritePlan {
+pub(super) fn build_input_writes(
+    text: &str,
+    rules: InputRules,
+) -> Result<InputWritePlan, ProtocolError> {
+    rules.validate_text(text)?;
     let mut immediate = Vec::new();
     if rules.bracketed_paste {
         immediate.extend_from_slice(BRACKETED_PASTE_START);
@@ -131,8 +136,8 @@ pub(super) fn build_input_writes(text: &str, rules: InputRules) -> InputWritePla
         Some((rules.submit_delay, SUBMIT.to_vec()))
     };
 
-    InputWritePlan {
+    Ok(InputWritePlan {
         immediate,
         delayed_submit,
-    }
+    })
 }

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { PROTOCOL_VERSION, type ProtocolEvent } from "@pohunek/protocol";
+import { PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, type ProtocolEvent } from "@pohunek/protocol";
 import {
   Client,
   ClientError,
@@ -12,6 +12,7 @@ import {
   errResponseLine,
   minimalSessionInfo,
   okResponseLine,
+  parseRequestLine,
   requestIdFromLine,
   startUnixDaemon,
 } from "./mock-daemon";
@@ -104,6 +105,29 @@ describe("Subscription", () => {
     }
   });
 
+  test("configured origin is added to a subscription request", async () => {
+    const request = subscribeRequest("subscribe-origin");
+    const daemon = await startUnixDaemon([
+      {
+        kind: "subscription",
+        ack: (requestLine) => okResponseLine(requestIdFromLine(requestLine), { subscribed: true }),
+        events: [],
+      },
+    ]);
+    try {
+      const client = await connectClient(daemon, {
+        origin: { sessionId: "s-origin", daemonId: "daemon-origin" },
+      });
+      const subscription = await client.subscribe(request);
+      const sent = parseRequestLine(await daemon.nextRequest());
+      expect(sent["origin_session_id"]).toBe("s-origin");
+      expect(sent["origin_daemon_id"]).toBe("daemon-origin");
+      expect(await subscription.nextLine()).toBeNull();
+    } finally {
+      await daemon.close();
+    }
+  });
+
   test("subscription ack errors preserve protocol class and code", async () => {
     const request = subscribeRequest("subscribe-error");
     const daemonError = {
@@ -156,7 +180,7 @@ describe("Subscription", () => {
 
 function subscribeRequest(id: string): Request {
   return {
-    v: PROTOCOL_VERSION,
+    v: SUPPORTED_PROTOCOL_VERSIONS,
     id,
     method: "subscribe",
     params: null,
@@ -182,12 +206,15 @@ async function expectClientError(promise: Promise<unknown>): Promise<ClientError
   throw new Error("expected promise to reject with ClientError");
 }
 
-async function connectClient(daemon: Awaited<ReturnType<typeof startUnixDaemon>>): Promise<Client> {
+async function connectClient(
+  daemon: Awaited<ReturnType<typeof startUnixDaemon>>,
+  options?: import("@pohunek/sdk").ConnectOptions,
+): Promise<Client> {
   if (daemon.endpoint.kind === "unix") {
-    return connectLocal(daemon.endpoint.socketPath);
+    return connectLocal(daemon.endpoint.socketPath, options);
   }
   if (daemon.endpoint.kind === "memory") {
-    return Client.connectTransport(daemon.endpoint.transport);
+    return Client.connectTransport(daemon.endpoint.transport, options);
   }
-  return connectTcp("build-box", { host: daemon.endpoint.host, port: daemon.endpoint.port });
+  return connectTcp("build-box", { host: daemon.endpoint.host, port: daemon.endpoint.port }, options);
 }

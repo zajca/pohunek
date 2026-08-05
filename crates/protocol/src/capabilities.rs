@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::version::ProtocolVersion;
+use crate::{version::ProtocolVersion, AgentKind};
 
 /// One agent runtime's availability on a host.
 ///
@@ -27,18 +27,37 @@ use crate::version::ProtocolVersion;
 pub struct AgentRuntime {
     /// Agent profile or built-in base name this runtime entry describes.
     pub agent: String,
+    /// Compiled adapter used to launch this runtime, when reported by the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub agent_base: Option<AgentKind>,
     /// Whether the agent's backing binary is available on the host.
     pub available: bool,
     /// Resolved path to the agent binary, when one was found.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub path: Option<String>,
+    /// Normalized runtime version, when a provider-specific probe recognized it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub version: Option<String>,
+    /// Whether the detected version is supported by this daemon.
+    ///
+    /// `None` means the runtime has no compiled version policy. A present
+    /// runtime with an unparseable version reports `Some(false)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub supported: Option<bool>,
 }
 
 /// Live capability snapshot returned by `host.inspect`.
 ///
 /// Built fresh on each request from the host's running daemon and a probe of its
 /// `PATH`; it is never cached, so it always reflects the host as it is now.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the wire snapshot exposes independent host feature flags"
+)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "HostCapabilities.ts"))]
@@ -57,4 +76,10 @@ pub struct HostCapabilities {
     /// Whether worktree-per-session is supported on the host (currently implied
     /// by [`git_available`](Self::git_available)).
     pub worktree_supported: bool,
+    /// Whether managed sessions support point-in-time terminal snapshots.
+    pub terminal_read_supported: bool,
+    /// Whether managed sessions support bounded retained-output reads.
+    pub output_read_supported: bool,
+    /// Whether managed sessions support bounded `session.wait` long polls.
+    pub session_wait_supported: bool,
 }

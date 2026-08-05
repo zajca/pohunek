@@ -16,6 +16,8 @@ export {
   isRequest,
 } from "./envelope";
 export type { ErrResponse, Event, OkResponse, Request, Response } from "./envelope";
+export { resolveRequestOrigin } from "./origin";
+export type { RequestOrigin } from "./origin";
 export {
   DEFAULT_CONNECT_TIMEOUT_MS,
   DEFAULT_REQUEST_TIMEOUT_MS,

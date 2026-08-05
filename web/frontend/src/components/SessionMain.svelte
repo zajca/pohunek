@@ -3,6 +3,7 @@
     HostedSession,
     Workspace,
   } from "@pohunek/client-core";
+  import { hasAttachableSessionAgentBases, sessionAgentLabel } from "../lib";
   import EmbeddedTerminal from "./EmbeddedTerminal.svelte";
   import SessionLifecycleActions from "./SessionLifecycleActions.svelte";
 
@@ -17,7 +18,11 @@
 
   let { workspace, entry, ondetails, onclose, onnewsession, onselect }: Props = $props();
 
-  const canAttach = $derived(entry?.session.state === "running" && entry.session.external !== true);
+  const canAttach = $derived(
+    entry?.session.state === "running"
+      && entry.session.external !== true
+      && hasAttachableSessionAgentBases(entry.session.agent_base, entry.session.active_agent_base),
+  );
 
   function openDetails(): void {
     if (entry !== undefined) {
@@ -27,6 +32,13 @@
 
   function sessionTitle(selected: HostedSession): string {
     return selected.session.name ?? selected.session.branch ?? selected.session.id;
+  }
+
+  function agentLabel(selected: HostedSession): string {
+    const session = selected.session;
+    return session.active_agent !== undefined
+      ? sessionAgentLabel(session.active_agent, session.active_agent_base)
+      : sessionAgentLabel(session.agent, session.agent_base);
   }
 
   function summaryTitle(selected: HostedSession): string {
@@ -92,7 +104,7 @@
           <span>{entry.session.project_label ?? entry.session.repo ?? "No project"}</span>
           {#if entry.session.branch !== undefined}<span> / {entry.session.branch}</span>{/if}
           <span> · {entry.host}</span>
-          <span> · {entry.session.active_agent ?? entry.session.agent}</span>
+          <span> · {agentLabel(entry)}</span>
         </p>
       </div>
       <div class="session-toolbar-actions">
@@ -119,7 +131,7 @@
         <h3>{summaryTitle(entry)}</h3>
         <p>{summaryBody(entry)}</p>
         <dl>
-          <div><dt>Agent</dt><dd>{entry.session.active_agent ?? entry.session.agent}</dd></div>
+          <div><dt>Agent</dt><dd>{agentLabel(entry)}</dd></div>
           <div><dt>Host</dt><dd>{entry.host}</dd></div>
           <div><dt>Working directory</dt><dd>{entry.session.cwd}</dd></div>
           {#if entry.session.activity !== undefined}

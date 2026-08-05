@@ -250,6 +250,7 @@ pub(crate) fn subscribe_request() -> Request {
         method::SUBSCRIBE,
         Value::Null,
     )
+    .expect("the SDK request ID generator and subscribe method constant are valid")
 }
 
 pub(crate) async fn connect_client(
@@ -272,7 +273,7 @@ pub(crate) async fn connect_client(
 
 pub(crate) fn parse_event_message(host_id: &HostId, line: &str) -> Result<DomainEvent, CoreError> {
     let raw: Event = serde_json::from_str(line)?;
-    let event = match raw.event.as_str() {
+    let event = match raw.event() {
         event::AGENT_STATE => HostEvent::AgentState(parse_agent_state(raw)?),
         event::SESSION_CREATED => HostEvent::SessionCreated(parse_session_event(&raw)?),
         event::SESSION_UPDATED => HostEvent::SessionUpdated(parse_session_event(&raw)?),
@@ -302,24 +303,24 @@ pub(crate) fn parse_event_message(host_id: &HostId, line: &str) -> Result<Domain
 }
 
 fn parse_notification_created(raw: &Event) -> Result<NotificationRecord, CoreError> {
-    let event: NotificationCreatedEvent = serde_json::from_value(raw.payload.clone())?;
+    let event: NotificationCreatedEvent = serde_json::from_value(raw.payload().clone())?;
     Ok(event.record)
 }
 
 fn parse_notification_updated(raw: &Event) -> Result<NotificationRecord, CoreError> {
-    let event: NotificationUpdatedEvent = serde_json::from_value(raw.payload.clone())?;
+    let event: NotificationUpdatedEvent = serde_json::from_value(raw.payload().clone())?;
     Ok(event.record)
 }
 
 fn parse_notification_deleted(raw: &Event) -> Result<NotificationId, CoreError> {
-    let event: NotificationDeletedEvent = serde_json::from_value(raw.payload.clone())?;
+    let event: NotificationDeletedEvent = serde_json::from_value(raw.payload().clone())?;
     Ok(event.notification_id)
 }
 
 pub(crate) fn parse_agent_state(raw: Event) -> Result<AgentStateEvent, CoreError> {
-    let session_id = required_str(&raw.payload, "session_id")?;
-    let activity = required_typed::<AgentActivity>(&raw.payload, "activity")?;
-    let source = required_typed::<StateSource>(&raw.payload, "source")?;
+    let session_id = required_str(raw.payload(), "session_id")?;
+    let activity = required_typed::<AgentActivity>(raw.payload(), "activity")?;
+    let source = required_typed::<StateSource>(raw.payload(), "source")?;
     Ok(AgentStateEvent {
         session_id: SessionId(session_id.to_owned()),
         activity,
@@ -330,7 +331,7 @@ pub(crate) fn parse_agent_state(raw: Event) -> Result<AgentStateEvent, CoreError
 
 fn parse_session_event(raw: &Event) -> Result<SessionInfo, CoreError> {
     let session = raw
-        .payload
+        .payload()
         .get("session")
         .ok_or(CoreError::MissingSessionEventPayload)?;
     Ok(serde_json::from_value(session.clone())?)

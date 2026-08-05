@@ -2,15 +2,18 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::{SinkExt, StreamExt};
 use protocol::{
-    AttachHeader, Event, Method, ProtocolError, ProtocolVersion, Request, Response,
-    MAX_CONTROL_LINE_BYTES,
+    AttachHeader, Event, Method, ProtocolError, ProtocolVersion, ProtocolVersionRange, Request,
+    Response, SessionId, SessionOutputParams, SessionOutputResult, SessionResizeParams,
+    SessionResizeResult, SessionResumeResult, SessionScreenParams, SessionScreenResult,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionWaitParams, SessionWaitResult,
+    ENV_DAEMON_ID, ENV_SESSION_ID, MAX_CONTROL_LINE_BYTES,
 };
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -23,17 +26,80 @@ use crate::ClientError;
 pub const LOCAL_HOST: &str = "local";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Transport processing budget added after a validated daemon-side wait.
+///
+/// One second leaves room for request framing, waiter teardown, scheduling,
+/// response serialization, and local mesh latency without racing the daemon's
+/// authoritative bounded-wait deadline.
+const DEDICATED_WAIT_TRANSPORT_HEADROOM: Duration = Duration::from_secs(1);
 
 /// A connected SDK client over either the local Unix socket or remote TCP.
 #[derive(Debug)]
 pub struct Client {
     inner: ClientInner,
+    endpoint: Endpoint,
+    options: ClientOptions,
+    selected_version: Option<ProtocolVersion>,
+    origin: Option<RequestOrigin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RequestOrigin {
+    session_id: SessionId,
+    daemon_id: String,
+}
+
+impl RequestOrigin {
+    pub(crate) fn from_environment() -> Result<Option<Self>, ClientError> {
+        Self::from_values(
+            read_origin_environment(ENV_SESSION_ID)?,
+            read_origin_environment(ENV_DAEMON_ID)?,
+        )
+    }
+
+    pub(crate) fn from_values(
+        session_id: Option<String>,
+        daemon_id: Option<String>,
+    ) -> Result<Option<Self>, ClientError> {
+        match (session_id, daemon_id) {
+            (None, None) => Ok(None),
+            (Some(session_id), Some(daemon_id)) => {
+                let origin = Self {
+                    session_id: SessionId(session_id),
+                    daemon_id,
+                };
+                origin
+                    .apply(
+                        Request::new("origin-validation", "daemon.health", Value::Null)
+                            .expect("constant validation request is valid"),
+                    )
+                    .map_err(|_error| ClientError::InvalidOriginEnvironment)?;
+                Ok(Some(origin))
+            }
+            _ => Err(ClientError::IncompleteOriginEnvironment),
+        }
+    }
+
+    pub(crate) fn apply(&self, request: Request) -> Result<Request, ClientError> {
+        request
+            .with_origin(Some(self.session_id.clone()), Some(self.daemon_id.clone()))
+            .map_err(|_error| ClientError::InvalidOriginEnvironment)
+    }
+}
+
+fn read_origin_environment(name: &str) -> Result<Option<String>, ClientError> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_value)) => Err(ClientError::InvalidOriginEnvironment),
+    }
 }
 
 /// A live subscription connection that yields raw event JSON lines.
 #[derive(Debug)]
 pub struct Subscription {
     inner: SubscriptionInner,
+    selected_version: ProtocolVersion,
 }
 
 /// A raw, unframed control connection used for attach byte streams.
@@ -87,6 +153,13 @@ enum ClientInner {
     Remote(Conn<TcpStream>),
 }
 
+/// Reconnectable destination for dedicated bounded wait connections.
+#[derive(Debug, Clone)]
+enum Endpoint {
+    Local(PathBuf),
+    Remote { host: String, addr: SocketAddr },
+}
+
 #[derive(Debug)]
 enum SubscriptionInner {
     Local(Conn<UnixStream>),
@@ -116,6 +189,9 @@ impl Client {
         socket_path: impl AsRef<Path>,
         options: ClientOptions,
     ) -> Result<Self, ClientError> {
+        // Validate the atomic pair before local dialing or remote discovery so
+        // a partial marker can never escape on a request or be masked by I/O.
+        RequestOrigin::from_environment()?;
         if is_local_host(host) {
             Self::connect_local_with_options(socket_path, options).await
         } else {
@@ -134,11 +210,16 @@ impl Client {
         socket_path: impl AsRef<Path>,
         options: ClientOptions,
     ) -> Result<Self, ClientError> {
+        let origin = RequestOrigin::from_environment()?;
         let socket_path = socket_path.as_ref();
         let stream = connect_unix(socket_path, options.connect_timeout).await?;
 
         Ok(Self {
             inner: ClientInner::Local(Conn::new(stream, None, options)),
+            endpoint: Endpoint::Local(socket_path.to_path_buf()),
+            options,
+            selected_version: None,
+            origin,
         })
     }
 
@@ -156,19 +237,28 @@ impl Client {
         addr: SocketAddr,
         options: ClientOptions,
     ) -> Result<Self, ClientError> {
+        let origin = RequestOrigin::from_environment()?;
         let host = host.into();
         let stream = connect_tcp(&host, addr, options.connect_timeout).await?;
 
         Ok(Self {
-            inner: ClientInner::Remote(Conn::new(stream, Some(host), options)),
+            inner: ClientInner::Remote(Conn::new(stream, Some(host.clone()), options)),
+            endpoint: Endpoint::Remote { host, addr },
+            options,
+            selected_version: None,
+            origin,
         })
     }
 
     /// Send one framed control request and return the daemon's `ok` payload.
     pub async fn request(&mut self, request: &Request) -> Result<Value, ClientError> {
+        let request = match &self.origin {
+            Some(origin) => origin.apply(request.clone())?,
+            None => request.clone(),
+        };
         match &mut self.inner {
-            ClientInner::Local(conn) => conn.request(request).await,
-            ClientInner::Remote(conn) => conn.request(request).await,
+            ClientInner::Local(conn) => conn.request(&request, &mut self.selected_version).await,
+            ClientInner::Remote(conn) => conn.request(&request, &mut self.selected_version).await,
         }
     }
 
@@ -185,15 +275,133 @@ impl Client {
             next_request_id(M::NAME),
             M::NAME,
             serde_json::to_value(params)?,
-        );
+        )?;
         let value = self.request(&request).await?;
         Ok(serde_json::from_value(value)?)
     }
 
     /// Probe the daemon and return the negotiated protocol version it reports.
     pub async fn handshake(&mut self) -> Result<ProtocolVersion, ClientError> {
-        let result = self.call::<protocol::method::DaemonHealth>(()).await?;
-        Ok(result.protocol_version)
+        let _result = self.call::<protocol::method::DaemonHealth>(()).await?;
+        self.selected_version.ok_or_else(|| {
+            ClientError::Framing(
+                "daemon health response did not select a protocol version".to_owned(),
+            )
+        })
+    }
+
+    /// Returns the version selected by the first valid response on this connection.
+    #[must_use]
+    pub const fn selected_version(&self) -> Option<ProtocolVersion> {
+        self.selected_version
+    }
+
+    /// Read one current terminal screen from the connected host.
+    pub async fn session_screen(
+        &mut self,
+        params: SessionScreenParams,
+    ) -> Result<SessionScreenResult, ClientError> {
+        self.call::<protocol::method::SessionScreen>(params).await
+    }
+
+    /// Read bounded retained output, using a dedicated connection when it waits.
+    pub async fn session_output(
+        &mut self,
+        params: SessionOutputParams,
+    ) -> Result<SessionOutputResult, ClientError> {
+        if let Some(wait_ms) = params.wait_ms() {
+            self.call_dedicated::<protocol::method::SessionOutput>(params, wait_ms)
+                .await
+        } else {
+            self.call::<protocol::method::SessionOutput>(params).await
+        }
+    }
+
+    /// Wait for a session predicate on a dedicated bounded connection.
+    pub async fn session_wait(
+        &mut self,
+        params: SessionWaitParams,
+    ) -> Result<SessionWaitResult, ClientError> {
+        let timeout_ms = params.timeout_ms();
+        self.call_dedicated::<protocol::method::SessionWait>(params, timeout_ms)
+            .await
+    }
+
+    /// Resume one logical session through the typed lifecycle API.
+    pub async fn session_resume(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<SessionResumeResult, ClientError> {
+        self.call::<protocol::method::SessionResume>(session_id)
+            .await
+    }
+
+    /// Resize one managed terminal through the typed lifecycle API.
+    pub async fn session_resize(
+        &mut self,
+        params: SessionResizeParams,
+    ) -> Result<SessionResizeResult, ClientError> {
+        self.call::<protocol::method::SessionResize>(params).await
+    }
+
+    /// Merge owner-controlled session metadata through the typed lifecycle API.
+    pub async fn session_set_metadata(
+        &mut self,
+        params: SessionSetMetadataParams,
+    ) -> Result<SessionSetMetadataResult, ClientError> {
+        self.call::<protocol::method::SessionSetMetadata>(params)
+            .await
+    }
+
+    /// List authenticated and quarantined managed worker runtimes.
+    pub async fn session_runtime_inventory(
+        &mut self,
+    ) -> Result<protocol::RuntimeInventoryResult, ClientError> {
+        self.call::<protocol::method::SessionRuntimeInventory>(())
+            .await
+    }
+
+    async fn call_dedicated<M>(
+        &self,
+        params: M::Params,
+        wire_timeout_ms: u32,
+    ) -> Result<M::Output, ClientError>
+    where
+        M: Method,
+    {
+        let request_timeout =
+            dedicated_request_timeout(self.options.request_timeout, wire_timeout_ms);
+        let options = self.options.with_request_timeout(request_timeout);
+        let mut client = self.connect_dedicated(options).await?;
+        client.call::<M>(params).await
+    }
+
+    async fn connect_dedicated(&self, options: ClientOptions) -> Result<Self, ClientError> {
+        match &self.endpoint {
+            Endpoint::Local(socket_path) => {
+                let stream = connect_unix(socket_path, options.connect_timeout).await?;
+                Ok(Self {
+                    inner: ClientInner::Local(Conn::new(stream, None, options)),
+                    endpoint: Endpoint::Local(socket_path.clone()),
+                    options,
+                    selected_version: None,
+                    origin: self.origin.clone(),
+                })
+            }
+            Endpoint::Remote { host, addr } => {
+                let stream = connect_tcp(host, *addr, options.connect_timeout).await?;
+                Ok(Self {
+                    inner: ClientInner::Remote(Conn::new(stream, Some(host.clone()), options)),
+                    endpoint: Endpoint::Remote {
+                        host: host.clone(),
+                        addr: *addr,
+                    },
+                    options,
+                    selected_version: None,
+                    origin: self.origin.clone(),
+                })
+            }
+        }
     }
 
     /// Send a subscription request and return a live raw event-line stream.
@@ -201,17 +409,29 @@ impl Client {
     /// The connection is consumed because a successful subscription turns the
     /// request/response channel into a one-way event stream.
     pub async fn subscribe(self, request: &Request) -> Result<Subscription, ClientError> {
-        match self.inner {
+        let Self {
+            inner,
+            mut selected_version,
+            origin,
+            ..
+        } = self;
+        let request = match origin {
+            Some(origin) => origin.apply(request.clone())?,
+            None => request.clone(),
+        };
+        match inner {
             ClientInner::Local(mut conn) => {
-                conn.subscribe(request).await?;
+                let selected_version = conn.subscribe(&request, &mut selected_version).await?;
                 Ok(Subscription {
                     inner: SubscriptionInner::Local(conn),
+                    selected_version,
                 })
             }
             ClientInner::Remote(mut conn) => {
-                conn.subscribe(request).await?;
+                let selected_version = conn.subscribe(&request, &mut selected_version).await?;
                 Ok(Subscription {
                     inner: SubscriptionInner::Remote(conn),
+                    selected_version,
                 })
             }
         }
@@ -256,8 +476,8 @@ impl Subscription {
     /// typed error, mapped by transport exactly like an unparseable reply.
     pub async fn next_event(&mut self) -> Result<Option<Event>, ClientError> {
         match &mut self.inner {
-            SubscriptionInner::Local(conn) => conn.next_event().await,
-            SubscriptionInner::Remote(conn) => conn.next_event().await,
+            SubscriptionInner::Local(conn) => conn.next_event(self.selected_version).await,
+            SubscriptionInner::Remote(conn) => conn.next_event(self.selected_version).await,
         }
     }
 }
@@ -278,7 +498,11 @@ where
         }
     }
 
-    async fn request(&mut self, request: &Request) -> Result<Value, ClientError> {
+    async fn request(
+        &mut self,
+        request: &Request,
+        selected_version: &mut Option<ProtocolVersion>,
+    ) -> Result<Value, ClientError> {
         if let Some(reason) = &self.poisoned {
             return Err(ClientError::Framing(format!(
                 "connection is unusable: {reason}"
@@ -286,7 +510,12 @@ where
         }
 
         let line = serde_json::to_string(request)?;
-        match tokio::time::timeout(self.request_timeout, self.exchange(&request.id, line)).await {
+        match tokio::time::timeout(
+            self.request_timeout,
+            self.exchange(request, line, selected_version),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_elapsed) => {
                 self.poisoned = Some(
@@ -300,7 +529,11 @@ where
         }
     }
 
-    async fn subscribe(&mut self, request: &Request) -> Result<(), ClientError> {
+    async fn subscribe(
+        &mut self,
+        request: &Request,
+        selected_version: &mut Option<ProtocolVersion>,
+    ) -> Result<ProtocolVersion, ClientError> {
         if let Some(reason) = &self.poisoned {
             return Err(ClientError::Framing(format!(
                 "connection is unusable: {reason}"
@@ -308,8 +541,15 @@ where
         }
 
         let line = serde_json::to_string(request)?;
-        match tokio::time::timeout(self.request_timeout, self.exchange(&request.id, line)).await {
-            Ok(result) => result.map(|_ok| ()),
+        match tokio::time::timeout(
+            self.request_timeout,
+            self.exchange(request, line, selected_version),
+        )
+        .await
+        {
+            Ok(result) => result.map(|_ok| {
+                (*selected_version).expect("response validation always selects a protocol version")
+            }),
             Err(_elapsed) => Err(no_response_error(
                 self.remote_host.as_deref(),
                 "timed out waiting for subscription ack",
@@ -317,7 +557,12 @@ where
         }
     }
 
-    async fn exchange(&mut self, request_id: &str, line: String) -> Result<Value, ClientError> {
+    async fn exchange(
+        &mut self,
+        request: &Request,
+        line: String,
+        selected_version: &mut Option<ProtocolVersion>,
+    ) -> Result<Value, ClientError> {
         let host = self.remote_host.as_deref();
 
         self.framed
@@ -340,18 +585,28 @@ where
             Err(err) => return Err(unparseable_reply_error(host, err)),
         };
 
-        if response.id() != request_id {
-            let err = response_id_mismatch_error(host, request_id, response.id());
+        if response.id() != request.id() {
+            let err = response_id_mismatch_error(host, request.id(), response.id());
             self.poisoned = Some(format!(
-                "previous response id mismatch; expected '{request_id}', got '{}'",
+                "previous response id mismatch; expected '{}', got '{}'",
+                request.id(),
                 response.id()
             ));
             return Err(err);
         }
 
-        match response {
-            Response::Ok { ok, .. } => Ok(ok),
-            Response::Err { err, .. } => Err(map_daemon_error(host, err)),
+        let response_version = response.version();
+        match response.into_result() {
+            Err(err) if err.code == "version_mismatch" => Err(map_daemon_error(host, err)),
+            result => {
+                validate_selected_version(
+                    request.version_range(),
+                    response_version,
+                    selected_version,
+                )
+                .map_err(|error| map_version_validation_error(host, &error))?;
+                result.map_err(|err| map_daemon_error(host, err))
+            }
         }
     }
 
@@ -363,16 +618,57 @@ where
         }
     }
 
-    async fn next_event(&mut self) -> Result<Option<Event>, ClientError> {
+    async fn next_event(
+        &mut self,
+        selected_version: ProtocolVersion,
+    ) -> Result<Option<Event>, ClientError> {
         let Some(line) = self.next_line().await? else {
             return Ok(None);
         };
         let host = self.remote_host.as_deref();
         match serde_json::from_str::<Event>(&line) {
-            Ok(event) => Ok(Some(event)),
+            Ok(event) if event.version() == selected_version => Ok(Some(event)),
+            Ok(event) => Err(map_version_validation_error(
+                host,
+                &ClientError::ProtocolVersionMismatch {
+                    expected: exact_version_range(selected_version),
+                    received: event.version(),
+                },
+            )),
             Err(err) => Err(unparseable_reply_error(host, err)),
         }
     }
+}
+
+fn validate_selected_version(
+    request_range: ProtocolVersionRange,
+    received: ProtocolVersion,
+    selected_version: &mut Option<ProtocolVersion>,
+) -> Result<(), ClientError> {
+    let expected = selected_version.map_or(request_range, exact_version_range);
+    if !request_range.contains(received)
+        || selected_version.is_some_and(|selected| selected != received)
+    {
+        return Err(ClientError::ProtocolVersionMismatch { expected, received });
+    }
+    *selected_version = Some(received);
+    Ok(())
+}
+
+fn exact_version_range(version: ProtocolVersion) -> ProtocolVersionRange {
+    ProtocolVersionRange::new(version, version)
+        .expect("a protocol version is always a valid exact range")
+}
+
+fn map_version_validation_error(remote_host: Option<&str>, error: &ClientError) -> ClientError {
+    map_daemon_error(remote_host, error.to_protocol_error())
+}
+
+fn dedicated_request_timeout(configured: Duration, wire_timeout_ms: u32) -> Duration {
+    Duration::from_millis(u64::from(wire_timeout_ms))
+        .checked_add(DEDICATED_WAIT_TRANSPORT_HEADROOM)
+        .unwrap_or(Duration::MAX)
+        .max(configured)
 }
 
 /// Open a raw, unframed control connection, selecting local or remote transport
@@ -390,6 +686,7 @@ pub async fn connect_raw_with_options(
     socket_path: impl AsRef<Path>,
     options: ClientOptions,
 ) -> Result<RawStream, ClientError> {
+    RequestOrigin::from_environment()?;
     if is_local_host(host) {
         connect_raw_local_with_options(socket_path, options).await
     } else {
@@ -409,6 +706,7 @@ pub async fn connect_raw_local_with_options(
     socket_path: impl AsRef<Path>,
     options: ClientOptions,
 ) -> Result<RawStream, ClientError> {
+    RequestOrigin::from_environment()?;
     Ok(RawStream::Local(
         connect_unix(socket_path.as_ref(), options.connect_timeout).await?,
     ))
@@ -429,6 +727,7 @@ pub async fn connect_raw_tcp_addr_with_options(
     addr: SocketAddr,
     options: ClientOptions,
 ) -> Result<RawStream, ClientError> {
+    RequestOrigin::from_environment()?;
     let host = host.into();
     Ok(RawStream::Remote(
         connect_tcp(&host, addr, options.connect_timeout).await?,
@@ -669,6 +968,330 @@ fn response_id_mismatch_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncBufReadExt as _, BufReader};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn origin_markers_are_atomic_and_payload_free_on_failure() {
+        assert!(RequestOrigin::from_values(None, None)
+            .expect("absent pair")
+            .is_none());
+        let origin =
+            RequestOrigin::from_values(Some("s-42".to_owned()), Some("daemon-a".to_owned()))
+                .expect("complete pair")
+                .expect("origin");
+        let request = origin
+            .apply(Request::new("r-1", "daemon.health", Value::Null).expect("request"))
+            .expect("apply origin");
+        assert_eq!(
+            request.origin_session_id(),
+            Some(&SessionId("s-42".to_owned()))
+        );
+        assert_eq!(request.origin_daemon_id(), Some("daemon-a"));
+
+        for incomplete in [
+            RequestOrigin::from_values(Some("private-session".to_owned()), None),
+            RequestOrigin::from_values(None, Some("private-daemon".to_owned())),
+        ] {
+            let error = incomplete.expect_err("single marker must fail");
+            let rendered = error.to_string();
+            assert!(!rendered.contains("private-session"));
+            assert!(!rendered.contains("private-daemon"));
+            assert_eq!(
+                error.to_protocol_error().code,
+                "incomplete_origin_environment"
+            );
+        }
+
+        let invalid = RequestOrigin::from_values(
+            Some("private\0session".to_owned()),
+            Some("private-daemon".to_owned()),
+        )
+        .expect_err("invalid pair must fail");
+        assert!(matches!(invalid, ClientError::InvalidOriginEnvironment));
+        assert!(!invalid.to_string().contains("private"));
+    }
+
+    #[tokio::test]
+    async fn remote_raw_request_carries_complete_origin_pair() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind fixture daemon");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.expect("read request");
+            let request: Request = serde_json::from_str(&line).expect("decode request");
+            let response = Response::ok(
+                request.version_range().maximum(),
+                request.id().to_owned(),
+                serde_json::json!({"healthy": true}),
+            )
+            .expect("response");
+            let mut encoded = serde_json::to_vec(&response).expect("encode response");
+            encoded.push(b'\n');
+            stream
+                .get_mut()
+                .write_all(&encoded)
+                .await
+                .expect("write response");
+            request
+        });
+
+        let mut client = Client::connect_tcp_addr("fixture-remote", address)
+            .await
+            .expect("connect remote");
+        client.origin = Some(RequestOrigin {
+            session_id: SessionId("s-origin".to_owned()),
+            daemon_id: "daemon-origin".to_owned(),
+        });
+        let request = Request::new("request-1", "daemon.health", Value::Null).expect("request");
+        let response = client.request(&request).await.expect("request succeeds");
+        assert_eq!(response, serde_json::json!({"healthy": true}));
+        let received = server.await.expect("fixture task");
+        assert_eq!(
+            received.origin_session_id(),
+            Some(&SessionId("s-origin".to_owned()))
+        );
+        assert_eq!(received.origin_daemon_id(), Some("daemon-origin"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_fallback_requests_carry_the_inherited_origin() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind lifecycle fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let mut stream = BufReader::new(stream);
+            let mut requests = Vec::new();
+            for _ in 0..3 {
+                let mut line = String::new();
+                stream.read_line(&mut line).await.expect("read request");
+                let request: Request = serde_json::from_str(&line).expect("decode request");
+                write_test_response(&mut stream, &request, Value::Null).await;
+                requests.push(request);
+            }
+            requests
+        });
+        let options = ClientOptions::default();
+        let stream = TcpStream::connect(address).await.expect("connect remote");
+        let mut client = Client {
+            inner: ClientInner::Remote(Conn::new(
+                stream,
+                Some("fixture-remote".to_owned()),
+                options,
+            )),
+            endpoint: Endpoint::Remote {
+                host: "fixture-remote".to_owned(),
+                addr: address,
+            },
+            options,
+            selected_version: None,
+            origin: Some(test_request_origin()),
+        };
+
+        for (index, method) in [
+            protocol::method::SESSION_REPORT_AGENT,
+            protocol::method::SESSION_RELEASE_AGENT,
+            protocol::method::SESSION_REPORT_NATIVE_ID,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = Request::new(format!("lifecycle-{index}"), method, Value::Null)
+                .expect("valid request");
+            client.request(&request).await.expect("request succeeds");
+        }
+
+        let requests = server.await.expect("fixture task");
+        for request in requests {
+            assert_test_request_origin(&request);
+        }
+    }
+
+    #[tokio::test]
+    async fn dedicated_waiting_output_carries_the_connection_origin() {
+        let result = serde_json::json!({
+            "session_id": "s-target",
+            "runtime_id": "runtime-1",
+            "runtime_generation": "1",
+            "history_start_offset": "0",
+            "start_offset": "0",
+            "next_offset": "0",
+            "runtime_end_offset": "0",
+            "data_base64": "",
+            "has_more": false,
+            "timed_out": true
+        });
+        let (address, server) = spawn_dedicated_capture_server(result).await;
+        let mut client = Client::connect_tcp_addr("fixture-remote", address)
+            .await
+            .expect("connect remote");
+        client.origin = Some(test_request_origin());
+        let runtime =
+            protocol::SessionRuntimeIdentity::new("runtime-1", protocol::RuntimeGeneration::new(1))
+                .expect("valid runtime identity");
+        let params = SessionOutputParams::new(
+            SessionId("s-target".to_owned()),
+            Some(runtime),
+            Some(protocol::OutputOffset::new(0)),
+            16,
+            Some(1),
+        )
+        .expect("valid waiting output params");
+
+        client
+            .session_output(params)
+            .await
+            .expect("waiting output succeeds");
+        let request = server.await.expect("capture server");
+        assert_eq!(request.method(), protocol::method::SESSION_OUTPUT);
+        assert_test_request_origin(&request);
+    }
+
+    #[tokio::test]
+    async fn dedicated_session_wait_carries_the_connection_origin() {
+        let result = serde_json::json!({
+            "reason": "timeout",
+            "session": test_session_json(),
+            "terminal_watermark": "0",
+            "output_offset": "0"
+        });
+        let (address, server) = spawn_dedicated_capture_server(result).await;
+        let mut client = Client::connect_tcp_addr("fixture-remote", address)
+            .await
+            .expect("connect remote");
+        client.origin = Some(test_request_origin());
+        let params = SessionWaitParams::new(
+            SessionId("s-target".to_owned()),
+            None,
+            None,
+            None,
+            None,
+            Some(vec![protocol::SessionState::Done]),
+            None,
+            1,
+        )
+        .expect("valid wait params");
+
+        client
+            .session_wait(params)
+            .await
+            .expect("session wait succeeds");
+        let request = server.await.expect("capture server");
+        assert_eq!(request.method(), protocol::method::SESSION_WAIT);
+        assert_test_request_origin(&request);
+    }
+
+    #[tokio::test]
+    async fn subscription_request_carries_the_connection_origin() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind subscription fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.expect("read request");
+            let request: Request = serde_json::from_str(&line).expect("decode request");
+            write_test_response(
+                &mut stream,
+                &request,
+                serde_json::json!({"subscribed": true}),
+            )
+            .await;
+            request
+        });
+        let mut client = Client::connect_tcp_addr("fixture-remote", address)
+            .await
+            .expect("connect remote");
+        client.origin = Some(test_request_origin());
+        let request = Request::new("subscribe-origin", protocol::method::SUBSCRIBE, Value::Null)
+            .expect("valid subscribe request");
+
+        let _subscription = client
+            .subscribe(&request)
+            .await
+            .expect("subscribe succeeds");
+        let received = server.await.expect("subscription fixture");
+        assert_test_request_origin(&received);
+    }
+
+    async fn spawn_dedicated_capture_server(
+        result: Value,
+    ) -> (SocketAddr, tokio::task::JoinHandle<Request>) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind dedicated fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            let (_idle_stream, _) = listener.accept().await.expect("accept shared client");
+            let (stream, _) = listener.accept().await.expect("accept dedicated client");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.expect("read request");
+            let request: Request = serde_json::from_str(&line).expect("decode request");
+            write_test_response(&mut stream, &request, result).await;
+            request
+        });
+        (address, server)
+    }
+
+    async fn write_test_response<S>(stream: &mut BufReader<S>, request: &Request, result: Value)
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let response = Response::ok(
+            request.version_range().maximum(),
+            request.id().to_owned(),
+            result,
+        )
+        .expect("response");
+        let mut encoded = serde_json::to_vec(&response).expect("encode response");
+        encoded.push(b'\n');
+        stream
+            .get_mut()
+            .write_all(&encoded)
+            .await
+            .expect("write response");
+    }
+
+    fn test_request_origin() -> RequestOrigin {
+        RequestOrigin {
+            session_id: SessionId("s-origin".to_owned()),
+            daemon_id: "daemon-origin".to_owned(),
+        }
+    }
+
+    fn assert_test_request_origin(request: &Request) {
+        assert_eq!(
+            request.origin_session_id(),
+            Some(&SessionId("s-origin".to_owned()))
+        );
+        assert_eq!(request.origin_daemon_id(), Some("daemon-origin"));
+    }
+
+    fn test_session_json() -> Value {
+        serde_json::json!({
+            "id": "s-target",
+            "agent": "codex",
+            "agent_base": "codex",
+            "capabilities": {"fork": false, "resume": true},
+            "cwd": "/workspace/pohunek",
+            "pid": 42424,
+            "state": "running",
+            "state_source": "process",
+            "cols": 80,
+            "rows": 24,
+            "created_at": "2026-07-08T00:00:00Z",
+            "updated_at": "2026-07-08T00:01:00Z"
+        })
+    }
 
     #[test]
     fn unix_connect_emfile_is_client_descriptor_exhaustion() {
@@ -709,6 +1332,39 @@ mod tests {
                 socket: path,
                 source
             } if path == socket && source.raw_os_error() == Some(libc::ENOENT)
+        ));
+    }
+
+    #[test]
+    fn dedicated_timeout_covers_wire_wait_and_transport_headroom() {
+        assert_eq!(
+            dedicated_request_timeout(Duration::from_secs(5), 8_000),
+            Duration::from_secs(9)
+        );
+        assert_eq!(
+            dedicated_request_timeout(Duration::from_secs(5), 5_000),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            dedicated_request_timeout(Duration::from_secs(12), 5_000),
+            Duration::from_secs(12)
+        );
+    }
+
+    #[test]
+    fn a_connection_rejects_selected_version_changes() {
+        let selected = protocol::PROTOCOL_VERSION;
+        let mut state = None;
+        validate_selected_version(protocol::SUPPORTED_PROTOCOL_VERSIONS, selected, &mut state)
+            .expect("first response selects the version");
+        let changed = ProtocolVersion::new(selected.get() + 1).expect("nonzero changed version");
+        assert!(matches!(
+            validate_selected_version(
+                ProtocolVersionRange::new(selected, changed).expect("valid test range"),
+                changed,
+                &mut state,
+            ),
+            Err(ClientError::ProtocolVersionMismatch { .. })
         ));
     }
 }

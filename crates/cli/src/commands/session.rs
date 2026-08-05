@@ -8,16 +8,21 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::io::Read as _;
 use std::io::Write as _;
 use std::path::PathBuf;
 
+use base64::Engine as _;
 #[cfg(test)]
 use protocol::Request;
 use protocol::{
-    method, AgentActivity, CwdSource, ForkCwdMode, SessionDiffParams, SessionForkParams, SessionId,
-    SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
-    SessionNewParams, SessionRemoveResult, SessionRenameParams, SessionState, SessionStopResult,
-    SessionWarningKind, StateSource,
+    method, AgentActivity, CwdSource, ForkCwdMode, OutputOffset, RuntimeGeneration,
+    SessionDiffParams, SessionForkParams, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
+    SessionOutputParams, SessionRemoveResult, SessionRenameParams, SessionResizeParams,
+    SessionRuntimeIdentity, SessionScreenParams, SessionSetMetadataParams, SessionState,
+    SessionStopResult, SessionWaitParams, SessionWarningKind, StateSource, TerminalWatermark,
+    MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
 };
 
 use crate::client::Client;
@@ -37,11 +42,154 @@ const DEFAULT_FORK_COLS: u16 = 80;
 /// Matches `session new`'s CLI default; attach and GUI surfaces send live size.
 const DEFAULT_FORK_ROWS: u16 = 24;
 
+/// Default observation page balances useful output with compact CLI responses.
+pub(crate) const DEFAULT_OUTPUT_BYTES: u32 = 16 * 1024;
+
+/// Parse an output page size while enforcing the public protocol ceiling.
+pub(crate) fn parse_output_bytes(value: &str) -> Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_error| "--max-bytes must be an unsigned 32-bit integer".to_owned())?;
+    if parsed == 0 || usize::try_from(parsed).unwrap_or(usize::MAX) > MAX_SESSION_OUTPUT_BYTES {
+        return Err(format!(
+            "--max-bytes must be between 1 and {MAX_SESSION_OUTPUT_BYTES}"
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Parse a required bounded wait timeout against the shared protocol ceiling.
+pub(crate) fn parse_wait_timeout_ms(value: &str) -> Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_error| "--timeout-ms must be an unsigned 32-bit integer".to_owned())?;
+    if parsed == 0 || parsed > protocol::MAX_SESSION_WAIT_MS {
+        return Err(format!(
+            "--timeout-ms must be between 1 and {}",
+            protocol::MAX_SESSION_WAIT_MS
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Maximum text accepted from stdin for `session new` and `session input`.
+///
+/// The daemon remains authoritative for provider-specific safe-text policy.
+pub(crate) const MAX_STDIN_INPUT_BYTES: usize = MAX_SESSION_INPUT_BYTES;
+
+/// Read and validate bounded UTF-8 text from a reader.
+///
+/// Newlines, carriage returns, and tabs are intentional terminal text. Other
+/// control characters are rejected before a request is constructed, and the
+/// diagnostic never contains the supplied payload.
+pub(crate) fn read_bounded_input<R: std::io::Read>(reader: R) -> Result<String, CliError> {
+    let read_limit =
+        u64::try_from(MAX_STDIN_INPUT_BYTES + 1).expect("stdin limit plus sentinel fits u64");
+    let mut bytes = Vec::with_capacity(MAX_STDIN_INPUT_BYTES.min(8 * 1024));
+    reader.take(read_limit).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_STDIN_INPUT_BYTES {
+        return Err(CliError::InvalidStdinInput {
+            detail: format!("input exceeds the maximum of {MAX_STDIN_INPUT_BYTES} UTF-8 bytes"),
+        });
+    }
+    let input = String::from_utf8(bytes).map_err(|_error| CliError::InvalidStdinInput {
+        detail: "input is not valid UTF-8".to_owned(),
+    })?;
+    if input
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err(CliError::InvalidStdinInput {
+            detail: "input contains a disallowed control character".to_owned(),
+        });
+    }
+    Ok(input)
+}
+
+/// Read one bounded terminal text payload from process stdin.
+pub(crate) fn read_stdin_input() -> Result<String, CliError> {
+    read_bounded_input(std::io::stdin().lock())
+}
+
+/// Resolve an exact session display name to its unique stable id.
+///
+/// Exact ids always win. Unknown values are left unchanged so the daemon emits
+/// its canonical not-found error. Ambiguity is rejected locally with sorted id
+/// candidates, which makes retries deterministic across list ordering.
+pub(crate) async fn resolve_target(
+    host: &str,
+    paths: &Paths,
+    target: &Target,
+) -> Result<Target, CliError> {
+    let client = Client::connect(host, paths).await?;
+    let mut sdk = client.into_sdk();
+    let sessions = sdk
+        .call::<protocol::method::SessionList>(SessionListParams {
+            filters: Vec::new(),
+        })
+        .await?;
+    resolve_target_from_sessions(target, &sessions)
+}
+
+fn resolve_target_from_sessions(
+    target: &Target,
+    sessions: &[SessionInfo],
+) -> Result<Target, CliError> {
+    if sessions
+        .iter()
+        .any(|session| session.id.0 == target.session_id)
+    {
+        return Ok(target.clone());
+    }
+    let mut candidates = sessions
+        .iter()
+        .filter(|session| session.name.as_deref() == Some(target.session_id.as_str()))
+        .map(|session| session.id.0.clone())
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+    match candidates.as_slice() {
+        [] => Ok(target.clone()),
+        [session_id] => Ok(Target {
+            host: target.host.clone(),
+            session_id: session_id.clone(),
+        }),
+        _ => Err(CliError::AmbiguousSessionName {
+            candidates: candidates.join(", "),
+        }),
+    }
+}
+
+#[cfg(unix)]
+async fn process_cancellation() -> Result<(), CliError> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result.map_err(CliError::from),
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn process_cancellation() -> Result<(), CliError> {
+    tokio::signal::ctrl_c().await.map_err(CliError::from)
+}
+
+async fn cancellable<T>(
+    future: impl std::future::Future<Output = Result<T, pohunek_client::ClientError>>,
+) -> Result<T, CliError> {
+    tokio::select! {
+        result = future => result.map_err(CliError::from),
+        signal = process_cancellation() => {
+            signal?;
+            Err(CliError::Cancelled)
+        }
+    }
+}
+
 /// Arguments for `session new`, grouped to keep the call site readable as the
 /// optional worktree flags accumulate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NewArgs {
-    /// Agent NAME to start: a base kind (`shell`/`codex`/`claude`) or a host
+    /// Agent NAME to start: a base kind (`shell`/`codex`/`claude`/`hermes`) or a host
     /// profile, resolved daemon-side on the target host (Part C, free string).
     pub agent: String,
     /// Owner-set display name for the session, or `None` to show it by id.
@@ -194,7 +342,7 @@ fn parse_meta_pairs(pairs: &[(String, String)]) -> Result<BTreeMap<String, Strin
     Ok(metadata)
 }
 
-fn parse_state_filter(value: &str) -> Result<SessionState, String> {
+pub(crate) fn parse_state_filter(value: &str) -> Result<SessionState, String> {
     match value {
         "starting" => Ok(SessionState::Starting),
         "running" => Ok(SessionState::Running),
@@ -207,7 +355,7 @@ fn parse_state_filter(value: &str) -> Result<SessionState, String> {
     }
 }
 
-fn parse_activity_filter(value: &str) -> Result<AgentActivity, String> {
+pub(crate) fn parse_activity_filter(value: &str) -> Result<AgentActivity, String> {
     match value {
         "working" => Ok(AgentActivity::Working),
         "blocked" => Ok(AgentActivity::Blocked),
@@ -489,6 +637,265 @@ pub(crate) async fn run_input(
         print!("{}", crate::commands::render_json(&input)?);
     } else {
         print!("{}", render_input_human(&target.session_id, &input));
+    }
+    Ok(())
+}
+
+pub(crate) async fn run_screen(
+    host: &str,
+    paths: &Paths,
+    target: &Target,
+    json: bool,
+) -> Result<(), CliError> {
+    let client = Client::connect(host, paths).await?;
+    let result = client
+        .into_sdk()
+        .session_screen(SessionScreenParams::new(SessionId(
+            target.session_id.clone(),
+        )))
+        .await?;
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        for line in result.visible_lines {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
+/// Cursor and filtering arguments for `session output`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OutputArgs {
+    pub runtime_id: Option<String>,
+    pub runtime_generation: Option<u64>,
+    pub after_offset: Option<u64>,
+    pub max_bytes: u32,
+    pub wait_ms: Option<u32>,
+}
+
+/// Predicate and cursor arguments for `session wait`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WaitArgs {
+    pub runtime_id: Option<String>,
+    pub runtime_generation: Option<u64>,
+    pub after_updated_at: Option<String>,
+    pub after_terminal_watermark: Option<u64>,
+    pub after_output_offset: Option<u64>,
+    pub states: Vec<SessionState>,
+    pub activities: Vec<AgentActivity>,
+    pub timeout_ms: u32,
+}
+
+fn runtime_identity(
+    runtime_id: Option<String>,
+    runtime_generation: Option<u64>,
+) -> Result<Option<SessionRuntimeIdentity>, CliError> {
+    match (runtime_id, runtime_generation) {
+        (None, None) => Ok(None),
+        (Some(runtime_id), Some(runtime_generation)) => {
+            SessionRuntimeIdentity::new(runtime_id, RuntimeGeneration::new(runtime_generation))
+                .map(Some)
+                .map_err(|error| CliError::InvalidObservation {
+                    detail: error.to_string(),
+                })
+        }
+        _ => Err(CliError::InvalidObservation {
+            detail: "--runtime-id and --runtime-generation must be supplied together".to_owned(),
+        }),
+    }
+}
+
+pub(crate) async fn run_output(
+    host: &str,
+    paths: &Paths,
+    target: &Target,
+    args: OutputArgs,
+    json: bool,
+) -> Result<(), CliError> {
+    if usize::try_from(args.max_bytes).unwrap_or(usize::MAX) > MAX_SESSION_OUTPUT_BYTES {
+        return Err(CliError::InvalidObservation {
+            detail: format!(
+                "--max-bytes must not exceed the protocol maximum of {MAX_SESSION_OUTPUT_BYTES}"
+            ),
+        });
+    }
+    let runtime = runtime_identity(args.runtime_id, args.runtime_generation)?;
+    let after_offset = args.after_offset.map(OutputOffset::new);
+    SessionOutputParams::new(
+        SessionId(target.session_id.clone()),
+        runtime.clone(),
+        after_offset,
+        args.max_bytes,
+        args.wait_ms,
+    )
+    .map_err(|error| CliError::InvalidObservation {
+        detail: error.to_string(),
+    })?;
+    let target = resolve_target(host, paths, target).await?;
+    let params = SessionOutputParams::new(
+        SessionId(target.session_id.clone()),
+        runtime,
+        after_offset,
+        args.max_bytes,
+        args.wait_ms,
+    )
+    .expect("only the already-validated session id changed");
+    let client = Client::connect(host, paths).await?;
+    let result = if args.wait_ms.is_some() {
+        cancellable(client.into_sdk().session_output(params)).await?
+    } else {
+        client.into_sdk().session_output(params).await?
+    };
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(result.data_base64())
+            .map_err(|_error| CliError::InvalidObservation {
+                detail: "daemon returned invalid output encoding".to_owned(),
+            })?;
+        print!("{}", String::from_utf8_lossy(&bytes));
+    }
+    Ok(())
+}
+
+pub(crate) async fn run_wait(
+    host: &str,
+    paths: &Paths,
+    target: &Target,
+    args: WaitArgs,
+    json: bool,
+) -> Result<(), CliError> {
+    let runtime = runtime_identity(args.runtime_id, args.runtime_generation)?;
+    let states = (!args.states.is_empty()).then_some(args.states);
+    let activities = (!args.activities.is_empty()).then_some(args.activities);
+    let terminal_watermark = args.after_terminal_watermark.map(TerminalWatermark::new);
+    let output_offset = args.after_output_offset.map(OutputOffset::new);
+    SessionWaitParams::new(
+        SessionId(target.session_id.clone()),
+        runtime.clone(),
+        args.after_updated_at.clone(),
+        terminal_watermark,
+        output_offset,
+        states.clone(),
+        activities.clone(),
+        args.timeout_ms,
+    )
+    .map_err(|error| CliError::InvalidObservation {
+        detail: error.to_string(),
+    })?;
+    let target = resolve_target(host, paths, target).await?;
+    let params = SessionWaitParams::new(
+        SessionId(target.session_id.clone()),
+        runtime,
+        args.after_updated_at,
+        terminal_watermark,
+        output_offset,
+        states,
+        activities,
+        args.timeout_ms,
+    )
+    .expect("only the already-validated session id changed");
+    let client = Client::connect(host, paths).await?;
+    let result = cancellable(client.into_sdk().session_wait(params)).await?;
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        println!(
+            "{:?}\t{}\t{}\t{}",
+            result.reason,
+            result.session.id.0,
+            result.session.state.as_str(),
+            result
+                .session
+                .activity
+                .map_or("unknown", AgentActivity::as_str)
+        );
+    }
+    Ok(())
+}
+
+pub(crate) async fn run_resume(
+    host: &str,
+    paths: &Paths,
+    target: &Target,
+    json: bool,
+) -> Result<(), CliError> {
+    let client = Client::connect(host, paths).await?;
+    let result = client
+        .into_sdk()
+        .session_resume(SessionId(target.session_id.clone()))
+        .await?;
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        println!("resumed {}", result.session.id.0);
+    }
+    Ok(())
+}
+
+pub(crate) async fn run_resize(
+    host: &str,
+    paths: &Paths,
+    target: &Target,
+    cols: u16,
+    rows: u16,
+    json: bool,
+) -> Result<(), CliError> {
+    let client = Client::connect(host, paths).await?;
+    let result = client
+        .into_sdk()
+        .session_resize(SessionResizeParams {
+            session_id: SessionId(target.session_id.clone()),
+            cols,
+            rows,
+        })
+        .await?;
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        println!("resized {} to {cols}x{rows}", target.session_id);
+    }
+    Ok(())
+}
+
+pub(crate) async fn run_metadata(
+    host: &str,
+    paths: &Paths,
+    target: &Target,
+    metadata: BTreeMap<String, Option<String>>,
+    json: bool,
+) -> Result<(), CliError> {
+    let client = Client::connect(host, paths).await?;
+    let result = client
+        .into_sdk()
+        .session_set_metadata(SessionSetMetadataParams {
+            session_id: SessionId(target.session_id.clone()),
+            metadata,
+        })
+        .await?;
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        println!("updated metadata for {}", target.session_id);
+    }
+    Ok(())
+}
+
+pub(crate) async fn run_runtime_inventory(
+    host: &str,
+    paths: &Paths,
+    json: bool,
+) -> Result<(), CliError> {
+    let client = Client::connect(host, paths).await?;
+    let result = client.into_sdk().session_runtime_inventory().await?;
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        for entry in result.entries {
+            println!("{}\t{:?}", entry.runtime_slot, entry.status);
+        }
     }
     Ok(())
 }
@@ -925,7 +1332,7 @@ fn render_inspect_human(info: &SessionInfo) -> String {
     if let Some(active_agent) = &info.active_agent {
         rows.insert(3, ("active_agent", active_agent.clone()));
     }
-    if let Some(active_base) = info.active_agent_base {
+    if let Some(active_base) = &info.active_agent_base {
         rows.insert(4, ("active_base", agent_kind_label(active_base).to_owned()));
     }
     if let Some(active_pid) = info.active_agent_pid {
@@ -1018,12 +1425,8 @@ fn session_agent_label(info: &SessionInfo) -> String {
     }
 }
 
-fn agent_kind_label(agent: protocol::AgentKind) -> &'static str {
-    match agent {
-        protocol::AgentKind::Shell => "shell",
-        protocol::AgentKind::Codex => "codex",
-        protocol::AgentKind::Claude => "claude",
-    }
+fn agent_kind_label(agent: &protocol::AgentKind) -> &str {
+    agent.as_wire()
 }
 
 fn state_label(state: SessionState) -> &'static str {
@@ -1090,6 +1493,7 @@ mod tests {
             name: None,
             id: protocol::SessionId(id.to_owned()),
             external: Some(false),
+            capabilities: protocol::SessionCapabilities::default(),
             agent: "shell".to_owned(),
             agent_base: protocol::AgentKind::Shell,
             cwd: PathBuf::from("/workspace/project"),
@@ -1143,15 +1547,18 @@ mod tests {
         reason = "test helper takes the json! literal by value to keep call sites terse"
     )]
     fn assert_request(request: &Request, method_name: &str, params: serde_json::Value) {
-        assert_eq!(request.v.get(), 1, "envelope version");
-        assert_eq!(request.method, method_name, "method");
-        assert_eq!(request.params, params, "params");
+        assert_eq!(
+            request.version_range(),
+            protocol::SUPPORTED_PROTOCOL_VERSIONS
+        );
+        assert_eq!(request.method(), method_name, "method");
+        assert_eq!(request.params(), &params, "params");
         // The id is now a unique per-call SDK correlation id, not a fixed string;
         // assert only its stable, log-greppable `sdk-<method>-` prefix.
         assert!(
-            request.id.starts_with(&format!("sdk-{method_name}-")),
+            request.id().starts_with(&format!("sdk-{method_name}-")),
             "id {:?} must be prefixed by the method",
-            request.id
+            request.id()
         );
     }
 
@@ -1194,6 +1601,21 @@ mod tests {
             method::SESSION_NEW,
             json!({
                 "agent": "claude",
+                "cols": 80,
+                "rows": 24
+            }),
+        );
+    }
+
+    #[test]
+    fn new_request_accepts_hermes_agent() {
+        let request = build_new_request(&new_args("hermes", None)).expect("request");
+
+        assert_request(
+            &request,
+            method::SESSION_NEW,
+            json!({
+                "agent": "hermes",
                 "cols": 80,
                 "rows": 24
             }),
@@ -1569,11 +1991,11 @@ mod tests {
             render_list_output(&sessions, &filters, ListOutputMode::Json).expect("json output");
         let quiet_output =
             render_list_output(&sessions, &filters, ListOutputMode::Quiet).expect("quiet output");
-        let json_ids: Vec<String> = serde_json::from_str::<Vec<SessionInfo>>(&json_output)
-            .expect("json sessions")
-            .into_iter()
-            .map(|session| session.id.0)
-            .collect();
+        let json_ids: Vec<String> =
+            crate::commands::parse_json_ok::<Vec<SessionInfo>>(&json_output)
+                .into_iter()
+                .map(|session| session.id.0)
+                .collect();
         let quiet_ids: Vec<&str> = quiet_output.lines().collect();
 
         assert_eq!(quiet_ids, json_ids);
@@ -1910,16 +2332,19 @@ mod tests {
     }
 
     #[test]
-    fn renders_codex_and_claude_agents_in_session_list_table() {
+    fn renders_known_agents_in_session_list_table() {
         let mut codex = running_session("s-codex");
         codex.agent = "codex".to_owned();
         let mut claude = running_session("s-claude");
         claude.agent = "claude".to_owned();
+        let mut hermes = running_session("s-hermes");
+        hermes.agent = "hermes".to_owned();
 
-        let output = render_list_human(&[codex, claude]);
+        let output = render_list_human(&[codex, claude, hermes]);
 
         assert_eq!(list_row(&output, "s-codex")[2], "codex");
         assert_eq!(list_row(&output, "s-claude")[2], "claude");
+        assert_eq!(list_row(&output, "s-hermes")[2], "hermes");
     }
 
     #[test]
@@ -2224,7 +2649,7 @@ mod tests {
     fn renders_new_session_as_json_that_deserializes() {
         let info = running_session("s-42");
         let doc = crate::commands::render_json(&info).expect("json doc");
-        let parsed: SessionInfo = serde_json::from_str(&doc).expect("parse session info");
+        let parsed: SessionInfo = crate::commands::parse_json_ok(&doc);
         assert_eq!(parsed, info);
     }
 
@@ -2232,7 +2657,7 @@ mod tests {
     fn renders_session_list_as_json_that_deserializes() {
         let sessions = vec![running_session("s-1"), running_session("s-2")];
         let doc = crate::commands::render_json(&sessions).expect("json doc");
-        let parsed: Vec<SessionInfo> = serde_json::from_str(&doc).expect("parse list");
+        let parsed: Vec<SessionInfo> = crate::commands::parse_json_ok(&doc);
         assert_eq!(parsed, sessions);
     }
 
@@ -2240,7 +2665,7 @@ mod tests {
     fn renders_inspect_as_json_that_deserializes() {
         let info = running_session("s-42");
         let doc = crate::commands::render_json(&info).expect("json doc");
-        let parsed: SessionInfo = serde_json::from_str(&doc).expect("parse inspect");
+        let parsed: SessionInfo = crate::commands::parse_json_ok(&doc);
         assert_eq!(parsed, info);
     }
 
@@ -2248,8 +2673,7 @@ mod tests {
     fn renders_stop_result_as_json_that_deserializes() {
         let result = protocol::SessionStopResult { stopped: true };
         let doc = crate::commands::render_json(&result).expect("json doc");
-        let parsed: protocol::SessionStopResult =
-            serde_json::from_str(&doc).expect("parse stop result");
+        let parsed: protocol::SessionStopResult = crate::commands::parse_json_ok(&doc);
         assert_eq!(parsed, result);
     }
 
@@ -2257,8 +2681,77 @@ mod tests {
     fn renders_input_result_as_json_that_deserializes() {
         let result = protocol::SessionInputResult { accepted: true };
         let doc = crate::commands::render_json(&result).expect("json doc");
-        let parsed: protocol::SessionInputResult =
-            serde_json::from_str(&doc).expect("parse input result");
+        let parsed: protocol::SessionInputResult = crate::commands::parse_json_ok(&doc);
         assert_eq!(parsed, result);
+    }
+
+    #[test]
+    fn bounded_input_accepts_multiline_utf8() {
+        let input = "first line\nsecond řádek\tvalue\r\n";
+        assert_eq!(
+            read_bounded_input(input.as_bytes()).expect("valid stdin"),
+            input
+        );
+    }
+
+    #[test]
+    fn bounded_input_rejects_control_without_echoing_payload() {
+        let error = read_bounded_input(b"private\0payload".as_slice()).expect_err("control");
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("control character"));
+        assert!(!diagnostic.contains("private"));
+        assert!(!diagnostic.contains("payload"));
+    }
+
+    #[test]
+    fn bounded_input_rejects_limit_plus_one_without_payload() {
+        let input = vec![b'x'; MAX_STDIN_INPUT_BYTES + 1];
+        let error = read_bounded_input(input.as_slice()).expect_err("oversized stdin");
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains(&MAX_STDIN_INPUT_BYTES.to_string()));
+        assert!(!diagnostic.contains("xxxx"));
+    }
+
+    #[test]
+    fn output_limit_parser_enforces_protocol_boundary() {
+        assert_eq!(
+            parse_output_bytes(&MAX_SESSION_OUTPUT_BYTES.to_string()).expect("maximum"),
+            u32::try_from(MAX_SESSION_OUTPUT_BYTES).expect("limit fits u32")
+        );
+        parse_output_bytes("0").expect_err("zero is invalid");
+        parse_output_bytes(&(MAX_SESSION_OUTPUT_BYTES + 1).to_string())
+            .expect_err("limit plus one is invalid");
+    }
+
+    #[test]
+    fn exact_name_resolution_prefers_id_and_rejects_sorted_ambiguity() {
+        let mut first = running_session("s-2");
+        first.name = Some("review".to_owned());
+        let mut second = running_session("s-1");
+        second.name = Some("review".to_owned());
+        let sessions = vec![first, second];
+
+        let id: Target = "s-2".parse().expect("target");
+        assert_eq!(
+            resolve_target_from_sessions(&id, &sessions)
+                .expect("exact id")
+                .session_id,
+            "s-2"
+        );
+
+        let name: Target = "review".parse().expect("target");
+        let error = resolve_target_from_sessions(&name, &sessions).expect_err("ambiguous");
+        assert_eq!(error.to_protocol_error().code, "ambiguous_session_name");
+        assert!(error.to_string().contains("s-1, s-2"));
+    }
+
+    #[test]
+    fn exact_unique_name_resolution_preserves_explicit_host() {
+        let mut session = running_session("s-42");
+        session.name = Some("review".to_owned());
+        let target: Target = "host-b/review".parse().expect("target");
+        let resolved = resolve_target_from_sessions(&target, &[session]).expect("unique name");
+        assert_eq!(resolved.host.as_deref(), Some("host-b"));
+        assert_eq!(resolved.session_id, "s-42");
     }
 }

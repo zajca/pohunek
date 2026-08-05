@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { describe, expect, test } from "bun:test";
-import { MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, type ProtocolError, type ProtocolEvent, type SessionInfo } from "@pohunek/protocol";
+import { MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, type ProtocolError, type ProtocolEvent, type SessionInfo } from "@pohunek/protocol";
 import { startRelay, type DaemonTarget, type RelayHandle } from "@pohunek/backend";
 import {
   Client,
@@ -52,7 +52,7 @@ describe("WebSocket transport through relay", () => {
 
       expect(result).toEqual([session] satisfies SessionInfo[]);
       const sent = parseRequestLine(await fixture.daemon.nextRequest());
-      expect(sent["v"]).toBe(PROTOCOL_VERSION);
+      expect(sent["v"]).toEqual(SUPPORTED_PROTOCOL_VERSIONS);
       expect(sent["method"]).toBe("session.list");
       expect(sent["params"]).toEqual({ filters: [{ key: "state", value: "running" }] });
       expect(String(sent["id"])).toStartWith("sdk-session.list-");
@@ -141,7 +141,7 @@ describe("WebSocket transport through relay", () => {
     try {
       const client = await fixture.client();
       const request: Request = {
-        v: PROTOCOL_VERSION,
+        v: SUPPORTED_PROTOCOL_VERSIONS,
         id: "req-too-large-ws",
         method: "daemon.health",
         params: { payload: "x".repeat(MAX_CONTROL_LINE_BYTES + 1) },
@@ -405,7 +405,7 @@ function daemonTarget(daemon: MockDaemon): DaemonTarget {
 
 function subscribeRequest(id: string): Request {
   return {
-    v: PROTOCOL_VERSION,
+    v: SUPPORTED_PROTOCOL_VERSIONS,
     id,
     method: "subscribe",
     params: null,

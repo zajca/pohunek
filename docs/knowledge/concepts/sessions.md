@@ -17,6 +17,25 @@ inspect with `pohunek session inspect`, list with `pohunek session list`, send
 input with `pohunek session input`, stop with `pohunek session stop`, and attach
 with `pohunek attach`.
 
+Automation can observe a managed terminal without attaching. Use
+`pohunek session screen <target> --json` for one rendered snapshot,
+`pohunek session output <target> --json` for a bounded newest retained tail,
+and `pohunek session wait <target> ... --timeout-ms <1..8000> --json` for one
+bounded state/activity/terminal/output change. Continue output with the exact
+`runtime_id`, decimal-string `runtime_generation`, and `next_offset` returned by
+the previous result. A retained-history `gap` means older requested bytes were
+evicted; a runtime change means discard old cursors and restart from a fresh
+screen or tail. Waiting calls use dedicated connections, and their timeout is
+the guaranteed waiter-slot release bound after a client disappears.
+
+Use `--input-stdin` (alias `--stdin`) with `session new`, or `--stdin` with
+`session input`, when prompt text should not appear in argv. Stdin and inline
+input are mutually exclusive and bounded. Hermes programmatic input rejects
+terminal controls other than intentional LF and tab, and it is disabled while
+Hermes is visibly blocked on owner approval. In JSON mode, stdout contains
+exactly one versioned document with either `ok` or `err`; diagnostics remain on
+stderr.
+
 `pohunek session diff <target> [--base <ref>] [--json]` prints a unified diff
 of a session's worktree against a base ref: raw diff text on stdout by
 default, or the structured `SessionDiffResult` (`diff`, `base`, `truncated`)
@@ -116,6 +135,11 @@ Unread `turn_completed` rows are bounded per session. A newer
 the same session supersedes the unread turn twin because waiting-for-owner
 attention includes the fact that the turn completed.
 
+Notification policy is provider-keyed. `enabled` is the complete base per-kind
+policy, while the deterministically ordered `providers` object holds complete
+overrides by open provider wire name. A missing provider key falls back to
+`enabled`. The old fixed `codex` and `claude` policy fields are not accepted.
+
 The GUI's Inbox modal opens a notification's message detail when it is
 selected from the list, auto-marking it read. If the record links to a session
 still known on the same host, the detail offers a primary Open session action
@@ -123,8 +147,9 @@ that closes the modal and selects that session; if the linked session is gone,
 explanatory text replaces the button so the record is not a dead end.
 
 Every session has an immutable launch identity: `agent` is the selected profile
-name and `agent_base` is the base kind (`shell`, `codex`, or `claude`). A shell
-session can temporarily host a nested Codex or Claude Code process. The daemon
+name and `agent_base` is the base kind (`shell`, `codex`, `claude`, or
+`hermes`). A shell session can temporarily host a nested Codex or Claude Code
+process. The daemon
 now treats active nested-agent state as an evidence tripod: process facts from
 procwatch are authoritative for start/stop, hooks are the fast path for rich
 claims and clean release, and PTY output remains an activity signal rather than
@@ -155,6 +180,12 @@ Every managed `SessionInfo` has a `runtime` object distinct from its agent
 identifies the PTY owner and `runtime_id` identifies one PTY generation. A
 daemon restart preserves both ids. Explicit native recovery preserves the
 logical session id but changes the worker and runtime ids.
+
+`SessionInfo.capabilities.resume` and `.fork` are independent, frozen flags.
+Clients must use them instead of guessing from the provider name. Long-lived
+wire counters (`runtime_generation`, output offsets, terminal watermarks, and
+hook sequences) are canonical unsigned decimal strings so JavaScript clients do
+not lose precision.
 
 `lost` means the worker or host runtime is gone and the PTY cannot be
 reattached. `conflict` means discovery found ambiguous or mismatched live
@@ -209,6 +240,12 @@ replace `native_session_id` / `native_session_path` for the parent session.
 Startup reconciliation merges the worker's immutable launch identity into the
 persisted session and recovery binding; it does not replace an already captured
 native reference with an empty worker field.
+If the owner-private worker identity claim cannot be delivered, the shipped
+hook falls back to the local public daemon with the exact runtime id, PID and
+kernel start identity, a monotonic sequence, and a short expiry. Stale runtime,
+PID reuse, wrong provider/session, expiry, and duplicate or reordered reports
+are rejected. The public path is fallback; the private worker claim remains
+preferred because it survives daemon outage.
 Procwatch can auto-report a matching nested agent when hooks are missing, and
 auto-release clears stale active fields when the backing process exits or an
 unbound claim exceeds the active-agent claim TTL.
@@ -223,6 +260,19 @@ present it as reconnection. Recovery is rejected for live, reconnecting,
 conflicting, or incompatible runtimes and is never automatic. A removed session
 is gone and cannot be recovered.
 
+Hermes uses the same durable worker model, but only for the local interactive
+terminal backend in the supported 0.20.0 release. Pohunek launches it as
+`hermes chat`; when a valid native reference is already present, recovery is
+exactly `hermes chat --resume <reference>`. It never continues ambient Hermes
+state and never reads `state.db`. Before either launch, the daemon requires an
+isolated, bounded version probe to confirm the pinned release and fails with
+payload-free `agent_runtime_unsupported` before material side effects when the
+runtime is missing or incompatible. M2 has no Hermes lifecycle hook or plugin, so
+a newly launched Hermes session normally has no native reference until one is
+provided through the existing validated lifecycle path. Its resume capability
+is independent from that temporary absence of a reference; fork is always
+unsupported and rejects before any child/worktree side effect.
+
 `session.fork` creates a new pohunek session id and PTY from the source session's
 native agent conversation. The source may still be live; fork does not require a
 terminal state. With `cwd_mode: "same"`, the new session starts in the source
@@ -230,7 +280,8 @@ cwd/worktree and carries the same launch-agent native metadata, so the fork is
 resumable too. Claude forks as `claude --resume <native_session_id>
 --fork-session`. Codex fork is intentionally not enabled in this daemon contract;
 Codex-backed sessions return the typed `agent_fork_unsupported` error instead
-of fabricating an unsupported branch.
+of fabricating an unsupported branch. Hermes-backed sessions return the same
+typed unsupported error.
 
 For project-aware work, prefer a registered project or repository target over an
 ad hoc directory. See [projects](projects.md) and [worktrees](worktrees.md).

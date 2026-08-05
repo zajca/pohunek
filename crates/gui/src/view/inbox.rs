@@ -1,12 +1,14 @@
 //! Inbox modal: notification list and message-detail layers, plus the
 //! age/date formatting they share.
 
+use std::collections::BTreeSet;
+
 use iced::widget::{button, column, container, pick_list, row, scrollable, text};
 use iced::{Center, Element, Fill, Theme};
-use pohunek_gui_core::{HostId, NotificationScope};
+use pohunek_gui_core::{HostId, NotificationScope, Selection};
 use protocol::{
-    NotificationId, NotificationKind, NotificationRecord, NotificationSeverity, NotificationStatus,
-    SessionId,
+    NotificationId, NotificationKind, NotificationKindPolicy, NotificationRecord,
+    NotificationSeverity, NotificationStatus, SessionId,
 };
 
 use crate::attach::window_dimension_to_f32;
@@ -14,7 +16,7 @@ use crate::message::{InboxView, Message, NotificationAction};
 use crate::view::provider::{status_pill, PillTone};
 use crate::PohunekApp;
 
-use super::{card, list_button, muted_style, push_meta, STATUS_DOT};
+use super::{agent_kind_label, card, list_button, muted_style, push_meta, STATUS_DOT};
 
 // Calendar conversion offset from the civil-date algorithm's day zero to Unix
 // epoch; changing it would make notification age labels wrong for every row.
@@ -98,8 +100,120 @@ fn inbox_list_content(app: &PohunekApp) -> Element<'_, Message> {
 
     inbox_dialog(
         app,
-        column![header, inbox_controls(app), card(list)].spacing(12),
+        column![
+            header,
+            inbox_controls(app),
+            notification_policy_card(app),
+            card(list)
+        ]
+        .spacing(12),
     )
+}
+
+fn notification_policy_card(app: &PohunekApp) -> Element<'_, Message> {
+    let Some(host_id) = notification_policy_host(app) else {
+        return card(text("Select a host to manage its notification policy").size(12));
+    };
+    let load = button("Load notification policy")
+        .on_press(Message::LoadNotificationPolicy(host_id.clone()))
+        .style(iced::widget::button::secondary);
+    let Some(policy) = app.workspace.notification_policy(&host_id) else {
+        return card(column![text(format!("Notification policy · {host_id}")), load].spacing(6));
+    };
+
+    let mut providers = BTreeSet::new();
+    if let Some(host) = app.workspace.hosts.get(&host_id) {
+        providers.extend(host.notification_providers.iter().cloned());
+    }
+    providers.extend(policy.providers.keys().cloned());
+
+    let mut rows = column![
+        row![
+            text(format!("Notification policy · {host_id}")).size(14),
+            iced::widget::space().width(Fill),
+            load,
+            button("Save")
+                .on_press(Message::SaveNotificationPolicy(host_id.clone()))
+                .style(iced::widget::button::primary),
+        ]
+        .spacing(6)
+        .align_y(Center),
+        policy_kind_row(&host_id, None, "base", &policy.enabled),
+    ]
+    .spacing(6);
+    for provider in providers {
+        let provider_policy = policy.for_provider(&provider);
+        rows = rows.push(policy_kind_row(
+            &host_id,
+            Some(&provider),
+            &provider,
+            provider_policy,
+        ));
+    }
+    card(rows)
+}
+
+fn notification_policy_host(app: &PohunekApp) -> Option<HostId> {
+    app.notification_filter.host_id.clone().or_else(|| {
+        app.workspace
+            .selection
+            .as_ref()
+            .map(|selection| match selection {
+                Selection::Host { host_id }
+                | Selection::Project { host_id, .. }
+                | Selection::Session { host_id, .. } => host_id.clone(),
+            })
+    })
+}
+
+fn policy_kind_row(
+    host_id: &HostId,
+    provider: Option<&str>,
+    label: &str,
+    policy: &NotificationKindPolicy,
+) -> Element<'static, Message> {
+    let mut values = row![text(label.to_owned()).size(12)]
+        .spacing(4)
+        .align_y(Center);
+    for (kind, kind_label, enabled) in [
+        (
+            NotificationKind::AgentBlocked,
+            "blocked",
+            policy.agent_blocked,
+        ),
+        (
+            NotificationKind::ApprovalRequired,
+            "approval",
+            policy.approval_required,
+        ),
+        (
+            NotificationKind::TurnCompleted,
+            "turn",
+            policy.turn_completed,
+        ),
+        (
+            NotificationKind::SessionFinished,
+            "finished",
+            policy.session_finished,
+        ),
+        (NotificationKind::Error, "error", policy.error),
+        (NotificationKind::System, "system", policy.system),
+    ] {
+        values = values.push(
+            button(text(format!(
+                "{kind_label}: {}",
+                if enabled { "on" } else { "off" }
+            )))
+            .on_press(Message::SetNotificationPolicyKind {
+                host_id: host_id.clone(),
+                provider: provider.map(str::to_owned),
+                kind,
+                enabled: !enabled,
+            })
+            .style(iced::widget::button::text),
+        );
+    }
+    values.into()
 }
 
 /// The scope segmented control, plus (when 2+ hosts have notifications) the
@@ -410,7 +524,7 @@ fn notification_details<'a>(
     if let Some(project_id) = &record.project_id {
         rows = rows.push(text(format!("project: {project_id}")).size(12));
     }
-    if let Some(agent_kind) = record.agent_kind {
+    if let Some(agent_kind) = &record.agent_kind {
         rows = rows.push(text(format!("agent: {}", agent_kind_label(agent_kind))).size(12));
     }
     for (key, value) in &record.metadata {
@@ -496,14 +610,6 @@ fn notification_kind_label(kind: NotificationKind) -> &'static str {
         NotificationKind::SessionFinished => "session finished",
         NotificationKind::Error => "error",
         NotificationKind::System => "system",
-    }
-}
-
-fn agent_kind_label(kind: protocol::AgentKind) -> &'static str {
-    match kind {
-        protocol::AgentKind::Shell => "shell",
-        protocol::AgentKind::Codex => "codex",
-        protocol::AgentKind::Claude => "claude",
     }
 }
 
@@ -630,4 +736,35 @@ pub(crate) fn date_part(timestamp: &str) -> &str {
     timestamp
         .split_once('T')
         .map_or(timestamp, |(date, _)| date)
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_inbox_host_scopes_notification_policy() {
+        let mut app = PohunekApp::test_default();
+        app.notification_filter.host_id = Some(HostId::new("host-b"));
+
+        assert_eq!(notification_policy_host(&app), Some(HostId::new("host-b")));
+    }
+
+    #[test]
+    fn future_provider_policy_row_renders_without_provider_enum_support() {
+        let policy = NotificationKindPolicy {
+            agent_blocked: true,
+            approval_required: true,
+            turn_completed: true,
+            session_finished: true,
+            error: true,
+            system: false,
+        };
+        let _: Element<'static, Message> = policy_kind_row(
+            &HostId::new("local"),
+            Some("future-agent"),
+            "future-agent",
+            &policy,
+        );
+    }
 }

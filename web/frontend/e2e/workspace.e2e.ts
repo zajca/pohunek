@@ -1,9 +1,14 @@
 import type { Locator, Page } from "@playwright/test";
+import { connectTcp } from "../../sdk/src/node";
 import {
   FIXTURE_LOCAL_HOST,
   FIXTURE_LOCAL_SESSION_ID,
+  FIXTURE_LEGACY_BASELESS_SESSION_ID,
   FIXTURE_PEER_HOST,
   FIXTURE_PEER_SESSION_ID,
+  FIXTURE_UNKNOWN_ACTIVE_SESSION_ID,
+  FIXTURE_UNKNOWN_PERSISTED_SESSION_ID,
+  type FixtureStackHandle,
 } from "../../scripts/fixture-stack";
 import { expect, test } from "./fixtures";
 
@@ -69,6 +74,73 @@ test("creates on the chosen host, attaches immediately, and stops from the toolb
   const confirmation = page.getByRole("dialog", { name: "Stop this session?" });
   await confirmation.getByRole("button", { name: "Stop session" }).click();
   await expect(page.getByRole("button", { name: "Resume", exact: true })).toBeVisible();
+});
+
+test("renders and launches Hermes with resume-only lifecycle capabilities", async ({ page, stack }) => {
+  await page.goto(stack.backend.url);
+  await page.getByRole("button", { name: "New session", exact: true }).first().click();
+
+  const createDialog = page.getByRole("dialog", { name: "New session" });
+  await createDialog.getByRole("combobox", { name: "Host", exact: true }).selectOption(FIXTURE_PEER_HOST);
+  const agentSelect = createDialog.getByRole("combobox", { name: "Agent", exact: true });
+  await expect(agentSelect.locator('option[value="hermes"]')).toHaveText("Hermes — installed (supported)");
+  await agentSelect.selectOption("hermes");
+  await createDialog.getByRole("textbox", { name: /Name/ }).fill("Browser Hermes session");
+  await createDialog.getByRole("button", { name: "Create and attach" }).click();
+
+  await expect(page.getByRole("heading", { name: "Browser Hermes session" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Fork unsupported", exact: true })).toBeDisabled();
+  const hermesRow = page.getByTestId("session-row").filter({ hasText: "Browser Hermes session" });
+  const sessionId = await hermesRow.getAttribute("data-session-id");
+  if (sessionId === null) throw new Error("Hermes session row did not expose its session id");
+  await reportNativeIdentity(stack, sessionId, "hermes", "browser-hermes-native");
+  await page.getByRole("button", { name: "Stop", exact: true }).click();
+  await page.getByRole("dialog", { name: "Stop this session?" }).getByRole("button", { name: "Stop session" }).click();
+  await expect(page.getByRole("button", { name: "Resume", exact: true })).toBeVisible();
+});
+
+test("does not offer resume for fresh Hermes without a native reference", async ({ page, stack }) => {
+  await page.goto(stack.backend.url);
+  await page.getByRole("button", { name: "New session", exact: true }).first().click();
+
+  const createDialog = page.getByRole("dialog", { name: "New session" });
+  await createDialog.getByRole("combobox", { name: "Host", exact: true }).selectOption(FIXTURE_PEER_HOST);
+  await createDialog.getByRole("combobox", { name: "Agent", exact: true }).selectOption("hermes");
+  await createDialog.getByRole("textbox", { name: /Name/ }).fill("Fresh Hermes without identity");
+  await createDialog.getByRole("button", { name: "Create and attach" }).click();
+
+  await page.getByRole("button", { name: "Stop", exact: true }).click();
+  await page.getByRole("dialog", { name: "Stop this session?" }).getByRole("button", { name: "Stop session" }).click();
+  await expect(page.getByRole("button", { name: "Resume unavailable", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Resume", exact: true })).toHaveCount(0);
+});
+
+test("keeps a known session with an unknown active agent presentation-only", async ({ page, stack }) => {
+  await page.goto(stack.backend.url);
+  const row = sessionRow(page, FIXTURE_LOCAL_HOST, FIXTURE_UNKNOWN_ACTIVE_SESSION_ID);
+  await expect(row).toContainText("Unknown active agent session");
+  await row.click();
+  await expect(page.getByTestId("session-summary")).toContainText("future-profile · Unknown agent (future-agent)");
+  for (const name of ["Rename", "Stop", "Resume", "Fork", "Fork unsupported", "Remove"]) {
+    await expect(page.getByRole("button", { name, exact: true })).toHaveCount(0);
+  }
+});
+
+test("keeps an explicitly unknown persisted agent presentation-only", async ({ page, stack }) => {
+  await page.goto(stack.backend.url);
+  const row = sessionRow(page, FIXTURE_LOCAL_HOST, FIXTURE_UNKNOWN_PERSISTED_SESSION_ID);
+  await row.click();
+  await expect(page.getByTestId("session-summary")).toContainText("Unknown agent (future-agent)");
+  await expect(page.getByTestId("terminal-status")).toHaveCount(0);
+});
+
+test("keeps a legacy session without agent_base attachable", async ({ page, stack }) => {
+  await page.goto(stack.backend.url);
+  const row = sessionRow(page, FIXTURE_LOCAL_HOST, FIXTURE_LEGACY_BASELESS_SESSION_ID);
+  await row.click();
+  await expect(page.getByTestId("terminal-status")).toContainText("Attached");
+  await expect(page.getByRole("heading", { name: "Legacy baseless profile session" })).toBeVisible();
+  await expect(page.locator(".session-identity")).toContainText("legacy-profile");
 });
 
 test("keeps local work usable when a peer disconnects", async ({ page, stack }) => {
@@ -174,4 +246,31 @@ function sessionRow(page: Page, host: string, sessionId: string): Locator {
   return page.locator(
     `[data-testid="session-row"][data-host="${host}"][data-session-id="${sessionId}"]`,
   );
+}
+
+async function reportNativeIdentity(
+  stack: FixtureStackHandle,
+  sessionId: string,
+  agent: string,
+  nativeSessionId: string,
+): Promise<void> {
+  const address = stack.peer.tcpAddress;
+  if (address === undefined) throw new Error("fixture peer did not expose a TCP address");
+  const client = await connectTcp("fixture-peer", address);
+  try {
+    const session = await client.call("session.inspect", sessionId);
+    const result = await client.call("session.report_native_id", {
+      session_id: sessionId,
+      runtime_id: `runtime-${sessionId}`,
+      agent,
+      pid: session.pid,
+      pid_start_identity: "playwright-start-identity",
+      sequence: "1",
+      expires_at: "2099-08-04T00:00:00Z",
+      native_session_id: nativeSessionId,
+    });
+    if (!result.recorded) throw new Error("fixture rejected the native identity report");
+  } finally {
+    await client.close();
+  }
 }

@@ -6,7 +6,7 @@ use iced::Task;
 use pohunek_gui_core::{
     spawn_attach_command, AttachCommandSpawner, AttachTemplateValues, HostId, NotificationIntent,
 };
-use protocol::SessionId;
+use protocol::{SessionId, SessionInfo};
 
 use crate::command::resume_session_task;
 use crate::message::Message;
@@ -41,7 +41,18 @@ pub(crate) fn attach_task(
     host_id: &HostId,
     session_id: &SessionId,
 ) -> Result<Task<Message>, String> {
-    if session_requires_resume_before_attach(app, host_id, session_id) {
+    let session = app
+        .workspace
+        .hosts
+        .get(host_id)
+        .and_then(|host| host.sessions.get(&session_id.0));
+    if let Some(session) = session.filter(|session| session_is_in_resumable_state(session)) {
+        if !session.capabilities.resume {
+            return Err("session does not support resume".to_owned());
+        }
+        if !session_has_native_resume_reference(session) {
+            return Err("session does not have native resume metadata".to_owned());
+        }
         return resume_session_task(app, host_id, session_id);
     }
 
@@ -52,6 +63,12 @@ pub(crate) fn attach_task(
     ))
 }
 
+/// Whether a session can be opened or recovered from the native GUI.
+pub(crate) fn session_can_open(session: &SessionInfo) -> bool {
+    !session_is_in_resumable_state(session) || session_is_ready_to_resume(session)
+}
+
+/// Whether a session currently requires native recovery before attach.
 pub(crate) fn session_requires_resume_before_attach(
     app: &PohunekApp,
     host_id: &HostId,
@@ -61,13 +78,33 @@ pub(crate) fn session_requires_resume_before_attach(
         .hosts
         .get(host_id)
         .and_then(|host| host.sessions.get(&session_id.0))
-        .is_some_and(|session| {
-            session.state.is_terminal()
-                || session
-                    .runtime
-                    .as_ref()
-                    .is_some_and(|runtime| runtime.state == protocol::RuntimeState::Lost)
-        })
+        .is_some_and(session_is_in_resumable_state)
+}
+
+/// Whether frozen capabilities and native metadata permit recovery now.
+pub(crate) fn session_is_ready_to_resume(session: &SessionInfo) -> bool {
+    session_is_in_resumable_state(session)
+        && session.capabilities.resume
+        && session_has_native_resume_reference(session)
+}
+
+fn session_has_native_resume_reference(session: &SessionInfo) -> bool {
+    session
+        .native_session_id
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+        || session
+            .native_session_path
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+}
+
+fn session_is_in_resumable_state(session: &SessionInfo) -> bool {
+    session.state.is_terminal()
+        || session
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.state == protocol::RuntimeState::Lost)
 }
 
 pub(crate) fn spawn_notification(command: &str, intent: &NotificationIntent) -> Result<(), String> {

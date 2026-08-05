@@ -40,6 +40,12 @@ export interface ScenarioBackend {
   resizes(sessionId: SessionId): ReadonlyArray<ScenarioResize>;
   writeToPty(sessionId: SessionId, bytes: Uint8Array): number;
   queuePtyOutput(sessionId: SessionId, bytes: Uint8Array): void;
+  setRetainedOutput(
+    sessionId: SessionId,
+    bytes: Uint8Array,
+    historyStartOffset: number | bigint,
+    runtimeId?: string,
+  ): void;
   setDiscoveredHosts(hosts: readonly HostRecord[]): void;
   stopAbruptly(): Promise<void>;
 }
@@ -91,6 +97,16 @@ export class FixtureScenario {
 
   public queuePtyOutput(sessionId: SessionId, bytes: Uint8Array): void {
     this.backend.queuePtyOutput(sessionId, bytes);
+  }
+
+  /** Replaces retained output, optionally creating an explicit history gap. */
+  public setRetainedOutput(
+    sessionId: SessionId,
+    bytes: Uint8Array,
+    historyStartOffset: number | bigint = 0,
+    runtimeId?: string,
+  ): void {
+    this.backend.setRetainedOutput(sessionId, bytes, historyStartOffset, runtimeId);
   }
 
   public setDiscoveredHosts(hosts: readonly HostRecord[]): void {

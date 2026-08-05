@@ -1,6 +1,6 @@
 //! Headless GUI-core harness against in-process loopback daemons.
 
-// Rust guideline compliant 2026-06-26
+// Rust guideline compliant 2026-08-04
 #![forbid(unsafe_code)]
 
 use std::ffi::OsString;
@@ -13,6 +13,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use pohunek_client::Client;
 use pohunek_daemon::api::{DaemonState, HealthInfo, RemoteServer};
+use pohunek_daemon::notifications::NotificationService;
 use pohunek_daemon::procwatch::LinuxInspector;
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
@@ -22,27 +23,46 @@ use pohunek_gui_core::{
     add_project, dispatch_review, host_subscription_stream, inspect_session,
     launch_action_prompt_with_options, launch_provider_item_with_options, list_project_actions,
     list_projects, load_host_snapshot, parse_unified_diff, preview_action_prompt,
-    preview_prompt_content, remove_project, rename_project, render_review_prompt,
-    resolve_project_action, resolve_project_prompt, session_link_metadata, session_metadata_rows,
+    preview_prompt_content, read_session_output, read_session_screen, remove_project,
+    rename_project, render_review_prompt, resolve_project_action, resolve_project_prompt,
+    session_link_metadata, session_metadata_rows, set_notification_policy_with_options,
     set_session_metadata, show_project, spawn_attach_command, stop_session as stop_gui_session,
-    workspace_connection_stream, AgentStateEvent, AttachCommandSpawner, AttachSpawnIntent,
-    AttachTemplateValues, ConnState, ConnectionOptions, CoreError, DiffFileStatus, DomainEvent,
-    HealthSummary, HostConfig, HostEvent, HostId, HostSnapshot, PromptContext, PromptLaunchParams,
-    PromptPreview, ProviderLaunchItem, ProviderLaunchParams, Review, ReviewComment,
-    ReviewDispatchParams, ReviewSide, ReviewSource, ReviewStatus, ReviewStore, RightTab, Selection,
-    SessionLinkKind, SessionLinkProvider, TreeNodeId, UiState, WindowSize, Workspace,
+    wait_for_session, workspace_connection_stream, AgentStateEvent, AttachCommandSpawner,
+    AttachSpawnIntent, AttachTemplateValues, ConnState, ConnectionOptions, CoreError,
+    DiffFileStatus, DomainEvent, HealthSummary, HostConfig, HostEvent, HostId, HostSnapshot,
+    PromptContext, PromptLaunchParams, PromptPreview, ProviderLaunchItem, ProviderLaunchParams,
+    Review, ReviewComment, ReviewDispatchParams, ReviewSide, ReviewSource, ReviewStatus,
+    ReviewStore, RightTab, Selection, SessionLinkKind, SessionLinkProvider, TreeNodeId, UiState,
+    WindowSize, Workspace,
 };
 use protocol::{
-    method, AgentActivity, AgentKind, ErrorClass, ProjectActionParams, ProjectActionResult,
-    ProjectActionsParams, ProjectAddParams, ProjectPromptParams, ProjectRemoveParams,
-    ProjectRenameParams, ProjectShowParams, ProtocolError, ProviderKind, Request, Response,
-    SessionDiffParams, SessionId, SessionInfo, SessionNewParams, SessionReportNativeIdParams,
-    SessionSetMetadataParams, StateSource,
+    method, AgentActivity, AgentKind, ErrorClass, NotificationPolicyParams, ProcessStartIdentity,
+    ProjectActionParams, ProjectActionResult, ProjectActionsParams, ProjectAddParams,
+    ProjectPromptParams, ProjectRemoveParams, ProjectRenameParams, ProjectShowParams,
+    ProtocolError, ProviderKind, ReportSequence, Request, Response, SessionDiffParams, SessionId,
+    SessionInfo, SessionNewParams, SessionOutputParams, SessionReportNativeIdParams,
+    SessionScreenParams, SessionSetMetadataParams, SessionWaitParams, StateSource,
 };
+use time::format_description::well_known::Rfc3339;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+
+// Linux `/proc/<pid>/stat` field 22 is the process start identity; after
+// removing pid and the parenthesized command it is item 19 in the remainder.
+const PROC_STAT_START_FIELD_AFTER_COMMAND: usize = 19;
+
+// Keeps a test report live long enough for local scheduling without making it
+// effectively unbounded.
+const NATIVE_REPORT_EXPIRY_MINUTES: i64 = 1;
+
+// Keeps the observation smoke test intentionally small while exercising a
+// nonempty bounded output page.
+const GUI_TEST_OUTPUT_BYTES: u32 = 1_024;
+
+// The state predicate is already true, so this only bounds a regression hang.
+const GUI_TEST_WAIT_MS: u32 = 100;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -68,6 +88,10 @@ async fn loopback_hosts_seed_and_stream_agent_state() {
     assert_eq!(snapshot_b.health.status, "ok");
     assert!(snapshot_a.sessions.is_empty());
     assert!(snapshot_b.sessions.is_empty());
+    assert!(snapshot_a
+        .notification_providers
+        .iter()
+        .any(|provider| provider == "codex"));
 
     let mut events = Box::pin(host_subscription_stream(host_a.clone()));
     assert!(matches!(
@@ -285,7 +309,7 @@ async fn session_lifecycle_create_inspect_and_stop_reconciles_workspace_state() 
     write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
     let _path = PathGuard::prepend(&bin_dir);
 
-    let daemon = LoopbackDaemon::spawn("m2-session", "0.2.0-session").await;
+    let daemon = LoopbackDaemon::spawn_with_notifications("m2-session", "0.2.0-session").await;
     let host = HostConfig::tcp("host-session", daemon.addr);
     let mut workspace = Workspace::default();
     let mut stream = Box::pin(workspace_connection_stream(
@@ -297,7 +321,7 @@ async fn session_lifecycle_create_inspect_and_stop_reconciles_workspace_state() 
     let created = pohunek_gui_core::create_session(
         &host,
         SessionNewParams {
-            agent: agent_name(AgentKind::Codex).to_owned(),
+            agent: agent_name(&AgentKind::Codex).to_owned(),
             name: None,
             cwd: Some(temp_dir("gui-core-m2-session-cwd")),
             cols: 100,
@@ -333,6 +357,8 @@ async fn session_lifecycle_create_inspect_and_stop_reconciles_workspace_state() 
     assert_eq!(inspected.id, created.session.id);
     assert_eq!(session_metadata_rows(&inspected)[0].key, "source");
 
+    exercise_observation_and_policy(&host, &inspected).await;
+
     let stopped = stop_gui_session(&host, &created.session.id)
         .await
         .expect("session.stop through gui-core");
@@ -363,6 +389,81 @@ async fn session_lifecycle_create_inspect_and_stop_reconciles_workspace_state() 
     daemon.shutdown().await;
 }
 
+async fn exercise_observation_and_policy(host: &HostConfig, session: &SessionInfo) {
+    let screen = read_session_screen(host, SessionScreenParams::new(session.id.clone()))
+        .await
+        .expect("session.screen through gui-core");
+    assert_eq!(screen.session_id, session.id);
+    let output = read_session_output(
+        host,
+        SessionOutputParams::new(session.id.clone(), None, None, GUI_TEST_OUTPUT_BYTES, None)
+            .expect("valid output params"),
+    )
+    .await
+    .expect("session.output through gui-core");
+    assert_eq!(output.session_id(), &session.id);
+    let stale_runtime = protocol::SessionRuntimeIdentity::new(
+        output.runtime().runtime_id(),
+        protocol::RuntimeGeneration::new(
+            output
+                .runtime()
+                .runtime_generation()
+                .get()
+                .checked_add(1)
+                .expect("test runtime generation can advance"),
+        ),
+    )
+    .expect("valid stale runtime identity");
+    let stale_error = read_session_output(
+        host,
+        SessionOutputParams::new(
+            session.id.clone(),
+            Some(stale_runtime),
+            Some(output.next_offset()),
+            GUI_TEST_OUTPUT_BYTES,
+            None,
+        )
+        .expect("valid stale output params"),
+    )
+    .await
+    .expect_err("same runtime id with a new generation is rejected");
+    assert!(stale_error.is_session_runtime_changed());
+    let waited = wait_for_session(
+        host,
+        SessionWaitParams::new(
+            session.id.clone(),
+            None,
+            None,
+            None,
+            None,
+            Some(vec![protocol::SessionState::Running]),
+            None,
+            GUI_TEST_WAIT_MS,
+        )
+        .expect("valid wait params"),
+    )
+    .await
+    .expect("session.wait through gui-core");
+    assert_eq!(waited.reason, protocol::SessionWaitReason::StateMatched);
+
+    let mut policy =
+        pohunek_gui_core::get_notification_policy_with_options(host, test_connection_options())
+            .await
+            .expect("notification.policy.get through gui-core")
+            .policy;
+    policy
+        .providers
+        .insert("future-agent".to_owned(), policy.enabled.clone());
+    let saved = set_notification_policy_with_options(
+        host,
+        NotificationPolicyParams { policy },
+        test_connection_options(),
+    )
+    .await
+    .expect("notification.policy.set through gui-core");
+    assert!(saved.policy.providers.contains_key("future-agent"));
+}
+
 #[tokio::test]
 async fn session_metadata_merge_and_clear_round_trips() {
     let _path_lock = PATH_LOCK.lock().await;
@@ -375,7 +476,7 @@ async fn session_metadata_merge_and_clear_round_trips() {
     let created = pohunek_gui_core::create_session(
         &host,
         SessionNewParams {
-            agent: agent_name(AgentKind::Codex).to_owned(),
+            agent: agent_name(&AgentKind::Codex).to_owned(),
             name: None,
             cwd: Some(temp_dir("gui-core-m2-metadata-cwd")),
             cols: 80,
@@ -524,7 +625,7 @@ async fn worktree_creation_is_session_new_with_branch_and_visible_in_project_sho
     let created = pohunek_gui_core::create_session(
         &host,
         SessionNewParams {
-            agent: agent_name(AgentKind::Codex).to_owned(),
+            agent: agent_name(&AgentKind::Codex).to_owned(),
             name: None,
             cwd: None,
             cols: 80,
@@ -667,6 +768,7 @@ async fn remote_prompt_resolution_uses_target_daemon_config_not_operator_filesys
         Some(remote_config_dir),
         None,
         None,
+        false,
     )
     .await;
     let host = HostConfig::tcp("remote-host", daemon.addr);
@@ -753,6 +855,9 @@ fn preview_state_updates_without_launching_session() {
             project_error: None,
             notifications: Vec::new(),
             supported_agents: Vec::new(),
+            runtimes: Vec::new(),
+            notification_providers: Vec::new(),
+            observation_capabilities: pohunek_gui_core::ObservationCapabilities::default(),
         },
     });
     let preview = PromptPreview {
@@ -1386,7 +1491,7 @@ async fn create_worktree_session(host: &HostConfig, project_id: &str, branch: &s
     pohunek_gui_core::create_session(
         host,
         SessionNewParams {
-            agent: agent_name(AgentKind::Codex).to_owned(),
+            agent: agent_name(&AgentKind::Codex).to_owned(),
             name: None,
             cwd: None,
             cols: 80,
@@ -1748,7 +1853,7 @@ async fn review_dispatch_uses_the_overridden_agent_instead_of_the_source_session
     let session_info = inspect_session(&host, &session.id)
         .await
         .expect("session.inspect");
-    assert_eq!(session_info.agent, agent_name(AgentKind::Codex));
+    assert_eq!(session_info.agent, agent_name(&AgentKind::Codex));
 
     let store = ReviewStore::new(temp_dir("gui-core-review-dispatch-agent-override-store"));
     let mut review = Review::new(
@@ -1771,7 +1876,7 @@ async fn review_dispatch_uses_the_overridden_agent_instead_of_the_source_session
             config: &host,
             store: &store,
             session_info: &session_info,
-            agent: Some(agent_name(AgentKind::Shell).to_owned()),
+            agent: Some(agent_name(&AgentKind::Shell).to_owned()),
             rendered_prompt,
             cols: 80,
             rows: 24,
@@ -1781,7 +1886,7 @@ async fn review_dispatch_uses_the_overridden_agent_instead_of_the_source_session
     .await
     .expect("dispatch review with agent override");
 
-    assert_eq!(dispatched.session.agent, agent_name(AgentKind::Shell));
+    assert_eq!(dispatched.session.agent, agent_name(&AgentKind::Shell));
     assert_ne!(dispatched.session.agent, session_info.agent);
 
     stop_session(&host, &session.id).await;
@@ -1926,11 +2031,15 @@ struct LoopbackDaemon {
 
 impl LoopbackDaemon {
     async fn spawn(tag: &str, version: &str) -> Self {
-        Self::spawn_with_config(tag, version, None, None, None).await
+        Self::spawn_with_config(tag, version, None, None, None, false).await
+    }
+
+    async fn spawn_with_notifications(tag: &str, version: &str) -> Self {
+        Self::spawn_with_config(tag, version, None, None, None, true).await
     }
 
     async fn spawn_with_store_path(tag: &str, version: &str, store_path: PathBuf) -> Self {
-        Self::spawn_with_config(tag, version, None, None, Some(store_path)).await
+        Self::spawn_with_config(tag, version, None, None, Some(store_path), false).await
     }
 
     async fn spawn_with_config(
@@ -1939,6 +2048,7 @@ impl LoopbackDaemon {
         config_dir: Option<PathBuf>,
         shell_command: Option<pohunek_daemon::session::ShellCommand>,
         store_path: Option<PathBuf>,
+        notifications_enabled: bool,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1957,7 +2067,13 @@ impl LoopbackDaemon {
             config.shell_command = shell_command;
         }
         let sessions = worker_backed_registry(config);
-        let state = DaemonState::new(HealthInfo::new(version), sessions);
+        let mut state = DaemonState::new(HealthInfo::new(version), sessions);
+        if notifications_enabled {
+            let notifications =
+                NotificationService::open(&temp_dir(&format!("{tag}-notifications")))
+                    .expect("open loopback notification service");
+            state = state.with_notifications(notifications);
+        }
         let server = RemoteServer::from_listener(listener, state);
         let (shutdown, rx) = oneshot::channel();
         let tag = tag.to_owned();
@@ -2095,29 +2211,41 @@ impl NotificationListErrorDaemon {
 }
 
 fn notification_error_response(request: &Request) -> Response {
-    match request.method.as_str() {
+    match request.method() {
         method::DAEMON_HEALTH => Response::ok(
-            request.id.clone(),
+            protocol::PROTOCOL_VERSION,
+            request.id(),
             serde_json::to_value(HealthSummary {
                 status: "ok".to_owned(),
                 daemon_version: "0.1.0-notif-error".to_owned(),
                 protocol_version: protocol::PROTOCOL_VERSION,
             })
             .expect("serialize health"),
-        ),
-        method::SESSION_LIST | method::PROJECT_LIST => {
-            Response::ok(request.id.clone(), serde_json::json!([]))
-        }
+        )
+        .expect("test health response is valid"),
+        method::SESSION_LIST | method::PROJECT_LIST => Response::ok(
+            protocol::PROTOCOL_VERSION,
+            request.id(),
+            serde_json::json!([]),
+        )
+        .expect("test list response is valid"),
         method::NOTIFICATION_LIST => Response::err(
-            request.id.clone(),
+            protocol::PROTOCOL_VERSION,
+            request.id(),
             ProtocolError::new(
                 ErrorClass::Runtime,
                 "notification_store_unavailable",
                 "notification store unavailable",
                 None,
             ),
-        ),
-        method => Response::err(request.id.clone(), ProtocolError::method_not_found(method)),
+        )
+        .expect("test notification error response is valid"),
+        method => Response::err(
+            protocol::PROTOCOL_VERSION,
+            request.id(),
+            ProtocolError::method_not_found(method),
+        )
+        .expect("test method error response is valid"),
     }
 }
 
@@ -2369,22 +2497,55 @@ async fn wait_for_file(path: &Path) -> String {
 }
 
 async fn report_native_id(host: &HostConfig, id: &SessionId, agent: &str, native_id: &str) {
+    let session = inspect_session(host, id)
+        .await
+        .expect("inspect session before native identity report");
+    let runtime_id = session
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.runtime_id.clone())
+        .expect("managed session has a runtime id");
+    let process_start_identity = process_start_identity(session.pid);
+    let expires_at = (time::OffsetDateTime::now_utc()
+        + time::Duration::minutes(NATIVE_REPORT_EXPIRY_MINUTES))
+    .format(&Rfc3339)
+    .expect("format native identity report expiry");
+    let params = SessionReportNativeIdParams::new(
+        id.clone(),
+        runtime_id,
+        agent,
+        session.pid,
+        process_start_identity,
+        ReportSequence::new(1),
+        expires_at,
+        native_id,
+        None,
+    )
+    .expect("native identity report params are valid");
     let mut client = client(host).await;
     let request = Request::new(
         "gui-core-report-native-id",
         method::SESSION_REPORT_NATIVE_ID,
-        serde_json::to_value(SessionReportNativeIdParams {
-            session_id: id.clone(),
-            agent: agent.to_owned(),
-            native_session_id: native_id.to_owned(),
-            transcript_path: None,
-        })
-        .expect("serialize native id params"),
-    );
+        serde_json::to_value(params).expect("serialize native id params"),
+    )
+    .expect("test report-native-id request is valid");
     let _ = client
         .request(&request)
         .await
         .expect("session.report_native_id");
+}
+
+fn process_start_identity(pid: u32) -> ProcessStartIdentity {
+    let stat =
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read managed process stat");
+    let command_end = stat.rfind(')').expect("process stat command is terminated");
+    let start_identity = stat[command_end + 1..]
+        .split_whitespace()
+        .nth(PROC_STAT_START_FIELD_AFTER_COMMAND)
+        .expect("process stat has start identity")
+        .parse::<u64>()
+        .expect("process start identity is numeric");
+    ProcessStartIdentity::new(start_identity)
 }
 
 async fn wait_for_native_id_tcp(host: &HostConfig, id: &SessionId, native_id: &str) -> SessionInfo {
@@ -2406,7 +2567,7 @@ async fn create_agent_session(host: &HostConfig, agent: AgentKind, cwd: PathBuf)
         "gui-core-session-new",
         method::SESSION_NEW,
         serde_json::to_value(SessionNewParams {
-            agent: agent_name(agent).to_owned(),
+            agent: agent_name(&agent).to_owned(),
             name: None,
             cwd: Some(cwd),
             cols: 80,
@@ -2419,7 +2580,8 @@ async fn create_agent_session(host: &HostConfig, agent: AgentKind, cwd: PathBuf)
             metadata: std::collections::BTreeMap::new(),
         })
         .expect("serialize session.new params"),
-    );
+    )
+    .expect("test session-new request is valid");
     serde_json::from_value(client.request(&request).await.expect("session.new"))
         .expect("session info")
 }
@@ -2430,7 +2592,8 @@ async fn stop_session(host: &HostConfig, id: &SessionId) {
         "gui-core-session-stop",
         method::SESSION_STOP,
         serde_json::to_value(id).expect("serialize session id"),
-    );
+    )
+    .expect("test session-stop request is valid");
     let _ = client.request(&request).await.expect("session.stop");
 }
 
@@ -2474,11 +2637,13 @@ where
     }
 }
 
-fn agent_name(agent: AgentKind) -> &'static str {
+fn agent_name(agent: &AgentKind) -> &'static str {
     match agent {
         AgentKind::Shell => "shell",
         AgentKind::Codex => "codex",
         AgentKind::Claude => "claude",
+        AgentKind::Hermes => "hermes",
+        AgentKind::Unknown(_) => panic!("unknown agents cannot be launched in tests"),
     }
 }
 

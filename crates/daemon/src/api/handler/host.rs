@@ -2,6 +2,8 @@
 
 use protocol::{HostDiscoverParams, Request, Response};
 
+use super::util::error_value;
+
 use super::util::{ok_value, parse_optional_params};
 use super::HealthInfo;
 use crate::discovery::DiscoveryCache;
@@ -36,10 +38,10 @@ pub(super) async fn handle_host_discover(
 ) -> Response {
     let params = match parse_optional_params::<HostDiscoverParams>(request) {
         Ok(params) => params,
-        Err(err) => return Response::err(request.id.clone(), err),
+        Err(err) => return error_value(request, err),
     };
     match discovery.records(params.force).await {
         Ok(records) => ok_value(request, &records),
-        Err(err) => Response::err(request.id.clone(), err.to_protocol_error()),
+        Err(err) => error_value(request, err.to_protocol_error()),
     }
 }

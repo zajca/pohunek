@@ -2,8 +2,14 @@
 
 import type { AttachHeader } from "./index";
 
-export const PROTOCOL_VERSION = 1 as const;
+export const PROTOCOL_VERSION = 2 as const;
+export const MIN_PROTOCOL_VERSION = 2 as const;
+export const SUPPORTED_PROTOCOL_VERSIONS = { minimum: 2, maximum: 2 } as const;
 export const MAX_CONTROL_LINE_BYTES = 1048576 as const;
+export const MAX_RUNTIME_ID_BYTES = 128 as const;
+export const MAX_SESSION_INPUT_BYTES = 262144 as const;
+export const MAX_SESSION_OUTPUT_BYTES = 783240 as const;
+export const MAX_SESSION_WAIT_MS = 8000 as const;
 
 export const EVENT_AGENT_STATE = "agent_state" as const;
 export const EVENT_ATTACH_CLOSED = "attach_closed" as const;

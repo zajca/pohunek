@@ -10,9 +10,10 @@
 //! `NetBird` transport reuses it unchanged.
 //!
 //! Design rules carried from the plan:
-//! - Every envelope carries `v` (protocol version). New fields are additive and
-//!   unknown fields are ignored, so a newer peer and an older peer interoperate
-//!   on the common subset.
+//! - Requests carry a supported `v` range. Responses and events carry the
+//!   highest mutually selected exact version.
+//! - Public observation and mutation DTOs reject unknown fields and invalid
+//!   cursor coordinates before dispatch.
 //! - Requests carry an `id` correlating the response and any related events.
 //! - Errors are typed (class + machine code + human message + optional recovery
 //!   hint) so `--json` consumers and operator agents can branch on them.
@@ -21,6 +22,7 @@
 
 mod assistant;
 mod capabilities;
+mod decimal;
 mod discovery;
 mod doctor;
 mod envelope;
@@ -41,11 +43,16 @@ pub use assistant::{
 #[doc(inline)]
 pub use capabilities::{AgentRuntime, HostCapabilities};
 #[doc(inline)]
+pub use decimal::{
+    DecimalWireError, OutputOffset, ProcessStartIdentity, ReportSequence, RuntimeGeneration,
+    TerminalWatermark,
+};
+#[doc(inline)]
 pub use discovery::{HostClass, HostDiscoverParams, HostRecord};
 #[doc(inline)]
 pub use doctor::{DaemonDoctorResult, DaemonHealthResult, DoctorCheck, DoctorReport, DoctorStatus};
 #[doc(inline)]
-pub use envelope::{Event, Request, Response, StateSource};
+pub use envelope::{EnvelopeError, Event, Request, Response, StateSource};
 #[doc(inline)]
 pub use error::{ErrorClass, ProtocolError};
 #[doc(inline)]
@@ -55,7 +62,13 @@ pub use integration::{
     ENV_WORKER_PROTOCOL_VERSION, ENV_WORKER_SOCKET_PATH,
 };
 #[doc(inline)]
-pub use limits::{MAX_CONTROL_LINE_BYTES, MAX_SESSION_DIFF_BYTES};
+pub use limits::{
+    MAX_CONTROL_LINE_BYTES, MAX_IDENTITY_CLAIM_TTL_SECS, MAX_REQUEST_ID_BYTES,
+    MAX_RUNTIME_ID_BYTES, MAX_SESSION_DIFF_BYTES, MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES,
+    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_WAIT_MS,
+    MAX_SUCCESS_RESPONSE_ENVELOPE_BYTES, OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES,
+    SESSION_OUTPUT_METADATA_HEADROOM_BYTES,
+};
 #[doc(inline)]
 pub use method::Method;
 #[doc(inline)]
@@ -79,20 +92,26 @@ pub use project::{
 #[doc(inline)]
 pub use session::{
     AgentActivity, AgentKind, AgentStateEvent, AttachEvent, AttachHeader, CwdSource, ForkCwdMode,
-    RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryResult, RuntimeInventoryStatus,
-    RuntimeState, SessionAttachParams, SessionAttachResult, SessionDetachParams,
-    SessionDetachResult, SessionDiffParams, SessionDiffResult, SessionEvent, SessionForkParams,
-    SessionForkResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionListFilter, SessionListParams, SessionNativeRecoveredEvent, SessionNewParams,
-    SessionNewResult, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
-    SessionRenameParams, SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
-    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
-    SessionResizeResult, SessionResumeResult, SessionRuntime, SessionSetMetadataParams,
-    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWarning, SessionWarningKind,
+    ObservationParamsError, RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryResult,
+    RuntimeInventoryStatus, RuntimeState, SessionAttachParams, SessionAttachResult,
+    SessionCapabilities, SessionDetachParams, SessionDetachResult, SessionDiffParams,
+    SessionDiffResult, SessionEvent, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
+    SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
+    SessionNativeRecoveredEvent, SessionNewParams, SessionNewResult, SessionOutputGap,
+    SessionOutputParams, SessionOutputResult, SessionReleaseAgentParams, SessionReleaseAgentResult,
+    SessionRemoveResult, SessionRenameParams, SessionRenameResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionResumeResult, SessionRuntime,
+    SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
+    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWaitParams,
+    SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind, TerminalCursor,
     TerminalDimensions, TerminalDimensionsError,
 };
 #[doc(inline)]
-pub use version::{negotiate, ProtocolVersion, PROTOCOL_VERSION};
+pub use version::{
+    negotiate, ProtocolVersion, ProtocolVersionError, ProtocolVersionRange, MIN_PROTOCOL_VERSION,
+    PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
+};
 
 /// Control-protocol event names.
 ///

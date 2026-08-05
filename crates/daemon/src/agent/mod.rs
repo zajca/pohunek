@@ -4,32 +4,117 @@
 //! carrying launch argv/env/cwd, input rules (Claude Ink submit-delay quirk),
 //! the state manifest, and the resume command.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use protocol::{ErrorClass, ProtocolError};
+use protocol::{AgentActivity, ErrorClass, ProtocolError};
 use serde::{Deserialize, Serialize};
 
 use crate::detect::Manifest;
 
 mod claude;
 mod codex;
+mod hermes;
 mod profile;
 mod shell;
 
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
-pub(crate) use profile::{default_program, ProfileRegistry, ResolvedAgent};
+pub use hermes::HermesAdapter;
+pub(crate) use profile::{default_args, default_program, ProfileRegistry, ResolvedAgent};
 pub use shell::ShellAdapter;
 
 static SHELL_ADAPTER: ShellAdapter = ShellAdapter;
 static CODEX_ADAPTER: CodexAdapter = CodexAdapter;
 static CLAUDE_ADAPTER: ClaudeAdapter = ClaudeAdapter;
+static HERMES_ADAPTER: HermesAdapter = HermesAdapter;
+static UNSUPPORTED_ADAPTER: UnsupportedAdapter = UnsupportedAdapter;
+
+#[derive(Debug)]
+struct UnsupportedAdapter;
+
+impl AgentAdapter for UnsupportedAdapter {
+    fn id(&self) -> &'static str {
+        "unsupported"
+    }
+
+    fn launch(&self, _opts: &LaunchOpts) -> Result<LaunchCommand, ProtocolError> {
+        Err(ProtocolError::agent_kind_unsupported("unknown"))
+    }
+
+    fn input_rules(&self) -> InputRules {
+        InputRules::unrestricted(false, Duration::ZERO)
+    }
+
+    fn manifest(&self) -> &Manifest {
+        crate::detect::generic_shell_manifest()
+    }
+}
 
 /// Default submit delay for Claude Code's Ink TUI.
 pub const DEFAULT_CLAUDE_SUBMIT_DELAY: Duration = Duration::from_millis(150);
 /// Claude Code flag that forks a resumed native conversation into a new branch.
 const CLAUDE_FORK_SESSION_ARG: &str = "--fork-session";
+
+/// A launch executable resolved and canonicalized before provider validation.
+///
+/// The private path invariant lets the session launch path consume the exact
+/// executable that was probed without consulting `PATH` a second time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValidatedLaunchProgram(PathBuf);
+
+impl ValidatedLaunchProgram {
+    /// Resolve one configured program and canonicalize its first executable match.
+    pub(crate) fn resolve(program: &str) -> Option<Self> {
+        let cwd = std::env::current_dir().ok()?;
+        let path = std::env::var_os("PATH");
+        Self::resolve_with_path(program, path.as_deref(), &cwd)
+    }
+
+    fn resolve_with_path(program: &str, path: Option<&OsStr>, cwd: &Path) -> Option<Self> {
+        let configured = Path::new(program);
+        let candidate = if configured.is_absolute()
+            || configured
+                .parent()
+                .is_some_and(|parent| !parent.as_os_str().is_empty())
+        {
+            if configured.is_absolute() {
+                configured.to_owned()
+            } else {
+                cwd.join(configured)
+            }
+        } else {
+            std::env::split_paths(path?).find_map(|entry| {
+                let directory = if entry.as_os_str().is_empty() {
+                    cwd.to_owned()
+                } else if entry.is_absolute() {
+                    entry
+                } else {
+                    cwd.join(entry)
+                };
+                let candidate = directory.join(configured);
+                is_executable_file(&candidate).then_some(candidate)
+            })?
+        };
+        if !is_executable_file(&candidate) {
+            return None;
+        }
+        let canonical = candidate.canonicalize().ok()?;
+        (canonical.is_absolute() && canonical.to_str().is_some()).then_some(Self(canonical))
+    }
+
+    /// The absolute canonical path used for both probing and launch.
+    pub(crate) fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    fn as_launch_str(&self) -> &str {
+        self.0
+            .to_str()
+            .expect("validated launch paths have a UTF-8 representation")
+    }
+}
 
 /// Options supplied by the session registry when launching an agent process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +127,8 @@ pub struct LaunchOpts {
     pub rows: u16,
     /// Extra environment variables for the child process.
     pub env_extra: Vec<(String, String)>,
+    /// Exact provider executable already resolved and validated for this launch.
+    pub(crate) validated_program: Option<ValidatedLaunchProgram>,
 }
 
 /// Sanitized process launch plan passed to a durable worker.
@@ -68,6 +155,81 @@ pub struct InputRules {
     pub bracketed_paste: bool,
     /// Delay before sending the submit byte as a separate write.
     pub submit_delay: Duration,
+    /// Provider-specific validation applied before terminal framing.
+    text_policy: InputTextPolicy,
+    /// Whether programmatic input is safe while approval UI is visible.
+    allow_while_blocked: bool,
+}
+
+/// Text accepted by one compiled input adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputTextPolicy {
+    /// Preserve the historical behavior for Shell, Codex, and Claude.
+    Unrestricted,
+    /// Bounded UTF-8 text with only LF and tab from the control ranges.
+    HermesSafeText,
+}
+
+impl InputRules {
+    /// Builds historical unrestricted framing rules.
+    #[must_use]
+    pub const fn unrestricted(bracketed_paste: bool, submit_delay: Duration) -> Self {
+        Self {
+            bracketed_paste,
+            submit_delay,
+            text_policy: InputTextPolicy::Unrestricted,
+            allow_while_blocked: true,
+        }
+    }
+
+    /// Builds the pinned Hermes safe-text and approval-state contract.
+    pub(crate) const fn hermes(bracketed_paste: bool, submit_delay: Duration) -> Self {
+        Self {
+            bracketed_paste,
+            submit_delay,
+            text_policy: InputTextPolicy::HermesSafeText,
+            allow_while_blocked: false,
+        }
+    }
+
+    /// Replaces framing while retaining the compiled provider safety contract.
+    pub(crate) const fn with_framing(self, bracketed_paste: bool, submit_delay: Duration) -> Self {
+        Self {
+            bracketed_paste,
+            submit_delay,
+            ..self
+        }
+    }
+
+    /// Validates text before any bytes are framed or written to the PTY.
+    pub(crate) fn validate_text(self, text: &str) -> Result<(), ProtocolError> {
+        if self.text_policy == InputTextPolicy::HermesSafeText
+            && (text.len() > protocol::MAX_SESSION_INPUT_BYTES
+                || text
+                    .chars()
+                    .any(|character| character.is_control() && !matches!(character, '\n' | '\t')))
+        {
+            return Err(ProtocolError::session_input_rejected());
+        }
+        Ok(())
+    }
+
+    /// Whether the adapter permits automated input while blocked on owner action.
+    pub(crate) const fn allows_while_blocked(self) -> bool {
+        self.allow_while_blocked
+    }
+
+    /// Validates whether programmatic input is permitted in the visible state.
+    pub(crate) fn validate_activity(
+        self,
+        activity: Option<AgentActivity>,
+    ) -> Result<(), ProtocolError> {
+        if activity == Some(AgentActivity::Blocked) && !self.allows_while_blocked() {
+            Err(ProtocolError::session_input_blocked())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Maximum length of an id-kind native session reference, in bytes.
@@ -202,18 +364,6 @@ impl ResumeMode {
             ResumeMode::Subcommand => vec!["resume".to_owned(), value.to_owned()],
         }
     }
-
-    /// Build the fork argv (excluding `argv[0]`) for `value`.
-    fn fork_argv(self, value: &str) -> Option<Vec<String>> {
-        match self {
-            ResumeMode::Flag => {
-                let mut args = self.argv(value);
-                args.push(CLAUDE_FORK_SESSION_ARG.to_owned());
-                Some(args)
-            }
-            ResumeMode::Subcommand => None,
-        }
-    }
 }
 
 /// The resolved "how to resume" for a session: the argv mode plus which native
@@ -231,20 +381,101 @@ pub(crate) struct ResumeTemplate {
     pub ref_kind: SessionRefKind,
 }
 
+/// A compiled provider-native fork command shape.
+///
+/// Fork mechanics are intentionally independent from [`ResumeMode`]. A provider
+/// may support resume without supporting a native conversation fork.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkMode {
+    /// Append `--fork-session` to a Claude Code resume operation.
+    ClaudeSession,
+}
+
+impl ForkMode {
+    /// Append provider-specific fork arguments to `args`.
+    fn append_args(self, args: &mut Vec<String>) {
+        match self {
+            Self::ClaudeSession => args.push(CLAUDE_FORK_SESSION_ARG.to_owned()),
+        }
+    }
+}
+
+/// A compiled provider-native fork capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForkTemplate {
+    /// The frozen provider resume operation used to select the conversation.
+    pub resume: ResumeTemplate,
+    /// The provider-owned argv shape for a fork operation.
+    pub mode: ForkMode,
+}
+
+impl ForkTemplate {
+    /// Build fork argv from the frozen resume operation and provider extension.
+    fn argv(self, value: &str) -> Vec<String> {
+        let mut args = self.resume.mode.argv(value);
+        self.mode.append_args(&mut args);
+        args
+    }
+}
+
+/// The independently declared native recovery capabilities of an agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AgentCapabilities {
+    /// Native resume support, when the provider supports it.
+    pub resume: Option<ResumeTemplate>,
+    /// Native fork support, when the provider supports it.
+    pub fork: Option<ForkTemplate>,
+}
+
+/// Return the compiled capabilities for a built-in base agent kind.
+#[must_use]
+pub(crate) fn base_capabilities(base: &protocol::AgentKind) -> AgentCapabilities {
+    match base {
+        protocol::AgentKind::Shell | protocol::AgentKind::Unknown(_) => AgentCapabilities {
+            resume: None,
+            fork: None,
+        },
+        protocol::AgentKind::Codex => AgentCapabilities {
+            resume: Some(ResumeTemplate {
+                mode: ResumeMode::Subcommand,
+                ref_kind: SessionRefKind::Id,
+            }),
+            fork: None,
+        },
+        protocol::AgentKind::Claude => AgentCapabilities {
+            resume: Some(ResumeTemplate {
+                mode: ResumeMode::Flag,
+                ref_kind: SessionRefKind::Id,
+            }),
+            fork: Some(ForkTemplate {
+                resume: ResumeTemplate {
+                    mode: ResumeMode::Flag,
+                    ref_kind: SessionRefKind::Id,
+                },
+                mode: ForkMode::ClaudeSession,
+            }),
+        },
+        protocol::AgentKind::Hermes => AgentCapabilities {
+            resume: Some(ResumeTemplate {
+                mode: ResumeMode::Flag,
+                ref_kind: SessionRefKind::Id,
+            }),
+            fork: None,
+        },
+    }
+}
+
 /// The resume template for a bare base kind, or `None` when it has no native
 /// resume (a shell).
-pub(crate) fn base_resume_template(base: protocol::AgentKind) -> Option<ResumeTemplate> {
-    match base {
-        protocol::AgentKind::Shell => None,
-        protocol::AgentKind::Codex => Some(ResumeTemplate {
-            mode: ResumeMode::Subcommand,
-            ref_kind: SessionRefKind::Id,
-        }),
-        protocol::AgentKind::Claude => Some(ResumeTemplate {
-            mode: ResumeMode::Flag,
-            ref_kind: SessionRefKind::Id,
-        }),
-    }
+pub(crate) fn base_resume_template(base: &protocol::AgentKind) -> Option<ResumeTemplate> {
+    base_capabilities(base).resume
+}
+
+/// Return the compiled native fork template for a base agent kind.
+#[must_use]
+pub(crate) fn base_fork_template(base: &protocol::AgentKind) -> Option<ForkTemplate> {
+    base_capabilities(base).fork
 }
 
 /// Thin per-agent adapter for launch, input, and activity behavior.
@@ -269,22 +500,27 @@ fn launch_command(
 
 /// Return the built-in adapter for an agent kind.
 #[must_use]
-pub fn adapter_for(agent: protocol::AgentKind) -> &'static dyn AgentAdapter {
+pub fn adapter_for(agent: &protocol::AgentKind) -> &'static dyn AgentAdapter {
     match agent {
         protocol::AgentKind::Shell => &SHELL_ADAPTER,
         protocol::AgentKind::Codex => &CODEX_ADAPTER,
         protocol::AgentKind::Claude => &CLAUDE_ADAPTER,
+        protocol::AgentKind::Hermes => &HERMES_ADAPTER,
+        protocol::AgentKind::Unknown(_) => &UNSUPPORTED_ADAPTER,
     }
 }
 
 /// Return the launch adapter, preserving the configured shell command seam.
-pub(crate) fn launch_adapter_for(
-    agent: protocol::AgentKind,
-    shell_command: &crate::session::ShellCommand,
-) -> &dyn AgentAdapter {
+pub(crate) fn launch_adapter_for<'a>(
+    agent: &protocol::AgentKind,
+    shell_command: &'a crate::session::ShellCommand,
+) -> &'a dyn AgentAdapter {
     match agent {
         protocol::AgentKind::Shell => shell_command,
-        protocol::AgentKind::Codex | protocol::AgentKind::Claude => adapter_for(agent),
+        protocol::AgentKind::Codex | protocol::AgentKind::Claude | protocol::AgentKind::Hermes => {
+            adapter_for(agent)
+        }
+        protocol::AgentKind::Unknown(_) => &UNSUPPORTED_ADAPTER,
     }
 }
 
@@ -298,8 +534,12 @@ pub fn build_pty_command(
     args: Vec<String>,
     opts: &LaunchOpts,
 ) -> Result<LaunchCommand, ProtocolError> {
+    let program = opts.validated_program.as_ref().map_or_else(
+        || resolve_binary(program),
+        |validated| Ok(validated.as_launch_str().to_owned()),
+    )?;
     Ok(LaunchCommand {
-        program: resolve_binary(program)?,
+        program,
         args,
         env: opts.env_extra.clone(),
         cwd: opts.cwd.clone(),
@@ -330,19 +570,14 @@ pub(crate) fn resume_pty_command_from_template(
 
 /// Build the PTY command that forks a native session from a frozen snapshot.
 pub(crate) fn fork_pty_command_from_template(
-    agent: &str,
     program: &str,
     frozen_args: Vec<String>,
-    template: ResumeTemplate,
+    template: ForkTemplate,
     session_ref: &SessionRef,
     opts: &LaunchOpts,
 ) -> Result<LaunchCommand, ProtocolError> {
     let mut args = frozen_args;
-    let fork_args = template
-        .mode
-        .fork_argv(session_ref.value())
-        .ok_or_else(|| agent_fork_unsupported(agent))?;
-    args.extend(fork_args);
+    args.extend(template.argv(session_ref.value()));
     build_pty_command(program, args, opts)
 }
 
@@ -355,13 +590,8 @@ pub(crate) fn agent_not_resumable(agent: &str) -> ProtocolError {
     )
 }
 
-pub(crate) fn agent_fork_unsupported(agent: &str) -> ProtocolError {
-    ProtocolError::new(
-        ErrorClass::Runtime,
-        "agent_fork_unsupported",
-        format!("{agent} sessions cannot be forked by this daemon"),
-        Some("forking is currently supported only for Claude-backed sessions".to_owned()),
-    )
+pub(crate) fn agent_fork_unsupported() -> ProtocolError {
+    ProtocolError::agent_fork_unsupported()
 }
 
 fn resolve_binary(name: &str) -> Result<String, ProtocolError> {
@@ -426,6 +656,7 @@ fn invalid_session_ref(message: &'static str) -> ProtocolError {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{LazyLock, Mutex};
@@ -434,9 +665,10 @@ mod tests {
     use protocol::{AgentActivity, ErrorClass};
 
     use super::{
-        base_resume_template, resume_pty_command_from_template, AgentAdapter, ClaudeAdapter,
-        CodexAdapter, LaunchOpts, ResumeMode, ResumeTemplate, SessionRef, SessionRefKind,
-        ShellAdapter,
+        base_capabilities, base_resume_template, build_pty_command, fork_pty_command_from_template,
+        resume_pty_command_from_template, AgentAdapter, ClaudeAdapter, CodexAdapter, ForkMode,
+        ForkTemplate, HermesAdapter, LaunchOpts, ResumeMode, ResumeTemplate, SessionRef,
+        SessionRefKind, ShellAdapter, ValidatedLaunchProgram,
     };
     use crate::detect::{ManifestRegion, MatchContext};
 
@@ -448,6 +680,7 @@ mod tests {
             cols: 120,
             rows: 40,
             env_extra: vec![("POHUNEK_SESSION_ID".to_owned(), "s-42".to_owned())],
+            validated_program: None,
         }
     }
 
@@ -557,6 +790,61 @@ mod tests {
     }
 
     #[test]
+    fn hermes_launch_is_exact_chat_argv_and_preserves_opts() {
+        let bin_dir = temp_dir("hermes-bin");
+        let hermes = write_executable(&bin_dir, "hermes");
+        let cwd = temp_dir("hermes-cwd");
+
+        let command = with_path(&bin_dir, || {
+            HermesAdapter
+                .launch(&launch_opts(cwd.clone()))
+                .expect("Hermes launch command")
+        });
+
+        assert_eq!(command.program, hermes.display().to_string());
+        assert_eq!(command.args, vec!["chat"]);
+        assert_eq!(command.cwd, cwd);
+        assert_eq!((command.cols, command.rows), (120, 40));
+        assert_eq!(
+            command.env,
+            vec![("POHUNEK_SESSION_ID".to_owned(), "s-42".to_owned())]
+        );
+    }
+
+    #[test]
+    fn validated_program_absolutizes_relative_and_empty_path_entries_once() {
+        let cwd = temp_dir("validated-relative-path");
+        let relative_dir = cwd.join("relative-bin");
+        fs::create_dir(&relative_dir).expect("create relative bin");
+        let relative_hermes = write_executable(&relative_dir, "hermes");
+        let relative = ValidatedLaunchProgram::resolve_with_path(
+            "hermes",
+            Some(OsStr::new("relative-bin")),
+            &cwd,
+        )
+        .expect("resolve relative PATH entry");
+        assert_eq!(
+            relative.as_path(),
+            relative_hermes
+                .canonicalize()
+                .expect("canonical relative fixture")
+        );
+
+        let cwd_hermes = write_executable(&cwd, "hermes");
+        let empty = ValidatedLaunchProgram::resolve_with_path("hermes", Some(OsStr::new("")), &cwd)
+            .expect("resolve empty PATH entry as cwd");
+        let expected = cwd_hermes.canonicalize().expect("canonical cwd fixture");
+        assert_eq!(empty.as_path(), expected);
+
+        let mut opts = launch_opts(cwd);
+        opts.validated_program = Some(empty);
+        let command = build_pty_command("must-not-be-resolved", vec!["chat".to_owned()], &opts)
+            .expect("build from validated program");
+        assert_eq!(command.program, expected.display().to_string());
+        assert_eq!(command.args, vec!["chat"]);
+    }
+
+    #[test]
     fn shell_launch_resolves_binary_and_preserves_opts() {
         let bin_dir = temp_dir("shell-bin");
         let shell = write_executable(&bin_dir, "shell");
@@ -592,6 +880,10 @@ mod tests {
         let claude = ClaudeAdapter.input_rules();
         assert!(!claude.bracketed_paste);
         assert_eq!(claude.submit_delay, Duration::from_millis(150));
+
+        let hermes = HermesAdapter.input_rules();
+        assert!(hermes.bracketed_paste);
+        assert_eq!(hermes.submit_delay, Duration::from_millis(150));
     }
 
     #[test]
@@ -683,14 +975,90 @@ mod tests {
     fn base_resume_template_defines_native_resume_modes() {
         // Claude → `--resume` flag, Codex → `resume` subcommand, both id-kind.
         // This is the single source of resume argv shape for built-in base kinds.
-        let claude = base_resume_template(protocol::AgentKind::Claude).expect("claude resumable");
+        let claude = base_resume_template(&protocol::AgentKind::Claude).expect("claude resumable");
         assert_eq!(claude.mode, ResumeMode::Flag);
         assert_eq!(claude.ref_kind, SessionRefKind::Id);
-        let codex = base_resume_template(protocol::AgentKind::Codex).expect("codex resumable");
+        let codex = base_resume_template(&protocol::AgentKind::Codex).expect("codex resumable");
         assert_eq!(codex.mode, ResumeMode::Subcommand);
         assert_eq!(codex.ref_kind, SessionRefKind::Id);
+        let hermes = base_resume_template(&protocol::AgentKind::Hermes).expect("Hermes resumable");
+        assert_eq!(hermes.mode, ResumeMode::Flag);
+        assert_eq!(hermes.ref_kind, SessionRefKind::Id);
         // A shell has no native resume.
-        assert!(base_resume_template(protocol::AgentKind::Shell).is_none());
+        assert!(base_resume_template(&protocol::AgentKind::Shell).is_none());
+    }
+
+    #[test]
+    fn built_in_capabilities_keep_resume_and_fork_independent() {
+        let shell = base_capabilities(&protocol::AgentKind::Shell);
+        assert_eq!(shell.resume, None);
+        assert_eq!(shell.fork, None);
+
+        let codex = base_capabilities(&protocol::AgentKind::Codex);
+        assert_eq!(
+            codex.resume,
+            base_resume_template(&protocol::AgentKind::Codex)
+        );
+        assert_eq!(codex.fork, None);
+
+        let hermes = base_capabilities(&protocol::AgentKind::Hermes);
+        assert_eq!(
+            hermes.resume,
+            base_resume_template(&protocol::AgentKind::Hermes)
+        );
+        assert_eq!(hermes.fork, None);
+
+        let claude = base_capabilities(&protocol::AgentKind::Claude);
+        assert_eq!(
+            claude.resume,
+            base_resume_template(&protocol::AgentKind::Claude)
+        );
+        assert_eq!(
+            claude.fork,
+            Some(ForkTemplate {
+                resume: ResumeTemplate {
+                    mode: ResumeMode::Flag,
+                    ref_kind: SessionRefKind::Id,
+                },
+                mode: ForkMode::ClaudeSession,
+            })
+        );
+    }
+
+    #[test]
+    fn fork_pty_command_preserves_claude_argv_without_resume_mode_coupling() {
+        let bin_dir = temp_dir("template-fork-bin");
+        write_executable(&bin_dir, "claude-sonnet");
+        let cwd = temp_dir("template-fork-cwd");
+        let session = SessionRef::id("native-123").expect("id ref");
+
+        let command = with_path(&bin_dir, || {
+            fork_pty_command_from_template(
+                "claude-sonnet",
+                vec!["--model".to_owned(), "sonnet".to_owned()],
+                ForkTemplate {
+                    resume: ResumeTemplate {
+                        mode: ResumeMode::Flag,
+                        ref_kind: SessionRefKind::Id,
+                    },
+                    mode: ForkMode::ClaudeSession,
+                },
+                &session,
+                &launch_opts(cwd),
+            )
+            .expect("fork command")
+        });
+
+        assert_eq!(
+            command.args,
+            vec![
+                "--model",
+                "sonnet",
+                "--resume",
+                "native-123",
+                "--fork-session",
+            ]
+        );
     }
 
     #[test]
@@ -733,6 +1101,34 @@ mod tests {
             .expect("subcommand resume command")
         });
         assert_eq!(sub.args, vec!["resume", "native-123"]);
+    }
+
+    #[test]
+    fn hermes_resume_keeps_reference_as_one_argument_after_chat() {
+        let bin_dir = temp_dir("hermes-resume-bin");
+        write_executable(&bin_dir, "hermes");
+        let session = SessionRef::id("native id with spaces + symbols")
+            .expect("spaces and non-control symbols are valid in opaque ids");
+
+        let command = with_path(&bin_dir, || {
+            resume_pty_command_from_template(
+                "hermes",
+                vec!["chat".to_owned()],
+                base_resume_template(&protocol::AgentKind::Hermes).expect("Hermes resumes"),
+                &session,
+                &launch_opts(temp_dir("hermes-resume-cwd")),
+            )
+            .expect("Hermes resume command")
+        });
+
+        assert_eq!(
+            command.args,
+            vec!["chat", "--resume", "native id with spaces + symbols"]
+        );
+        assert!(!command
+            .args
+            .iter()
+            .any(|arg| { matches!(arg.as_str(), "--continue" | "--pass-session-id") }));
     }
 
     #[test]

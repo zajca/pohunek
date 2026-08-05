@@ -4,7 +4,7 @@
 //! connection. Unknown additive object fields are ignored by serde, while
 //! unknown operations fail deserialization and affect only that connection.
 
-// Rust guideline compliant 2026-07-29
+// Rust guideline compliant 2026-08-04
 
 use std::fmt::{Debug, Formatter};
 use std::path::PathBuf;
@@ -31,6 +31,8 @@ pub enum Capability {
     IdentityHook,
     /// Atomic initial resize, terminal repaint, and live attach subscription.
     AttachSnapshot,
+    /// One-shot, runtime-bound terminal and retained-output observation.
+    ControlPlaneObservation,
 }
 
 /// Describes the worker runtime lifecycle.
@@ -196,6 +198,17 @@ impl Debug for ActiveIdentityClaim {
             .field("native_reference", &"[REDACTED]")
             .finish()
     }
+}
+
+/// Ordering tombstone for an explicit worker-private identity release.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleasedIdentityClaim {
+    /// Provider base released by the hook.
+    pub provider: String,
+    /// Released process identity.
+    pub process: ProcessIdentity,
+    /// Monotonic release sequence.
+    pub sequence: u64,
 }
 
 /// Defines bounded worker memory and retention limits.
@@ -507,6 +520,8 @@ pub enum StreamMode {
     Attach,
     /// Daemon semantic detector feed.
     Detector,
+    /// One bounded control-plane output observation.
+    Observation,
 }
 
 /// Defines the atomic start state for a public terminal attachment.
@@ -587,6 +602,9 @@ pub struct InspectSnapshot {
     pub launch_identity: Option<ReportedLaunchIdentity>,
     /// Latest active provider claim captured while the daemon was absent.
     pub active_identity: Option<ActiveIdentityClaim>,
+    /// Explicit release tombstone, absent when no private release was accepted.
+    #[serde(default)]
+    pub active_identity_release: Option<ReleasedIdentityClaim>,
 }
 
 /// Defines one daemon-to-worker request.
@@ -646,6 +664,24 @@ pub enum RequestKind {
         /// Atomic terminal state requested by a fresh public attachment.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attach: Option<AttachStart>,
+    },
+    /// Returns the current rendered terminal without attaching a data stream.
+    TerminalSnapshot {
+        /// Exact leased runtime scope.
+        scope: RuntimeScope,
+    },
+    /// Returns one bounded retained-output page without attaching a data stream.
+    ReadOutput {
+        /// Exact leased runtime scope.
+        scope: RuntimeScope,
+        /// Unique one-shot observation stream.
+        stream_id: StreamId,
+        /// Output cursor. An omitted cursor requests the newest bounded tail.
+        after_offset: Option<u64>,
+        /// Maximum raw output bytes in this response.
+        max_bytes: u32,
+        /// Optional bounded wait when the cursor is at the current end.
+        wait_ms: u64,
     },
     /// Executes one deduplicated input plan.
     WritePlan {
@@ -741,6 +777,20 @@ pub enum ResponseKind {
         /// Worker monotonic millisecond expiry.
         expires_at_ms: u64,
     },
+    /// Returns a rendered terminal snapshot for one runtime generation.
+    TerminalSnapshot {
+        /// Runtime that produced the snapshot.
+        runtime_id: RuntimeId,
+        /// Current terminal state.
+        snapshot: Box<crate::TerminalSnapshot>,
+    },
+    /// Opens one bounded, framed output observation stream.
+    OutputReadOpened {
+        /// Redacted one-use data-stream credential.
+        token: DataToken,
+        /// Worker monotonic millisecond expiry.
+        expires_at_ms: u64,
+    },
     /// Reports successful input completion.
     WriteCompleted {
         /// Deduplicated write acknowledgement.
@@ -789,6 +839,19 @@ pub enum ControlCode {
     WriteOutcomeUnknown,
     /// The runtime encountered an internal fault.
     RuntimeFault,
+    /// The selected private protocol lacks a requested capability.
+    WorkerFeatureUnavailable,
+    /// A bounded observation request exceeded worker policy.
+    ObservationLimitExceeded,
+}
+
+/// Describes output evicted before a requested cursor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputGap {
+    /// First byte no longer retained.
+    pub missing_start: u64,
+    /// Offset immediately after the missing range.
+    pub missing_end: u64,
 }
 
 /// Carries a structured worker request failure.
@@ -960,5 +1023,38 @@ mod tests {
             .expect_err("zero columns must fail");
 
         assert!(error.to_string().contains("must be nonzero"));
+    }
+
+    #[test]
+    fn observation_messages_round_trip_without_embedding_pty_bytes() {
+        let scope = RuntimeScope {
+            lease_id: LeaseId::new("lease-1").expect("valid lease"),
+            session_id: SessionId::new("s-1").expect("valid session"),
+            worker_id: WorkerId::new("w-1").expect("valid worker"),
+            runtime_id: RuntimeId::new("runtime-1").expect("valid runtime"),
+        };
+        let request = ControlMessage::Request(ControlRequest {
+            request_id: RequestId::new("observation-1").expect("valid request"),
+            kind: RequestKind::ReadOutput {
+                scope: scope.clone(),
+                stream_id: StreamId::new("observation-stream-1").expect("valid stream"),
+                after_offset: Some(9),
+                max_bytes: 128,
+                wait_ms: 50,
+            },
+        });
+        let encoded = serde_json::to_string(&request).expect("serialize request");
+        assert_eq!(
+            serde_json::from_str::<ControlMessage>(&encoded).expect("deserialize request"),
+            request
+        );
+
+        let response = ResponseKind::OutputReadOpened {
+            token: DataToken::new("observation-token").expect("valid token"),
+            expires_at_ms: 500,
+        };
+        let rendered = format!("{response:?}");
+        assert!(rendered.contains("OutputReadOpened"));
+        assert!(!rendered.contains("pty-data"));
     }
 }

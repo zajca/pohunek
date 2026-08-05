@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use protocol::{
-    method, AttachHeader, HostCapabilities, ProtocolVersion, Request, Response,
+    method, AttachHeader, HostCapabilities, Request as ProtocolRequest, Response,
     SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
     SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
     SessionNewParams, SessionState, SessionStopResult, PROTOCOL_VERSION,
@@ -38,6 +38,14 @@ use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLaunc
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct Request;
+
+impl Request {
+    fn make(id: &str, method: &str, params: Value) -> ProtocolRequest {
+        ProtocolRequest::new(id, method, params).expect("valid test request")
+    }
+}
 
 /// Stop grace for remote TCP integration tests.
 ///
@@ -206,7 +214,7 @@ async fn open_attach_stream_tcp(addr: SocketAddr, stream_id: &str) -> TcpStream 
 }
 
 /// Send a request line over a generic line-framed client and read one response.
-async fn exchange<S>(framed: &mut Framed<S, LinesCodec>, request: &Request) -> Response
+async fn exchange<S>(framed: &mut Framed<S, LinesCodec>, request: &ProtocolRequest) -> Response
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -221,10 +229,9 @@ where
 }
 
 fn ok_payload(response: Response) -> Value {
-    match response {
-        Response::Ok { ok, .. } => ok,
-        Response::Err { err, .. } => panic!("expected ok, got error: {err}"),
-    }
+    response
+        .into_result()
+        .unwrap_or_else(|error| panic!("expected ok, got error: {error}"))
 }
 
 fn session_params() -> SessionNewParams {
@@ -247,7 +254,7 @@ async fn create_session<S>(framed: &mut Framed<S, LinesCodec>) -> SessionInfo
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let req = Request::new(
+    let req = Request::make(
         "session-new",
         method::SESSION_NEW,
         serde_json::to_value(session_params()).expect("serialize params"),
@@ -262,7 +269,7 @@ async fn create_session_with_params<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let req = Request::new(
+    let req = Request::make(
         "session-new-custom",
         method::SESSION_NEW,
         serde_json::to_value(params).expect("serialize params"),
@@ -274,7 +281,7 @@ async fn inspect_session<S>(framed: &mut Framed<S, LinesCodec>, id: &SessionId) 
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let req = Request::new(
+    let req = Request::make(
         "session-inspect",
         method::SESSION_INSPECT,
         serde_json::to_value(id).expect("serialize id"),
@@ -289,7 +296,7 @@ async fn attach_session<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let req = Request::new(
+    let req = Request::make(
         "session-attach",
         method::SESSION_ATTACH,
         serde_json::to_value(SessionAttachParams {
@@ -311,7 +318,7 @@ async fn detach_stream<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let req = Request::new(
+    let req = Request::make(
         "session-detach",
         method::SESSION_DETACH,
         serde_json::to_value(SessionDetachParams {
@@ -330,7 +337,7 @@ async fn input_session<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let req = Request::new(
+    let req = Request::make(
         "session-input",
         method::SESSION_INPUT,
         serde_json::to_value(SessionInputParams {
@@ -389,7 +396,7 @@ async fn session_lifecycle_over_tcp() {
     assert_eq!(created.state, SessionState::Running);
     assert!(created.pid > 0);
 
-    let list_req = Request::new("session-list", method::SESSION_LIST, Value::Null);
+    let list_req = Request::make("session-list", method::SESSION_LIST, Value::Null);
     let list: Vec<SessionInfo> =
         serde_json::from_value(ok_payload(exchange(&mut client, &list_req).await))
             .expect("session list");
@@ -400,7 +407,7 @@ async fn session_lifecycle_over_tcp() {
     );
 
     let second = create_session(&mut client).await;
-    let filtered_list_req = Request::new(
+    let filtered_list_req = Request::make(
         "session-list-filtered",
         method::SESSION_LIST,
         serde_json::to_value(SessionListParams {
@@ -430,7 +437,7 @@ async fn session_lifecycle_over_tcp() {
     let input = input_session(&mut client, &created.id, "echo over tcp").await;
     assert!(input.accepted);
 
-    let stop_req = Request::new(
+    let stop_req = Request::make(
         "session-stop",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),
@@ -441,7 +448,7 @@ async fn session_lifecycle_over_tcp() {
     assert!(stopped.stopped);
     let stopped_info = inspect_session(&mut client, &created.id).await;
     assert_eq!(stopped_info.state, SessionState::Stopped);
-    let stop_second_req = Request::new(
+    let stop_second_req = Request::make(
         "session-stop-second",
         method::SESSION_STOP,
         serde_json::to_value(&second.id).expect("serialize second id"),
@@ -497,7 +504,7 @@ async fn session_new_with_input_over_tcp_writes_text_to_shell_pty() {
 
     let detached = detach_stream(&mut control, &attach.stream_id).await;
     assert!(detached.detached);
-    let stop_req = Request::new(
+    let stop_req = Request::make(
         "session-new-input-stop",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),
@@ -548,7 +555,7 @@ async fn attach_over_tcp_round_trips_and_detach_keeps_session_running() {
         "detach must not kill the daemon-owned process"
     );
 
-    let stop_req = Request::new(
+    let stop_req = Request::make(
         "session-stop-after-attach",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),
@@ -567,14 +574,17 @@ async fn host_inspect_over_tcp_returns_capabilities() {
         spawn_dual_servers("remote-inspect", "7.7.7-test", shell_config()).await;
 
     let mut client = connect_tcp(addr).await;
-    let req = Request::new("host-inspect", method::HOST_INSPECT, Value::Null);
+    let req = Request::make("host-inspect", method::HOST_INSPECT, Value::Null);
     let caps: HostCapabilities =
         serde_json::from_value(ok_payload(exchange(&mut client, &req).await))
             .expect("host capabilities");
 
     assert_eq!(caps.daemon_version, "7.7.7-test");
     assert_eq!(caps.protocol_version, PROTOCOL_VERSION);
-    assert_eq!(caps.supported_agents, vec!["shell", "codex", "claude"]);
+    assert_eq!(
+        caps.supported_agents,
+        vec!["shell", "codex", "claude", "hermes"]
+    );
     assert_eq!(caps.worktree_supported, caps.git_available);
 
     let _ = shutdown.send(());
@@ -589,7 +599,7 @@ async fn daemon_health_payload_is_identical_over_unix_and_tcp() {
     let mut tcp_client = connect_tcp(addr).await;
     let mut unix_client = connect_unix(&socket).await;
 
-    let health_req = Request::new("health", method::DAEMON_HEALTH, Value::Null);
+    let health_req = Request::make("health", method::DAEMON_HEALTH, Value::Null);
     let tcp_ok = ok_payload(exchange(&mut tcp_client, &health_req).await);
     let unix_ok = ok_payload(exchange(&mut unix_client, &health_req).await);
 
@@ -615,19 +625,25 @@ async fn version_mismatch_over_tcp_is_rejected_with_the_daemon_version() {
 
     let mut client = connect_tcp(addr).await;
     // Speak a protocol version one higher than the daemon — an incompatible peer.
-    let mut request = Request::new("skew", method::DAEMON_HEALTH, Value::Null);
-    request.v = ProtocolVersion(PROTOCOL_VERSION.get() + 1);
+    let unsupported = PROTOCOL_VERSION.get() + 1;
+    let request: ProtocolRequest = serde_json::from_value(serde_json::json!({
+        "v": {"minimum": unsupported, "maximum": unsupported},
+        "id": "skew",
+        "method": method::DAEMON_HEALTH,
+        "params": null
+    }))
+    .expect("valid unsupported request range");
 
-    match exchange(&mut client, &request).await {
-        Response::Err { v, err, .. } => {
-            assert_eq!(
-                v, PROTOCOL_VERSION,
-                "the rejection envelope must carry the daemon's own version"
-            );
-            assert_eq!(err.code, "version_mismatch", "stable code");
-        }
-        Response::Ok { .. } => panic!("an incompatible client must be rejected, not served"),
-    }
+    let response = exchange(&mut client, &request).await;
+    assert_eq!(
+        response.version(),
+        PROTOCOL_VERSION,
+        "the rejection envelope must carry the daemon's own version"
+    );
+    let err = response
+        .into_result()
+        .expect_err("an incompatible client must be rejected");
+    assert_eq!(err.code, "version_mismatch", "stable code");
 
     let _ = shutdown.send(());
     let _ = handle.await;

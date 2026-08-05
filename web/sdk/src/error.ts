@@ -1,4 +1,9 @@
-import type { ErrorClass, ProtocolError, ProtocolVersion } from "@pohunek/protocol";
+import type {
+  ErrorClass,
+  ProtocolError,
+  ProtocolVersion,
+  ProtocolVersionRange,
+} from "@pohunek/protocol";
 
 export const ClientErrorClass = {
   Configuration: "configuration",
@@ -135,8 +140,14 @@ export class ClientError extends Error {
     );
   }
 
-  public static versionMismatch(clientVersion: ProtocolVersion, daemonVersion: ProtocolVersion): ClientError {
-    const msg = `client protocol version ${clientVersion} is incompatible with daemon protocol version ${daemonVersion}`;
+  public static versionMismatch(
+    clientVersion: ProtocolVersion | ProtocolVersionRange,
+    daemonVersion: ProtocolVersion,
+  ): ClientError {
+    const clientLabel = typeof clientVersion === "number"
+      ? String(clientVersion)
+      : `${clientVersion.minimum}..=${clientVersion.maximum}`;
+    const msg = `client protocol version ${clientLabel} is incompatible with daemon protocol version ${daemonVersion}`;
     return new ClientError(
       "versionMismatch",
       msg,

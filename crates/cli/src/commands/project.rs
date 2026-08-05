@@ -608,7 +608,7 @@ mod tests {
     fn list_and_show_json_round_trip() {
         let projects = vec![project("p-aaa", "ui", ProjectSource::Auto)];
         let doc = crate::commands::render_json(&projects).expect("json");
-        let parsed: Vec<ProjectInfo> = serde_json::from_str(&doc).expect("parse");
+        let parsed: Vec<ProjectInfo> = crate::commands::parse_json_ok(&doc);
         assert_eq!(parsed, projects);
     }
 }

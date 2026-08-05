@@ -18,6 +18,7 @@ mod tree;
 use iced::widget::{button, center, column, container, mouse_area, opaque, row, stack, text};
 use iced::{Background, Center, Color, Element, Fill, Theme};
 use pohunek_gui_core::{ConnState, TreeNodeId};
+use protocol::{AgentKind, SessionInfo};
 
 use crate::message::{Message, ModalView};
 use crate::PohunekApp;
@@ -31,6 +32,26 @@ use modals::{
 use tree::{
     agents_monitor, assistant_entry_button, conn_color, inbox_entry_button, workspace_tree,
 };
+
+/// Returns a provider-neutral label for an agent kind received from the wire.
+fn agent_kind_label(kind: &AgentKind) -> String {
+    match kind {
+        AgentKind::Shell => "shell".to_owned(),
+        AgentKind::Codex => "codex".to_owned(),
+        AgentKind::Claude => "claude".to_owned(),
+        AgentKind::Hermes => "hermes".to_owned(),
+        AgentKind::Unknown(value) => format!("Unknown agent ({value})"),
+    }
+}
+
+/// Returns the launch profile for known agents and a neutral future-agent label.
+fn session_agent_label(session: &SessionInfo) -> String {
+    if session.agent_base.is_known() {
+        session.agent.clone()
+    } else {
+        agent_kind_label(&session.agent_base)
+    }
+}
 
 /// Subtle rounded card that groups a detail section so the pane reads as panels
 /// rather than a flat stack of text and buttons.
@@ -223,4 +244,22 @@ fn conn_dot(conn: ConnState) -> Element<'static, Message> {
             color: Some(conn_color(theme, &conn)),
         })
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_agent_kind_has_neutral_label() {
+        assert_eq!(
+            agent_kind_label(&AgentKind::Unknown("future-agent".to_owned())),
+            "Unknown agent (future-agent)"
+        );
+    }
+
+    #[test]
+    fn hermes_agent_kind_has_a_stable_label() {
+        assert_eq!(agent_kind_label(&AgentKind::Hermes), "hermes");
+    }
 }

@@ -15,7 +15,9 @@ sessions across your own machines on a NetBird (WireGuard) network.
 
 - CLI-first; Rust daemon + Rust CLI.
 - Daemon owns PTYs; clients attach/detach. Agents run PTY/TUI-first.
-- Codex and Claude Code are both first-class.
+- Codex, Claude Code, and the local interactive Hermes Agent runtime are
+  first-class. Hermes is pinned to version 0.20.0; its operator plugin remains
+  a later M3 deliverable.
 - Remote transport is **direct over NetBird**, not an SSH bridge.
 - Discovery is **tokenless NetBird-local** + live capability query (no signed
   manifests, no mesh crypto).
@@ -54,6 +56,12 @@ sessions across your own machines on a NetBird (WireGuard) network.
 - [Universal Pohunek Assistant](design/universal-assistant.md) - one ordinary
   session-backed assistant, steered by intent and a live snapshot, for setup,
   project configuration, updates, troubleshooting, and general help.
+- [First-class Hermes agent integration](design/hermes-agent-integration.md) —
+  proposed managed Hermes runtime plus a profile-scoped Hermes plugin with
+  typed Pohunek tools, lifecycle hooks, and a generated skill.
+  - [Implementation plan](design/hermes-agent-integration-plan.md) — complete
+    protocol, worker, daemon, CLI, plugin, client, security, testing, and release
+    workstreams.
 - [Projects: automatic git-repo awareness](design/projects.md) — detect the repo
   / worktree a session runs in and record lightweight projects; auto on session
   start or manual via CLI, no filesystem scan.
