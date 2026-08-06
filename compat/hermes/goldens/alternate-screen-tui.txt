@@ -1,0 +1,10 @@
+# Hermes PTY compatibility golden
+state: alternate-screen-tui
+mode: alternate_screen_tui
+release: 0.20.0
+terminal: alternate_screen_not_observed
+process: exited
+assistant_panel: none
+
+raw_transcript:
+npm not found — install Node.js to use the TUI.

@@ -1,0 +1,98 @@
+# Hermes PTY compatibility golden
+state: prompt-ready
+mode: classic
+release: 0.20.0
+terminal: classic
+process: exited
+assistant_panel: none
+
+raw_transcript:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+██╗  ██╗███████╗██████╗ ███╗   ███╗███████╗███████╗       █████╗  ██████╗ ███████╗███╗
+██╗████████╗
+██║  ██║██╔════╝██╔══██╗████╗ ████║██╔════╝██╔════╝      ██╔══██╗██╔════╝ ██╔════╝████╗
+██║╚══██╔══╝
+███████║█████╗  ██████╔╝██╔████╔██║█████╗  ███████╗█████╗███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║
+██╔══██║██╔══╝  ██╔══██╗██║╚██╔╝██║██╔══╝  ╚════██║╚════╝██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║
+██║  ██║███████╗██║  ██║██║ ╚═╝ ██║███████╗███████║      ██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║
+╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚══════╝      ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝
+
+╭──────────────────────────────── Hermes Agent v0.20.0 (2026.8.3) ─────────────────────────────────╮
+│                                           Available Tools                                        │
+│      ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⡀⠀⣀⣀⠀⢀⣀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀       bfl: bfl_flux3_get_result, ...                         │
+│      ⠀⠀⠀⠀⠀⠀⢀⣠⣴⣾⣿⣿⣇⠸⣿⣿⠇⣸⣿⣿⣷⣦⣄⡀⠀⠀⠀⠀⠀⠀       browser: browser_back, browser_click, ...              │
+│      ⠀⢀⣠⣴⣶⠿⠋⣩⡿⣿⡿⠻⣿⡇⢠⡄⢸⣿⠟⢿⣿⢿⣍⠙⠿⣶⣦⣄⡀⠀       clarify: clarify                                       │
+│      ⠀⠀⠉⠉⠁⠶⠟⠋⠀⠉⠀⢀⣈⣁⡈⢁⣈⣁⡀⠀⠉⠀⠙⠻⠶⠈⠉⠉⠀⠀       code_execution: execute_code                           │
+│      ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣴⣿⡿⠛⢁⡈⠛⢿⣿⣦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀       computer_use: computer_use                             │
+│      ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠿⣿⣦⣤⣈⠁⢠⣴⣿⠿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀       cronjob: cronjob                                       │
+│      ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠉⠻⢿⣿⣦⡉⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀       delegation: delegate_task                              │
+│      ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⢷⣦⣈⠛⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀       file: patch, read_file, search_files, write_file       │
+│      ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣴⠦⠈⠙⠿⣦⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀       (and 10 more toolsets...)                              │
+│      ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠸⣿⣤⡈⠁⢤⣿⠇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀                                                              │
+│      ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠛⠷⠄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀       Available Skills                                       │
+│      ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⠑⢶⣄⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀       autonomous-ai-agents: claude-code, codex, +3 more      │
+│      ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠁⢰⡆⠈⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀       creative: architecture-diagram, +15 more               │
+│      ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠳⠈⣡⠞⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀       email: himalaya                                        │
+│      ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀       github: codebase-inspection, github-auth, +4 more      │
+│                                           media: gif-search, songsee, youtube-content            │
+│     pohunek-compat-v1 · Nous Research     mlops: evaluating-llms-harness, +4 more                │
+│  <ISOLATED_ROOT>/work  note-taking: obsidian                                  │
+│      Session: <SESSION_ID>      productivity: airtable, docx, +9 more                  │
+│                                           research: arxiv, blogwatcher, +4 more                  │
+│                                           smart-home: openhue                                    │
+│                                           social-media: xurl                                     │
+│                                           software-development: dogfood, +10 more                │
+│                                                                                                  │
+│                                           17 tools · 67 skills · /help for commands              │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+Welcome to Hermes Agent! Type your message or /help for commands.
+✦ Tip: <RANDOMIZED>
+
+ ⚕ pohunek-compat-v1 │ ctx -- │ [░░░░░░░░░░] -- │ <RUNTIME> │ ⏲ <RUNTIME>
+
+───────────────────────────────────────────────────────────────────────────────────────────────────
+─
+
+❯
+
+───────────────────────────────────────────────────────────────────────────────────────────────────
+─
+
+
+⚙️  /exit
+
+Shutting down… (finalizing session)
+
+Goodbye! ⚕

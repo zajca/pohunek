@@ -2,15 +2,76 @@
   "schema_version": 1,
   "release": "0.20.0",
   "records": [
-    {"id":"prompt-ready","mode":"classic","status":"pending","note":"Requires an operator refresh with a provider available to the isolated process."},
-    {"id":"short-input","mode":"classic","status":"pending","note":"Requires an operator-configured provider."},
-    {"id":"multiline-input","mode":"classic","status":"pending","note":"Requires an operator-configured provider."},
-    {"id":"working","mode":"classic","status":"pending","note":"Requires an operator-configured provider."},
-    {"id":"approval-blocked","mode":"classic","status":"pending","note":"Requires an operator-configured provider and deterministic approval policy."},
-    {"id":"completion","mode":"classic","status":"pending","note":"Requires an operator-configured provider."},
-    {"id":"interruption","mode":"classic","status":"pending","note":"Requires an operator-configured provider."},
-    {"id":"exit","mode":"classic","status":"pending","note":"Captured with the same provider-isolated refresh for consistent startup evidence."},
-    {"id":"resume","mode":"classic","status":"pending","note":"Requires a completed isolated turn that yields a native session reference."},
-    {"id":"alternate-screen-tui","mode":"alternate_screen_tui","status":"pending","note":"Refresh requires alternate-screen evidence or a recognized bounded local-TUI-unavailable diagnosis."}
+    {
+      "id": "prompt-ready",
+      "mode": "classic",
+      "status": "captured",
+      "file": "prompt-ready.txt",
+      "sha256": "7dd0cd7bc735355d80a7e622da48239bb665b05d233152860d47cda583bb1d49"
+    },
+    {
+      "id": "short-input",
+      "mode": "classic",
+      "status": "captured",
+      "file": "short-input.txt",
+      "sha256": "c93314675cbc2e3b5d64a8e0f16b4a98a5a0fae97bbf3cb098b37ee189fdb761"
+    },
+    {
+      "id": "multiline-input",
+      "mode": "classic",
+      "status": "captured",
+      "file": "multiline-input.txt",
+      "sha256": "7132b38d2bda7828a74920cd29cea1604f11d5f5d0e2a4f86f93e511c419b78b"
+    },
+    {
+      "id": "working",
+      "mode": "classic",
+      "status": "captured",
+      "file": "working.txt",
+      "sha256": "b14d8dad651606c8961e04c1cba7c5d83c30ca0d6887f120bf51422c4c07f5cd"
+    },
+    {
+      "id": "approval-blocked",
+      "mode": "classic",
+      "status": "captured",
+      "file": "approval-blocked.txt",
+      "sha256": "1be04a3aeeb78c11129943507234d5b8c00a42f3dbb0ecb73d92e8589d9ca373"
+    },
+    {
+      "id": "completion",
+      "mode": "classic",
+      "status": "captured",
+      "file": "completion.txt",
+      "sha256": "0f10e7ebbab0f2237a05f6e28a5811cb69792c830b2d2b61906209de281c3fb1"
+    },
+    {
+      "id": "interruption",
+      "mode": "classic",
+      "status": "captured",
+      "file": "interruption.txt",
+      "sha256": "45c490463f3f856065a7adc298f22840d30eb75a7389d920ec63825e575ba4d9"
+    },
+    {
+      "id": "exit",
+      "mode": "classic",
+      "status": "captured",
+      "file": "exit.txt",
+      "sha256": "9c560af2317e61df1994af381e30433c8892e2b2fd28fcad123332a9a88df807"
+    },
+    {
+      "id": "resume",
+      "mode": "classic",
+      "status": "captured",
+      "file": "resume.txt",
+      "sha256": "1daa560f451afd9d7ea1bec2762bac0fe721ec9a4d7ad40ba7d0a19eafa950de"
+    },
+    {
+      "id": "alternate-screen-tui",
+      "mode": "alternate_screen_tui",
+      "status": "unsupported",
+      "file": "alternate-screen-tui.txt",
+      "sha256": "a92c2778a3e3ac612fdd0383e74dc0f6a6a4d39b104043f63d5b62d7f7168a4b",
+      "note": "Local alternate-screen TUI could not be exercised in the isolated refresh environment."
+    }
   ]
 }

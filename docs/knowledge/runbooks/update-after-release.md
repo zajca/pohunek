@@ -51,11 +51,52 @@ For the Hermes M2 runtime, inspect the `hermes` entry after upgrade. It is
 launchable only with `version: "0.20.0"` and `supported: true`; a missing
 binary has no version-policy result, while a wrong or unparseable version is
 reported as unsupported. The model-free `cargo xtask hermes compatibility`
-check needs the pinned executable and validates committed evidence. Do not run
-`refresh-goldens` casually: it performs real provider turns in an isolated home
-and can incur provider cost. It requires an operator-selected provider
-environment-variable name, never reads the real Hermes home or `state.db`, and
-must leave no pending golden records before release.
+check needs the pinned executable and validates committed evidence. Refresh
+goldens with `cargo xtask hermes refresh-goldens --hermes-bin ABS`, where `ABS`
+is the absolute path to the pinned executable. The harness runs that real Hermes
+process in a real PTY but replaces the model API with a repository-owned,
+deterministic IPv4-loopback mock.
+It requires no provider credentials and incurs no provider cost.
+Credential-source suppression normally produces no Copilot startup probe. If
+the pinned background exchange still starts, the mock admits at most its
+three-attempt budget of `CONNECT api.github.com:443` requests plus a
+three-attempt `CONNECT api.githubcopilot.com:443` fallback budget. Fast process
+shutdown may shorten
+those probes or interleave them with scenario traffic. The mock validates the
+two exact request lines and matching `Host` headers, returns HTTP 403 before TLS
+begins, and therefore receives no authorization header or token. An over-budget
+attempt, any other `CONNECT`, extra header, or absolute-form external request
+fails closed. Each of the six model-bearing classic scenarios must then make
+this exact localhost sequence: five ordered detection GETs to `/api/v1/models`,
+`/api/tags`, `/v1/props`, `/props`, and `/version`, each receiving a
+deterministic HTTP 404; then exactly one `POST /v1/chat/completions`. Discovery
+is not cached across those processes. The isolated config statically pins
+`pohunek-compat-v1`, `context_length: 64000`, and `discover_models: false`, so
+Hermes does not request `/v1/models` and the mock does not permit that path.
+The isolated home is preseeded with fresh `models_dev_cache.json` and
+`cache/model_catalog.json` files, and remote model-catalog refreshes are
+disabled. Its isolated `auth.json` suppresses every Copilot credential source,
+including the `gh auth token` fallback. A repository-owned noncredential value
+is selected before that subprocess; its pinned three-attempt token exchange is
+the locally denied probe described above. An unreachable isolated D-Bus address
+also prevents child processes from opening the operator's desktop keyring.
+Harness-owned HTTP(S) proxy variables point at the loopback mock and
+exempt only localhost. The exact denied Copilot probe is the only admitted
+non-local proxy authority and never opens a tunnel. This is a fail-closed
+application-level defense, not OS-level network containment. Exact response
+evidence is the pinned streaming response frame's
+ordered rounded header, exact content, and rounded footer render events across
+prompt-toolkit redraws.
+The `prompt-ready` and `exit` classic scenarios issue no model API requests.
+The mock validates this application-level sequence, the POST model and last user
+prompt, and the terminal tool where required. The refresh uses an isolated home without reading the
+real Hermes home or `state.db`. Review every refreshed fixture and leave no
+pending golden records before release.
+The refresh also sets `HERMES_SKIP_NODE_BOOTSTRAP=1` and gives only the TUI
+process an empty isolated `PATH`. A missing Node/npm runtime is recorded as the
+recognized local `unsupported` state; the harness must never install TUI
+dependencies or contact a package registry. Classic terminal-tool captures keep
+the normal executable path for their exact repository-owned commands.
 
 Do not downgrade a host from M2 to M1 after it has persisted a Hermes session.
 M1 can preserve unknown provider values neutrally on the wire, but it cannot

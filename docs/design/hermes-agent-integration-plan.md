@@ -54,9 +54,10 @@ The implementation must preserve these decisions from the RFC:
 16. Public and private protocol versions are bumped deliberately; no pre-1.0
     backward shape shim is added.
 17. Deterministic tests are supplemented by a pinned real-Hermes compatibility
-    job that requires no model provider. Turn-dependent terminal fixtures are
-    recorded goldens refreshed by a documented operator command; no fake
-    provider server is built.
+    job that requires no model provider. Separately, turn-dependent terminal
+    goldens are refreshed outside CI with the real Hermes process and PTY against
+    a repository-owned deterministic localhost model mock with an explicit,
+    validated application-level request sequence.
 18. Only the local Hermes terminal backend is supported.
 19. Native identity prefers the ordered worker-private claim path and falls
     back locally to the public `session.report_native_id` method, which is a
@@ -249,18 +250,61 @@ Expected additions or changes:
 - CI setup for an isolated pinned Hermes environment;
 - no production dependency on the fixture driver.
 
-Do not add real tokens or rely on a developer's configured model provider. Do
-not build a fake provider server either: the CI suite is deliberately
-model-free and runs only what needs no model turn — version and CLI shape,
-`hermes plugins list`/`enable`/`disable`, successful `register_tool`,
-`register_skill`, and `register_hook` registration with the expected tool and
-skill names present, target resolution, and `integration install`/`status`/
-`doctor`/`uninstall` against an isolated profile.
+Do not add real tokens or rely on a developer's configured model provider. The
+CI suite is deliberately model-free and runs only what needs no model turn —
+version and CLI shape, `hermes plugins list`/`enable`/`disable`, successful
+`register_tool`, `register_skill`, and `register_hook` registration with the
+expected tool and skill names present, target resolution, and the isolated
+profile's `integration install`/`status`/`doctor`/`uninstall` lifecycle.
 
 Turn-dependent terminal fixtures — prompt-ready, working, approval-blocked,
 completion, interruption, resumed session, and alternate-screen — are recorded
-goldens captured from a real Hermes run and refreshed by a documented operator
-command, not reproduced in CI. This keeps the gate stable in a repository that
+goldens captured from a real Hermes process and PTY against a repository-owned,
+deterministic IPv4-loopback model mock.
+The mock requires no provider credentials and incurs no provider cost.
+Credential-source suppression normally produces no Copilot startup probe. If
+the pinned background exchange still starts, the mock admits at most its
+three-attempt budget of `CONNECT api.github.com:443` requests plus a
+three-attempt `CONNECT api.githubcopilot.com:443` fallback budget. Fast process
+shutdown may shorten
+those probes or interleave them with scenario traffic. The mock accepts only the
+two exact request lines and matching `Host` headers, returns HTTP 403 before TLS
+begins, and therefore receives no authorization header or token. An over-budget
+attempt, any other `CONNECT`, extra header, or absolute-form external request
+fails closed. Each of the six
+model-bearing classic scenarios must then issue this exact localhost sequence:
+five ordered detection GETs to
+`/api/v1/models`, `/api/tags`, `/v1/props`, `/props`, and `/version`, each
+receiving a deterministic HTTP 404; then exactly one
+`POST /v1/chat/completions`. Discovery is not cached across those processes. The
+isolated config statically pins
+`pohunek-compat-v1`, `context_length: 64000`, and `discover_models: false`, so
+Hermes does not request `/v1/models` and the mock does not permit that path.
+The isolated home contains fresh deterministic `models_dev_cache.json` and
+schema-valid `cache/model_catalog.json` caches, and the generated configuration
+sets `model_catalog.enabled: false`; together these satisfy pinned Hermes's
+remote metadata lookups without a background refresh. Its isolated `auth.json`
+suppresses every Copilot credential source, including `gh_cli`. A
+repository-owned noncredential value is selected before `gh auth token`; its
+pinned three-attempt token exchange is the locally denied probe described
+above. An unreachable isolated D-Bus address also prevents child processes from
+opening the operator's desktop keyring. Harness-owned HTTP(S) proxy variables point to the
+loopback mock and only localhost is exempt. The exact denied Copilot probe is
+the only admitted non-local proxy authority and never opens a tunnel. This is
+fail-closed application behavior, not OS-level network containment. The response proof
+tracks the pinned streaming response frame as ordered rounded header, exact
+content, and rounded footer terminal events even when prompt-toolkit redraws
+interleave the writes.
+The refresh sets `HERMES_SKIP_NODE_BOOTSTRAP=1` and replaces `PATH` only for the
+TUI process with an empty isolated directory. If Node/npm or a built TUI is not
+already available inside that environment, the recognized local diagnosis is
+stored as `unsupported`; the evidence workflow never installs dependencies or
+contacts a package registry. Classic terminal-tool scenarios retain the normal
+path for their exact repository-owned commands.
+The `prompt-ready` and `exit` classic scenarios issue no model API requests.
+The mock also validates the POST model identifier and last user prompt, plus the
+terminal tool for terminal scenarios. A documented operator command refreshes
+these fixtures outside CI. This keeps the gate stable in a repository that
 already has flaky PTY and socket tests under load, while still catching the
 failure the gate exists for: an upstream plugin or CLI API change, which is
 detectable without a model.
@@ -1803,8 +1847,28 @@ environment/profile and must not use the operator's real Hermes configuration.
 1. The model-free compatibility suite. CI gates on this one: version and CLI
    shape, plugin list/enable/disable, tool/skill/hook registration, target
    resolution, and integration install/status/doctor/uninstall.
-2. The golden refresh command, run by the operator against a real provider when
-   turn-dependent terminal fixtures need updating. CI never runs it.
+2. The golden refresh command, run by the operator with the real pinned Hermes
+   process and PTY against the repository-owned deterministic loopback model
+   mock when turn-dependent terminal fixtures need updating. It requires no
+   provider credentials and incurs no provider cost. Credential-source
+   suppression normally emits no Copilot probe. If the pinned exchange starts,
+   the mock admits at most its three-attempt budget of locally denied
+   `CONNECT api.github.com:443` requests plus a three-attempt locally denied
+   `CONNECT api.githubcopilot.com:443` fallback budget; fast process shutdown may
+   shorten or interleave the probes. The mock returns HTTP 403 before TLS and
+   admits no other proxy authority or header shape. Each of the six
+   model-bearing classic scenarios then requires, in order, five
+   deterministic-404 detection GETs to `/api/v1/models`, `/api/tags`,
+   `/v1/props`, `/props`, and `/version`, followed directly by one
+   `POST /v1/chat/completions`; discovery is not cached across processes. The
+   static `pohunek-compat-v1`/`context_length: 64000` configuration sets
+   `discover_models: false`; `/v1/models` is neither requested nor permitted.
+   The `prompt-ready` and `exit` classic scenarios make no model API requests.
+   The POST model, last user prompt, and required terminal tool remain validated.
+   TUI refresh sets `HERMES_SKIP_NODE_BOOTSTRAP=1` and an empty isolated `PATH`,
+   so a missing Node/npm runtime yields only the recognized local `unsupported`
+   fixture and can never trigger a dependency download.
+   This is not an OS-level zero-egress claim. CI never runs the refresh.
 ```
 
 The implementation must add both as stable repository commands and document the
@@ -1878,7 +1942,7 @@ unrun gate.
 | The single M1 protocol transition breaks mixed versions | fleet-wide local/remote outage, once | explicit M1 runbook, inventory all clients/hosts, range negotiation afterwards so M2/M3 and future providers never repeat it, drain cross-host calls, coordinated upgrades |
 | New worker feature breaks old live workers | session disruption | current/previous capability negotiation |
 | Notification schema breaks config | lost policy | explicit pre-1.0 upgrade note, deterministic new schema, no silent shim |
-| Real-Hermes tests need credentials | unreliable CI | model-free CI suite (version/CLI shape, plugin enable, tool/skill/hook registration, installer); turn-dependent fixtures are recorded goldens, no provider server built |
+| Golden refresh regresses to a live-provider workflow | credentials, provider cost, and nondeterminism enter the workflow | keep CI model-free; refresh turn-dependent fixtures with the real Hermes process and PTY against the deterministic, keyless, loopback-only model mock; seed the fresh local models.dev cache; route non-local HTTP(S) through the mock so proxy egress fails closed; require five 404 detection GETs and one POST per model-bearing process; reject `/v1/models`; validate model, prompt, terminal tool, and ordered pinned response-panel render events |
 | Abandoned waiter exhausts waiter caps | temporary `session_waiter_limit_reached` for legitimate callers | short maximum wait so slots free within seconds, caps documented as an availability bound, slot-release test |
 | Sensitive PTY content leaks | confidentiality loss | explicit-only bounded APIs, payload-free logs/errors/notifications |
 

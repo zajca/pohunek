@@ -6158,6 +6158,7 @@ name = "xtask"
 version = "0.29.3"
 dependencies = [
  "clap",
+ "httparse",
  "nix 0.29.0",
  "pohunek-cli",
  "pohunek-knowledge",
@@ -6169,6 +6170,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "vt100",
 ]
 
 [[package]]

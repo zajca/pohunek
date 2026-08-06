@@ -1,16 +1,15 @@
 //! Validates the pinned Hermes CLI and refreshes bounded PTY evidence.
 
-// Rust guideline compliant 2026-08-04
+// Rust guideline compliant 2026-08-06
 
 use std::ffi::OsString;
-use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use regex::Regex;
@@ -18,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+use crate::hermes_mock::{Mock, Scenario as MockScenario, MODEL_ID};
 use crate::XtaskError;
 
 const LOCK_PATH: &str = "compat/hermes/compatibility-lock.json";
@@ -56,14 +56,28 @@ const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// One PTY transcript remains reviewable and cannot consume unbounded memory.
 const MAX_PTY_OUTPUT_BYTES: usize = 512 * 1024;
+/// Timeout diagnostics expose only a short reviewable suffix of safe output.
+const MAX_PTY_DIAGNOSTIC_BYTES: usize = 8 * 1024;
+/// Retain enough terminal redraw lines to include the preceding turn failure.
+const MAX_PTY_DIAGNOSTIC_LINES: usize = 128;
+const PTY_DIAGNOSTIC_WITHHELD: &str = "PTY diagnostic withheld";
+const RAW_TRANSCRIPT_SECTION: &str = "raw_transcript:";
+const ASSISTANT_PANEL_SECTION: &str = "terminal_assistant_panel:";
 /// The fixed terminal size matches the common baseline used by PTY fixtures.
 const PTY_COLS: u16 = 100;
 const PTY_ROWS: u16 = 32;
+/// Preserve enough rendered history for every reviewable classic fixture.
+///
+/// The parser remains bounded independently from the raw byte cap. If a future
+/// Hermes release pushes semantic evidence beyond this history, refresh fails
+/// closed instead of accepting cursor-control-stripped output.
+const PTY_SCROLLBACK_ROWS: usize = 1024;
+const ASSISTANT_PANEL_TITLE: &str = "⚕ Hermes";
 /// Polling at 20 ms bounds timeout overshoot without busy-waiting.
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// The classic prompt normally appears within this bounded startup window.
 const STARTUP_WAIT: Duration = Duration::from_secs(8);
-/// Real provider turns may be slow but golden refresh must still terminate.
+/// Local mock turns include a real Hermes startup and must remain bounded.
 const TURN_WAIT: Duration = Duration::from_secs(45);
 /// Working and interruption evidence is sampled shortly after submission.
 const WORKING_WAIT: Duration = Duration::from_secs(3);
@@ -72,17 +86,53 @@ const INPUT_SETTLE_WAIT: Duration = Duration::from_secs(2);
 const EXIT_GRACE: Duration = Duration::from_secs(8);
 /// Reader completion is bounded even if an escaped descendant retained a pipe.
 const READER_GRACE: Duration = Duration::from_secs(2);
+/// Pinned Hermes rejects models below its 64K tool-calling context floor.
+///
+/// The static metadata also prevents local model-context discovery requests.
+const MOCK_CONTEXT_LENGTH: u32 = 64_000;
+const _: () = assert!(MOCK_CONTEXT_LENGTH >= 64_000);
+const MOCK_PROVIDER_NAME: &str = "pohunek-compat";
+const MOCK_PROVIDER_KEY: &str = "custom:pohunek-compat";
+const PINNED_HERMES_VERSION: &str = "0.20.0";
+const UPDATE_CACHE_FILE: &str = ".update_check";
+const MODELS_DEV_CACHE_FILE: &str = "models_dev_cache.json";
+/// Fresh non-empty metadata prevents pinned Hermes from refreshing models.dev.
+const MODELS_DEV_CACHE: &str = r#"{"pohunek-offline":{"name":"Pohunek offline compatibility cache","env":[],"api":"","doc":"","models":{}}}
+"#;
+const MODEL_CATALOG_CACHE_DIRECTORY: &str = "cache";
+const MODEL_CATALOG_CACHE_FILE: &str = "model_catalog.json";
+/// Pinned Hermes accepts this schema-valid empty catalog without network refresh.
+const MODEL_CATALOG_CACHE: &str = r#"{"version":1,"providers":{}}
+"#;
+const AUTH_STORE_FILE: &str = "auth.json";
+/// Suppress every pinned Hermes Copilot credential source before startup.
+///
+/// In particular, `gh_cli` otherwise executes `gh auth token` and reads the
+/// operator's ambient keyring even though the process environment is empty.
+const AUTH_STORE: &str = r#"{"version":1,"providers":{},"suppressed_sources":{"copilot":["gh_cli","env:COPILOT_GITHUB_TOKEN","env:GH_TOKEN","env:GITHUB_TOKEN"]}}
+"#;
+/// Pinned Hermes selects any non-classic-PAT value before its CLI fallback.
+/// This repository-owned value is not a usable credential, and its exchange is locally denied.
+const MOCK_COPILOT_CREDENTIAL: &str = "pohunek-compat-local-mock";
 
 const SHORT_PROMPT: &[u8] = b"Reply with exactly HERMES_COMPAT_OK.";
+const SHORT_PROMPT_TEXT: &str = "Reply with exactly HERMES_COMPAT_OK.";
 const MULTILINE_PROMPT: &[u8] =
     b"\x1b[200~Treat all three lines as one prompt.\nalpha\nbeta\nReply with exactly HERMES_MULTILINE_OK.\x1b[201~";
 const MULTILINE_PREVIEW: &str =
     "Treat all three lines as one prompt.\nalpha\nbeta\nReply with exactly HERMES_MULTILINE_OK.";
 const WORKING_PROMPT: &[u8] =
     b"Use the terminal tool to run `sleep 8`, then reply exactly HERMES_WORKING_DONE.";
-const APPROVAL_PROMPT: &[u8] = b"Use the terminal tool to run `rm -f HERMES_COMPAT_APPROVAL_SENTINEL`, then reply exactly HERMES_APPROVAL_DONE.";
+const WORKING_PROMPT_TEXT: &str =
+    "Use the terminal tool to run `sleep 8`, then reply exactly HERMES_WORKING_DONE.";
+/// This is relative to the isolated work directory and remains inert until approval.
+const APPROVAL_PROMPT: &[u8] = b"Use the terminal tool to run `rm -rf HERMES_COMPAT_APPROVAL_SENTINEL`, then reply exactly HERMES_APPROVAL_DONE.";
+const APPROVAL_PROMPT_TEXT: &str =
+    "Use the terminal tool to run `rm -rf HERMES_COMPAT_APPROVAL_SENTINEL`, then reply exactly HERMES_APPROVAL_DONE.";
 const INTERRUPTION_PROMPT: &[u8] =
     b"Use the terminal tool to run `sleep 30`, then reply exactly HERMES_INTERRUPT_DONE.";
+const INTERRUPTION_PROMPT_TEXT: &str =
+    "Use the terminal tool to run `sleep 30`, then reply exactly HERMES_INTERRUPT_DONE.";
 const SUBMIT: &[u8] = b"\r";
 const EXIT_COMMAND: &[u8] = b"/exit\r";
 const INTERRUPT: &[u8] = b"\x03";
@@ -91,8 +141,13 @@ const PROMPT_READY_MARKER: &str = "\u{276f}";
 const USER_TURN_SEPARATOR: &str = "────────────────────────────────────────";
 /// Pinned Hermes prefixes the first line of a submitted user turn with this glyph.
 const USER_TURN_MARKER: &str = "\u{25cf}";
+/// Prompt-toolkit may repaint its bounded status area between boundary rows.
+/// One fixed-height PTY screen is the largest accepted boundary gap.
+const MAX_USER_TURN_BOUNDARY_GAP_LINES: usize = 32;
 /// Rich wrapping at the fixed PTY width needs at most a few continuation lines.
 const MAX_USER_TURN_PREVIEW_LINES: usize = 8;
+/// Four multiline fragments may each be separated by one fixed-height status repaint.
+const MAX_USER_TURN_PREVIEW_SCAN_LINES: usize = 4 * 32;
 /// This bounds normalization well above every repository-owned compatibility prompt.
 const MAX_USER_TURN_PREVIEW_BYTES: usize = 1024;
 const SHORT_RESPONSE: &str = "HERMES_COMPAT_OK";
@@ -225,6 +280,7 @@ struct Isolation {
     home: PathBuf,
     hermes_home: PathBuf,
     work: PathBuf,
+    tui_path: PathBuf,
 }
 
 impl Isolation {
@@ -237,10 +293,12 @@ impl Isolation {
         let home = root.join("home");
         let hermes_home = root.join("hermes-home");
         let work = root.join("work");
+        let tui_path = root.join("tui-path");
         for path in [
             &home,
             &hermes_home,
             &work,
+            &tui_path,
             &root.join("xdg-config"),
             &root.join("xdg-cache"),
             &root.join("xdg-data"),
@@ -254,17 +312,41 @@ impl Isolation {
                 ))
             })?;
         }
+        fs::write(hermes_home.join(MODELS_DEV_CACHE_FILE), MODELS_DEV_CACHE).map_err(|error| {
+            fail(format!(
+                "failed to seed isolated Hermes models.dev cache: {error}"
+            ))
+        })?;
+        let model_catalog_cache_directory = hermes_home.join(MODEL_CATALOG_CACHE_DIRECTORY);
+        fs::create_dir_all(&model_catalog_cache_directory).map_err(|error| {
+            fail(format!(
+                "failed to create isolated Hermes model catalog cache directory: {error}"
+            ))
+        })?;
+        let model_catalog_cache = model_catalog_cache_directory.join(MODEL_CATALOG_CACHE_FILE);
+        fs::write(&model_catalog_cache, MODEL_CATALOG_CACHE).map_err(|error| {
+            fail(format!(
+                "failed to seed isolated Hermes model catalog cache: {error}"
+            ))
+        })?;
+        fs::write(hermes_home.join(AUTH_STORE_FILE), AUTH_STORE).map_err(|error| {
+            fail(format!(
+                "failed to seed isolated Hermes credential-source policy: {error}"
+            ))
+        })?;
+        write_update_cache(&hermes_home)?;
         Ok(Self {
             _temp: temp,
             root,
             home,
             hermes_home,
             work,
+            tui_path,
         })
     }
 
-    fn model_free_env(&self) -> Vec<(OsString, OsString)> {
-        let mut env = self.isolation_env();
+    fn model_free_env(&self, proxy_url: &str) -> Vec<(OsString, OsString)> {
+        let mut env = self.refresh_env(proxy_url);
         env.push((OsString::from("NO_COLOR"), OsString::from("1")));
         env.push((OsString::from("TERM"), OsString::from("dumb")));
         env
@@ -301,6 +383,13 @@ impl Isolation {
                 OsString::from("UV_CACHE_DIR"),
                 self.root.join("uv-cache").into_os_string(),
             ),
+            (
+                OsString::from("DBUS_SESSION_BUS_ADDRESS"),
+                OsString::from(format!(
+                    "unix:path={}",
+                    self.root.join("no-session-bus").display()
+                )),
+            ),
             (OsString::from("PYTHONNOUSERSITE"), OsString::from("1")),
             (
                 OsString::from("PYTHONDONTWRITEBYTECODE"),
@@ -314,6 +403,43 @@ impl Isolation {
         }
         env
     }
+
+    fn refresh_env(&self, proxy_url: &str) -> Vec<(OsString, OsString)> {
+        let mut env = self.isolation_env();
+        // Hermes otherwise may install optional tooling from the network during startup.
+        env.push((
+            OsString::from("HERMES_DISABLE_LAZY_INSTALLS"),
+            OsString::from("1"),
+        ));
+        // TUI startup has a separate Node bootstrap path in the pinned release.
+        env.push((
+            OsString::from("HERMES_SKIP_NODE_BOOTSTRAP"),
+            OsString::from("1"),
+        ));
+        // Tirith has an independent downloader and does not honor the generic
+        // Hermes lazy-install switch.
+        env.push((OsString::from("TIRITH_ENABLED"), OsString::from("0")));
+        // Pinned Hermes otherwise shells out to `gh auth token` during generic
+        // provider discovery. This is deliberately not a usable credential.
+        env.push((
+            OsString::from("COPILOT_GITHUB_TOKEN"),
+            OsString::from(MOCK_COPILOT_CREDENTIAL),
+        ));
+        for name in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            env.push((OsString::from(name), OsString::from(proxy_url)));
+        }
+        for name in ["NO_PROXY", "no_proxy"] {
+            env.push((OsString::from(name), OsString::from("127.0.0.1,localhost")));
+        }
+        env
+    }
 }
 
 #[derive(Debug)]
@@ -321,20 +447,6 @@ struct ProcessOutput {
     status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
-}
-
-struct ProviderEnv {
-    name: String,
-    value: String,
-}
-
-impl fmt::Debug for ProviderEnv {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ProviderEnv")
-            .field("name", &self.name)
-            .field("value", &"[REDACTED]")
-            .finish()
-    }
 }
 
 #[derive(Debug)]
@@ -354,12 +466,244 @@ enum Action {
 #[derive(Clone, Debug)]
 enum Evidence {
     PromptReady,
-    ExactLine(&'static str),
-    Working,
+    AssistantPanel(&'static str),
+    Working(&'static str),
     Approval,
     Interrupted,
     Resumed(String),
     AlternateScreen,
+}
+
+#[cfg(test)]
+struct TerminalCapture {
+    parser: vt100::Parser,
+    observed_bytes: usize,
+}
+
+#[cfg(test)]
+impl TerminalCapture {
+    fn new() -> Self {
+        Self {
+            parser: vt100::Parser::new(PTY_ROWS, PTY_COLS, PTY_SCROLLBACK_ROWS),
+            observed_bytes: 0,
+        }
+    }
+
+    fn feed_snapshot(&mut self, bytes: &[u8]) -> bool {
+        if bytes.len() < self.observed_bytes {
+            self.parser = vt100::Parser::new(PTY_ROWS, PTY_COLS, PTY_SCROLLBACK_ROWS);
+            self.observed_bytes = 0;
+        }
+        if bytes.len() == self.observed_bytes {
+            return false;
+        }
+        self.parser.process(&bytes[self.observed_bytes..]);
+        self.observed_bytes = bytes.len();
+        true
+    }
+
+    fn transcript(&mut self) -> String {
+        terminal_history(&mut self.parser)
+    }
+
+    fn assistant_panel_count(&mut self, expected: &str) -> usize {
+        assistant_panel_count(&self.transcript(), expected)
+    }
+}
+
+struct AssistantPanelObserver {
+    parser: vt100::Parser,
+    expected: &'static str,
+    observed_bytes: usize,
+    visible_events: [usize; 3],
+    occurrence_count: usize,
+    captured_panels: Vec<String>,
+    progress: PanelProgress,
+    invalid: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PanelProgress {
+    Start,
+    HeaderSeen,
+    ContentSeen,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PanelRenderEvent {
+    Top,
+    Content,
+    Bottom,
+}
+
+impl AssistantPanelObserver {
+    fn new(expected: &'static str) -> Self {
+        Self {
+            parser: vt100::Parser::new(PTY_ROWS, PTY_COLS, PTY_SCROLLBACK_ROWS),
+            expected,
+            observed_bytes: 0,
+            visible_events: [0; 3],
+            occurrence_count: 0,
+            captured_panels: Vec::new(),
+            progress: PanelProgress::Start,
+            invalid: false,
+        }
+    }
+
+    fn feed_snapshot(&mut self, bytes: &[u8]) -> bool {
+        if bytes.len() < self.observed_bytes {
+            *self = Self::new(self.expected);
+        }
+        if bytes.len() == self.observed_bytes {
+            return false;
+        }
+
+        let appended = &bytes[self.observed_bytes..];
+        let mut start = 0;
+        while start < appended.len() {
+            let checkpoint = next_panel_checkpoint(appended, start);
+            let end = checkpoint.map_or(appended.len(), |checkpoint| checkpoint.end);
+            let chunk = &appended[start..end];
+            let candidate = contains_bytes(chunk, self.expected.as_bytes())
+                || contains_bytes(chunk, ASSISTANT_PANEL_TITLE.as_bytes());
+            if candidate {
+                // Refresh rising-edge baselines before a possible new panel
+                // segment, including after prior evidence left scrollback.
+                self.observe();
+            }
+            self.parser.process(chunk);
+            if checkpoint.is_some() && (candidate || self.progress != PanelProgress::Start) {
+                self.observe();
+            }
+            start = end;
+        }
+        self.observed_bytes = bytes.len();
+        self.observe();
+        true
+    }
+
+    fn observe(&mut self) {
+        let transcript = terminal_history(&mut self.parser);
+        let (visible_events, events) =
+            panel_render_events(&transcript, self.expected, self.visible_events);
+        self.visible_events = visible_events;
+        for event in events {
+            self.record(event);
+        }
+    }
+
+    fn record(&mut self, event: PanelRenderEvent) {
+        self.progress = match (self.progress, event) {
+            (PanelProgress::Start, PanelRenderEvent::Top) => PanelProgress::HeaderSeen,
+            (PanelProgress::HeaderSeen, PanelRenderEvent::Content) => PanelProgress::ContentSeen,
+            (PanelProgress::ContentSeen, PanelRenderEvent::Bottom) => {
+                self.occurrence_count = self.occurrence_count.saturating_add(1).min(2);
+                if self.captured_panels.len() < 2 {
+                    self.captured_panels
+                        .push(normalized_assistant_panel(self.expected));
+                }
+                PanelProgress::Start
+            }
+            // Pinned prompt-toolkit repaints the completed footer while the
+            // status area settles. Without a new header or content this is not
+            // a second assistant response.
+            (PanelProgress::Start, PanelRenderEvent::Bottom) => PanelProgress::Start,
+            _ => {
+                self.invalid = true;
+                self.progress
+            }
+        };
+    }
+
+    #[cfg(test)]
+    fn occurrence_count(&self) -> usize {
+        self.occurrence_count
+    }
+
+    fn one_panel(&self) -> Option<&str> {
+        (self.occurrence_count == 1
+            && self.captured_panels.len() == 1
+            && self.progress == PanelProgress::Start
+            && !self.invalid)
+            .then(|| self.captured_panels[0].as_str())
+    }
+}
+
+fn panel_render_events(
+    transcript: &str,
+    expected: &str,
+    previous_counts: [usize; 3],
+) -> ([usize; 3], Vec<PanelRenderEvent>) {
+    let top = assistant_panel_top();
+    let bottom = assistant_panel_bottom();
+    let mut positions = [Vec::new(), Vec::new(), Vec::new()];
+    for (index, line) in transcript.lines().enumerate() {
+        let line = line.trim_end_matches(' ');
+        if line == top {
+            positions[0].push(index);
+        }
+        if line == expected {
+            positions[1].push(index);
+        }
+        if line == bottom {
+            positions[2].push(index);
+        }
+    }
+    let counts = positions.each_ref().map(Vec::len);
+    let mut events = Vec::new();
+    for (kind, event) in [
+        PanelRenderEvent::Top,
+        PanelRenderEvent::Content,
+        PanelRenderEvent::Bottom,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let added = counts[kind].saturating_sub(previous_counts[kind]);
+        events.extend(
+            positions[kind]
+                .iter()
+                .rev()
+                .take(added)
+                .map(|position| (*position, event)),
+        );
+    }
+    events.sort_by_key(|(position, _event)| *position);
+    (
+        counts,
+        events.into_iter().map(|(_position, event)| event).collect(),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct PanelCheckpoint {
+    end: usize,
+}
+
+fn next_panel_checkpoint(bytes: &[u8], start: usize) -> Option<PanelCheckpoint> {
+    let mut index = start;
+    while index < bytes.len() {
+        if bytes[index] == b'\n' {
+            return Some(PanelCheckpoint { end: index + 1 });
+        }
+        if bytes[index] == 0x1b && bytes.get(index + 1).copied() == Some(b'[') {
+            let end = skip_csi(bytes, index + 2);
+            return Some(PanelCheckpoint { end });
+        }
+        if bytes[index] == 0x9b {
+            let end = skip_csi(bytes, index + 1);
+            return Some(PanelCheckpoint { end });
+        }
+        index += 1;
+    }
+    None
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 #[derive(Debug)]
@@ -378,14 +722,12 @@ pub(crate) fn compatibility(
     compatibility_with(repo, hermes_bin, Limits::production())
 }
 
-/// Refreshes sanitized real-Hermes PTY goldens.
+/// Refreshes sanitized PTY goldens against the repository-owned local mock.
 pub(crate) fn refresh_goldens(
     repo: &Path,
     hermes_bin: &Path,
-    provider_env: &[String],
 ) -> Result<RefreshSummary, XtaskError> {
-    let provider_env = resolve_provider_env(provider_env)?;
-    refresh_with(repo, hermes_bin, &provider_env, Limits::production())
+    refresh_with(repo, hermes_bin, Limits::production())
 }
 
 fn compatibility_with(
@@ -409,7 +751,10 @@ fn check_cli(repo: &Path, hermes_bin: &Path, limits: Limits) -> Result<Lock, Xta
     let lock = load_lock(repo)?;
     validate_lock(&lock)?;
     let isolation = Isolation::new("pohunek-hermes-compat-")?;
-    let env = isolation.model_free_env();
+    let mock = Mock::start().map_err(|error| fail(error.to_string()))?;
+    mock.begin(MockScenario::no_request("cli-preflight"))
+        .map_err(|error| fail(error.to_string()))?;
+    let env = isolation.model_free_env(&mock.proxy_url());
 
     for check in &lock.cli_checks {
         let output = run_process(
@@ -436,6 +781,7 @@ fn check_cli(repo: &Path, hermes_bin: &Path, limits: Limits) -> Result<Lock, Xta
             }
         }
     }
+    mock.finish().map_err(|error| fail(error.to_string()))?;
 
     Ok(lock)
 }
@@ -443,20 +789,31 @@ fn check_cli(repo: &Path, hermes_bin: &Path, limits: Limits) -> Result<Lock, Xta
 fn refresh_with(
     repo: &Path,
     hermes_bin: &Path,
-    provider_env: &[ProviderEnv],
     limits: Limits,
 ) -> Result<RefreshSummary, XtaskError> {
     require_explicit_binary(hermes_bin)?;
     let lock = check_cli(repo, hermes_bin, limits)?;
 
     let isolation = Isolation::new("pohunek-hermes-goldens-")?;
+    let mock = Mock::start().map_err(|error| fail(error.to_string()))?;
+    let mock_base_url = mock.base_url();
+    write_refresh_config(&isolation, &mock_base_url)?;
+    let diagnostic_paths = sensitive_paths(repo, hermes_bin, &isolation, &mock_base_url);
     let scenarios = classic_scenarios(limits);
     let mut captures = Vec::new();
     let mut resume_reference = None;
 
     for scenario in &scenarios {
-        let capture = run_pty(hermes_bin, scenario, &isolation, provider_env, limits)?;
-        validate_classic_capture(scenario.id, &capture)?;
+        let capture = run_mocked_pty(
+            hermes_bin,
+            scenario,
+            &isolation,
+            &mock,
+            &diagnostic_paths,
+            limits,
+        )?;
+        validate_classic_capture(scenario.id, &capture)
+            .map_err(|error| with_pty_diagnostic(&error, &capture.bytes, &diagnostic_paths))?;
         if scenario.id == "completion" {
             resume_reference = extract_session_reference(&capture.bytes);
         }
@@ -464,9 +821,7 @@ fn refresh_with(
     }
 
     let reference = resume_reference.ok_or_else(|| {
-        fail(
-            "Hermes completion capture did not expose a native session reference; an operator-configured provider is required",
-        )
+        fail("Hermes completion capture did not expose a native session reference")
     })?;
     let resume = Scenario {
         id: "resume",
@@ -477,7 +832,14 @@ fn refresh_with(
             Action::Write(EXIT_COMMAND),
         ],
     };
-    let resume_capture = run_pty(hermes_bin, &resume, &isolation, provider_env, limits)?;
+    let resume_capture = run_mocked_pty(
+        hermes_bin,
+        &resume,
+        &isolation,
+        &mock,
+        &diagnostic_paths,
+        limits,
+    )?;
     validate_resume_capture(&resume_capture, &resume.args[2])?;
     captures.push((
         resume.id,
@@ -487,7 +849,14 @@ fn refresh_with(
     ));
 
     let tui = tui_scenario(limits);
-    let tui_capture = run_pty(hermes_bin, &tui, &isolation, provider_env, limits);
+    let tui_capture = run_mocked_pty(
+        hermes_bin,
+        &tui,
+        &isolation,
+        &mock,
+        &diagnostic_paths,
+        limits,
+    );
     match tui_capture {
         Ok(capture) if has_alternate_screen(&capture.bytes) => {
             if !capture.killed
@@ -517,10 +886,105 @@ fn refresh_with(
         &lock,
         hermes_bin,
         &isolation,
-        provider_env,
+        &mock_base_url,
         captures,
         limits,
     )
+}
+
+fn write_refresh_config(isolation: &Isolation, base_url: &str) -> Result<(), XtaskError> {
+    if !base_url.starts_with("http://127.0.0.1:") || !base_url.ends_with("/v1") {
+        return Err(fail(
+            "Hermes compatibility mock endpoint is not IPv4 loopback",
+        ));
+    }
+    // Hermes auto-generates a title after the first successful turn. Keep that
+    // background model request disabled because the mock admits exactly one
+    // primary request per deterministic capture scenario.
+    let config = format!(
+        "model:\n  default: {MODEL_ID}\n  provider: {MOCK_PROVIDER_KEY}\n  api_mode: chat_completions\n  context_length: {MOCK_CONTEXT_LENGTH}\nmodel_catalog:\n  enabled: false\nproviders:\n  {MOCK_PROVIDER_NAME}:\n    name: {MOCK_PROVIDER_NAME}\n    api: {base_url}\n    transport: chat_completions\n    default_model: {MODEL_ID}\n    discover_models: false\n    models:\n      {MODEL_ID}:\n        context_length: {MOCK_CONTEXT_LENGTH}\nfallback_providers: []\ntoolsets:\n  - terminal\napprovals:\n  mode: manual\n  timeout: 300\nsecurity:\n  tirith_enabled: false\n  allow_lazy_installs: false\nauxiliary:\n  title_generation:\n    enabled: false\ntelemetry:\n  shared_metrics:\n    enabled: false\n",
+    );
+    let config_path = isolation.hermes_home.join("config.yaml");
+    fs::write(&config_path, config)
+        .map_err(|error| fail(format!("failed to write isolated Hermes config: {error}")))?;
+
+    Ok(())
+}
+
+fn write_update_cache(hermes_home: &Path) -> Result<(), XtaskError> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| fail(format!("system clock predates the Unix epoch: {error}")))?
+        .as_secs();
+    let cache =
+        format!(r#"{{"ts":{timestamp},"behind":null,"rev":null,"ver":"{PINNED_HERMES_VERSION}"}}"#);
+    fs::write(hermes_home.join(UPDATE_CACHE_FILE), cache).map_err(|error| {
+        fail(format!(
+            "failed to write isolated Hermes update cache: {error}"
+        ))
+    })
+}
+
+fn mock_scenario(scenario: &Scenario) -> MockScenario {
+    let scenario = match scenario.id {
+        "prompt-ready" | "exit" | "resume" | "alternate-screen-tui" => {
+            MockScenario::no_request(scenario.id)
+        }
+        "short-input" | "completion" => {
+            MockScenario::text_with_local_discovery(scenario.id, SHORT_PROMPT_TEXT, SHORT_RESPONSE)
+        }
+        "multiline-input" => MockScenario::text_with_local_discovery(
+            scenario.id,
+            MULTILINE_PREVIEW,
+            MULTILINE_RESPONSE,
+        ),
+        "working" => {
+            MockScenario::terminal_with_local_discovery(scenario.id, WORKING_PROMPT_TEXT, "sleep 8")
+        }
+        "approval-blocked" => MockScenario::terminal_with_local_discovery(
+            scenario.id,
+            APPROVAL_PROMPT_TEXT,
+            "rm -rf HERMES_COMPAT_APPROVAL_SENTINEL",
+        ),
+        "interruption" => MockScenario::terminal_with_local_discovery(
+            scenario.id,
+            INTERRUPTION_PROMPT_TEXT,
+            "sleep 30",
+        ),
+        _ => unreachable!("the Hermes scenario inventory is closed"),
+    };
+    scenario.with_copilot_probe_denials()
+}
+
+fn run_mocked_pty(
+    program: &Path,
+    scenario: &Scenario,
+    isolation: &Isolation,
+    mock: &Mock,
+    diagnostic_paths: &[(String, &'static str)],
+    limits: Limits,
+) -> Result<PtyCapture, XtaskError> {
+    mock.begin(mock_scenario(scenario))
+        .map_err(|error| fail(error.to_string()))?;
+    let capture = run_pty(
+        program,
+        scenario,
+        isolation,
+        &mock.proxy_url(),
+        diagnostic_paths,
+        limits,
+    );
+    let verification = mock.finish().map_err(|error| fail(error.to_string()));
+    finish_mocked_pty(capture, verification)
+}
+
+fn finish_mocked_pty(
+    capture: Result<PtyCapture, XtaskError>,
+    verification: Result<(), XtaskError>,
+) -> Result<PtyCapture, XtaskError> {
+    verification?;
+    let capture = capture?;
+    Ok(capture)
 }
 
 fn load_lock(repo: &Path) -> Result<Lock, XtaskError> {
@@ -860,7 +1324,7 @@ fn combined_text(output: &ProcessOutput) -> String {
     let mut bytes = output.stdout.clone();
     bytes.push(b'\n');
     bytes.extend_from_slice(&output.stderr);
-    strip_terminal_controls(&String::from_utf8_lossy(&bytes))
+    strip_terminal_control_bytes(&bytes, false)
 }
 
 fn classic_scenarios(limits: Limits) -> Vec<Scenario> {
@@ -895,7 +1359,7 @@ fn classic_scenarios(limits: Limits) -> Vec<Scenario> {
                 Action::Write(INTERRUPTION_PROMPT),
                 Action::Pause(limits.input_settle_wait),
                 Action::Write(SUBMIT),
-                Action::WaitFor(Evidence::Working, limits.working_wait),
+                Action::WaitFor(Evidence::Working("sleep 30"), limits.working_wait),
                 Action::Write(INTERRUPT),
                 Action::WaitFor(Evidence::Interrupted, limits.input_settle_wait),
                 Action::Write(EXIT_COMMAND),
@@ -941,9 +1405,9 @@ fn turn_scenario(
 
 fn turn_evidence(id: &str) -> Evidence {
     match id {
-        "short-input" | "completion" => Evidence::ExactLine(SHORT_RESPONSE),
-        "multiline-input" => Evidence::ExactLine(MULTILINE_RESPONSE),
-        "working" => Evidence::Working,
+        "short-input" | "completion" => Evidence::AssistantPanel(SHORT_RESPONSE),
+        "multiline-input" => Evidence::AssistantPanel(MULTILINE_RESPONSE),
+        "working" => Evidence::Working("sleep 8"),
         "approval-blocked" => Evidence::Approval,
         _ => unreachable!("turn scenarios use a closed evidence inventory"),
     }
@@ -972,7 +1436,8 @@ fn run_pty(
     program: &Path,
     scenario: &Scenario,
     isolation: &Isolation,
-    provider_env: &[ProviderEnv],
+    proxy_url: &str,
+    diagnostic_paths: &[(String, &'static str)],
     limits: Limits,
 ) -> Result<PtyCapture, XtaskError> {
     require_process_containment()?;
@@ -988,11 +1453,11 @@ fn run_pty(
     command.args(&scenario.args);
     command.cwd(&isolation.work);
     command.env_clear();
-    for (key, value) in isolation.isolation_env() {
+    for (key, value) in isolation.refresh_env(proxy_url) {
         command.env(key, value);
     }
-    for variable in provider_env {
-        command.env(&variable.name, &variable.value);
+    if scenario.id == "alternate-screen-tui" {
+        command.env("PATH", &isolation.tui_path);
     }
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
@@ -1029,9 +1494,11 @@ fn run_pty(
         .recv_timeout(READER_GRACE)
         .map_err(|_timeout| fail("Hermes PTY reader did not close within its time limit"))?
         .map_err(|error| fail(format!("failed to read Hermes PTY: {error}")))?;
-    action_result?;
-    let (exit_code, killed) = finish_result?;
     let (bytes, overflow) = output_snapshot(&output)?;
+    if let Err(error) = action_result {
+        return Err(with_pty_diagnostic(&error, &bytes, diagnostic_paths));
+    }
+    let (exit_code, killed) = finish_result?;
     if overflow {
         return Err(fail(format!(
             "Hermes PTY scenario `{}` exceeded its output limit",
@@ -1081,25 +1548,16 @@ fn run_pty_actions(
     writer: &mut dyn Write,
     output: &Arc<Mutex<(Vec<u8>, bool)>>,
 ) -> Result<(), XtaskError> {
-    let mut observed_bytes = 0;
     for action in &scenario.actions {
         match action {
             Action::WaitFor(evidence, timeout) => {
-                let observed = wait_for_evidence(
-                    scenario.id,
-                    child,
-                    output,
-                    evidence,
-                    observed_bytes,
-                    *timeout,
-                )?;
+                let observed = wait_for_evidence(scenario.id, child, output, evidence, *timeout)?;
                 if !observed && !matches!(evidence, Evidence::AlternateScreen) {
                     return Err(fail(format!(
                         "Hermes PTY scenario `{}` exited before required evidence appeared",
                         scenario.id
                     )));
                 }
-                observed_bytes = output_snapshot(output)?.0.len();
                 if !observed {
                     break;
                 }
@@ -1123,10 +1581,13 @@ fn wait_for_evidence(
     child: &mut dyn portable_pty::Child,
     output: &Arc<Mutex<(Vec<u8>, bool)>>,
     evidence: &Evidence,
-    observed_bytes: usize,
     timeout: Duration,
 ) -> Result<bool, XtaskError> {
     let deadline = Instant::now() + timeout;
+    let mut panel_observer = match evidence {
+        Evidence::AssistantPanel(expected) => Some(AssistantPanelObserver::new(expected)),
+        _ => None,
+    };
     loop {
         let (bytes, overflow) = output_snapshot(output)?;
         if overflow {
@@ -1134,8 +1595,14 @@ fn wait_for_evidence(
                 "Hermes PTY scenario `{scenario_id}` exceeded its output limit"
             )));
         }
-        let evidence_start = observed_bytes.saturating_sub(32).min(bytes.len());
-        if evidence_matches(evidence, &bytes[evidence_start..]) {
+        let matched = if let (Evidence::AssistantPanel(_), Some(observer)) =
+            (evidence, panel_observer.as_mut())
+        {
+            observer.feed_snapshot(&bytes) && observer.one_panel().is_some()
+        } else {
+            evidence_matches(evidence, &bytes)
+        };
+        if matched {
             return Ok(true);
         }
         if child
@@ -1146,6 +1613,15 @@ fn wait_for_evidence(
             return Ok(false);
         }
         if Instant::now() >= deadline {
+            if let Some(observer) = panel_observer {
+                return Err(fail(format!(
+                    "Hermes PTY scenario `{scenario_id}` did not reach required assistant-panel evidence within its time limit (occurrences: {}, progress: {:?}, invalid: {}, visible events: {:?})",
+                    observer.occurrence_count,
+                    observer.progress,
+                    observer.invalid,
+                    observer.visible_events,
+                )));
+            }
             return Err(fail(format!(
                 "Hermes PTY scenario `{scenario_id}` did not reach required evidence within its time limit"
             )));
@@ -1158,11 +1634,13 @@ fn evidence_matches(evidence: &Evidence, output: &[u8]) -> bool {
     if matches!(evidence, Evidence::AlternateScreen) {
         return has_alternate_screen(output);
     }
-    let text = strip_terminal_controls(&String::from_utf8_lossy(output));
+    let text = raw_terminal_transcript(output);
     match evidence {
         Evidence::PromptReady => text.contains(PROMPT_READY_MARKER),
-        Evidence::ExactLine(expected) => has_exact_line(&text, expected),
-        Evidence::Working => text.contains("Running") && text.contains("sleep"),
+        Evidence::AssistantPanel(_) => {
+            unreachable!("assistant panels use the terminal-state matcher")
+        }
+        Evidence::Working(command) => has_rendered_terminal_command(&text, command),
         Evidence::Approval => {
             text.contains("Dangerous Command")
                 && text.contains("HERMES_COMPAT_APPROVAL_SENTINEL")
@@ -1278,23 +1756,126 @@ fn require_process_containment() -> Result<(), XtaskError> {
     }
 }
 
-fn has_exact_line(text: &str, expected: &str) -> bool {
-    text.lines().any(|line| line.trim() == expected)
+struct TerminalRow {
+    text: String,
+    wrapped: bool,
 }
 
-fn exact_line_count(text: &str, expected: &str) -> usize {
-    text.lines().filter(|line| line.trim() == expected).count()
+fn visible_terminal_rows(screen: &vt100::Screen) -> Vec<TerminalRow> {
+    screen
+        .rows(0, PTY_COLS)
+        .enumerate()
+        .map(|(row, text)| TerminalRow {
+            text,
+            wrapped: u16::try_from(row).is_ok_and(|row| screen.row_wrapped(row)),
+        })
+        .collect()
+}
+
+fn terminal_history(parser: &mut vt100::Parser) -> String {
+    let screen = parser.screen_mut();
+    screen.set_scrollback(usize::MAX);
+    let max_scrollback = screen.scrollback();
+    let mut rows = visible_terminal_rows(screen);
+    for offset in (0..max_scrollback).rev() {
+        screen.set_scrollback(offset);
+        if let Some(row) = visible_terminal_rows(screen).pop() {
+            rows.push(row);
+        }
+    }
+    screen.set_scrollback(0);
+    while rows.last().is_some_and(|row| row.text.is_empty()) {
+        rows.pop();
+    }
+
+    let mut transcript = String::new();
+    for row in rows {
+        transcript.push_str(&row.text);
+        if !row.wrapped {
+            transcript.push('\n');
+        }
+    }
+    if transcript.ends_with('\n') {
+        transcript.pop();
+    }
+    transcript
+}
+
+#[cfg(test)]
+fn terminal_transcript(output: &[u8]) -> String {
+    let mut terminal = TerminalCapture::new();
+    terminal.feed_snapshot(output);
+    terminal.transcript()
+}
+
+fn observe_assistant_panels(output: &[u8], expected: &'static str) -> AssistantPanelObserver {
+    let mut observer = AssistantPanelObserver::new(expected);
+    observer.feed_snapshot(output);
+    observer
+}
+
+#[cfg(test)]
+fn assistant_panel_count(text: &str, expected: &str) -> usize {
+    assistant_panels(text, expected).len()
+}
+
+fn assistant_panels(text: &str, expected: &str) -> Vec<String> {
+    let lines = text.lines().collect::<Vec<_>>();
+    lines
+        .windows(3)
+        .filter(|panel| is_assistant_panel(panel, expected))
+        .map(|panel| {
+            panel
+                .iter()
+                .map(|line| line.trim_end_matches(' '))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect()
+}
+
+fn assistant_panel_top() -> String {
+    let prefix = format!("╭─ {ASSISTANT_PANEL_TITLE} ");
+    let rule_width = usize::from(PTY_COLS)
+        .saturating_sub(1)
+        .saturating_sub(prefix.chars().count());
+    format!("{prefix}{}╮", "─".repeat(rule_width))
+}
+
+fn assistant_panel_bottom() -> String {
+    format!("╰{}╯", "─".repeat(usize::from(PTY_COLS).saturating_sub(2)))
+}
+
+fn normalized_assistant_panel(expected: &str) -> String {
+    format!(
+        "{}\n{expected}\n{}",
+        assistant_panel_top(),
+        assistant_panel_bottom()
+    )
+}
+
+fn is_assistant_panel(panel: &[&str], expected: &str) -> bool {
+    let top = panel[0].trim_end_matches(' ');
+    let bottom = panel[2].trim_end_matches(' ');
+
+    top == assistant_panel_top()
+        && panel[1].trim_end_matches(' ') == expected
+        && bottom == assistant_panel_bottom()
 }
 
 fn submitted_user_turn_starts(lines: &[&str]) -> Vec<usize> {
     lines
-        .windows(2)
+        .iter()
         .enumerate()
-        .filter_map(|(index, pair)| {
-            (pair[0].trim() == USER_TURN_SEPARATOR)
-                .then(|| pair[1].trim())
-                .filter(|line| line.starts_with(USER_TURN_MARKER))
-                .map(|_| index + 1)
+        .filter_map(|(index, line)| {
+            if !line.trim().starts_with(USER_TURN_MARKER) {
+                return None;
+            }
+            let first = index.saturating_sub(MAX_USER_TURN_BOUNDARY_GAP_LINES);
+            lines[first..index]
+                .iter()
+                .any(|candidate| candidate.trim() == USER_TURN_SEPARATOR)
+                .then_some(index)
         })
         .collect()
 }
@@ -1308,52 +1889,78 @@ fn normalize_preview_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn extends_prompt_prefix(expected: &str, observed: &str) -> bool {
+    observed == expected
+        || expected
+            .strip_prefix(observed)
+            .is_some_and(|remainder| remainder.starts_with(' '))
+}
+
 fn has_one_submitted_user_turn(text: &str, expected_prompt: &str) -> bool {
     let lines: Vec<_> = text.lines().collect();
     let starts = submitted_user_turn_starts(&lines);
-    if starts.len() != 1 {
-        return false;
-    }
+    // Pinned Hermes replays the exact submitted preview while rebuilding the
+    // classic view after an interrupt. Every rendered copy must still decode
+    // to the one repository-owned prompt; a different turn fails closed.
+    !starts.is_empty()
+        && starts
+            .into_iter()
+            .all(|start| submitted_user_turn_matches(&lines, start, expected_prompt))
+}
+
+fn submitted_user_turn_matches(lines: &[&str], start: usize, expected_prompt: &str) -> bool {
     let expected = normalize_preview_text(expected_prompt);
     if expected.is_empty() || expected.len() > MAX_USER_TURN_PREVIEW_BYTES {
         return false;
     }
 
-    let mut observed = String::new();
-    let mut observed_bytes = 0;
-    for (offset, line) in lines[starts[0]..]
+    let Some(first) = lines[start]
+        .trim()
+        .strip_prefix(USER_TURN_MARKER)
+        .map(str::trim_start)
+    else {
+        return false;
+    };
+    let mut observed = normalize_preview_text(first);
+    if observed.is_empty()
+        || observed.len() > MAX_USER_TURN_PREVIEW_BYTES
+        || !extends_prompt_prefix(&expected, &observed)
+    {
+        return false;
+    }
+    if observed == expected {
+        return true;
+    }
+
+    let mut fragments = 1;
+    let mut gap = 0;
+    for line in lines[start + 1..]
         .iter()
-        .take(MAX_USER_TURN_PREVIEW_LINES)
-        .enumerate()
+        .take(MAX_USER_TURN_PREVIEW_SCAN_LINES)
     {
         let trimmed = line.trim();
-        let fragment = if offset == 0 {
-            let Some(fragment) = trimmed.strip_prefix(USER_TURN_MARKER) else {
+        if trimmed == USER_TURN_SEPARATOR {
+            return false;
+        }
+        let fragment = normalize_preview_text(trimmed);
+        let candidate = format!("{observed} {fragment}");
+        if !fragment.is_empty() && extends_prompt_prefix(&expected, &candidate) {
+            fragments += 1;
+            if fragments > MAX_USER_TURN_PREVIEW_LINES
+                || candidate.len() > MAX_USER_TURN_PREVIEW_BYTES
+            {
                 return false;
-            };
-            fragment.trim_start()
+            }
+            observed = candidate;
+            gap = 0;
+            if observed == expected {
+                return true;
+            }
         } else {
-            trimmed
-        };
-        if fragment.is_empty() {
-            return false;
-        }
-        observed_bytes += fragment.len();
-        if observed_bytes > MAX_USER_TURN_PREVIEW_BYTES {
-            return false;
-        }
-        if !observed.is_empty() {
-            observed.push(' ');
-        }
-        observed.push_str(&normalize_preview_text(fragment));
-        if observed == expected {
-            return true;
-        }
-        if !expected
-            .strip_prefix(&observed)
-            .is_some_and(|remainder| remainder.starts_with(' '))
-        {
-            return false;
+            gap += 1;
+            if gap > MAX_USER_TURN_BOUNDARY_GAP_LINES {
+                return false;
+            }
         }
     }
     false
@@ -1365,34 +1972,52 @@ fn has_sanitized_session_reference(text: &str) -> bool {
     pattern.is_match(text)
 }
 
+fn has_rendered_terminal_command(text: &str, command: &str) -> bool {
+    let rich_prefix = format!("💻 {command}");
+    let controlled = format!("Running {command}");
+    text.lines().any(|line| {
+        let line = line.trim();
+        let rich = line.find(&rich_prefix).is_some_and(|start| {
+            let suffix = &line[start + rich_prefix.len()..];
+            suffix.chars().next().is_some_and(char::is_whitespace)
+                && suffix.trim_start().starts_with('(')
+        });
+        rich || line == controlled
+    })
+}
+
+fn expected_assistant_response(id: &str) -> Option<&'static str> {
+    match id {
+        "short-input" | "completion" => Some(SHORT_RESPONSE),
+        "multiline-input" => Some(MULTILINE_RESPONSE),
+        _ => None,
+    }
+}
+
 fn validate_classic_transcript(id: &str, text: &str) -> Result<(), XtaskError> {
     if !text.contains(PROMPT_READY_MARKER) {
         return Err(fail(format!(
             "Hermes PTY scenario `{id}` lacks prompt-ready evidence"
         )));
     }
+    let submitted_turns = submitted_user_turn_count(text);
     let valid = match id {
-        "prompt-ready" => submitted_user_turn_count(text) == 0,
-        "short-input" => {
-            has_one_submitted_user_turn(text, "Reply with exactly HERMES_COMPAT_OK.")
-                && exact_line_count(text, SHORT_RESPONSE) == 1
-        }
+        "prompt-ready" => submitted_turns == 0,
+        "short-input" =>
+            has_one_submitted_user_turn(text, "Reply with exactly HERMES_COMPAT_OK."),
         "multiline-input" => {
             has_one_submitted_user_turn(text, MULTILINE_PREVIEW)
-                && text.contains("alpha\nbeta")
-                && exact_line_count(text, MULTILINE_RESPONSE) == 1
         }
         "working" => {
             has_one_submitted_user_turn(
                 text,
                 "Use the terminal tool to run `sleep 8`, then reply exactly HERMES_WORKING_DONE.",
-            ) && text.contains("Running")
-                && text.contains("sleep 8")
+            ) && has_rendered_terminal_command(text, "sleep 8")
         }
         "approval-blocked" => {
             has_one_submitted_user_turn(
                 text,
-                "Use the terminal tool to run `rm -f HERMES_COMPAT_APPROVAL_SENTINEL`, then reply exactly HERMES_APPROVAL_DONE.",
+                "Use the terminal tool to run `rm -rf HERMES_COMPAT_APPROVAL_SENTINEL`, then reply exactly HERMES_APPROVAL_DONE.",
             ) && text.contains("Dangerous Command")
                 && text.contains("HERMES_COMPAT_APPROVAL_SENTINEL")
                 && text.contains("Allow once")
@@ -1400,7 +2025,6 @@ fn validate_classic_transcript(id: &str, text: &str) -> Result<(), XtaskError> {
         }
         "completion" => {
             has_one_submitted_user_turn(text, "Reply with exactly HERMES_COMPAT_OK.")
-                && exact_line_count(text, SHORT_RESPONSE) == 1
                 && (extract_session_reference(text.as_bytes()).is_some()
                     || has_sanitized_session_reference(text))
         }
@@ -1408,16 +2032,15 @@ fn validate_classic_transcript(id: &str, text: &str) -> Result<(), XtaskError> {
             has_one_submitted_user_turn(
                 text,
                 "Use the terminal tool to run `sleep 30`, then reply exactly HERMES_INTERRUPT_DONE.",
-            ) && text.contains("Running")
-                && text.contains("sleep 30")
+            ) && has_rendered_terminal_command(text, "sleep 30")
                 && text.contains(INTERRUPT_MARKER)
         }
-        "exit" => submitted_user_turn_count(text) == 0 && text.contains("Goodbye!"),
+        "exit" => submitted_turns == 0 && text.contains("Goodbye!"),
         _ => false,
     };
     if !valid {
         return Err(fail(format!(
-            "Hermes PTY scenario `{id}` lacks its required semantic evidence"
+            "Hermes PTY scenario `{id}` lacks its required semantic evidence (submitted turns: {submitted_turns})"
         )));
     }
     Ok(())
@@ -1425,13 +2048,22 @@ fn validate_classic_transcript(id: &str, text: &str) -> Result<(), XtaskError> {
 
 fn validate_classic_capture(id: &str, capture: &PtyCapture) -> Result<(), XtaskError> {
     validate_classic_mode_and_exit(id, capture)?;
-    let text = strip_terminal_controls(&String::from_utf8_lossy(&capture.bytes));
-    validate_classic_transcript(id, &text)
+    let text = raw_terminal_transcript(&capture.bytes);
+    validate_classic_transcript(id, &text)?;
+    if let Some(expected) = expected_assistant_response(id) {
+        let observer = observe_assistant_panels(&capture.bytes, expected);
+        if observer.one_panel().is_none() {
+            return Err(fail(format!(
+                "Hermes PTY scenario `{id}` lacks exactly one terminal-rendered assistant panel"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_resume_capture(capture: &PtyCapture, reference: &str) -> Result<(), XtaskError> {
     validate_classic_mode_and_exit("resume", capture)?;
-    let text = strip_terminal_controls(&String::from_utf8_lossy(&capture.bytes));
+    let text = raw_terminal_transcript(&capture.bytes);
     if !text.contains(&format!("Resumed session {reference}")) {
         return Err(fail(
             "Hermes resume capture did not restore the exact captured native reference",
@@ -1471,7 +2103,7 @@ fn validate_golden_fixture(
         }
     };
     let header = format!(
-        "# Hermes PTY compatibility golden\nstate: {}\nmode: {}\nrelease: {release}\nterminal: {expected_terminal}\nprocess: ",
+        "# Hermes PTY compatibility golden\nstate: {}\nmode: {}\nrelease: {release}\nterminal: {expected_terminal}\n",
         record.id, record.mode
     );
     let remainder = fixture.strip_prefix(&header).ok_or_else(|| {
@@ -1480,12 +2112,21 @@ fn validate_golden_fixture(
             record.id
         ))
     })?;
-    let (process, transcript) = remainder.split_once("\n\n").ok_or_else(|| {
+    let (metadata, body) = remainder.split_once("\n\n").ok_or_else(|| {
         fail(format!(
             "Hermes golden `{}` has no bounded transcript",
             record.id
         ))
     })?;
+    let (process, panel_label) = metadata
+        .strip_prefix("process: ")
+        .and_then(|metadata| metadata.split_once("\nassistant_panel: "))
+        .ok_or_else(|| {
+            fail(format!(
+                "Hermes golden `{}` has invalid evidence metadata",
+                record.id
+            ))
+        })?;
     let valid_process = match (record.mode.as_str(), record.status) {
         ("alternate_screen_tui", GoldenStatus::Captured) => {
             matches!(process, "exited" | "terminated_by_bounded_harness")
@@ -1494,13 +2135,72 @@ fn validate_golden_fixture(
         | ("alternate_screen_tui", GoldenStatus::Unsupported) => process == "exited",
         _ => false,
     };
-    if !valid_process || transcript.trim().is_empty() {
+    let expected_response = expected_assistant_response(&record.id);
+    let expected_panel_label = if expected_response.is_some() {
+        ASSISTANT_PANEL_SECTION.trim_end_matches(':')
+    } else {
+        "none"
+    };
+    if !valid_process || panel_label != expected_panel_label {
         return Err(fail(format!(
-            "Hermes golden `{}` has invalid process or transcript evidence",
+            "Hermes golden `{}` has invalid process or panel metadata",
             record.id
         )));
     }
+    let transcript = validate_golden_evidence_sections(record, body, expected_response)?;
 
+    validate_golden_semantics(record, transcript)
+}
+
+fn validate_golden_evidence_sections<'a>(
+    record: &GoldenRecord,
+    body: &'a str,
+    expected_response: Option<&str>,
+) -> Result<&'a str, XtaskError> {
+    let structured = body
+        .strip_prefix(&format!("{RAW_TRANSCRIPT_SECTION}\n"))
+        .ok_or_else(|| {
+            fail(format!(
+                "Hermes golden `{}` lacks its bounded raw transcript section",
+                record.id
+            ))
+        })?;
+    let panel_boundary = format!("\n\n{ASSISTANT_PANEL_SECTION}\n");
+    let transcript = if let Some(expected) = expected_response {
+        let (transcript, panel) = structured.split_once(&panel_boundary).ok_or_else(|| {
+            fail(format!(
+                "Hermes golden `{}` lacks derived terminal assistant-panel evidence",
+                record.id
+            ))
+        })?;
+        let normalized_panel = panel.trim_end_matches('\n');
+        let panels = assistant_panels(normalized_panel, expected);
+        if panels.len() != 1 || panels[0] != normalized_panel {
+            return Err(fail(format!(
+                "Hermes golden `{}` lacks exactly one normalized terminal assistant panel",
+                record.id
+            )));
+        }
+        transcript
+    } else {
+        if structured.contains(&panel_boundary) {
+            return Err(fail(format!(
+                "Hermes golden `{}` has unexpected terminal assistant-panel evidence",
+                record.id
+            )));
+        }
+        structured.trim_end_matches('\n')
+    };
+    if transcript.trim().is_empty() {
+        return Err(fail(format!(
+            "Hermes golden `{}` has invalid transcript or panel evidence",
+            record.id
+        )));
+    }
+    Ok(transcript)
+}
+
+fn validate_golden_semantics(record: &GoldenRecord, transcript: &str) -> Result<(), XtaskError> {
     match (record.id.as_str(), record.status) {
         ("alternate-screen-tui", GoldenStatus::Captured) => {
             if !transcript.contains("Hermes") || recognized_tui_unavailable(transcript.as_bytes()) {
@@ -1536,18 +2236,31 @@ fn validate_golden_fixture(
     Ok(())
 }
 
+fn captured_assistant_panel(id: &str, capture: &PtyCapture) -> Result<Option<String>, XtaskError> {
+    let Some(expected) = expected_assistant_response(id) else {
+        return Ok(None);
+    };
+    let observer = observe_assistant_panels(&capture.bytes, expected);
+    let Some(panel) = observer.one_panel() else {
+        return Err(fail(format!(
+            "Hermes golden `{id}` requires exactly one captured terminal assistant panel"
+        )));
+    };
+    Ok(Some(panel.to_owned()))
+}
+
 fn recognized_tui_unavailable(output: &[u8]) -> bool {
     if output.is_empty() || output.len() > MAX_PTY_OUTPUT_BYTES {
         return false;
     }
-    let text = strip_terminal_controls(&String::from_utf8_lossy(output));
+    let text = strip_terminal_control_bytes(output, false);
     TUI_UNAVAILABLE_MARKERS
         .iter()
         .any(|marker| text.contains(marker))
 }
 
 fn extract_session_reference(output: &[u8]) -> Option<String> {
-    let text = strip_terminal_controls(&String::from_utf8_lossy(output));
+    let text = raw_terminal_transcript(output);
     let pattern = Regex::new(r"(?im)(?:Session ID|Session|session_id):\s*([A-Za-z0-9_.:-]+)")
         .expect("session-reference regex is valid");
     pattern
@@ -1571,21 +2284,25 @@ fn write_goldens(
     lock: &Lock,
     hermes_bin: &Path,
     isolation: &Isolation,
-    provider_env: &[ProviderEnv],
+    mock_base_url: &str,
     captures: Vec<(&'static str, &'static str, GoldenStatus, PtyCapture)>,
     limits: Limits,
 ) -> Result<RefreshSummary, XtaskError> {
     let golden_root = repo.join(GOLDEN_ROOT);
     fs::create_dir_all(&golden_root)
         .map_err(|error| fail(format!("failed to create Hermes golden directory: {error}")))?;
-    let replacements = sensitive_paths(repo, hermes_bin, isolation, provider_env);
+    let replacements = sensitive_paths(repo, hermes_bin, isolation, mock_base_url);
     let mut staged = Vec::new();
     let mut records = Vec::new();
     let mut unsupported = 0;
 
     for (id, mode, status, capture) in captures {
-        let body = sanitize_output(&String::from_utf8_lossy(&capture.bytes), &replacements);
+        let body = sanitize_output(&capture.bytes, &replacements);
         validate_safe_fixture(&body)?;
+        let panel = captured_assistant_panel(id, &capture)?;
+        if let Some(panel) = panel.as_deref() {
+            validate_safe_fixture(panel)?;
+        }
         let disposition = if capture.killed {
             "terminated_by_bounded_harness"
         } else {
@@ -1598,10 +2315,22 @@ fn write_goldens(
         } else {
             "alternate_screen_not_observed"
         };
+        let panel_label = if panel.is_some() {
+            ASSISTANT_PANEL_SECTION.trim_end_matches(':')
+        } else {
+            "none"
+        };
+        let mut evidence = format!("{RAW_TRANSCRIPT_SECTION}\n{}", body.trim_end());
+        if let Some(panel) = panel {
+            evidence.push_str("\n\n");
+            evidence.push_str(ASSISTANT_PANEL_SECTION);
+            evidence.push('\n');
+            evidence.push_str(&panel);
+        }
         let rendered = format!(
-            "# Hermes PTY compatibility golden\nstate: {id}\nmode: {mode}\nrelease: {}\nterminal: {terminal}\nprocess: {disposition}\n\n{}\n",
+            "# Hermes PTY compatibility golden\nstate: {id}\nmode: {mode}\nrelease: {}\nterminal: {terminal}\nprocess: {disposition}\nassistant_panel: {panel_label}\n\n{}\n",
             lock.release,
-            body.trim_end()
+            evidence.trim_end()
         );
         if rendered.len() > limits.pty_output_bytes {
             return Err(fail(format!("sanitized Hermes golden `{id}` is oversized")));
@@ -1662,12 +2391,17 @@ fn sensitive_paths(
     repo: &Path,
     hermes_bin: &Path,
     isolation: &Isolation,
-    provider_env: &[ProviderEnv],
+    mock_base_url: &str,
 ) -> Vec<(String, &'static str)> {
     let mut paths = vec![
         (isolation.root.display().to_string(), "<ISOLATED_ROOT>"),
         (repo.display().to_string(), "<REPOSITORY>"),
         (hermes_bin.display().to_string(), "<HERMES_BIN>"),
+        (mock_base_url.to_owned(), "<HERMES_MOCK_ENDPOINT>"),
+        (
+            mock_base_url.trim_end_matches("/v1").to_owned(),
+            "<HERMES_MOCK_PROXY>",
+        ),
     ];
     if let Some(parent) = hermes_bin.parent() {
         paths.push((parent.display().to_string(), "<HERMES_INSTALL_DIR>"));
@@ -1675,19 +2409,86 @@ fn sensitive_paths(
     if let Some(home) = std::env::var_os("HOME") {
         paths.push((PathBuf::from(home).display().to_string(), "<USER_HOME>"));
     }
-    paths.extend(
-        provider_env
-            .iter()
-            .map(|variable| (variable.value.clone(), "<PROVIDER_CREDENTIAL>")),
-    );
     paths.sort_by_key(|path| std::cmp::Reverse(path.0.len()));
     paths
 }
 
-fn sanitize_output(output: &str, paths: &[(String, &'static str)]) -> String {
-    let mut sanitized = strip_terminal_controls(output)
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
+fn with_pty_diagnostic(
+    error: &XtaskError,
+    output: &[u8],
+    paths: &[(String, &'static str)],
+) -> XtaskError {
+    let message = error.to_string();
+    match sanitized_pty_tail(output, paths) {
+        Some(tail) => fail(format!("{message}\nSanitized PTY tail:\n{tail}")),
+        None => fail(format!("{message}\n{PTY_DIAGNOSTIC_WITHHELD}")),
+    }
+}
+
+fn sanitized_pty_tail(output: &[u8], paths: &[(String, &'static str)]) -> Option<String> {
+    let sanitized = sanitize_output(output, paths);
+    if validate_safe_fixture(&sanitized).is_err() || contains_http_diagnostic_content(&sanitized) {
+        return None;
+    }
+    let redacted = redact_diagnostic_prompts(sanitized);
+    let lines = redacted
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let first = lines.len().saturating_sub(MAX_PTY_DIAGNOSTIC_LINES);
+    let mut tail = lines[first..].join("\n");
+    if tail.len() > MAX_PTY_DIAGNOSTIC_BYTES {
+        let mut start = tail.len() - MAX_PTY_DIAGNOSTIC_BYTES;
+        while !tail.is_char_boundary(start) {
+            start += 1;
+        }
+        tail.drain(..start);
+    }
+    if tail.is_empty() || validate_safe_fixture(&tail).is_err() {
+        None
+    } else {
+        Some(tail)
+    }
+}
+
+fn redact_diagnostic_prompts(mut text: String) -> String {
+    for line in [
+        SHORT_PROMPT_TEXT,
+        MULTILINE_PREVIEW,
+        WORKING_PROMPT_TEXT,
+        APPROVAL_PROMPT_TEXT,
+        INTERRUPTION_PROMPT_TEXT,
+    ]
+    .into_iter()
+    .flat_map(str::lines)
+    {
+        text = text.replace(line, "<HERMES_PROMPT>");
+    }
+    text
+}
+
+fn contains_http_diagnostic_content(text: &str) -> bool {
+    let request_line = Regex::new(
+        r"(?im)(?:^|\s)(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\S+\s+HTTP/\d(?:\.\d)?(?:\s|$)",
+    )
+    .expect("HTTP request-line regex is valid");
+    let status_line = Regex::new(r"(?im)(?:^|\s)HTTP/\d(?:\.\d)?\s+\d{3}(?:\s|$)")
+        .expect("HTTP status-line regex is valid");
+    let header = Regex::new(
+        r"(?im)^(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|content-length|content-type|transfer-encoding|host|user-agent|accept|connection|server|location|www-authenticate):\s*",
+    )
+    .expect("HTTP header regex is valid");
+    let body = Regex::new(r#"(?i)\"(?:messages|tools|api_key|prompt|error)\"\s*:"#)
+        .expect("HTTP body regex is valid");
+    request_line.is_match(text)
+        || status_line.is_match(text)
+        || header.is_match(text)
+        || body.is_match(text)
+}
+
+fn sanitize_output(output: &[u8], paths: &[(String, &'static str)]) -> String {
+    let mut sanitized = raw_terminal_transcript(output);
     for (path, replacement) in paths {
         if !path.is_empty() {
             sanitized = sanitized.replace(path, replacement);
@@ -1715,6 +2516,37 @@ fn sanitize_output(output: &str, paths: &[(String, &'static str)]) -> String {
     sanitized = timestamp
         .replace_all(&sanitized, "<TIMESTAMP>")
         .into_owned();
+    let tip =
+        Regex::new(r"(?ms)^([ \t]*)✦ Tip:.*?(\n[ \t]*\n|\z)").expect("Hermes tip regex is valid");
+    sanitized = tip
+        .replace_all(&sanitized, "$1✦ Tip: <RANDOMIZED>$2")
+        .into_owned();
+    let status_runtime = Regex::new(r"(?m)([│]\s*)\d+(?:\.\d+)?(?:ms|s|m|h)(\s*[│])")
+        .expect("Hermes status runtime regex is valid");
+    sanitized = status_runtime
+        .replace_all(&sanitized, "$1<RUNTIME>$2")
+        .into_owned();
+    let status_clock = Regex::new(r"([⏱⏲✓]\s*)\d+(?:\.\d+)?(?:ms|s|m|h)\b")
+        .expect("Hermes status clock regex is valid");
+    sanitized = status_clock
+        .replace_all(&sanitized, "$1<RUNTIME>")
+        .into_owned();
+    let parenthesized_duration = Regex::new(r"\(\s*\d+(?:\.\d+)?(?:ms|s|m|h)\)")
+        .expect("Hermes parenthesized duration regex is valid");
+    sanitized = parenthesized_duration
+        .replace_all(&sanitized, "(<DURATION>)")
+        .into_owned();
+    let tool_duration =
+        Regex::new(r"(?m)^(\s*(?:┊\s+)?💻\s+\$\s+.*?\s+)\d+(?:\.\d+)?(?:ms|s|m|h)(\s+\[)")
+            .expect("Hermes tool duration regex is valid");
+    sanitized = tool_duration
+        .replace_all(&sanitized, "$1<DURATION>$2")
+        .into_owned();
+    let final_duration = Regex::new(r"(?m)^(Duration:\s*)\d+(?:\.\d+)?(?:ms|s|m|h)\b")
+        .expect("Hermes final duration regex is valid");
+    sanitized = final_duration
+        .replace_all(&sanitized, "$1<DURATION>")
+        .into_owned();
     sanitized
         .lines()
         .map(str::trim_end)
@@ -1722,63 +2554,151 @@ fn sanitize_output(output: &str, paths: &[(String, &'static str)]) -> String {
         .join("\n")
 }
 
+#[cfg(test)]
 fn strip_terminal_controls(text: &str) -> String {
-    let bytes = text.as_bytes();
+    strip_terminal_control_bytes(text.as_bytes(), false)
+}
+
+fn raw_terminal_transcript(bytes: &[u8]) -> String {
+    strip_terminal_control_bytes(bytes, true)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+}
+
+fn strip_terminal_control_bytes(bytes: &[u8], preserve_carriage_returns: bool) -> String {
     let mut output = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
+        if bytes[index] == 0xc2 {
+            match bytes.get(index + 1).copied() {
+                Some(0x9b) => {
+                    index = skip_csi(bytes, index + 2);
+                    continue;
+                }
+                Some(0x9d) => {
+                    index = skip_control_string(bytes, index + 2, true);
+                    continue;
+                }
+                Some(0x90 | 0x98 | 0x9e | 0x9f) => {
+                    index = skip_control_string(bytes, index + 2, false);
+                    continue;
+                }
+                Some(0x80..=0x9f) => {
+                    index += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        }
         match bytes[index] {
             0x1b => {
+                index = skip_escape_sequence(bytes, index);
+            }
+            0x9b => {
+                index = skip_csi(bytes, index + 1);
+            }
+            0x9d => {
+                index = skip_control_string(bytes, index + 1, true);
+            }
+            0x90 | 0x98 | 0x9e | 0x9f => {
+                index = skip_control_string(bytes, index + 1, false);
+            }
+            b'\r' if preserve_carriage_returns => {
+                output.push(bytes[index]);
                 index += 1;
-                if index >= bytes.len() {
-                    break;
-                }
-                match bytes[index] {
-                    b'[' => {
-                        index += 1;
-                        while index < bytes.len() {
-                            let byte = bytes[index];
-                            index += 1;
-                            if (0x40..=0x7e).contains(&byte) {
-                                break;
-                            }
-                        }
-                    }
-                    b']' => {
-                        index += 1;
-                        while index < bytes.len() {
-                            if bytes[index] == 0x07 {
-                                index += 1;
-                                break;
-                            }
-                            if bytes[index] == 0x1b && bytes.get(index + 1).copied() == Some(b'\\')
-                            {
-                                index += 2;
-                                break;
-                            }
-                            index += 1;
-                        }
-                    }
-                    _ => index += 1,
-                }
             }
             b'\n' | b'\t' | 0x20..=0x7e => {
                 output.push(bytes[index]);
                 index += 1;
             }
-            0x80..=0xff => {
-                let rest = &text[index..];
-                let Some(character) = rest.chars().next() else {
-                    break;
-                };
-                let mut encoded = [0_u8; 4];
-                output.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
-                index += character.len_utf8();
+            0xc2..=0xf4 => {
+                let width = utf8_sequence_width(bytes[index]);
+                let end = index.saturating_add(width).min(bytes.len());
+                if std::str::from_utf8(&bytes[index..end]).is_ok() && end - index == width {
+                    output.extend_from_slice(&bytes[index..end]);
+                    index = end;
+                } else {
+                    output.extend_from_slice("�".as_bytes());
+                    index += 1;
+                }
             }
             _ => index += 1,
         }
     }
     String::from_utf8_lossy(&output).into_owned()
+}
+
+fn skip_escape_sequence(bytes: &[u8], escape: usize) -> usize {
+    let Some(&introducer) = bytes.get(escape + 1) else {
+        return bytes.len();
+    };
+    match introducer {
+        b'[' => skip_csi(bytes, escape + 2),
+        b']' => skip_control_string(bytes, escape + 2, true),
+        b'P' | b'X' | b'^' | b'_' => skip_control_string(bytes, escape + 2, false),
+        0x20..=0x2f => {
+            let mut index = escape + 2;
+            while bytes
+                .get(index)
+                .is_some_and(|byte| (0x20..=0x2f).contains(byte))
+            {
+                index += 1;
+            }
+            if bytes
+                .get(index)
+                .is_some_and(|byte| (0x30..=0x7e).contains(byte))
+            {
+                index + 1
+            } else {
+                index
+            }
+        }
+        0x30..=0x7e => escape + 2,
+        _ => escape + 1,
+    }
+}
+
+fn skip_csi(bytes: &[u8], mut index: usize) -> usize {
+    while let Some(&byte) = bytes.get(index) {
+        index += 1;
+        if (0x40..=0x7e).contains(&byte) {
+            break;
+        }
+    }
+    index
+}
+
+fn skip_control_string(bytes: &[u8], mut index: usize, bell_terminated: bool) -> usize {
+    while let Some(&byte) = bytes.get(index) {
+        if (bell_terminated && byte == 0x07) || byte == 0x9c {
+            return index + 1;
+        }
+        if byte == 0xc2 && bytes.get(index + 1).copied() == Some(0x9c) {
+            return index + 2;
+        }
+        if byte == 0x1b && bytes.get(index + 1).copied() == Some(b'\\') {
+            return index + 2;
+        }
+        if (0xc2..=0xf4).contains(&byte) {
+            let width = utf8_sequence_width(byte);
+            let end = index.saturating_add(width).min(bytes.len());
+            if end - index == width && std::str::from_utf8(&bytes[index..end]).is_ok() {
+                index = end;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    index
+}
+
+fn utf8_sequence_width(byte: u8) -> usize {
+    match byte {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => 1,
+    }
 }
 
 fn validate_safe_fixture(text: &str) -> Result<(), XtaskError> {
@@ -1796,89 +2716,6 @@ fn validate_safe_fixture(text: &str) -> Result<(), XtaskError> {
         .expect("token regex is valid");
     if assigned_secret.is_match(text) || token.is_match(text) {
         return Err(fail("Hermes fixture contains credential-shaped output"));
-    }
-    Ok(())
-}
-
-fn resolve_provider_env(names: &[String]) -> Result<Vec<ProviderEnv>, XtaskError> {
-    names
-        .iter()
-        .map(|name| {
-            validate_provider_env_name(name)?;
-            let value = std::env::var_os(name).ok_or_else(|| {
-                fail(format!("provider environment variable `{name}` is not set"))
-            })?;
-            if value.is_empty() {
-                return Err(fail(format!(
-                    "provider environment variable `{name}` is empty"
-                )));
-            }
-            let value = value.into_string().map_err(|_non_utf8| {
-                fail(format!(
-                    "provider environment variable `{name}` is not valid UTF-8"
-                ))
-            })?;
-            Ok(ProviderEnv {
-                name: name.clone(),
-                value,
-            })
-        })
-        .collect()
-}
-
-fn validate_provider_env_name(name: &str) -> Result<(), XtaskError> {
-    /// Credential variables read by pinned Hermes model-provider adapters.
-    ///
-    /// Endpoint/path/environment-control variables are deliberately excluded.
-    const PROVIDER_CREDENTIAL_ENV: [&str; 43] = [
-        "AI_GATEWAY_API_KEY",
-        "ALIBABA_CODING_PLAN_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_TOKEN",
-        "ARCEEAI_API_KEY",
-        "AZURE_FOUNDRY_API_KEY",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "COPILOT_GITHUB_TOKEN",
-        "CUSTOM_API_KEY",
-        "DASHSCOPE_API_KEY",
-        "DEEPINFRA_API_KEY",
-        "DEEPSEEK_API_KEY",
-        "FIREWORKS_API_KEY",
-        "GEMINI_API_KEY",
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "GLM_API_KEY",
-        "GMI_API_KEY",
-        "GOOGLE_API_KEY",
-        "HF_TOKEN",
-        "KILOCODE_API_KEY",
-        "KIMI_API_KEY",
-        "KIMI_CN_API_KEY",
-        "KIMI_CODING_API_KEY",
-        "LM_API_KEY",
-        "MINIMAX_API_KEY",
-        "MINIMAX_CN_API_KEY",
-        "NOUS_API_KEY",
-        "NOVITA_API_KEY",
-        "NVIDIA_API_KEY",
-        "OLLAMA_API_KEY",
-        "OPENAI_API_KEY",
-        "OPENCODE_GO_API_KEY",
-        "OPENCODE_ZEN_API_KEY",
-        "OPENROUTER_API_KEY",
-        "QWEN_API_KEY",
-        "STEPFUN_API_KEY",
-        "TOKENHUB_API_KEY",
-        "UPSTAGE_API_KEY",
-        "XAI_API_KEY",
-        "XIAOMI_API_KEY",
-        "ZAI_API_KEY",
-        "Z_AI_API_KEY",
-    ];
-    if !PROVIDER_CREDENTIAL_ENV.contains(&name) {
-        return Err(fail(format!(
-            "invalid --provider-env name `{name}`; only pinned Hermes provider credential variables are accepted"
-        )));
     }
     Ok(())
 }
@@ -1905,16 +2742,26 @@ fn fail(message: impl Into<String>) -> XtaskError {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use super::{
-        compatibility_with, has_alternate_screen, load_golden_manifest, load_lock, refresh_with,
-        run_process, sanitize_output, sensitive_paths, strip_terminal_controls,
-        validate_golden_manifest, validate_provider_env_name, validate_safe_fixture,
-        GoldenManifest, GoldenStatus, Isolation, Limits, ProviderEnv, GOLDEN_MANIFEST, GOLDEN_ROOT,
-        LOCK_PATH,
+        assistant_panel_bottom, assistant_panel_count, assistant_panel_top, classic_scenarios,
+        compatibility_with, fail, finish_mocked_pty, has_alternate_screen,
+        has_one_submitted_user_turn, load_golden_manifest, load_lock, mock_scenario,
+        normalized_assistant_panel, observe_assistant_panels, raw_terminal_transcript,
+        refresh_with, run_process, sanitize_output, sanitized_pty_tail, sensitive_paths,
+        strip_terminal_controls, submitted_user_turn_count, terminal_transcript,
+        validate_classic_capture, validate_classic_transcript, validate_golden_manifest,
+        validate_safe_fixture, with_pty_diagnostic, GoldenManifest, GoldenStatus, Isolation,
+        Limits, PtyCapture, TerminalCapture, APPROVAL_PROMPT_TEXT, ASSISTANT_PANEL_SECTION,
+        GOLDEN_MANIFEST, GOLDEN_ROOT, INTERRUPTION_PROMPT_TEXT, INTERRUPT_MARKER, LOCK_PATH,
+        MAX_PTY_DIAGNOSTIC_BYTES, MAX_PTY_DIAGNOSTIC_LINES, MULTILINE_PREVIEW, MULTILINE_RESPONSE,
+        PROMPT_READY_MARKER, PTY_COLS, PTY_DIAGNOSTIC_WITHHELD, PTY_SCROLLBACK_ROWS,
+        SHORT_PROMPT_TEXT, SHORT_RESPONSE, USER_TURN_MARKER, USER_TURN_SEPARATOR,
+        WORKING_PROMPT_TEXT,
     };
 
     fn fast_limits() -> Limits {
@@ -1922,10 +2769,10 @@ mod tests {
             command_timeout: Duration::from_secs(2),
             command_output_bytes: 16 * 1024,
             pty_output_bytes: 64 * 1024,
-            startup_wait: Duration::from_millis(10),
-            turn_wait: Duration::from_millis(10),
-            working_wait: Duration::from_millis(10),
-            input_settle_wait: Duration::from_millis(10),
+            startup_wait: Duration::from_secs(1),
+            turn_wait: Duration::from_secs(1),
+            working_wait: Duration::from_secs(1),
+            input_settle_wait: Duration::from_secs(1),
             exit_grace: Duration::from_secs(1),
         }
     }
@@ -1947,7 +2794,382 @@ mod tests {
             include_bytes!("../../../compat/hermes/goldens/manifest.json"),
         )
         .expect("write manifest");
+        let source_goldens = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(GOLDEN_ROOT);
+        let manifest = load_golden_manifest(repo.path()).expect("load fixture manifest");
+        for file in manifest
+            .records
+            .iter()
+            .filter_map(|record| record.file.as_deref())
+        {
+            fs::copy(
+                source_goldens.join(file),
+                repo.path().join(GOLDEN_ROOT).join(file),
+            )
+            .expect("copy committed golden fixture");
+        }
         repo
+    }
+
+    fn terminal_row(text: &str) -> String {
+        let padding = usize::from(PTY_COLS).saturating_sub(text.chars().count());
+        format!("{text}{}\r\n", " ".repeat(padding))
+    }
+
+    fn assistant_panel_bytes(response: &str) -> Vec<u8> {
+        [
+            terminal_row(&assistant_panel_top()),
+            terminal_row(response),
+            terminal_row(&assistant_panel_bottom()),
+        ]
+        .concat()
+        .into_bytes()
+    }
+
+    fn cursor_moved_panel_bytes(response: &str) -> Vec<u8> {
+        format!(
+            "{}\x1b[1E{}\x1b[1E{}",
+            assistant_panel_top(),
+            response,
+            assistant_panel_bottom()
+        )
+        .into_bytes()
+    }
+
+    fn interleaved_panel_bytes(response: &str) -> Vec<u8> {
+        format!(
+            "{}\r\n\x1b[3A\x1b[Jprompt status redraw\r\n{response}\r\n\
+             \x1b[3A\x1b[Jprompt status redraw\r\n{}\r\n",
+            assistant_panel_top(),
+            assistant_panel_bottom()
+        )
+        .into_bytes()
+    }
+
+    fn short_transcript(panel: &[u8]) -> Vec<u8> {
+        let mut output = format!(
+            "{PROMPT_READY_MARKER}\r\n{USER_TURN_SEPARATOR}\r\n{USER_TURN_MARKER} {SHORT_PROMPT_TEXT}\r\n"
+        )
+        .into_bytes();
+        output.extend_from_slice(panel);
+        output
+    }
+
+    #[test]
+    fn assistant_panel_matches_terminal_redraw_and_split_escape() {
+        let mut bytes = b"spinner\r\x1b[2K".to_vec();
+        bytes.extend_from_slice(&cursor_moved_panel_bytes(SHORT_RESPONSE));
+        let split = bytes
+            .windows(2)
+            .position(|window| window == b"\x1b[")
+            .expect("panel contains a split-worthy CSI")
+            + 2;
+        let mut terminal = TerminalCapture::new();
+
+        assert!(terminal.feed_snapshot(&bytes[..split]));
+        assert_eq!(terminal.assistant_panel_count(SHORT_RESPONSE), 0);
+        assert!(terminal.feed_snapshot(&bytes));
+        assert_eq!(terminal.assistant_panel_count(SHORT_RESPONSE), 1);
+        assert!(!terminal.feed_snapshot(&bytes));
+    }
+
+    #[test]
+    fn assistant_panel_matches_ordered_interleaved_render_events() {
+        let bytes = interleaved_panel_bytes(SHORT_RESPONSE);
+        let final_screen = terminal_transcript(&bytes);
+        assert_eq!(assistant_panel_count(&final_screen, SHORT_RESPONSE), 0);
+
+        let observer = observe_assistant_panels(&bytes, SHORT_RESPONSE);
+        assert_eq!(observer.occurrence_count(), 1);
+        assert_eq!(
+            observer.one_panel(),
+            Some(normalized_assistant_panel(SHORT_RESPONSE).as_str())
+        );
+        assert_eq!(
+            observer.one_panel().map(|panel| panel.lines().count()),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn assistant_panel_rejects_echo_unframed_and_inexact_content() {
+        let echoed = short_transcript(b"");
+        assert_eq!(
+            assistant_panel_count(&terminal_transcript(&echoed), SHORT_RESPONSE),
+            0
+        );
+
+        let unframed = short_transcript(format!("{SHORT_RESPONSE}\r\n").as_bytes());
+        assert_eq!(
+            assistant_panel_count(&terminal_transcript(&unframed), SHORT_RESPONSE),
+            0
+        );
+        assert!(observe_assistant_panels(&unframed, SHORT_RESPONSE)
+            .one_panel()
+            .is_none());
+        let mut unframed_then_panel = unframed;
+        unframed_then_panel.extend_from_slice(&assistant_panel_bytes(SHORT_RESPONSE));
+        assert!(
+            observe_assistant_panels(&unframed_then_panel, SHORT_RESPONSE)
+                .one_panel()
+                .is_none(),
+            "an unframed exact line must invalidate a later framed response"
+        );
+
+        for response in [
+            "prefix-HERMES_COMPAT_OK",
+            "HERMES_COMPAT_OK-suffix",
+            "HERMES_COMPAT_OTHER",
+        ] {
+            let panel = short_transcript(&assistant_panel_bytes(response));
+            assert_eq!(
+                assistant_panel_count(&terminal_transcript(&panel), SHORT_RESPONSE),
+                0,
+                "inexact response must not satisfy assistant-panel evidence"
+            );
+        }
+
+        let mut missing_footer = assistant_panel_bytes(SHORT_RESPONSE);
+        missing_footer
+            .truncate(missing_footer.len() - terminal_row(&assistant_panel_bottom()).len());
+        assert_eq!(
+            assistant_panel_count(&terminal_transcript(&missing_footer), SHORT_RESPONSE),
+            0
+        );
+
+        let mut hidden = b"\x1bP".to_vec();
+        hidden.extend_from_slice(normalized_assistant_panel(SHORT_RESPONSE).as_bytes());
+        hidden.extend_from_slice(b"\x1b\\");
+        assert!(observe_assistant_panels(&hidden, SHORT_RESPONSE)
+            .one_panel()
+            .is_none());
+    }
+
+    #[test]
+    fn assistant_panel_requires_exactly_one_framed_response() {
+        let one = assistant_panel_bytes(SHORT_RESPONSE);
+        assert_eq!(
+            assistant_panel_count(&terminal_transcript(&one), SHORT_RESPONSE),
+            1
+        );
+
+        let mut two = one.clone();
+        two.extend_from_slice(b"\r\n");
+        two.extend_from_slice(&one);
+        let transcript = terminal_transcript(&two);
+        assert_eq!(assistant_panel_count(&transcript, SHORT_RESPONSE), 2);
+        let capture = PtyCapture {
+            bytes: short_transcript(&two),
+            exit_code: Some(0),
+            killed: false,
+        };
+        assert!(validate_classic_capture("short-input", &capture).is_err());
+    }
+
+    #[test]
+    fn assistant_panel_observer_rejects_duplicate_after_scrollback_eviction() {
+        let panel = assistant_panel_bytes(SHORT_RESPONSE);
+        let mut one = short_transcript(&panel);
+        for index in 0..(PTY_SCROLLBACK_ROWS + usize::from(super::PTY_ROWS) + 8) {
+            one.extend_from_slice(format!("noise-{index}\r\n").as_bytes());
+        }
+        let observer = observe_assistant_panels(&one, SHORT_RESPONSE);
+        assert_eq!(observer.occurrence_count(), 1);
+        assert!(observer.one_panel().is_some());
+
+        let mut duplicate = one;
+        duplicate.extend_from_slice(&panel);
+        let observer = observe_assistant_panels(&duplicate, SHORT_RESPONSE);
+        assert_eq!(observer.occurrence_count(), 2);
+        let capture = PtyCapture {
+            bytes: duplicate,
+            exit_code: Some(0),
+            killed: false,
+        };
+        assert!(validate_classic_capture("short-input", &capture).is_err());
+    }
+
+    #[test]
+    fn assistant_panel_observer_counts_panel_after_clear_as_duplicate() {
+        let panel = assistant_panel_bytes(SHORT_RESPONSE);
+        let mut bytes = short_transcript(&panel);
+        bytes.extend_from_slice(b"\x1b[2J\x1b[H");
+        bytes.extend_from_slice(&panel);
+
+        assert_eq!(
+            observe_assistant_panels(&bytes, SHORT_RESPONSE).occurrence_count(),
+            2
+        );
+    }
+
+    #[test]
+    fn assistant_panel_observer_ignores_prompt_status_repaint() {
+        let panel = assistant_panel_bytes(SHORT_RESPONSE);
+        let mut bytes = short_transcript(&panel);
+        bytes.extend_from_slice(b"\r\x1b[2KWorking\r\x1b[2K\xe2\x9d\xaf ");
+
+        assert_eq!(
+            observe_assistant_panels(&bytes, SHORT_RESPONSE).occurrence_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn assistant_panel_observer_ignores_completed_footer_repaint() {
+        let panel = assistant_panel_bytes(SHORT_RESPONSE);
+        let mut bytes = short_transcript(&panel);
+        let footer = terminal_row(&assistant_panel_bottom());
+        bytes.extend_from_slice(footer.as_bytes());
+
+        let observer = observe_assistant_panels(&bytes, SHORT_RESPONSE);
+
+        assert_eq!(observer.occurrence_count(), 1);
+        assert!(observer.one_panel().is_some());
+    }
+
+    #[test]
+    fn prompt_ready_capture_uses_raw_history_after_terminal_clear() {
+        let capture = PtyCapture {
+            bytes: format!("{PROMPT_READY_MARKER} \r\n\x1b[2J\x1b[HGoodbye!\r\n").into_bytes(),
+            exit_code: Some(0),
+            killed: false,
+        };
+
+        let final_screen = terminal_transcript(&capture.bytes);
+        assert!(!final_screen.contains(PROMPT_READY_MARKER));
+        assert!(final_screen.contains("Goodbye!"));
+        validate_classic_capture("prompt-ready", &capture)
+            .expect("raw capture history retains prompt-ready evidence after terminal clear");
+    }
+
+    #[test]
+    fn terminal_transcript_keeps_panel_in_bounded_scrollback() {
+        let mut bytes = assistant_panel_bytes(SHORT_RESPONSE);
+        for index in 0..64 {
+            bytes.extend_from_slice(format!("noise-{index}\r\n").as_bytes());
+        }
+
+        let transcript = terminal_transcript(&bytes);
+        assert_eq!(assistant_panel_count(&transcript, SHORT_RESPONSE), 1);
+        assert!(transcript.contains("noise-63"));
+    }
+
+    #[test]
+    fn terminal_transcript_preserves_classic_evidence_without_repaint_duplicates() {
+        let raw = format!(
+            "stale status\r\x1b[2K{PROMPT_READY_MARKER}\r\n{USER_TURN_SEPARATOR}\r\n\
+             {USER_TURN_MARKER} {SHORT_PROMPT_TEXT}\r\nRunning sleep 8\r\nDangerous Command\r\n\
+             Allow once\r\nDeny\r\n{INTERRUPT_MARKER}\r\nGoodbye!\r\nSession: native-reference\r\n"
+        );
+        let transcript = terminal_transcript(raw.as_bytes());
+
+        assert!(!transcript.contains("stale status"));
+        for expected in [
+            PROMPT_READY_MARKER,
+            USER_TURN_SEPARATOR,
+            USER_TURN_MARKER,
+            "Running sleep 8",
+            "Dangerous Command",
+            "Allow once",
+            "Deny",
+            INTERRUPT_MARKER,
+            "Goodbye!",
+            "Session: native-reference",
+        ] {
+            assert_eq!(
+                transcript.matches(expected).count(),
+                1,
+                "terminal normalization must preserve one rendered `{expected}`"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_command_evidence_requires_the_exact_rendered_command() {
+        let transcript = "┊ 💻 preparing terminal…\n┊ 💻 sleep 8   ( 0.1s)\n";
+
+        assert!(super::has_rendered_terminal_command(transcript, "sleep 8"));
+        assert!(!super::has_rendered_terminal_command(
+            transcript, "sleep 30"
+        ));
+        assert!(!super::has_rendered_terminal_command(
+            "💻 sleep 80 ( 0.1s)",
+            "sleep 8"
+        ));
+    }
+
+    #[test]
+    fn terminal_normalized_short_transcript_passes_classic_validation() {
+        let bytes = short_transcript(&cursor_moved_panel_bytes(SHORT_RESPONSE));
+        let transcript = terminal_transcript(&bytes);
+
+        validate_classic_transcript("short-input", &transcript)
+            .expect("terminal-normalized transcript retains exact classic evidence");
+    }
+
+    #[test]
+    fn submitted_user_turn_allows_bounded_status_repaint_gap() {
+        let text = format!(
+            "{USER_TURN_SEPARATOR}\nstatus repaint\nrule repaint\n{USER_TURN_MARKER} {SHORT_PROMPT_TEXT}"
+        );
+        let mut distant = format!("{USER_TURN_SEPARATOR}\n");
+        for _line in 0..=super::MAX_USER_TURN_BOUNDARY_GAP_LINES {
+            distant.push_str("status repaint\n");
+        }
+        write!(&mut distant, "{USER_TURN_MARKER} {SHORT_PROMPT_TEXT}")
+            .expect("write bounded submitted-turn fixture");
+
+        assert_eq!(submitted_user_turn_count(&text), 1);
+        assert!(has_one_submitted_user_turn(&text, SHORT_PROMPT_TEXT));
+        assert_eq!(submitted_user_turn_count(&distant), 0);
+    }
+
+    #[test]
+    fn identical_submitted_turn_repaint_is_one_semantic_turn() {
+        let submitted = format!("{USER_TURN_SEPARATOR}\n{USER_TURN_MARKER} {SHORT_PROMPT_TEXT}");
+        let repaint = format!("{submitted}\nrenderer output\n{submitted}");
+        let different = format!(
+            "{submitted}\nrenderer output\n{USER_TURN_SEPARATOR}\n{USER_TURN_MARKER} different prompt"
+        );
+
+        assert_eq!(submitted_user_turn_count(&repaint), 2);
+        assert!(has_one_submitted_user_turn(&repaint, SHORT_PROMPT_TEXT));
+        assert!(!has_one_submitted_user_turn(&different, SHORT_PROMPT_TEXT));
+    }
+
+    #[test]
+    fn submitted_multiline_turn_skips_only_pinned_status_repaints() {
+        let repaint = "⚕ pohunek-compat-v1 │ ctx --\n────────────────────────────────────────────────────────\n─\n⚕ ❯ msg=interrupt";
+        let text = format!(
+            "{USER_TURN_SEPARATOR}\n{USER_TURN_MARKER} Treat all three lines as one prompt.\n{repaint}\nalpha\n{repaint}\nbeta\n{repaint}\nReply with exactly HERMES_MULTILINE_OK."
+        );
+        let mut unbounded = format!(
+            "{USER_TURN_SEPARATOR}\n{USER_TURN_MARKER} Treat all three lines as one prompt."
+        );
+        for _line in 0..=super::MAX_USER_TURN_BOUNDARY_GAP_LINES {
+            unbounded.push_str("\nunrelated output");
+        }
+        unbounded.push_str("\nalpha\nbeta\nReply with exactly HERMES_MULTILINE_OK.");
+
+        assert!(has_one_submitted_user_turn(&text, MULTILINE_PREVIEW));
+        assert!(!has_one_submitted_user_turn(&unbounded, MULTILINE_PREVIEW));
+    }
+
+    #[test]
+    fn terminal_transcript_rejoins_soft_wrapped_approval_prompt() {
+        let raw = format!(
+            "{PROMPT_READY_MARKER}\r\n{USER_TURN_SEPARATOR}\r\n\
+             {USER_TURN_MARKER} {APPROVAL_PROMPT_TEXT}\r\nDangerous Command\r\n\
+             rm -rf HERMES_COMPAT_APPROVAL_SENTINEL\r\nAllow once\r\nDeny\r\n"
+        );
+        let transcript = terminal_transcript(raw.as_bytes());
+
+        assert!(transcript.contains(&format!("{USER_TURN_MARKER} {APPROVAL_PROMPT_TEXT}")));
+        assert!(transcript.contains("HERMES_APPROVAL_DONE."));
+        assert!(!transcript.contains("HERMES_A\nPPROVAL_DONE."));
+        validate_classic_transcript("approval-blocked", &transcript)
+            .expect("soft-wrapped repository approval prompt remains one submitted turn");
     }
 
     #[cfg(unix)]
@@ -1955,6 +3177,63 @@ mod tests {
 user_turn() {
   echo '__SEPARATOR__'
   printf '__MARKER__ %s\n' "$1"
+}
+assistant_panel() {
+  printf '%s\n' '__PANEL_TOP__'
+  printf '\033[3A\033[Jprompt status redraw\n'
+  printf '%s\n' "$1"
+  printf '\033[3A\033[Jprompt status redraw\n'
+  printf '%s\n' '__PANEL_BOTTOM__'
+}
+copilot_probe() {
+  python3 - <<'PY'
+import os
+import socket
+from urllib.parse import urlsplit
+
+proxy = urlsplit(os.environ["HTTPS_PROXY"])
+for authority in ["api.github.com:443"] * 3 + ["api.githubcopilot.com:443"] * 3:
+    connection = socket.create_connection((proxy.hostname, proxy.port), timeout=2)
+    request = f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n".encode()
+    connection.sendall(request)
+    response = b""
+    while b"\r\n\r\n" not in response:
+        chunk = connection.recv(4096)
+        assert chunk
+        response += chunk
+    assert response.startswith(b"HTTP/1.1 403 Forbidden\r\n")
+    connection.close()
+PY
+}
+mock_request() {
+  HERMES_COMPAT_PROMPT="$1" HERMES_COMPAT_TOOL="$2" python3 - "$HERMES_HOME/config.yaml" <<'PY'
+import json
+import os
+import sys
+from http.client import HTTPConnection
+from urllib.parse import urlsplit
+
+config = open(sys.argv[1], encoding="utf-8").read().splitlines()
+endpoint = next(line.split(":", 1)[1].strip() for line in config if line.lstrip().startswith("api:"))
+parts = urlsplit(endpoint)
+for detection_path in ("/api/v1/models", "/api/tags", "/v1/props", "/props", "/version"):
+    connection = HTTPConnection(parts.hostname, parts.port, timeout=2)
+    connection.request("GET", detection_path)
+    response = connection.getresponse()
+    assert response.status == 404
+    response.read()
+    connection.close()
+tools = []
+if os.environ["HERMES_COMPAT_TOOL"] == "terminal":
+    tools = [{"type": "function", "function": {"name": "terminal", "parameters": {"type": "object"}}}]
+body = json.dumps({"model": "pohunek-compat-v1", "stream": True, "messages": [{"role": "user", "content": os.environ["HERMES_COMPAT_PROMPT"]}], "tools": tools}).encode()
+connection = HTTPConnection(parts.hostname, parts.port, timeout=2)
+connection.request("POST", parts.path + "/chat/completions", body, {"Content-Type": "application/json"})
+response = connection.getresponse()
+assert response.status == 200
+response.read()
+connection.close()
+PY
 }
 case "$*" in
   --version) echo 'Hermes Agent v__VERSION__ (2026.8.3)' ;;
@@ -1966,11 +3245,13 @@ case "$*" in
   'profile show --help') echo 'usage: hermes profile show [-h] profile_name' ;;
   'profile rename --help') echo 'usage: hermes profile rename [-h] old_name new_name' ;;
   'chat --tui')
+    copilot_probe
     trap 'exit 0' INT
     printf '\033[?1049hHermes TUI\n'
     while :; do sleep 1; done
     ;;
   chat\ --resume\ *)
+    copilot_probe
     trap 'printf "\nInterrupting agent...\n❯ "' INT
     echo "↻ Resumed session $3"
     printf '❯ '
@@ -1982,6 +3263,7 @@ case "$*" in
     done
     ;;
   chat)
+    copilot_probe
     trap 'printf "\nInterrupting agent...\n❯ "' INT
     printf '❯ '
     had_turn=0
@@ -1996,11 +3278,15 @@ case "$*" in
       if [ "$in_paste" -eq 1 ]; then
         case "$line" in
           *HERMES_MULTILINE_OK*)
+            mock_request 'Treat all three lines as one prompt.
+alpha
+beta
+Reply with exactly HERMES_MULTILINE_OK.' text
             user_turn 'Treat all three lines as one prompt.'
             echo 'alpha'
             echo 'beta'
             echo 'Reply with exactly HERMES_MULTILINE_OK.'
-            echo HERMES_MULTILINE_OK
+            assistant_panel HERMES_MULTILINE_OK
             in_paste=0
             had_turn=1
             ;;
@@ -2012,30 +3298,34 @@ case "$*" in
       fi
       case "$line" in
         *HERMES_COMPAT_OK*)
+          mock_request 'Reply with exactly HERMES_COMPAT_OK.' text
           user_turn 'Reply with exactly HERMES_COMPAT_OK.'
-          echo HERMES_COMPAT_OK
+          assistant_panel HERMES_COMPAT_OK
           had_turn=1
           ;;
         *'sleep 8'*)
+          mock_request 'Use the terminal tool to run `sleep 8`, then reply exactly HERMES_WORKING_DONE.' terminal
           user_turn 'Use the terminal tool to run `sleep 8`, then reply exactly HERMES_WORKING_DONE.'
           echo 'Running sleep 8'
           had_turn=1
           ;;
         *HERMES_COMPAT_APPROVAL_SENTINEL*)
+          mock_request 'Use the terminal tool to run `rm -rf HERMES_COMPAT_APPROVAL_SENTINEL`, then reply exactly HERMES_APPROVAL_DONE.' terminal
           if [ "$wrap_approval" -eq 1 ]; then
             echo '__SEPARATOR__'
-            printf '__MARKER__ %s\n' 'Use the terminal tool to run `rm -f HERMES_COMPAT_APPROVAL_SENTINEL`, then reply exactly'
+            printf '__MARKER__ %s\n' 'Use the terminal tool to run `rm -rf HERMES_COMPAT_APPROVAL_SENTINEL`, then reply exactly'
             echo 'HERMES_APPROVAL_DONE.'
           else
-            user_turn 'Use the terminal tool to run `rm -f HERMES_COMPAT_APPROVAL_SENTINEL`, then reply exactly HERMES_APPROVAL_DONE.'
+            user_turn 'Use the terminal tool to run `rm -rf HERMES_COMPAT_APPROVAL_SENTINEL`, then reply exactly HERMES_APPROVAL_DONE.'
           fi
           echo 'Dangerous Command'
-          echo 'rm -f HERMES_COMPAT_APPROVAL_SENTINEL'
+          echo 'rm -rf HERMES_COMPAT_APPROVAL_SENTINEL'
           echo 'Allow once'
           echo 'Deny'
           had_turn=1
           ;;
         *'sleep 30'*)
+          mock_request 'Use the terminal tool to run `sleep 30`, then reply exactly HERMES_INTERRUPT_DONE.' terminal
           user_turn 'Use the terminal tool to run `sleep 30`, then reply exactly HERMES_INTERRUPT_DONE.'
           echo 'Running sleep 30'
           had_turn=1
@@ -2063,7 +3353,9 @@ esac
         let script = FAKE_HERMES_TEMPLATE
             .replace("__VERSION__", version)
             .replace("__SEPARATOR__", super::USER_TURN_SEPARATOR)
-            .replace("__MARKER__", super::USER_TURN_MARKER);
+            .replace("__MARKER__", super::USER_TURN_MARKER)
+            .replace("__PANEL_TOP__", &super::assistant_panel_top())
+            .replace("__PANEL_BOTTOM__", &super::assistant_panel_bottom());
         fs::write(&path, script).expect("write fake Hermes");
         let mut permissions = fs::metadata(&path).expect("fake metadata").permissions();
         permissions.set_mode(0o700);
@@ -2117,8 +3409,7 @@ esac
     fn compatibility_accepts_pinned_model_free_shape() {
         let repo = fixture_repo();
         let binary = fake_hermes(repo.path(), "0.20.0");
-        refresh_with(repo.path(), &binary, &[], fast_limits())
-            .expect("controlled refresh succeeds");
+        refresh_with(repo.path(), &binary, fast_limits()).expect("controlled refresh succeeds");
 
         let summary = compatibility_with(repo.path(), &binary, fast_limits())
             .expect("pinned compatibility succeeds");
@@ -2130,18 +3421,20 @@ esac
 
     #[test]
     #[cfg(unix)]
-    fn compatibility_rejects_rehashed_captured_golden_without_state_evidence() {
+    fn compatibility_rejects_rehashed_model_golden_with_metadata_only_panel_claim() {
         let repo = fixture_repo();
         let binary = fake_hermes(repo.path(), "0.20.0");
-        refresh_with(repo.path(), &binary, &[], fast_limits())
-            .expect("controlled refresh succeeds");
+        refresh_with(repo.path(), &binary, fast_limits()).expect("controlled refresh succeeds");
 
         let golden_path = repo.path().join(GOLDEN_ROOT).join("short-input.txt");
         let original = fs::read_to_string(&golden_path).expect("read captured golden");
-        let (header, _) = original
+        let (header, body) = original
             .split_once("\n\n")
             .expect("captured golden has a transcript boundary");
-        let forged = format!("{header}\n\nHermes setup failed before prompt initialization.\n");
+        let (raw_transcript, _) = body
+            .split_once(&format!("\n\n{ASSISTANT_PANEL_SECTION}\n"))
+            .expect("captured model golden has derived panel evidence");
+        let forged = format!("{header}\n\n{raw_transcript}\n");
         fs::write(&golden_path, &forged).expect("write forged captured golden");
 
         let manifest_path = repo.path().join(GOLDEN_ROOT).join(GOLDEN_MANIFEST);
@@ -2164,7 +3457,9 @@ esac
         let error = compatibility_with(repo.path(), &binary, fast_limits())
             .expect_err("every captured state is validated even when another state is pending");
 
-        assert!(error.to_string().contains("prompt-ready evidence"));
+        assert!(error
+            .to_string()
+            .contains("lacks derived terminal assistant-panel evidence"));
     }
 
     #[test]
@@ -2174,14 +3469,17 @@ esac
         let binary = fake_hermes(repo.path(), "0.20.0");
         rewrite_script(
             &binary,
-            "echo HERMES_COMPAT_OK",
+            "assistant_panel HERMES_COMPAT_OK",
             "echo 'prompt echoed only'",
         );
 
-        let error = refresh_with(repo.path(), &binary, &[], fast_limits())
+        let error = refresh_with(repo.path(), &binary, fast_limits())
             .expect_err("prompt echo cannot satisfy response evidence");
 
-        assert!(error.to_string().contains("required evidence"));
+        assert!(
+            error.to_string().contains("assistant-panel evidence"),
+            "unexpected prompt-echo failure: {error}"
+        );
     }
 
     #[test]
@@ -2191,10 +3489,13 @@ esac
         let binary = fake_hermes(repo.path(), "0.20.0");
         rewrite_script(&binary, "split_paste=0", "split_paste=1");
 
-        let error = refresh_with(repo.path(), &binary, &[], fast_limits())
+        let error = refresh_with(repo.path(), &binary, fast_limits())
             .expect_err("embedded newlines submitted as separate turns must fail");
 
-        assert!(error.to_string().contains("required semantic evidence"));
+        assert!(
+            error.to_string().contains("required semantic evidence"),
+            "unexpected controlled multiline failure: {error}"
+        );
     }
 
     #[test]
@@ -2204,7 +3505,7 @@ esac
         let binary = fake_hermes(repo.path(), "0.20.0");
         rewrite_script(&binary, "wrap_approval=0", "wrap_approval=1");
 
-        refresh_with(repo.path(), &binary, &[], fast_limits())
+        refresh_with(repo.path(), &binary, fast_limits())
             .expect("one approval preview wrapped at the fixed PTY width remains one turn");
     }
 
@@ -2222,9 +3523,52 @@ esac
 
     #[test]
     #[cfg(unix)]
+    fn compatibility_preflight_routes_proxy_egress_to_mock() {
+        let repo = fixture_repo();
+        let binary = fake_hermes(repo.path(), "0.20.0");
+        rewrite_script(
+            &binary,
+            "  --version) echo 'Hermes Agent v0.20.0 (2026.8.3)' ;;",
+            r#"  --version)
+    python3 - <<'PY'
+import os
+import socket
+from urllib.parse import urlsplit
+
+proxy = urlsplit(os.environ["HTTPS_PROXY"])
+connection = socket.create_connection((proxy.hostname, proxy.port), timeout=2)
+connection.sendall(b"CONNECT private.example:443 HTTP/1.1\r\nHost: private.example:443\r\n\r\n")
+connection.recv(4096)
+connection.close()
+PY
+    echo 'Hermes Agent v0.20.0 (2026.8.3)'
+    ;;"#,
+        );
+
+        let error = compatibility_with(repo.path(), &binary, fast_limits())
+            .expect_err("preflight proxy egress must fail the no-request mock scenario");
+
+        assert!(error
+            .to_string()
+            .contains("blocked an outbound HTTPS proxy CONNECT request"));
+        assert!(!error.to_string().contains("private.example"));
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn compatibility_rejects_pending_goldens() {
         let repo = fixture_repo();
         let binary = fake_hermes(repo.path(), "0.20.0");
+        let manifest_path = repo.path().join(GOLDEN_ROOT).join(GOLDEN_MANIFEST);
+        let mut manifest = load_golden_manifest(repo.path()).expect("load fixture manifest");
+        let pending = &mut manifest.records[0];
+        pending.status = GoldenStatus::Pending;
+        pending.file = None;
+        pending.sha256 = None;
+        pending.note = Some("Controlled pending record.".to_owned());
+        let mut rendered = serde_json::to_string_pretty(&manifest).expect("serialize manifest");
+        rendered.push('\n');
+        fs::write(manifest_path, rendered).expect("write pending manifest");
 
         let error = compatibility_with(repo.path(), &binary, fast_limits())
             .expect_err("pending evidence fails closed");
@@ -2239,16 +3583,28 @@ esac
         let mut manifest = load_golden_manifest(repo.path()).expect("load fixture manifest");
         manifest.records[0].status = GoldenStatus::Unsupported;
 
-        let unsupported = validate_golden_manifest(repo.path(), &lock, &manifest, 4096, true)
-            .expect_err("classic state cannot be unsupported");
+        let unsupported = validate_golden_manifest(
+            repo.path(),
+            &lock,
+            &manifest,
+            super::MAX_PTY_OUTPUT_BYTES,
+            true,
+        )
+        .expect_err("classic state cannot be unsupported");
         assert!(unsupported
             .to_string()
             .contains("only the Hermes alternate-screen TUI"));
 
         let mut manifest = load_golden_manifest(repo.path()).expect("reload fixture manifest");
         manifest.records[9].mode = "classic".to_owned();
-        let mode = validate_golden_manifest(repo.path(), &lock, &manifest, 4096, true)
-            .expect_err("alternate-screen state requires its exact mode");
+        let mode = validate_golden_manifest(
+            repo.path(),
+            &lock,
+            &manifest,
+            super::MAX_PTY_OUTPUT_BYTES,
+            true,
+        )
+        .expect_err("alternate-screen state requires its exact mode");
         assert!(mode.to_string().contains("invalid display mode"));
     }
 
@@ -2327,12 +3683,16 @@ esac
         let binary = fake_hermes(repo.path(), "0.20.0");
         let pid_file = repo.path().join("held-pty-child.pid");
         let replacement = format!(
-            "  chat)\n    /bin/sleep 30 &\n    echo $! > '{}'\n    trap",
+            "  chat)\n    copilot_probe\n    /bin/sleep 30 &\n    echo $! > '{}'\n    trap",
             pid_file.display()
         );
-        rewrite_script(&binary, "  chat)\n    trap", &replacement);
+        rewrite_script(
+            &binary,
+            "  chat)\n    copilot_probe\n    trap",
+            &replacement,
+        );
 
-        refresh_with(repo.path(), &binary, &[], fast_limits())
+        refresh_with(repo.path(), &binary, fast_limits())
             .expect("PTY refresh cleans up descendants after every scenario");
         let process_id: i32 = fs::read_to_string(pid_file)
             .expect("read PTY descendant pid")
@@ -2354,7 +3714,7 @@ esac
             tui_loop,
             "    echo 'node not found \u{2014} install Node.js to use the TUI.'\n    exit 1",
         );
-        let summary = refresh_with(repo.path(), &unavailable, &[], fast_limits())
+        let summary = refresh_with(repo.path(), &unavailable, fast_limits())
             .expect("recognized local TUI unavailability is recorded");
         assert_eq!(summary.unsupported, 1);
 
@@ -2365,7 +3725,7 @@ esac
             tui_loop,
             "    echo 'authentication failed'\n    exit 1",
         );
-        let error = refresh_with(crash_repo.path(), &crash, &[], fast_limits())
+        let error = refresh_with(crash_repo.path(), &crash, fast_limits())
             .expect_err("auth failure cannot be recorded as unsupported");
         assert!(error
             .to_string()
@@ -2378,7 +3738,7 @@ esac
             tui_loop,
             "    trap 'exit 2' INT\n    printf '\\033[?1049hHermes TUI\\n'\n    while :; do sleep 1; done",
         );
-        let error = refresh_with(alt_crash_repo.path(), &alt_crash, &[], fast_limits())
+        let error = refresh_with(alt_crash_repo.path(), &alt_crash, fast_limits())
             .expect_err("alternate-screen entry does not hide a subsequent crash");
         assert!(error.to_string().contains("crashed after entering"));
     }
@@ -2389,8 +3749,8 @@ esac
         let repo = fixture_repo();
         let binary = fake_hermes(repo.path(), "0.20.0");
 
-        let summary = refresh_with(repo.path(), &binary, &[], fast_limits())
-            .expect("controlled refresh succeeds");
+        let summary =
+            refresh_with(repo.path(), &binary, fast_limits()).expect("controlled refresh succeeds");
         let manifest: GoldenManifest = serde_json::from_slice(
             &fs::read(summary.manifest_path).expect("read refreshed manifest"),
         )
@@ -2418,7 +3778,7 @@ esac
     fn sanitizer_removes_terminal_sequences_paths_and_dynamic_ids() {
         let paths = vec![("/home/operator".to_owned(), "<USER_HOME>")];
         let sanitized = sanitize_output(
-            "\u{1b}[31m/home/operator\u{1b}[0m\r\nSession ID: 20260804_120000_abcdef12\n550e8400-e29b-41d4-a716-446655440000\nC:\\Users\\operator\\secret.txt",
+            b"\x1b[31m/home/operator\x1b[0m\r\nSession ID: 20260804_120000_abcdef12\n550e8400-e29b-41d4-a716-446655440000\nC:\\Users\\operator\\secret.txt",
             &paths,
         );
 
@@ -2432,6 +3792,82 @@ esac
     }
 
     #[test]
+    fn sanitizer_canonicalizes_random_tips_and_status_runtime() {
+        let first = sanitize_output(
+            "Welcome to Hermes Agent!\n✦ Tip: /redraw forces a full UI repaint.\n\n ⚕ pohunek-compat-v1 │ ctx -- │ [░░░░░░░░░░] -- │ 1s │ ⏲ 0s".as_bytes(),
+            &[],
+        );
+        let second = sanitize_output(
+            "Welcome to Hermes Agent!\n✦ Tip: credential_pool_strategies supports fill_first, round_robin, least_used, and\nrandom rotation.\n\n ⚕ pohunek-compat-v1 │ ctx -- │ [░░░░░░░░░░] -- │ 47s │ ⏲ 22s".as_bytes(),
+            &[],
+        );
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            "Welcome to Hermes Agent!\n✦ Tip: <RANDOMIZED>\n\n ⚕ pohunek-compat-v1 │ ctx -- │ [░░░░░░░░░░] -- │ <RUNTIME> │ ⏲ <RUNTIME>"
+        );
+    }
+
+    #[test]
+    fn sanitizer_canonicalizes_approval_runtime_countdown_and_durations() {
+        let first = sanitize_output(
+            " ⚕ pohunek-compat-v1 │ 0/64K │ [░░░░░░░░░░] 0% │ 5s │ ⏱ 1s\n  💻 rm -rf HERMES_COMPAT_APPROVAL_SENTINEL  (  0.3s)\n  ↑/↓ to select, Enter to confirm  (299s)\n  ┊ 💻 $         rm -rf HERMES_COMPAT_APPROVAL_SENTINEL  0.3s [BLOCKED: User denied this command.]\n ⚕ pohunek-compat-v1 │ 0/64K │ [░░░░░░░░░░] 0% │ 5s │ ⏲ 1s │ ✓ 0s\nDuration:       4s".as_bytes(),
+            &[],
+        );
+        let second = sanitize_output(
+            " ⚕ pohunek-compat-v1 │ 0/64K │ [░░░░░░░░░░] 0% │ 42s │ ⏱ 17s\n  💻 rm -rf HERMES_COMPAT_APPROVAL_SENTINEL  (  1.7s)\n  ↑/↓ to select, Enter to confirm  (283s)\n  ┊ 💻 $         rm -rf HERMES_COMPAT_APPROVAL_SENTINEL  1.7s [BLOCKED: User denied this command.]\n ⚕ pohunek-compat-v1 │ 0/64K │ [░░░░░░░░░░] 0% │ 42s │ ⏲ 17s │ ✓ 3s\nDuration:       39s".as_bytes(),
+            &[],
+        );
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            " ⚕ pohunek-compat-v1 │ 0/64K │ [░░░░░░░░░░] 0% │ <RUNTIME> │ ⏱ <RUNTIME>\n  💻 rm -rf HERMES_COMPAT_APPROVAL_SENTINEL  (<DURATION>)\n  ↑/↓ to select, Enter to confirm  (<DURATION>)\n  ┊ 💻 $         rm -rf HERMES_COMPAT_APPROVAL_SENTINEL  <DURATION> [BLOCKED: User denied this command.]\n ⚕ pohunek-compat-v1 │ 0/64K │ [░░░░░░░░░░] 0% │ <RUNTIME> │ ⏲ <RUNTIME> │ ✓ <RUNTIME>\nDuration:       <DURATION>"
+        );
+    }
+
+    #[test]
+    fn raw_transcript_discards_ecma48_string_payloads_and_complete_escapes() {
+        let hidden = format!(
+            "{PROMPT_READY_MARKER}\n{USER_TURN_SEPARATOR}\n{USER_TURN_MARKER} hidden\n\
+             Running sleep\nDangerous Command\nAllow once\nDeny\n{INTERRUPT_MARKER}\n\
+             Goodbye!\nResumed session hidden"
+        );
+        for introducer in [b"\x1bP".as_slice(), b"\x1bX", b"\x1b^", b"\x1b_"] {
+            let mut bytes = b"visible-before".to_vec();
+            bytes.extend_from_slice(introducer);
+            bytes.extend_from_slice(hidden.as_bytes());
+            bytes.extend_from_slice(b"\x1b\\visible-after");
+
+            assert_eq!(
+                raw_terminal_transcript(&bytes),
+                "visible-beforevisible-after"
+            );
+        }
+        for introducer in [0x90, 0x98, 0x9e, 0x9f] {
+            let mut bytes = b"visible-before".to_vec();
+            bytes.push(introducer);
+            bytes.extend_from_slice(hidden.as_bytes());
+            bytes.push(0x9c);
+            bytes.extend_from_slice(b"visible-after");
+
+            assert_eq!(
+                raw_terminal_transcript(&bytes),
+                "visible-beforevisible-after"
+            );
+        }
+        assert_eq!(
+            raw_terminal_transcript(b"visible-before\x1bPunterminated hidden marker"),
+            "visible-before"
+        );
+        assert_eq!(
+            strip_terminal_controls("visible-before\x1b(Bvisible-after"),
+            "visible-beforevisible-after"
+        );
+    }
+
+    #[test]
     fn fixture_validation_rejects_secret_shaped_output() {
         let error = validate_safe_fixture("API_KEY=abcdefghijk")
             .expect_err("credential-shaped output fails closed");
@@ -2440,66 +3876,329 @@ esac
     }
 
     #[test]
-    fn provider_environment_names_are_bounded_and_isolation_safe() {
-        validate_provider_env_name("OPENAI_API_KEY").expect("provider name is valid");
-        for invalid in [
-            "",
-            "lowercase_key",
-            "HOME",
-            "XDG_DATA_HOME",
-            "LD_PRELOAD",
-            "LD_LIBRARY_PATH",
-            "BASH_ENV",
-            "NODE_OPTIONS",
-            "PYTHONSTARTUP",
-            "TMPDIR",
-            "OPENAI_API_KEY_FILE",
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            "HERMES_TUI",
-            "NAME-WITH-DASH",
-            "THIS_PROVIDER_ENVIRONMENT_VARIABLE_NAME_IS_DELIBERATELY_LONGER_THAN_SIXTY_FOUR_BYTES",
-        ] {
-            assert!(
-                validate_provider_env_name(invalid).is_err(),
-                "{invalid:?} must be rejected"
-            );
-        }
+    fn mock_verification_error_precedes_capture_error() {
+        let error = finish_mocked_pty(
+            Err(fail("capture did not reach prompt-ready evidence")),
+            Err(fail(
+                "Hermes compatibility mock received an unexpected request",
+            )),
+        )
+        .expect_err("specific mock verification failure must not be hidden by a PTY failure");
+
+        assert_eq!(
+            error.to_string(),
+            "Hermes compatibility mock received an unexpected request"
+        );
     }
 
     #[test]
-    fn provider_environment_debug_redacts_values() {
-        let secret = "provider-value-must-not-appear";
-        let variable = ProviderEnv {
-            name: "OPENAI_API_KEY".to_owned(),
-            value: secret.into(),
-        };
+    fn every_model_turn_requires_local_discovery() {
+        use crate::hermes_mock::Scenario as MockScenario;
 
-        let debug = format!("{variable:?}");
+        let scenarios = classic_scenarios(fast_limits());
+        let mapped = scenarios.iter().map(mock_scenario).collect::<Vec<_>>();
 
-        assert!(debug.contains("OPENAI_API_KEY"));
-        assert!(debug.contains("[REDACTED]"));
-        assert!(!debug.contains(secret));
+        let expected = vec![
+            MockScenario::no_request("prompt-ready"),
+            MockScenario::text_with_local_discovery(
+                "short-input",
+                SHORT_PROMPT_TEXT,
+                SHORT_RESPONSE,
+            ),
+            MockScenario::text_with_local_discovery(
+                "multiline-input",
+                MULTILINE_PREVIEW,
+                MULTILINE_RESPONSE,
+            ),
+            MockScenario::terminal_with_local_discovery("working", WORKING_PROMPT_TEXT, "sleep 8"),
+            MockScenario::terminal_with_local_discovery(
+                "approval-blocked",
+                APPROVAL_PROMPT_TEXT,
+                "rm -rf HERMES_COMPAT_APPROVAL_SENTINEL",
+            ),
+            MockScenario::text_with_local_discovery(
+                "completion",
+                SHORT_PROMPT_TEXT,
+                SHORT_RESPONSE,
+            ),
+            MockScenario::terminal_with_local_discovery(
+                "interruption",
+                INTERRUPTION_PROMPT_TEXT,
+                "sleep 30",
+            ),
+            MockScenario::no_request("exit"),
+        ]
+        .into_iter()
+        .map(MockScenario::with_copilot_probe_denials)
+        .collect::<Vec<_>>();
+
+        assert_eq!(mapped, expected);
     }
 
     #[test]
-    fn provider_environment_values_are_removed_from_fixtures() {
+    fn refresh_config_is_keyless_named_custom_provider_with_static_metadata() {
         let isolation =
-            Isolation::new("hermes-provider-redaction-").expect("create isolated environment");
-        let secret = "provider-value-must-not-appear";
-        let variables = vec![ProviderEnv {
-            name: "OPENAI_API_KEY".to_owned(),
-            value: secret.to_owned(),
-        }];
+            Isolation::new("hermes-refresh-config-").expect("create isolated environment");
+        let endpoint = "http://127.0.0.1:45231/v1";
+
+        super::write_refresh_config(&isolation, endpoint).expect("write isolated refresh config");
+
+        let config = fs::read_to_string(isolation.hermes_home.join("config.yaml"))
+            .expect("read isolated refresh config");
+        assert!(config.contains("provider: custom:pohunek-compat"));
+        assert!(config.contains("api: http://127.0.0.1:45231/v1"));
+        assert!(config.contains("default_model: pohunek-compat-v1"));
+        assert!(config.contains("context_length: 64000"));
+        assert!(config.contains("model_catalog:\n  enabled: false"));
+        assert!(config.contains("discover_models: false"));
+        assert!(config.contains("fallback_providers: []"));
+        assert!(config.contains("  - terminal"));
+        assert!(config.contains("mode: manual"));
+        assert!(config.contains("security:\n  tirith_enabled: false\n  allow_lazy_installs: false"));
+        assert!(config.contains("auxiliary:\n  title_generation:\n    enabled: false"));
+        assert!(config.contains("telemetry:\n  shared_metrics:\n    enabled: false"));
+        assert!(!config.contains("tirith_enabled: true"));
+        assert!(!config.contains("allow_lazy_installs: true"));
+        assert!(!config.contains("tirith_path:"));
+        assert!(!config.contains("api_key"));
+        assert!(!config.contains("key_env"));
+
+        let cache: serde_json::Value = serde_json::from_slice(
+            &fs::read(isolation.hermes_home.join(super::UPDATE_CACHE_FILE))
+                .expect("read isolated update cache"),
+        )
+        .expect("parse isolated update cache");
+        assert_eq!(cache["behind"], serde_json::Value::Null);
+        assert_eq!(cache["ver"], "0.20.0");
+        assert!(cache["ts"].as_u64().is_some());
+
+        let models_cache: serde_json::Value = serde_json::from_slice(
+            &fs::read(isolation.hermes_home.join(super::MODELS_DEV_CACHE_FILE))
+                .expect("read isolated models.dev cache"),
+        )
+        .expect("parse isolated models.dev cache");
+        let offline = &models_cache["pohunek-offline"];
+        assert_eq!(offline["name"], "Pohunek offline compatibility cache");
+        assert_eq!(offline["env"], serde_json::json!([]));
+        assert_eq!(offline["api"], "");
+        assert_eq!(offline["models"], serde_json::json!({}));
+        assert_eq!(models_cache.as_object().map(serde_json::Map::len), Some(1));
+
+        let model_catalog_cache: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                isolation
+                    .hermes_home
+                    .join(super::MODEL_CATALOG_CACHE_DIRECTORY)
+                    .join(super::MODEL_CATALOG_CACHE_FILE),
+            )
+            .expect("read isolated model catalog cache"),
+        )
+        .expect("parse isolated model catalog cache");
+        assert_eq!(model_catalog_cache["version"], 1);
+        assert_eq!(model_catalog_cache["providers"], serde_json::json!({}));
+        assert_eq!(
+            model_catalog_cache.as_object().map(serde_json::Map::len),
+            Some(2)
+        );
+        let cache_age = fs::metadata(isolation.hermes_home.join(super::MODELS_DEV_CACHE_FILE))
+            .expect("stat isolated models.dev cache")
+            .modified()
+            .expect("models.dev cache has modification time")
+            .elapsed()
+            .expect("models.dev cache is not future dated");
+        assert!(cache_age < Duration::from_mins(1));
+    }
+
+    #[test]
+    fn isolation_seeds_model_catalog_cache_before_refresh_configuration() {
+        let isolation =
+            Isolation::new("hermes-model-catalog-cache-").expect("create isolated environment");
+
+        let cache: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                isolation
+                    .hermes_home
+                    .join(super::MODEL_CATALOG_CACHE_DIRECTORY)
+                    .join(super::MODEL_CATALOG_CACHE_FILE),
+            )
+            .expect("read pre-configuration model catalog cache"),
+        )
+        .expect("parse pre-configuration model catalog cache");
+
+        assert_eq!(cache, serde_json::json!({"version": 1, "providers": {}}));
+        let auth_store: serde_json::Value = serde_json::from_slice(
+            &fs::read(isolation.hermes_home.join(super::AUTH_STORE_FILE))
+                .expect("read pre-configuration auth store"),
+        )
+        .expect("parse pre-configuration auth store");
+        assert_eq!(
+            auth_store,
+            serde_json::json!({
+                "version": 1,
+                "providers": {},
+                "suppressed_sources": {
+                    "copilot": [
+                        "gh_cli",
+                        "env:COPILOT_GITHUB_TOKEN",
+                        "env:GH_TOKEN",
+                        "env:GITHUB_TOKEN"
+                    ]
+                }
+            })
+        );
+        assert!(!isolation.hermes_home.join("config.yaml").exists());
+    }
+
+    #[test]
+    fn refresh_environment_contains_only_isolation_and_loopback_controls() {
+        let isolation = Isolation::new("hermes-refresh-env-").expect("create isolated environment");
+        let proxy_url = "http://127.0.0.1:45231";
+        let environment = isolation.refresh_env(proxy_url);
+        let preflight_environment = isolation.model_free_env(proxy_url);
+        let names: Vec<_> = environment
+            .iter()
+            .map(|(name, _value)| name.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(names.contains(&"HERMES_HOME".to_owned()));
+        assert!(names.contains(&"HERMES_DISABLE_LAZY_INSTALLS".to_owned()));
+        assert!(environment
+            .iter()
+            .any(|(name, value)| { name == "TIRITH_ENABLED" && value == "0" }));
+        assert!(environment.iter().any(|(name, value)| {
+            name == "COPILOT_GITHUB_TOKEN" && value == super::MOCK_COPILOT_CREDENTIAL
+        }));
+        assert_eq!(super::MOCK_COPILOT_CREDENTIAL, "pohunek-compat-local-mock");
+        assert!(environment.iter().any(|(name, value)| {
+            name == "DBUS_SESSION_BUS_ADDRESS"
+                && value.to_string_lossy().ends_with("/no-session-bus")
+        }));
+        assert!(environment.iter().any(|(name, value)| {
+            matches!(name.to_str(), Some("NO_PROXY" | "no_proxy")) && value == "127.0.0.1,localhost"
+        }));
+        assert!(!names.contains(&"TIRITH_BIN".to_owned()));
+        assert!(!names.iter().any(|name| name.ends_with("_API_KEY")));
+        for proxy in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            assert!(environment
+                .iter()
+                .any(|(name, value)| name == proxy && value == proxy_url));
+        }
+        assert!(!names.iter().any(|name| name == "HERMES_INFERENCE_PROVIDER"));
+        assert!(!names.iter().any(|name| name == "HERMES_YOLO_MODE"));
+        assert!(preflight_environment
+            .iter()
+            .any(|(name, value)| name == "HTTPS_PROXY" && value == proxy_url));
+        assert!(preflight_environment
+            .iter()
+            .any(|(name, value)| name == "NO_COLOR" && value == "1"));
+    }
+
+    #[test]
+    fn sanitizer_removes_ephemeral_mock_endpoint() {
+        let isolation =
+            Isolation::new("hermes-mock-redaction-").expect("create isolated environment");
+        let endpoint = "http://127.0.0.1:45231/v1";
         let paths = sensitive_paths(
             Path::new("/repository"),
             Path::new("/usr/bin/hermes"),
             &isolation,
-            &variables,
+            endpoint,
         );
 
-        let sanitized = sanitize_output(&format!("credential={secret}"), &paths);
+        let sanitized = sanitize_output(
+            b"provider endpoint http://127.0.0.1:45231/v1/chat/completions",
+            &paths,
+        );
 
-        assert_eq!(sanitized, "credential=<PROVIDER_CREDENTIAL>");
-        assert!(!sanitized.contains(secret));
+        assert_eq!(
+            sanitized,
+            "provider endpoint <HERMES_MOCK_ENDPOINT>/chat/completions"
+        );
+    }
+
+    #[test]
+    fn safe_pty_diagnostic_redacts_prompts_paths_ids_and_bounds_the_tail() {
+        let paths = vec![("/private/isolation".to_owned(), "<ISOLATED_ROOT>")];
+        let mut output = String::new();
+        for index in 0..14 {
+            writeln!(
+                &mut output,
+                "discardable diagnostic {index}: {}",
+                "x".repeat(500)
+            )
+            .expect("write diagnostic fixture");
+        }
+        output.push_str("\u{1b}[31mReply with exactly HERMES_COMPAT_OK.\u{1b}[0m\n");
+        output.push_str("state at /private/isolation/work\n");
+        output.push_str("id 550e8400-e29b-41d4-a716-446655440000\n");
+
+        let tail = sanitized_pty_tail(output.as_bytes(), &paths)
+            .expect("repository-owned diagnostic is safe");
+
+        assert!(tail.len() <= MAX_PTY_DIAGNOSTIC_BYTES);
+        assert!(tail.lines().count() <= MAX_PTY_DIAGNOSTIC_LINES);
+        assert!(tail.contains("<HERMES_PROMPT>"));
+        assert!(tail.contains("<ISOLATED_ROOT>/work"));
+        assert!(tail.contains("<UUID>"));
+        assert!(!tail.contains(SHORT_PROMPT_TEXT));
+        assert!(!tail.contains("/private/isolation"));
+        assert!(!tail.contains('\u{1b}'));
+
+        let error = with_pty_diagnostic(&fail("evidence timeout"), output.as_bytes(), &paths);
+        assert!(error.to_string().contains("Sanitized PTY tail:"));
+        assert!(!error.to_string().contains(SHORT_PROMPT_TEXT));
+    }
+
+    #[test]
+    fn unsafe_pty_diagnostic_is_withheld_before_tail_selection() {
+        let mut output = String::from("API_KEY=abcdefghijk\n");
+        for index in 0..20 {
+            writeln!(&mut output, "safe trailing line {index}").expect("write diagnostic fixture");
+        }
+
+        assert!(sanitized_pty_tail(output.as_bytes(), &[]).is_none());
+        assert!(sanitized_pty_tail(
+            br#"Host: localhost
+{"messages":[{"role":"user","content":"private"}]}"#,
+            &[],
+        )
+        .is_none());
+        let response_dump = b"HTTP/1.1 401 Unauthorized\nSet-Cookie: session=private-cookie\n{\"error\":\"private payload\"}\nsafe trailing line\n";
+        assert!(sanitized_pty_tail(response_dump, &[]).is_none());
+
+        let error = with_pty_diagnostic(&fail("evidence timeout"), output.as_bytes(), &[]);
+        assert_eq!(
+            error.to_string(),
+            format!("evidence timeout\n{PTY_DIAGNOSTIC_WITHHELD}")
+        );
+        assert!(!error.to_string().contains("abcdefghijk"));
+        assert!(!error.to_string().contains("safe trailing line"));
+
+        let response_error = with_pty_diagnostic(&fail("evidence timeout"), response_dump, &[]);
+        assert_eq!(
+            response_error.to_string(),
+            format!("evidence timeout\n{PTY_DIAGNOSTIC_WITHHELD}")
+        );
+        assert!(!response_error.to_string().contains("private-cookie"));
+        assert!(!response_error.to_string().contains("private payload"));
+    }
+
+    #[test]
+    fn pty_diagnostic_preserves_plain_status_and_unicode_after_unknown_escape() {
+        assert_eq!(
+            sanitized_pty_tail(b"Status: waiting", &[]).as_deref(),
+            Some("Status: waiting")
+        );
+        assert_eq!(
+            sanitized_pty_tail(b"\x1b\xe2\x9d\xa4", &[]).as_deref(),
+            Some("❤")
+        );
     }
 }

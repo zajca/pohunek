@@ -4,6 +4,7 @@ mod checks;
 mod eval;
 mod generators;
 mod hermes;
+mod hermes_mock;
 mod site;
 mod ts;
 
@@ -304,11 +305,8 @@ fn run_hermes(action: HermesAction, root: &Path) -> Result<(), XtaskError> {
             );
             Ok(())
         }
-        HermesAction::RefreshGoldens {
-            hermes_bin,
-            provider_env,
-        } => {
-            let summary = hermes::refresh_goldens(root, &hermes_bin, &provider_env)?;
+        HermesAction::RefreshGoldens { hermes_bin } => {
+            let summary = hermes::refresh_goldens(root, &hermes_bin)?;
             println!(
                 "hermes golden refresh ok: {} captures, {} unsupported diagnostics, manifest {}",
                 summary.captures,
@@ -371,9 +369,6 @@ enum HermesAction {
         /// Exact Hermes executable used for every capture.
         #[arg(long, value_name = "PATH", required = true)]
         hermes_bin: PathBuf,
-        /// Provider credential environment variable to pass by name.
-        #[arg(long = "provider-env", value_name = "NAME")]
-        provider_env: Vec<String>,
     },
 }
 
