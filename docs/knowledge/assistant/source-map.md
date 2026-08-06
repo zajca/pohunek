@@ -177,6 +177,7 @@ Hermes compatibility evidence:
 - `compat/hermes/README.md`
 - `compat/hermes/goldens/manifest.json`
 - `crates/xtask/src/hermes.rs`
+- `crates/xtask/src/hermes_mock.rs`
 
 Protocol contracts and transport:
 

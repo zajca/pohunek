@@ -122,22 +122,36 @@ runtime. Hermes PTY goldens are refreshed explicitly and are never regenerated
 by CI. `cargo xtask hermes compatibility` is expected to fail while any checked-
 in golden remains `pending`; do not report that gate green until all required
 captures or a legitimate alternate-TUI `unsupported` diagnosis are committed.
-The executable path must be absolute. Provider credentials are passed only by
-naming each required environment variable; repeat `--provider-env` when needed:
+The executable path must be absolute. Refresh the evidence with the real pinned
+Hermes process and PTY against the repository-owned deterministic model mock:
 
 ```bash
-cargo xtask hermes refresh-goldens \
-  --hermes-bin /absolute/path/to/hermes \
-  --provider-env OPENAI_API_KEY
+cargo xtask hermes refresh-goldens --hermes-bin ABS
 ```
 
-Only credential names in the pinned Hermes provider allowlist are accepted;
-path and interpreter-control variables are rejected. The refresh uses isolated
-temporary `HOME`, `HERMES_HOME`, XDG, and Python locations, bounded semantic
-state waits, and process-group cleanup. Never point it at or copy from the
-operator's real Hermes home.
-It performs real provider turns and may incur cost, so run it only with explicit
-operator authorization and named provider environment variables.
+The mock model endpoint binds only to IPv4 loopback.
+It requires no provider credentials and incurs no provider cost. Each of the six
+model-bearing classic scenarios starts a new Hermes process and must issue this
+exact localhost sequence: five ordered detection GETs to `/api/v1/models`,
+`/api/tags`, `/v1/props`, `/props`, and `/version`, each receiving a
+deterministic HTTP 404; then exactly one `POST /v1/chat/completions`. Discovery
+is not cached across those processes. The isolated config statically pins
+`pohunek-compat-v1`, `context_length: 64000`, and `discover_models: false`, so
+Hermes does not request `/v1/models` and the mock does not permit that path.
+Each isolated home is seeded with a fresh nonempty `models_dev_cache.json`, so
+Hermes satisfies that remote metadata lookup locally. Harness-owned proxy
+variables route any other HTTP(S) attempt to the loopback mock, which rejects
+proxy `CONNECT` and absolute-form external requests fail closed; this remains
+an application-level defense, not OS-level network containment. Model-response
+evidence follows the pinned streaming response frame as ordered rounded header,
+exact content, and rounded footer events across prompt-toolkit redraws.
+The `prompt-ready` and `exit` classic scenarios issue no model API requests.
+The mock also checks the POST model identifier and last user prompt, plus the
+terminal tool for terminal scenarios.
+The refresh uses isolated temporary `HOME`, `HERMES_HOME`, XDG, and Python
+locations, bounded semantic state waits, and process-group cleanup. Never point
+it at or copy from the operator's real Hermes home, and review every refreshed
+fixture before committing it.
 
 Extra CI jobs (run if your change touches deps/features): `cargo audit`,
 `cargo hack --feature-powerset --workspace clippy --all-targets`,

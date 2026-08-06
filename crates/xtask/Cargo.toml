@@ -16,6 +16,7 @@ cli = { workspace = true }
 pohunek-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+httparse = { workspace = true }
 sha2 = { workspace = true }
 regex = { workspace = true }
 clap = { workspace = true }
@@ -23,6 +24,7 @@ pulldown-cmark = { workspace = true }
 nix = { workspace = true, features = ["process", "signal"] }
 portable-pty = { workspace = true }
 tempfile = { workspace = true }
+vt100 = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
