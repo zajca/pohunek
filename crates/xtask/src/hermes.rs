@@ -3248,7 +3248,7 @@ case "$*" in
     copilot_probe
     trap 'exit 0' INT
     printf '\033[?1049hHermes TUI\n'
-    while :; do sleep 1; done
+    while IFS= read -r _line; do :; done
     ;;
   chat\ --resume\ *)
     copilot_probe
@@ -3708,7 +3708,7 @@ PY
     fn tui_unsupported_requires_recognized_local_diagnostic() {
         let repo = fixture_repo();
         let unavailable = fake_hermes(repo.path(), "0.20.0");
-        let tui_loop = "    trap 'exit 0' INT\n    printf '\\033[?1049hHermes TUI\\n'\n    while :; do sleep 1; done";
+        let tui_loop = "    trap 'exit 0' INT\n    printf '\\033[?1049hHermes TUI\\n'\n    while IFS= read -r _line; do :; done";
         rewrite_script(
             &unavailable,
             tui_loop,
@@ -3736,7 +3736,7 @@ PY
         rewrite_script(
             &alt_crash,
             tui_loop,
-            "    trap 'exit 2' INT\n    printf '\\033[?1049hHermes TUI\\n'\n    while :; do sleep 1; done",
+            "    trap 'exit 2' INT\n    printf '\\033[?1049hHermes TUI\\n'\n    while IFS= read -r _line; do :; done",
         );
         let error = refresh_with(alt_crash_repo.path(), &alt_crash, fast_limits())
             .expect_err("alternate-screen entry does not hide a subsequent crash");
