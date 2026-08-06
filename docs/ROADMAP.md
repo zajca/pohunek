@@ -59,6 +59,32 @@ The chassis (daemon + control protocol) stays **provider-agnostic and
 presentation-agnostic** and gains no new network surface. Three separate tracks,
 in dependency order: **SDKs → native desktop app → browser control center**.
 
+### Track H — Hermes runtime and operator plugin
+
+The first-class local Hermes Agent runtime is pinned to `0.20.0`. The runtime
+launches in Pohunek-owned PTYs, resumes only an exact recorded native reference,
+and reports native fork as unsupported data. Hermes remains limited to its local
+interactive backend; it does not turn Pohunek into a Hermes gateway, database
+reader, SSH bridge, or remote-provider client.
+
+The operator-plugin milestone adds an explicitly selected Hermes profile or
+custom owner-private home to the existing CLI integration surface. The release
+CLI embeds the managed plugin and the skill generated from `docs/knowledge`.
+Its policy is external to immutable plugin checksums and requires explicit
+access mode and host allowlist. Read/manage/full tool availability is bounded;
+`full` alone exposes stop/remove. Hook reporting is local and best effort, while
+the daemon stays authoritative for the exact eight origin-session denials and
+the three lifecycle-report exceptions. No public protocol bump is introduced:
+the one-time M1 range-negotiation boundary already covers M2 and M3.
+
+Operational rollout is ordinary after M1: install matching local binaries,
+reconcile workers, run integration doctor for a selected profile, and validate a
+canary before enabling remote or full policy. Binary downgrade after Hermes enum
+or provider-keyed notification-policy persistence is unsupported; recover by
+upgrading forward. See the [operator guide](knowledge/guides/hermes-operator.md),
+[rollout runbook](runbooks/hermes-operator-plugin.md), and
+[migration guide](migrations/hermes-operator-plugin.md).
+
 ### Track S — Public API + SDKs *(foundational, split out)*
 
 Promote the control protocol from an internal CLI wire format to a **documented,

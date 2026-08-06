@@ -53,8 +53,10 @@ but treat a present unknown base as display-only.
 Hermes profiles use `base = "hermes"`. Their program and fixed arguments may
 wrap the local terminal command, but they cannot enable fork semantics. The
 compiled bare launch is exactly `hermes chat`; a valid native reference resumes
-only as `hermes chat --resume <reference>`. M2 does not install a Hermes plugin,
-lifecycle hook, or skill and never reads the profile's `state.db`.
+only as `hermes chat --resume <reference>`. The separately selected Hermes
+operator plugin provides lifecycle hooks, typed tools, and a generated skill in
+an isolated profile or custom absolute home; it never reads the profile's
+`state.db`. See [Hermes operator](../guides/hermes-operator.md).
 
 Resume and fork are independent capabilities frozen into each session at
 creation. A profile may disable a capability supported by its base adapter, but

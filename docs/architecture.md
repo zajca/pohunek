@@ -366,6 +366,47 @@ Kandev's hard-won handling:
 These per-agent input rules live in the agent adapter next to its launch command,
 state manifest, and resume command.
 
+### Hermes operator plugin
+
+The pinned local Hermes Agent `0.20.0` runtime may load a Pohunek-owned plugin
+from one explicitly selected Hermes profile. This is a CLI/client-side
+integration; the daemon stays provider-neutral and M3 does not increase the
+public protocol version. The release `pohunek` binary embeds the plugin assets
+and the deterministically generated `pohunek:pohunek` skill. Installation uses
+only Hermes's supported plugin commands and places a separate owner-private
+Pohunek policy outside the immutable plugin checksum set. The rendered plugin
+asset stores the exact absolute policy path selected by the installer.
+
+The policy fixes the verified absolute CLI executable, public protocol range,
+access mode, host allowlist, and bounded tool limits. It is a delegated-tool
+guardrail, not a same-user sandbox: a process with shell or file-write authority
+can still bypass or alter same-user files. The plugin accepts no raw argv,
+arbitrary daemon method, arbitrary endpoint, raw attach stream, force flag, or
+environment map. It invokes a single fixed-argv CLI JSON runner and passes
+untrusted prompt/input text only on standard input. Remote requests remain
+direct connections to the selected host daemon over NetBird; no plugin listener,
+proxy, SSH bridge, or central service is introduced.
+
+Read tools expose hosts, sessions, inspect, rendered screen, bounded output,
+wait, and diff. `manage` additionally exposes structured project/worktree/agent
+profile session operations with exact unique-name resolution. `full` alone
+registers stop and remove. The plugin repeats the daemon's origin-session guard
+before subprocess start: it denies exactly `session.stop`, `session.resume`,
+`session.remove`, `session.fork`, `session.resize`, `session.set_metadata`,
+`session.rename`, and `session.input` when they target the hosting session. The
+only origin-session exceptions are the lifecycle reports
+`session.report_agent`, `session.release_agent`, and
+`session.report_native_id`; the daemon remains authoritative.
+
+Hooks run only in a Pohunek-managed Hermes process. They use a short bounded
+local Unix-socket attempt, prefer worker-private identity reporting, and fall
+back to the hardened local public native-ID method. They never start a
+subprocess, access the network or Hermes `state.db`, emit terminal output, or
+copy prompt/tool/output payloads. A failed hook is counted and swallowed, so
+process and screen detection remain the daemon's fallback. `on_session_end` is
+not a process-exit signal. A higher-sequence continuation identity reported by
+`pre_llm_call` supersedes the launch identity for a later native resume.
+
 ## NetBird Discovery
 
 Discovery is tokenless and NetBird-local. There is no signed manifest exchange.

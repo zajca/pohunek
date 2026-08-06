@@ -49,3 +49,8 @@ host: `host/id` overrides `--host`, while a bare id targets the selected
 The assistant design keeps the same boundary. A remote assistant must use a
 knowledge bundle materialized on the remote host, version-matched to the remote
 binary, and readable by the selected remote agent profile.
+
+The Hermes operator uses the same direct NetBird path but never performs host
+discovery on a model's behalf. Its policy allows only explicitly listed hosts;
+a wildcard requires explicit install-time confirmation. See
+[Hermes operator](hermes-operator.md#access-policy-and-targets).

@@ -5,6 +5,7 @@ mod eval;
 mod generators;
 mod hermes;
 mod hermes_mock;
+mod hermes_skill;
 mod site;
 mod ts;
 
@@ -297,12 +298,13 @@ where
 
 fn run_hermes(action: HermesAction, root: &Path) -> Result<(), XtaskError> {
     match action {
-        HermesAction::Compatibility { hermes_bin } => {
-            let summary = hermes::compatibility(root, &hermes_bin)?;
-            println!(
-                "hermes compatibility ok: {} {}, {} CLI checks, {} golden records",
-                summary.release, summary.tag, summary.cli_checks, summary.golden_records
-            );
+        HermesAction::Compatibility {
+            hermes_bin,
+            pohunek_bin,
+        } => {
+            let summary = hermes::compatibility(root, &hermes_bin, &pohunek_bin)?;
+            let message = hermes_compatibility_message(&summary);
+            println!("{message}");
             Ok(())
         }
         HermesAction::RefreshGoldens { hermes_bin } => {
@@ -315,7 +317,33 @@ fn run_hermes(action: HermesAction, root: &Path) -> Result<(), XtaskError> {
             );
             Ok(())
         }
+        HermesAction::GenerateSkill => {
+            hermes_skill::generate(root)?;
+            println!("hermes generate-skill ok: checked skill artifact updated");
+            Ok(())
+        }
+        HermesAction::CheckSkill => {
+            if hermes_skill::check(root)? {
+                println!("hermes check-skill ok: checked skill artifact is current");
+                Ok(())
+            } else {
+                Err(XtaskError::Usage(
+                    "hermes check-skill failed: generated skill is missing or stale".to_string(),
+                ))
+            }
+        }
     }
+}
+
+fn hermes_compatibility_message(summary: &hermes::CompatibilitySummary) -> String {
+    format!(
+        "hermes compatibility ok: {} {}, {} CLI checks, {} plugin checks, {} golden records",
+        summary.release,
+        summary.tag,
+        summary.cli_checks,
+        summary.plugin_checks,
+        summary.golden_records
+    )
 }
 
 #[derive(Debug, Parser)]
@@ -363,6 +391,13 @@ enum HermesAction {
         /// Hermes executable to inspect; defaults to PATH resolution.
         #[arg(long, value_name = "PATH", default_value = "hermes")]
         hermes_bin: PathBuf,
+        #[arg(
+            long,
+            value_name = "PATH",
+            required = true,
+            help = "Required absolute canonical path to a safe Pohunek executable: no symlink components and no group- or world-write permissions."
+        )]
+        pohunek_bin: PathBuf,
     },
     /// Refresh sanitized PTY goldens with an explicit Hermes executable.
     RefreshGoldens {
@@ -370,6 +405,10 @@ enum HermesAction {
         #[arg(long, value_name = "PATH", required = true)]
         hermes_bin: PathBuf,
     },
+    /// Regenerate the checked Hermes skill from its knowledge source.
+    GenerateSkill,
+    /// Check that the checked Hermes skill is present and current.
+    CheckSkill,
 }
 
 fn repo_root() -> PathBuf {
@@ -509,4 +548,83 @@ fn remove_dir_all(path: &Path) -> Result<(), XtaskError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hermes, hermes_compatibility_message, HermesAction, TopCommand, XtaskCommand};
+    use clap::{CommandFactory as _, Parser as _};
+    use std::path::Path;
+
+    #[test]
+    fn hermes_compatibility_requires_an_explicit_pohunek_binary() {
+        XtaskCommand::try_parse_from([
+            "xtask",
+            "hermes",
+            "compatibility",
+            "--hermes-bin",
+            "/controlled/hermes",
+        ])
+        .expect_err("missing Pohunek executable is rejected by clap");
+
+        let command = XtaskCommand::try_parse_from([
+            "xtask",
+            "hermes",
+            "compatibility",
+            "--hermes-bin",
+            "/controlled/hermes",
+            "--pohunek-bin",
+            "/controlled/pohunek",
+        ])
+        .expect("both explicit executables parse");
+        let TopCommand::Hermes {
+            action:
+                HermesAction::Compatibility {
+                    hermes_bin,
+                    pohunek_bin,
+                },
+        } = command.command
+        else {
+            panic!("expected Hermes compatibility command");
+        };
+        assert_eq!(hermes_bin, Path::new("/controlled/hermes"));
+        assert_eq!(pohunek_bin, Path::new("/controlled/pohunek"));
+    }
+
+    #[test]
+    fn hermes_compatibility_help_states_the_complete_pohunek_binary_contract() {
+        let command = XtaskCommand::command();
+        let compatibility = command
+            .find_subcommand("hermes")
+            .and_then(|hermes| hermes.find_subcommand("compatibility"))
+            .expect("Hermes compatibility subcommand exists");
+        let pohunek_bin = compatibility
+            .get_arguments()
+            .find(|argument| argument.get_id() == "pohunek_bin")
+            .expect("Pohunek binary argument exists");
+
+        assert_eq!(
+            pohunek_bin.get_help().map(ToString::to_string).as_deref(),
+            Some(
+                "Required absolute canonical path to a safe Pohunek executable: no symlink components and no group- or world-write permissions."
+            )
+        );
+        assert!(pohunek_bin.is_required_set());
+    }
+
+    #[test]
+    fn hermes_compatibility_output_reports_unique_check_categories() {
+        let summary = hermes::CompatibilitySummary {
+            release: "0.20.0".to_owned(),
+            tag: "v2026.8.3".to_owned(),
+            cli_checks: 8,
+            plugin_checks: 17,
+            golden_records: 10,
+        };
+
+        assert_eq!(
+            hermes_compatibility_message(&summary),
+            "hermes compatibility ok: 0.20.0 v2026.8.3, 8 CLI checks, 17 plugin checks, 10 golden records"
+        );
+    }
 }

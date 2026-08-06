@@ -56,6 +56,14 @@ pub(crate) enum CliError {
     #[error(transparent)]
     Prompt(#[from] pohunek_prompt::Error),
 
+    /// A local Hermes operator-plugin action failed without exposing local paths
+    /// or controlled subprocess output.
+    #[error("Hermes integration failed: {error}")]
+    Hermes {
+        /// Redacted lifecycle failure class.
+        error: crate::hermes_integration::error::Error,
+    },
+
     /// A `session new --meta` key was supplied more than once. Caught client-side
     /// (before any connection is dialed) because metadata travels as a flat map:
     /// a repeated key would otherwise silently collapse to whichever occurrence
@@ -169,6 +177,12 @@ impl CliError {
                 err.to_string(),
                 None,
             ),
+            CliError::Hermes { error } => ProtocolError::new(
+                hermes_error_class(error),
+                hermes_error_code(error),
+                error.to_string(),
+                Some(error.recovery_hint().to_owned()),
+            ),
             CliError::MissingEnv { var } => ProtocolError::new(
                 ErrorClass::Configuration,
                 "missing_env",
@@ -281,6 +295,70 @@ impl CliError {
     /// The recovery hint to surface beneath this error, when one applies.
     pub(crate) fn recover_hint(&self) -> Option<String> {
         self.to_protocol_error().recover
+    }
+}
+
+fn hermes_error_class(error: &crate::hermes_integration::error::Error) -> ErrorClass {
+    use crate::hermes_integration::error::Error;
+
+    match error {
+        Error::UnsafeTarget
+        | Error::RelativePath
+        | Error::InvalidProfile
+        | Error::ReservedProfile
+        | Error::UnsafePermissions
+        | Error::UnsupportedPolicySchema
+        | Error::InvalidPolicy
+        | Error::InvalidCliPath
+        | Error::WildcardConfirmationRequired
+        | Error::UnsafePolicyPath
+        | Error::InvalidHermesExecutable
+        | Error::InvalidHermesRuntime
+        | Error::UnsupportedHermes
+        | Error::ConfirmationRequired => ErrorClass::Configuration,
+        Error::Io { .. }
+        | Error::InvalidAsset
+        | Error::Collision
+        | Error::InvalidMarker
+        | Error::HermesCommand
+        | Error::HermesTimeout
+        | Error::HermesOutputLimit
+        | Error::InvalidHermesState
+        | Error::StagedValidation
+        | Error::InstalledProbe
+        | Error::RecoveryRequired => ErrorClass::Runtime,
+    }
+}
+
+fn hermes_error_code(error: &crate::hermes_integration::error::Error) -> &'static str {
+    use crate::hermes_integration::error::Error;
+
+    match error {
+        Error::UnsafeTarget => "hermes_unsafe_target",
+        Error::RelativePath => "hermes_absolute_path_required",
+        Error::InvalidProfile => "hermes_invalid_profile",
+        Error::ReservedProfile => "hermes_reserved_profile",
+        Error::UnsafePermissions => "hermes_unsafe_permissions",
+        Error::Io { .. } => "hermes_io_failed",
+        Error::UnsupportedPolicySchema => "hermes_unsupported_policy_schema",
+        Error::InvalidPolicy => "hermes_invalid_policy",
+        Error::InvalidCliPath => "hermes_invalid_pohunek_binary",
+        Error::WildcardConfirmationRequired => "hermes_wildcard_confirmation_required",
+        Error::UnsafePolicyPath => "hermes_unsafe_policy_path",
+        Error::InvalidAsset => "hermes_invalid_asset",
+        Error::Collision => "hermes_plugin_collision",
+        Error::InvalidMarker => "hermes_invalid_marker",
+        Error::HermesCommand => "hermes_command_failed",
+        Error::InvalidHermesExecutable => "hermes_invalid_executable",
+        Error::InvalidHermesRuntime => "hermes_invalid_runtime",
+        Error::HermesTimeout => "hermes_command_timeout",
+        Error::HermesOutputLimit => "hermes_command_output_limit",
+        Error::InvalidHermesState => "hermes_invalid_state",
+        Error::UnsupportedHermes => "hermes_unsupported_version",
+        Error::ConfirmationRequired => "hermes_modified_confirmation_required",
+        Error::StagedValidation => "hermes_staged_validation_failed",
+        Error::InstalledProbe => "hermes_installed_probe_failed",
+        Error::RecoveryRequired => "hermes_recovery_required",
     }
 }
 

@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+for forbidden in POHUNEK_SMOKE_AMBIENT_SENTINEL OPENAI_API_KEY HTTPS_PROXY HERMES_API_KEY; do
+  if [[ -v "$forbidden" ]]; then
+    exit 91
+  fi
+done
+
+if [[ "$#" -lt 2 || "$1" != "integration" ]]; then
+  exit 92
+fi
+
+current="$HERMES_HOME"
+while true; do
+  if [[ -e "$current/.git" || -L "$current/.git" ]]; then
+    exit 94
+  fi
+  if [[ "$current" == "/" ]]; then
+    break
+  fi
+  current="${current%/*}"
+  if [[ -z "$current" ]]; then
+    current="/"
+  fi
+done
+
+plugin_root="$HERMES_HOME/plugins/operators/pohunek"
+case "$2" in
+  install)
+    mkdir -p "$plugin_root/skills/pohunek"
+    : > "$plugin_root/plugin.yaml"
+    : > "$plugin_root/skills/pohunek/SKILL.md"
+    ;;
+  status|doctor)
+    test -f "$plugin_root/plugin.yaml"
+    ;;
+  uninstall)
+    rm -f "$plugin_root/skills/pohunek/SKILL.md" "$plugin_root/plugin.yaml"
+    rmdir "$plugin_root/skills/pohunek" "$plugin_root/skills" "$plugin_root"
+    ;;
+  *)
+    exit 93
+    ;;
+esac
+printf '%s\n' '{"cli_version":"controlled","protocol":{"minimum":2,"maximum":2},"ok":{}}'

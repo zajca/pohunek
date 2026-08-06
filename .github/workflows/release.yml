@@ -279,6 +279,11 @@ jobs:
             cp packaging/systemd/pohunek-session@.service.in "${staging}/packaging/systemd/"
             cp packaging/systemd/pohunek-sessions.slice "${staging}/packaging/systemd/"
           fi
+          if [ "${{ matrix.component }}" = "cli" ]; then
+            mkdir -p "${staging}/packaging"
+            cp scripts/smoke-hermes-plugin-release "${staging}/packaging/"
+            chmod 0755 "${staging}/packaging/smoke-hermes-plugin-release"
+          fi
           mkdir -p "${staging}/docs"
           cp -R target/pohunek-docs/offline "${staging}/docs/offline"
           cp target/pohunek-docs/manifest.json "${staging}/docs/manifest.json"

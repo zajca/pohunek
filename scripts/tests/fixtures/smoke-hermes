@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+for forbidden in POHUNEK_SMOKE_AMBIENT_SENTINEL OPENAI_API_KEY HTTPS_PROXY HERMES_API_KEY; do
+  if [[ -v "$forbidden" ]]; then
+    exit 91
+  fi
+done
+
+if [[ "$#" -ne 3 || "$1" != "plugins" || "$2" != "list" || "$3" != "--json" ]]; then
+  exit 92
+fi
+test -f "$HERMES_HOME/plugins/operators/pohunek/plugin.yaml"
+test -f "$HERMES_HOME/plugins/operators/pohunek/skills/pohunek/SKILL.md"
+printf '%s\n' '[{"name":"pohunek","status":"enabled","source":"user"}]'

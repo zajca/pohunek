@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# Smoke a packaged Pohunek CLI against an explicitly supplied pinned Hermes.
+#
+# This script deliberately creates every mutable path below one temporary root.
+# It never downloads Hermes, Python/Node dependencies, plugins, or models, and
+# it must be run with an extracted release binary rather than a source-tree
+# `cargo run` command.
+
+set -euo pipefail
+
+readonly SCRIPT_NAME="${0##*/}"
+readonly REQUIRED_ARGUMENTS=2
+readonly CONTROLLED_ARGUMENTS=6
+readonly PRIVATE_DIRECTORY_MODE=700
+readonly ISOLATED_PATH="/usr/bin:/bin"
+readonly ISOLATED_LOCALE="C"
+readonly NO_COLOR_VALUE="1"
+readonly ENV_EXECUTABLE="/usr/bin/env"
+readonly MKTEMP_EXECUTABLE="/usr/bin/mktemp"
+readonly MKDIR_EXECUTABLE="/usr/bin/mkdir"
+readonly CHMOD_EXECUTABLE="/usr/bin/chmod"
+readonly RM_EXECUTABLE="/usr/bin/rm"
+readonly DEFAULT_TEMP_PARENT="/tmp"
+readonly FALLBACK_TEMP_PARENT="/var/tmp"
+
+usage() {
+  printf 'usage: %s /absolute/path/to/release/pohunek /absolute/path/to/pinned/hermes\n' "$SCRIPT_NAME" >&2
+}
+
+absolute_executable() {
+  local candidate="$1"
+  if [[ "$candidate" != /* || ! -f "$candidate" || ! -x "$candidate" ]]; then
+    printf '%s: expected an executable absolute path\n' "$SCRIPT_NAME" >&2
+    exit 2
+  fi
+  local candidate_directory="${candidate%/*}"
+  local candidate_name="${candidate##*/}"
+  local directory
+  directory="$(cd -- "$candidate_directory" && pwd -P)"
+  printf '%s/%s\n' "$directory" "$candidate_name"
+}
+
+run_isolated() {
+  "$ENV_EXECUTABLE" -i \
+    HOME="$release_smoke_home" \
+    HERMES_HOME="$release_smoke_hermes_home" \
+    XDG_CONFIG_HOME="$release_smoke_xdg_config" \
+    XDG_DATA_HOME="$release_smoke_xdg_data" \
+    XDG_STATE_HOME="$release_smoke_xdg_state" \
+    XDG_CACHE_HOME="$release_smoke_xdg_cache" \
+    XDG_RUNTIME_DIR="$release_smoke_xdg_runtime" \
+    PATH="$ISOLATED_PATH" \
+    LANG="$ISOLATED_LOCALE" \
+    LC_ALL="$ISOLATED_LOCALE" \
+    NO_COLOR="$NO_COLOR_VALUE" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    "$@"
+}
+
+safe_temp_parent() {
+  local candidate="$1"
+  if [[ "$candidate" != /* || "$candidate" == "/" || ! -d "$candidate" || ! -w "$candidate" ]]; then
+    return 1
+  fi
+
+  local current="$candidate"
+  while true; do
+    if [[ -L "$current" || -e "$current/.git" || -L "$current/.git" ]]; then
+      return 1
+    fi
+    if [[ "$current" == "/" ]]; then
+      break
+    fi
+    current="${current%/*}"
+    if [[ -z "$current" ]]; then
+      current="/"
+    fi
+  done
+
+  local canonical
+  canonical="$(cd -- "$candidate" && pwd -P)"
+  [[ "$candidate" == "$canonical" ]]
+}
+
+select_temp_parent() {
+  local candidate
+  for candidate in "$@"; do
+    if safe_temp_parent "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  printf '%s: no validated temporary parent is available\n' "$SCRIPT_NAME" >&2
+  return 1
+}
+
+if [[ "$#" -ne "$REQUIRED_ARGUMENTS" && "$#" -ne "$CONTROLLED_ARGUMENTS" ]]; then
+  usage
+  exit 2
+fi
+
+temp_parent_primary="$DEFAULT_TEMP_PARENT"
+temp_parent_fallback="$FALLBACK_TEMP_PARENT"
+if [[ "$#" -eq "$CONTROLLED_ARGUMENTS" ]]; then
+  if [[ "$3" != "--temp-parent-primary" || "$5" != "--temp-parent-fallback" ]]; then
+    usage
+    exit 2
+  fi
+  temp_parent_primary="$4"
+  temp_parent_fallback="$6"
+fi
+
+release_pohunek="$(absolute_executable "$1")"
+pinned_hermes="$(absolute_executable "$2")"
+release_smoke_parent="$(select_temp_parent "$temp_parent_primary" "$temp_parent_fallback")"
+release_smoke_root="$(
+  "$ENV_EXECUTABLE" -i \
+    HOME="$release_smoke_parent" \
+    HERMES_HOME="$release_smoke_parent" \
+    XDG_CONFIG_HOME="$release_smoke_parent" \
+    XDG_DATA_HOME="$release_smoke_parent" \
+    XDG_STATE_HOME="$release_smoke_parent" \
+    XDG_CACHE_HOME="$release_smoke_parent" \
+    XDG_RUNTIME_DIR="$release_smoke_parent" \
+    PATH="$ISOLATED_PATH" \
+    LANG="$ISOLATED_LOCALE" \
+    LC_ALL="$ISOLATED_LOCALE" \
+    NO_COLOR="$NO_COLOR_VALUE" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    "$MKTEMP_EXECUTABLE" -d "$release_smoke_parent/pohunek-hermes-release.XXXXXX"
+)"
+
+release_smoke_home="$release_smoke_root/home"
+release_smoke_hermes_home="$release_smoke_root/hermes-home"
+release_smoke_workdir="$release_smoke_root/work"
+release_smoke_xdg_config="$release_smoke_root/xdg-config"
+release_smoke_xdg_data="$release_smoke_root/xdg-data"
+release_smoke_xdg_state="$release_smoke_root/xdg-state"
+release_smoke_xdg_cache="$release_smoke_root/xdg-cache"
+release_smoke_xdg_runtime="$release_smoke_root/xdg-runtime"
+
+cleanup() {
+  run_isolated "$RM_EXECUTABLE" -rf -- "$release_smoke_root"
+}
+trap cleanup EXIT
+
+run_isolated "$MKDIR_EXECUTABLE" -p "$release_smoke_home" "$release_smoke_hermes_home" "$release_smoke_workdir"
+run_isolated "$CHMOD_EXECUTABLE" "$PRIVATE_DIRECTORY_MODE" "$release_smoke_root" "$release_smoke_home" "$release_smoke_hermes_home"
+
+# Keep the release CLI out of the source tree and give both the installer and
+# Hermes a fresh owner-private profile/state. The preinstalled Hermes path is
+# explicit; PATH is never used to discover a model or runtime. Every child gets
+# an empty environment followed by this exact non-secret allowlist, so ambient
+# provider credentials, proxies, and operator Hermes settings cannot propagate.
+run_isolated "$MKDIR_EXECUTABLE" -p "$release_smoke_xdg_config" "$release_smoke_xdg_data" "$release_smoke_xdg_state" "$release_smoke_xdg_cache" "$release_smoke_xdg_runtime"
+run_isolated "$CHMOD_EXECUTABLE" "$PRIVATE_DIRECTORY_MODE" "$release_smoke_xdg_config" "$release_smoke_xdg_data" "$release_smoke_xdg_state" "$release_smoke_xdg_cache" "$release_smoke_xdg_runtime"
+cd -- "$release_smoke_workdir"
+
+run_isolated "$release_pohunek" integration install --agent hermes \
+  --hermes-home "$release_smoke_hermes_home" \
+  --hermes-bin "$pinned_hermes" \
+  --pohunek-bin "$release_pohunek" \
+  --access-mode manage \
+  --allow-host local \
+  --json
+
+test -f "$release_smoke_hermes_home/plugins/operators/pohunek/plugin.yaml"
+test -f "$release_smoke_hermes_home/plugins/operators/pohunek/skills/pohunek/SKILL.md"
+
+# The selected pinned executable must see the managed plugin through its normal
+# profile semantics. This command does not start a model turn.
+run_isolated "$pinned_hermes" plugins list --json
+
+run_isolated "$release_pohunek" integration status --agent hermes \
+  --hermes-home "$release_smoke_hermes_home" \
+  --hermes-bin "$pinned_hermes" \
+  --json
+run_isolated "$release_pohunek" integration doctor --agent hermes \
+  --hermes-home "$release_smoke_hermes_home" \
+  --hermes-bin "$pinned_hermes" \
+  --json
+run_isolated "$release_pohunek" integration uninstall --agent hermes \
+  --hermes-home "$release_smoke_hermes_home" \
+  --hermes-bin "$pinned_hermes" \
+  --json
+
+test ! -e "$release_smoke_hermes_home/plugins/operators/pohunek"
+printf '%s\n' 'Hermes release-plugin smoke passed.'

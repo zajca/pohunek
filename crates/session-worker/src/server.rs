@@ -1,6 +1,6 @@
 //! Serves the private daemon-worker Unix protocol.
 
-// Rust guideline compliant 2026-08-04
+// Rust guideline compliant 2026-08-06
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -2368,7 +2368,7 @@ where
 }
 
 fn known_identity_provider(provider: &str) -> bool {
-    matches!(provider, "shell" | "codex" | "claude")
+    matches!(provider, "shell" | "codex" | "claude" | "hermes")
 }
 
 fn identity_sequence_is_fresh(journal: &JournalRecord, sequence: u64) -> bool {
@@ -2999,9 +2999,9 @@ mod tests {
 
     use super::{
         await_observation_page, capabilities, control_input_id, identity_sequence_is_fresh,
-        observation_timed_out, parse_stat, random_value, redeem_data_grant, signal_number,
-        valid_identity_expiry, validate_attach_write_id, validate_data_start,
-        validate_observation_request, validate_terminal_snapshot_dimensions,
+        known_identity_provider, observation_timed_out, parse_stat, random_value,
+        redeem_data_grant, signal_number, valid_identity_expiry, validate_attach_write_id,
+        validate_data_start, validate_observation_request, validate_terminal_snapshot_dimensions,
         validate_terminal_snapshot_response, wait_runtime_exit, write_data_error,
         write_observation_page, write_output_chunks, write_terminal_chunks, Connection,
         ControlInputId, DataGrant, ObservationGrant, ObservationWaitOutcome, PrefixStream,
@@ -3023,6 +3023,23 @@ mod tests {
 
     /// Extra bytes force exactly one partial frame after a full wire payload.
     const OVERSIZED_PAYLOAD_EXTRA: usize = 257;
+
+    #[test]
+    fn identity_provider_allowlist_is_exact() {
+        for provider in ["shell", "codex", "claude", "hermes"] {
+            assert!(
+                known_identity_provider(provider),
+                "{provider} must be accepted"
+            );
+        }
+
+        for provider in ["", "Hermes", "HERMES", "hermes ", "unknown"] {
+            assert!(
+                !known_identity_provider(provider),
+                "{provider:?} must be rejected"
+            );
+        }
+    }
 
     #[test]
     fn identity_expiry_enforces_the_shared_ttl_ceiling() {

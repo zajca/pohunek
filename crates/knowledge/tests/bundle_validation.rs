@@ -5,6 +5,12 @@ use knowledge::{
     CONCEPT_SCHEMA_VERSION,
 };
 
+// The committed bundle contains 21 frontmatter-backed concepts (including the
+// source map and system prompt) plus the reserved `index.md` and `log.md` files.
+// Keep this exact assertion so changing a checked Markdown file needs an intentional update.
+const COMMITTED_KNOWLEDGE_FILES: usize = 23;
+const COMMITTED_KNOWLEDGE_CONCEPTS: usize = 21;
+
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -71,8 +77,8 @@ fn committed_docs_knowledge_bundle_passes_validation() {
     let report = validate_bundle(repo_knowledge_dir()).expect("docs/knowledge should validate");
 
     assert_eq!(report.schema_version, CONCEPT_SCHEMA_VERSION);
-    assert_eq!(report.files_checked, 22);
-    assert_eq!(report.concepts.len(), 20);
+    assert_eq!(report.files_checked, COMMITTED_KNOWLEDGE_FILES);
+    assert_eq!(report.concepts.len(), COMMITTED_KNOWLEDGE_CONCEPTS);
 }
 
 #[test]

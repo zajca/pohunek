@@ -45,10 +45,11 @@ where they are doing it, and when they need you.
   `shell`), with
   per-host **agent profiles** that define the program, arguments, environment,
   and input rules for custom runtimes (e.g. `claude-otel`).
-- Hermes M2 support is intentionally limited to the local interactive terminal
-  backend and the pinned Hermes Agent `0.20.0` release. Docker, SSH, browser,
-  desktop, gateway, ACP, and other Hermes backends are outside Pohunek's PTY
-  ownership model.
+- Hermes Agent `0.20.0` is supported only through its local interactive terminal
+  backend. Docker, SSH, browser, desktop, gateway, ACP, and other Hermes
+  backends are outside Pohunek's PTY ownership model. The selected Hermes
+  profile can additionally host the owner-private Pohunek operator plugin:
+  bounded typed tools, a generated skill, and best-effort lifecycle hooks.
 - **Live agent state detection** — `working` / `blocked` / `idle` — derived
   from OSC terminal titles, screen-content pattern matching, and PTY activity.
   Detection rules are TOML manifests, so new agents can be added without
@@ -220,15 +221,14 @@ archive's `README.md` for the complete commands.
 Download from [Releases](https://github.com/zajca/pohunek/releases), unpack,
 and put the binaries on your `PATH`.
 
-Protocol v2 is a one-time coordinated pre-1.0 boundary. Before upgrading any
-host, inventory every CLI, GUI, web backend/SDK, custom client, and local or
-remote daemon that must communicate. Drain cross-host automation, upgrade all
-peers together, then verify each host with `pohunek health --json` and
-`pohunek host inspect <host> --json`. The legacy integer-v1 request envelope and
-fixed `codex`/`claude` notification-policy fields have no compatibility shim.
-Downgrading one peer to v1 breaks communication with v2 peers; restore the
-coordinated v2 set instead of rewriting persisted state. Future overlapping
-protocol ranges do not repeat this lockstep transition.
+Protocol v2 was a one-time coordinated pre-1.0 boundary. Before that M1
+transition, every CLI, GUI, web backend/SDK, custom client, and local or remote
+daemon had to cross together. The legacy integer-v1 envelope and fixed
+`codex`/`claude` notification-policy fields have no compatibility shim. Once a
+fleet is on v2, peers negotiate their highest overlap: M2 and this M3 plugin do
+not raise the public protocol version or require a second coordinated boundary.
+Do not binary-downgrade a host after it has persisted Hermes enum values or the
+provider-keyed notification policy; recover by upgrading forward instead.
 
 For the daemon component, run the included installer so the worker binary and
 all systemd user units are installed together. The first upgrade from a legacy
@@ -275,9 +275,9 @@ pohunek session new --agent codex \
   --input "Add retry logic to the API client, then run the tests."
 ```
 
-### Hermes Agent
+### Hermes Agent and operator plugin
 
-M2 manages the local interactive Hermes terminal as `--agent hermes`. Before
+Pohunek manages the local interactive Hermes terminal as `--agent hermes`. Before
 launching, inspect the target host: the `hermes` runtime must be `available`
 and report `version=0.20.0` with `supported=true`.
 
@@ -286,14 +286,53 @@ pohunek host inspect local --json
 pohunek session new --agent hermes --name "investigate-login-bug"
 ```
 
-Pohunek launches exactly `hermes chat`. A valid recorded native Hermes reference
-is resumed only as `hermes chat --resume <reference>`; it never resumes ambient
-Hermes state with `--continue` and does not add `--pass-session-id`. Hermes has
-no supported fork operation, so clients expose fork only from session
-capabilities and Hermes fork requests fail before they create a worktree or
-child session. M2 does not install a Hermes plugin or lifecycle hooks and never
-reads Hermes `state.db`; a session without an already valid native reference is
-therefore not resumable yet.
+Pohunek launches exactly `hermes chat`. A valid reported native Hermes reference
+is resumed only as `hermes chat --resume <reference>`; it never uses
+`--continue` or `--pass-session-id`. Hermes has no supported native fork, so a
+fork request returns typed `agent_fork_unsupported` data before a worktree or
+child session is created. Pohunek never reads Hermes `state.db`.
+
+Install the operator plugin only into a target you name explicitly. The default
+profile is valid only when stated as `--hermes-profile default`; named profiles
+and a custom absolute home are isolated alternatives. The installer creates a
+Pohunek-owned owner-private policy outside the plugin checksum set, and binds
+its exact absolute path into the managed plugin asset.
+
+```bash
+# Observation plus constrained peer-session management in one named profile.
+pohunek integration install --agent hermes --hermes-profile work \
+  --access-mode manage --allow-host local --json
+
+# A default profile must still be selected explicitly.
+pohunek integration status --agent hermes --hermes-profile default --json
+pohunek integration doctor --agent hermes --hermes-profile work --json
+
+# A relocated profile must be an explicit absolute, owner-private target.
+pohunek integration install --agent hermes \
+  --hermes-home /absolute/private/hermes-home \
+  --access-mode read_only --allow-host local --json
+```
+
+`read_only` registers observation tools; `manage` adds constrained session
+management; `full` alone registers stop and remove. Remote host access is
+restricted by the explicit allowlist and goes directly to that daemon over
+NetBird, never through SSH. `*` needs `--confirm-wildcard`. Use
+`integration update` for a version/policy refresh and `integration uninstall`
+to remove only managed assets; add `--confirm-modified` when the ownership
+check reports changed assets. `status`, `doctor`, `update`, and `uninstall` are
+Hermes-only; Codex and Claude retain their existing `integration install`
+behavior and receive a typed unsupported-action error for these lifecycle
+actions.
+
+The plugin is a delegated-tool guardrail, not a sandbox against a same-user
+Hermes process with shell or file-write access. It repeats the daemon's exact
+origin-session denial for `session.stop`, `session.resume`, `session.remove`,
+`session.fork`, `session.resize`, `session.set_metadata`, `session.rename`, and
+`session.input`. Only `session.report_agent`, `session.release_agent`, and
+`session.report_native_id` remain lifecycle-report exceptions. Hooks use
+bounded local reporting, never a subprocess, network connection, or Hermes
+database; if they fail, turns remain usable and daemon process/screen detection
+is the fallback.
 
 Hermes programmatic input preserves multiline prompts with bracketed paste and
 a separate submit. It accepts LF and tab, rejects other terminal control
@@ -329,7 +368,8 @@ them `--json` for machine-readable output (the exceptions are `attach`,
 | `pohunek notifications list / watch` | Inspect or stream the durable inbox; `--all-hosts` fans out. |
 | `pohunek notifications read / ack / archive / delete` | Drive one record's lifecycle (`host/id` targets a specific host). |
 | `pohunek notifications policy / retention` | Per-kind/provider policy (including `hermes`), retention pruning (`--dry-run` / `--apply`). |
-| `pohunek integration install` | Install Codex/Claude hooks for resume capture and notifications. |
+| `pohunek integration install` | Install Codex/Claude hooks, or a selected Hermes profile's managed plugin with explicit access mode and host allowlist. |
+| `pohunek integration status / doctor / update / uninstall --agent hermes` | Inspect, diagnose, atomically refresh, or safely remove one explicitly selected Hermes plugin target. |
 | `pohunek setup [scripts\|config\|sway]` | Install launcher scripts, default config + prompt templates, sway keybindings. |
 | `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + live snapshot. |
 | `pohunek prompt render / link` | Render provider prompt templates and work-item link metadata (used by launchers). |
@@ -390,6 +430,13 @@ pohunek session wait s-01J00000000000000000000000 \
 Waiting output and `session wait` use dedicated connections. Re-issue short
 waits as needed; a killed client does not promise immediate daemon-side waiter
 cancellation, so the requested timeout is the release bound.
+
+If `session output` returns a structured `gap`, retained history no longer
+contains the requested range: discard that cursor and restart from a current
+screen or newest tail. If it reports `session_runtime_changed`, discard the old
+runtime identity and cursor before retrying. A `session wait` result with
+`reason: "timeout"` is a bounded no-change outcome, not proof of idle or
+health; a wake reports the changed runtime/session snapshot and watermark.
 
 TypeScript clients running inside a managed session configure the atomic origin
 pair explicitly; the SDK copies it to ordinary, subscription, and dedicated
@@ -710,8 +757,17 @@ cargo xtask ts check      # CI gate
 Release workflow re-runs the gates on the tag, then builds and publishes glibc
 and MUSL x86_64 CLI and daemon archives, a glibc x86_64 GUI archive, and a
 self-contained Linux x86_64 web-control-center archive. The offline docs are
-bundled into every native component archive.
+bundled into every native component archive. CLI archives also contain
+`packaging/smoke-hermes-plugin-release`: run it from an extracted archive with
+the release `pohunek` binary and an explicitly supplied, preinstalled pinned
+Hermes executable. It creates an isolated temporary profile/state, requires
+that executable rather than downloading it, and fails if install, status,
+doctor, or uninstall cannot prove the embedded plugin and generated skill.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). The embedded Pohunek Hermes plugin and generated skill are
+repository-owned MIT assets. Their Python modules use only the Python standard
+library plus the pinned Hermes host API; Pohunek does not bundle Hermes code,
+marks, model/provider SDKs, or third-party Python dependencies in the CLI
+archive.
