@@ -24,14 +24,15 @@
 )]
 
 use std::collections::BTreeSet;
+use std::ffi::CString;
 use std::fs;
 use std::io::Write as _;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{
     DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
 };
 use std::path::{Component, Path, PathBuf};
 
-use nix::fcntl::{renameat2, RenameFlags};
 use nix::unistd::Uid;
 
 use super::assets::{self, Asset, Ownership, MARKER_NAME};
@@ -737,20 +738,38 @@ impl<'a> InstallTransaction<'a> {
     }
 }
 
+#[expect(
+    unsafe_code,
+    reason = "renameat2 is the Linux kernel boundary for atomic no-replace moves"
+)]
 fn rename_no_replace(source: &Path, destination: &Path) -> Result<(), Error> {
-    renameat2(
-        None,
-        source,
-        None,
-        destination,
-        RenameFlags::RENAME_NOREPLACE,
-    )
-    .map_err(|error| match error {
-        nix::Error::EEXIST => Error::Collision,
-        _ => Error::Io {
-            kind: std::io::ErrorKind::Other,
-        },
-    })
+    let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| Error::Io {
+        kind: std::io::ErrorKind::InvalidInput,
+    })?;
+    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| Error::Io {
+        kind: std::io::ErrorKind::InvalidInput,
+    })?;
+    // SAFETY: both path pointers reference owned NUL-terminated strings for the
+    // duration of the call; directory descriptors and flags are scalar values.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EEXIST) {
+        Err(Error::Collision)
+    } else {
+        Err(Error::Io { kind: error.kind() })
+    }
 }
 
 fn matches_ownership(root: &Path, expected: &Ownership) -> Result<bool, Error> {
@@ -1143,6 +1162,7 @@ fn remove_owned_file(path: &Path) {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1715,6 +1735,21 @@ mod tests {
         assert!(target.plugin_root().is_dir());
         assert!(!policy_path.exists());
         assert!(!hermes.enabled);
+    }
+
+    #[test]
+    fn rename_no_replace_rejects_interior_nul_paths() {
+        let invalid = Path::new(std::ffi::OsStr::from_bytes(b"invalid\0path"));
+        let valid = Path::new("valid");
+
+        for (source, destination) in [(invalid, valid), (valid, invalid)] {
+            assert_eq!(
+                rename_no_replace(source, destination),
+                Err(Error::Io {
+                    kind: std::io::ErrorKind::InvalidInput,
+                })
+            );
+        }
     }
 
     #[test]
