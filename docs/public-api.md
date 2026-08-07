@@ -387,6 +387,14 @@ cursor. Omitting `after_offset` requests the newest retained tail. A cursor
 requires its exact runtime identity, and `wait_ms` requires a cursor:
 
 ```json
+{"session_id":"s-42","max_bytes":65536}
+```
+
+The initial-tail request deliberately has no runtime or offset. Persist the
+returned `runtime_id`, `runtime_generation`, and `next_offset` before issuing a
+cursor-based read:
+
+```json
 {
   "session_id": "s-42",
   "runtime": {"runtime_id": "runtime-1", "runtime_generation": "3"},
@@ -421,7 +429,9 @@ metadata headroom) is 783,240 raw bytes; the daemon may configure a lower
 positive value. `max_bytes`
 must be `1..=MAX_SESSION_OUTPUT_BYTES`. `wait_ms` must be `1..=8000` and is used
 only when the explicit cursor is at the current end. A waiting output read uses
-a dedicated SDK connection.
+a dedicated SDK connection. In the shown gap result, offsets `2..4` are no
+longer retained: callers must discard the old cursor and restart from a fresh
+screen or newest tail, never synthesize the missing bytes.
 
 `session.wait` requires a non-zero `timeout_ms` no greater than 8000 and at
 least one predicate. Runtime-scoped terminal/output cursors require `runtime`;
@@ -449,6 +459,64 @@ and holds no registry write lock while sleeping. Each wait uses a dedicated
 connection and consumes one waiter slot; defaults are 128 concurrent waiters
 globally and 8 per session. Disconnect is not promised as immediate daemon-side
 cancellation: the required timeout is the resource-release bound.
+
+A wake and a timeout use the same result shape; callers branch only on the
+typed reason:
+
+```json
+{
+  "reason": "output_advanced",
+  "session": {
+    "id": "s-42",
+    "external": false,
+    "capabilities": {"resume": false, "fork": false},
+    "agent": "shell",
+    "agent_base": "shell",
+    "cwd": "/workspace/project",
+    "cwd_source": "launch",
+    "pid": 4242,
+    "cols": 120,
+    "rows": 40,
+    "state": "running",
+    "state_source": "process",
+    "warnings": [],
+    "metadata": {},
+    "created_at": "2026-06-17T10:00:00Z",
+    "updated_at": "2026-06-17T10:01:00Z"
+  },
+  "terminal_watermark": "8",
+  "output_offset": "9"
+}
+```
+
+```json
+{
+  "reason": "timeout",
+  "session": {
+    "id": "s-42",
+    "external": false,
+    "capabilities": {"resume": false, "fork": false},
+    "agent": "shell",
+    "agent_base": "shell",
+    "cwd": "/workspace/project",
+    "cwd_source": "launch",
+    "pid": 4242,
+    "cols": 120,
+    "rows": 40,
+    "state": "running",
+    "state_source": "process",
+    "warnings": [],
+    "metadata": {},
+    "created_at": "2026-06-17T10:00:00Z",
+    "updated_at": "2026-06-17T10:01:00Z"
+  },
+  "terminal_watermark": "7",
+  "output_offset": "8"
+}
+```
+
+The timeout means that no selected predicate changed before the requested
+deadline. It does not imply a healthy, idle, or terminal session.
 
 | Result field | Type | Notes |
 |---|---|---|
@@ -622,6 +690,14 @@ For example:
       "agent_blocked": true,
       "approval_required": true,
       "turn_completed": true,
+      "session_finished": false,
+      "error": true,
+      "system": false
+    },
+    "hermes": {
+      "agent_blocked": true,
+      "approval_required": true,
+      "turn_completed": false,
       "session_finished": false,
       "error": true,
       "system": false
@@ -867,6 +943,62 @@ diagnostics, or logs. The CLI validates observation byte/wait bounds and paired
 runtime coordinates before dialing. `session wait` and waiting `session output`
 use the Rust SDK's dedicated connections and preserve inherited request-origin
 markers.
+
+For example, keep untrusted prompt text out of argv by writing it on stdin:
+
+```bash
+printf '%s' 'Redacted input.' | pohunek session input s-42 --stdin --json
+```
+
+The resulting stdout remains exactly one JSON envelope. The input bytes do not
+appear in that envelope, diagnostics, or structured logs.
+
+## Hermes Operator Plugin CLI
+
+The Hermes operator plugin is a local CLI lifecycle, not a daemon public method:
+M3 does not change public protocol version `2` or add a Hermes-specific wire
+shape. It embeds the plugin assets and generated skill in the `pohunek` binary,
+then installs them only into an explicitly selected Hermes profile or custom
+absolute home.
+
+```bash
+pohunek integration install --agent hermes --hermes-profile default \
+  --access-mode manage --allow-host local \
+  --tool-timeout-ms 8000 --max-output-bytes 262144 \
+  --max-screen-bytes 65536 --max-concurrency 1 --json
+pohunek integration doctor --agent hermes --hermes-profile default --json
+```
+
+`--hermes-profile default`, a named `--hermes-profile`, and an absolute
+`--hermes-home` are explicit target selections; a profile and home cannot be
+combined. `status`, `doctor`, `update`, and `uninstall` are Hermes-only and
+return `configuration/integration_action_unsupported` for another agent. The
+existing daemon-backed Codex/Claude `integration install` behavior is unchanged.
+
+The installation policy is Pohunek-owned, owner-private, and external to the
+immutable plugin checksum set. It fixes the absolute `pohunek` executable,
+protocol range, access mode, and host allowlist. `read_only` exposes only read
+tools, `manage` adds bounded management, and `full` alone adds stop/remove.
+Remote calls use the existing direct NetBird transport. The policy is a
+delegated-tool guardrail, not an authorization sandbox for a same-user process.
+
+Install and update accept the non-repeatable bounds `--tool-timeout-ms <u32>`,
+`--max-output-bytes <u32>`, `--max-screen-bytes <u32>`, and
+`--max-concurrency <u8>`. Values must be positive and cannot exceed the policy
+ceilings. Install defaults omitted bounds to their ceilings. Update inherits
+each omitted bound and replaces each supplied bound; it also always refreshes
+the stored protocol range from the updating Pohunek binary so it repairs
+protocol drift. Other installed policy fields remain unchanged unless their
+existing update flags replace them. Status, doctor, and uninstall do not accept
+the bound flags.
+
+The plugin never offers raw attach bytes, arbitrary protocol methods, raw argv,
+or force bypasses. It repeats the daemon-authoritative origin denial before a
+subprocess for exactly `session.stop`, `session.resume`, `session.remove`,
+`session.fork`, `session.resize`, `session.set_metadata`, `session.rename`, and
+`session.input`. Exactly three lifecycle reports may target the origin:
+`session.report_agent`, `session.release_agent`, and
+`session.report_native_id`.
 
 ## CLI Notification Surface
 

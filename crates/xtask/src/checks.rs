@@ -4,6 +4,7 @@ use std::path::Path;
 use clap::error::ErrorKind;
 use regex::Regex;
 
+use crate::hermes_skill;
 use crate::{
     collect_files, create_dir_all, remove_dir_all, repo_root, validate_docs, BuildOptions,
     XtaskError,
@@ -48,6 +49,8 @@ pub(crate) fn check_docs(
     all_pass &= check_schema_validation(source_dir);
     all_pass &= check_deterministic_build(source_dir, output_root)?;
     all_pass &= check_source_map_paths(source_dir, &repo);
+    all_pass &= hermes_skill::check(&repo)?;
+    all_pass &= check_generated_skill_documentation(&repo)?;
     all_pass &= check_runbook_commands(source_dir)?;
     all_pass &= check_secret_scan(source_dir, output_root)?;
     all_pass &= check_release_extras(&repo);
@@ -132,18 +135,7 @@ fn check_source_map_paths(source_dir: &Path, repo: &Path) -> bool {
     let source_map_path = source_dir.join("assistant/source-map.md");
     match std::fs::read_to_string(&source_map_path) {
         Ok(content) => {
-            let backtick_re = Regex::new(r"`([^`]+)`").expect("valid backtick regex");
-            let mut missing: Vec<String> = Vec::new();
-
-            for captures in backtick_re.captures_iter(&content) {
-                let candidate = captures[1].to_string();
-                if candidate.starts_with("crates/") || candidate.starts_with("docs/") {
-                    let full_path = repo.join(&candidate);
-                    if !full_path.exists() {
-                        missing.push(candidate);
-                    }
-                }
-            }
+            let missing = missing_documented_paths(&content, repo);
 
             if missing.is_empty() {
                 println!("[PASS] source-map-paths: all referenced paths exist");
@@ -167,6 +159,55 @@ fn check_source_map_paths(source_dir: &Path, repo: &Path) -> bool {
             false
         }
     }
+}
+
+fn check_generated_skill_documentation(repo: &Path) -> Result<bool, XtaskError> {
+    let Some(bytes) = hermes_skill::read_checked(repo)? else {
+        // `hermes_skill::check` reports the missing artifact and the remediation.
+        return Ok(true);
+    };
+    let Ok(content) = std::str::from_utf8(&bytes) else {
+        println!("[FAIL] hermes-skill-documentation: generated skill is not UTF-8");
+        return Ok(false);
+    };
+    let missing = missing_documented_paths(content, repo);
+    let secret_hits = secret_hits(content, hermes_skill::GENERATED_PATH);
+    if missing.is_empty() && secret_hits.is_empty() {
+        println!("[PASS] hermes-skill-documentation: backtick paths and secret scan passed");
+        return Ok(true);
+    }
+    if !missing.is_empty() {
+        println!(
+            "[FAIL] hermes-skill-documentation: {} missing backtick path(s):",
+            missing.len()
+        );
+        for path in missing {
+            println!("        {path}");
+        }
+    }
+    if !secret_hits.is_empty() {
+        println!(
+            "[FAIL] hermes-skill-documentation: {} potential secret(s):",
+            secret_hits.len()
+        );
+        for hit in secret_hits {
+            println!("        {hit}");
+        }
+    }
+    Ok(false)
+}
+
+fn missing_documented_paths(content: &str, repo: &Path) -> Vec<String> {
+    let backtick_re = Regex::new(r"`([^`]+)`").expect("valid backtick regex");
+    backtick_re
+        .captures_iter(content)
+        .filter_map(|captures| {
+            let candidate = captures[1].to_string();
+            (candidate.starts_with("crates/") || candidate.starts_with("docs/"))
+                .then_some(candidate)
+        })
+        .filter(|candidate| !repo.join(candidate).exists())
+        .collect()
 }
 
 const REQUIRED_RELEASE_EXTRAS: [&str; 2] = ["README.md", "LICENSE"];
@@ -295,27 +336,8 @@ fn check_secret_scan(source_dir: &Path, output_root: &Path) -> Result<bool, Xtas
             all_pass = false;
         }
         Ok(build_summary) => {
-            let patterns: &[(&str, &str)] = &[
-                (r"(?i)api[_-]?key\s*[:=]\s*\S+", "api-key assignment"),
-                (r"(?i)token\s*[:=]\s*\S+", "token assignment"),
-                (
-                    r"-----BEGIN [A-Z ]+PRIVATE KEY-----",
-                    "PEM private key header",
-                ),
-                (r"(?i)^\s*\[env\]\s*$", "TOML [env] section header"),
-                (
-                    r"(?i)(secret|password|passwd|api_key|private_key|auth_token|access_token)\s*[:=]\s*\S{8,}",
-                    "credential assignment",
-                ),
-            ];
-
-            let compiled: Vec<(Regex, &str)> = patterns
-                .iter()
-                .map(|(pat, label)| (Regex::new(pat).expect("secret scan regex is valid"), *label))
-                .collect();
-
             let bundle_files = collect_files(&build_summary.bundle_dir)?;
-            let mut secret_hits: Vec<String> = Vec::new();
+            let mut hits: Vec<String> = Vec::new();
             for file in &bundle_files {
                 if file.source_path.extension().and_then(|e| e.to_str()) != Some("md") {
                     continue;
@@ -323,26 +345,17 @@ fn check_secret_scan(source_dir: &Path, output_root: &Path) -> Result<bool, Xtas
                 let Ok(content) = std::fs::read_to_string(&file.source_path) else {
                     continue;
                 };
-                for (i, line) in content.lines().enumerate() {
-                    for (re, label) in &compiled {
-                        if re.is_match(line) {
-                            secret_hits.push(format!(
-                                "{}:{}: [{}] {}",
-                                file.source_path.display(),
-                                i + 1,
-                                label,
-                                line.trim()
-                            ));
-                        }
-                    }
-                }
+                hits.extend(secret_hits(
+                    &content,
+                    &file.source_path.display().to_string(),
+                ));
             }
 
             if bundle_root.exists() {
                 remove_dir_all(&bundle_root)?;
             }
 
-            if secret_hits.is_empty() {
+            if hits.is_empty() {
                 println!(
                     "[PASS] secret-scan: no credential patterns found in {} bundle file(s)",
                     bundle_files.len()
@@ -350,9 +363,9 @@ fn check_secret_scan(source_dir: &Path, output_root: &Path) -> Result<bool, Xtas
             } else {
                 println!(
                     "[FAIL] secret-scan: {} potential secret(s) found:",
-                    secret_hits.len()
+                    hits.len()
                 );
-                for hit in &secret_hits {
+                for hit in &hits {
                     println!("        {hit}");
                 }
                 all_pass = false;
@@ -363,13 +376,47 @@ fn check_secret_scan(source_dir: &Path, output_root: &Path) -> Result<bool, Xtas
     Ok(all_pass)
 }
 
+const SECRET_PATTERNS: [(&str, &str); 5] = [
+    (r"(?i)api[_-]?key\s*[:=]\s*\S+", "api-key assignment"),
+    (r"(?i)token\s*[:=]\s*\S+", "token assignment"),
+    (
+        r"-----BEGIN [A-Z ]+PRIVATE KEY-----",
+        "PEM private key header",
+    ),
+    (r"(?i)^\s*\[env\]\s*$", "TOML [env] section header"),
+    (
+        r"(?i)(secret|password|passwd|api_key|private_key|auth_token|access_token)\s*[:=]\s*\S{8,}",
+        "credential assignment",
+    ),
+];
+
+fn secret_hits(content: &str, display_path: &str) -> Vec<String> {
+    let compiled: Vec<(Regex, &str)> = SECRET_PATTERNS
+        .iter()
+        .map(|(pattern, label)| {
+            (
+                Regex::new(pattern).expect("secret scan regex is valid"),
+                *label,
+            )
+        })
+        .collect();
+    let mut hits = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        for (regex, label) in &compiled {
+            if regex.is_match(line) {
+                hits.push(format!("{display_path}:{}: [{label}]", index + 1));
+            }
+        }
+    }
+    hits
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::{env, fs};
 
-    use super::missing_release_extras;
-    use super::parse_pohunek_command;
+    use super::{missing_release_extras, parse_pohunek_command, secret_hits};
 
     fn temp_root(tag: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
@@ -414,5 +461,20 @@ mod tests {
             err.contains("unrecognized"),
             "unknown command error should come from clap: {err}"
         );
+    }
+
+    #[test]
+    fn secret_hits_never_include_matched_content() {
+        const SENTINEL: &str = "never-expose-this-secret-sentinel";
+        let content = format!("safe line\napi_key={SENTINEL}\n");
+
+        let hits = secret_hits(&content, "docs/example.md");
+
+        assert!(!hits.is_empty());
+        assert!(hits
+            .iter()
+            .all(|hit| hit.starts_with("docs/example.md:2: [")));
+        assert!(hits.iter().all(|hit| !hit.contains(SENTINEL)));
+        assert!(hits.iter().all(|hit| !hit.contains("api_key")));
     }
 }

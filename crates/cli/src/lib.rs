@@ -11,13 +11,14 @@
 mod client;
 mod commands;
 mod error;
+mod hermes_integration;
 mod paths;
 mod target;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Command, CommandFactory, Parser, Subcommand};
+use clap::{Args, Command, CommandFactory, Parser, Subcommand};
 use protocol::{method, Request};
 
 use crate::error::CliError;
@@ -590,10 +591,274 @@ enum IntegrationAction {
         /// Restrict installation to a single agent.
         #[arg(long, value_enum)]
         agent: Option<commands::integration::HookAgentArg>,
+        #[command(flatten)]
+        hermes: HermesCliOptions,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
     },
+    /// Inspect the locally managed Hermes operator plugin.
+    Status {
+        /// Hermes is the only agent with a local integration lifecycle.
+        #[arg(long, value_enum)]
+        agent: commands::integration::HookAgentArg,
+        #[command(flatten)]
+        hermes: HermesStatusCliOptions,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run payload-free diagnostics for the managed Hermes operator plugin.
+    Doctor {
+        /// Hermes is the only agent with a local integration lifecycle.
+        #[arg(long, value_enum)]
+        agent: commands::integration::HookAgentArg,
+        #[command(flatten)]
+        hermes: HermesDoctorCliOptions,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Atomically update the managed Hermes plugin and its policy.
+    Update {
+        /// Hermes is the only agent with a local integration lifecycle.
+        #[arg(long, value_enum)]
+        agent: commands::integration::HookAgentArg,
+        #[command(flatten)]
+        hermes: HermesUpdateCliOptions,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove only the marker-owned Hermes plugin and its policy.
+    Uninstall {
+        /// Hermes is the only agent with a local integration lifecycle.
+        #[arg(long, value_enum)]
+        agent: commands::integration::HookAgentArg,
+        #[command(flatten)]
+        hermes: HermesUninstallCliOptions,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Explicit local inputs for one Hermes operator-plugin lifecycle command.
+#[derive(Debug, Args)]
+struct HermesCliOptions {
+    /// Select the default or one named Hermes profile.
+    #[arg(long, conflicts_with = "hermes_home")]
+    hermes_profile: Option<String>,
+    /// Select one absolute, owner-private Hermes home.
+    #[arg(long)]
+    hermes_home: Option<PathBuf>,
+    /// Use one absolute Hermes executable instead of a bounded absolute PATH lookup.
+    #[arg(long)]
+    hermes_bin: Option<PathBuf>,
+    /// Use one absolute Pohunek executable in the generated policy.
+    #[arg(long)]
+    pohunek_bin: Option<PathBuf>,
+    /// Explicit plugin tool access mode for install or a policy replacement update.
+    #[arg(long, value_enum)]
+    access_mode: Option<commands::integration::AccessModeArg>,
+    /// Explicit host allowed by the generated or replacement policy; repeatable.
+    #[arg(long = "allow-host")]
+    allow_host: Vec<String>,
+    /// Bound one plugin tool invocation in milliseconds.
+    #[arg(long)]
+    tool_timeout_ms: Option<u32>,
+    /// Bound one plugin tool result in bytes.
+    #[arg(long)]
+    max_output_bytes: Option<u32>,
+    /// Bound one rendered terminal screen in bytes.
+    #[arg(long)]
+    max_screen_bytes: Option<u32>,
+    /// Bound concurrent plugin tool invocations.
+    #[arg(long)]
+    max_concurrency: Option<u8>,
+    /// Acknowledge a newly supplied wildcard host entry.
+    #[arg(long)]
+    confirm_wildcard: bool,
+    /// Acknowledge a modified managed plugin before update or uninstall.
+    #[arg(long)]
+    confirm_modified: bool,
+}
+
+impl From<HermesCliOptions> for commands::integration::HermesOptions {
+    fn from(value: HermesCliOptions) -> Self {
+        Self {
+            profile: value.hermes_profile,
+            home: value.hermes_home,
+            hermes_bin: value.hermes_bin,
+            pohunek_bin: value.pohunek_bin,
+            access_mode: value.access_mode,
+            allowed_hosts: value.allow_host,
+            tool_timeout_ms: value.tool_timeout_ms,
+            max_output_bytes: value.max_output_bytes,
+            max_screen_bytes: value.max_screen_bytes,
+            max_concurrency: value.max_concurrency,
+            confirm_wildcard: value.confirm_wildcard,
+            confirm_modified: value.confirm_modified,
+        }
+    }
+}
+
+/// Exactly one explicit target for a Hermes-only lifecycle verb.
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+struct HermesRequiredTarget {
+    /// Select the default or one named Hermes profile.
+    #[arg(long)]
+    hermes_profile: Option<String>,
+    /// Select one absolute, owner-private Hermes home.
+    #[arg(long)]
+    hermes_home: Option<PathBuf>,
+}
+
+/// Read-only Hermes status options.
+#[derive(Debug, Args)]
+struct HermesStatusCliOptions {
+    #[command(flatten)]
+    target: HermesRequiredTarget,
+    /// Use one absolute Hermes executable instead of a bounded absolute PATH lookup.
+    #[arg(long)]
+    hermes_bin: Option<PathBuf>,
+}
+
+impl From<HermesStatusCliOptions> for commands::integration::HermesOptions {
+    fn from(value: HermesStatusCliOptions) -> Self {
+        Self {
+            profile: value.target.hermes_profile,
+            home: value.target.hermes_home,
+            hermes_bin: value.hermes_bin,
+            pohunek_bin: None,
+            access_mode: None,
+            allowed_hosts: vec![],
+            tool_timeout_ms: None,
+            max_output_bytes: None,
+            max_screen_bytes: None,
+            max_concurrency: None,
+            confirm_wildcard: false,
+            confirm_modified: false,
+        }
+    }
+}
+
+/// Read-only Hermes doctor options.
+#[derive(Debug, Args)]
+struct HermesDoctorCliOptions {
+    #[command(flatten)]
+    target: HermesRequiredTarget,
+    /// Use one absolute Hermes executable instead of a bounded absolute PATH lookup.
+    #[arg(long)]
+    hermes_bin: Option<PathBuf>,
+}
+
+impl From<HermesDoctorCliOptions> for commands::integration::HermesOptions {
+    fn from(value: HermesDoctorCliOptions) -> Self {
+        Self {
+            profile: value.target.hermes_profile,
+            home: value.target.hermes_home,
+            hermes_bin: value.hermes_bin,
+            pohunek_bin: None,
+            access_mode: None,
+            allowed_hosts: vec![],
+            tool_timeout_ms: None,
+            max_output_bytes: None,
+            max_screen_bytes: None,
+            max_concurrency: None,
+            confirm_wildcard: false,
+            confirm_modified: false,
+        }
+    }
+}
+
+/// Hermes update options, including optional policy replacements.
+#[derive(Debug, Args)]
+struct HermesUpdateCliOptions {
+    #[command(flatten)]
+    target: HermesRequiredTarget,
+    /// Use one absolute Hermes executable instead of a bounded absolute PATH lookup.
+    #[arg(long)]
+    hermes_bin: Option<PathBuf>,
+    /// Replace the fixed Pohunek executable in the installed policy.
+    #[arg(long)]
+    pohunek_bin: Option<PathBuf>,
+    /// Replace the installed plugin access mode.
+    #[arg(long, value_enum)]
+    access_mode: Option<commands::integration::AccessModeArg>,
+    /// Replace the host allowlist; repeatable.
+    #[arg(long = "allow-host")]
+    allow_host: Vec<String>,
+    /// Replace the per-tool timeout in milliseconds.
+    #[arg(long)]
+    tool_timeout_ms: Option<u32>,
+    /// Replace the maximum tool-result size in bytes.
+    #[arg(long)]
+    max_output_bytes: Option<u32>,
+    /// Replace the maximum rendered-screen size in bytes.
+    #[arg(long)]
+    max_screen_bytes: Option<u32>,
+    /// Replace the maximum concurrent plugin tool count.
+    #[arg(long)]
+    max_concurrency: Option<u8>,
+    /// Acknowledge a newly supplied wildcard host entry.
+    #[arg(long)]
+    confirm_wildcard: bool,
+    /// Acknowledge modified managed assets before replacement.
+    #[arg(long)]
+    confirm_modified: bool,
+}
+
+impl From<HermesUpdateCliOptions> for commands::integration::HermesOptions {
+    fn from(value: HermesUpdateCliOptions) -> Self {
+        Self {
+            profile: value.target.hermes_profile,
+            home: value.target.hermes_home,
+            hermes_bin: value.hermes_bin,
+            pohunek_bin: value.pohunek_bin,
+            access_mode: value.access_mode,
+            allowed_hosts: value.allow_host,
+            tool_timeout_ms: value.tool_timeout_ms,
+            max_output_bytes: value.max_output_bytes,
+            max_screen_bytes: value.max_screen_bytes,
+            max_concurrency: value.max_concurrency,
+            confirm_wildcard: value.confirm_wildcard,
+            confirm_modified: value.confirm_modified,
+        }
+    }
+}
+
+/// Hermes uninstall options.
+#[derive(Debug, Args)]
+struct HermesUninstallCliOptions {
+    #[command(flatten)]
+    target: HermesRequiredTarget,
+    /// Use one absolute Hermes executable instead of a bounded absolute PATH lookup.
+    #[arg(long)]
+    hermes_bin: Option<PathBuf>,
+    /// Acknowledge modified managed assets before removal.
+    #[arg(long)]
+    confirm_modified: bool,
+}
+
+impl From<HermesUninstallCliOptions> for commands::integration::HermesOptions {
+    fn from(value: HermesUninstallCliOptions) -> Self {
+        Self {
+            profile: value.target.hermes_profile,
+            home: value.target.hermes_home,
+            hermes_bin: value.hermes_bin,
+            pohunek_bin: None,
+            access_mode: None,
+            allowed_hosts: vec![],
+            tool_timeout_ms: None,
+            max_output_bytes: None,
+            max_screen_bytes: None,
+            max_concurrency: None,
+            confirm_wildcard: false,
+            confirm_modified: value.confirm_modified,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -1073,9 +1338,30 @@ impl SessionAction {
 impl IntegrationAction {
     fn wants_json(&self) -> bool {
         match self {
-            IntegrationAction::Install { json, .. } => *json,
+            IntegrationAction::Install { json, .. }
+            | IntegrationAction::Status { json, .. }
+            | IntegrationAction::Doctor { json, .. }
+            | IntegrationAction::Update { json, .. }
+            | IntegrationAction::Uninstall { json, .. } => *json,
         }
     }
+}
+
+fn run_integration_hermes_action(
+    action: commands::integration::HermesAction,
+    agent: commands::integration::HookAgentArg,
+    options: &commands::integration::HermesOptions,
+    json: bool,
+) -> Result<ExitCode, CliError> {
+    if agent != commands::integration::HookAgentArg::Hermes {
+        return Err(commands::integration::unsupported_action(Some(agent)));
+    }
+    let healthy = commands::integration::run_hermes(action, options, json)?;
+    Ok(if healthy {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 impl PromptAction {
@@ -1392,12 +1678,79 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Integration { action } => {
-            // Installing hooks is a local daemon op (writes this machine's agent
-            // config); the command stays local regardless of `--host`.
-            let paths = Paths::resolve()?;
             match action {
-                IntegrationAction::Install { agent, json } => {
-                    commands::integration::run_install(&paths, agent, json).await?;
+                IntegrationAction::Install {
+                    agent,
+                    hermes,
+                    json,
+                } => {
+                    let hermes = commands::integration::HermesOptions::from(hermes);
+                    match agent {
+                        Some(commands::integration::HookAgentArg::Hermes) => {
+                            commands::integration::run_hermes(
+                                commands::integration::HermesAction::Install,
+                                &hermes,
+                                json,
+                            )?;
+                        }
+                        _ if hermes.is_explicit() => {
+                            return Err(commands::integration::hermes_options_require_hermes());
+                        }
+                        agent => {
+                            // Codex and Claude hook installation remains a local daemon
+                            // operation and retains its existing request and output shape.
+                            let paths = Paths::resolve()?;
+                            commands::integration::run_install(&paths, agent, json).await?;
+                        }
+                    }
+                }
+                IntegrationAction::Status {
+                    agent,
+                    hermes,
+                    json,
+                } => {
+                    return run_integration_hermes_action(
+                        commands::integration::HermesAction::Status,
+                        agent,
+                        &hermes.into(),
+                        json,
+                    );
+                }
+                IntegrationAction::Doctor {
+                    agent,
+                    hermes,
+                    json,
+                } => {
+                    return run_integration_hermes_action(
+                        commands::integration::HermesAction::Doctor,
+                        agent,
+                        &hermes.into(),
+                        json,
+                    );
+                }
+                IntegrationAction::Update {
+                    agent,
+                    hermes,
+                    json,
+                } => {
+                    return run_integration_hermes_action(
+                        commands::integration::HermesAction::Update,
+                        agent,
+                        &hermes.into(),
+                        json,
+                    );
+                }
+                IntegrationAction::Uninstall {
+                    agent,
+                    hermes,
+                    json,
+                } => {
+                    return run_integration_hermes_action(
+                        commands::integration::HermesAction::Uninstall,
+                        agent,
+                        &hermes.into(),
+                        json,
+                    );
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -1743,6 +2096,184 @@ mod tests {
         // structural invariants) in `debug_assert`; a typo'd reference panics
         // here rather than at runtime.
         pohunek_cli::command().debug_assert();
+    }
+
+    #[test]
+    fn integration_parses_explicit_hermes_install_policy() {
+        let cli = Cli::try_parse_from([
+            "pohunek",
+            "integration",
+            "install",
+            "--agent",
+            "hermes",
+            "--hermes-profile",
+            "default",
+            "--access-mode",
+            "read_only",
+            "--allow-host",
+            "local",
+            "--tool-timeout-ms",
+            "8000",
+            "--max-output-bytes",
+            "262144",
+            "--max-screen-bytes",
+            "65536",
+            "--max-concurrency",
+            "1",
+            "--json",
+        ])
+        .expect("parse explicit Hermes install");
+
+        match cli.command {
+            Commands::Integration {
+                action:
+                    IntegrationAction::Install {
+                        agent: Some(commands::integration::HookAgentArg::Hermes),
+                        hermes,
+                        json,
+                    },
+            } => {
+                assert_eq!(hermes.hermes_profile.as_deref(), Some("default"));
+                assert_eq!(hermes.allow_host, ["local"]);
+                assert_eq!(hermes.tool_timeout_ms, Some(8_000));
+                assert_eq!(hermes.max_output_bytes, Some(262_144));
+                assert_eq!(hermes.max_screen_bytes, Some(65_536));
+                assert_eq!(hermes.max_concurrency, Some(1));
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn integration_parses_explicit_hermes_update_policy_bounds() {
+        let cli = Cli::try_parse_from([
+            "pohunek",
+            "integration",
+            "update",
+            "--agent",
+            "hermes",
+            "--hermes-profile",
+            "default",
+            "--tool-timeout-ms",
+            "8000",
+            "--max-output-bytes",
+            "262144",
+            "--max-screen-bytes",
+            "65536",
+            "--max-concurrency",
+            "1",
+        ])
+        .expect("parse explicit Hermes update bounds");
+
+        match cli.command {
+            Commands::Integration {
+                action:
+                    IntegrationAction::Update {
+                        agent: commands::integration::HookAgentArg::Hermes,
+                        hermes,
+                        json: false,
+                    },
+            } => {
+                assert_eq!(hermes.tool_timeout_ms, Some(8_000));
+                assert_eq!(hermes.max_output_bytes, Some(262_144));
+                assert_eq!(hermes.max_screen_bytes, Some(65_536));
+                assert_eq!(hermes.max_concurrency, Some(1));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn integration_rejects_hermes_policy_bounds_for_other_actions() {
+        for action in ["status", "doctor", "uninstall"] {
+            for (flag, value) in [
+                ("--tool-timeout-ms", "8000"),
+                ("--max-output-bytes", "262144"),
+                ("--max-screen-bytes", "65536"),
+                ("--max-concurrency", "1"),
+            ] {
+                let error = Cli::try_parse_from([
+                    "pohunek",
+                    "integration",
+                    action,
+                    "--agent",
+                    "hermes",
+                    "--hermes-profile",
+                    "default",
+                    flag,
+                    value,
+                ])
+                .expect_err("policy bound must be rejected for this action");
+                assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+            }
+        }
+    }
+
+    #[test]
+    fn integration_rejects_conflicting_hermes_targets_and_missing_lifecycle_agent() {
+        let conflict = Cli::try_parse_from([
+            "pohunek",
+            "integration",
+            "status",
+            "--agent",
+            "hermes",
+            "--hermes-profile",
+            "default",
+            "--hermes-home",
+            "/private/hermes",
+        ])
+        .expect_err("targets conflict");
+        assert_eq!(conflict.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let missing = Cli::try_parse_from(["pohunek", "integration", "status"])
+            .expect_err("lifecycle requires an agent");
+        assert_eq!(
+            missing.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        for action in ["status", "doctor", "update", "uninstall"] {
+            let missing_target =
+                Cli::try_parse_from(["pohunek", "integration", action, "--agent", "hermes"])
+                    .expect_err("Hermes-only action requires an explicit target");
+            assert_eq!(
+                missing_target.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{action}"
+            );
+        }
+
+        Cli::try_parse_from(["pohunek", "integration", "install"])
+            .expect("legacy no-agent install remains valid");
+    }
+
+    #[test]
+    fn integration_rejects_non_hermes_lifecycle_before_dispatch() {
+        let error = run_integration_hermes_action(
+            commands::integration::HermesAction::Status,
+            commands::integration::HookAgentArg::Codex,
+            &commands::integration::HermesOptions {
+                profile: None,
+                home: None,
+                hermes_bin: None,
+                pohunek_bin: None,
+                access_mode: None,
+                allowed_hosts: vec![],
+                tool_timeout_ms: None,
+                max_output_bytes: None,
+                max_screen_bytes: None,
+                max_concurrency: None,
+                confirm_wildcard: false,
+                confirm_modified: false,
+            },
+            true,
+        )
+        .expect_err("Codex lifecycle is unsupported");
+        assert_eq!(
+            error.to_protocol_error().code,
+            "integration_action_unsupported"
+        );
     }
 
     #[test]

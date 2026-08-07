@@ -113,6 +113,9 @@ Release packaging:
 - `packaging/systemd/pohunek-session@.service.in`
 - `packaging/systemd/pohunek-sessions.slice`
 - `scripts/release`
+- `scripts/smoke-hermes-plugin-release`
+- `docs/runbooks/hermes-operator-plugin.md`
+- `docs/migrations/hermes-operator-plugin.md`
 
 Daemon, sessions, integrations, and project state:
 
@@ -178,6 +181,32 @@ Hermes compatibility evidence:
 - `compat/hermes/goldens/manifest.json`
 - `crates/xtask/src/hermes.rs`
 - `crates/xtask/src/hermes_mock.rs`
+- `crates/xtask/src/eval.rs`
+- `crates/xtask/src/hermes_skill.rs`
+
+Hermes operator plugin and managed lifecycle:
+
+- `crates/cli/src/hermes_integration/mod.rs`
+- `crates/cli/src/hermes_integration/error.rs`
+- `crates/cli/src/hermes_integration/target.rs`
+- `crates/cli/src/hermes_integration/policy.rs`
+- `crates/cli/src/hermes_integration/lifecycle.rs`
+- `crates/cli/src/hermes_integration/runner.rs`
+- `crates/cli/src/hermes_integration/assets.rs`
+- `crates/cli/src/hermes_integration/doctor.rs`
+- `crates/cli/src/hermes_integration/skill.rs`
+- `crates/cli/src/hermes_integration/assets/pohunek/plugin.yaml`
+- `crates/cli/src/hermes_integration/assets/pohunek/__init__.py`
+- `crates/cli/src/hermes_integration/assets/pohunek/cli.py`
+- `crates/cli/src/hermes_integration/assets/pohunek/hooks.py`
+- `crates/cli/src/hermes_integration/assets/pohunek/policy.py`
+- `crates/cli/src/hermes_integration/assets/pohunek/redact.py`
+- `crates/cli/src/hermes_integration/assets/pohunek/tools.py`
+- `crates/cli/src/hermes_integration/assets/tests/test_plugin_runtime.py`
+- `docs/knowledge/guides/hermes-operator.md`
+- `docs/design/hermes-agent-integration.md`
+- `docs/design/hermes-agent-integration-plan.md`
+- `docs/public-api.md`
 
 Protocol contracts and transport:
 

@@ -267,11 +267,13 @@ exactly `hermes chat --resume <reference>`. It never continues ambient Hermes
 state and never reads `state.db`. Before either launch, the daemon requires an
 isolated, bounded version probe to confirm the pinned release and fails with
 payload-free `agent_runtime_unsupported` before material side effects when the
-runtime is missing or incompatible. M2 has no Hermes lifecycle hook or plugin, so
-a newly launched Hermes session normally has no native reference until one is
-provided through the existing validated lifecycle path. Its resume capability
-is independent from that temporary absence of a reference; fork is always
-unsupported and rejects before any child/worktree side effect.
+runtime is missing or incompatible. The Hermes operator plugin reports a native
+reference through its bounded lifecycle hooks for a managed Hermes session; it
+does not infer or read one from Hermes state. Its resume capability is
+independent from a temporarily unavailable report; fork is always unsupported
+and rejects before any child/worktree side effect. See
+[Hermes operator](../guides/hermes-operator.md) for the typed tool and hook
+boundaries.
 
 `session.fork` creates a new pohunek session id and PTY from the source session's
 native agent conversation. The source may still be live; fork does not require a

@@ -30,7 +30,7 @@ const GOLDEN_SCHEMA: u32 = 1;
 /// Updating the upstream pin requires reviewing the complete lock and changing
 /// this digest in the same compatibility-infrastructure change.
 const EXPECTED_LOCK_SHA256: &str =
-    "f53f9401ecc6a5d1ab138507f7e0805d14e196167a7a3e2eaa710e0b521b1a14";
+    "a4ccdde37aa679859f03485a36b895610c9c2f44f46a44562a9e180bb97825b4";
 /// The pinned source archive digest recorded by the M2 baseline review.
 const EXPECTED_SOURCE_SHA256: &str =
     "1e9319c58a7f5e95808546af1091d58472be7437adc63fae0cbb53316e2711aa";
@@ -38,6 +38,112 @@ const EXPECTED_SOURCE_FORMAT: &str = "git archive --format=tar";
 const EXPECTED_FRESH_ARGV: [&str; 1] = ["chat"];
 const EXPECTED_RESUME_ARGV: [&str; 3] = ["chat", "--resume", "<reference>"];
 const EXPECTED_DISPLAY_MODES: [&str; 2] = ["classic", "alternate_screen_tui"];
+const EXPECTED_PLUGIN_MANIFEST_FIELDS: [&str; 5] = [
+    "name",
+    "version",
+    "description",
+    "provides_tools",
+    "provides_hooks",
+];
+const EXPECTED_PLUGIN_OPTIONAL_MANIFEST_FIELDS: [&str; 2] = ["requires_env", "kind"];
+const EXPECTED_PLUGIN_KIND: &str = "implicit_standalone";
+const EXPECTED_PLUGIN_ENTRYPOINT_FILE: &str = "__init__.py";
+const EXPECTED_PLUGIN_ENTRYPOINT: &str = "register(ctx)";
+const EXPECTED_PLUGIN_TOOL_METHOD: &str = "ctx.register_tool";
+const EXPECTED_PLUGIN_TOOL_ARGS: [&str; 4] = ["name", "toolset", "schema", "handler"];
+const EXPECTED_PLUGIN_TOOLSET: &str = "pohunek";
+const EXPECTED_PLUGIN_TOOL_SCHEMA_TYPE: &str = "object";
+const EXPECTED_PLUGIN_TOOL_HANDLER_ARGS: &str = "args: dict, **kwargs";
+const EXPECTED_PLUGIN_TOOL_RETURN: &str = "JSON string";
+const EXPECTED_PLUGIN_HOOK_METHOD: &str = "ctx.register_hook";
+const EXPECTED_PLUGIN_HOOK_ARGS: [&str; 2] = ["hook_name", "callback"];
+const EXPECTED_PLUGIN_SKILL_METHOD: &str = "ctx.register_skill";
+const EXPECTED_PLUGIN_SKILL_ARGS: [&str; 3] = ["name", "path", "description"];
+const EXPECTED_PLUGIN_SKILL_PATH_TYPE: &str = "pathlib.Path";
+const EXPECTED_PLUGIN_NAME: &str = "pohunek";
+const EXPECTED_PLUGIN_KEY: &str = "operators/pohunek";
+const EXPECTED_PLUGIN_SKILL: &str = "pohunek:pohunek";
+const EXPECTED_PLUGIN_DISCOVERY_ROOT: &str = "plugins";
+const EXPECTED_PLUGIN_DISCOVERY_CATEGORY: &str = "operators";
+/// Hermes scans one optional grouping directory below its plugin root.
+const EXPECTED_PLUGIN_DISCOVERY_DEPTH: u8 = 1;
+/// The plugin lifecycle validates disabled, enabled, and disabled terminal states.
+const PLUGIN_LIFECYCLE_CHECKS: usize = 5;
+/// The harness proves both named-profile and absolute custom-home targeting.
+const PLUGIN_TARGET_CHECKS: usize = 2;
+const EXPECTED_NAMED_PROFILE: &str = "pohunek-compat";
+const EXPECTED_NAMED_PROFILE_ARGS: [&str; 2] = ["--profile", EXPECTED_NAMED_PROFILE];
+const EXPECTED_NAMED_PROFILE_HOME: &str = "profiles/pohunek-compat";
+const EXPECTED_CUSTOM_HOME_ENV: &str = "HERMES_HOME";
+const PLUGIN_FIXTURE_VERSION: &str = "0.0.0-compat";
+const PLUGIN_FIXTURE_TOOL: &str = "pohunek_hosts";
+const PLUGIN_FIXTURE_HOOK: &str = "pre_llm_call";
+const PLUGIN_FIXTURE_SKILL_BODY: &str = "Model-free Pohunek compatibility skill.";
+const PLUGIN_RUNTIME_CHECKS: usize = 1;
+/// Four CLI states plus one real production-plugin registration check.
+const PRODUCTION_PLUGIN_CHECKS: usize = 5;
+/// The current Pohunek CLI protocol required by the generated plugin policy.
+const EXPECTED_POHUNEK_PROTOCOL: u32 = 2;
+/// A normal executable search remains well below this abuse-resistant bound.
+const MAX_EXECUTABLE_PATH_ENTRIES: usize = 64;
+const PLUGIN_RUNTIME_MARKERS: [&str; 3] = [
+    "plugin api tool pohunek_hosts",
+    "plugin api hook pre_llm_call",
+    "plugin api skill pohunek:pohunek",
+];
+const PLUGIN_RUNTIME_SMOKE: &str = r#"
+from pathlib import Path
+
+from hermes_cli.plugins import PluginManager
+
+manager = PluginManager()
+manager.discover_and_load(force=True)
+loaded = manager._plugins.get("operators/pohunek")
+if loaded is None or not loaded.enabled or loaded.error is not None:
+    raise RuntimeError("pinned Hermes did not load the compatibility plugin")
+if loaded.manifest.kind != "standalone":
+    raise RuntimeError("pinned Hermes resolved the wrong plugin kind")
+if set(loaded.tools_registered) != {"pohunek_hosts"}:
+    raise RuntimeError("pinned Hermes registered the wrong tool inventory")
+if set(loaded.hooks_registered) != {"pre_llm_call"}:
+    raise RuntimeError("pinned Hermes registered the wrong hook inventory")
+skill = manager._plugin_skills.get("pohunek:pohunek")
+if skill is None or not isinstance(skill.get("path"), Path) or not skill["path"].is_file():
+    raise RuntimeError("pinned Hermes registered the wrong skill inventory")
+print("plugin api tool pohunek_hosts")
+print("plugin api hook pre_llm_call")
+print("plugin api skill pohunek:pohunek")
+"#;
+const PRODUCTION_PLUGIN_RUNTIME_SMOKE: &str = r#"
+from pathlib import Path
+
+from hermes_cli.plugins import PluginManager
+
+expected_tools = {
+    "pohunek_hosts", "pohunek_sessions", "pohunek_session_get",
+    "pohunek_session_screen", "pohunek_session_output", "pohunek_session_wait",
+    "pohunek_session_diff",
+}
+expected_hooks = {
+    "on_session_start", "pre_llm_call", "pre_approval_request",
+    "post_approval_response", "post_llm_call", "on_session_end",
+    "on_session_finalize",
+}
+manager = PluginManager()
+manager.discover_and_load(force=True)
+loaded = manager._plugins.get("operators/pohunek")
+if loaded is None or not loaded.enabled or loaded.error is not None:
+    raise RuntimeError("pinned Hermes did not load the production Pohunek plugin")
+if set(loaded.tools_registered) != expected_tools:
+    raise RuntimeError("production Pohunek read-only tool inventory drifted")
+if set(loaded.hooks_registered) != expected_hooks:
+    raise RuntimeError("production Pohunek hook inventory drifted")
+skill = manager._plugin_skills.get("pohunek:pohunek")
+if skill is None or not isinstance(skill.get("path"), Path) or not skill["path"].is_file():
+    raise RuntimeError("production Pohunek skill inventory drifted")
+print("production plugin registration healthy")
+"#;
+const PRODUCTION_PLUGIN_RUNTIME_MARKER: &str = "production plugin registration healthy";
 const GOLDEN_STATES: [&str; 10] = [
     "prompt-ready",
     "short-input",
@@ -165,6 +271,7 @@ pub(crate) struct CompatibilitySummary {
     pub(crate) release: String,
     pub(crate) tag: String,
     pub(crate) cli_checks: usize,
+    pub(crate) plugin_checks: usize,
     pub(crate) golden_records: usize,
 }
 
@@ -188,6 +295,7 @@ struct Lock {
     source_archive: SourceArchive,
     runtime: RuntimeContract,
     cli_checks: Vec<CliCheck>,
+    plugin_contract: PluginContract,
     golden_states: Vec<String>,
 }
 
@@ -214,6 +322,101 @@ struct CliCheck {
     id: String,
     args: Vec<String>,
     required_text: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginContract {
+    cli_checks: Vec<CliCheck>,
+    lifecycle: PluginLifecycle,
+    targets: PluginTargets,
+    api: PluginApi,
+    integration_lifecycle: IntegrationLifecycle,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginLifecycle {
+    plugin_name: String,
+    plugin_key: String,
+    list_args: Vec<String>,
+    enable_args: Vec<String>,
+    disable_args: Vec<String>,
+    not_enabled_text: Vec<String>,
+    enable_text: Vec<String>,
+    disabled_text: Vec<String>,
+    enabled_text: Vec<String>,
+    disable_text: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginTargets {
+    named_profile: String,
+    named_profile_args: Vec<String>,
+    named_profile_relative_home: String,
+    custom_home_env: String,
+    custom_home_must_be_absolute: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginApi {
+    manifest_required_fields: Vec<String>,
+    manifest_optional_fields: Vec<String>,
+    manifest_kind: String,
+    entrypoint_file: String,
+    entrypoint: String,
+    tool_method: String,
+    tool_registration_args: Vec<String>,
+    toolset: String,
+    tool_schema_type: String,
+    tool_handler_args: String,
+    tool_return: String,
+    hook_method: String,
+    hook_registration_args: Vec<String>,
+    skill_method: String,
+    skill_registration_args: Vec<String>,
+    skill_path_type: String,
+    skill_name: String,
+    skill_qualified_name: String,
+    discovery_root: String,
+    discovery_category: String,
+    maximum_category_depth: u8,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntegrationLifecycle {
+    target_kind: String,
+    target_value: String,
+    access_mode: String,
+    allowed_hosts: Vec<String>,
+    steps: Vec<IntegrationStep>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum IntegrationAction {
+    Install,
+    Status,
+    Doctor,
+    Uninstall,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum IntegrationState {
+    Installed,
+    Healthy,
+    Absent,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntegrationStep {
+    action: IntegrationAction,
+    expected_state: IntegrationState,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -289,6 +492,18 @@ impl Isolation {
             .prefix(prefix)
             .tempdir()
             .map_err(|error| fail(format!("failed to create isolated Hermes root: {error}")))?;
+        Self::from_temp(temp)
+    }
+
+    fn new_in(prefix: &str, parent: &Path) -> Result<Self, XtaskError> {
+        let temp = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(parent)
+            .map_err(|error| fail(format!("failed to create isolated Hermes root: {error}")))?;
+        Self::from_temp(temp)
+    }
+
+    fn from_temp(temp: TempDir) -> Result<Self, XtaskError> {
         let root = temp.path().to_path_buf();
         let home = root.join("home");
         let hermes_home = root.join("hermes-home");
@@ -442,11 +657,109 @@ impl Isolation {
     }
 }
 
+/// Selects a temporary parent that cannot make the production CLI target unsafe.
+///
+/// `tempfile` creates the child isolation root with private permissions. The
+/// parent nevertheless must be outside every Git workspace because Pohunek's
+/// production resolver intentionally treats Git ancestry as an unsafe target.
+fn production_integration_isolation() -> Result<Isolation, XtaskError> {
+    let mut candidates = Vec::new();
+    if let Some(runtime_directory) = std::env::var_os("XDG_RUNTIME_DIR") {
+        candidates.push(PathBuf::from(runtime_directory));
+    }
+    candidates.push(std::env::temp_dir());
+    let parent = select_production_integration_temp_parent(candidates)?;
+    Isolation::new_in("pohunek-production-plugin-", &parent)
+}
+
+fn select_production_integration_temp_parent(
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Result<PathBuf, XtaskError> {
+    candidates
+        .into_iter()
+        .filter_map(|candidate| fs::canonicalize(candidate).ok())
+        .find(|candidate| {
+            fs::metadata(candidate).is_ok_and(|metadata| metadata.is_dir())
+                && path_is_outside_git_workspaces(candidate)
+        })
+        .ok_or_else(|| {
+            fail(
+                "no isolated temporary parent outside a Git workspace is available for Pohunek production compatibility",
+            )
+        })
+}
+
+fn path_is_outside_git_workspaces(path: &Path) -> bool {
+    ancestors_are_outside_git_workspaces(path.ancestors())
+}
+
+fn ancestors_are_outside_git_workspaces<'path>(
+    ancestors: impl IntoIterator<Item = &'path Path>,
+) -> bool {
+    ancestors.into_iter().all(|candidate| {
+        let marker = candidate.join(".git");
+        match fs::symlink_metadata(marker) {
+            Ok(metadata) => !metadata.is_dir() && !metadata.is_file(),
+            Err(error) => error.kind() == io::ErrorKind::NotFound,
+        }
+    })
+}
+
 #[derive(Debug)]
 struct ProcessOutput {
     status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PohunekEnvelope {
+    cli_version: String,
+    protocol: PohunekProtocol,
+    ok: PohunekIntegrationResult,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PohunekProtocol {
+    minimum: u32,
+    maximum: u32,
+}
+
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the CLI lifecycle envelope intentionally exposes independent state findings"
+)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PohunekIntegrationResult {
+    action: String,
+    target_kind: String,
+    target_label: String,
+    installed: bool,
+    enabled: bool,
+    modified: bool,
+    stale_stage: bool,
+    stale_backup: bool,
+    access_mode: Option<String>,
+    allowed_host_count: Option<usize>,
+    doctor: Option<PohunekDoctorReport>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PohunekDoctorReport {
+    ok: bool,
+    checks: Vec<PohunekDoctorCheck>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PohunekDoctorCheck {
+    code: String,
+    status: String,
+    recovery_hint: String,
 }
 
 #[derive(Debug)]
@@ -718,8 +1031,9 @@ struct Scenario {
 pub(crate) fn compatibility(
     repo: &Path,
     hermes_bin: &Path,
+    pohunek_bin: &Path,
 ) -> Result<CompatibilitySummary, XtaskError> {
-    compatibility_with(repo, hermes_bin, Limits::production())
+    compatibility_with(repo, hermes_bin, pohunek_bin, Limits::production())
 }
 
 /// Refreshes sanitized PTY goldens against the repository-owned local mock.
@@ -733,18 +1047,36 @@ pub(crate) fn refresh_goldens(
 fn compatibility_with(
     repo: &Path,
     hermes_bin: &Path,
+    pohunek_bin: &Path,
     limits: Limits,
 ) -> Result<CompatibilitySummary, XtaskError> {
-    let lock = check_cli(repo, hermes_bin, limits)?;
+    let pohunek_bin = require_safe_pohunek_binary(pohunek_bin)?;
+    let hermes_bin = resolve_compatibility_hermes_binary(hermes_bin)?;
+    let lock = check_cli(repo, &hermes_bin, limits)?;
     let manifest = load_golden_manifest(repo)?;
     validate_golden_manifest(repo, &lock, &manifest, limits.pty_output_bytes, false)?;
+    check_pohunek_integration(
+        &hermes_bin,
+        &pohunek_bin,
+        &lock.plugin_contract.integration_lifecycle,
+        limits,
+    )?;
 
-    Ok(CompatibilitySummary {
+    Ok(compatibility_summary(lock, &manifest))
+}
+
+fn compatibility_summary(lock: Lock, manifest: &GoldenManifest) -> CompatibilitySummary {
+    CompatibilitySummary {
         release: lock.release,
         tag: lock.tag,
         cli_checks: lock.cli_checks.len(),
+        plugin_checks: lock.plugin_contract.cli_checks.len()
+            + PLUGIN_LIFECYCLE_CHECKS
+            + PLUGIN_TARGET_CHECKS
+            + PLUGIN_RUNTIME_CHECKS
+            + PRODUCTION_PLUGIN_CHECKS,
         golden_records: manifest.records.len(),
-    })
+    }
 }
 
 fn check_cli(repo: &Path, hermes_bin: &Path, limits: Limits) -> Result<Lock, XtaskError> {
@@ -757,33 +1089,228 @@ fn check_cli(repo: &Path, hermes_bin: &Path, limits: Limits) -> Result<Lock, Xta
     let env = isolation.model_free_env(&mock.proxy_url());
 
     for check in &lock.cli_checks {
-        let output = run_process(
-            hermes_bin,
-            &check.args,
-            &isolation.work,
-            &env,
-            limits.command_timeout,
-            limits.command_output_bytes,
-        )?;
-        if !output.status.success() {
-            return Err(fail(format!(
-                "Hermes CLI check `{}` exited unsuccessfully",
-                check.id
-            )));
-        }
-        let text = combined_text(&output);
-        for required in &check.required_text {
-            if !text.contains(required) {
-                return Err(fail(format!(
-                    "Hermes CLI check `{}` is missing required text `{required}`",
-                    check.id
-                )));
-            }
-        }
+        run_cli_check(hermes_bin, check, &isolation, &env, limits)?;
     }
+    check_plugin_contract(hermes_bin, &lock.plugin_contract, &isolation, &env, limits)?;
     mock.finish().map_err(|error| fail(error.to_string()))?;
 
     Ok(lock)
+}
+
+fn check_plugin_contract(
+    hermes_bin: &Path,
+    plugin: &PluginContract,
+    isolation: &Isolation,
+    env: &[(OsString, OsString)],
+    limits: Limits,
+) -> Result<(), XtaskError> {
+    let custom_home_key = OsString::from(&plugin.targets.custom_home_env);
+    let custom_home = env
+        .iter()
+        .find(|(name, _value)| name == &custom_home_key)
+        .map(|(_name, value)| Path::new(value));
+    if !plugin.targets.custom_home_must_be_absolute
+        || custom_home != Some(isolation.hermes_home.as_path())
+        || !isolation.hermes_home.is_absolute()
+    {
+        return Err(fail(
+            "Hermes plugin custom-home compatibility target is not absolute",
+        ));
+    }
+    materialize_plugin_fixture(&isolation.hermes_home, plugin)?;
+    for check in &plugin.cli_checks {
+        run_cli_check(hermes_bin, check, isolation, env, limits)?;
+    }
+
+    run_plugin_state_check(
+        hermes_bin,
+        "plugins-list-not-enabled-before-enable",
+        &plugin.lifecycle.list_args,
+        &plugin.lifecycle.not_enabled_text,
+        isolation,
+        env,
+        limits,
+    )?;
+    run_plugin_state_check(
+        hermes_bin,
+        "plugins-enable",
+        &plugin.lifecycle.enable_args,
+        &plugin.lifecycle.enable_text,
+        isolation,
+        env,
+        limits,
+    )?;
+    run_plugin_state_check(
+        hermes_bin,
+        "plugins-list-enabled",
+        &plugin.lifecycle.list_args,
+        &plugin.lifecycle.enabled_text,
+        isolation,
+        env,
+        limits,
+    )?;
+    run_plugin_runtime_check(hermes_bin, isolation, env, limits)?;
+    run_plugin_state_check(
+        hermes_bin,
+        "plugins-disable",
+        &plugin.lifecycle.disable_args,
+        &plugin.lifecycle.disable_text,
+        isolation,
+        env,
+        limits,
+    )?;
+    run_plugin_state_check(
+        hermes_bin,
+        "plugins-list-disabled-after-disable",
+        &plugin.lifecycle.list_args,
+        &plugin.lifecycle.disabled_text,
+        isolation,
+        env,
+        limits,
+    )?;
+
+    let named_home = isolation
+        .hermes_home
+        .join(&plugin.targets.named_profile_relative_home);
+    materialize_plugin_fixture(&named_home, plugin)?;
+    let mut named_list_args = plugin.targets.named_profile_args.clone();
+    named_list_args.extend(plugin.lifecycle.list_args.iter().cloned());
+    run_plugin_state_check(
+        hermes_bin,
+        "plugins-list-named-profile",
+        &named_list_args,
+        &plugin.lifecycle.not_enabled_text,
+        isolation,
+        env,
+        limits,
+    )
+}
+
+fn run_plugin_runtime_check(
+    hermes_bin: &Path,
+    isolation: &Isolation,
+    env: &[(OsString, OsString)],
+    limits: Limits,
+) -> Result<(), XtaskError> {
+    let python = sibling_python(hermes_bin)?;
+    let args = vec!["-c".to_owned(), PLUGIN_RUNTIME_SMOKE.to_owned()];
+    let required_text: Vec<_> = PLUGIN_RUNTIME_MARKERS
+        .iter()
+        .map(|marker| (*marker).to_owned())
+        .collect();
+    run_plugin_state_check(
+        &python,
+        "plugins-runtime-api",
+        &args,
+        &required_text,
+        isolation,
+        env,
+        limits,
+    )
+}
+
+fn sibling_python(hermes_bin: &Path) -> Result<PathBuf, XtaskError> {
+    let directory = hermes_bin.parent().ok_or_else(|| {
+        fail("Hermes executable has no installation directory for its Python runtime")
+    })?;
+    [directory.join("python"), directory.join("python3")]
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| fail("Hermes installation has no sibling Python runtime"))
+}
+
+fn run_cli_check(
+    hermes_bin: &Path,
+    check: &CliCheck,
+    isolation: &Isolation,
+    env: &[(OsString, OsString)],
+    limits: Limits,
+) -> Result<(), XtaskError> {
+    run_plugin_state_check(
+        hermes_bin,
+        &check.id,
+        &check.args,
+        &check.required_text,
+        isolation,
+        env,
+        limits,
+    )
+}
+
+fn run_plugin_state_check(
+    hermes_bin: &Path,
+    id: &str,
+    args: &[String],
+    required_text: &[String],
+    isolation: &Isolation,
+    env: &[(OsString, OsString)],
+    limits: Limits,
+) -> Result<(), XtaskError> {
+    let output = run_process(
+        hermes_bin,
+        args,
+        &isolation.work,
+        env,
+        limits.command_timeout,
+        limits.command_output_bytes,
+    )?;
+    if !output.status.success() {
+        return Err(fail(format!(
+            "Hermes CLI check `{id}` exited unsuccessfully"
+        )));
+    }
+    let text = combined_text(&output);
+    for required in required_text {
+        if !text.contains(required) {
+            return Err(fail(format!(
+                "Hermes CLI check `{id}` is missing required text `{required}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn materialize_plugin_fixture(
+    hermes_home: &Path,
+    plugin: &PluginContract,
+) -> Result<(), XtaskError> {
+    let root = hermes_home.join(&plugin.api.discovery_root);
+    let directory = root
+        .join(&plugin.api.discovery_category)
+        .join(&plugin.lifecycle.plugin_name);
+    fs::create_dir_all(&directory)
+        .map_err(|error| fail(format!("failed to create isolated plugin fixture: {error}")))?;
+    let manifest = format!(
+        "name: {}\nversion: {}\ndescription: Model-free Pohunek compatibility fixture\nprovides_tools:\n  - {}\nprovides_hooks:\n  - {}\n",
+        plugin.lifecycle.plugin_name,
+        PLUGIN_FIXTURE_VERSION,
+        PLUGIN_FIXTURE_TOOL,
+        PLUGIN_FIXTURE_HOOK,
+    );
+    fs::write(directory.join("plugin.yaml"), manifest)
+        .map_err(|error| fail(format!("failed to write isolated plugin manifest: {error}")))?;
+    let skill_directory = directory.join("skills").join(&plugin.api.skill_name);
+    fs::create_dir_all(&skill_directory)
+        .map_err(|error| fail(format!("failed to create isolated plugin skill: {error}")))?;
+    fs::write(
+        skill_directory.join("SKILL.md"),
+        format!("# Pohunek\n\n{PLUGIN_FIXTURE_SKILL_BODY}\n"),
+    )
+    .map_err(|error| fail(format!("failed to write isolated plugin skill: {error}")))?;
+    let entrypoint = format!(
+        "import json\nfrom pathlib import Path\n\n_ROOT = Path(__file__).resolve().parent\n\ndef _tool(args: dict, **kwargs) -> str:\n    return json.dumps({{\"ok\": True}})\n\ndef _hook(*args, **kwargs):\n    return None\n\ndef register(ctx):\n    ctx.register_tool(\"{}\", \"{}\", {{\"name\": \"{}\", \"description\": \"List Pohunek hosts\", \"parameters\": {{\"type\": \"object\", \"properties\": {{}}, \"additionalProperties\": False}}}}, _tool, description=\"List Pohunek hosts\")\n    ctx.register_hook(\"{}\", _hook)\n    ctx.register_skill(\"{}\", _ROOT / \"skills\" / \"{}\" / \"SKILL.md\", description=\"Use Pohunek safely\")\n",
+        PLUGIN_FIXTURE_TOOL,
+        plugin.api.toolset,
+        PLUGIN_FIXTURE_TOOL,
+        PLUGIN_FIXTURE_HOOK,
+        plugin.api.skill_name,
+        plugin.api.skill_name,
+    );
+    fs::write(directory.join(&plugin.api.entrypoint_file), entrypoint).map_err(|error| {
+        fail(format!(
+            "failed to write isolated plugin entrypoint: {error}"
+        ))
+    })
 }
 
 fn refresh_with(
@@ -1041,6 +1568,424 @@ fn validate_lock(lock: &Lock) -> Result<(), XtaskError> {
         })
     {
         return Err(fail("Hermes CLI check inventory is incomplete"));
+    }
+    validate_plugin_contract(&lock.plugin_contract)?;
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the pinned plugin contract is validated in one auditable sequence"
+)]
+fn validate_plugin_contract(plugin: &PluginContract) -> Result<(), XtaskError> {
+    if plugin.cli_checks.len() != 4
+        || plugin.cli_checks.iter().any(|check| {
+            check.id.is_empty() || check.args.is_empty() || check.required_text.is_empty()
+        })
+    {
+        return Err(fail("Hermes plugin CLI check inventory is incomplete"));
+    }
+    let cli_ids: Vec<_> = plugin
+        .cli_checks
+        .iter()
+        .map(|check| check.id.as_str())
+        .collect();
+    let cli_args: Vec<_> = plugin
+        .cli_checks
+        .iter()
+        .map(|check| string_slice(&check.args))
+        .collect();
+    if cli_ids
+        != [
+            "plugins-help",
+            "plugins-list-help",
+            "plugins-enable-help",
+            "plugins-disable-help",
+        ]
+        || cli_args
+            != [
+                vec!["plugins", "--help"],
+                vec!["plugins", "list", "--help"],
+                vec!["plugins", "enable", "--help"],
+                vec!["plugins", "disable", "--help"],
+            ]
+    {
+        return Err(fail("Hermes plugin CLI parser contract changed"));
+    }
+    if plugin.lifecycle.plugin_name != EXPECTED_PLUGIN_NAME
+        || plugin.lifecycle.plugin_key != EXPECTED_PLUGIN_KEY
+        || string_slice(&plugin.lifecycle.list_args) != ["plugins", "list", "--json"]
+        || string_slice(&plugin.lifecycle.enable_args)
+            != [
+                "plugins",
+                "enable",
+                EXPECTED_PLUGIN_NAME,
+                "--no-allow-tool-override",
+            ]
+        || string_slice(&plugin.lifecycle.disable_args)
+            != ["plugins", "disable", EXPECTED_PLUGIN_NAME]
+        || string_slice(&plugin.lifecycle.not_enabled_text)
+            != ["\"name\": \"pohunek\"", "\"status\": \"not enabled\""]
+        || string_slice(&plugin.lifecycle.enable_text)
+            != [
+                "Plugin",
+                EXPECTED_PLUGIN_NAME,
+                "enabled.",
+                "Takes effect on next session.",
+            ]
+        || string_slice(&plugin.lifecycle.enabled_text)
+            != ["\"name\": \"pohunek\"", "\"status\": \"enabled\""]
+        || string_slice(&plugin.lifecycle.disable_text)
+            != [
+                "Plugin",
+                EXPECTED_PLUGIN_NAME,
+                "disabled.",
+                "Takes effect on next session.",
+            ]
+        || string_slice(&plugin.lifecycle.disabled_text)
+            != ["\"name\": \"pohunek\"", "\"status\": \"disabled\""]
+    {
+        return Err(fail("Hermes plugin lifecycle contract changed"));
+    }
+    if plugin.targets.named_profile != EXPECTED_NAMED_PROFILE
+        || string_slice(&plugin.targets.named_profile_args) != EXPECTED_NAMED_PROFILE_ARGS
+        || plugin.targets.named_profile_relative_home != EXPECTED_NAMED_PROFILE_HOME
+        || plugin.targets.custom_home_env != EXPECTED_CUSTOM_HOME_ENV
+        || !plugin.targets.custom_home_must_be_absolute
+    {
+        return Err(fail("Hermes plugin target contract changed"));
+    }
+    if string_slice(&plugin.api.manifest_required_fields) != EXPECTED_PLUGIN_MANIFEST_FIELDS
+        || string_slice(&plugin.api.manifest_optional_fields)
+            != EXPECTED_PLUGIN_OPTIONAL_MANIFEST_FIELDS
+        || plugin.api.manifest_kind != EXPECTED_PLUGIN_KIND
+        || plugin.api.entrypoint_file != EXPECTED_PLUGIN_ENTRYPOINT_FILE
+        || plugin.api.entrypoint != EXPECTED_PLUGIN_ENTRYPOINT
+        || plugin.api.tool_method != EXPECTED_PLUGIN_TOOL_METHOD
+        || string_slice(&plugin.api.tool_registration_args) != EXPECTED_PLUGIN_TOOL_ARGS
+        || plugin.api.toolset != EXPECTED_PLUGIN_TOOLSET
+        || plugin.api.tool_schema_type != EXPECTED_PLUGIN_TOOL_SCHEMA_TYPE
+        || plugin.api.tool_handler_args != EXPECTED_PLUGIN_TOOL_HANDLER_ARGS
+        || plugin.api.tool_return != EXPECTED_PLUGIN_TOOL_RETURN
+        || plugin.api.hook_method != EXPECTED_PLUGIN_HOOK_METHOD
+        || string_slice(&plugin.api.hook_registration_args) != EXPECTED_PLUGIN_HOOK_ARGS
+        || plugin.api.skill_method != EXPECTED_PLUGIN_SKILL_METHOD
+        || string_slice(&plugin.api.skill_registration_args) != EXPECTED_PLUGIN_SKILL_ARGS
+        || plugin.api.skill_path_type != EXPECTED_PLUGIN_SKILL_PATH_TYPE
+        || plugin.api.skill_name != EXPECTED_PLUGIN_NAME
+        || plugin.api.skill_qualified_name != EXPECTED_PLUGIN_SKILL
+        || plugin.api.discovery_root != EXPECTED_PLUGIN_DISCOVERY_ROOT
+        || plugin.api.discovery_category != EXPECTED_PLUGIN_DISCOVERY_CATEGORY
+        || plugin.api.maximum_category_depth != EXPECTED_PLUGIN_DISCOVERY_DEPTH
+    {
+        return Err(fail("Hermes plugin API contract changed"));
+    }
+    validate_integration_contract(&plugin.integration_lifecycle)?;
+    Ok(())
+}
+
+fn validate_integration_contract(contract: &IntegrationLifecycle) -> Result<(), XtaskError> {
+    let expected_steps = [
+        (IntegrationAction::Install, IntegrationState::Installed),
+        (IntegrationAction::Status, IntegrationState::Installed),
+        (IntegrationAction::Doctor, IntegrationState::Healthy),
+        (IntegrationAction::Uninstall, IntegrationState::Absent),
+    ];
+    let steps: Vec<_> = contract
+        .steps
+        .iter()
+        .map(|step| (step.action, step.expected_state))
+        .collect();
+    if contract.target_kind != "named_profile"
+        || contract.target_value != EXPECTED_NAMED_PROFILE
+        || contract.access_mode != "read_only"
+        || string_slice(&contract.allowed_hosts) != ["local"]
+        || steps != expected_steps
+    {
+        return Err(fail("Pohunek integration lifecycle contract changed"));
+    }
+    Ok(())
+}
+
+fn check_pohunek_integration(
+    hermes_bin: &Path,
+    pohunek_bin: &Path,
+    contract: &IntegrationLifecycle,
+    limits: Limits,
+) -> Result<(), XtaskError> {
+    let isolation = production_integration_isolation()?;
+    let hermes_home = isolation.home.join(".hermes");
+    let profile_home = hermes_home.join("profiles").join(EXPECTED_NAMED_PROFILE);
+    let state_home = isolation.root.join("xdg-state");
+    let runtime_home = isolation.root.join("xdg-runtime");
+    for path in [
+        &isolation.home,
+        &hermes_home,
+        &hermes_home.join("profiles"),
+        &profile_home,
+        &state_home,
+        &runtime_home,
+    ] {
+        create_private_directory(path)?;
+    }
+    let env = integration_environment(&isolation, &hermes_home, &state_home, &runtime_home);
+    let [install, status, doctor, uninstall] = contract.steps.as_slice() else {
+        return Err(fail("Pohunek integration lifecycle step count changed"));
+    };
+
+    run_pohunek_integration_action(
+        pohunek_bin,
+        hermes_bin,
+        install,
+        &isolation.work,
+        &env,
+        limits,
+    )?;
+    run_pohunek_integration_action(
+        pohunek_bin,
+        hermes_bin,
+        status,
+        &isolation.work,
+        &env,
+        limits,
+    )?;
+    run_production_plugin_runtime(hermes_bin, &profile_home, &isolation.work, &env, limits)?;
+    run_pohunek_integration_action(
+        pohunek_bin,
+        hermes_bin,
+        doctor,
+        &isolation.work,
+        &env,
+        limits,
+    )?;
+    run_pohunek_integration_action(
+        pohunek_bin,
+        hermes_bin,
+        uninstall,
+        &isolation.work,
+        &env,
+        limits,
+    )?;
+    Ok(())
+}
+
+fn create_private_directory(path: &Path) -> Result<(), XtaskError> {
+    fs::create_dir_all(path).map_err(|error| {
+        fail(format!(
+            "failed to create private compatibility directory: {error}"
+        ))
+    })?;
+    #[cfg(unix)]
+    secure_private_directory(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_private_directory(path: &Path) -> Result<(), XtaskError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+        fail(format!(
+            "failed to secure private compatibility directory: {error}"
+        ))
+    })
+}
+
+fn integration_environment(
+    isolation: &Isolation,
+    hermes_home: &Path,
+    state_home: &Path,
+    runtime_home: &Path,
+) -> Vec<(OsString, OsString)> {
+    let mut env: Vec<_> = isolation
+        .isolation_env()
+        .into_iter()
+        .filter(|(name, _value)| name != "HERMES_HOME")
+        .collect();
+    env.extend([
+        (
+            OsString::from("HERMES_HOME"),
+            hermes_home.as_os_str().to_owned(),
+        ),
+        (
+            OsString::from("XDG_STATE_HOME"),
+            state_home.as_os_str().to_owned(),
+        ),
+        (
+            OsString::from("XDG_RUNTIME_DIR"),
+            runtime_home.as_os_str().to_owned(),
+        ),
+        (OsString::from("NO_COLOR"), OsString::from("1")),
+        (OsString::from("TERM"), OsString::from("dumb")),
+    ]);
+    env
+}
+
+fn run_pohunek_integration_action(
+    pohunek_bin: &Path,
+    hermes_bin: &Path,
+    step: &IntegrationStep,
+    cwd: &Path,
+    env: &[(OsString, OsString)],
+    limits: Limits,
+) -> Result<(), XtaskError> {
+    let mut args = vec![
+        "integration".to_owned(),
+        integration_action_name(step.action).to_owned(),
+        "--agent".to_owned(),
+        "hermes".to_owned(),
+        "--hermes-profile".to_owned(),
+        EXPECTED_NAMED_PROFILE.to_owned(),
+        "--hermes-bin".to_owned(),
+        hermes_bin.as_os_str().to_string_lossy().into_owned(),
+    ];
+    if step.action == IntegrationAction::Install {
+        args.extend([
+            "--pohunek-bin".to_owned(),
+            pohunek_bin.as_os_str().to_string_lossy().into_owned(),
+            "--access-mode".to_owned(),
+            "read_only".to_owned(),
+            "--allow-host".to_owned(),
+            "local".to_owned(),
+        ]);
+    }
+    args.push("--json".to_owned());
+    let output = run_process(
+        pohunek_bin,
+        &args,
+        cwd,
+        env,
+        limits.command_timeout,
+        limits.command_output_bytes,
+    )?;
+    if output.status.code() != Some(0) {
+        return Err(fail(format!(
+            "Pohunek integration action `{}` exited unsuccessfully",
+            integration_action_name(step.action)
+        )));
+    }
+    let envelope: PohunekEnvelope = serde_json::from_slice(&output.stdout).map_err(|_error| {
+        fail(format!(
+            "Pohunek integration action `{}` returned a malformed envelope",
+            integration_action_name(step.action)
+        ))
+    })?;
+    validate_pohunek_envelope(step, &envelope)
+}
+
+fn integration_action_name(action: IntegrationAction) -> &'static str {
+    match action {
+        IntegrationAction::Install => "install",
+        IntegrationAction::Status => "status",
+        IntegrationAction::Doctor => "doctor",
+        IntegrationAction::Uninstall => "uninstall",
+    }
+}
+
+fn validate_pohunek_envelope(
+    step: &IntegrationStep,
+    envelope: &PohunekEnvelope,
+) -> Result<(), XtaskError> {
+    let result = &envelope.ok;
+    if envelope.cli_version.is_empty()
+        || envelope.protocol.minimum != EXPECTED_POHUNEK_PROTOCOL
+        || envelope.protocol.maximum != EXPECTED_POHUNEK_PROTOCOL
+        || result.action != integration_action_name(step.action)
+        || result.target_kind != "profile"
+        || result.target_label != EXPECTED_NAMED_PROFILE
+        || result.modified
+        || result.stale_stage
+        || result.stale_backup
+    {
+        return Err(fail(format!(
+            "Pohunek integration action `{}` returned an invalid envelope",
+            integration_action_name(step.action)
+        )));
+    }
+    let observed = match step.action {
+        IntegrationAction::Install | IntegrationAction::Status
+            if result.installed && result.enabled =>
+        {
+            IntegrationState::Installed
+        }
+        IntegrationAction::Doctor
+            if result.installed
+                && result.enabled
+                && result.doctor.as_ref().is_some_and(doctor_is_healthy) =>
+        {
+            IntegrationState::Healthy
+        }
+        IntegrationAction::Uninstall if !result.installed && !result.enabled => {
+            IntegrationState::Absent
+        }
+        _ => {
+            return Err(fail(format!(
+                "Pohunek integration action `{}` returned the wrong state",
+                integration_action_name(step.action)
+            )))
+        }
+    };
+    if observed != step.expected_state {
+        return Err(fail(format!(
+            "Pohunek integration action `{}` violated the locked state",
+            integration_action_name(step.action)
+        )));
+    }
+    let policy_matches = match step.action {
+        IntegrationAction::Install | IntegrationAction::Status => {
+            result.access_mode.as_deref() == Some("read_only")
+                && result.allowed_host_count == Some(1)
+        }
+        IntegrationAction::Doctor | IntegrationAction::Uninstall => {
+            result.access_mode.is_none() && result.allowed_host_count.is_none()
+        }
+    };
+    if !policy_matches {
+        return Err(fail(format!(
+            "Pohunek integration action `{}` returned the wrong policy state",
+            integration_action_name(step.action)
+        )));
+    }
+    Ok(())
+}
+
+fn doctor_is_healthy(report: &PohunekDoctorReport) -> bool {
+    report.ok
+        && report.checks.len() == 15
+        && report.checks.iter().all(|check| {
+            !check.code.is_empty() && check.status == "pass" && check.recovery_hint == "none"
+        })
+}
+
+fn run_production_plugin_runtime(
+    hermes_bin: &Path,
+    profile_home: &Path,
+    cwd: &Path,
+    env: &[(OsString, OsString)],
+    limits: Limits,
+) -> Result<(), XtaskError> {
+    let python = sibling_python(hermes_bin)?;
+    let mut runtime_env = env.to_vec();
+    runtime_env.retain(|(name, _value)| name != "HERMES_HOME");
+    runtime_env.push((
+        OsString::from("HERMES_HOME"),
+        profile_home.as_os_str().to_owned(),
+    ));
+    let args = vec!["-c".to_owned(), PRODUCTION_PLUGIN_RUNTIME_SMOKE.to_owned()];
+    let output = run_process(
+        &python,
+        &args,
+        cwd,
+        &runtime_env,
+        limits.command_timeout,
+        limits.command_output_bytes,
+    )?;
+    if output.status.code() != Some(0)
+        || !String::from_utf8_lossy(&output.stdout).contains(PRODUCTION_PLUGIN_RUNTIME_MARKER)
+    {
+        return Err(fail(
+            "pinned Hermes rejected the production Pohunek plugin registration",
+        ));
     }
     Ok(())
 }
@@ -2732,6 +3677,79 @@ fn require_explicit_binary(path: &Path) -> Result<(), XtaskError> {
     Ok(())
 }
 
+fn require_safe_pohunek_binary(path: &Path) -> Result<PathBuf, XtaskError> {
+    if !path.is_absolute() {
+        return Err(fail(
+            "Hermes compatibility requires an absolute --pohunek-bin path",
+        ));
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|_error| fail("Hermes compatibility Pohunek executable does not exist"))?;
+        if metadata.file_type().is_symlink() {
+            return Err(fail(
+                "Hermes compatibility Pohunek executable contains a symlink",
+            ));
+        }
+    }
+    let canonical = fs::canonicalize(path).map_err(|_error| {
+        fail("Hermes compatibility Pohunek executable cannot be canonicalized")
+    })?;
+    if canonical != path {
+        return Err(fail(
+            "Hermes compatibility Pohunek executable is not canonical",
+        ));
+    }
+    let metadata = fs::metadata(&canonical)
+        .map_err(|_error| fail("Hermes compatibility Pohunek executable is unavailable"))?;
+    if !metadata.is_file() {
+        return Err(fail(
+            "Hermes compatibility Pohunek executable is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode = metadata.permissions().mode();
+        if mode & 0o111 == 0 || mode & 0o022 != 0 {
+            return Err(fail(
+                "Hermes compatibility Pohunek executable has unsafe permissions",
+            ));
+        }
+    }
+    Ok(canonical)
+}
+
+fn resolve_compatibility_hermes_binary(path: &Path) -> Result<PathBuf, XtaskError> {
+    if path.is_absolute() {
+        return fs::canonicalize(path)
+            .map_err(|_error| fail("Hermes compatibility executable does not exist"));
+    }
+    if path.components().count() != 1 {
+        return Err(fail(
+            "Hermes compatibility executable must be absolute or a PATH basename",
+        ));
+    }
+    let search_path = std::env::var_os("PATH")
+        .ok_or_else(|| fail("Hermes compatibility executable is not available on PATH"))?;
+    for directory in std::env::split_paths(&search_path)
+        .filter(|directory| directory.is_absolute())
+        .take(MAX_EXECUTABLE_PATH_ENTRIES)
+    {
+        let candidate = directory.join(path);
+        if candidate.is_file() {
+            return fs::canonicalize(candidate)
+                .map_err(|_error| fail("Hermes compatibility executable cannot be canonicalized"));
+        }
+    }
+    Err(fail(
+        "Hermes compatibility executable is not available on PATH",
+    ))
+}
+
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -2748,20 +3766,22 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        assistant_panel_bottom, assistant_panel_count, assistant_panel_top, classic_scenarios,
-        compatibility_with, fail, finish_mocked_pty, has_alternate_screen,
-        has_one_submitted_user_turn, load_golden_manifest, load_lock, mock_scenario,
-        normalized_assistant_panel, observe_assistant_panels, raw_terminal_transcript,
-        refresh_with, run_process, sanitize_output, sanitized_pty_tail, sensitive_paths,
-        strip_terminal_controls, submitted_user_turn_count, terminal_transcript,
-        validate_classic_capture, validate_classic_transcript, validate_golden_manifest,
-        validate_safe_fixture, with_pty_diagnostic, GoldenManifest, GoldenStatus, Isolation,
-        Limits, PtyCapture, TerminalCapture, APPROVAL_PROMPT_TEXT, ASSISTANT_PANEL_SECTION,
-        GOLDEN_MANIFEST, GOLDEN_ROOT, INTERRUPTION_PROMPT_TEXT, INTERRUPT_MARKER, LOCK_PATH,
-        MAX_PTY_DIAGNOSTIC_BYTES, MAX_PTY_DIAGNOSTIC_LINES, MULTILINE_PREVIEW, MULTILINE_RESPONSE,
-        PROMPT_READY_MARKER, PTY_COLS, PTY_DIAGNOSTIC_WITHHELD, PTY_SCROLLBACK_ROWS,
-        SHORT_PROMPT_TEXT, SHORT_RESPONSE, USER_TURN_MARKER, USER_TURN_SEPARATOR,
-        WORKING_PROMPT_TEXT,
+        assistant_panel_bottom, assistant_panel_count, assistant_panel_top, check_cli,
+        classic_scenarios, compatibility_summary, compatibility_with, fail, finish_mocked_pty,
+        has_alternate_screen, has_one_submitted_user_turn, load_golden_manifest, load_lock,
+        mock_scenario, normalized_assistant_panel, observe_assistant_panels,
+        raw_terminal_transcript, refresh_with, require_safe_pohunek_binary,
+        run_pohunek_integration_action, run_process, sanitize_output, sanitized_pty_tail,
+        select_production_integration_temp_parent, sensitive_paths, strip_terminal_controls,
+        submitted_user_turn_count, terminal_transcript, validate_classic_capture,
+        validate_classic_transcript, validate_golden_manifest, validate_safe_fixture,
+        with_pty_diagnostic, GoldenManifest, GoldenStatus, IntegrationAction, IntegrationState,
+        IntegrationStep, Isolation, Limits, PtyCapture, TerminalCapture, APPROVAL_PROMPT_TEXT,
+        ASSISTANT_PANEL_SECTION, GOLDEN_MANIFEST, GOLDEN_ROOT, INTERRUPTION_PROMPT_TEXT,
+        INTERRUPT_MARKER, LOCK_PATH, MAX_PTY_DIAGNOSTIC_BYTES, MAX_PTY_DIAGNOSTIC_LINES,
+        MULTILINE_PREVIEW, MULTILINE_RESPONSE, PROMPT_READY_MARKER, PTY_COLS,
+        PTY_DIAGNOSTIC_WITHHELD, PTY_SCROLLBACK_ROWS, SHORT_PROMPT_TEXT, SHORT_RESPONSE,
+        USER_TURN_MARKER, USER_TURN_SEPARATOR, WORKING_PROMPT_TEXT,
     };
 
     fn fast_limits() -> Limits {
@@ -3235,6 +4255,18 @@ response.read()
 connection.close()
 PY
 }
+plugin_list() {
+  state='not enabled'
+  if [ -f "$HERMES_HOME/.pohunek-plugin-state" ]; then
+    state=$(sed -n '1p' "$HERMES_HOME/.pohunek-plugin-state")
+  fi
+  printf '[\n  {\n    "name": "pohunek",\n    "status": "%s",\n    "version": "0.0.0-compat",\n    "description": "Model-free Pohunek compatibility fixture",\n    "source": "user"\n  }\n]\n' "$state"
+}
+if [ "$1" = "--profile" ]; then
+  HERMES_HOME="$HERMES_HOME/profiles/$2"
+  export HERMES_HOME
+  shift 2
+fi
 case "$*" in
   --version) echo 'Hermes Agent v__VERSION__ (2026.8.3)' ;;
   --help) echo 'usage: hermes chat profile --version' ;;
@@ -3244,6 +4276,19 @@ case "$*" in
   'profile create --help') echo 'usage: hermes profile create [-h] [--clone-from SOURCE] profile_name' ;;
   'profile show --help') echo 'usage: hermes profile show [-h] profile_name' ;;
   'profile rename --help') echo 'usage: hermes profile rename [-h] old_name new_name' ;;
+  'plugins --help') echo 'usage: hermes plugins [-h] {install,update,remove,rm,uninstall,list,ls,enable,disable} ...' ;;
+  'plugins list --help') echo 'usage: hermes plugins list [-h] [--enabled] [--user] [--no-bundled] [--plain] [--json]' ;;
+  'plugins enable --help') echo 'usage: hermes plugins enable [-h] [--allow-tool-override | --no-allow-tool-override] name' ;;
+  'plugins disable --help') echo 'usage: hermes plugins disable [-h] name' ;;
+  'plugins list --json') plugin_list ;;
+  'plugins enable pohunek --no-allow-tool-override')
+    echo 'enabled' > "$HERMES_HOME/.pohunek-plugin-state"
+    echo 'Plugin pohunek enabled. Takes effect on next session.'
+    ;;
+  'plugins disable pohunek')
+    echo 'disabled' > "$HERMES_HOME/.pohunek-plugin-state"
+    echo 'Plugin pohunek disabled. Takes effect on next session.'
+    ;;
   'chat --tui')
     copilot_probe
     trap 'exit 0' INT
@@ -3346,20 +4391,97 @@ esac
 "#;
 
     #[cfg(unix)]
+    const FAKE_PLUGIN_RUNTIME_TEMPLATE: &str = r#"#!/bin/sh
+if [ "$1" != "-c" ]; then
+  exit 2
+fi
+case "$2" in
+  *PluginManager*) ;;
+  *) exit 2 ;;
+esac
+python3 - "$HERMES_HOME/plugins/operators/pohunek" <<'PY'
+import importlib.util
+import inspect
+import json
+from pathlib import Path
+import sys
+
+plugin_dir = Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("pohunek_compat", plugin_dir / "__init__.py")
+if spec is None or spec.loader is None:
+    raise RuntimeError("controlled plugin entrypoint could not be loaded")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+class Context:
+    def __init__(self):
+        self.tools = []
+        self.hooks = []
+        self.skills = []
+
+    def register_tool(
+        self,
+        name,
+        toolset,
+        schema,
+        handler,
+        check_fn=None,
+        requires_env=None,
+        is_async=False,
+        description="",
+        emoji="",
+        override=False,
+    ):
+        if name != "pohunek_hosts" or toolset != "pohunek":
+            raise RuntimeError("controlled plugin registered the wrong tool")
+        if schema.get("name") != name or schema.get("parameters", {}).get("type") != "object":
+            raise RuntimeError("controlled plugin registered the wrong tool schema")
+        if list(inspect.signature(handler).parameters) != ["args", "kwargs"]:
+            raise RuntimeError("controlled plugin handler signature drifted")
+        if json.loads(handler({})) != {"ok": True}:
+            raise RuntimeError("controlled plugin handler return drifted")
+        self.tools.append(name)
+
+    def register_hook(self, hook_name, callback):
+        if hook_name != "pre_llm_call" or not callable(callback):
+            raise RuntimeError("controlled plugin registered the wrong hook")
+        self.hooks.append(hook_name)
+
+    def register_skill(self, name, path: Path, description=""):
+        if name != "pohunek" or not isinstance(path, Path) or not path.is_file():
+            raise RuntimeError("controlled plugin registered the wrong skill")
+        self.skills.append(f"pohunek:{name}")
+
+context = Context()
+module.register(context)
+if context.tools != ["pohunek_hosts"]:
+    raise RuntimeError("controlled plugin tool inventory drifted")
+if context.hooks != ["pre_llm_call"]:
+    raise RuntimeError("controlled plugin hook inventory drifted")
+if context.skills != ["pohunek:pohunek"]:
+    raise RuntimeError("controlled plugin skill inventory drifted")
+print("plugin api tool pohunek_hosts")
+print("plugin api hook pre_llm_call")
+print("plugin api skill pohunek:pohunek")
+PY
+"#;
+
+    #[cfg(unix)]
     fn fake_hermes(root: &Path, version: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
 
         let path = root.join("hermes");
-        let script = FAKE_HERMES_TEMPLATE
+        let script_content = FAKE_HERMES_TEMPLATE
             .replace("__VERSION__", version)
             .replace("__SEPARATOR__", super::USER_TURN_SEPARATOR)
             .replace("__MARKER__", super::USER_TURN_MARKER)
             .replace("__PANEL_TOP__", &super::assistant_panel_top())
             .replace("__PANEL_BOTTOM__", &super::assistant_panel_bottom());
-        fs::write(&path, script).expect("write fake Hermes");
+        fs::write(&path, script_content).expect("write fake Hermes");
         let mut permissions = fs::metadata(&path).expect("fake metadata").permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&path, permissions).expect("make fake executable");
+        script(root, "python", FAKE_PLUGIN_RUNTIME_TEMPLATE);
         path
     }
 
@@ -3375,6 +4497,116 @@ esac
         permissions.set_mode(0o700);
         fs::set_permissions(&path, permissions).expect("make controlled executable runnable");
         path
+    }
+
+    #[cfg(unix)]
+    fn hermes_start_marker(root: &Path) -> (PathBuf, PathBuf) {
+        let hermes = script(
+            root,
+            "hermes-start-marker",
+            "#!/bin/sh\n: > \"$0.started\"\nexit 2\n",
+        );
+        let marker = hermes.with_extension("started");
+        (hermes, marker)
+    }
+
+    #[cfg(unix)]
+    fn fake_pohunek(root: &Path) -> PathBuf {
+        script(root, "pohunek", "#!/bin/sh\nexit 2\n")
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum ControlledPohunekFailure {
+        None,
+        WrongStatus,
+        NonzeroDoctor,
+        MalformedUninstall,
+    }
+
+    #[cfg(unix)]
+    fn controlled_pohunek(
+        root: &Path,
+        record: &Path,
+        failure: ControlledPohunekFailure,
+    ) -> PathBuf {
+        let document = |action: &str,
+                        installed: bool,
+                        enabled: bool,
+                        access_mode: Option<&str>,
+                        doctor: Option<serde_json::Value>| {
+            serde_json::json!({
+                "cli_version": "controlled",
+                "protocol": {"minimum": 2, "maximum": 2},
+                "ok": {
+                    "action": action,
+                    "target_kind": "profile",
+                    "target_label": "pohunek-compat",
+                    "installed": installed,
+                    "enabled": enabled,
+                    "modified": false,
+                    "stale_stage": false,
+                    "stale_backup": false,
+                    "access_mode": access_mode,
+                    "allowed_host_count": access_mode.map(|_| 1),
+                    "doctor": doctor,
+                }
+            })
+            .to_string()
+        };
+        let checks: Vec<_> = (0..15)
+            .map(|index| {
+                serde_json::json!({
+                    "code": format!("controlled_{index}"),
+                    "status": "pass",
+                    "recovery_hint": "none",
+                })
+            })
+            .collect();
+        let install = document("install", true, true, Some("read_only"), None);
+        let status = document(
+            "status",
+            !matches!(failure, ControlledPohunekFailure::WrongStatus),
+            !matches!(failure, ControlledPohunekFailure::WrongStatus),
+            Some("read_only"),
+            None,
+        );
+        let doctor = document(
+            "doctor",
+            true,
+            true,
+            None,
+            Some(serde_json::json!({"ok": true, "checks": checks})),
+        );
+        let uninstall = document("uninstall", false, false, None, None);
+        let doctor_case = if matches!(failure, ControlledPohunekFailure::NonzeroDoctor) {
+            "exit 9".to_owned()
+        } else {
+            format!("printf '%s\\n' '{doctor}'")
+        };
+        let uninstall_case = if matches!(failure, ControlledPohunekFailure::MalformedUninstall) {
+            "printf '%s\\n' '{malformed'".to_owned()
+        } else {
+            format!("printf '%s\\n' '{uninstall}'")
+        };
+        script(
+            root,
+            &format!(
+                "pohunek-{}",
+                match failure {
+                    ControlledPohunekFailure::None => "ok",
+                    ControlledPohunekFailure::WrongStatus => "wrong",
+                    ControlledPohunekFailure::NonzeroDoctor => "nonzero",
+                    ControlledPohunekFailure::MalformedUninstall => "malformed",
+                }
+            ),
+            &format!(
+                "#!/bin/sh\nprintf 'BEGIN\\n' >> '{}'\nprintf '%s\\n' \"$@\" >> '{}'\nprintf 'END\\n' >> '{}'\ncase \"$2\" in\n  install) printf '%s\\n' '{install}' ;;\n  status) printf '%s\\n' '{status}' ;;\n  doctor) {doctor_case} ;;\n  uninstall) {uninstall_case} ;;\n  *) exit 8 ;;\nesac\n",
+                record.display(),
+                record.display(),
+                record.display()
+            ),
+        )
     }
 
     #[cfg(unix)]
@@ -3406,17 +4638,238 @@ esac
 
     #[test]
     #[cfg(unix)]
-    fn compatibility_accepts_pinned_model_free_shape() {
+    fn cli_and_fixture_plugin_accept_pinned_model_free_shape() {
         let repo = fixture_repo();
         let binary = fake_hermes(repo.path(), "0.20.0");
         refresh_with(repo.path(), &binary, fast_limits()).expect("controlled refresh succeeds");
 
-        let summary = compatibility_with(repo.path(), &binary, fast_limits())
-            .expect("pinned compatibility succeeds");
-
+        let lock = check_cli(repo.path(), &binary, fast_limits())
+            .expect("pinned CLI and fixture plugin checks succeed");
+        let manifest = load_golden_manifest(repo.path()).expect("load refreshed manifest");
+        validate_golden_manifest(repo.path(), &lock, &manifest, 64 * 1024, false)
+            .expect("refreshed model-free evidence succeeds");
+        let summary = compatibility_summary(lock, &manifest);
         assert_eq!(summary.release, "0.20.0");
         assert_eq!(summary.cli_checks, 8);
+        assert_eq!(summary.plugin_checks, 17);
         assert_eq!(summary.golden_records, 10);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn compatibility_rejects_missing_sibling_python_runtime() {
+        let repo = fixture_repo();
+        let binary = fake_hermes(repo.path(), "0.20.0");
+        fs::remove_file(repo.path().join("python")).expect("remove controlled sibling Python");
+
+        let error = check_cli(repo.path(), &binary, fast_limits())
+            .expect_err("a missing sibling Python runtime fails closed");
+
+        assert!(error.to_string().contains("no sibling Python runtime"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn compatibility_rejects_plugin_cli_shape_drift() {
+        let repo = fixture_repo();
+        let binary = fake_hermes(repo.path(), "0.20.0");
+        rewrite_script(
+            &binary,
+            "--no-allow-tool-override",
+            "--unsafe-tool-override",
+        );
+
+        let error = check_cli(repo.path(), &binary, fast_limits())
+            .expect_err("plugin CLI shape drift fails closed");
+
+        assert!(error.to_string().contains("plugins-enable-help"));
+        assert!(error.to_string().contains("--no-allow-tool-override"));
+    }
+
+    #[test]
+    fn compatibility_rejects_missing_plugin_api_contract() {
+        let mut value: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../../compat/hermes/compatibility-lock.json"
+        ))
+        .expect("parse checked compatibility lock as JSON");
+        value["plugin_contract"]["api"]
+            .as_object_mut()
+            .expect("plugin API is an object")
+            .remove("skill_method");
+
+        let error = serde_json::from_value::<super::Lock>(value)
+            .expect_err("a required plugin API contract field cannot be omitted");
+
+        assert!(error.to_string().contains("skill_method"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn production_integration_temp_parent_skips_git_ancestors_and_canonicalizes_fallback() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().expect("create temporary parent fixture");
+        let safe_parent = PathBuf::from("/var/tmp");
+        let safe_alias = fixture.path().join("safe-alias");
+        symlink(&safe_parent, &safe_alias).expect("create safe parent alias");
+        let canonical_safe_parent =
+            fs::canonicalize(&safe_parent).expect("canonicalize safe temporary parent");
+
+        for (name, marker_is_directory) in [("file", false), ("directory", true)] {
+            let workspace = fixture.path().join(format!("workspace-{name}"));
+            let unsafe_parent = workspace.join("nested");
+            fs::create_dir_all(&unsafe_parent).expect("create nested workspace directory");
+            if marker_is_directory {
+                fs::create_dir(workspace.join(".git"))
+                    .expect("create controlled Git directory marker");
+            } else {
+                fs::write(workspace.join(".git"), "gitdir: controlled\n")
+                    .expect("create controlled Git file marker");
+            }
+
+            let selected =
+                select_production_integration_temp_parent(vec![unsafe_parent, safe_alias.clone()])
+                    .expect("select safe fallback after Git workspace candidate");
+
+            assert_eq!(selected, canonical_safe_parent);
+        }
+    }
+
+    #[test]
+    fn production_integration_temp_parent_fails_closed_without_safe_candidate() {
+        let fixture = tempfile::tempdir().expect("create temporary parent fixture");
+        let workspace = fixture.path().join("workspace");
+        let unsafe_parent = workspace.join("nested");
+        fs::create_dir_all(&unsafe_parent).expect("create nested workspace directory");
+        fs::create_dir(workspace.join(".git")).expect("create controlled Git marker");
+
+        let error = select_production_integration_temp_parent(vec![unsafe_parent])
+            .expect_err("Git workspace ancestry must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("outside a Git workspace is available"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn integration_process_actions_are_ordered_and_exact() {
+        let lock: super::Lock = serde_json::from_slice(include_bytes!(
+            "../../../compat/hermes/compatibility-lock.json"
+        ))
+        .expect("parse checked compatibility lock");
+        let isolation = tempfile::tempdir().expect("create integration isolation");
+        let record = isolation.path().join("actions");
+        let pohunek = controlled_pohunek(isolation.path(), &record, ControlledPohunekFailure::None);
+        for step in &lock.plugin_contract.integration_lifecycle.steps {
+            run_pohunek_integration_action(
+                &pohunek,
+                Path::new("/controlled/hermes"),
+                step,
+                isolation.path(),
+                &[],
+                fast_limits(),
+            )
+            .expect("controlled lifecycle action succeeds");
+        }
+        let pohunek_path = pohunek.to_string_lossy();
+        assert_eq!(
+            fs::read_to_string(record).expect("read exact action arguments"),
+            format!(
+                "BEGIN\nintegration\ninstall\n--agent\nhermes\n--hermes-profile\npohunek-compat\n--hermes-bin\n/controlled/hermes\n--pohunek-bin\n{pohunek_path}\n--access-mode\nread_only\n--allow-host\nlocal\n--json\nEND\n\
+                 BEGIN\nintegration\nstatus\n--agent\nhermes\n--hermes-profile\npohunek-compat\n--hermes-bin\n/controlled/hermes\n--json\nEND\n\
+                 BEGIN\nintegration\ndoctor\n--agent\nhermes\n--hermes-profile\npohunek-compat\n--hermes-bin\n/controlled/hermes\n--json\nEND\n\
+                 BEGIN\nintegration\nuninstall\n--agent\nhermes\n--hermes-profile\npohunek-compat\n--hermes-bin\n/controlled/hermes\n--json\nEND\n"
+            )
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn integration_process_rejects_wrong_nonzero_malformed_and_missing_executables() {
+        let isolation = tempfile::tempdir().expect("create integration isolation");
+        let step = |action, expected_state| IntegrationStep {
+            action,
+            expected_state,
+        };
+        for (failure, action, state, expected) in [
+            (
+                ControlledPohunekFailure::WrongStatus,
+                IntegrationAction::Status,
+                IntegrationState::Installed,
+                "wrong state",
+            ),
+            (
+                ControlledPohunekFailure::NonzeroDoctor,
+                IntegrationAction::Doctor,
+                IntegrationState::Healthy,
+                "exited unsuccessfully",
+            ),
+            (
+                ControlledPohunekFailure::MalformedUninstall,
+                IntegrationAction::Uninstall,
+                IntegrationState::Absent,
+                "malformed envelope",
+            ),
+        ] {
+            let executable = controlled_pohunek(
+                isolation.path(),
+                &isolation.path().join("failure-actions"),
+                failure,
+            );
+            let error = run_pohunek_integration_action(
+                &executable,
+                Path::new("/controlled/hermes"),
+                &step(action, state),
+                isolation.path(),
+                &[],
+                fast_limits(),
+            )
+            .expect_err("controlled process failure is rejected");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        let missing = isolation.path().join("missing-pohunek");
+        let error = run_pohunek_integration_action(
+            &missing,
+            Path::new("/controlled/hermes"),
+            &step(IntegrationAction::Install, IntegrationState::Installed),
+            isolation.path(),
+            &[],
+            fast_limits(),
+        )
+        .expect_err("missing executable is rejected");
+        assert!(error
+            .to_string()
+            .contains("failed to start Hermes CLI check"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn compatibility_requires_an_absolute_canonical_safe_pohunek_executable() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let isolation = tempfile::tempdir().expect("create executable isolation");
+        let executable = script(isolation.path(), "safe-pohunek", "#!/bin/sh\nexit 0\n");
+        assert_eq!(
+            require_safe_pohunek_binary(&executable).expect("safe executable"),
+            executable
+        );
+        assert!(require_safe_pohunek_binary(Path::new("relative-pohunek"))
+            .expect_err("relative executable")
+            .to_string()
+            .contains("absolute"));
+        let link = isolation.path().join("linked-pohunek");
+        symlink(&executable, &link).expect("create executable symlink");
+        assert!(require_safe_pohunek_binary(&link)
+            .expect_err("symlink executable")
+            .to_string()
+            .contains("symlink"));
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o722))
+            .expect("make executable unsafe");
+        assert!(require_safe_pohunek_binary(&executable)
+            .expect_err("writable executable")
+            .to_string()
+            .contains("unsafe permissions"));
     }
 
     #[test]
@@ -3454,7 +4907,8 @@ esac
         rendered.push('\n');
         fs::write(manifest_path, rendered).expect("write rehashed manifest");
 
-        let error = compatibility_with(repo.path(), &binary, fast_limits())
+        let pohunek = fake_pohunek(repo.path());
+        let error = compatibility_with(repo.path(), &binary, &pohunek, fast_limits())
             .expect_err("every captured state is validated even when another state is pending");
 
         assert!(error
@@ -3515,8 +4969,8 @@ esac
         let repo = fixture_repo();
         let binary = fake_hermes(repo.path(), "0.21.0");
 
-        let error = compatibility_with(repo.path(), &binary, fast_limits())
-            .expect_err("wrong version fails closed");
+        let error =
+            check_cli(repo.path(), &binary, fast_limits()).expect_err("wrong version fails closed");
 
         assert!(error.to_string().contains("missing required text"));
     }
@@ -3545,7 +4999,7 @@ PY
     ;;"#,
         );
 
-        let error = compatibility_with(repo.path(), &binary, fast_limits())
+        let error = check_cli(repo.path(), &binary, fast_limits())
             .expect_err("preflight proxy egress must fail the no-request mock scenario");
 
         assert!(error
@@ -3570,7 +5024,8 @@ PY
         rendered.push('\n');
         fs::write(manifest_path, rendered).expect("write pending manifest");
 
-        let error = compatibility_with(repo.path(), &binary, fast_limits())
+        let pohunek = fake_pohunek(repo.path());
+        let error = compatibility_with(repo.path(), &binary, &pohunek, fast_limits())
             .expect_err("pending evidence fails closed");
 
         assert!(error.to_string().contains("is pending"));
@@ -3612,15 +5067,21 @@ PY
     #[cfg(unix)]
     fn compatibility_rejects_modified_lock() {
         let repo = fixture_repo();
+        let (hermes, marker) = hermes_start_marker(repo.path());
         let lock = repo.path().join(LOCK_PATH);
         let mut bytes = fs::read(&lock).expect("read lock");
         bytes.push(b'\n');
         fs::write(lock, bytes).expect("modify lock");
 
-        let error = compatibility_with(repo.path(), Path::new("missing-hermes"), fast_limits())
+        let pohunek = fake_pohunek(repo.path());
+        let error = compatibility_with(repo.path(), &hermes, &pohunek, fast_limits())
             .expect_err("modified lock fails before process launch");
 
         assert!(error.to_string().contains("lock digest mismatch"));
+        assert!(
+            !marker.exists(),
+            "the modified lock must be rejected before the Hermes process starts"
+        );
     }
 
     #[test]
@@ -3631,7 +5092,8 @@ PY
         let mut timeout_limits = fast_limits();
         timeout_limits.command_timeout = Duration::from_millis(50);
 
-        let timeout = compatibility_with(repo.path(), &sleeper, timeout_limits)
+        let pohunek = fake_pohunek(repo.path());
+        let timeout = compatibility_with(repo.path(), &sleeper, &pohunek, timeout_limits)
             .expect_err("slow CLI fails closed");
         assert!(timeout.to_string().contains("time limit"));
 
@@ -3643,7 +5105,7 @@ PY
         let mut output_limits = fast_limits();
         output_limits.command_output_bytes = 1024;
 
-        let output = compatibility_with(repo.path(), &noisy, output_limits)
+        let output = compatibility_with(repo.path(), &noisy, &pohunek, output_limits)
             .expect_err("noisy CLI fails closed");
         assert!(output.to_string().contains("output limit"));
     }

@@ -54,7 +54,11 @@ The assistant must:
   a resumable session. Use only a valid reported native reference. Programmatic
   Hermes input is restricted to bounded text with LF/tab as the only controls
   and is denied while owner approval is visible; do not bypass that guard with
-  raw attach bytes.
+  raw attach bytes. Use only the installed typed tool surface, an explicit host
+  allowlist, and the selected `read_only`, `manage`, or `full` access mode.
+  The plugin policy is an owner-private delegated-tool guardrail, not a
+  same-user sandbox; the daemon's exact eight-method origin-session denial is
+  authoritative. Ask a human to attach when typed model control is insufficient.
 
 The assistant may write host or repo configuration when that is the requested
 task, but it must stay inside the user's requested scope and respect the

@@ -59,6 +59,84 @@
       "required_text": ["usage: hermes profile rename [-h] old_name new_name"]
     }
   ],
+  "plugin_contract": {
+    "cli_checks": [
+      {
+        "id": "plugins-help",
+        "args": ["plugins", "--help"],
+        "required_text": ["usage: hermes plugins", "{install,update,remove,rm,uninstall,list,ls,enable,disable}"]
+      },
+      {
+        "id": "plugins-list-help",
+        "args": ["plugins", "list", "--help"],
+        "required_text": ["usage: hermes plugins list", "--enabled", "--user", "--no-bundled", "--plain", "--json"]
+      },
+      {
+        "id": "plugins-enable-help",
+        "args": ["plugins", "enable", "--help"],
+        "required_text": ["usage: hermes plugins enable", "--allow-tool-override", "--no-allow-tool-override", "name"]
+      },
+      {
+        "id": "plugins-disable-help",
+        "args": ["plugins", "disable", "--help"],
+        "required_text": ["usage: hermes plugins disable [-h] name"]
+      }
+    ],
+    "lifecycle": {
+      "plugin_name": "pohunek",
+      "plugin_key": "operators/pohunek",
+      "list_args": ["plugins", "list", "--json"],
+      "enable_args": ["plugins", "enable", "pohunek", "--no-allow-tool-override"],
+      "disable_args": ["plugins", "disable", "pohunek"],
+      "not_enabled_text": ["\"name\": \"pohunek\"", "\"status\": \"not enabled\""],
+      "enable_text": ["Plugin", "pohunek", "enabled.", "Takes effect on next session."],
+      "enabled_text": ["\"name\": \"pohunek\"", "\"status\": \"enabled\""],
+      "disable_text": ["Plugin", "pohunek", "disabled.", "Takes effect on next session."],
+      "disabled_text": ["\"name\": \"pohunek\"", "\"status\": \"disabled\""]
+    },
+    "targets": {
+      "named_profile": "pohunek-compat",
+      "named_profile_args": ["--profile", "pohunek-compat"],
+      "named_profile_relative_home": "profiles/pohunek-compat",
+      "custom_home_env": "HERMES_HOME",
+      "custom_home_must_be_absolute": true
+    },
+    "api": {
+      "manifest_required_fields": ["name", "version", "description", "provides_tools", "provides_hooks"],
+      "manifest_optional_fields": ["requires_env", "kind"],
+      "manifest_kind": "implicit_standalone",
+      "entrypoint_file": "__init__.py",
+      "entrypoint": "register(ctx)",
+      "tool_method": "ctx.register_tool",
+      "tool_registration_args": ["name", "toolset", "schema", "handler"],
+      "toolset": "pohunek",
+      "tool_schema_type": "object",
+      "tool_handler_args": "args: dict, **kwargs",
+      "tool_return": "JSON string",
+      "hook_method": "ctx.register_hook",
+      "hook_registration_args": ["hook_name", "callback"],
+      "skill_method": "ctx.register_skill",
+      "skill_registration_args": ["name", "path", "description"],
+      "skill_path_type": "pathlib.Path",
+      "skill_name": "pohunek",
+      "skill_qualified_name": "pohunek:pohunek",
+      "discovery_root": "plugins",
+      "discovery_category": "operators",
+      "maximum_category_depth": 1
+    },
+    "integration_lifecycle": {
+      "target_kind": "named_profile",
+      "target_value": "pohunek-compat",
+      "access_mode": "read_only",
+      "allowed_hosts": ["local"],
+      "steps": [
+        {"action": "install", "expected_state": "installed"},
+        {"action": "status", "expected_state": "installed"},
+        {"action": "doctor", "expected_state": "healthy"},
+        {"action": "uninstall", "expected_state": "absent"}
+      ]
+    }
+  },
   "golden_states": [
     "prompt-ready",
     "short-input",

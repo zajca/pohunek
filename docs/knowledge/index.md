@@ -13,7 +13,9 @@ Start here:
   [agent profiles](concepts/agent-profiles.md) describe the operating model.
 - [Setup](guides/setup.md), [project setup](guides/project-setup.md),
   [remote hosts](guides/remote-hosts.md), [launcher](guides/launcher.md), and
-  [GUI setup](guides/gui.md) cover common configuration paths.
+  [GUI setup](guides/gui.md) cover common configuration paths. The
+  [Hermes operator](guides/hermes-operator.md) documents the managed plugin,
+  policy, typed tools, lifecycle reporting, and recovery boundaries.
 - [Web control center](guides/web-control-center.md) covers the browser client,
   backend trust boundary, development stack, and TypeScript package surfaces.
 - [Debug daemon](runbooks/debug-daemon.md),

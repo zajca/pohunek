@@ -38,3 +38,8 @@ Do not overwrite existing user config unless the user asks for that behavior and
 the command supports it. For launcher details, see [launcher](launcher.md). For
 profile and secret boundaries, see [agent profiles](../concepts/agent-profiles.md)
 and [secrets](../safety/secrets.md).
+
+For the separately managed Hermes operator integration, use its typed install,
+status, doctor, update, and uninstall commands. Do not edit Hermes YAML, a
+database, credentials, or a real profile by hand; the install uses an isolated
+profile or custom absolute home. See [Hermes operator](hermes-operator.md).
