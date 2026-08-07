@@ -23,7 +23,6 @@ SPEC = importlib.util.spec_from_file_location(
 )
 assert SPEC is not None and SPEC.loader is not None
 PLUGIN = importlib.util.module_from_spec(SPEC)
-import sys
 sys.modules["pohunek"] = PLUGIN
 PLUGIN.__dict__["__POHUNEK_POLICY_PATH__"] = "/tmp/pohunek-plugin-test-policy.json"
 SPEC.loader.exec_module(PLUGIN)
@@ -576,6 +575,37 @@ class ToolTests(unittest.TestCase):
         missing = json.loads(tools.handlers()["pohunek_session_resume"]({"session": "missing"}))
         self.assertEqual(missing["error"]["code"], "plugin_session_not_found")
 
+    def test_user_controlled_positional_operands_follow_end_of_options(self) -> None:
+        tools = Tools(policy(), None)
+        runner = mock.Mock()
+
+        def response(invocation: Invocation) -> object:
+            command = invocation.argv[3]
+            if command == "list":
+                return [{"id": "s-1", "name": "peer"}]
+            if command == "output":
+                return {"data_base64": ""}
+            return {}
+
+        runner.run.side_effect = response
+        tools._runner = runner
+        leading_option = "--host=other.example"
+        calls = (
+            (tools.session_get, {"session": leading_option}, (leading_option,)),
+            (tools.screen, {"session": leading_option}, (leading_option,)),
+            (tools.output, {"session": leading_option}, (leading_option,)),
+            (tools.wait, {"session": leading_option, "timeout_ms": 10}, (leading_option,)),
+            (tools.diff, {"session": leading_option}, (leading_option,)),
+            (tools.rename, {"session": "peer", "name": "--json"}, ("s-1", "--json")),
+        )
+        for function, args, operands in calls:
+            with self.subTest(function=function.__name__):
+                runner.run.reset_mock()
+                function(args)
+                argv = runner.run.call_args.args[0].argv
+                self.assertEqual(argv[-len(operands) - 1], "--")
+                self.assertEqual(argv[-len(operands):], operands)
+
     def test_hosts_uses_policy_without_discovery(self) -> None:
         tools = Tools(policy(), None)
         runner = mock.Mock()
@@ -607,9 +637,10 @@ class ToolTests(unittest.TestCase):
         }))
         self.assertTrue(output["ok"])
         self.assertEqual(runner.run.call_args.args[0].argv, (
-            "--host", "local", "session", "output", "s", "--max-bytes", "16", "--json",
+            "--host", "local", "session", "output", "--max-bytes", "16", "--json",
             "--runtime-id", "r", "--runtime-generation", "0",
             "--after-offset", "18446744073709551615", "--wait-ms", "10",
+            "--", "s",
         ))
         runner.reset_mock()
         runner.run.return_value = {}
@@ -620,10 +651,11 @@ class ToolTests(unittest.TestCase):
         }))
         self.assertTrue(waited["ok"])
         self.assertEqual(runner.run.call_args.args[0].argv, (
-            "--host", "local", "session", "wait", "s", "--timeout-ms", "10", "--json",
+            "--host", "local", "session", "wait", "--timeout-ms", "10", "--json",
             "--runtime-id", "r", "--runtime-generation", "18446744073709551615",
             "--after-terminal-watermark", "0",
             "--after-output-offset", "18446744073709551615",
+            "--", "s",
         ))
 
     def test_output_cursor_roundtrips_u64_max_into_next_input(self) -> None:
@@ -643,9 +675,9 @@ class ToolTests(unittest.TestCase):
             "after_offset": cursor, "max_bytes": 16,
         }))
         self.assertTrue(second["ok"])
-        self.assertEqual(runner.run.call_args.args[0].argv[-6:], (
+        self.assertEqual(runner.run.call_args.args[0].argv[-8:], (
             "--runtime-id", "r", "--runtime-generation", maximum,
-            "--after-offset", maximum,
+            "--after-offset", maximum, "--", "s",
         ))
 
     def test_all_cursor_fields_reject_noncanonical_or_out_of_range_values(self) -> None:
@@ -710,6 +742,18 @@ class HookTests(unittest.TestCase):
         reporter.pre_llm_call({"session_id": "native", "prompt": "must-not-leak"})
         self.assertLess(time.monotonic() - started, 0.2)
         self.assertGreaterEqual(reporter.failures, 1)
+
+    def test_send_reads_fragmented_first_response_line(self) -> None:
+        reporter = HookReporter({})
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.recv.side_effect = [b'{"ok":', b'true}\nignored']
+
+        with mock.patch("pohunek.hooks.socket.socket", return_value=client):
+            response = reporter._send("/tmp/worker", {"type": "identity_report"})
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(client.recv.call_count, 2)
 
     def test_continuation_identity_uses_monotonic_sequences(self) -> None:
         reporter = HookReporter({

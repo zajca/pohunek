@@ -3,7 +3,7 @@
 //! Codex and Claude hook installation remains a local daemon RPC. Hermes is an
 //! owner-local plugin lifecycle and deliberately never contacts the daemon.
 
-// Rust guideline compliant 2026-08-06
+// Rust guideline compliant 2026-08-07
 
 use std::env;
 use std::fmt::Write as _;
@@ -101,6 +101,14 @@ pub(crate) struct HermesOptions {
     pub(crate) access_mode: Option<AccessModeArg>,
     /// Optional replacement host allowlist for install or update.
     pub(crate) allowed_hosts: Vec<String>,
+    /// Optional per-tool timeout for install or update.
+    pub(crate) tool_timeout_ms: Option<u32>,
+    /// Optional maximum tool-output size for install or update.
+    pub(crate) max_output_bytes: Option<u32>,
+    /// Optional maximum terminal-screen size for install or update.
+    pub(crate) max_screen_bytes: Option<u32>,
+    /// Optional maximum concurrent tool count for install or update.
+    pub(crate) max_concurrency: Option<u8>,
     /// Explicit acknowledgement for a newly supplied wildcard host.
     pub(crate) confirm_wildcard: bool,
     /// Explicit acknowledgement for modifying or removing changed managed files.
@@ -117,6 +125,10 @@ impl HermesOptions {
             || self.pohunek_bin.is_some()
             || self.access_mode.is_some()
             || !self.allowed_hosts.is_empty()
+            || self.tool_timeout_ms.is_some()
+            || self.max_output_bytes.is_some()
+            || self.max_screen_bytes.is_some()
+            || self.max_concurrency.is_some()
             || self.confirm_wildcard
             || self.confirm_modified
     }
@@ -133,6 +145,10 @@ impl HermesOptions {
                 self.pohunek_bin.is_some()
                     || self.access_mode.is_some()
                     || !self.allowed_hosts.is_empty()
+                    || self.tool_timeout_ms.is_some()
+                    || self.max_output_bytes.is_some()
+                    || self.max_screen_bytes.is_some()
+                    || self.max_concurrency.is_some()
                     || self.confirm_wildcard
                     || self.confirm_modified
             }
@@ -140,6 +156,10 @@ impl HermesOptions {
                 self.pohunek_bin.is_some()
                     || self.access_mode.is_some()
                     || !self.allowed_hosts.is_empty()
+                    || self.tool_timeout_ms.is_some()
+                    || self.max_output_bytes.is_some()
+                    || self.max_screen_bytes.is_some()
+                    || self.max_concurrency.is_some()
                     || self.confirm_wildcard
             }
         };
@@ -398,7 +418,7 @@ fn install_policy(options: &HermesOptions) -> Result<Policy, CliError> {
         return Err(hermes_error(HermesError::InvalidPolicy));
     }
     new_policy(
-        options.pohunek_bin.clone(),
+        options,
         access_mode.into(),
         options.allowed_hosts.clone(),
         options.confirm_wildcard,
@@ -417,7 +437,7 @@ fn update_policy(options: &HermesOptions, existing: &Policy) -> Result<Policy, C
         existing.allowed_hosts().map(str::to_owned).collect()
     };
     new_policy(
-        options.pohunek_bin.clone(),
+        options,
         access_mode,
         hosts,
         // Existing wildcard entries were explicitly confirmed at install time;
@@ -428,40 +448,58 @@ fn update_policy(options: &HermesOptions, existing: &Policy) -> Result<Policy, C
 }
 
 fn new_policy(
-    supplied_cli: Option<PathBuf>,
+    options: &HermesOptions,
     access_mode: AccessMode,
     allowed_hosts: Vec<String>,
     confirm_wildcard: bool,
     existing: Option<&Policy>,
 ) -> Result<Policy, CliError> {
-    let pohunek_cli = match (supplied_cli, existing) {
+    let pohunek_cli = match (options.pohunek_bin.clone(), existing) {
         (Some(path), _) => path,
         (None, Some(policy)) => policy.pohunek_cli().to_owned(),
         (None, None) => env::current_exe()
             .map_err(HermesError::from)
             .map_err(hermes_error)?,
     };
-    let (protocol_min, protocol_max) = if let Some(policy) = existing {
-        (policy.protocol_min(), policy.protocol_max())
-    } else {
-        let versions = protocol::SUPPORTED_PROTOCOL_VERSIONS;
-        (
-            i32::try_from(versions.minimum().get())
-                .map_err(|_error| hermes_error(HermesError::InvalidPolicy))?,
-            i32::try_from(versions.maximum().get())
-                .map_err(|_error| hermes_error(HermesError::InvalidPolicy))?,
-        )
-    };
+    // Policies always use this binary's range so updates repair drift that
+    // `assets/pohunek/cli.py::_validate_envelope` rejects as `pohunek_cli_incompatible`.
+    let versions = protocol::SUPPORTED_PROTOCOL_VERSIONS;
+    let protocol_min = i32::try_from(versions.minimum().get())
+        .map_err(|_error| hermes_error(HermesError::InvalidPolicy))?;
+    let protocol_max = i32::try_from(versions.maximum().get())
+        .map_err(|_error| hermes_error(HermesError::InvalidPolicy))?;
+    if existing.is_some_and(|policy| {
+        policy.protocol_min() != protocol_min || policy.protocol_max() != protocol_max
+    }) {
+        tracing::info!(
+            name: "hermes.integration.protocol_range.refresh",
+            protocol_min,
+            protocol_max,
+            "refreshing stored Hermes policy protocol range"
+        );
+    }
     Policy::new(PolicyInput {
         pohunek_cli,
         protocol_min,
         protocol_max,
         access_mode,
         allowed_hosts,
-        tool_timeout_ms: existing.map_or(MAX_TIMEOUT_MS, Policy::tool_timeout_ms),
-        max_output_bytes: existing.map_or(MAX_OUTPUT_BYTES, Policy::max_output_bytes),
-        max_screen_bytes: existing.map_or(MAX_SCREEN_BYTES, Policy::max_screen_bytes),
-        max_concurrency: existing.map_or(MAX_CONCURRENCY, Policy::max_concurrency),
+        tool_timeout_ms: options
+            .tool_timeout_ms
+            .or_else(|| existing.map(Policy::tool_timeout_ms))
+            .unwrap_or(MAX_TIMEOUT_MS),
+        max_output_bytes: options
+            .max_output_bytes
+            .or_else(|| existing.map(Policy::max_output_bytes))
+            .unwrap_or(MAX_OUTPUT_BYTES),
+        max_screen_bytes: options
+            .max_screen_bytes
+            .or_else(|| existing.map(Policy::max_screen_bytes))
+            .unwrap_or(MAX_SCREEN_BYTES),
+        max_concurrency: options
+            .max_concurrency
+            .or_else(|| existing.map(Policy::max_concurrency))
+            .unwrap_or(MAX_CONCURRENCY),
         wildcard_confirmation: WildcardConfirmation::new(confirm_wildcard),
     })
     .map_err(hermes_error)
@@ -552,18 +590,19 @@ fn result(
 }
 
 fn lifecycle_from_doctor(report: &doctor::Report) -> LifecycleState {
-    let passed = |code: &str| {
+    let has_status = |code: &str, status: doctor::Status| {
         report
             .checks
             .iter()
-            .any(|check| check.code == code && check.status == doctor::Status::Pass)
+            .any(|check| check.code == code && check.status == status)
     };
     LifecycleState {
-        installed: passed("plugin_ownership"),
-        enabled: passed("plugin_enabled"),
-        modified: passed("plugin_ownership") && !passed("asset_integrity"),
-        stale_stage: !passed("stale_stage"),
-        stale_backup: !passed("stale_backup"),
+        installed: has_status("plugin_ownership", doctor::Status::Pass),
+        enabled: has_status("plugin_enabled", doctor::Status::Pass),
+        modified: has_status("plugin_ownership", doctor::Status::Pass)
+            && has_status("asset_integrity", doctor::Status::Fail),
+        stale_stage: has_status("stale_stage", doctor::Status::Fail),
+        stale_backup: has_status("stale_backup", doctor::Status::Fail),
     }
 }
 
@@ -611,7 +650,31 @@ mod tests {
     use clap::ValueEnum as _;
     use protocol::{AgentKind, IntegrationInstallReport, IntegrationInstallResult};
 
-    use super::{agent_name, render_install_human, AccessModeArg, HookAgentArg};
+    use super::{
+        agent_name, lifecycle_from_doctor, render_install_human, AccessModeArg, HookAgentArg,
+    };
+    use crate::hermes_integration::doctor;
+    use crate::hermes_integration::policy::{
+        AccessMode, Policy, PolicyInput, WildcardConfirmation, MAX_CONCURRENCY, MAX_OUTPUT_BYTES,
+        MAX_SCREEN_BYTES, MAX_TIMEOUT_MS,
+    };
+
+    fn hermes_options() -> super::HermesOptions {
+        super::HermesOptions {
+            profile: None,
+            home: None,
+            hermes_bin: None,
+            pohunek_bin: None,
+            access_mode: None,
+            allowed_hosts: vec![],
+            tool_timeout_ms: None,
+            max_output_bytes: None,
+            max_screen_bytes: None,
+            max_concurrency: None,
+            confirm_wildcard: false,
+            confirm_modified: false,
+        }
+    }
 
     fn private_directory(path: &Path) {
         fs::create_dir_all(path).expect("create private directory");
@@ -625,6 +688,22 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         private_directory(&path);
         path
+    }
+
+    fn doctor_report(statuses: &[(&'static str, doctor::Status)]) -> doctor::Report {
+        let checks: Vec<doctor::Check> = statuses
+            .iter()
+            .copied()
+            .map(|(code, status)| doctor::Check {
+                code,
+                status,
+                recovery_hint: "test recovery",
+            })
+            .collect();
+        let ok = checks
+            .iter()
+            .all(|check| check.status == doctor::Status::Pass);
+        doctor::Report { ok, checks }
     }
 
     #[test]
@@ -679,6 +758,72 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_from_doctor_ignores_not_run_checks() {
+        let report = doctor_report(&[
+            ("plugin_ownership", doctor::Status::NotRun),
+            ("asset_integrity", doctor::Status::NotRun),
+            ("plugin_enabled", doctor::Status::NotRun),
+            ("stale_stage", doctor::Status::NotRun),
+            ("stale_backup", doctor::Status::NotRun),
+        ]);
+
+        let lifecycle = lifecycle_from_doctor(&report);
+
+        assert!(!lifecycle.installed);
+        assert!(!lifecycle.enabled);
+        assert!(!lifecycle.modified);
+        assert!(!lifecycle.stale_stage);
+        assert!(!lifecycle.stale_backup);
+    }
+
+    #[test]
+    fn lifecycle_from_doctor_reports_failed_stale_stage_check() {
+        let report = doctor_report(&[
+            ("stale_stage", doctor::Status::Fail),
+            ("stale_backup", doctor::Status::NotRun),
+        ]);
+
+        let lifecycle = lifecycle_from_doctor(&report);
+
+        assert!(lifecycle.stale_stage);
+        assert!(!lifecycle.stale_backup);
+    }
+
+    #[test]
+    fn lifecycle_from_doctor_maps_all_passed_checks() {
+        let report = doctor_report(&[
+            ("plugin_ownership", doctor::Status::Pass),
+            ("asset_integrity", doctor::Status::Pass),
+            ("plugin_enabled", doctor::Status::Pass),
+            ("stale_stage", doctor::Status::Pass),
+            ("stale_backup", doctor::Status::Pass),
+        ]);
+
+        let lifecycle = lifecycle_from_doctor(&report);
+
+        assert!(lifecycle.installed);
+        assert!(lifecycle.enabled);
+        assert!(!lifecycle.modified);
+        assert!(!lifecycle.stale_stage);
+        assert!(!lifecycle.stale_backup);
+    }
+
+    #[test]
+    fn lifecycle_from_doctor_requires_failed_asset_integrity_for_modified() {
+        let not_run = doctor_report(&[
+            ("plugin_ownership", doctor::Status::Pass),
+            ("asset_integrity", doctor::Status::NotRun),
+        ]);
+        let failed = doctor_report(&[
+            ("plugin_ownership", doctor::Status::Pass),
+            ("asset_integrity", doctor::Status::Fail),
+        ]);
+
+        assert!(!lifecycle_from_doctor(&not_run).modified);
+        assert!(lifecycle_from_doctor(&failed).modified);
+    }
+
+    #[test]
     fn renders_install_result_as_json_that_deserializes() {
         let result = IntegrationInstallResult {
             installed: vec![IntegrationInstallReport {
@@ -712,16 +857,7 @@ mod tests {
 
     #[test]
     fn install_requires_policy_inputs_and_new_wildcards_need_confirmation() {
-        let base = super::HermesOptions {
-            profile: None,
-            home: None,
-            hermes_bin: None,
-            pohunek_bin: None,
-            access_mode: None,
-            allowed_hosts: vec![],
-            confirm_wildcard: false,
-            confirm_modified: false,
-        };
+        let base = hermes_options();
         assert_eq!(
             super::install_policy(&base)
                 .expect_err("missing access mode")
@@ -744,17 +880,115 @@ mod tests {
     }
 
     #[test]
+    fn install_policy_uses_explicit_bounds_or_ceiling_defaults() {
+        let explicit = super::install_policy(&super::HermesOptions {
+            access_mode: Some(AccessModeArg::Manage),
+            allowed_hosts: vec!["local".to_owned()],
+            tool_timeout_ms: Some(MAX_TIMEOUT_MS / 2),
+            max_output_bytes: Some(MAX_OUTPUT_BYTES / 2),
+            max_screen_bytes: Some(MAX_SCREEN_BYTES / 2),
+            max_concurrency: Some(MAX_CONCURRENCY / 2),
+            ..hermes_options()
+        })
+        .expect("explicit policy bounds");
+        assert_eq!(explicit.tool_timeout_ms(), MAX_TIMEOUT_MS / 2);
+        assert_eq!(explicit.max_output_bytes(), MAX_OUTPUT_BYTES / 2);
+        assert_eq!(explicit.max_screen_bytes(), MAX_SCREEN_BYTES / 2);
+        assert_eq!(explicit.max_concurrency(), MAX_CONCURRENCY / 2);
+
+        let defaults = super::install_policy(&super::HermesOptions {
+            access_mode: Some(AccessModeArg::Manage),
+            allowed_hosts: vec!["local".to_owned()],
+            ..hermes_options()
+        })
+        .expect("default policy bounds");
+        assert_eq!(defaults.tool_timeout_ms(), MAX_TIMEOUT_MS);
+        assert_eq!(defaults.max_output_bytes(), MAX_OUTPUT_BYTES);
+        assert_eq!(defaults.max_screen_bytes(), MAX_SCREEN_BYTES);
+        assert_eq!(defaults.max_concurrency(), MAX_CONCURRENCY);
+    }
+
+    #[test]
+    fn update_policy_inherits_or_replaces_bounds() {
+        let existing = super::install_policy(&super::HermesOptions {
+            access_mode: Some(AccessModeArg::Manage),
+            allowed_hosts: vec!["local".to_owned()],
+            tool_timeout_ms: Some(MAX_TIMEOUT_MS / 2),
+            max_output_bytes: Some(MAX_OUTPUT_BYTES / 2),
+            max_screen_bytes: Some(MAX_SCREEN_BYTES / 2),
+            max_concurrency: Some(MAX_CONCURRENCY / 2),
+            ..hermes_options()
+        })
+        .expect("existing policy");
+
+        let inherited =
+            super::update_policy(&hermes_options(), &existing).expect("inherited policy bounds");
+        assert_eq!(inherited.tool_timeout_ms(), existing.tool_timeout_ms());
+        assert_eq!(inherited.max_output_bytes(), existing.max_output_bytes());
+        assert_eq!(inherited.max_screen_bytes(), existing.max_screen_bytes());
+        assert_eq!(inherited.max_concurrency(), existing.max_concurrency());
+
+        let replaced = super::update_policy(
+            &super::HermesOptions {
+                tool_timeout_ms: Some(MAX_TIMEOUT_MS / 4),
+                max_output_bytes: Some(MAX_OUTPUT_BYTES / 4),
+                max_screen_bytes: Some(MAX_SCREEN_BYTES / 4),
+                max_concurrency: Some(MAX_CONCURRENCY / 4),
+                ..hermes_options()
+            },
+            &existing,
+        )
+        .expect("replacement policy bounds");
+        assert_eq!(replaced.tool_timeout_ms(), MAX_TIMEOUT_MS / 4);
+        assert_eq!(replaced.max_output_bytes(), MAX_OUTPUT_BYTES / 4);
+        assert_eq!(replaced.max_screen_bytes(), MAX_SCREEN_BYTES / 4);
+        assert_eq!(replaced.max_concurrency(), MAX_CONCURRENCY / 4);
+    }
+
+    #[test]
+    fn update_policy_refreshes_the_supported_protocol_range() {
+        let versions = protocol::SUPPORTED_PROTOCOL_VERSIONS;
+        let current_min = i32::try_from(versions.minimum().get()).expect("protocol minimum");
+        let current_max = i32::try_from(versions.maximum().get()).expect("protocol maximum");
+        let old_version = current_min.checked_sub(1).expect("older protocol version");
+        let existing = Policy::new(PolicyInput {
+            pohunek_cli: std::env::current_exe().expect("test executable"),
+            protocol_min: old_version,
+            protocol_max: old_version,
+            access_mode: AccessMode::Manage,
+            allowed_hosts: vec!["local".to_owned()],
+            tool_timeout_ms: MAX_TIMEOUT_MS / 2,
+            max_output_bytes: MAX_OUTPUT_BYTES / 2,
+            max_screen_bytes: MAX_SCREEN_BYTES / 2,
+            max_concurrency: MAX_CONCURRENCY / 2,
+            wildcard_confirmation: WildcardConfirmation::new(false),
+        })
+        .expect("old installed policy");
+
+        let updated = super::update_policy(&hermes_options(), &existing)
+            .expect("policy with refreshed protocol range");
+
+        assert_eq!(updated.protocol_min(), current_min);
+        assert_eq!(updated.protocol_max(), current_max);
+        assert_eq!(updated.tool_timeout_ms(), existing.tool_timeout_ms());
+    }
+
+    #[test]
+    fn install_policy_returns_typed_error_for_out_of_range_bound() {
+        let error = super::install_policy(&super::HermesOptions {
+            access_mode: Some(AccessModeArg::Manage),
+            allowed_hosts: vec!["local".to_owned()],
+            tool_timeout_ms: Some(MAX_TIMEOUT_MS + 1),
+            ..hermes_options()
+        })
+        .expect_err("timeout above policy ceiling");
+
+        assert_eq!(error.to_protocol_error().code, "hermes_invalid_policy");
+    }
+
+    #[test]
     fn every_hermes_action_requires_an_explicit_target_and_rejects_irrelevant_flags() {
-        let no_target = super::HermesOptions {
-            profile: None,
-            home: None,
-            hermes_bin: None,
-            pohunek_bin: None,
-            access_mode: None,
-            allowed_hosts: vec![],
-            confirm_wildcard: false,
-            confirm_modified: false,
-        };
+        let no_target = hermes_options();
         for action in [
             super::HermesAction::Install,
             super::HermesAction::Status,
@@ -784,31 +1018,60 @@ mod tests {
                 .code,
             "integration_hermes_usage"
         );
+
+        for options in [
+            super::HermesOptions {
+                profile: Some("default".to_owned()),
+                tool_timeout_ms: Some(MAX_TIMEOUT_MS),
+                ..hermes_options()
+            },
+            super::HermesOptions {
+                profile: Some("default".to_owned()),
+                max_output_bytes: Some(MAX_OUTPUT_BYTES),
+                ..hermes_options()
+            },
+            super::HermesOptions {
+                profile: Some("default".to_owned()),
+                max_screen_bytes: Some(MAX_SCREEN_BYTES),
+                ..hermes_options()
+            },
+            super::HermesOptions {
+                profile: Some("default".to_owned()),
+                max_concurrency: Some(MAX_CONCURRENCY),
+                ..hermes_options()
+            },
+        ] {
+            assert!(options.is_explicit());
+            for action in [
+                super::HermesAction::Status,
+                super::HermesAction::Doctor,
+                super::HermesAction::Uninstall,
+            ] {
+                assert_eq!(
+                    options
+                        .validate_for_action(action)
+                        .expect_err("policy bound is invalid for read/remove action")
+                        .to_protocol_error()
+                        .code,
+                    "integration_hermes_usage"
+                );
+            }
+        }
     }
 
     #[test]
     fn update_preserves_a_confirmed_wildcard_without_reconfirming_it() {
         let existing = super::install_policy(&super::HermesOptions {
-            profile: None,
-            home: None,
-            hermes_bin: None,
-            pohunek_bin: None,
             access_mode: Some(AccessModeArg::Manage),
             allowed_hosts: vec!["*".to_owned()],
             confirm_wildcard: true,
-            confirm_modified: false,
+            ..hermes_options()
         })
         .expect("confirmed stored wildcard policy");
         let updated = super::update_policy(
             &super::HermesOptions {
-                profile: None,
-                home: None,
-                hermes_bin: None,
-                pohunek_bin: None,
                 access_mode: Some(AccessModeArg::Full),
-                allowed_hosts: vec![],
-                confirm_wildcard: false,
-                confirm_modified: false,
+                ..hermes_options()
             },
             &existing,
         )

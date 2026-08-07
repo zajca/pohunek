@@ -2,6 +2,8 @@
 
 ## Unreleased (2026-07-21)
 
+- Documented configurable Hermes plugin timeout, output, screen, and concurrency
+  bounds plus protocol-range repair during integration update.
 - Added the Hermes operator guide: explicit managed runtime selection, isolated
   plugin lifecycle, access and host policy, complete typed tool surface,
   origin-session protection, bounded control-loop recovery, and payload-free

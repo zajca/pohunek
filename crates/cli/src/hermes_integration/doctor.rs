@@ -4,7 +4,7 @@
 //! fixed local runner. It neither reads Hermes state databases nor contacts an
 //! allowed remote host.
 
-// Rust guideline compliant 2026-08-06
+// Rust guideline compliant 2026-08-07
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Read as _;
@@ -139,10 +139,10 @@ pub(crate) fn inspect(
         policy.is_some(),
         "repair the owner-private Pohunek policy and its schema",
     );
-    if let Some(policy) = policy.as_ref() {
+    if policy.is_some() {
+        // `Policy::from_json` validates both fields before returning a policy.
         set_pass(&mut checks, "host_allowlist_syntax");
         set_pass(&mut checks, "access_mode");
-        let _ = policy.allowed_hosts().len();
     }
 
     let lifecycle = target_safe.then(|| lifecycle::inspect(runner, target, policy_path));

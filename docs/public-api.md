@@ -963,7 +963,9 @@ absolute home.
 
 ```bash
 pohunek integration install --agent hermes --hermes-profile default \
-  --access-mode manage --allow-host local --json
+  --access-mode manage --allow-host local \
+  --tool-timeout-ms 8000 --max-output-bytes 262144 \
+  --max-screen-bytes 65536 --max-concurrency 1 --json
 pohunek integration doctor --agent hermes --hermes-profile default --json
 ```
 
@@ -979,6 +981,16 @@ protocol range, access mode, and host allowlist. `read_only` exposes only read
 tools, `manage` adds bounded management, and `full` alone adds stop/remove.
 Remote calls use the existing direct NetBird transport. The policy is a
 delegated-tool guardrail, not an authorization sandbox for a same-user process.
+
+Install and update accept the non-repeatable bounds `--tool-timeout-ms <u32>`,
+`--max-output-bytes <u32>`, `--max-screen-bytes <u32>`, and
+`--max-concurrency <u8>`. Values must be positive and cannot exceed the policy
+ceilings. Install defaults omitted bounds to their ceilings. Update inherits
+each omitted bound and replaces each supplied bound; it also always refreshes
+the stored protocol range from the updating Pohunek binary so it repairs
+protocol drift. Other installed policy fields remain unchanged unless their
+existing update flags replace them. Status, doctor, and uninstall do not accept
+the bound flags.
 
 The plugin never offers raw attach bytes, arbitrary protocol methods, raw argv,
 or force bypasses. It repeats the daemon-authoritative origin denial before a

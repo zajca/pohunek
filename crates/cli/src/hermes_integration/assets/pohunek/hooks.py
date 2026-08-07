@@ -159,8 +159,15 @@ class HookReporter:
             client.settimeout(self._deadline)
             client.connect(endpoint)
             client.sendall(encoded)
-            response = client.recv(_RESPONSE_BYTES)
-        return json.loads(response.splitlines()[0]) if response else None
+            response = bytearray()
+            while len(response) < _RESPONSE_BYTES:
+                chunk = client.recv(_RESPONSE_BYTES - len(response))
+                if not chunk:
+                    break
+                response.extend(chunk)
+                if b"\n" in chunk:
+                    break
+        return json.loads(bytes(response).split(b"\n", 1)[0]) if response else None
 
     def _next_sequence(self) -> int:
         self._sequence += 1

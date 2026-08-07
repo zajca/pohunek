@@ -117,10 +117,10 @@ jobs:
         working-directory: web
         run: bun run test:e2e
 
-      # The real daemon used by these suites spawns `pohunek-sessiond` by path,
-      # so both binaries must be present in target/debug.
-      - name: Build daemon and session worker for web e2e
-        run: cargo build -p pohunek-daemon -p pohunek-session-worker
+      # The real daemon spawns `pohunek-sessiond` by path, and the Hermes plugin
+      # e2e drives the real `pohunek` CLI, so all three binaries must be present.
+      - name: Build daemon, session worker, and CLI for web e2e
+        run: cargo build -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli
 
       - name: SDK e2e against real daemon
         working-directory: web
@@ -135,6 +135,8 @@ jobs:
         env:
           POHUNEK_E2E: "1"
           POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
+          POHUNEK_CLI_BIN: ${{ github.workspace }}/target/debug/pohunek
+          POHUNEK_PYTHON_BIN: /usr/bin/python3
 
   web-release:
     name: Build web control center for Linux x86_64

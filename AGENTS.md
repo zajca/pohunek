@@ -91,12 +91,15 @@ bun run test:e2e
 ```
 
 The real-daemon web suite is opt-in locally and mandatory in CI after building
-both `pohunekd` and `pohunek-sessiond` (the suite runs the daemon in subprocess
-worker mode, which spawns `pohunek-sessiond` from beside `pohunekd`):
+`pohunekd`, `pohunek-sessiond`, and `pohunek` (the suite runs the daemon in
+subprocess worker mode, which spawns `pohunek-sessiond` from beside `pohunekd`,
+and the Hermes plugin e2e drives the real CLI):
 
 ```bash
-cargo build -p pohunek-daemon -p pohunek-session-worker
+cargo build -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli
 POHUNEK_E2E=1 POHUNEK_DAEMON_BIN=/absolute/path/to/target/debug/pohunekd \
+  POHUNEK_CLI_BIN=/absolute/path/to/target/debug/pohunek \
+  POHUNEK_PYTHON_BIN=/usr/bin/python3 \
   bun test sdk/test/e2e.test.ts backend/test/real-daemon.e2e.test.ts
 ```
 

@@ -664,6 +664,18 @@ struct HermesCliOptions {
     /// Explicit host allowed by the generated or replacement policy; repeatable.
     #[arg(long = "allow-host")]
     allow_host: Vec<String>,
+    /// Bound one plugin tool invocation in milliseconds.
+    #[arg(long)]
+    tool_timeout_ms: Option<u32>,
+    /// Bound one plugin tool result in bytes.
+    #[arg(long)]
+    max_output_bytes: Option<u32>,
+    /// Bound one rendered terminal screen in bytes.
+    #[arg(long)]
+    max_screen_bytes: Option<u32>,
+    /// Bound concurrent plugin tool invocations.
+    #[arg(long)]
+    max_concurrency: Option<u8>,
     /// Acknowledge a newly supplied wildcard host entry.
     #[arg(long)]
     confirm_wildcard: bool,
@@ -681,6 +693,10 @@ impl From<HermesCliOptions> for commands::integration::HermesOptions {
             pohunek_bin: value.pohunek_bin,
             access_mode: value.access_mode,
             allowed_hosts: value.allow_host,
+            tool_timeout_ms: value.tool_timeout_ms,
+            max_output_bytes: value.max_output_bytes,
+            max_screen_bytes: value.max_screen_bytes,
+            max_concurrency: value.max_concurrency,
             confirm_wildcard: value.confirm_wildcard,
             confirm_modified: value.confirm_modified,
         }
@@ -718,6 +734,10 @@ impl From<HermesStatusCliOptions> for commands::integration::HermesOptions {
             pohunek_bin: None,
             access_mode: None,
             allowed_hosts: vec![],
+            tool_timeout_ms: None,
+            max_output_bytes: None,
+            max_screen_bytes: None,
+            max_concurrency: None,
             confirm_wildcard: false,
             confirm_modified: false,
         }
@@ -743,6 +763,10 @@ impl From<HermesDoctorCliOptions> for commands::integration::HermesOptions {
             pohunek_bin: None,
             access_mode: None,
             allowed_hosts: vec![],
+            tool_timeout_ms: None,
+            max_output_bytes: None,
+            max_screen_bytes: None,
+            max_concurrency: None,
             confirm_wildcard: false,
             confirm_modified: false,
         }
@@ -766,6 +790,18 @@ struct HermesUpdateCliOptions {
     /// Replace the host allowlist; repeatable.
     #[arg(long = "allow-host")]
     allow_host: Vec<String>,
+    /// Replace the per-tool timeout in milliseconds.
+    #[arg(long)]
+    tool_timeout_ms: Option<u32>,
+    /// Replace the maximum tool-result size in bytes.
+    #[arg(long)]
+    max_output_bytes: Option<u32>,
+    /// Replace the maximum rendered-screen size in bytes.
+    #[arg(long)]
+    max_screen_bytes: Option<u32>,
+    /// Replace the maximum concurrent plugin tool count.
+    #[arg(long)]
+    max_concurrency: Option<u8>,
     /// Acknowledge a newly supplied wildcard host entry.
     #[arg(long)]
     confirm_wildcard: bool,
@@ -783,6 +819,10 @@ impl From<HermesUpdateCliOptions> for commands::integration::HermesOptions {
             pohunek_bin: value.pohunek_bin,
             access_mode: value.access_mode,
             allowed_hosts: value.allow_host,
+            tool_timeout_ms: value.tool_timeout_ms,
+            max_output_bytes: value.max_output_bytes,
+            max_screen_bytes: value.max_screen_bytes,
+            max_concurrency: value.max_concurrency,
             confirm_wildcard: value.confirm_wildcard,
             confirm_modified: value.confirm_modified,
         }
@@ -811,6 +851,10 @@ impl From<HermesUninstallCliOptions> for commands::integration::HermesOptions {
             pohunek_bin: None,
             access_mode: None,
             allowed_hosts: vec![],
+            tool_timeout_ms: None,
+            max_output_bytes: None,
+            max_screen_bytes: None,
+            max_concurrency: None,
             confirm_wildcard: false,
             confirm_modified: value.confirm_modified,
         }
@@ -2068,6 +2112,14 @@ mod tests {
             "read_only",
             "--allow-host",
             "local",
+            "--tool-timeout-ms",
+            "8000",
+            "--max-output-bytes",
+            "262144",
+            "--max-screen-bytes",
+            "65536",
+            "--max-concurrency",
+            "1",
             "--json",
         ])
         .expect("parse explicit Hermes install");
@@ -2083,9 +2135,78 @@ mod tests {
             } => {
                 assert_eq!(hermes.hermes_profile.as_deref(), Some("default"));
                 assert_eq!(hermes.allow_host, ["local"]);
+                assert_eq!(hermes.tool_timeout_ms, Some(8_000));
+                assert_eq!(hermes.max_output_bytes, Some(262_144));
+                assert_eq!(hermes.max_screen_bytes, Some(65_536));
+                assert_eq!(hermes.max_concurrency, Some(1));
                 assert!(json);
             }
             other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn integration_parses_explicit_hermes_update_policy_bounds() {
+        let cli = Cli::try_parse_from([
+            "pohunek",
+            "integration",
+            "update",
+            "--agent",
+            "hermes",
+            "--hermes-profile",
+            "default",
+            "--tool-timeout-ms",
+            "8000",
+            "--max-output-bytes",
+            "262144",
+            "--max-screen-bytes",
+            "65536",
+            "--max-concurrency",
+            "1",
+        ])
+        .expect("parse explicit Hermes update bounds");
+
+        match cli.command {
+            Commands::Integration {
+                action:
+                    IntegrationAction::Update {
+                        agent: commands::integration::HookAgentArg::Hermes,
+                        hermes,
+                        json: false,
+                    },
+            } => {
+                assert_eq!(hermes.tool_timeout_ms, Some(8_000));
+                assert_eq!(hermes.max_output_bytes, Some(262_144));
+                assert_eq!(hermes.max_screen_bytes, Some(65_536));
+                assert_eq!(hermes.max_concurrency, Some(1));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn integration_rejects_hermes_policy_bounds_for_other_actions() {
+        for action in ["status", "doctor", "uninstall"] {
+            for (flag, value) in [
+                ("--tool-timeout-ms", "8000"),
+                ("--max-output-bytes", "262144"),
+                ("--max-screen-bytes", "65536"),
+                ("--max-concurrency", "1"),
+            ] {
+                let error = Cli::try_parse_from([
+                    "pohunek",
+                    "integration",
+                    action,
+                    "--agent",
+                    "hermes",
+                    "--hermes-profile",
+                    "default",
+                    flag,
+                    value,
+                ])
+                .expect_err("policy bound must be rejected for this action");
+                assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+            }
         }
     }
 
@@ -2139,6 +2260,10 @@ mod tests {
                 pohunek_bin: None,
                 access_mode: None,
                 allowed_hosts: vec![],
+                tool_timeout_ms: None,
+                max_output_bytes: None,
+                max_screen_bytes: None,
+                max_concurrency: None,
                 confirm_wildcard: false,
                 confirm_modified: false,
             },

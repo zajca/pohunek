@@ -147,17 +147,17 @@ class Tools:
 
     def session_get(self, args: dict[str, Any], **kwargs: Any) -> Any:
         host, target = self._target(args)
-        return self._runner.run(Invocation(("--host", host, "session", "inspect", target, "--json")))
+        return self._runner.run(Invocation(("--host", host, "session", "inspect", "--json", "--", target)))
 
     def screen(self, args: dict[str, Any], **kwargs: Any) -> Any:
         host, target = self._target(args)
-        result = self._runner.run(Invocation(("--host", host, "session", "screen", target, "--json")))
+        result = self._runner.run(Invocation(("--host", host, "session", "screen", "--json", "--", target)))
         return _normalize_terminal(result, self._policy.max_screen_bytes)
 
     def output(self, args: dict[str, Any], **kwargs: Any) -> Any:
         host, target = self._target(args)
         maximum = _bounded_int(args.get("max_bytes", self._policy.max_output_bytes), 1, self._policy.max_output_bytes)
-        argv = ["--host", host, "session", "output", target, "--max-bytes", str(maximum), "--json"]
+        argv = ["--host", host, "session", "output", "--max-bytes", str(maximum), "--json"]
         _runtime_args(argv, args)
         if "after_offset" in args:
             argv.extend(("--after-offset", _canonical_u64(args["after_offset"])))
@@ -167,12 +167,13 @@ class Tools:
             argv.extend(("--wait-ms", str(_bounded_int(args["wait_ms"], 1, _MAX_WAIT_MS))))
         if "after_offset" in args and "runtime_id" not in args:
             raise CliError("plugin_invalid_request")
+        argv.extend(("--", target))
         return _normalize_terminal(self._runner.run(Invocation(tuple(argv))), maximum, decode_output=True)
 
     def wait(self, args: dict[str, Any], **kwargs: Any) -> Any:
         host, target = self._target(args)
         timeout = _bounded_int(args.get("timeout_ms"), 1, _MAX_WAIT_MS)
-        argv = ["--host", host, "session", "wait", target, "--timeout-ms", str(timeout), "--json"]
+        argv = ["--host", host, "session", "wait", "--timeout-ms", str(timeout), "--json"]
         _runtime_args(argv, args)
         if any(name in args for name in ("after_terminal_watermark", "after_output_offset")) and "runtime_id" not in args:
             raise CliError("plugin_invalid_request")
@@ -187,13 +188,15 @@ class Tools:
             argv.extend(("--state", state))
         for activity in _string_list(args.get("activities", []), "activities", 3, 32):
             argv.extend(("--activity", activity))
+        argv.extend(("--", target))
         return self._runner.run(Invocation(tuple(argv)))
 
     def diff(self, args: dict[str, Any], **kwargs: Any) -> Any:
         host, target = self._target(args)
-        argv = ["--host", host, "session", "diff", target, "--json"]
+        argv = ["--host", host, "session", "diff", "--json"]
         if "base" in args:
             argv.extend(("--base", _string(args["base"], "base", _MAX_NAME_CHARS)))
+        argv.extend(("--", target))
         return _normalize_terminal(self._runner.run(Invocation(tuple(argv))), self._policy.max_output_bytes)
 
     def start(self, args: dict[str, Any], **kwargs: Any) -> Any:
@@ -259,7 +262,7 @@ class Tools:
     def rename(self, args: dict[str, Any], **kwargs: Any) -> Any:
         host, target = self._mutation_target(args, "rename")
         name = _string(args.get("name"), "name", _MAX_NAME_CHARS)
-        return self._runner.run(Invocation(("--host", host, "session", "rename", target, name, "--json")))
+        return self._runner.run(Invocation(("--host", host, "session", "rename", "--json", "--", target, name)))
 
     def set_metadata(self, args: dict[str, Any], **kwargs: Any) -> Any:
         host, target = self._mutation_target(args, "set_metadata")

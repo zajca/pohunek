@@ -4,7 +4,7 @@
 //! clears the inherited environment, owns each child process group, and never
 //! retains subprocess output in an error.
 
-// Rust guideline compliant 2026-08-06
+// Rust guideline compliant 2026-08-07
 
 #![expect(
     clippy::map_err_ignore,
@@ -1179,6 +1179,8 @@ fn configure_child(command: &mut Command, fallback_fd_limit: libc::c_int) {
     // SAFETY: the closure calls only raw async-signal-safe descriptor syscalls.
     unsafe {
         command.pre_exec(move || {
+            // This also closes std::process's CLOEXEC exec-error pipe, so exec
+            // failures become non-zero child exits; both map to `HermesCommand`.
             close_inherited_fds(fallback_fd_limit);
             Ok(())
         });

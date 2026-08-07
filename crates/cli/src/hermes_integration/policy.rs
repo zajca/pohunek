@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-08-06
+// Rust guideline compliant 2026-08-07
 
 #![expect(
     clippy::map_err_ignore,
@@ -18,7 +18,7 @@ use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as
 use std::path::{Path, PathBuf};
 
 use nix::unistd::{access, AccessFlags};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest as _, Sha256};
 
 use super::error::Error;
@@ -102,7 +102,6 @@ pub(crate) struct PolicyInput {
 
 /// Versioned policy serialized for the embedded Hermes plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct Policy {
     schema_version: u32,
     pohunek_cli: PathBuf,
@@ -338,16 +337,6 @@ impl Serialize for Host {
         S: Serializer,
     {
         serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for Host {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(value, WildcardConfirmation::new(true)).map_err(serde::de::Error::custom)
     }
 }
 

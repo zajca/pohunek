@@ -49,6 +49,10 @@ pohunek integration install --agent hermes \
   --access-mode full \
   --allow-host local \
   --allow-host desktop \
+  --tool-timeout-ms 8000 \
+  --max-output-bytes 262144 \
+  --max-screen-bytes 65536 \
+  --max-concurrency 1 \
   --json
 
 pohunek integration install --agent hermes \
@@ -103,6 +107,22 @@ only when its exact host is listed; Pohunek reaches it directly over NetBird.
 The plugin never discovers or scans hosts implicitly. A wildcard host policy
 requires the installer's explicit wildcard confirmation and is still a delegated
 tool guardrail, not a network or same-user security boundary.
+
+Install and update accept four non-repeatable policy bounds:
+
+- `--tool-timeout-ms <u32>` limits one tool invocation to at most 60,000 ms.
+- `--max-output-bytes <u32>` limits one tool result to at most 1,048,576 bytes.
+- `--max-screen-bytes <u32>` limits one rendered screen to at most 262,144 bytes.
+- `--max-concurrency <u8>` limits concurrent tool invocations to at most 8.
+
+Each supplied value must be greater than zero and no greater than its listed
+ceiling; invalid input returns the typed `hermes_invalid_policy` error. An
+install without these flags uses the ceilings. An update without a bound flag
+inherits that installed bound, while a supplied flag replaces only its matching
+bound. Update always refreshes the policy protocol range from the Pohunek binary
+performing the update, repairing a policy whose stored range no longer overlaps
+the installed CLI. It otherwise preserves the installed CLI path, access mode,
+host allowlist, and bounds unless their replacement flags are supplied.
 
 The plugin preserves the daemon's exact origin-session protection. It must deny
 these eight methods when they target the session hosting Hermes:

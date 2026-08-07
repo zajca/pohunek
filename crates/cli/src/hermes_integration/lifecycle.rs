@@ -4,7 +4,7 @@
 //! this module. This module never launches Hermes; `HermesControl` is the
 //! narrow boundary the fixed runner implements later.
 
-// Rust guideline compliant 2026-08-06
+// Rust guideline compliant 2026-08-07
 
 #![expect(
     clippy::map_err_ignore,
@@ -26,7 +26,9 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write as _;
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{
+    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+};
 use std::path::{Component, Path, PathBuf};
 
 use nix::fcntl::{renameat2, RenameFlags};
@@ -992,7 +994,9 @@ fn create_or_validate_private_directory(path: &Path) -> Result<(), Error> {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(Error::UnsafeTarget),
         Ok(_) => validate_private_directory(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(path)?;
+            fs::DirBuilder::new()
+                .mode(PRIVATE_DIRECTORY_MODE)
+                .create(path)?;
             fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))?;
             validate_private_directory(path)
         }
@@ -1027,7 +1031,10 @@ fn validate_private_file(path: &Path, error: Error) -> Result<(), Error> {
 fn create_private_sibling(parent: &Path, prefix: &str) -> Result<PathBuf, Error> {
     for attempt in 0..SIBLING_NAME_ATTEMPTS {
         let path = parent.join(format!("{prefix}{}-{attempt}", std::process::id()));
-        match fs::create_dir(&path) {
+        match fs::DirBuilder::new()
+            .mode(PRIVATE_DIRECTORY_MODE)
+            .create(&path)
+        {
             Ok(()) => {
                 fs::set_permissions(&path, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))?;
                 return Ok(path);
