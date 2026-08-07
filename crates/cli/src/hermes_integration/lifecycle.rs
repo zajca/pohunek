@@ -1143,7 +1143,7 @@ fn remove_owned_file(path: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::{symlink, PermissionsExt as _};
+    use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;

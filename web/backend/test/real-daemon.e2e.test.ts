@@ -55,6 +55,8 @@ const READ_MARKER_TIMEOUT_MS = 10_000;
 const DAEMON_TERM_GRACE_MS = 5_000;
 const E2E_TEST_TIMEOUT_MS = 60_000;
 const PLUGIN_E2E_TIMEOUT_MS = 60_000;
+// Bun remains a backstop so the scenario-specific timeout reports the useful diagnostic first.
+const BUN_TEST_TIMEOUT_BACKSTOP_MARGIN_MS = 5_000;
 const PROGRAM_TIMEOUT_MS = 15_000;
 const PLUGIN_FIXTURE_TIMEOUT_MS = 45_000;
 const REMOTE_READY_TIMEOUT_MS = 10_000;
@@ -116,33 +118,44 @@ interface ExitStatus {
   readonly signal: NodeJS.Signals | null;
 }
 
-type SkippableTest = typeof test & { readonly skip: typeof test };
+interface SkippableTest {
+  (name: string, fn: () => void | Promise<void>, timeout?: number): void;
+  readonly skip: SkippableTest;
+}
 
 const skippableTest = test as SkippableTest;
-const realDaemonTest = E2E_ENABLED ? skippableTest : skippableTest.skip;
+const realDaemonTest: SkippableTest = E2E_ENABLED ? skippableTest : skippableTest.skip;
 
-realDaemonTest("real pohunekd supports the browser lifecycle through the backend origin", async () => {
-  await withTimeout(
-    withDaemon(async (daemon) => {
-      await withBackend(daemon, async (backend) => {
-        await runBrowserScenario(daemon, backend);
-      });
-    }),
-    E2E_TEST_TIMEOUT_MS,
-    `backend real-daemon e2e did not finish within ${E2E_TEST_TIMEOUT_MS}ms`,
-  );
-});
+realDaemonTest(
+  "real pohunekd supports the browser lifecycle through the backend origin",
+  async () => {
+    await withTimeout(
+      withDaemon(async (daemon) => {
+        await withBackend(daemon, async (backend) => {
+          await runBrowserScenario(daemon, backend);
+        });
+      }),
+      E2E_TEST_TIMEOUT_MS,
+      `backend real-daemon e2e did not finish within ${E2E_TEST_TIMEOUT_MS}ms`,
+    );
+  },
+  E2E_TEST_TIMEOUT_MS + BUN_TEST_TIMEOUT_BACKSTOP_MARGIN_MS,
+);
 
-realDaemonTest("embedded Hermes plugin tools control a real durable shell session", async () => {
-  const prerequisites = await pluginPrerequisites();
-  await withTimeout(
-    withPluginDaemon(prerequisites, async (daemon) => {
-      await runHermesPluginScenario(daemon);
-    }),
-    PLUGIN_E2E_TIMEOUT_MS,
-    `Hermes plugin real-daemon e2e did not finish within ${PLUGIN_E2E_TIMEOUT_MS}ms`,
-  );
-});
+realDaemonTest(
+  "embedded Hermes plugin tools control a real durable shell session",
+  async () => {
+    const prerequisites = await pluginPrerequisites();
+    await withTimeout(
+      withPluginDaemon(prerequisites, async (daemon) => {
+        await runHermesPluginScenario(daemon);
+      }),
+      PLUGIN_E2E_TIMEOUT_MS,
+      `Hermes plugin real-daemon e2e did not finish within ${PLUGIN_E2E_TIMEOUT_MS}ms`,
+    );
+  },
+  PLUGIN_E2E_TIMEOUT_MS + BUN_TEST_TIMEOUT_BACKSTOP_MARGIN_MS,
+);
 
 async function runHermesPluginScenario(daemon: PluginDaemonHarness): Promise<void> {
   await waitForRemoteListener(daemon.remoteCapture);

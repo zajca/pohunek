@@ -1354,7 +1354,7 @@ fn receive_reader(
 mod tests {
     use std::fs::OpenOptions;
     use std::os::fd::AsRawFd as _;
-    use std::os::unix::fs::{symlink, PermissionsExt as _};
+    use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
 

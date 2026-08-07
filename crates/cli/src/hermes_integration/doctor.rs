@@ -368,7 +368,7 @@ fn is_pass(checks: &[Check], code: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::{symlink, PermissionsExt as _};
+    use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
