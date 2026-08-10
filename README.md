@@ -758,11 +758,14 @@ Release workflow re-runs the gates on the tag, then builds and publishes glibc
 and MUSL x86_64 CLI and daemon archives, a glibc x86_64 GUI archive, and a
 self-contained Linux x86_64 web-control-center archive. The offline docs are
 bundled into every native component archive. CLI archives also contain
-`packaging/smoke-hermes-plugin-release`: run it from an extracted archive with
-the release `pohunek` binary and an explicitly supplied, preinstalled pinned
-Hermes executable. It creates an isolated temporary profile/state, requires
-that executable rather than downloading it, and fails if install, status,
-doctor, or uninstall cannot prove the embedded plugin and generated skill.
+`packaging/smoke-hermes-plugin-release`. Release automation provisions the
+source-locked Hermes runtime without provider credentials, runs the model-free
+compatibility gate, extracts each CLI archive, and executes its packaged smoke
+script against the extracted `pohunek` binary. Operators can repeat the same
+script with an explicitly supplied, preinstalled pinned Hermes executable. It
+creates an isolated temporary profile/state, requires that executable rather
+than downloading it, and fails if install, status, doctor, or uninstall cannot
+prove the embedded plugin and generated skill.
 
 ## License
 

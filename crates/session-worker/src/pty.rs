@@ -1,6 +1,6 @@
 //! Owns one PTY master and its managed process identity.
 
-// Rust guideline compliant 2026-07-29
+// Rust guideline compliant 2026-08-09
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -489,10 +489,13 @@ impl PtyOwner {
         let output_readiness = Arc::clone(&self.output_readiness);
         let tty_name = Arc::clone(&self.tty_name);
         let output_pause = tokio::task::spawn_blocking(move || {
+            // Stop the producer before contending for the ordering gate. This
+            // makes the remaining queue finite even when the reader repeatedly
+            // drains batches from an otherwise unbounded producer.
+            let output_pause = OutputPause::new(&tty_name)?;
             let _order = output_order
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let output_pause = OutputPause::new(&tty_name)?;
             let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
             drain_snapshot_boundary(
                 &output_reader,
@@ -558,10 +561,13 @@ impl PtyOwner {
         let output_readiness = Arc::clone(&self.output_readiness);
         let tty_name = Arc::clone(&self.tty_name);
         let (output_pause, subscriber) = tokio::task::spawn_blocking(move || {
+            // Stop the producer before contending for the ordering gate. This
+            // makes the remaining queue finite even when the reader repeatedly
+            // drains batches from an otherwise unbounded producer.
+            let output_pause = OutputPause::new(&tty_name)?;
             let _order = output_order
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let output_pause = OutputPause::new(&tty_name)?;
             let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
             drain_snapshot_boundary(
                 &output_reader,
@@ -1120,6 +1126,13 @@ mod tests {
     #[tokio::test]
     async fn resize_and_snapshot_complete_during_continuous_output() {
         let pty = spawn(shell("yes continuous-output"));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pty.output().next_offset() < READ_CHUNK_BYTES as u64 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("continuous output must start");
 
         tokio::time::timeout(
             Duration::from_secs(2),

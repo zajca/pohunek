@@ -2,6 +2,8 @@
 
 ## Unreleased (2026-07-21)
 
+- Documented source-locked, credential-free Hermes compatibility CI and
+  extracted release-archive plugin smoke verification.
 - Documented configurable Hermes plugin timeout, output, screen, and concurrency
   bounds plus protocol-range repair during integration update.
 - Added the Hermes operator guide: explicit managed runtime selection, isolated

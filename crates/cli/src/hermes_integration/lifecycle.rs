@@ -4,7 +4,7 @@
 //! this module. This module never launches Hermes; `HermesControl` is the
 //! narrow boundary the fixed runner implements later.
 
-// Rust guideline compliant 2026-08-07
+// Rust guideline compliant 2026-08-09
 
 #![expect(
     clippy::map_err_ignore,
@@ -1162,7 +1162,6 @@ fn remove_owned_file(path: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -136,4 +136,6 @@ For a release-artifact smoke, run the script bundled under
 the archive's `pohunek` binary and an absolute, preinstalled pinned Hermes
 executable. The script creates its own temporary home/profile/state and fails
 hard if either executable is missing or install/status/doctor/uninstall fails;
-it never downloads runtime dependencies or contacts a model/provider.
+it never downloads runtime dependencies or contacts a model/provider. The
+release workflow performs this check for every CLI target before publication;
+repeat it manually when validating a downloaded archive or local canary.
