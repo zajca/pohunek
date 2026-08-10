@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# Provision the repository-locked Hermes runtime for model-free CI checks.
+
+set -euo pipefail
+
+readonly SCRIPT_NAME="${0##*/}"
+readonly REQUIRED_ARGUMENTS=1
+readonly LOCK_RELATIVE_PATH="compat/hermes/compatibility-lock.json"
+readonly EXPECTED_LOCK_SHA256="a4ccdde37aa679859f03485a36b895610c9c2f44f46a44562a9e180bb97825b4"
+readonly EXPECTED_ARCHIVE_FORMAT="git archive --format=tar"
+readonly PYTHON_MINIMUM_MINOR=11
+readonly PYTHON_MAXIMUM_MINOR=14
+
+fail() {
+  printf '%s: %s\n' "$SCRIPT_NAME" "$1" >&2
+  exit 1
+}
+
+if [[ "$#" -ne "$REQUIRED_ARGUMENTS" ]]; then
+  printf 'usage: %s /absolute/path/to/install-root\n' "$SCRIPT_NAME" >&2
+  exit 2
+fi
+
+install_root="$1"
+if [[ "$install_root" != /* || "$install_root" == "/" || -e "$install_root" ]]; then
+  fail "install root must be an unused absolute path other than /"
+fi
+
+for executable in git python3 realpath sha256sum uv; do
+  command -v "$executable" >/dev/null 2>&1 || fail "required executable is unavailable: $executable"
+done
+
+script_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+lock_path="$script_root/$LOCK_RELATIVE_PATH"
+[[ -f "$lock_path" && ! -L "$lock_path" ]] || fail "compatibility lock is missing or is a symlink"
+observed_lock_sha256="$(sha256sum "$lock_path")"
+observed_lock_sha256="${observed_lock_sha256%% *}"
+[[ "$observed_lock_sha256" == "$EXPECTED_LOCK_SHA256" ]] \
+  || fail "compatibility lock SHA-256 does not match the reviewed digest"
+
+python_bin="$(command -v python3)"
+python_bin="$(cd -- "$(dirname -- "$python_bin")" && pwd -P)/${python_bin##*/}"
+"$python_bin" - "$PYTHON_MINIMUM_MINOR" "$PYTHON_MAXIMUM_MINOR" <<'PY'
+import sys
+
+minimum = int(sys.argv[1])
+maximum = int(sys.argv[2])
+if sys.version_info.major != 3 or not minimum <= sys.version_info.minor < maximum:
+    raise SystemExit(
+        f"Hermes compatibility requires Python 3.{minimum}-3.{maximum - 1}; "
+        f"got {sys.version_info.major}.{sys.version_info.minor}"
+    )
+PY
+
+readarray -d '' -t lock_fields < <(
+  "$python_bin" - "$lock_path" <<'PY'
+import json
+import pathlib
+import sys
+
+lock = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+fields = (
+    lock["release"],
+    lock["tag"],
+    lock["repository"],
+    lock["commit"],
+    lock["tree"],
+    lock["source_archive"]["format"],
+    lock["source_archive"]["sha256"],
+)
+if not all(isinstance(field, str) for field in fields):
+    raise SystemExit("Hermes compatibility lock fields must be strings")
+for field in fields:
+    sys.stdout.write(field)
+    sys.stdout.write("\0")
+PY
+)
+[[ "${#lock_fields[@]}" -eq 7 ]] || fail "compatibility lock is malformed"
+
+release="${lock_fields[0]}"
+tag="${lock_fields[1]}"
+repository="${lock_fields[2]}"
+commit="${lock_fields[3]}"
+tree="${lock_fields[4]}"
+archive_format="${lock_fields[5]}"
+archive_sha256="${lock_fields[6]}"
+
+[[ "$release" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "locked release is invalid"
+[[ "$tag" =~ ^[A-Za-z0-9._-]+$ ]] || fail "locked tag is invalid"
+[[ "$repository" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+  || fail "locked repository must be an HTTPS GitHub repository"
+[[ "$commit" =~ ^[0-9a-f]{40}$ ]] || fail "locked commit is invalid"
+[[ "$tree" =~ ^[0-9a-f]{40}$ ]] || fail "locked tree is invalid"
+[[ "$archive_format" == "$EXPECTED_ARCHIVE_FORMAT" ]] || fail "locked archive format is unsupported"
+[[ "$archive_sha256" =~ ^[0-9a-f]{64}$ ]] || fail "locked archive SHA-256 is invalid"
+
+# No provider or GitHub credential is needed. Clearing common credential and
+# Git transport variables prevents a caller's ambient secrets from reaching
+# the verified upstream build or its dependency installers.
+unset ANTHROPIC_API_KEY AZURE_OPENAI_API_KEY GITHUB_TOKEN GH_TOKEN GOOGLE_API_KEY
+unset HERMES_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY SSH_AUTH_SOCK
+unset GIT_ASKPASS GIT_SSH GIT_SSH_COMMAND
+unset PIP_EXTRA_INDEX_URL PIP_INDEX_URL PIP_TRUSTED_HOST
+unset UV_DEFAULT_INDEX UV_EXTRA_INDEX_URL UV_INDEX UV_INDEX_URL
+unset UV_KEYRING_PROVIDER UV_NATIVE_TLS UV_NO_VERIFY_HOST
+unset ACTIONS_CACHE_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
+unset ACTIONS_RESULTS_URL ACTIONS_RUNTIME_TOKEN
+unset GITHUB_ENV GITHUB_OUTPUT GITHUB_PATH GITHUB_STEP_SUMMARY
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_TERMINAL_PROMPT=0
+
+mkdir -m 0700 -- "$install_root"
+source_root="$install_root/source"
+archive_path="$install_root/source.tar"
+venv_root="$install_root/venv"
+uv_cache_root="$install_root/uv-cache"
+
+git init --quiet "$source_root" >&2
+git -C "$source_root" remote add origin "${repository}.git"
+git -C "$source_root" -c credential.helper= -c core.askPass= \
+  fetch --quiet --no-tags --depth=1 origin "refs/tags/$tag:refs/tags/$tag" >&2
+
+observed_commit="$(git -C "$source_root" rev-parse --verify "refs/tags/$tag^{commit}")"
+[[ "$observed_commit" == "$commit" ]] || fail "locked tag does not resolve to the locked commit"
+observed_tree="$(git -C "$source_root" rev-parse --verify "$commit^{tree}")"
+[[ "$observed_tree" == "$tree" ]] || fail "locked commit does not contain the locked tree"
+
+git -C "$source_root" archive --format=tar "$commit" >"$archive_path"
+observed_archive_sha256="$(sha256sum "$archive_path")"
+observed_archive_sha256="${observed_archive_sha256%% *}"
+[[ "$observed_archive_sha256" == "$archive_sha256" ]] \
+  || fail "canonical source archive SHA-256 does not match the compatibility lock"
+
+git -C "$source_root" checkout --quiet --detach "$commit" >&2
+
+# Copy the selected interpreter into the venv so Pohunek's production runner
+# can prove that the sibling Python runtime is contained by this install root.
+# `--without-pip` avoids an unnecessary installer; uv populates the environment
+# from the reviewed upstream lock in the next step.
+"$python_bin" -m venv --copies --without-pip "$venv_root" >&2
+
+# Use only the reviewed upstream lock. UV_PYTHON_DOWNLOADS=never prevents uv
+# from substituting a downloaded interpreter. --frozen is intentional: newer
+# uv releases re-resolve and reject this historical lock under --locked, while
+# frozen consumes its exact hash-pinned resolution without modifying it.
+UV_CACHE_DIR="$uv_cache_root" \
+  UV_NO_CONFIG=1 \
+  UV_PYTHON_DOWNLOADS=never \
+  UV_PROJECT_ENVIRONMENT="$venv_root" \
+  uv sync --extra all --frozen --project "$source_root" >&2
+
+runtime_bin="$(realpath -e "$venv_root/bin/python3")" \
+  || fail "locked installation did not produce a Python runtime"
+[[ "$runtime_bin" == "$install_root"/* ]] \
+  || fail "locked Python runtime escaped the isolated installation root"
+hermes_bin="$venv_root/bin/hermes"
+[[ -f "$hermes_bin" && -x "$hermes_bin" && ! -L "$hermes_bin" ]] \
+  || fail "locked installation did not produce a regular Hermes executable"
+mkdir -m 0700 -- "$install_root/home" "$install_root/hermes-home"
+version_output="$(
+  env -i \
+    ALL_PROXY="http://127.0.0.1:9" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$install_root/unreachable-dbus" \
+    HOME="$install_root/home" \
+    HERMES_HOME="$install_root/hermes-home" \
+    HTTPS_PROXY="http://127.0.0.1:9" \
+    HTTP_PROXY="http://127.0.0.1:9" \
+    PATH="/usr/bin:/bin" \
+    LANG=C \
+    LC_ALL=C \
+    NO_COLOR=1 \
+    NO_PROXY="localhost,127.0.0.1" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    all_proxy="http://127.0.0.1:9" \
+    https_proxy="http://127.0.0.1:9" \
+    http_proxy="http://127.0.0.1:9" \
+    no_proxy="localhost,127.0.0.1" \
+    "$hermes_bin" --version
+)"
+[[ "$version_output" == *"Hermes Agent v$release "* ]] \
+  || fail "installed Hermes executable does not report the locked release"
+
+printf '%s\n' "$hermes_bin"

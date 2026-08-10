@@ -23,6 +23,7 @@ _PLUGIN_PACKAGE_NAME = "pohunek_e2e_plugin"
 _MARKER = "pohunek-hermes-plugin-e2e-marker"
 _REMOTE_MARKER = "pohunek-hermes-plugin-remote-marker"
 _NATIVE_REFERENCE = "hermes-e2e-native"
+_GAP_COMPLETE_MARKER = "pohunek-hermes-gap-output-complete"
 _GAP_OUTPUT_BYTES = 11_000_000
 _MAX_RETRIES = 200
 _RETRY_DELAY_SECONDS = 0.05
@@ -147,6 +148,23 @@ def inspect_until_terminal(handlers: dict[str, Any], session_id: str) -> dict[st
             return session
         time.sleep(_RETRY_DELAY_SECONDS)
     raise FixtureError("initial Hermes runtime did not become terminal")
+
+
+def wait_for_screen_marker(
+    handlers: dict[str, Any], session_id: str, runtime_id: str, generation: str, marker: str,
+) -> None:
+    """Wait until the worker has processed one controlled terminal marker."""
+    for _ in range(_MAX_RETRIES):
+        screen = invoke(handlers, "pohunek_session_screen", {"session": session_id})
+        if not isinstance(screen, dict) or screen.get("session_id") != session_id:
+            raise FixtureError("screen logical ID mismatch while waiting for output")
+        if screen.get("runtime_id") != runtime_id or screen.get("runtime_generation") != generation:
+            raise FixtureError("screen runtime ID mismatch while waiting for output")
+        text = screen.get("text")
+        if isinstance(text, str) and marker in text:
+            return
+        time.sleep(_RETRY_DELAY_SECONDS)
+    raise FixtureError("controlled output completion marker was not observed")
 
 
 def require_session_result(value: Any, session_id: str, field: str) -> dict[str, Any]:
@@ -357,9 +375,14 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
 
     gap_command = (
         f"/usr/bin/head -c {_GAP_OUTPUT_BYTES} /dev/zero | "
-        "/usr/bin/tr '\\000' G; printf '\\n'\n"
+        "/usr/bin/tr '\\000' G; "
+        "printf '\\n%s%s\\n' 'pohunek-hermes-' 'gap-output-complete'; "
+        "read -r _pohunek_gap_release\n"
     )
     invoke(handlers, "pohunek_session_send", {"session": session_id, "input": gap_command})
+    wait_for_screen_marker(
+        handlers, session_id, runtime_id, generation, _GAP_COMPLETE_MARKER,
+    )
     gap_page = None
     for _ in range(_MAX_RETRIES):
         candidate = invoke(handlers, "pohunek_session_output", {
@@ -384,6 +407,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
     require_output_shape(recovered, session_id, runtime_id, generation)
     if recovered.get("start_offset") != gap_cursor or recovered.get("gap") is not None:
         raise FixtureError("gap recovery did not continue from the returned cursor")
+    invoke(handlers, "pohunek_session_send", {"session": session_id, "input": "\n"})
 
     invoke(handlers, "pohunek_session_resize", {"session": session_id, "cols": 100, "rows": 30})
     invoke(handlers, "pohunek_session_rename", {"session": session_id, "name": "hermes-plugin-renamed"})

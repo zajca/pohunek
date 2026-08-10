@@ -5397,6 +5397,8 @@ async fn reconnect_rejects_a_replacement_worker_before_mutating_registry() {
 
 #[tokio::test]
 async fn reconnect_persistence_failure_retries_without_orphaning_live_handle() {
+    const CONCURRENT_RETRY_LIMIT: usize = 32;
+
     let registry = SessionRegistry::new(SessionRegistryConfig {
         stop_grace: Duration::from_millis(50),
         store_path: Some(temp_store_path("reconnect-persist-retry")),
@@ -5438,12 +5440,26 @@ async fn reconnect_persistence_failure_retries_without_orphaning_live_handle() {
             .state,
         RuntimeState::Reconnecting
     );
-    assert!(matches!(
-        registry
+    // Other session tasks may commit between the durable write and the memory
+    // compare. Production retries that explicit outcome, so exercise the same
+    // bounded behavior instead of depending on test-executor scheduling.
+    let mut applied = false;
+    for _ in 0..CONCURRENT_RETRY_LIMIT {
+        match registry
             .adopt_reconnected_worker(&created.id, &expected, worker.clone())
-            .await,
-        super::RuntimeTransitionOutcome::Applied(_)
-    ));
+            .await
+        {
+            super::RuntimeTransitionOutcome::Applied(_) => {
+                applied = true;
+                break;
+            }
+            super::RuntimeTransitionOutcome::RetryableConcurrentChange => {
+                tokio::task::yield_now().await;
+            }
+            outcome => panic!("unexpected reconnect retry outcome: {outcome:?}"),
+        }
+    }
+    assert!(applied, "reconnect retry remained concurrently stale");
     assert_eq!(
         next_runtime_event(&mut events).await,
         protocol::event::SESSION_RUNTIME_RECONNECTED

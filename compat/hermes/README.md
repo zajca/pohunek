@@ -10,20 +10,35 @@ rather than repeat `0.20.0` in another mutable source.
 Run the model-free CI gate with an installed pinned executable on `PATH`:
 
 ```bash
-cargo xtask hermes compatibility
+cargo xtask hermes compatibility --pohunek-bin ABS
 ```
 
-For local diagnosis, `--hermes-bin <path>` selects another executable. The
-gate creates temporary `HOME`, `HERMES_HOME`, XDG, Python user, bytecode, and
+`ABS` must be the absolute, canonical path to a built `pohunek` executable with
+no symlink components or group/world-write permissions. For local diagnosis,
+`--hermes-bin <path>` selects another Hermes executable. The gate creates
+temporary `HOME`, `HERMES_HOME`, XDG, Python user, bytecode, and
 uv-cache locations. It clears the ambient environment except for the minimum
 process-launch variables, bounds every command by time and output size, checks
 the exact lock digest and source-archive contract, rejects a wrong Hermes
 version or CLI shape (including the used profile subcommands and their
 positional-argument ordering), and validates every committed golden record. It
-never runs a model turn, plugin command, installer, or user profile operation.
-Validation does not trust a matching checksum alone: every `captured` fixture
-must satisfy the state-specific prompt, response, tool, approval, interruption,
-exit, resume, or alternate-screen evidence contract recorded by the refresh.
+uses that isolated profile to exercise plugin list/enable/disable, tool, skill,
+and hook registration, plus Pohunek integration install/status/doctor/uninstall.
+It never runs a model turn, reads an operator profile, or accesses provider
+credentials. Validation does not trust a matching checksum alone: every
+`captured` fixture must satisfy the state-specific prompt, response, tool,
+approval, interruption, exit, resume, or alternate-screen evidence contract
+recorded by the refresh.
+
+GitHub Actions provisions the executable with
+`scripts/provision-hermes-compat`. The provisioner verifies the reviewed lock
+digest before any upstream command runs, then verifies the locked tag, commit,
+tree, and canonical source archive before installing the hash-locked upstream
+environment. It clears provider and GitHub credential variables, refuses Python
+fallback downloads, copies the selected interpreter into the isolated runtime
+root required by Pohunek's executable-containment checks, and uses the reviewed
+frozen upstream resolution. Its network-free fail-closed test is
+`scripts/tests/provision-hermes-compat.sh`.
 
 Refresh PTY evidence explicitly with the real pinned Hermes process and PTY
 against the repository-owned deterministic model mock:

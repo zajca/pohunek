@@ -106,6 +106,7 @@ Web control center client:
 
 Release packaging:
 
+- `.github/workflows/ci.yml`
 - `.github/workflows/release.yml`
 - `README.md`
 - `packaging/install-daemon.sh`
@@ -113,6 +114,8 @@ Release packaging:
 - `packaging/systemd/pohunek-session@.service.in`
 - `packaging/systemd/pohunek-sessions.slice`
 - `scripts/release`
+- `scripts/provision-hermes-compat`
+- `scripts/tests/provision-hermes-compat.sh`
 - `scripts/smoke-hermes-plugin-release`
 - `docs/runbooks/hermes-operator-plugin.md`
 - `docs/migrations/hermes-operator-plugin.md`

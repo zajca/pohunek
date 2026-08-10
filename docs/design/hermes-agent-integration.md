@@ -1,6 +1,6 @@
 # Design: First-Class Hermes Agent Integration
 
-Status: proposed (RFC)
+Status: implemented (M1-M3 released in v0.30.1)
 
 Research baseline: 2026-07-27
 
