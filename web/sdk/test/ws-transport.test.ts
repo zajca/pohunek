@@ -31,7 +31,7 @@ const SLOW_CLIENT_READ_DELAY_MS = 1;
 interface RelayFixture {
   daemon: MockDaemon;
   relay: RelayHandle;
-  client(): Promise<Client>;
+  client(requestTimeoutMs?: number): Promise<Client>;
   raw(): Promise<RawStream>;
   attach(streamId: string): Promise<RawStream>;
   close(): Promise<void>;
@@ -125,7 +125,7 @@ describe("WebSocket transport through relay", () => {
   test("oversized daemon reply closes the WebSocket with a framing error", async () => {
     const fixture = await startRelayFixture([{ kind: "oversized" }]);
     try {
-      const client = await fixture.client();
+      const client = await fixture.client(200);
 
       const error = await expectClientError(client.call("daemon.health", null));
 
@@ -169,8 +169,8 @@ describe("WebSocket transport through relay", () => {
       const client = await fixture.client();
 
       const firstError = await expectClientError(client.call("daemon.health", null));
-      expect(firstError.toProtocolError().class).toBe("daemon");
-      expect(firstError.toProtocolError().code).toBe("remote_daemon_unavailable");
+      expect(firstError.toProtocolError().class).toBe("transport");
+      expect(firstError.toProtocolError().code).toBe("request_timeout");
       await fixture.daemon.nextRequest();
 
       const secondError = await expectClientError(client.call("daemon.health", null));
@@ -379,7 +379,7 @@ async function startRelayFixture(steps: Parameters<typeof startUnixDaemon>[0]): 
     return {
       daemon,
       relay,
-      client: (): Promise<Client> => Client.connectWs(relay.url, RELAY_HOST, { requestTimeoutMs: 20 }),
+      client: (requestTimeoutMs = 20): Promise<Client> => Client.connectWs(relay.url, RELAY_HOST, { requestTimeoutMs }),
       raw: (): Promise<RawStream> => connectRawWs(relay.url, RELAY_HOST),
       attach: (streamId: string): Promise<RawStream> => attachRawWs(relay.url, RELAY_HOST, streamId),
       close: async (): Promise<void> => {

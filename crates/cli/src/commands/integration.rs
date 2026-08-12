@@ -3,7 +3,7 @@
 //! Codex and Claude hook installation remains a local daemon RPC. Hermes is an
 //! owner-local plugin lifecycle and deliberately never contacts the daemon.
 
-// Rust guideline compliant 2026-08-07
+// Rust guideline compliant 2026-08-12
 
 use std::env;
 use std::fmt::Write as _;
@@ -25,8 +25,8 @@ use crate::hermes_integration::lifecycle::{
     self, InstallRequest, LifecycleState, UninstallRequest,
 };
 use crate::hermes_integration::policy::{
-    self, AccessMode, Policy, PolicyInput, WildcardConfirmation, MAX_CONCURRENCY, MAX_OUTPUT_BYTES,
-    MAX_SCREEN_BYTES, MAX_TIMEOUT_MS,
+    self, AccessMode, Policy, PolicyInput, WildcardConfirmation, DEFAULT_REQUEST_TIMEOUT_MS,
+    MAX_CONCURRENCY, MAX_OUTPUT_BYTES, MAX_SCREEN_BYTES, MAX_TIMEOUT_MS,
 };
 use crate::hermes_integration::runner::HermesRunner;
 use crate::hermes_integration::target::{ProfileName, TargetContext, TargetSelection};
@@ -103,6 +103,8 @@ pub(crate) struct HermesOptions {
     pub(crate) allowed_hosts: Vec<String>,
     /// Optional per-tool timeout for install or update.
     pub(crate) tool_timeout_ms: Option<u32>,
+    /// Optional session-creation response timeout for install or update.
+    pub(crate) request_timeout_ms: Option<u32>,
     /// Optional maximum tool-output size for install or update.
     pub(crate) max_output_bytes: Option<u32>,
     /// Optional maximum terminal-screen size for install or update.
@@ -126,6 +128,7 @@ impl HermesOptions {
             || self.access_mode.is_some()
             || !self.allowed_hosts.is_empty()
             || self.tool_timeout_ms.is_some()
+            || self.request_timeout_ms.is_some()
             || self.max_output_bytes.is_some()
             || self.max_screen_bytes.is_some()
             || self.max_concurrency.is_some()
@@ -146,6 +149,7 @@ impl HermesOptions {
                     || self.access_mode.is_some()
                     || !self.allowed_hosts.is_empty()
                     || self.tool_timeout_ms.is_some()
+                    || self.request_timeout_ms.is_some()
                     || self.max_output_bytes.is_some()
                     || self.max_screen_bytes.is_some()
                     || self.max_concurrency.is_some()
@@ -157,6 +161,7 @@ impl HermesOptions {
                     || self.access_mode.is_some()
                     || !self.allowed_hosts.is_empty()
                     || self.tool_timeout_ms.is_some()
+                    || self.request_timeout_ms.is_some()
                     || self.max_output_bytes.is_some()
                     || self.max_screen_bytes.is_some()
                     || self.max_concurrency.is_some()
@@ -488,6 +493,10 @@ fn new_policy(
             .tool_timeout_ms
             .or_else(|| existing.map(Policy::tool_timeout_ms))
             .unwrap_or(MAX_TIMEOUT_MS),
+        request_timeout_ms: options
+            .request_timeout_ms
+            .or_else(|| existing.map(Policy::request_timeout_ms))
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS),
         max_output_bytes: options
             .max_output_bytes
             .or_else(|| existing.map(Policy::max_output_bytes))
@@ -655,8 +664,8 @@ mod tests {
     };
     use crate::hermes_integration::doctor;
     use crate::hermes_integration::policy::{
-        AccessMode, Policy, PolicyInput, WildcardConfirmation, MAX_CONCURRENCY, MAX_OUTPUT_BYTES,
-        MAX_SCREEN_BYTES, MAX_TIMEOUT_MS,
+        AccessMode, Policy, PolicyInput, WildcardConfirmation, DEFAULT_REQUEST_TIMEOUT_MS,
+        MAX_CONCURRENCY, MAX_OUTPUT_BYTES, MAX_SCREEN_BYTES, MAX_TIMEOUT_MS,
     };
 
     fn hermes_options() -> super::HermesOptions {
@@ -668,6 +677,7 @@ mod tests {
             access_mode: None,
             allowed_hosts: vec![],
             tool_timeout_ms: None,
+            request_timeout_ms: None,
             max_output_bytes: None,
             max_screen_bytes: None,
             max_concurrency: None,
@@ -885,6 +895,7 @@ mod tests {
             access_mode: Some(AccessModeArg::Manage),
             allowed_hosts: vec!["local".to_owned()],
             tool_timeout_ms: Some(MAX_TIMEOUT_MS / 2),
+            request_timeout_ms: Some(MAX_TIMEOUT_MS / 4),
             max_output_bytes: Some(MAX_OUTPUT_BYTES / 2),
             max_screen_bytes: Some(MAX_SCREEN_BYTES / 2),
             max_concurrency: Some(MAX_CONCURRENCY / 2),
@@ -892,6 +903,7 @@ mod tests {
         })
         .expect("explicit policy bounds");
         assert_eq!(explicit.tool_timeout_ms(), MAX_TIMEOUT_MS / 2);
+        assert_eq!(explicit.request_timeout_ms(), MAX_TIMEOUT_MS / 4);
         assert_eq!(explicit.max_output_bytes(), MAX_OUTPUT_BYTES / 2);
         assert_eq!(explicit.max_screen_bytes(), MAX_SCREEN_BYTES / 2);
         assert_eq!(explicit.max_concurrency(), MAX_CONCURRENCY / 2);
@@ -903,6 +915,7 @@ mod tests {
         })
         .expect("default policy bounds");
         assert_eq!(defaults.tool_timeout_ms(), MAX_TIMEOUT_MS);
+        assert_eq!(defaults.request_timeout_ms(), DEFAULT_REQUEST_TIMEOUT_MS);
         assert_eq!(defaults.max_output_bytes(), MAX_OUTPUT_BYTES);
         assert_eq!(defaults.max_screen_bytes(), MAX_SCREEN_BYTES);
         assert_eq!(defaults.max_concurrency(), MAX_CONCURRENCY);
@@ -914,6 +927,7 @@ mod tests {
             access_mode: Some(AccessModeArg::Manage),
             allowed_hosts: vec!["local".to_owned()],
             tool_timeout_ms: Some(MAX_TIMEOUT_MS / 2),
+            request_timeout_ms: Some(MAX_TIMEOUT_MS / 4),
             max_output_bytes: Some(MAX_OUTPUT_BYTES / 2),
             max_screen_bytes: Some(MAX_SCREEN_BYTES / 2),
             max_concurrency: Some(MAX_CONCURRENCY / 2),
@@ -924,6 +938,10 @@ mod tests {
         let inherited =
             super::update_policy(&hermes_options(), &existing).expect("inherited policy bounds");
         assert_eq!(inherited.tool_timeout_ms(), existing.tool_timeout_ms());
+        assert_eq!(
+            inherited.request_timeout_ms(),
+            existing.request_timeout_ms()
+        );
         assert_eq!(inherited.max_output_bytes(), existing.max_output_bytes());
         assert_eq!(inherited.max_screen_bytes(), existing.max_screen_bytes());
         assert_eq!(inherited.max_concurrency(), existing.max_concurrency());
@@ -931,6 +949,7 @@ mod tests {
         let replaced = super::update_policy(
             &super::HermesOptions {
                 tool_timeout_ms: Some(MAX_TIMEOUT_MS / 4),
+                request_timeout_ms: Some(MAX_TIMEOUT_MS / 8),
                 max_output_bytes: Some(MAX_OUTPUT_BYTES / 4),
                 max_screen_bytes: Some(MAX_SCREEN_BYTES / 4),
                 max_concurrency: Some(MAX_CONCURRENCY / 4),
@@ -940,6 +959,7 @@ mod tests {
         )
         .expect("replacement policy bounds");
         assert_eq!(replaced.tool_timeout_ms(), MAX_TIMEOUT_MS / 4);
+        assert_eq!(replaced.request_timeout_ms(), MAX_TIMEOUT_MS / 8);
         assert_eq!(replaced.max_output_bytes(), MAX_OUTPUT_BYTES / 4);
         assert_eq!(replaced.max_screen_bytes(), MAX_SCREEN_BYTES / 4);
         assert_eq!(replaced.max_concurrency(), MAX_CONCURRENCY / 4);
@@ -958,6 +978,7 @@ mod tests {
             access_mode: AccessMode::Manage,
             allowed_hosts: vec!["local".to_owned()],
             tool_timeout_ms: MAX_TIMEOUT_MS / 2,
+            request_timeout_ms: MAX_TIMEOUT_MS / 4,
             max_output_bytes: MAX_OUTPUT_BYTES / 2,
             max_screen_bytes: MAX_SCREEN_BYTES / 2,
             max_concurrency: MAX_CONCURRENCY / 2,

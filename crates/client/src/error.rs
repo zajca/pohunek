@@ -2,6 +2,7 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use protocol::{EnvelopeError, ErrorClass, ProtocolError, ProtocolVersion, ProtocolVersionRange};
 
@@ -104,6 +105,15 @@ pub enum ClientError {
     RemoteDaemonUnavailable {
         /// The host whose daemon did not answer.
         host: String,
+    },
+
+    /// An established daemon request exceeded its response deadline.
+    #[error("timed out after {timeout:?} waiting for a daemon response")]
+    RequestTimeout {
+        /// Remote host involved in the request, or `None` for the local daemon.
+        host: Option<String>,
+        /// Configured response deadline that elapsed.
+        timeout: Duration,
     },
 
     /// A daemon on a remote host returned a typed protocol error.
@@ -223,6 +233,22 @@ impl ClientError {
             ClientError::RemoteDaemonUnavailable { host } => {
                 ProtocolError::remote_daemon_unavailable(host)
             }
+            ClientError::RequestTimeout { host, timeout } => ProtocolError::new(
+                ErrorClass::Transport,
+                "request_timeout",
+                host.as_ref().map_or_else(
+                    || format!("timed out after {timeout:?} waiting for the local daemon response"),
+                    |host| {
+                        format!(
+                            "timed out after {timeout:?} waiting for a response from host '{host}'"
+                        )
+                    },
+                ),
+                Some(
+                    "the request may have completed; reconcile daemon state before retrying a mutation"
+                        .to_owned(),
+                ),
+            ),
             ClientError::RemoteProtocol { host, source } => {
                 let mut err = source.clone();
                 err.msg = format!("host '{host}': {}", err.msg);
@@ -473,6 +499,23 @@ mod tests {
             "msg names host: {}",
             structured.msg
         );
+    }
+
+    #[test]
+    fn request_timeout_maps_to_transient_transport_code() {
+        let structured = ClientError::RequestTimeout {
+            host: Some("build-box".to_owned()),
+            timeout: Duration::from_secs(5),
+        }
+        .to_protocol_error();
+
+        assert_eq!(structured.class, ErrorClass::Transport);
+        assert_eq!(structured.code, "request_timeout");
+        assert!(structured.msg.contains("build-box"));
+        assert!(structured
+            .recover
+            .as_deref()
+            .is_some_and(|hint| hint.contains("reconcile")));
     }
 
     #[test]

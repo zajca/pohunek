@@ -667,6 +667,9 @@ struct HermesCliOptions {
     /// Bound one plugin tool invocation in milliseconds.
     #[arg(long)]
     tool_timeout_ms: Option<u32>,
+    /// Bound one session-creation daemon response wait in milliseconds.
+    #[arg(long)]
+    request_timeout_ms: Option<u32>,
     /// Bound one plugin tool result in bytes.
     #[arg(long)]
     max_output_bytes: Option<u32>,
@@ -694,6 +697,7 @@ impl From<HermesCliOptions> for commands::integration::HermesOptions {
             access_mode: value.access_mode,
             allowed_hosts: value.allow_host,
             tool_timeout_ms: value.tool_timeout_ms,
+            request_timeout_ms: value.request_timeout_ms,
             max_output_bytes: value.max_output_bytes,
             max_screen_bytes: value.max_screen_bytes,
             max_concurrency: value.max_concurrency,
@@ -735,6 +739,7 @@ impl From<HermesStatusCliOptions> for commands::integration::HermesOptions {
             access_mode: None,
             allowed_hosts: vec![],
             tool_timeout_ms: None,
+            request_timeout_ms: None,
             max_output_bytes: None,
             max_screen_bytes: None,
             max_concurrency: None,
@@ -764,6 +769,7 @@ impl From<HermesDoctorCliOptions> for commands::integration::HermesOptions {
             access_mode: None,
             allowed_hosts: vec![],
             tool_timeout_ms: None,
+            request_timeout_ms: None,
             max_output_bytes: None,
             max_screen_bytes: None,
             max_concurrency: None,
@@ -793,6 +799,9 @@ struct HermesUpdateCliOptions {
     /// Replace the per-tool timeout in milliseconds.
     #[arg(long)]
     tool_timeout_ms: Option<u32>,
+    /// Replace the session-creation response timeout in milliseconds.
+    #[arg(long)]
+    request_timeout_ms: Option<u32>,
     /// Replace the maximum tool-result size in bytes.
     #[arg(long)]
     max_output_bytes: Option<u32>,
@@ -820,6 +829,7 @@ impl From<HermesUpdateCliOptions> for commands::integration::HermesOptions {
             access_mode: value.access_mode,
             allowed_hosts: value.allow_host,
             tool_timeout_ms: value.tool_timeout_ms,
+            request_timeout_ms: value.request_timeout_ms,
             max_output_bytes: value.max_output_bytes,
             max_screen_bytes: value.max_screen_bytes,
             max_concurrency: value.max_concurrency,
@@ -852,6 +862,7 @@ impl From<HermesUninstallCliOptions> for commands::integration::HermesOptions {
             access_mode: None,
             allowed_hosts: vec![],
             tool_timeout_ms: None,
+            request_timeout_ms: None,
             max_output_bytes: None,
             max_screen_bytes: None,
             max_concurrency: None,
@@ -970,6 +981,9 @@ enum SessionAction {
         /// Read initial text from stdin. Alias: `--stdin`.
         #[arg(long = "input-stdin", alias = "stdin", conflicts_with = "input")]
         input_stdin: bool,
+        /// Override the daemon response timeout for this creation request.
+        #[arg(long, value_parser = commands::session::parse_request_timeout_ms)]
+        request_timeout_ms: Option<u32>,
         /// Session metadata in key=value form (repeatable). Split on the first
         /// `=` only, so a value may itself contain `=`. Each key may be set at
         /// most once; the daemon enforces size limits on the values.
@@ -1456,6 +1470,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     base_branch,
                     input,
                     input_stdin,
+                    request_timeout_ms,
                     meta,
                     yes,
                     json,
@@ -1480,6 +1495,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                             branch,
                             base_branch,
                             input,
+                            request_timeout_ms,
                             meta,
                         },
                         json,
@@ -2261,6 +2277,7 @@ mod tests {
                 access_mode: None,
                 allowed_hosts: vec![],
                 tool_timeout_ms: None,
+                request_timeout_ms: None,
                 max_output_bytes: None,
                 max_screen_bytes: None,
                 max_concurrency: None,
@@ -2338,6 +2355,7 @@ mod tests {
                         base_branch,
                         input,
                         input_stdin,
+                        request_timeout_ms,
                         meta,
                         yes,
                         json,
@@ -2354,6 +2372,7 @@ mod tests {
                 assert_eq!(base_branch, None);
                 assert_eq!(input, None);
                 assert!(!input_stdin);
+                assert_eq!(request_timeout_ms, None);
                 assert!(meta.is_empty(), "meta defaults to empty");
                 assert!(!yes, "yes defaults to false");
                 assert!(!json, "json defaults to false");

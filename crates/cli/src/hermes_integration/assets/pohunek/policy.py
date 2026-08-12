@@ -41,6 +41,7 @@ class Policy:
     access_mode: str
     allowed_hosts: frozenset[str]
     tool_timeout_ms: int
+    request_timeout_ms: int
     max_output_bytes: int
     max_screen_bytes: int
     max_concurrency: int
@@ -92,8 +93,8 @@ def _validate(raw: Any) -> Policy:
         raise PolicyError("policy must be an object")
     required = {
         "schema_version", "pohunek_cli", "protocol_min", "protocol_max", "access_mode",
-        "allowed_hosts", "tool_timeout_ms", "max_output_bytes", "max_screen_bytes",
-        "max_concurrency",
+        "allowed_hosts", "tool_timeout_ms", "request_timeout_ms", "max_output_bytes",
+        "max_screen_bytes", "max_concurrency",
     }
     if set(raw) != required:
         raise PolicyError("policy fields do not match the supported schema")
@@ -116,13 +117,20 @@ def _validate(raw: Any) -> Policy:
         raise PolicyError("allowed_hosts must be a nonempty string list")
     if len(set(hosts)) != len(hosts):
         raise PolicyError("allowed_hosts must not contain duplicates")
+    tool_timeout_ms = _integer(raw, "tool_timeout_ms", MIN_TIMEOUT_MS, MAX_TIMEOUT_MS)
+    request_timeout_ms = _integer(
+        raw, "request_timeout_ms", MIN_TIMEOUT_MS, MAX_TIMEOUT_MS
+    )
+    if request_timeout_ms >= tool_timeout_ms:
+        raise PolicyError("request_timeout_ms must be less than tool_timeout_ms")
     return Policy(
         pohunek_cli=cli,
         protocol_min=protocol_min,
         protocol_max=protocol_max,
         access_mode=access_mode,
         allowed_hosts=frozenset(hosts),
-        tool_timeout_ms=_integer(raw, "tool_timeout_ms", MIN_TIMEOUT_MS, MAX_TIMEOUT_MS),
+        tool_timeout_ms=tool_timeout_ms,
+        request_timeout_ms=request_timeout_ms,
         max_output_bytes=_integer(raw, "max_output_bytes", MIN_OUTPUT_BYTES, MAX_OUTPUT_BYTES),
         max_screen_bytes=_integer(raw, "max_screen_bytes", MIN_SCREEN_BYTES, MAX_SCREEN_BYTES),
         max_concurrency=_integer(raw, "max_concurrency", MIN_CONCURRENCY, MAX_CONCURRENCY),

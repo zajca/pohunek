@@ -521,9 +521,9 @@ where
                 self.poisoned = Some(
                     "previous request timed out; pending daemon response may be stale".to_owned(),
                 );
-                Err(no_response_error(
+                Err(request_timeout_error(
                     self.remote_host.as_deref(),
-                    "timed out waiting for daemon response",
+                    self.request_timeout,
                 ))
             }
         }
@@ -550,9 +550,9 @@ where
             Ok(result) => result.map(|_ok| {
                 (*selected_version).expect("response validation always selects a protocol version")
             }),
-            Err(_elapsed) => Err(no_response_error(
+            Err(_elapsed) => Err(request_timeout_error(
                 self.remote_host.as_deref(),
-                "timed out waiting for subscription ack",
+                self.request_timeout,
             )),
         }
     }
@@ -910,6 +910,13 @@ fn no_response_error(remote_host: Option<&str>, local_msg: &str) -> ClientError 
             host: host.to_owned(),
         },
         None => ClientError::Framing(local_msg.to_owned()),
+    }
+}
+
+fn request_timeout_error(remote_host: Option<&str>, timeout: Duration) -> ClientError {
+    ClientError::RequestTimeout {
+        host: remote_host.map(str::to_owned),
+        timeout,
     }
 }
 
