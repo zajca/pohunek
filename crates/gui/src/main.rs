@@ -30,7 +30,8 @@ use attach::window_dimension_to_f32;
 use command::{discover_hosts_task, update};
 use config::AppConfig;
 use message::{
-    AssistantForm, InboxView, Message, MetadataEdit, ModalView, StartForm, TemplateRecipe,
+    AssistantForm, FormField, FormSelect, InboxView, Message, MetadataEdit, ModalView, StartForm,
+    TemplateRecipe,
 };
 use view::view;
 
@@ -162,6 +163,10 @@ struct PohunekApp {
     ui_state: UiState,
     start: StartForm,
     assistant: AssistantForm,
+    /// Logical focus for launch-form fields that Iced cannot focus natively.
+    form_focus: FormField,
+    /// Expanded launch-form select and its keyboard cursor.
+    form_select: Option<FormSelect>,
     /// Editable session input / rendered prompt buffer shown in the Start modal.
     prompt_editor: text_editor::Content,
     /// Editable request buffer shown in the Assistant modal.
@@ -214,6 +219,8 @@ impl PohunekApp {
                 ui_state: boot.ui_state,
                 start: StartForm::default(),
                 assistant: AssistantForm::default(),
+                form_focus: FormField::StartAgent,
+                form_select: None,
                 prompt_editor: text_editor::Content::new(),
                 assistant_editor: text_editor::Content::new(),
                 template_recipe: None,
@@ -268,6 +275,8 @@ impl PohunekApp {
             ui_state: UiState::default(),
             start: StartForm::default(),
             assistant: AssistantForm::default(),
+            form_focus: FormField::StartAgent,
+            form_select: None,
             prompt_editor: text_editor::Content::new(),
             assistant_editor: text_editor::Content::new(),
             template_recipe: None,
@@ -422,6 +431,8 @@ mod tests {
             ui_state: UiState::default(),
             start: StartForm::default(),
             assistant: AssistantForm::default(),
+            form_focus: FormField::StartAgent,
+            form_select: None,
             prompt_editor: text_editor::Content::new(),
             assistant_editor: text_editor::Content::new(),
             template_recipe: None,
@@ -506,6 +517,8 @@ mod tests {
             ui_state: UiState::default(),
             start: StartForm::default(),
             assistant: AssistantForm::default(),
+            form_focus: FormField::StartAgent,
+            form_select: None,
             prompt_editor: text_editor::Content::new(),
             assistant_editor: text_editor::Content::new(),
             template_recipe: None,

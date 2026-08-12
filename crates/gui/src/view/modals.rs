@@ -2,17 +2,13 @@
 
 // Rust guideline compliant 2026-08-12
 
-use iced::widget::{
-    button, checkbox, column, container, pick_list, row, text, text_editor, text_input,
-};
+use iced::widget::{button, checkbox, column, container, row, text, text_editor, text_input};
 use iced::{Center, Element};
-use pohunek_gui_core::assistant::Intent as AssistantIntent;
 use pohunek_gui_core::Toast;
-use protocol::ProviderKind;
 
 use crate::keyboard::{KeyBindingHelp, KeyContext};
-use crate::message::{Message, ASSISTANT_AUTO_AGENT_LABEL, BLANK_TEMPLATE_LABEL};
-use crate::selection::{available_actions, selected_assistant_project, selected_host_id};
+use crate::message::{FormField, Message};
+use crate::selection::{selected_assistant_project, selected_host_id};
 use crate::view::session::session_name_input;
 use crate::PohunekApp;
 
@@ -24,14 +20,6 @@ pub(crate) fn start_modal_content(app: &PohunekApp) -> Element<'_, Message> {
     } else {
         "Advanced >"
     };
-    let mut template_options = vec![BLANK_TEMPLATE_LABEL.to_owned()];
-    template_options.extend(available_actions(app, &ProviderKind::None));
-    let selected_template = Some(
-        app.start
-            .template
-            .clone()
-            .unwrap_or_else(|| BLANK_TEMPLATE_LABEL.to_owned()),
-    );
     let prompt_label = if app.start.template.is_some() {
         "Prompt (edit before starting)"
     } else {
@@ -39,22 +27,12 @@ pub(crate) fn start_modal_content(app: &PohunekApp) -> Element<'_, Message> {
     };
     let mut panel = column![
         row![
-            text("Agent").size(14),
-            pick_list(
-                start_agent_options(app),
-                Some(app.start.agent.clone()),
-                Message::StartAgentSelected
-            ),
-            text("Template").size(14),
-            pick_list(
-                template_options,
-                selected_template,
-                Message::StartTemplateSelected
-            ),
+            form_select(app, "Agent", FormField::StartAgent),
+            form_select(app, "Template", FormField::StartTemplate),
         ]
         .spacing(8)
         .align_y(Center),
-        session_name_input(app, Message::CreateSession),
+        session_name_input(app),
         text(prompt_label).size(13),
         text_editor(&app.prompt_editor)
             .id(crate::keyboard::start_prompt_input_id())
@@ -71,12 +49,10 @@ pub(crate) fn start_modal_content(app: &PohunekApp) -> Element<'_, Message> {
             row![
                 text_input("branch override", &app.start.branch)
                     .id(crate::keyboard::start_branch_input_id())
-                    .on_input(Message::StartBranchChanged)
-                    .on_submit(Message::CreateSession),
+                    .on_input(Message::StartBranchChanged),
                 text_input("base branch override", &app.start.base_branch)
                     .id(crate::keyboard::start_base_branch_input_id())
-                    .on_input(Message::StartBaseBranchChanged)
-                    .on_submit(Message::CreateSession),
+                    .on_input(Message::StartBaseBranchChanged),
             ]
             .spacing(8),
         );
@@ -97,33 +73,11 @@ pub(crate) fn assistant_modal_content(app: &PohunekApp) -> Element<'_, Message> 
     let context = selected_assistant_project(app).map_or_else(std::convert::identity, |target| {
         format!("{}  ·  {}", target.host.id, target.project_ref)
     });
-    let selected_agent = Some(
-        app.assistant
-            .agent
-            .clone()
-            .unwrap_or_else(|| ASSISTANT_AUTO_AGENT_LABEL.to_owned()),
-    );
     let mut panel = column![
         text(context).size(13),
         row![
-            text("Intent").size(14),
-            pick_list(
-                [
-                    AssistantIntent::Help,
-                    AssistantIntent::Setup,
-                    AssistantIntent::Project,
-                    AssistantIntent::Update,
-                    AssistantIntent::Debug,
-                ],
-                Some(app.assistant.intent),
-                Message::AssistantIntentSelected,
-            ),
-            text("Agent").size(14),
-            pick_list(
-                assistant_agent_options(app),
-                selected_agent,
-                Message::AssistantAgentSelected,
-            ),
+            form_select(app, "Intent", FormField::AssistantIntent),
+            form_select(app, "Agent", FormField::AssistantAgent),
         ]
         .spacing(8)
         .align_y(Center),
@@ -144,12 +98,10 @@ pub(crate) fn assistant_modal_content(app: &PohunekApp) -> Element<'_, Message> 
                 row![
                     text_input("branch override", &app.assistant.branch)
                         .id(crate::keyboard::assistant_branch_input_id())
-                        .on_input(Message::AssistantBranchChanged)
-                        .on_submit(Message::LaunchAssistant),
+                        .on_input(Message::AssistantBranchChanged),
                     text_input("base branch override", &app.assistant.base_branch)
                         .id(crate::keyboard::assistant_base_branch_input_id())
-                        .on_input(Message::AssistantBaseBranchChanged)
-                        .on_submit(Message::LaunchAssistant),
+                        .on_input(Message::AssistantBaseBranchChanged),
                 ]
                 .spacing(8),
             )
@@ -246,16 +198,37 @@ fn selected_host(app: &PohunekApp) -> Option<&pohunek_gui_core::HostView> {
         .and_then(|host_id| app.workspace.hosts.get(&host_id))
 }
 
-fn start_agent_options(app: &PohunekApp) -> Vec<String> {
-    selected_host(app).map_or_else(Vec::new, pohunek_gui_core::HostView::launchable_agents)
-}
-
-fn assistant_agent_options(app: &PohunekApp) -> Vec<String> {
-    let mut options = vec![ASSISTANT_AUTO_AGENT_LABEL.to_owned()];
-    if let Some(host) = selected_host(app) {
-        options.extend(host.launchable_assistant_agents());
+fn form_select<'a>(
+    app: &'a PohunekApp,
+    label: &'static str,
+    field: FormField,
+) -> Element<'a, Message> {
+    let selected = crate::keyboard::form_select_label(app, field);
+    let is_focused = app.form_focus == field;
+    let open = app.form_select.filter(|select| select.field == field);
+    let control = button(row![text(selected), text("v")].spacing(8))
+        .on_press(Message::ToggleFormSelect(field));
+    let control = if is_focused {
+        control.style(iced::widget::button::primary)
+    } else {
+        control.style(iced::widget::button::secondary)
+    };
+    let mut content = column![text(label).size(14), control].spacing(4);
+    if let Some(select) = open {
+        for (index, option) in crate::keyboard::form_select_options(app, field)
+            .into_iter()
+            .enumerate()
+        {
+            let option_button =
+                button(text(option)).on_press(Message::ChooseFormSelect { field, index });
+            content = content.push(if select.cursor == index {
+                option_button.style(iced::widget::button::primary)
+            } else {
+                option_button.style(iced::widget::button::secondary)
+            });
+        }
     }
-    options
+    content.into()
 }
 
 pub(crate) fn toast_view(toast: &Toast) -> Element<'_, Message> {

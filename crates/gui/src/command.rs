@@ -28,9 +28,9 @@ use crate::attach::{attach_task, spawn_notification, window_dimension_to_u32};
 use crate::config::AppConfig;
 use crate::keyboard;
 use crate::message::{
-    AssistantForm, DiscoveryResult, InboxView, ListDirection, Message, ModalView,
-    NotificationAction, ResolvedTemplate, StartForm, TemplateRecipe, ASSISTANT_AUTO_AGENT_LABEL,
-    BLANK_TEMPLATE_LABEL,
+    AssistantForm, DiscoveryResult, FormField, FormSelect, InboxView, ListDirection, Message,
+    ModalView, NotificationAction, ResolvedTemplate, StartForm, TemplateRecipe,
+    ASSISTANT_AUTO_AGENT_LABEL, BLANK_TEMPLATE_LABEL,
 };
 use crate::runtime;
 use crate::selection::{
@@ -246,6 +246,8 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         Message::OpenAssistantModal => {
             app.assistant = AssistantForm::default();
             app.assistant_editor = text_editor::Content::new();
+            app.form_focus = FormField::AssistantIntent;
+            app.form_select = None;
             app.modal = ModalView::Assistant;
             tasks.push(keyboard::focus_task(app));
         }
@@ -255,6 +257,7 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         }
         Message::CloseModal => {
             app.modal = ModalView::None;
+            app.form_select = None;
         }
         Message::StartAgentSelected(agent) => app.start.agent = agent,
         Message::StartTemplateSelected(template) => {
@@ -277,8 +280,14 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             }
             Err(err) => app.status = Some(err),
         },
-        Message::PromptEdited(action) => app.prompt_editor.perform(action),
-        Message::AssistantRequestEdited(action) => app.assistant_editor.perform(action),
+        Message::PromptEdited(action) => {
+            app.form_focus = FormField::StartPrompt;
+            app.prompt_editor.perform(action);
+        }
+        Message::AssistantRequestEdited(action) => {
+            app.form_focus = FormField::AssistantRequest;
+            app.assistant_editor.perform(action);
+        }
         Message::AssistantIntentSelected(intent) => app.assistant.intent = intent,
         Message::AssistantAgentSelected(agent) => {
             app.assistant.agent = (agent != ASSISTANT_AUTO_AGENT_LABEL).then_some(agent);
@@ -286,14 +295,79 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         Message::ToggleAssistantAdvanced => {
             app.assistant.show_advanced = !app.assistant.show_advanced;
         }
-        Message::AssistantBranchChanged(value) => app.assistant.branch = value,
-        Message::AssistantBaseBranchChanged(value) => app.assistant.base_branch = value,
+        Message::AssistantBranchChanged(value) => {
+            app.form_focus = FormField::AssistantBranch;
+            app.assistant.branch = value;
+        }
+        Message::AssistantBaseBranchChanged(value) => {
+            app.form_focus = FormField::AssistantBaseBranch;
+            app.assistant.base_branch = value;
+        }
         Message::AssistantNoSnapshotToggled(value) => app.assistant.no_snapshot = value,
         Message::AssistantDegradedToggled(value) => app.assistant.degraded = value,
+        Message::ToggleFormSelect(field) => {
+            if keyboard::form_field_is_visible(app, field) {
+                app.form_focus = field;
+                if app.form_select.is_some_and(|select| select.field == field) {
+                    app.form_select = None;
+                } else {
+                    let options = keyboard::form_select_options(app, field);
+                    if !options.is_empty() {
+                        app.form_select = Some(FormSelect {
+                            field,
+                            cursor: keyboard::form_select_cursor(app, field),
+                        });
+                    }
+                }
+                tasks.push(keyboard::form_field_focus_task(field));
+            }
+        }
+        Message::MoveFormSelect(direction) => {
+            move_form_select(app, direction);
+        }
+        Message::ConfirmFormSelect => {
+            if let Some(select) = app.form_select.take() {
+                if let Some(message) = keyboard::form_select_choice_message(app, select) {
+                    tasks.push(Task::done(message));
+                }
+            }
+        }
+        Message::CloseFormSelect => app.form_select = None,
+        Message::ChooseFormSelect { field, index } => {
+            if keyboard::form_field_is_visible(app, field) {
+                app.form_focus = field;
+                app.form_select = None;
+                if let Some(message) = keyboard::form_select_choice_message(
+                    app,
+                    FormSelect {
+                        field,
+                        cursor: index,
+                    },
+                ) {
+                    tasks.push(Task::done(message));
+                }
+                tasks.push(keyboard::form_field_focus_task(field));
+            }
+        }
+        Message::TraverseFormFocus { focused, direction } => {
+            let target = keyboard::next_form_field(app, focused, direction);
+            app.form_focus = target;
+            app.form_select = None;
+            tasks.push(keyboard::form_field_focus_task(target));
+        }
         Message::ToggleStartAdvanced => app.start.show_advanced = !app.start.show_advanced,
-        Message::StartBranchChanged(value) => app.start.branch = value,
-        Message::StartBaseBranchChanged(value) => app.start.base_branch = value,
-        Message::StartNameChanged(value) => app.start.name = value,
+        Message::StartBranchChanged(value) => {
+            app.form_focus = FormField::StartBranch;
+            app.start.branch = value;
+        }
+        Message::StartBaseBranchChanged(value) => {
+            app.form_focus = FormField::StartBaseBranch;
+            app.start.base_branch = value;
+        }
+        Message::StartNameChanged(value) => {
+            app.form_focus = FormField::StartName;
+            app.start.name = value;
+        }
         Message::CreateSession => match create_session_task(app) {
             Ok(task) => {
                 tasks.push(task);
@@ -473,8 +547,15 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             tasks.push(save_ui_state_task(app));
         }
         Message::KeyPressed { key, modifiers } => {
-            if let Some(task) = keyboard::form_focus_task(app, &key, modifiers) {
+            if let Some(message) = keyboard::form_submit_message(app, &key, modifiers) {
+                tasks.push(Task::done(message));
+            } else if let Some(message) = keyboard::form_select_key_message(app, &key, modifiers) {
+                tasks.push(Task::done(message));
+            } else if let Some(task) = keyboard::form_focus_task(app, &key, modifiers) {
                 tasks.push(task);
+            } else if keyboard::form_reserves_enter(app, &key) {
+                // Bare Enter confirms an expanded select, but never submits a
+                // launch form. Ctrl+Enter is the only form submit chord.
             } else {
                 // Replays the routed message(s) through this same reducer next
                 // tick, so a shortcut has no logic of its own to drift out of
@@ -490,9 +571,29 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
 
 fn open_start_modal(app: &mut PohunekApp) {
     app.start = StartForm::default();
+    app.form_focus = FormField::StartAgent;
+    app.form_select = None;
     app.template_recipe = None;
     app.prompt_editor = text_editor::Content::new();
     app.modal = ModalView::Start;
+}
+
+fn move_form_select(app: &mut PohunekApp, direction: ListDirection) {
+    let Some(mut select) = app.form_select else {
+        return;
+    };
+    let option_count = keyboard::form_select_options(app, select.field).len();
+    if option_count == 0 {
+        app.form_select = None;
+        return;
+    }
+    let cursor = select.cursor.min(option_count - 1);
+    select.cursor = match direction {
+        ListDirection::Up if cursor == 0 => option_count - 1,
+        ListDirection::Up => cursor - 1,
+        ListDirection::Down => (cursor + 1) % option_count,
+    };
+    app.form_select = Some(select);
 }
 
 fn move_list_selection(app: &mut PohunekApp, direction: ListDirection) {
@@ -1386,6 +1487,8 @@ mod tests {
             ui_state: UiState::default(),
             start: StartForm::default(),
             assistant: AssistantForm::default(),
+            form_focus: crate::message::FormField::StartAgent,
+            form_select: None,
             prompt_editor: text_editor::Content::new(),
             assistant_editor: text_editor::Content::new(),
             template_recipe: None,
@@ -1402,6 +1505,34 @@ mod tests {
             status: None,
             notified_intents: 0,
         }
+    }
+
+    #[test]
+    fn assistant_select_cursor_wraps_in_both_directions() {
+        let mut app = app_without_selection();
+        app.modal = ModalView::Assistant;
+        app.form_focus = FormField::AssistantIntent;
+        app.form_select = Some(FormSelect {
+            field: FormField::AssistantIntent,
+            cursor: 0,
+        });
+
+        move_form_select(&mut app, ListDirection::Up);
+        assert_eq!(app.form_select.expect("open select").cursor, 4);
+
+        move_form_select(&mut app, ListDirection::Down);
+        assert_eq!(app.form_select.expect("open select").cursor, 0);
+    }
+
+    #[test]
+    fn empty_start_agent_select_stays_closed() {
+        let mut app = app_without_selection();
+        app.modal = ModalView::Start;
+
+        let _ = update(&mut app, Message::ToggleFormSelect(FormField::StartAgent));
+
+        assert_eq!(app.form_focus, FormField::StartAgent);
+        assert!(app.form_select.is_none());
     }
 
     fn test_host() -> HostView {
