@@ -126,13 +126,17 @@ Default global bindings:
 | `open_assistant` | `a` | Open the Assistant modal. |
 
 Modal bindings include `escape`, `enter`, `shift+enter`, `o`, and `j`/`k` or
-the arrow keys for Inbox navigation. Add a partial `[keybindings]` table to
-override supported names. Unknown removed binding names fail configuration
-validation instead of silently doing nothing.
+the arrow keys for Inbox navigation. Launch forms reserve Enter for select
+confirmation and use Ctrl+Enter for submission. Add a partial `[keybindings]`
+table to override supported names. Unknown removed binding names fail
+configuration validation instead of silently doing nothing.
 
 Tab and Shift+Tab are conventional, non-configurable form navigation in the
-Start session modal. Focus cycles only through Name, Prompt, and visible
-Advanced branch fields, never into controls behind the modal overlay.
+Start session and Assistant modals. Focus cycles through both leading select
+fields, the prompt/name inputs, and visible Advanced branch fields, never into
+controls behind the modal overlay. On a focused select, Up or Down opens its
+options, the arrow keys move the option cursor, and Enter confirms the choice.
+Ctrl+Enter submits either launch form from any focused field.
 
 ## Session and Assistant Launch
 

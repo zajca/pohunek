@@ -13,9 +13,14 @@ use iced::keyboard::key::Named;
 use iced::keyboard::{self, Key, Modifiers};
 use iced::widget::{operation, Id};
 use iced::{Subscription, Task};
+use pohunek_gui_core::assistant::Intent as AssistantIntent;
+use protocol::ProviderKind;
 
-use crate::message::{InboxView, ListDirection, Message, ModalView};
-use crate::selection::{selected_project, selected_session};
+use crate::message::{
+    FormField, FormSelect, InboxView, ListDirection, Message, ModalView,
+    ASSISTANT_AUTO_AGENT_LABEL, BLANK_TEMPLATE_LABEL,
+};
+use crate::selection::{available_actions, selected_host_id, selected_project, selected_session};
 use crate::PohunekApp;
 
 /// Keyboard routing scope.
@@ -32,12 +37,6 @@ impl fmt::Display for KeyContext {
             Self::Modal => f.write_str("modal"),
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FormFocusDirection {
-    Next,
-    Previous,
 }
 
 /// Shortcut action resolved from a key chord.
@@ -61,9 +60,13 @@ const START_NAME_INPUT_ID: &str = "start-session-name";
 const START_PROMPT_INPUT_ID: &str = "start-session-prompt";
 const START_BRANCH_INPUT_ID: &str = "start-session-branch";
 const START_BASE_BRANCH_INPUT_ID: &str = "start-session-base-branch";
+const START_AGENT_SELECT_ID: &str = "start-session-agent";
+const START_TEMPLATE_SELECT_ID: &str = "start-session-template";
 const ASSISTANT_REQUEST_INPUT_ID: &str = "assistant-request";
 const ASSISTANT_BRANCH_INPUT_ID: &str = "assistant-branch";
 const ASSISTANT_BASE_BRANCH_INPUT_ID: &str = "assistant-base-branch";
+const ASSISTANT_INTENT_SELECT_ID: &str = "assistant-intent";
+const ASSISTANT_AGENT_SELECT_ID: &str = "assistant-agent";
 const READ_ONLY_TEXT_INPUT_ID: &str = "read-only-selectable-text";
 
 pub(crate) fn start_name_input_id() -> Id {
@@ -82,6 +85,14 @@ pub(crate) fn start_base_branch_input_id() -> Id {
     Id::new(START_BASE_BRANCH_INPUT_ID)
 }
 
+fn start_agent_select_id() -> Id {
+    Id::new(START_AGENT_SELECT_ID)
+}
+
+fn start_template_select_id() -> Id {
+    Id::new(START_TEMPLATE_SELECT_ID)
+}
+
 pub(crate) fn assistant_request_input_id() -> Id {
     Id::new(ASSISTANT_REQUEST_INPUT_ID)
 }
@@ -92,6 +103,14 @@ pub(crate) fn assistant_branch_input_id() -> Id {
 
 pub(crate) fn assistant_base_branch_input_id() -> Id {
     Id::new(ASSISTANT_BASE_BRANCH_INPUT_ID)
+}
+
+fn assistant_intent_select_id() -> Id {
+    Id::new(ASSISTANT_INTENT_SELECT_ID)
+}
+
+fn assistant_agent_select_id() -> Id {
+    Id::new(ASSISTANT_AGENT_SELECT_ID)
 }
 
 pub(crate) fn read_only_text_input_id() -> Id {
@@ -647,27 +666,28 @@ pub(crate) fn route_key_press(app: &PohunekApp, key: &Key, modifiers: Modifiers)
         .map_or_else(Vec::new, |action| action_messages(app, action))
 }
 
-/// Handles conventional Tab traversal inside the Start session modal.
+/// Handles conventional Tab traversal inside launch-form modals.
 pub(crate) fn form_focus_task(
     app: &PohunekApp,
     key: &Key,
     modifiers: Modifiers,
 ) -> Option<Task<Message>> {
-    let direction = start_form_focus_direction(app, key, modifiers)?;
-    let mut ids = vec![start_name_input_id(), start_prompt_input_id()];
-    if app.start.show_advanced && app.start.template.is_none() {
-        ids.push(start_branch_input_id());
-        ids.push(start_base_branch_input_id());
-    }
-    Some(query_form_focus(ids, 0, direction))
+    let direction = form_focus_direction(app, key, modifiers)?;
+    let fields = form_fields(app);
+    let text_fields = fields
+        .iter()
+        .copied()
+        .filter_map(|field| field_text_id(field).map(|id| (field, id)))
+        .collect();
+    Some(query_form_focus(text_fields, 0, direction))
 }
 
-fn start_form_focus_direction(
+fn form_focus_direction(
     app: &PohunekApp,
     key: &Key,
     modifiers: Modifiers,
-) -> Option<FormFocusDirection> {
-    if app.modal != ModalView::Start
+) -> Option<ListDirection> {
+    if !matches!(app.modal, ModalView::Start | ModalView::Assistant)
         || !matches!(key.as_ref(), Key::Named(Named::Tab))
         || modifiers.control()
         || modifiers.alt()
@@ -677,36 +697,297 @@ fn start_form_focus_direction(
     }
 
     Some(if modifiers.shift() {
-        FormFocusDirection::Previous
+        ListDirection::Up
     } else {
-        FormFocusDirection::Next
+        ListDirection::Down
     })
 }
 
-fn query_form_focus(ids: Vec<Id>, index: usize, direction: FormFocusDirection) -> Task<Message> {
-    operation::is_focused(ids[index].clone()).then(move |focused| {
+fn query_form_focus(
+    fields: Vec<(FormField, Id)>,
+    index: usize,
+    direction: ListDirection,
+) -> Task<Message> {
+    if fields.is_empty() {
+        return Task::done(Message::TraverseFormFocus {
+            focused: None,
+            direction,
+        });
+    }
+    let (field, id) = fields[index].clone();
+    operation::is_focused(id).then(move |focused| {
         if focused {
-            let target = relative_focus_index(Some(index), ids.len(), direction);
-            operation::focus(ids[target].clone())
-        } else if index + 1 < ids.len() {
-            query_form_focus(ids.clone(), index + 1, direction)
+            Task::done(Message::TraverseFormFocus {
+                focused: Some(field),
+                direction,
+            })
+        } else if index + 1 < fields.len() {
+            query_form_focus(fields.clone(), index + 1, direction)
         } else {
-            let target = relative_focus_index(None, ids.len(), direction);
-            operation::focus(ids[target].clone())
+            Task::done(Message::TraverseFormFocus {
+                focused: None,
+                direction,
+            })
         }
     })
+}
+
+pub(crate) fn next_form_field(
+    app: &PohunekApp,
+    focused: Option<FormField>,
+    direction: ListDirection,
+) -> FormField {
+    let fields = form_fields(app);
+    let current = focused
+        .filter(|field| fields.contains(field))
+        .unwrap_or(app.form_focus);
+    let index = fields.iter().position(|field| *field == current);
+    let target = relative_focus_index(index, fields.len(), direction);
+    fields[target]
 }
 
 fn relative_focus_index(
     focused: Option<usize>,
     field_count: usize,
-    direction: FormFocusDirection,
+    direction: ListDirection,
 ) -> usize {
     match (focused, direction) {
-        (None, FormFocusDirection::Next) => 0,
-        (None | Some(0), FormFocusDirection::Previous) => field_count - 1,
-        (Some(index), FormFocusDirection::Next) => (index + 1) % field_count,
-        (Some(index), FormFocusDirection::Previous) => index - 1,
+        (None, ListDirection::Down) => 0,
+        (None | Some(0), ListDirection::Up) => field_count - 1,
+        (Some(index), ListDirection::Down) => (index + 1) % field_count,
+        (Some(index), ListDirection::Up) => index - 1,
+    }
+}
+
+pub(crate) fn form_field_focus_task(field: FormField) -> Task<Message> {
+    operation::focus(form_field_id(field))
+}
+
+fn form_field_id(field: FormField) -> Id {
+    match field {
+        FormField::StartAgent => start_agent_select_id(),
+        FormField::StartTemplate => start_template_select_id(),
+        FormField::StartName => start_name_input_id(),
+        FormField::StartPrompt => start_prompt_input_id(),
+        FormField::StartBranch => start_branch_input_id(),
+        FormField::StartBaseBranch => start_base_branch_input_id(),
+        FormField::AssistantIntent => assistant_intent_select_id(),
+        FormField::AssistantAgent => assistant_agent_select_id(),
+        FormField::AssistantRequest => assistant_request_input_id(),
+        FormField::AssistantBranch => assistant_branch_input_id(),
+        FormField::AssistantBaseBranch => assistant_base_branch_input_id(),
+    }
+}
+
+fn field_text_id(field: FormField) -> Option<Id> {
+    match field {
+        FormField::StartName
+        | FormField::StartPrompt
+        | FormField::StartBranch
+        | FormField::StartBaseBranch
+        | FormField::AssistantRequest
+        | FormField::AssistantBranch
+        | FormField::AssistantBaseBranch => Some(form_field_id(field)),
+        FormField::StartAgent
+        | FormField::StartTemplate
+        | FormField::AssistantIntent
+        | FormField::AssistantAgent => None,
+    }
+}
+
+fn form_fields(app: &PohunekApp) -> Vec<FormField> {
+    match app.modal {
+        ModalView::Start => {
+            let mut fields = vec![
+                FormField::StartAgent,
+                FormField::StartTemplate,
+                FormField::StartName,
+                FormField::StartPrompt,
+            ];
+            if app.start.show_advanced && app.start.template.is_none() {
+                fields.push(FormField::StartBranch);
+                fields.push(FormField::StartBaseBranch);
+            }
+            fields
+        }
+        ModalView::Assistant => {
+            let mut fields = vec![
+                FormField::AssistantIntent,
+                FormField::AssistantAgent,
+                FormField::AssistantRequest,
+            ];
+            if app.assistant.show_advanced {
+                fields.push(FormField::AssistantBranch);
+                fields.push(FormField::AssistantBaseBranch);
+            }
+            fields
+        }
+        ModalView::None
+        | ModalView::Session
+        | ModalView::ConfirmDeleteSession
+        | ModalView::Keymap
+        | ModalView::Inbox => Vec::new(),
+    }
+}
+
+pub(crate) fn form_field_is_visible(app: &PohunekApp, field: FormField) -> bool {
+    form_fields(app).contains(&field)
+}
+
+const ASSISTANT_INTENTS: [AssistantIntent; 5] = [
+    AssistantIntent::Help,
+    AssistantIntent::Setup,
+    AssistantIntent::Project,
+    AssistantIntent::Update,
+    AssistantIntent::Debug,
+];
+
+pub(crate) fn form_select_options(app: &PohunekApp, field: FormField) -> Vec<String> {
+    match field {
+        FormField::StartAgent => selected_host_id(app)
+            .ok()
+            .and_then(|host_id| app.workspace.hosts.get(&host_id))
+            .map_or_else(Vec::new, pohunek_gui_core::HostView::launchable_agents),
+        FormField::StartTemplate => {
+            let mut options = vec![BLANK_TEMPLATE_LABEL.to_owned()];
+            options.extend(available_actions(app, &ProviderKind::None));
+            options
+        }
+        FormField::AssistantIntent => ASSISTANT_INTENTS.iter().map(ToString::to_string).collect(),
+        FormField::AssistantAgent => {
+            let mut options = vec![ASSISTANT_AUTO_AGENT_LABEL.to_owned()];
+            if let Some(host) = selected_host_id(app)
+                .ok()
+                .and_then(|host_id| app.workspace.hosts.get(&host_id))
+            {
+                options.extend(host.launchable_assistant_agents());
+            }
+            options
+        }
+        FormField::StartName
+        | FormField::StartPrompt
+        | FormField::StartBranch
+        | FormField::StartBaseBranch
+        | FormField::AssistantRequest
+        | FormField::AssistantBranch
+        | FormField::AssistantBaseBranch => Vec::new(),
+    }
+}
+
+pub(crate) fn form_select_label(app: &PohunekApp, field: FormField) -> String {
+    match field {
+        FormField::StartAgent => app.start.agent.clone(),
+        FormField::StartTemplate => app
+            .start
+            .template
+            .clone()
+            .unwrap_or_else(|| BLANK_TEMPLATE_LABEL.to_owned()),
+        FormField::AssistantIntent => app.assistant.intent.to_string(),
+        FormField::AssistantAgent => app
+            .assistant
+            .agent
+            .clone()
+            .unwrap_or_else(|| ASSISTANT_AUTO_AGENT_LABEL.to_owned()),
+        FormField::StartName
+        | FormField::StartPrompt
+        | FormField::StartBranch
+        | FormField::StartBaseBranch
+        | FormField::AssistantRequest
+        | FormField::AssistantBranch
+        | FormField::AssistantBaseBranch => String::new(),
+    }
+}
+
+pub(crate) fn form_select_cursor(app: &PohunekApp, field: FormField) -> usize {
+    let selected = form_select_label(app, field);
+    form_select_options(app, field)
+        .iter()
+        .position(|option| option == &selected)
+        .unwrap_or(0)
+}
+
+pub(crate) fn form_select_key_message(
+    app: &PohunekApp,
+    key: &Key,
+    modifiers: Modifiers,
+) -> Option<Message> {
+    if !matches!(app.modal, ModalView::Start | ModalView::Assistant)
+        || modifiers.control()
+        || modifiers.alt()
+        || modifiers.logo()
+        || !matches!(
+            app.form_focus,
+            FormField::StartAgent
+                | FormField::StartTemplate
+                | FormField::AssistantIntent
+                | FormField::AssistantAgent
+        )
+    {
+        return None;
+    }
+    let is_open = app
+        .form_select
+        .is_some_and(|select| select.field == app.form_focus);
+    match key.as_ref() {
+        Key::Named(Named::ArrowUp) if is_open => Some(Message::MoveFormSelect(ListDirection::Up)),
+        Key::Named(Named::ArrowDown) if is_open => {
+            Some(Message::MoveFormSelect(ListDirection::Down))
+        }
+        Key::Named(Named::ArrowUp | Named::ArrowDown | Named::Enter) if !is_open => {
+            Some(Message::ToggleFormSelect(app.form_focus))
+        }
+        Key::Named(Named::Enter) => Some(Message::ConfirmFormSelect),
+        Key::Named(Named::Escape) if is_open => Some(Message::CloseFormSelect),
+        _ => None,
+    }
+}
+
+pub(crate) fn form_submit_message(
+    app: &PohunekApp,
+    key: &Key,
+    modifiers: Modifiers,
+) -> Option<Message> {
+    if !matches!(key.as_ref(), Key::Named(Named::Enter))
+        || !modifiers.control()
+        || modifiers.alt()
+        || modifiers.logo()
+    {
+        return None;
+    }
+    match app.modal {
+        ModalView::Start => Some(Message::CreateSession),
+        ModalView::Assistant => Some(Message::LaunchAssistant),
+        ModalView::None
+        | ModalView::Session
+        | ModalView::ConfirmDeleteSession
+        | ModalView::Keymap
+        | ModalView::Inbox => None,
+    }
+}
+
+pub(crate) fn form_reserves_enter(app: &PohunekApp, key: &Key) -> bool {
+    matches!(app.modal, ModalView::Start | ModalView::Assistant)
+        && matches!(key.as_ref(), Key::Named(Named::Enter))
+}
+
+pub(crate) fn form_select_choice_message(app: &PohunekApp, select: FormSelect) -> Option<Message> {
+    let options = form_select_options(app, select.field);
+    let option = options.get(select.cursor)?.clone();
+    match select.field {
+        FormField::StartAgent => Some(Message::StartAgentSelected(option)),
+        FormField::StartTemplate => Some(Message::StartTemplateSelected(option)),
+        FormField::AssistantIntent => ASSISTANT_INTENTS
+            .get(select.cursor)
+            .copied()
+            .map(Message::AssistantIntentSelected),
+        FormField::AssistantAgent => Some(Message::AssistantAgentSelected(option)),
+        FormField::StartName
+        | FormField::StartPrompt
+        | FormField::StartBranch
+        | FormField::StartBaseBranch
+        | FormField::AssistantRequest
+        | FormField::AssistantBranch
+        | FormField::AssistantBaseBranch => None,
     }
 }
 
@@ -865,8 +1146,7 @@ fn selected_inbox_row(app: &PohunekApp) -> Option<pohunek_gui_core::Notification
 
 pub(crate) fn focus_task(app: &PohunekApp) -> Task<Message> {
     match app.modal {
-        ModalView::Start => operation::focus(start_name_input_id()),
-        ModalView::Assistant => operation::focus(assistant_request_input_id()),
+        ModalView::Start | ModalView::Assistant => form_field_focus_task(app.form_focus),
         ModalView::None
         | ModalView::Session
         | ModalView::ConfirmDeleteSession
@@ -880,49 +1160,160 @@ mod tests {
     use super::*;
 
     #[test]
-    fn start_modal_routes_tab_focus_forward_and_backward() {
+    fn launch_modals_route_tab_focus_forward_and_backward() {
         let mut app = PohunekApp::test_default();
         app.modal = ModalView::Start;
 
         assert_eq!(
-            start_form_focus_direction(&app, &Key::Named(Named::Tab), Modifiers::empty()),
-            Some(FormFocusDirection::Next)
+            form_focus_direction(&app, &Key::Named(Named::Tab), Modifiers::empty()),
+            Some(ListDirection::Down)
         );
         assert_eq!(
-            start_form_focus_direction(&app, &Key::Named(Named::Tab), Modifiers::SHIFT),
-            Some(FormFocusDirection::Previous)
+            form_focus_direction(&app, &Key::Named(Named::Tab), Modifiers::SHIFT),
+            Some(ListDirection::Up)
         );
         assert_eq!(
-            start_form_focus_direction(&app, &Key::Named(Named::Tab), Modifiers::CTRL),
+            form_focus_direction(&app, &Key::Named(Named::Tab), Modifiers::CTRL),
             None
         );
 
         app.modal = ModalView::Assistant;
         assert_eq!(
-            start_form_focus_direction(&app, &Key::Named(Named::Tab), Modifiers::empty()),
-            None
+            form_focus_direction(&app, &Key::Named(Named::Tab), Modifiers::empty()),
+            Some(ListDirection::Down)
         );
     }
 
     #[test]
     fn relative_form_focus_wraps_in_both_directions() {
-        assert_eq!(relative_focus_index(None, 4, FormFocusDirection::Next), 0);
+        assert_eq!(relative_focus_index(None, 4, ListDirection::Down), 0);
+        assert_eq!(relative_focus_index(Some(3), 4, ListDirection::Down), 0);
+        assert_eq!(relative_focus_index(None, 4, ListDirection::Up), 3);
+        assert_eq!(relative_focus_index(Some(0), 4, ListDirection::Up), 3);
+        assert_eq!(relative_focus_index(Some(2), 4, ListDirection::Up), 1);
+    }
+
+    #[test]
+    fn launch_form_focus_orders_selects_text_fields_and_visible_advanced_fields() {
+        let mut app = PohunekApp::test_default();
+        app.modal = ModalView::Start;
+        app.form_focus = FormField::StartAgent;
+
         assert_eq!(
-            relative_focus_index(Some(3), 4, FormFocusDirection::Next),
-            0
+            form_fields(&app),
+            vec![
+                FormField::StartAgent,
+                FormField::StartTemplate,
+                FormField::StartName,
+                FormField::StartPrompt,
+            ]
         );
         assert_eq!(
-            relative_focus_index(None, 4, FormFocusDirection::Previous),
-            3
+            next_form_field(&app, None, ListDirection::Down),
+            FormField::StartTemplate
         );
         assert_eq!(
-            relative_focus_index(Some(0), 4, FormFocusDirection::Previous),
-            3
+            next_form_field(&app, Some(FormField::StartTemplate), ListDirection::Down),
+            FormField::StartName
         );
         assert_eq!(
-            relative_focus_index(Some(2), 4, FormFocusDirection::Previous),
-            1
+            next_form_field(&app, Some(FormField::StartName), ListDirection::Up),
+            FormField::StartTemplate
         );
+
+        app.start.show_advanced = true;
+        assert_eq!(
+            form_fields(&app),
+            vec![
+                FormField::StartAgent,
+                FormField::StartTemplate,
+                FormField::StartName,
+                FormField::StartPrompt,
+                FormField::StartBranch,
+                FormField::StartBaseBranch,
+            ]
+        );
+
+        app.modal = ModalView::Assistant;
+        app.assistant.show_advanced = true;
+        assert_eq!(
+            form_fields(&app),
+            vec![
+                FormField::AssistantIntent,
+                FormField::AssistantAgent,
+                FormField::AssistantRequest,
+                FormField::AssistantBranch,
+                FormField::AssistantBaseBranch,
+            ]
+        );
+    }
+
+    #[test]
+    fn select_keys_open_move_confirm_and_close_without_submitting() {
+        let mut app = PohunekApp::test_default();
+        app.modal = ModalView::Start;
+        app.form_focus = FormField::StartAgent;
+        let down = Key::Named(Named::ArrowDown);
+        let enter = Key::Named(Named::Enter);
+        let escape = Key::Named(Named::Escape);
+
+        assert!(matches!(
+            form_select_key_message(&app, &down, Modifiers::empty()),
+            Some(Message::ToggleFormSelect(FormField::StartAgent))
+        ));
+        app.form_select = Some(FormSelect {
+            field: FormField::StartAgent,
+            cursor: 0,
+        });
+        assert!(matches!(
+            form_select_key_message(&app, &down, Modifiers::empty()),
+            Some(Message::MoveFormSelect(ListDirection::Down))
+        ));
+        assert!(matches!(
+            form_select_key_message(&app, &enter, Modifiers::empty()),
+            Some(Message::ConfirmFormSelect)
+        ));
+        assert!(matches!(
+            form_select_key_message(&app, &escape, Modifiers::empty()),
+            Some(Message::CloseFormSelect)
+        ));
+    }
+
+    #[test]
+    fn launch_forms_submit_only_with_ctrl_enter() {
+        let mut app = PohunekApp::test_default();
+        app.modal = ModalView::Start;
+        let enter = Key::Named(Named::Enter);
+
+        assert!(matches!(
+            form_submit_message(&app, &enter, Modifiers::CTRL),
+            Some(Message::CreateSession)
+        ));
+        assert!(form_submit_message(&app, &enter, Modifiers::empty()).is_none());
+        assert!(form_reserves_enter(&app, &enter));
+
+        app.modal = ModalView::Assistant;
+        assert!(matches!(
+            form_submit_message(&app, &enter, Modifiers::CTRL),
+            Some(Message::LaunchAssistant)
+        ));
+    }
+
+    #[test]
+    fn assistant_intent_choice_maps_the_cursor_to_the_existing_selection_message() {
+        let mut app = PohunekApp::test_default();
+        app.modal = ModalView::Assistant;
+
+        assert!(matches!(
+            form_select_choice_message(
+                &app,
+                FormSelect {
+                    field: FormField::AssistantIntent,
+                    cursor: 4,
+                }
+            ),
+            Some(Message::AssistantIntentSelected(AssistantIntent::Debug))
+        ));
     }
 
     #[test]

@@ -386,13 +386,12 @@ fn metadata_view<'a>(app: &'a PohunekApp, session: &'a SessionInfo) -> Element<'
 
 /// A labeled "Name" text input bound to the shared start-form name buffer, used
 /// by every session-creation surface so a session can be named at any creation.
-pub(crate) fn session_name_input(app: &PohunekApp, on_submit: Message) -> Element<'_, Message> {
+pub(crate) fn session_name_input(app: &PohunekApp) -> Element<'_, Message> {
     row![
         text("Name").size(14),
         text_input("optional session name", &app.start.name)
             .id(crate::keyboard::start_name_input_id())
-            .on_input(Message::StartNameChanged)
-            .on_submit(on_submit),
+            .on_input(Message::StartNameChanged),
     ]
     .spacing(8)
     .align_y(Center)

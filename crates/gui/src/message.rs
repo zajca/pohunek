@@ -123,6 +123,29 @@ pub(crate) enum ListDirection {
     Down,
 }
 
+/// A keyboard-focusable field in a launch form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FormField {
+    StartAgent,
+    StartTemplate,
+    StartName,
+    StartPrompt,
+    StartBranch,
+    StartBaseBranch,
+    AssistantIntent,
+    AssistantAgent,
+    AssistantRequest,
+    AssistantBranch,
+    AssistantBaseBranch,
+}
+
+/// State of an expanded keyboard-controlled select field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FormSelect {
+    pub(crate) field: FormField,
+    pub(crate) cursor: usize,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum Message {
     Core(CoreEvent),
@@ -184,6 +207,18 @@ pub(crate) enum Message {
     AssistantBaseBranchChanged(String),
     AssistantNoSnapshotToggled(bool),
     AssistantDegradedToggled(bool),
+    ToggleFormSelect(FormField),
+    MoveFormSelect(ListDirection),
+    ConfirmFormSelect,
+    CloseFormSelect,
+    ChooseFormSelect {
+        field: FormField,
+        index: usize,
+    },
+    TraverseFormFocus {
+        focused: Option<FormField>,
+        direction: ListDirection,
+    },
     LaunchAssistant,
     ToggleStartAdvanced,
     StartBranchChanged(String),
