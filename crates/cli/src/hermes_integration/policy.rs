@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-08-07
+// Rust guideline compliant 2026-08-12
 
 #![expect(
     clippy::map_err_ignore,
@@ -28,6 +28,10 @@ use super::target::ResolvedTarget;
 const SCHEMA_VERSION: u32 = 1;
 /// Plugin invocations must not occupy a delegated tool slot for longer than one minute.
 pub(crate) const MAX_TIMEOUT_MS: u32 = 60_000;
+/// Session creation leaves fifteen seconds for exact-state reconciliation.
+pub(crate) const DEFAULT_REQUEST_TIMEOUT_MS: u32 = 45_000;
+/// Policies created before request-timeout configuration used the SDK's five-second default.
+const LEGACY_REQUEST_TIMEOUT_MS: u32 = 5_000;
 /// This cap bounds one JSON tool result independently of protocol framing.
 pub(crate) const MAX_OUTPUT_BYTES: u32 = 1_048_576;
 /// Screens are bounded more tightly because they are repeated observation payloads.
@@ -90,6 +94,8 @@ pub(crate) struct PolicyInput {
     pub(crate) allowed_hosts: Vec<String>,
     /// Maximum one-tool wall-clock duration in milliseconds.
     pub(crate) tool_timeout_ms: u32,
+    /// Maximum daemon response wait for session creation in milliseconds.
+    pub(crate) request_timeout_ms: u32,
     /// Maximum returned tool-output bytes.
     pub(crate) max_output_bytes: u32,
     /// Maximum returned terminal-screen bytes.
@@ -110,6 +116,7 @@ pub(crate) struct Policy {
     access_mode: AccessMode,
     allowed_hosts: Vec<Host>,
     tool_timeout_ms: u32,
+    request_timeout_ms: u32,
     max_output_bytes: u32,
     max_screen_bytes: u32,
     max_concurrency: u8,
@@ -126,6 +133,7 @@ impl Policy {
             input.access_mode,
             input.allowed_hosts,
             input.tool_timeout_ms,
+            input.request_timeout_ms,
             input.max_output_bytes,
             input.max_screen_bytes,
             input.max_concurrency,
@@ -151,6 +159,7 @@ impl Policy {
             wire.access_mode,
             wire.allowed_hosts,
             wire.tool_timeout_ms,
+            wire.request_timeout_ms,
             wire.max_output_bytes,
             wire.max_screen_bytes,
             wire.max_concurrency,
@@ -216,6 +225,12 @@ impl Policy {
         self.tool_timeout_ms
     }
 
+    /// Returns the bounded session-creation response timeout in milliseconds.
+    #[must_use]
+    pub(crate) const fn request_timeout_ms(&self) -> u32 {
+        self.request_timeout_ms
+    }
+
     /// Returns the bounded maximum tool output bytes.
     #[must_use]
     pub(crate) const fn max_output_bytes(&self) -> u32 {
@@ -246,6 +261,7 @@ impl Policy {
         access_mode: AccessMode,
         allowed_hosts: Vec<String>,
         tool_timeout_ms: u32,
+        request_timeout_ms: u32,
         max_output_bytes: u32,
         max_screen_bytes: u32,
         max_concurrency: u8,
@@ -256,6 +272,8 @@ impl Policy {
             || protocol_min > protocol_max
             || tool_timeout_ms == 0
             || tool_timeout_ms > MAX_TIMEOUT_MS
+            || request_timeout_ms == 0
+            || request_timeout_ms >= tool_timeout_ms
             || max_output_bytes == 0
             || max_output_bytes > MAX_OUTPUT_BYTES
             || max_screen_bytes == 0
@@ -274,6 +292,7 @@ impl Policy {
             access_mode,
             allowed_hosts,
             tool_timeout_ms,
+            request_timeout_ms,
             max_output_bytes,
             max_screen_bytes,
             max_concurrency,
@@ -350,9 +369,15 @@ struct PolicyWire {
     access_mode: AccessMode,
     allowed_hosts: Vec<String>,
     tool_timeout_ms: u32,
+    #[serde(default = "legacy_request_timeout_ms")]
+    request_timeout_ms: u32,
     max_output_bytes: u32,
     max_screen_bytes: u32,
     max_concurrency: u8,
+}
+
+const fn legacy_request_timeout_ms() -> u32 {
+    LEGACY_REQUEST_TIMEOUT_MS
 }
 
 fn canonical_executable(path: &Path) -> Result<PathBuf, Error> {
@@ -568,6 +593,7 @@ mod tests {
             access_mode: AccessMode::Manage,
             allowed_hosts: vec!["local".to_owned(), "peer-1.netbird".to_owned()],
             tool_timeout_ms: MAX_TIMEOUT_MS,
+            request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
             max_output_bytes: MAX_OUTPUT_BYTES,
             max_screen_bytes: MAX_SCREEN_BYTES,
             max_concurrency: MAX_CONCURRENCY,
@@ -598,6 +624,7 @@ mod tests {
                     },
                     "allowed_hosts": ["local", "peer-1.netbird"],
                     "tool_timeout_ms": MAX_TIMEOUT_MS,
+                    "request_timeout_ms": DEFAULT_REQUEST_TIMEOUT_MS,
                     "max_output_bytes": MAX_OUTPUT_BYTES,
                     "max_screen_bytes": MAX_SCREEN_BYTES,
                     "max_concurrency": MAX_CONCURRENCY,
@@ -611,10 +638,31 @@ mod tests {
                 ["local", "peer-1.netbird"]
             );
             assert_eq!(policy.tool_timeout_ms(), MAX_TIMEOUT_MS);
+            assert_eq!(policy.request_timeout_ms(), DEFAULT_REQUEST_TIMEOUT_MS);
             assert_eq!(policy.max_output_bytes(), MAX_OUTPUT_BYTES);
             assert_eq!(policy.max_screen_bytes(), MAX_SCREEN_BYTES);
             assert_eq!(policy.max_concurrency(), MAX_CONCURRENCY);
         }
+    }
+
+    #[test]
+    fn loads_legacy_policy_with_the_historical_request_timeout() {
+        let root = temp_dir("legacy-request-timeout");
+        let cli = executable(&root);
+        let policy = Policy::new(input(cli)).expect("policy");
+        let mut document = serde_json::to_value(policy).expect("serialize policy");
+        document
+            .as_object_mut()
+            .expect("policy object")
+            .remove("request_timeout_ms");
+
+        let loaded = Policy::from_json(
+            serde_json::to_string(&document).expect("json").as_bytes(),
+            WildcardConfirmation::new(false),
+        )
+        .expect("legacy policy");
+
+        assert_eq!(loaded.request_timeout_ms(), LEGACY_REQUEST_TIMEOUT_MS);
     }
 
     #[test]
@@ -626,6 +674,8 @@ mod tests {
             ("protocol_max", json!(0)),
             ("tool_timeout_ms", json!(0)),
             ("tool_timeout_ms", json!(MAX_TIMEOUT_MS + 1)),
+            ("request_timeout_ms", json!(0)),
+            ("request_timeout_ms", json!(MAX_TIMEOUT_MS)),
             ("max_output_bytes", json!(0)),
             ("max_output_bytes", json!(MAX_OUTPUT_BYTES + 1)),
             ("max_screen_bytes", json!(0)),

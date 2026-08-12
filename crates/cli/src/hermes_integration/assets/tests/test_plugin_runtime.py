@@ -40,7 +40,7 @@ def policy(
     max_output_bytes: int = 1024,
     max_screen_bytes: int = 1024,
 ) -> Policy:
-    return Policy(cli, 1, 3, mode, frozenset(("local",)), 100, max_output_bytes, max_screen_bytes, 1)
+    return Policy(cli, 1, 3, mode, frozenset(("local",)), 100, 50, max_output_bytes, max_screen_bytes, 1)
 
 
 class PolicyTests(unittest.TestCase):
@@ -72,13 +72,13 @@ class PolicyTests(unittest.TestCase):
             with self.assertRaises(PolicyError):
                 load_policy(str(link))
         for host in ("127.0.0.1", "/tmp/socket", "bad\nhost"):
-            raw = {"schema_version": 1, "pohunek_cli": "/bin/true", "protocol_min": 1, "protocol_max": 1, "access_mode": "read_only", "allowed_hosts": [host], "tool_timeout_ms": 1, "max_output_bytes": 1, "max_screen_bytes": 1, "max_concurrency": 1}
+            raw = {"schema_version": 1, "pohunek_cli": "/bin/true", "protocol_min": 1, "protocol_max": 1, "access_mode": "read_only", "allowed_hosts": [host], "tool_timeout_ms": 2, "request_timeout_ms": 1, "max_output_bytes": 1, "max_screen_bytes": 1, "max_concurrency": 1}
             with mock.patch("pohunek.policy.os.path.isfile", return_value=True), mock.patch("pohunek.policy.os.access", return_value=True):
                 with self.assertRaises(PolicyError):
                     __import__("pohunek.policy", fromlist=["_validate"])._validate(raw)
 
     def test_policy_rejects_boolean_numeric_fields(self) -> None:
-        raw = {"schema_version": 1, "pohunek_cli": "/bin/true", "protocol_min": True, "protocol_max": 1, "access_mode": "read_only", "allowed_hosts": ["local"], "tool_timeout_ms": 1, "max_output_bytes": 1, "max_screen_bytes": 1, "max_concurrency": 1}
+        raw = {"schema_version": 1, "pohunek_cli": "/bin/true", "protocol_min": True, "protocol_max": 1, "access_mode": "read_only", "allowed_hosts": ["local"], "tool_timeout_ms": 2, "request_timeout_ms": 1, "max_output_bytes": 1, "max_screen_bytes": 1, "max_concurrency": 1}
         with mock.patch("pohunek.policy.os.path.isfile", return_value=True), mock.patch("pohunek.policy.os.access", return_value=True):
             with self.assertRaises(PolicyError):
                 __import__("pohunek.policy", fromlist=["_validate"])._validate(raw)
@@ -383,7 +383,7 @@ class ToolTests(unittest.TestCase):
         runner.verify_compatibility.assert_called_once_with()
 
     def test_wildcard_policy_still_rejects_unsafe_runtime_hosts(self) -> None:
-        wildcard = Policy("/bin/true", 1, 3, "full", frozenset(("*",)), 100, 1024, 1024, 1)
+        wildcard = Policy("/bin/true", 1, 3, "full", frozenset(("*",)), 100, 50, 1024, 1024, 1)
         tools = Tools(wildcard, None)
         for host in ("127.0.0.1", "/tmp/socket", "bad\nhost", "*"):
             result = json.loads(tools.handlers()["pohunek_sessions"]({"host": host}))
@@ -722,6 +722,120 @@ class ToolTests(unittest.TestCase):
         self.assertNotIn("--repo", argv)
         rejected = json.loads(tools.handlers()["pohunek_session_start"]({"agent_profile": "hermes", "worktree": {"repo": "/tmp/repo"}}))
         self.assertEqual(rejected["error"]["code"], "plugin_invalid_request")
+
+    def test_start_timeout_recovers_exact_live_session_without_second_start(self) -> None:
+        tools = Tools(policy(), None)
+        runner = mock.Mock()
+        recovered = {
+            "id": "s-1",
+            "name": "review-opus",
+            "external": False,
+            "agent": "hermes",
+            "project_id": "p-1",
+            "is_linked_worktree": True,
+            "branch": "review-branch",
+            "state": "running",
+            "runtime": {
+                "state": "live",
+                "runtime_id": "r-1",
+                "runtime_generation": "1",
+            },
+        }
+        runner.run.side_effect = [
+            {"supported_agents": ["hermes"], "runtimes": [{"agent": "hermes", "available": True, "supported": True}]},
+            [{"id": "p-1", "label": "project"}],
+            CliError("request_timeout"),
+            [recovered],
+        ]
+        tools._runner = runner
+
+        result = json.loads(tools.handlers()["pohunek_session_start"]({
+            "agent_profile": "hermes",
+            "name": "review-opus",
+            "worktree": {
+                "project": {"label": "project"},
+                "branch": "review-branch",
+            },
+        }))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["result"]["id"], "s-1")
+        start_calls = [
+            call for call in runner.run.call_args_list
+            if call.args[0].argv[2:4] == ("session", "new")
+        ]
+        self.assertEqual(len(start_calls), 1)
+        self.assertIn("--request-timeout-ms", start_calls[0].args[0].argv)
+
+    def test_start_timeout_rejects_ambiguous_or_conflicting_recovery_without_second_start(self) -> None:
+        recovered = {
+            "id": "s-1",
+            "name": "review-opus",
+            "external": False,
+            "agent": "hermes",
+            "project_id": "p-1",
+            "is_linked_worktree": True,
+            "branch": "review-branch",
+            "state": "running",
+            "runtime": {
+                "state": "live",
+                "runtime_id": "r-1",
+                "runtime_generation": "1",
+            },
+        }
+        cases = (
+            ([recovered, {**recovered, "id": "s-2"}], "plugin_ambiguous_session"),
+            ([{**recovered, "agent": "codex"}], "plugin_session_conflict"),
+        )
+        for sessions, expected_code in cases:
+            with self.subTest(expected_code=expected_code):
+                tools = Tools(policy(), None)
+                runner = mock.Mock()
+                runner.run.side_effect = [
+                    {"supported_agents": ["hermes"], "runtimes": [{"agent": "hermes", "available": True, "supported": True}]},
+                    [{"id": "p-1", "label": "project"}],
+                    CliError("request_timeout"),
+                    sessions,
+                ]
+                tools._runner = runner
+
+                result = json.loads(tools.handlers()["pohunek_session_start"]({
+                    "agent_profile": "hermes",
+                    "name": "review-opus",
+                    "worktree": {
+                        "project": {"label": "project"},
+                        "branch": "review-branch",
+                    },
+                }))
+
+                self.assertEqual(result["error"]["code"], expected_code)
+                start_calls = [
+                    call for call in runner.run.call_args_list
+                    if call.args[0].argv[2:4] == ("session", "new")
+                ]
+                self.assertEqual(len(start_calls), 1)
+
+    def test_start_timeout_without_deterministic_name_is_not_retried(self) -> None:
+        tools = Tools(policy(), None)
+        runner = mock.Mock()
+        runner.run.side_effect = [
+            {"supported_agents": ["hermes"], "runtimes": [{"agent": "hermes", "available": True, "supported": True}]},
+            [{"id": "p-1", "label": "project"}],
+            CliError("request_timeout"),
+        ]
+        tools._runner = runner
+
+        result = json.loads(tools.handlers()["pohunek_session_start"]({
+            "agent_profile": "hermes",
+            "project": {"label": "project"},
+        }))
+
+        self.assertEqual(result["error"]["code"], "request_timeout")
+        start_calls = [
+            call for call in runner.run.call_args_list
+            if call.args[0].argv[2:4] == ("session", "new")
+        ]
+        self.assertEqual(len(start_calls), 1)
 
 
 class HookTests(unittest.TestCase):

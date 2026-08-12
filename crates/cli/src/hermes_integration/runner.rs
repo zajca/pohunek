@@ -4,7 +4,7 @@
 //! clears the inherited environment, owns each child process group, and never
 //! retains subprocess output in an error.
 
-// Rust guideline compliant 2026-08-09
+// Rust guideline compliant 2026-08-12
 
 #![expect(
     clippy::map_err_ignore,
@@ -1515,6 +1515,7 @@ mod tests {
             "access_mode": "full",
             "allowed_hosts": ["local"],
             "tool_timeout_ms": 1_000,
+            "request_timeout_ms": 500,
             "max_output_bytes": 65_536,
             "max_screen_bytes": 32_768,
             "max_concurrency": 2
@@ -2025,6 +2026,7 @@ mod tests {
                 "access_mode": "full",
                 "allowed_hosts": ["local"],
                 "tool_timeout_ms": 1_000,
+                "request_timeout_ms": 500,
                 "max_output_bytes": 65_536,
                 "max_screen_bytes": 32_768,
                 "max_concurrency": 2

@@ -18,6 +18,7 @@ export const ClientErrorCode = {
   Framing: "framing",
   HostUnreachable: "host_unreachable",
   RemoteDaemonUnavailable: "remote_daemon_unavailable",
+  RequestTimeout: "request_timeout",
   Io: "io_error",
   Json: "json_error",
   VersionMismatch: "version_mismatch",
@@ -29,6 +30,7 @@ export type ClientErrorKind =
   | "protocol"
   | "hostUnreachable"
   | "remoteDaemonUnavailable"
+  | "requestTimeout"
   | "remoteProtocol"
   | "io"
   | "json"
@@ -116,6 +118,21 @@ export class ClientError extends Error {
         ClientErrorCode.RemoteDaemonUnavailable,
         msg,
         "ensure a matching pohunek daemon is running on the host",
+      ),
+    );
+  }
+
+  public static requestTimeout(remoteHost: string | undefined, timeoutMs: number): ClientError {
+    const target = remoteHost === undefined ? "the local daemon" : `host '${remoteHost}'`;
+    const msg = `timed out after ${timeoutMs}ms waiting for a response from ${target}`;
+    return new ClientError(
+      "requestTimeout",
+      msg,
+      protocolError(
+        ClientErrorClass.Transport,
+        ClientErrorCode.RequestTimeout,
+        msg,
+        "the request may have completed; reconcile daemon state before retrying a mutation",
       ),
     );
   }

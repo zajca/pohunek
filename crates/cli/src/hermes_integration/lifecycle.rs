@@ -4,7 +4,7 @@
 //! this module. This module never launches Hermes; `HermesControl` is the
 //! narrow boundary the fixed runner implements later.
 
-// Rust guideline compliant 2026-08-09
+// Rust guideline compliant 2026-08-12
 
 #![expect(
     clippy::map_err_ignore,
@@ -1229,6 +1229,7 @@ mod tests {
             access_mode: AccessMode::Manage,
             allowed_hosts: vec!["local".to_owned()],
             tool_timeout_ms: MAX_TIMEOUT_MS,
+            request_timeout_ms: crate::hermes_integration::policy::DEFAULT_REQUEST_TIMEOUT_MS,
             max_output_bytes: MAX_OUTPUT_BYTES,
             max_screen_bytes: MAX_SCREEN_BYTES,
             max_concurrency: MAX_CONCURRENCY,
@@ -1569,6 +1570,7 @@ mod tests {
             access_mode: AccessMode::Full,
             allowed_hosts: vec!["local".to_owned()],
             tool_timeout_ms: MAX_TIMEOUT_MS,
+            request_timeout_ms: crate::hermes_integration::policy::DEFAULT_REQUEST_TIMEOUT_MS,
             max_output_bytes: MAX_OUTPUT_BYTES,
             max_screen_bytes: MAX_SCREEN_BYTES,
             max_concurrency: MAX_CONCURRENCY,
@@ -1616,6 +1618,7 @@ mod tests {
             access_mode: AccessMode::ReadOnly,
             allowed_hosts: vec!["local".to_owned()],
             tool_timeout_ms: MAX_TIMEOUT_MS,
+            request_timeout_ms: crate::hermes_integration::policy::DEFAULT_REQUEST_TIMEOUT_MS,
             max_output_bytes: MAX_OUTPUT_BYTES,
             max_screen_bytes: MAX_SCREEN_BYTES,
             max_concurrency: MAX_CONCURRENCY,

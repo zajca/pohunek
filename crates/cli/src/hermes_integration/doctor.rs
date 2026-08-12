@@ -4,7 +4,7 @@
 //! fixed local runner. It neither reads Hermes state databases nor contacts an
 //! allowed remote host.
 
-// Rust guideline compliant 2026-08-07
+// Rust guideline compliant 2026-08-12
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Read as _;
@@ -500,6 +500,7 @@ mod tests {
             "access_mode": access_mode,
             "allowed_hosts": ["local"],
             "tool_timeout_ms": 1_000,
+            "request_timeout_ms": 500,
             "max_output_bytes": 65_536,
             "max_screen_bytes": 32_768,
             "max_concurrency": 2,
@@ -792,6 +793,7 @@ mod tests {
             "access_mode": access_mode,
             "allowed_hosts": [host],
             "tool_timeout_ms": 1_000,
+            "request_timeout_ms": 500,
             "max_output_bytes": 65_536,
             "max_screen_bytes": 32_768,
             "max_concurrency": 2,

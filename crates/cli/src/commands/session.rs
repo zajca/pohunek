@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::io::Read as _;
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use base64::Engine as _;
 #[cfg(test)]
@@ -68,6 +69,17 @@ pub(crate) fn parse_wait_timeout_ms(value: &str) -> Result<u32, String> {
             "--timeout-ms must be between 1 and {}",
             protocol::MAX_SESSION_WAIT_MS
         ));
+    }
+    Ok(parsed)
+}
+
+/// Parse a non-zero daemon response timeout for `session new`.
+pub(crate) fn parse_request_timeout_ms(value: &str) -> Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_error| "--request-timeout-ms must be an unsigned 32-bit integer".to_owned())?;
+    if parsed == 0 {
+        return Err("--request-timeout-ms must be greater than zero".to_owned());
     }
     Ok(parsed)
 }
@@ -210,6 +222,8 @@ pub(crate) struct NewArgs {
     pub base_branch: Option<String>,
     /// Initial text to inject into the spawned PTY.
     pub input: Option<String>,
+    /// Optional daemon response timeout for this creation request.
+    pub request_timeout_ms: Option<u32>,
     /// Parsed `--meta KEY=VALUE` pairs, one per repeated flag. Shape-validated
     /// per pair by [`parse_meta_pair`] (the clap value parser); duplicate-key
     /// rejection happens once the full set is known, in [`parse_meta_pairs`].
@@ -430,7 +444,17 @@ pub(crate) async fn run_new(
         }
     }
 
-    let mut client = Client::connect(host, paths).await?;
+    let mut client = match args.request_timeout_ms {
+        Some(timeout_ms) => {
+            Client::connect_with_request_timeout(
+                host,
+                paths,
+                Duration::from_millis(u64::from(timeout_ms)),
+            )
+            .await?
+        }
+        None => Client::connect(host, paths).await?,
+    };
     let result = client
         .call::<method::SessionNew>(new_params(&args)?)
         .await?;
@@ -1538,6 +1562,7 @@ mod tests {
             branch: None,
             base_branch: None,
             input: None,
+            request_timeout_ms: None,
             meta: Vec::new(),
         }
     }
@@ -1635,6 +1660,7 @@ mod tests {
             branch: Some("feature/login".to_owned()),
             base_branch: Some("main".to_owned()),
             input: None,
+            request_timeout_ms: None,
             meta: Vec::new(),
         };
         let request = build_new_request(&args).expect("request");
@@ -1666,6 +1692,7 @@ mod tests {
             branch: None,
             base_branch: None,
             input: None,
+            request_timeout_ms: None,
             meta: Vec::new(),
         })
         .expect("request");

@@ -752,10 +752,11 @@ async fn request_response_timeout_poisons_connection_before_late_response_can_be
         .await
         .expect_err("first request times out")
     {
-        ClientError::Framing(msg) => {
-            assert!(msg.contains("timed out"), "timeout message is clear: {msg}");
+        ClientError::RequestTimeout { host, timeout } => {
+            assert_eq!(host, None);
+            assert_eq!(timeout, Duration::from_millis(20));
         }
-        other => panic!("expected timeout Framing error, got {other:?}"),
+        other => panic!("expected typed request timeout, got {other:?}"),
     }
     assert_sent_specific_request(
         &daemon

@@ -1,5 +1,7 @@
 //! CLI compatibility wrapper around the public SDK client.
 
+use std::time::Duration;
+
 use protocol::{Method, Request};
 use serde_json::Value;
 
@@ -17,7 +19,26 @@ pub(crate) struct Client {
 impl Client {
     /// Connect to the daemon for `host`.
     pub(crate) async fn connect(host: &str, paths: &Paths) -> Result<Self, CliError> {
-        let inner = pohunek_client::Client::connect(host, &paths.socket)
+        Self::connect_with_options(host, paths, pohunek_client::ClientOptions::default()).await
+    }
+
+    /// Connect with a custom daemon response timeout.
+    pub(crate) async fn connect_with_request_timeout(
+        host: &str,
+        paths: &Paths,
+        request_timeout: Duration,
+    ) -> Result<Self, CliError> {
+        let options =
+            pohunek_client::ClientOptions::default().with_request_timeout(request_timeout);
+        Self::connect_with_options(host, paths, options).await
+    }
+
+    async fn connect_with_options(
+        host: &str,
+        paths: &Paths,
+        options: pohunek_client::ClientOptions,
+    ) -> Result<Self, CliError> {
+        let inner = pohunek_client::Client::connect_with_options(host, &paths.socket, options)
             .await
             .map_err(map_connect_error)?;
         Ok(Self { inner })

@@ -119,7 +119,7 @@ export class Client {
         this.options.requestTimeoutMs,
         () => {
           this.poisoned = "previous request timed out; pending daemon response may be stale";
-          return noResponseError(this.remoteHost, "timed out waiting for daemon response");
+          return ClientError.requestTimeout(this.remoteHost, this.options.requestTimeoutMs);
         },
       );
     } catch (error: unknown) {
@@ -143,7 +143,7 @@ export class Client {
       await withTimeout(
         this.exchange(prepared, stringifyRequest(prepared)),
         this.options.requestTimeoutMs,
-        () => noResponseError(this.remoteHost, "timed out waiting for subscription ack"),
+        () => ClientError.requestTimeout(this.remoteHost, this.options.requestTimeoutMs),
       );
     } catch (error: unknown) {
       this.poisoned = "subscription request failed; connection state is unknown";

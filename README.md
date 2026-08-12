@@ -351,7 +351,7 @@ them `--json` for machine-readable output (the exceptions are `attach`,
 | `pohunek doctor` | Environment health: binaries, socket, state dirs, NetBird, agents. |
 | `pohunek daemon start [--detach]` | Run the host daemon (foreground or background). |
 | `pohunek health` / `status` | Daemon liveness, build, and protocol version. |
-| `pohunek session new` | Start a session: `--agent`, `--name`, `--project`/`--repo`, `--branch`, `--base-branch`, `--cwd`, `--input`, `--meta k=v`. |
+| `pohunek session new` | Start a session: `--agent`, `--name`, `--project`/`--repo`, `--branch`, `--base-branch`, `--cwd`, `--input`, `--request-timeout-ms`, `--meta k=v`. |
 | `pohunek session list` | List sessions; `--filter state=running --filter agent=codex` (ANDed), `-q` for ids only. |
 | `pohunek session inspect <target>` | Full logical session record: agent state, runtime state and generation, cwd, project, branch, worktree, recovery binding. |
 | `pohunek attach <target>` | Attach the current terminal; `Ctrl-]` detaches. |

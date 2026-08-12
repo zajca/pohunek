@@ -849,7 +849,7 @@ Canonical public codes currently emitted include:
 |---|---|
 | `configuration` | `paths_unavailable`, `netbird_invalid_config`, `invalid_discovery_options` |
 | `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback` |
-| `transport` | `framing`, `host_unreachable` |
+| `transport` | `framing`, `host_unreachable`, `request_timeout` |
 | `discovery` | `netbird_cli_missing`, `netbird_state_unavailable`, `host_unknown`, `remote_discovery_failed` |
 | `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor` |
 
@@ -942,7 +942,8 @@ positional text or `--stdin`, never both. Stdin payloads do not appear in argv,
 diagnostics, or logs. The CLI validates observation byte/wait bounds and paired
 runtime coordinates before dialing. `session wait` and waiting `session output`
 use the Rust SDK's dedicated connections and preserve inherited request-origin
-markers.
+markers. `session new --request-timeout-ms <u32>` overrides the response deadline
+for that creation request; zero is rejected.
 
 For example, keep untrusted prompt text out of argv by writing it on stdin:
 
@@ -1107,7 +1108,9 @@ Public exports:
 - `Subscription`: raw event-line stream after a successful `subscribe`.
 - `RawStream`: local Unix or remote TCP raw byte stream for attach.
 - `ClientError`: SDK error enum with `to_protocol_error()` for structured
-  rendering.
+  rendering. An elapsed response deadline maps to `request_timeout`, distinct
+  from connection and daemon-discovery failures; the timed-out mutation may
+  still have completed remotely.
 - `next_request_id(method)`: shared correlation-id generator used by SDK-backed
   clients.
 - `discover_hosts()`: local-NetBird peer discovery with default bounded probes.
@@ -1287,8 +1290,8 @@ SDK error mapping:
   and `recover` fields.
 - SDK-originated errors map into the public protocol taxonomy through
   `ClientErrorClass` and `ClientErrorCode`: `daemon_unreachable`, `framing`,
-  `host_unreachable`, `remote_daemon_unavailable`, `io_error`, `json_error`, and
-  `version_mismatch`.
+  `host_unreachable`, `remote_daemon_unavailable`, `request_timeout`, `io_error`,
+  `json_error`, and `version_mismatch`.
 - `ClientError.toProtocolError()` returns the structured `ProtocolError` for
   CLI/API rendering, and `recoverHint()` returns the optional recovery text.
 

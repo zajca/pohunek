@@ -461,7 +461,7 @@ describe("Client request/response", () => {
 
       const firstError = await expectClientError(client.call("daemon.health", null));
       expect(firstError.toProtocolError().class).toBe("transport");
-      expect(firstError.toProtocolError().code).toBe("framing");
+      expect(firstError.toProtocolError().code).toBe("request_timeout");
       await daemon.nextRequest();
 
       const secondError = await expectClientError(client.call("daemon.health", null));

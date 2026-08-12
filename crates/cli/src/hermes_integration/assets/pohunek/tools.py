@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import base64
 import binascii
+import time
 import unicodedata
 from typing import Any, Callable
 
@@ -19,6 +20,7 @@ _MAX_NAME_CHARS = 256
 _MAX_DIMENSION = 500
 _MIN_DIMENSION = 1
 _MAX_WAIT_MS = 8_000
+_START_RECOVERY_INTERVAL_SECONDS = 0.25
 _U64_MAX = "18446744073709551615"
 _METADATA_KEYS = frozenset(("label", "issue", "priority"))
 _READ = (
@@ -216,21 +218,74 @@ class Tools:
         if project is None and worktree is None:
             raise CliError("plugin_invalid_request")
         self._validate_inventory_agent(host, agent)
-        argv = ["--host", host, "session", "new", "--agent", agent, "--json", "--yes"]
+        argv = [
+            "--host", host, "session", "new", "--agent", agent,
+            "--request-timeout-ms", str(self._policy.request_timeout_ms), "--json", "--yes",
+        ]
+        name = None
         if "name" in args:
-            argv.extend(("--name", _string(args["name"], "name", _MAX_NAME_CHARS)))
+            name = _string(args["name"], "name", _MAX_NAME_CHARS)
+            argv.extend(("--name", name))
+        project_id = None
         if project is not None:
-            argv.extend(("--project", self._resolve_project(host, project)))
+            project_id = self._resolve_project(host, project)
+            argv.extend(("--project", project_id))
         if worktree_fields is not None:
-            argv.extend(("--project", self._resolve_project(host, worktree_fields["project"])))
-            for name, flag in (("branch", "--branch"), ("base_branch", "--base-branch")):
-                if name in worktree_fields:
-                    argv.extend((flag, _string(worktree_fields[name], f"worktree.{name}", _MAX_NAME_CHARS)))
+            project_id = self._resolve_project(host, worktree_fields["project"])
+            argv.extend(("--project", project_id))
+            for field_name, flag in (("branch", "--branch"), ("base_branch", "--base-branch")):
+                if field_name in worktree_fields:
+                    argv.extend((flag, _string(worktree_fields[field_name], f"worktree.{field_name}", _MAX_NAME_CHARS)))
         _dimensions(argv, args)
         if validated_initial is not None:
             argv.append("--input-stdin")
-            return self._runner.run(Invocation(tuple(argv), validated_initial))
-        return self._runner.run(Invocation(tuple(argv)))
+        invocation = Invocation(tuple(argv), validated_initial)
+        try:
+            return self._runner.run(invocation)
+        except CliError as error:
+            if error.code != "request_timeout" or name is None:
+                raise
+            return self._recover_started_session(
+                host,
+                name,
+                agent,
+                project_id,
+                worktree_fields.get("branch") if worktree_fields is not None else None,
+            )
+
+    def _recover_started_session(
+        self,
+        host: str,
+        name: str,
+        agent: str,
+        project_id: str | None,
+        branch: str | None,
+    ) -> Any:
+        deadline = time.monotonic() + (
+            self._policy.tool_timeout_ms - self._policy.request_timeout_ms
+        ) / 1000
+        while True:
+            sessions = self._runner.run(
+                Invocation(("--host", host, "session", "list", "--json"))
+            )
+            if not isinstance(sessions, list):
+                raise CliError("pohunek_cli_invalid_envelope")
+            matches = [
+                session for session in sessions
+                if isinstance(session, dict) and session.get("name") == name
+            ]
+            if len(matches) > 1:
+                raise CliError("plugin_ambiguous_session")
+            if matches:
+                session = matches[0]
+                if not _matches_started_identity(session, agent, project_id, branch):
+                    raise CliError("plugin_session_conflict")
+                if _has_live_runtime(session):
+                    return session
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CliError("request_timeout")
+            time.sleep(min(_START_RECOVERY_INTERVAL_SECONDS, remaining))
 
     def send(self, args: dict[str, Any], **kwargs: Any) -> Any:
         text = _input(args.get("input"))
@@ -366,6 +421,38 @@ class Tools:
             except (TypeError, ValueError):
                 return json.dumps(tool_error("plugin_invalid_request"), ensure_ascii=False)
         return handler
+
+
+def _matches_started_identity(
+    session: dict[str, Any],
+    agent: str,
+    project_id: str | None,
+    branch: str | None,
+) -> bool:
+    if (
+        session.get("external") is not False
+        or session.get("agent") != agent
+        or session.get("project_id") != project_id
+    ):
+        return False
+    if branch is None:
+        return True
+    return session.get("is_linked_worktree") is True and session.get("branch") == branch
+
+
+def _has_live_runtime(session: dict[str, Any]) -> bool:
+    runtime = session.get("runtime")
+    if not isinstance(runtime, dict) or runtime.get("state") != "live":
+        return False
+    runtime_id = runtime.get("runtime_id")
+    generation = runtime.get("runtime_generation")
+    if not isinstance(runtime_id, str) or not runtime_id:
+        return False
+    try:
+        _canonical_u64(generation)
+    except CliError:
+        return False
+    return session.get("state") in {"starting", "running"}
 
 
 def _object(value: Any, name: str) -> dict[str, Any]:

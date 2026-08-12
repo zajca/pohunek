@@ -108,21 +108,25 @@ The plugin never discovers or scans hosts implicitly. A wildcard host policy
 requires the installer's explicit wildcard confirmation and is still a delegated
 tool guardrail, not a network or same-user security boundary.
 
-Install and update accept four non-repeatable policy bounds:
+Install and update accept five non-repeatable policy bounds:
 
 - `--tool-timeout-ms <u32>` limits one tool invocation to at most 60,000 ms.
+- `--request-timeout-ms <u32>` limits a session-creation daemon response wait
+  and must be lower than the tool timeout; it defaults to 45,000 ms.
 - `--max-output-bytes <u32>` limits one tool result to at most 1,048,576 bytes.
 - `--max-screen-bytes <u32>` limits one rendered screen to at most 262,144 bytes.
 - `--max-concurrency <u8>` limits concurrent tool invocations to at most 8.
 
 Each supplied value must be greater than zero and no greater than its listed
-ceiling; invalid input returns the typed `hermes_invalid_policy` error. An
-install without these flags uses the ceilings. An update without a bound flag
-inherits that installed bound, while a supplied flag replaces only its matching
-bound. Update always refreshes the policy protocol range from the Pohunek binary
-performing the update, repairing a policy whose stored range no longer overlaps
-the installed CLI. It otherwise preserves the installed CLI path, access mode,
-host allowlist, and bounds unless their replacement flags are supplied.
+ceiling; the request timeout must also be lower than the tool timeout. Invalid
+input returns the typed `hermes_invalid_policy` error. An install without these
+flags uses the listed request-timeout default and the other ceilings. An update
+without a bound flag inherits that installed bound, while a supplied flag
+replaces only its matching bound. Update always refreshes the policy protocol
+range from the Pohunek binary performing the update, repairing a policy whose
+stored range no longer overlaps the installed CLI. It otherwise preserves the
+installed CLI path, access mode, host allowlist, and bounds unless their
+replacement flags are supplied.
 
 The plugin preserves the daemon's exact origin-session protection. It must deny
 these eight methods when they target the session hosting Hermes:
@@ -170,6 +174,13 @@ fields. When a name is accepted, Pohunek first resolves it to exactly one stable
 object; ambiguous and missing names are typed errors. Successful mutations
 return both the logical session ID and current runtime ID, and use only supported
 idempotency keys.
+
+Always give automated starts a deterministic name. If the one permitted start
+returns `request_timeout`, the plugin must not start again. It lists sessions
+until the remaining policy budget expires and accepts only one exact-name entry
+whose agent, project, requested worktree branch, non-terminal state, and live
+runtime identity match the original request. Missing, ambiguous, or conflicting
+state remains a typed failure.
 
 ## Safe model control loop
 

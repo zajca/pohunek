@@ -171,6 +171,7 @@ async function runHermesPluginScenario(daemon: PluginDaemonHarness): Promise<voi
       access_mode: "full",
       allowed_hosts: [LOCAL_HOST, REMOTE_HOST],
       tool_timeout_ms: 8_000,
+      request_timeout_ms: 5_000,
       max_output_bytes: 262_144,
       max_screen_bytes: 65_536,
       max_concurrency: 1,
