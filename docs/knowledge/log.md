@@ -1,7 +1,10 @@
 # Knowledge Bundle Log
 
-## Unreleased (2026-07-21)
+## Unreleased (2026-08-12)
 
+- Documented the simplified session-first native GUI: prioritized cross-host
+  groups, modal session detail, direct lifecycle actions, and removal of the
+  Agents monitor, provider browsers, review, and worktree-management surfaces.
 - Documented standard Tab/Shift+Tab form focus, Enter/Ctrl+Enter submission,
   modal focus containment, and mouse selection/copy for native GUI detail text.
 - Documented source-locked, credential-free Hermes compatibility CI and

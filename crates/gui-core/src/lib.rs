@@ -77,17 +77,15 @@ pub use sdk::{
 };
 #[doc(inline)]
 pub use state::{
-    AgentMonitor, AgentRow, AgentStateEvent, ConnState, GitHubProviderScope, GitHubProviderState,
+    AgentStateEvent, ConnState, GitHubProviderScope, GitHubProviderState,
     GitHubPullRequestStatusKey, HostEvent, HostView, LinearProviderState, NotificationFilter,
     NotificationIntent, NotificationRow, NotificationScope, PromptState, ProviderOperation,
     ProviderPanel, ProviderRequestId, ProviderState, ReviewCommentEditor, ReviewDiffStatus,
-    ReviewDispatchModal, ReviewLineTarget, ReviewTabState, RuntimeContinuity, SessionObservation,
-    Toast, Workspace,
+    ReviewDispatchModal, ReviewLineTarget, ReviewTabState, RuntimeContinuity, SessionAccess,
+    SessionGroup, SessionObservation, SessionRow, Toast, Workspace,
 };
 #[doc(inline)]
-pub use ui_state::{
-    default_state_dir, RightTab, Selection, TreeNodeId, UiState, UiStateError, WindowSize,
-};
+pub use ui_state::{default_state_dir, Selection, TreeNodeId, UiState, UiStateError, WindowSize};
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -98,12 +96,6 @@ const UI_STATE_FILE: &str = "ui-state.toml";
 const DEFAULT_LEFT_PANE_WIDTH: u16 = 280;
 /// Stable protocol code older daemons return for unknown optional methods.
 const METHOD_NOT_FOUND_CODE: &str = "method_not_found";
-/// Minimum height for the Agents monitor.
-///
-/// This leaves room for about five compact two-line session rows in the
-/// default-height window; the previous 220px layout fit only about three.
-const MIN_AGENTS_PANE_HEIGHT: u16 = 360;
-const DEFAULT_AGENTS_PANE_HEIGHT: u16 = MIN_AGENTS_PANE_HEIGHT;
 const DEFAULT_WINDOW_WIDTH: u32 = 960;
 const DEFAULT_WINDOW_HEIGHT: u32 = 640;
 /// Per-query page size used to seed the inbox from `notification.list` on

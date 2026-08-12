@@ -13,11 +13,11 @@ use protocol::{
 
 use crate::attach::window_dimension_to_f32;
 use crate::message::{InboxView, Message, NotificationAction};
-use crate::view::provider::{status_pill, PillTone};
 use crate::PohunekApp;
 
 use super::{
-    agent_kind_label, card, list_button, muted_style, push_meta, selectable_text, STATUS_DOT,
+    agent_kind_label, card, list_button, muted_style, push_meta, selectable_text, status_pill,
+    PillTone, STATUS_DOT,
 };
 
 // Calendar conversion offset from the civil-date algorithm's day zero to Unix
