@@ -91,9 +91,8 @@ fn session_group(group: SessionGroup, rows: &[SessionRow]) -> Element<'static, M
 fn session_row(row: &SessionRow) -> Element<'static, Message> {
     let title = row.name.clone().unwrap_or_else(|| row.session_id.0.clone());
     let mut metadata = format!("{}  ·  {}", row.host_id, row.agent);
-    if let Some(project) = row.project_label.as_ref().or(row.project_id.as_ref()) {
-        push_meta(&mut metadata, project);
-    }
+    let project = project_context_label(row.project_label.as_deref(), row.project_id.as_deref());
+    push_meta(&mut metadata, &format!("project:{project}"));
     if let Some(branch) = &row.branch {
         push_meta(&mut metadata, branch);
     }
@@ -172,6 +171,10 @@ fn session_row(row: &SessionRow) -> Element<'static, Message> {
     .into()
 }
 
+fn project_context_label<'a>(label: Option<&'a str>, id: Option<&'a str>) -> &'a str {
+    label.or(id).unwrap_or("unassigned")
+}
+
 fn group_label(group: SessionGroup) -> &'static str {
     match group {
         SessionGroup::NeedsAction => "Needs action",
@@ -216,6 +219,16 @@ mod tests {
         assert_eq!(group_label(SessionGroup::Idle), "Idle");
         assert_eq!(group_label(SessionGroup::Running), "Running");
         assert_eq!(group_label(SessionGroup::Unavailable), "Unavailable");
+    }
+
+    #[test]
+    fn project_context_prefers_label_and_keeps_fallbacks_explicit() {
+        assert_eq!(
+            project_context_label(Some("pohunek"), Some("p-1")),
+            "pohunek"
+        );
+        assert_eq!(project_context_label(None, Some("p-1")), "p-1");
+        assert_eq!(project_context_label(None, None), "unassigned");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! The Iced `update` reducer and the command/task builders it dispatches to.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use iced::widget::text_editor;
 use iced::Task;
@@ -42,6 +43,10 @@ use crate::PohunekApp;
 // One GUI click reads a bounded page small enough to render responsively while
 // repeated clicks continue from the headless state's exact output cursor.
 const GUI_SESSION_OUTPUT_PAGE_BYTES: u32 = 16 * 1_024;
+
+// Match the conventional desktop double-click interval already used by the
+// GUI's interaction design.
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 
 #[expect(
     clippy::too_many_lines,
@@ -154,6 +159,7 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             host_id,
             session_id,
         } => {
+            app.last_project_click = None;
             app.workspace
                 .select_session(host_id.clone(), session_id.clone());
             app.ui_state.selection = Some(Selection::Session {
@@ -176,6 +182,14 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             host_id,
             project_id,
         } => {
+            let now = Instant::now();
+            let double_click = matches!(
+                &app.last_project_click,
+                Some((last_host, last_project, at))
+                    if *last_host == host_id
+                        && *last_project == project_id
+                        && now.duration_since(*at) <= DOUBLE_CLICK_WINDOW
+            );
             app.workspace
                 .select_project(host_id.clone(), project_id.clone());
             app.ui_state.selection = app.workspace.selection.clone();
@@ -186,6 +200,13 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                 tasks.push(task);
             }
             tasks.push(save_ui_state_task(app));
+            if double_click {
+                app.last_project_click = None;
+                open_start_modal(app);
+                tasks.push(keyboard::focus_task(app));
+            } else {
+                app.last_project_click = Some((host_id, project_id, now));
+            }
         }
         Message::OpenSession {
             host_id,
@@ -219,10 +240,7 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             Err(err) => app.status = Some(err),
         },
         Message::OpenStartModal => {
-            app.start = StartForm::default();
-            app.template_recipe = None;
-            app.prompt_editor = text_editor::Content::new();
-            app.modal = ModalView::Start;
+            open_start_modal(app);
             tasks.push(keyboard::focus_task(app));
         }
         Message::OpenAssistantModal => {
@@ -455,15 +473,26 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             tasks.push(save_ui_state_task(app));
         }
         Message::KeyPressed { key, modifiers } => {
-            // Replays the routed message(s) through this same reducer next
-            // tick, so a shortcut has no logic of its own to drift out of
-            // sync with the button it stands in for.
-            for message in keyboard::route_key_press(app, &key, modifiers) {
-                tasks.push(Task::done(message));
+            if let Some(task) = keyboard::form_focus_task(app, &key, modifiers) {
+                tasks.push(task);
+            } else {
+                // Replays the routed message(s) through this same reducer next
+                // tick, so a shortcut has no logic of its own to drift out of
+                // sync with the button it stands in for.
+                for message in keyboard::route_key_press(app, &key, modifiers) {
+                    tasks.push(Task::done(message));
+                }
             }
         }
     }
     Task::batch(tasks)
+}
+
+fn open_start_modal(app: &mut PohunekApp) {
+    app.start = StartForm::default();
+    app.template_recipe = None;
+    app.prompt_editor = text_editor::Content::new();
+    app.modal = ModalView::Start;
 }
 
 fn move_list_selection(app: &mut PohunekApp, direction: ListDirection) {
@@ -1195,6 +1224,33 @@ mod tests {
     use crate::message::MetadataEdit;
 
     #[test]
+    fn double_clicking_project_opens_fresh_start_modal() {
+        let host_id = HostId::new("local");
+        let mut app = app_without_selection();
+        app.workspace.hosts.insert(host_id.clone(), test_host());
+        let select_project = || Message::SelectProject {
+            host_id: host_id.clone(),
+            project_id: "p-1".to_owned(),
+        };
+
+        let _ = update(&mut app, select_project());
+        assert_eq!(app.modal, ModalView::None);
+        app.start.name = "stale name".to_owned();
+
+        let _ = update(&mut app, select_project());
+
+        assert_eq!(app.modal, ModalView::Start);
+        assert!(app.start.name.is_empty());
+        assert_eq!(
+            app.ui_state.selection,
+            Some(Selection::Project {
+                host_id,
+                project_id: "p-1".to_owned(),
+            })
+        );
+    }
+
+    #[test]
     fn launch_guard_uses_runtime_capabilities_and_preserves_legacy_profiles() {
         let host_id = HostId::new("local");
         let mut host = test_host();
@@ -1341,6 +1397,7 @@ mod tests {
             inbox_details_expanded: false,
             metadata_edit: MetadataEdit::default(),
             rename_edit: String::new(),
+            last_project_click: None,
             state_dir: None,
             status: None,
             notified_intents: 0,

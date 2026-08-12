@@ -34,6 +34,12 @@ impl fmt::Display for KeyContext {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormFocusDirection {
+    Next,
+    Previous,
+}
+
 /// Shortcut action resolved from a key chord.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum KeyAction {
@@ -641,6 +647,69 @@ pub(crate) fn route_key_press(app: &PohunekApp, key: &Key, modifiers: Modifiers)
         .map_or_else(Vec::new, |action| action_messages(app, action))
 }
 
+/// Handles conventional Tab traversal inside the Start session modal.
+pub(crate) fn form_focus_task(
+    app: &PohunekApp,
+    key: &Key,
+    modifiers: Modifiers,
+) -> Option<Task<Message>> {
+    let direction = start_form_focus_direction(app, key, modifiers)?;
+    let mut ids = vec![start_name_input_id(), start_prompt_input_id()];
+    if app.start.show_advanced && app.start.template.is_none() {
+        ids.push(start_branch_input_id());
+        ids.push(start_base_branch_input_id());
+    }
+    Some(query_form_focus(ids, 0, direction))
+}
+
+fn start_form_focus_direction(
+    app: &PohunekApp,
+    key: &Key,
+    modifiers: Modifiers,
+) -> Option<FormFocusDirection> {
+    if app.modal != ModalView::Start
+        || !matches!(key.as_ref(), Key::Named(Named::Tab))
+        || modifiers.control()
+        || modifiers.alt()
+        || modifiers.logo()
+    {
+        return None;
+    }
+
+    Some(if modifiers.shift() {
+        FormFocusDirection::Previous
+    } else {
+        FormFocusDirection::Next
+    })
+}
+
+fn query_form_focus(ids: Vec<Id>, index: usize, direction: FormFocusDirection) -> Task<Message> {
+    operation::is_focused(ids[index].clone()).then(move |focused| {
+        if focused {
+            let target = relative_focus_index(Some(index), ids.len(), direction);
+            operation::focus(ids[target].clone())
+        } else if index + 1 < ids.len() {
+            query_form_focus(ids.clone(), index + 1, direction)
+        } else {
+            let target = relative_focus_index(None, ids.len(), direction);
+            operation::focus(ids[target].clone())
+        }
+    })
+}
+
+fn relative_focus_index(
+    focused: Option<usize>,
+    field_count: usize,
+    direction: FormFocusDirection,
+) -> usize {
+    match (focused, direction) {
+        (None, FormFocusDirection::Next) => 0,
+        (None | Some(0), FormFocusDirection::Previous) => field_count - 1,
+        (Some(index), FormFocusDirection::Next) => (index + 1) % field_count,
+        (Some(index), FormFocusDirection::Previous) => index - 1,
+    }
+}
+
 fn action_messages(app: &PohunekApp, action: KeyAction) -> Vec<Message> {
     match action {
         KeyAction::OpenInbox => vec![Message::OpenInbox],
@@ -809,6 +878,52 @@ pub(crate) fn focus_task(app: &PohunekApp) -> Task<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_modal_routes_tab_focus_forward_and_backward() {
+        let mut app = PohunekApp::test_default();
+        app.modal = ModalView::Start;
+
+        assert_eq!(
+            start_form_focus_direction(&app, &Key::Named(Named::Tab), Modifiers::empty()),
+            Some(FormFocusDirection::Next)
+        );
+        assert_eq!(
+            start_form_focus_direction(&app, &Key::Named(Named::Tab), Modifiers::SHIFT),
+            Some(FormFocusDirection::Previous)
+        );
+        assert_eq!(
+            start_form_focus_direction(&app, &Key::Named(Named::Tab), Modifiers::CTRL),
+            None
+        );
+
+        app.modal = ModalView::Assistant;
+        assert_eq!(
+            start_form_focus_direction(&app, &Key::Named(Named::Tab), Modifiers::empty()),
+            None
+        );
+    }
+
+    #[test]
+    fn relative_form_focus_wraps_in_both_directions() {
+        assert_eq!(relative_focus_index(None, 4, FormFocusDirection::Next), 0);
+        assert_eq!(
+            relative_focus_index(Some(3), 4, FormFocusDirection::Next),
+            0
+        );
+        assert_eq!(
+            relative_focus_index(None, 4, FormFocusDirection::Previous),
+            3
+        );
+        assert_eq!(
+            relative_focus_index(Some(0), 4, FormFocusDirection::Previous),
+            3
+        );
+        assert_eq!(
+            relative_focus_index(Some(2), 4, FormFocusDirection::Previous),
+            1
+        );
+    }
 
     #[test]
     fn default_keymap_contains_only_session_first_global_actions() {
