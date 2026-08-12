@@ -86,7 +86,8 @@ The main pane always groups every loaded session in this priority order:
 
 Rows are stable within a group by host id and session id. Activity or runtime
 changes may move a row between groups, but do not reorder unrelated rows inside
-the same group.
+the same group. Every row identifies its project explicitly as
+`project:<label>`, falling back to the project id or `project:unassigned`.
 
 Each eligible row exposes direct actions:
 
@@ -110,6 +111,9 @@ The left rail contains Assistant, Inbox, hosts, and projects. Select a project
 before starting a session. Sessions do not appear in the left tree because the
 main pane is their single navigation surface.
 
+Double-clicking a project row selects that project and opens a fresh Start
+session modal scoped to it.
+
 Default global bindings:
 
 | Name | Default | Behavior |
@@ -125,6 +129,10 @@ Modal bindings include `escape`, `enter`, `shift+enter`, `o`, and `j`/`k` or
 the arrow keys for Inbox navigation. Add a partial `[keybindings]` table to
 override supported names. Unknown removed binding names fail configuration
 validation instead of silently doing nothing.
+
+Tab and Shift+Tab are conventional, non-configurable form navigation in the
+Start session modal. Focus cycles only through Name, Prompt, and visible
+Advanced branch fields, never into controls behind the modal overlay.
 
 ## Session and Assistant Launch
 
@@ -148,7 +156,9 @@ session into the main list's Needs action group.
 
 The daemon remains the source of truth for notification lifecycle. The GUI
 raises desktop notifications only for newly created `action_required` or
-`error` records.
+`error` records. Acknowledged `action_required` and `error` notifications remain
+actionable until archived; acknowledgement alone does not remove their linked
+session from the Needs action group.
 
 ## Troubleshooting
 

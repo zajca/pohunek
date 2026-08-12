@@ -15,6 +15,7 @@ mod view;
 use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Instant;
 
 use iced::widget::text_editor;
 use iced::{window, Subscription, Task, Theme};
@@ -184,6 +185,8 @@ struct PohunekApp {
     metadata_edit: MetadataEdit,
     /// Edit buffer for renaming the selected session's display name.
     rename_edit: String,
+    /// Last project row click, used to open the Start modal on double-click.
+    last_project_click: Option<(HostId, String, Instant)>,
     state_dir: Option<PathBuf>,
     status: Option<String>,
     notified_intents: usize,
@@ -222,6 +225,7 @@ impl PohunekApp {
                 inbox_details_expanded: false,
                 metadata_edit: MetadataEdit::default(),
                 rename_edit: String::new(),
+                last_project_click: None,
                 state_dir: boot.state_dir,
                 status: boot.status,
                 notified_intents: 0,
@@ -275,6 +279,7 @@ impl PohunekApp {
             inbox_details_expanded: false,
             metadata_edit: MetadataEdit::default(),
             rename_edit: String::new(),
+            last_project_click: None,
             state_dir: None,
             status: None,
             notified_intents: 0,
@@ -428,6 +433,7 @@ mod tests {
             inbox_details_expanded: false,
             metadata_edit: MetadataEdit::default(),
             rename_edit: String::new(),
+            last_project_click: None,
             state_dir: None,
             status: None,
             notified_intents: 0,
@@ -511,6 +517,7 @@ mod tests {
             inbox_details_expanded: false,
             metadata_edit: MetadataEdit::default(),
             rename_edit: String::new(),
+            last_project_click: None,
             state_dir: None,
             status: None,
             notified_intents: 0,
