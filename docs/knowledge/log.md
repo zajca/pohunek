@@ -4,6 +4,8 @@
 
 - Documented standard Tab/Shift+Tab form focus, Enter/Ctrl+Enter submission,
   modal focus containment, and mouse selection/copy for native GUI detail text.
+- Documented source-locked, credential-free Hermes compatibility CI and
+  extracted release-archive plugin smoke verification.
 - Documented configurable Hermes plugin timeout, output, screen, and concurrency
   bounds plus protocol-range repair during integration update.
 - Added the Hermes operator guide: explicit managed runtime selection, isolated

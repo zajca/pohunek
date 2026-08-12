@@ -4,7 +4,7 @@
 //! clears the inherited environment, owns each child process group, and never
 //! retains subprocess output in an error.
 
-// Rust guideline compliant 2026-08-07
+// Rust guideline compliant 2026-08-09
 
 #![expect(
     clippy::map_err_ignore,
@@ -31,8 +31,10 @@ use serde::{Deserialize, Serialize};
 use super::error::Error;
 use super::target::{HermesInvocation, ResolvedTarget};
 
-/// The exact release line required by `compat/hermes/compatibility-lock.json`.
+/// The release prefix required by `compat/hermes/compatibility-lock.json`.
 const PINNED_HERMES_VERSION_LINE: &str = "Hermes Agent v0.20.0 (2026.8.3)";
+/// Hermes appends source-provenance metadata after this delimiter for Git installs.
+const HERMES_VERSION_METADATA_DELIMITER: &str = " · ";
 /// A local lifecycle query must finish promptly and never block the CLI indefinitely.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// This caps each pipe independently while still draining it to prevent a pipe deadlock.
@@ -552,15 +554,12 @@ impl HermesRunner {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::UnsupportedHermes`] when no output line exactly matches
-    /// the pinned version line.
+    /// Returns [`Error::UnsupportedHermes`] when no output line contains the
+    /// pinned release, optionally followed by Hermes's provenance metadata.
     pub(crate) fn verify_version(&self, target: &ResolvedTarget) -> Result<(), Error> {
         let output = self.run(target, FixedCommand::Version)?;
         let version = std::str::from_utf8(&output.stdout).map_err(|_| Error::UnsupportedHermes)?;
-        if version
-            .lines()
-            .any(|line| line == PINNED_HERMES_VERSION_LINE)
-        {
+        if version.lines().any(pinned_version_line_matches) {
             Ok(())
         } else {
             Err(Error::UnsupportedHermes)
@@ -754,6 +753,13 @@ impl HermesRunner {
             stdout: stdout.bytes,
         })
     }
+}
+
+fn pinned_version_line_matches(line: &str) -> bool {
+    line.strip_prefix(PINNED_HERMES_VERSION_LINE)
+        .is_some_and(|suffix| {
+            suffix.is_empty() || suffix.starts_with(HERMES_VERSION_METADATA_DELIMITER)
+        })
 }
 
 /// The exact environment contract for one fixed child process family.
@@ -1744,7 +1750,7 @@ mod tests {
     }
 
     #[test]
-    fn verifies_an_exact_pinned_version_line_and_rejects_malformed_output() {
+    fn verifies_the_pinned_version_with_optional_provenance_metadata() {
         let root = fixture("version");
         let selected = target(&root.0, TargetSelection::Profile(ProfileName::default()));
         runner(
@@ -1753,6 +1759,20 @@ mod tests {
         )
         .verify_version(&selected)
         .expect("supported Hermes version");
+        runner(
+            &root.0,
+            "printf '%s\\n' 'Hermes Agent v0.20.0 (2026.8.3) · upstream 7aecab56 · local 3c27eb62'",
+        )
+        .verify_version(&selected)
+        .expect("supported Hermes version with provenance");
+        assert_eq!(
+            runner(
+                &root.0,
+                "printf '%s\\n' 'Hermes Agent v0.20.0 (2026.8.3)-unexpected'",
+            )
+            .verify_version(&selected),
+            Err(Error::UnsupportedHermes)
+        );
         assert_eq!(
             runner(&root.0, "printf '%s\\n' 'Hermes Agent v0.20.1 (2026.8.3)'")
                 .verify_version(&selected),

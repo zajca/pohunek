@@ -210,6 +210,21 @@ jobs:
             binary: pohunekd
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Python for Hermes release verification
+        if: matrix.component == 'cli'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv for Hermes release verification
+        if: matrix.component == 'cli'
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
 
       - name: Install musl toolchain
         if: endsWith(matrix.target, '-musl')
@@ -311,6 +326,34 @@ jobs:
           trap 'rm -rf "$extract_dir"' EXIT
           tar -xzf "$archive" -C "$extract_dir"
           scripts/smoke-gui-release "$extract_dir/${{ matrix.archive_prefix }}-${GITHUB_REF_NAME#v}-${{ matrix.target }}/${{ matrix.binary }}"
+
+      - name: Provision locked Hermes runtime
+        if: matrix.component == 'cli'
+        id: hermes
+        shell: bash
+        run: |
+          set -euo pipefail
+          hermes_bin="$(scripts/provision-hermes-compat "$RUNNER_TEMP/hermes-compat")"
+          printf 'bin=%s\n' "$hermes_bin" >> "$GITHUB_OUTPUT"
+
+      - name: Verify packaged CLI against pinned Hermes
+        if: matrix.component == 'cli'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${{ steps.package.outputs.archive }}"
+          extract_dir="$(mktemp -d)"
+          trap 'rm -rf "$extract_dir"' EXIT
+          tar -xzf "$archive" -C "$extract_dir"
+          release_root="$extract_dir/${{ matrix.archive_prefix }}-${GITHUB_REF_NAME#v}-${{ matrix.target }}"
+          release_pohunek="$(realpath "$release_root/${{ matrix.binary }}")"
+          packaged_smoke="$release_root/packaging/smoke-hermes-plugin-release"
+          test -x "$release_pohunek"
+          test -x "$packaged_smoke"
+          cargo xtask hermes compatibility \
+            --hermes-bin "${{ steps.hermes.outputs.bin }}" \
+            --pohunek-bin "$release_pohunek"
+          "$packaged_smoke" "$release_pohunek" "${{ steps.hermes.outputs.bin }}"
 
       - name: Attach to release
         uses: softprops/action-gh-release@v2

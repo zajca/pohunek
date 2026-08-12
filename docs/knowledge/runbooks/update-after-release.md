@@ -50,12 +50,13 @@ M3, and additive provider work do not require another lockstep transition.
 For the Hermes M2 runtime, inspect the `hermes` entry after upgrade. It is
 launchable only with `version: "0.20.0"` and `supported: true`; a missing
 binary has no version-policy result, while a wrong or unparseable version is
-reported as unsupported. The model-free `cargo xtask hermes compatibility`
-check needs the pinned executable and validates committed evidence. Refresh
-goldens with `cargo xtask hermes refresh-goldens --hermes-bin ABS`, where `ABS`
-is the absolute path to the pinned executable. The harness runs that real Hermes
-process in a real PTY but replaces the model API with a repository-owned,
-deterministic IPv4-loopback mock.
+reported as unsupported. The model-free compatibility check, `cargo xtask
+hermes compatibility --pohunek-bin ABS`, needs the pinned Hermes executable on
+`PATH` and an absolute, canonical built Pohunek executable at `ABS`; it validates
+committed evidence. Refresh goldens with `cargo xtask hermes refresh-goldens
+--hermes-bin ABS`, where `ABS` is the absolute path to the pinned Hermes
+executable. The harness runs that real Hermes process in a real PTY but replaces
+the model API with a repository-owned, deterministic IPv4-loopback mock.
 It requires no provider credentials and incurs no provider cost.
 Credential-source suppression normally produces no Copilot startup probe. If
 the pinned background exchange still starts, the mock admits at most its

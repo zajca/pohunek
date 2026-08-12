@@ -77,6 +77,57 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
 
+  hermes-compatibility:
+    name: pinned Hermes compatibility (model-free)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: hermes-compatibility
+
+      - name: Check fail-closed Hermes provisioning
+        run: scripts/tests/provision-hermes-compat.sh
+
+      - name: Provision locked Hermes runtime
+        id: hermes
+        shell: bash
+        run: |
+          set -euo pipefail
+          hermes_bin="$(scripts/provision-hermes-compat "$RUNNER_TEMP/hermes-compat")"
+          printf 'bin=%s\n' "$hermes_bin" >> "$GITHUB_OUTPUT"
+
+      - name: Build Pohunek CLI for integration lifecycle checks
+        run: cargo build --locked -p pohunek-cli --bin pohunek
+
+      - name: Check pinned Hermes compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          pohunek_bin="$(realpath target/debug/pohunek)"
+          cargo xtask hermes compatibility \
+            --hermes-bin "${{ steps.hermes.outputs.bin }}" \
+            --pohunek-bin "$pohunek_bin"
+
   web:
     name: web SDK + control center
     runs-on: ubuntu-latest

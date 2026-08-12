@@ -1,9 +1,14 @@
 # Implementation Plan: First-Class Hermes Agent Integration
 
-Status: proposed
+Status: implemented (M1-M3 released in v0.30.1)
 
 Planning baseline: `main` at
 `15ebebb20a6ad6302f95b324e3136b28c17e8feb` on 2026-07-27.
+
+Completion baseline: M1-M3 shipped through `v0.30.1` at
+`4d03d7ed03f1accbdd3ce8f6836c342fdf3dffb7`. Section 18 records the verified
+completion state maintained by the model-free compatibility, release-smoke,
+Rust, web, TypeScript, and documentation gates.
 
 Normative design:
 [`hermes-agent-integration.md`](./hermes-agent-integration.md).
@@ -1596,187 +1601,187 @@ milestone; no milestone may claim items assigned to a later milestone.
 
 ### 18.1 Runtime
 
-- [ ] `AgentKind::Hermes` is present in all Rust and TypeScript surfaces.
-- [ ] `hermes chat` launches in a real Pohunek PTY.
-- [ ] Multiline input works using validated framing.
-- [ ] Native Hermes ID is reported without reading `state.db`.
-- [ ] Daemon restart preserves the live worker, PTY, terminal, output, and
+- [x] `AgentKind::Hermes` is present in all Rust and TypeScript surfaces.
+- [x] `hermes chat` launches in a real Pohunek PTY.
+- [x] Multiline input works using validated framing.
+- [x] Native Hermes ID is reported without reading `state.db`.
+- [x] Daemon restart preserves the live worker, PTY, terminal, output, and
       native ID.
-- [ ] Resume uses the recorded native ID under the same logical session.
-- [ ] Resume creates a new runtime ID/generation.
-- [ ] Hermes fork returns `agent_fork_unsupported` with no side effects.
-- [ ] Hermes-based Pohunek profiles validate and run.
-- [ ] Process/screen fallback works when the plugin is absent.
-- [ ] Runtime inventory and doctor report Hermes accurately.
+- [x] Resume uses the recorded native ID under the same logical session.
+- [x] Resume creates a new runtime ID/generation.
+- [x] Hermes fork returns `agent_fork_unsupported` with no side effects.
+- [x] Hermes-based Pohunek profiles validate and run.
+- [x] Process/screen fallback works when the plugin is absent.
+- [x] Runtime inventory and doctor report Hermes accurately.
 
 ### 18.2 Observation protocol
 
-- [ ] `session.screen` returns bounded rendered terminal state.
-- [ ] `session.output` supports tail, cursor, pagination, gap, wait, and runtime
+- [x] `session.screen` returns bounded rendered terminal state.
+- [x] `session.output` supports tail, cursor, pagination, gap, wait, and runtime
       mismatch.
-- [ ] Output larger than one frame is chunked correctly.
-- [ ] `session.wait` is race-free, non-polling, uses a dedicated connection,
+- [x] Output larger than one frame is chunked correctly.
+- [x] `session.wait` is race-free, non-polling, uses a dedicated connection,
       and terminates by result, required timeout, or daemon shutdown without a
       disconnect-cancellation guarantee.
-- [ ] External sessions return a typed no-managed-terminal error.
-- [ ] Previous workers remain usable and report observation unsupported.
-- [ ] Public protocol and private worker versions are bumped and tested.
-- [ ] Rust/TypeScript types and `docs/public-api.md` agree.
+- [x] External sessions return a typed no-managed-terminal error.
+- [x] Previous workers remain usable and report observation unsupported.
+- [x] Public protocol and private worker versions are bumped and tested.
+- [x] Rust/TypeScript types and `docs/public-api.md` agree.
 
 ### 18.3 CLI and SDK
 
-- [ ] Rust SDK exposes every new operation.
-- [ ] CLI exposes JSON parity for every plugin-used operation.
-- [ ] JSON stdout contains exactly one document.
-- [ ] Typed errors are machine-readable.
-- [ ] New/input prompt text uses stdin and never argv.
-- [ ] Remote host calls use direct NetBird transport.
-- [ ] Local client cancellation and configured daemon limits are enforced
+- [x] Rust SDK exposes every new operation.
+- [x] CLI exposes JSON parity for every plugin-used operation.
+- [x] JSON stdout contains exactly one document.
+- [x] Typed errors are machine-readable.
+- [x] New/input prompt text uses stdin and never argv.
+- [x] Remote host calls use direct NetBird transport.
+- [x] Local client cancellation and configured daemon limits are enforced
       without claiming disconnect-cancellation of daemon waiters.
 
 ### 18.4 Plugin and policy
 
-- [ ] A real Hermes plugin loads in the pinned supported release.
-- [ ] Install is local, profile-aware, atomic, idempotent, and owner-private.
-- [ ] Update and uninstall preserve unrelated Hermes files/state.
-- [ ] Name collision and modified assets fail safely.
-- [ ] Plugin enablement uses supported Hermes APIs/CLI, not YAML text surgery.
-- [ ] Access mode is explicit.
-- [ ] Host allowlist is explicit.
-- [ ] Agent/profile and metadata inputs are constrained.
-- [ ] The daemon authoritatively rejects `session.stop`, `session.resume`,
+- [x] A real Hermes plugin loads in the pinned supported release.
+- [x] Install is local, profile-aware, atomic, idempotent, and owner-private.
+- [x] Update and uninstall preserve unrelated Hermes files/state.
+- [x] Name collision and modified assets fail safely.
+- [x] Plugin enablement uses supported Hermes APIs/CLI, not YAML text surgery.
+- [x] Access mode is explicit.
+- [x] Host allowlist is explicit.
+- [x] Agent/profile and metadata inputs are constrained.
+- [x] The daemon authoritatively rejects `session.stop`, `session.resume`,
       `session.remove`, `session.fork`, `session.resize`,
       `session.set_metadata`, `session.rename`, and `session.input` for the
       origin session, and the plugin repeats that exact check before subprocess
       start as defence in depth. `session.report_agent`,
       `session.release_agent`, and the necessary public fallback
       `session.report_native_id` remain allowed.
-- [ ] Stop/remove register only in `full`.
-- [ ] CLI version incompatibility disables tools safely.
-- [ ] Doctor covers files, policy, versions, tools, skill, and hook dry run.
+- [x] Stop/remove register only in `full`.
+- [x] CLI version incompatibility disables tools safely.
+- [x] Doctor covers files, policy, versions, tools, skill, and hook dry run.
 
 ### 18.5 Hooks
 
-- [ ] New and resumed native IDs are reported.
-- [ ] Context-compaction continuation IDs supersede the immutable launch
+- [x] New and resumed native IDs are reported.
+- [x] Context-compaction continuation IDs supersede the immutable launch
       identity through ordered `pre_llm_call` reassertion and are used by the
       next resume.
-- [ ] Working, blocked, idle, interruption, error, and finalize mappings match
+- [x] Working, blocked, idle, interruption, error, and finalize mappings match
       the RFC.
-- [ ] `on_session_end` is not treated as process exit.
-- [ ] Hook failure never fails a Hermes turn.
-- [ ] Hooks perform no subprocess, network, or database access.
-- [ ] Hook deadline and latency regression are tested.
-- [ ] Stale/out-of-order/cross-runtime reports are rejected.
-- [ ] Prompt/tool/output payloads never enter reports or logs.
+- [x] `on_session_end` is not treated as process exit.
+- [x] Hook failure never fails a Hermes turn.
+- [x] Hooks perform no subprocess, network, or database access.
+- [x] Hook deadline and latency regression are tested.
+- [x] Stale/out-of-order/cross-runtime reports are rejected.
+- [x] Prompt/tool/output payloads never enter reports or logs.
 
 ### 18.6 Tools and skill
 
-- [ ] Every read tool is implemented against the real CLI.
-- [ ] Every manage tool is implemented against the real CLI.
-- [ ] Stop/remove work only in `full`.
-- [ ] No raw attach or arbitrary-method tool exists.
-- [ ] Send/wait/screen control loop reaches a deterministic terminal/activity
+- [x] Every read tool is implemented against the real CLI.
+- [x] Every manage tool is implemented against the real CLI.
+- [x] Stop/remove work only in `full`.
+- [x] No raw attach or arbitrary-method tool exists.
+- [x] Send/wait/screen control loop reaches a deterministic terminal/activity
       outcome.
-- [ ] Output gap and runtime change are recoverable.
-- [ ] Tool output is bounded, normalized, and cursor-preserving.
-- [ ] Bundled skill is generated from `docs/knowledge`.
-- [ ] Skill tool requirements match registered tools.
-- [ ] Pinned Hermes discovers tools and skill.
+- [x] Output gap and runtime change are recoverable.
+- [x] Tool output is bounded, normalized, and cursor-preserving.
+- [x] Bundled skill is generated from `docs/knowledge`.
+- [x] Skill tool requirements match registered tools.
+- [x] Pinned Hermes discovers tools and skill.
 
 ### 18.7 Notifications and clients
 
-- [ ] Notification policy is provider-keyed, landed in M1.
-- [ ] `AgentKind::Hermes` is added in M2 with no public protocol bump, and an
+- [x] Notification policy is provider-keyed, landed in M1.
+- [x] `AgentKind::Hermes` is added in M2 with no public protocol bump, and an
       unknown value renders neutrally on an older M1 peer.
-- [ ] Hermes attention is sanitized and projected.
-- [ ] CLI, GUI, web SDK, client core, frontend, and fixtures support Hermes.
-- [ ] Resume/fork actions are capability-driven.
-- [ ] Unknown future agents do not crash clients.
-- [ ] Universal assistant can select Hermes explicitly and by documented
+- [x] Hermes attention is sanitized and projected.
+- [x] CLI, GUI, web SDK, client core, frontend, and fixtures support Hermes.
+- [x] Resume/fork actions are capability-driven.
+- [x] Unknown future agents do not crash clients.
+- [x] Universal assistant can select Hermes explicitly and by documented
       fallback.
 
 ### 18.8 Security and operations
 
-- [ ] No secret, `.env`, key, certificate, or Hermes database is read.
-- [ ] Installer path traversal, symlink escape, unsafe owner/mode, and broad
+- [x] No secret, `.env`, key, certificate, or Hermes database is read.
+- [x] Installer path traversal, symlink escape, unsafe owner/mode, and broad
       target tests pass.
-- [ ] Subprocesses use argv, fixed allowlists, minimal environment, timeout,
+- [x] Subprocesses use argv, fixed allowlists, minimal environment, timeout,
       output cap, and redaction.
-- [ ] Terminal/prompt payloads are absent from logs/errors/notifications.
-- [ ] Remote/full policy must be explicitly enabled.
-- [ ] Documentation and tests treat plugin policy as a delegated-tool
+- [x] Terminal/prompt payloads are absent from logs/errors/notifications.
+- [x] Remote/full policy must be explicitly enabled.
+- [x] Documentation and tests treat plugin policy as a delegated-tool
       guardrail, not a sandbox against same-user shell/file-write bypass.
-- [ ] Upgrade and unsupported downgrade are documented.
-- [ ] Release binary embeds working plugin assets.
+- [x] Upgrade and unsupported downgrade are documented.
+- [x] Release binary embeds working plugin assets.
 
 ### 18.9 Tests and documentation
 
-- [ ] Deterministic unit/integration tests cover happy, error, and edge paths.
-- [ ] Real daemon + real worker E2E covers runtime and tools.
-- [ ] Pinned real-Hermes smoke covers plugin, hooks, skill, input, and resume.
-- [ ] Rust full gates pass.
-- [ ] Web full gates pass.
-- [ ] Real-daemon web suite passes.
-- [ ] `cargo xtask ts check` passes.
-- [ ] `cargo xtask docs check` passes.
-- [ ] README, architecture, public API, knowledge, runbooks, and release notes
+- [x] Deterministic unit/integration tests cover happy, error, and edge paths.
+- [x] Real daemon + real worker E2E covers runtime and tools.
+- [x] Pinned real-Hermes smoke covers plugin, hooks, skill, input, and resume.
+- [x] Rust full gates pass.
+- [x] Web full gates pass.
+- [x] Real-daemon web suite passes.
+- [x] `cargo xtask ts check` passes.
+- [x] `cargo xtask docs check` passes.
+- [x] README, architecture, public API, knowledge, runbooks, and release notes
       are current.
-- [ ] Diff review finds no unrelated changes or dead-code removal.
+- [x] Diff review finds no unrelated changes or dead-code removal.
 
 ### 18.10 Independently releasable milestone subsets
 
 **M1 — provider-neutral foundations**
 
-- [ ] Resume and fork are independent for existing agents, with no
+- [x] Resume and fork are independent for existing agents, with no
       Codex/Claude regression.
-- [ ] Every item in sections 18.2 and 18.3 passes, including derived
+- [x] Every item in sections 18.2 and 18.3 passes, including derived
       control-line bounds and the dedicated-connection wait contract.
-- [ ] The daemon rejects all eight guarded origin-session methods —
+- [x] The daemon rejects all eight guarded origin-session methods —
       `session.stop`, `session.resume`, `session.remove`, `session.fork`,
       `session.resize`, `session.set_metadata`, `session.rename`, and
       `session.input` — through direct CLI/API bypass. Lifecycle
       `session.report_agent`, `session.release_agent`, and the necessary public
       fallback `session.report_native_id` remain allowed, and the existing
       self-feeding attach behavior remains green.
-- [ ] The single public break is complete: range negotiation, the provider-keyed
+- [x] The single public break is complete: range negotiation, the provider-keyed
       notification policy, and forward-compatible `AgentKind` all land in M1, an
       unknown wire value round-trips to the neutral variant, and that variant is
       rejected by every mutating path.
-- [ ] `session.report_native_id` carries runtime identity, PID start identity,
+- [x] `session.report_native_id` carries runtime identity, PID start identity,
       sequence, and expiry; the daemon enforces the same rejection rules as the
       private claim path; both existing hook scripts send the new fields.
-- [ ] Public range negotiation, the private compatibility window, generated
+- [x] Public range negotiation, the private compatibility window, generated
       TypeScript, `docs/public-api.md`, and relevant knowledge are current.
-- [ ] Relevant deterministic, real-daemon/worker, Rust, web, TypeScript, and
+- [x] Relevant deterministic, real-daemon/worker, Rust, web, TypeScript, and
       docs gates pass.
 
 **M2 — first-class Hermes runtime**
 
-- [ ] The launch, PTY input, daemon-restart durability, profile, fallback,
+- [x] The launch, PTY input, daemon-restart durability, profile, fallback,
       inventory, and unsupported-fork items in section 18.1 pass with local
       terminal backend only.
-- [ ] Resume capability and exact argv are implemented and tested against an
+- [x] Resume capability and exact argv are implemented and tested against an
       injected valid native reference; without M3 lifecycle reporting, a real
       session with no reference returns the typed missing-reference error.
-- [ ] `AgentKind::Hermes` is added additively with no public protocol bump, and
+- [x] `AgentKind::Hermes` is added additively with no public protocol bump, and
       an M1 peer that predates the value still renders it neutrally.
-- [ ] Every non-plugin client item in section 18.7 passes.
-- [ ] Process/screen fallback remains bounded when lifecycle integration is
+- [x] Every non-plugin client item in section 18.7 passes.
+- [x] Process/screen fallback remains bounded when lifecycle integration is
       absent.
-- [ ] Relevant deterministic, real-Hermes PTY, Rust, web, TypeScript, docs, and
+- [x] Relevant deterministic, real-Hermes PTY, Rust, web, TypeScript, docs, and
       release gates pass.
 
 **M3 — Hermes operator plugin**
 
-- [ ] Every item in sections 18.4, 18.5, and 18.6 passes, including the real
+- [x] Every item in sections 18.4, 18.5, and 18.6 passes, including the real
       `plugin.yaml`/`__init__.py` API, continuation-session identity, and
       generated `pohunek:pohunek` skill.
-- [ ] Policy is Pohunek-owned outside the plugin checksum set, and policy-file
+- [x] Policy is Pohunek-owned outside the plugin checksum set, and policy-file
       tampering is diagnosed without being represented as a same-user sandbox.
-- [ ] Plugin-sourced notification items in section 18.7 and all applicable
+- [x] Plugin-sourced notification items in section 18.7 and all applicable
       security/operations items in section 18.8 pass.
-- [ ] Every full-RFC test/documentation item in section 18.9 passes; therefore
+- [x] Every full-RFC test/documentation item in section 18.9 passes; therefore
       M3 completion also proves the union of M1, M2, and M3.
 
 ## 19. Test matrix
