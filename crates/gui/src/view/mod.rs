@@ -6,6 +6,7 @@ pub(crate) mod detail;
 pub(crate) mod inbox;
 mod modals;
 mod project;
+mod selectable_text;
 // `pub(crate)` so `crate::keyboard` can reuse the "what's selected" lookups
 // (`selected_linear_issue_in_state` and friends) for the provider-item
 // modal's `Enter` shortcut, the same way `inbox` above is widened for its
@@ -29,6 +30,7 @@ use modals::{
     assistant_modal_content, dispatch_review_modal_content, keymap_modal_content,
     provider_item_modal_content, start_modal_content,
 };
+use selectable_text::selectable_text;
 use tree::{
     agents_monitor, assistant_entry_button, conn_color, inbox_entry_button, workspace_tree,
 };

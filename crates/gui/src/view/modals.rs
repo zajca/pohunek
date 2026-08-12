@@ -19,7 +19,7 @@ use crate::view::provider::{
 use crate::view::session::session_name_input;
 use crate::PohunekApp;
 
-use super::{dialog_card, muted_style};
+use super::{dialog_card, muted_style, selectable_text};
 
 /// "Start a session" modal. The operator picks the agent and an optional
 /// template; the prompt editor holds the session input (typed for a blank
@@ -61,10 +61,12 @@ pub(crate) fn start_modal_content(app: &PohunekApp) -> Element<'_, Message> {
         ]
         .spacing(8)
         .align_y(Center),
-        session_name_input(app),
+        session_name_input(app, Message::CreateSession),
         text(prompt_label).size(13),
         text_editor(&app.prompt_editor)
+            .id(crate::keyboard::start_prompt_input_id())
             .height(220)
+            .key_binding(start_prompt_binding)
             .on_action(Message::PromptEdited),
         button(text(advanced_label).size(13))
             .on_press(Message::ToggleStartAdvanced)
@@ -75,9 +77,13 @@ pub(crate) fn start_modal_content(app: &PohunekApp) -> Element<'_, Message> {
         panel = panel.push(
             row![
                 text_input("branch override", &app.start.branch)
-                    .on_input(Message::StartBranchChanged),
+                    .id(crate::keyboard::start_branch_input_id())
+                    .on_input(Message::StartBranchChanged)
+                    .on_submit(Message::CreateSession),
                 text_input("base branch override", &app.start.base_branch)
-                    .on_input(Message::StartBaseBranchChanged),
+                    .id(crate::keyboard::start_base_branch_input_id())
+                    .on_input(Message::StartBaseBranchChanged)
+                    .on_submit(Message::CreateSession),
             ]
             .spacing(8),
         );
@@ -132,7 +138,9 @@ pub(crate) fn assistant_modal_content(app: &PohunekApp) -> Element<'_, Message> 
         .align_y(Center),
         text("Request / initial prompt").size(13),
         text_editor(&app.assistant_editor)
+            .id(crate::keyboard::assistant_request_input_id())
             .height(180)
+            .key_binding(assistant_request_binding)
             .on_action(Message::AssistantRequestEdited),
         button(text(advanced_label).size(13))
             .on_press(Message::ToggleAssistantAdvanced)
@@ -144,9 +152,13 @@ pub(crate) fn assistant_modal_content(app: &PohunekApp) -> Element<'_, Message> 
             .push(
                 row![
                     text_input("branch override", &app.assistant.branch)
-                        .on_input(Message::AssistantBranchChanged),
+                        .id(crate::keyboard::assistant_branch_input_id())
+                        .on_input(Message::AssistantBranchChanged)
+                        .on_submit(Message::LaunchAssistant),
                     text_input("base branch override", &app.assistant.base_branch)
-                        .on_input(Message::AssistantBaseBranchChanged),
+                        .id(crate::keyboard::assistant_base_branch_input_id())
+                        .on_input(Message::AssistantBaseBranchChanged)
+                        .on_submit(Message::LaunchAssistant),
                 ]
                 .spacing(8),
             )
@@ -174,6 +186,36 @@ pub(crate) fn assistant_modal_content(app: &PohunekApp) -> Element<'_, Message> 
     }
     let panel = panel.push(assistant_button);
     dialog_card("Start assistant", panel)
+}
+
+fn start_prompt_binding(key_press: text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
+    multiline_binding(key_press, Message::CreateSession)
+}
+
+fn assistant_request_binding(
+    key_press: text_editor::KeyPress,
+) -> Option<text_editor::Binding<Message>> {
+    multiline_binding(key_press, Message::LaunchAssistant)
+}
+
+fn multiline_binding(
+    key_press: text_editor::KeyPress,
+    submit: Message,
+) -> Option<text_editor::Binding<Message>> {
+    if is_ctrl_enter(&key_press.key, key_press.modifiers) {
+        Some(text_editor::Binding::Custom(submit))
+    } else {
+        text_editor::Binding::from_key_press(key_press)
+    }
+}
+
+fn is_ctrl_enter(key: &iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) -> bool {
+    matches!(
+        key.as_ref(),
+        iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter)
+    ) && modifiers.control()
+        && !modifiers.alt()
+        && !modifiers.logo()
 }
 
 pub(crate) fn keymap_modal_content(app: &PohunekApp) -> Element<'_, Message> {
@@ -259,7 +301,7 @@ fn linear_issue_modal<'a>(
     let Some(issue) = selected_linear_issue_in_state(&host.provider.linear) else {
         return dialog_card("Linear issue", text("No issue selected").size(13));
     };
-    let mut header = row![text(issue.identifier.as_str())
+    let mut header = row![selectable_text(issue.identifier.as_str())
         .size(14)
         .font(iced::Font::MONOSPACE)]
     .spacing(8)
@@ -272,18 +314,18 @@ fn linear_issue_modal<'a>(
     }
     let mut body = column![
         header,
-        text(issue.title.clone())
+        selectable_text(issue.title.clone())
             .size(16)
             .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
     ]
     .spacing(10);
     if let Some(meta) = linear_issue_meta_line(issue) {
-        body = body.push(text(meta).size(12).style(muted_style));
+        body = body.push(selectable_text(meta).size(12).style(muted_style));
     }
     body = body
         .push(branch_row(issue.branch.clone(), issue.url.clone()))
-        .push(scrollable(text(issue.body.clone()).size(13)).height(360))
-        .push(session_name_input(app))
+        .push(scrollable(selectable_text(issue.body.clone()).size(13)).height(360))
+        .push(session_name_input(app, Message::LaunchLinearIssue))
         .push(action_launcher(
             available_actions(app, &ProviderKind::LinearIssue),
             selected_action,
@@ -324,9 +366,9 @@ fn github_pull_request_modal<'a>(
         header = header.push(status_pill("draft", PillTone::Neutral));
     }
     header = header
-        .push(text(format!("#{}", pull_request.number)).size(14))
+        .push(selectable_text(format!("#{}", pull_request.number)).size(14))
         .push(
-            text(pull_request.title.clone())
+            selectable_text(pull_request.title.clone())
                 .size(16)
                 .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
         );
@@ -335,7 +377,11 @@ fn github_pull_request_modal<'a>(
     if has_author_or_labels {
         let mut meta_line = row![].spacing(6).align_y(Center);
         if let Some(author) = &pull_request.author {
-            meta_line = meta_line.push(text(format!("@{author}")).size(12).style(muted_style));
+            meta_line = meta_line.push(
+                selectable_text(format!("@{author}"))
+                    .size(12)
+                    .style(muted_style),
+            );
         }
         for label in &pull_request.labels {
             meta_line = meta_line.push(label_pill(label));
@@ -355,8 +401,8 @@ fn github_pull_request_modal<'a>(
             .spacing(6)
             .align_y(Center),
         )
-        .push(scrollable(text(pull_request.body.clone()).size(13)).height(260))
-        .push(session_name_input(app))
+        .push(scrollable(selectable_text(pull_request.body.clone()).size(13)).height(260))
+        .push(session_name_input(app, Message::LaunchGitHubPullRequest))
         .push(action_launcher(
             available_actions(app, &ProviderKind::GithubPr),
             selected_action,
@@ -376,15 +422,18 @@ fn github_pull_request_modal<'a>(
 /// (otherwise a bare Open-in-browser button), the scrollable body, and the
 /// reference-only launch guidance (issues have no native launch flow).
 fn github_issue_modal(issue: &providers::github::GitHubIssue) -> Element<'_, Message> {
-    let mut body =
-        column![text(format!("#{}  {}", issue.number, issue.title)).size(16)].spacing(10);
+    let mut body = column![selectable_text(format!("#{}  {}", issue.number, issue.title)).size(16)]
+        .spacing(10);
     body = body.push(match &issue.branch {
         Some(branch) => branch_row(branch.clone(), issue.url.clone()),
         None => open_in_browser_button(issue.url.clone()),
     });
     body = body
-        .push(scrollable(text(issue.body.clone()).size(13)).height(260))
-        .push(text("GitHub issues are reference-only; launch from a pull request.").size(12));
+        .push(scrollable(selectable_text(issue.body.clone()).size(13)).height(260))
+        .push(
+            selectable_text("GitHub issues are reference-only; launch from a pull request.")
+                .size(12),
+        );
     dialog_card("GitHub issue", body)
 }
 
@@ -418,7 +467,9 @@ fn linear_state_tone(state_type: Option<&str>) -> PillTone {
 /// (see `Message::OpenUrl`).
 fn branch_row(branch: String, url: String) -> Element<'static, Message> {
     row![
-        text(branch.clone()).size(13).font(iced::Font::MONOSPACE),
+        selectable_text(branch.clone())
+            .size(13)
+            .font(iced::Font::MONOSPACE),
         button(text("Copy").size(12))
             .padding([4, 8])
             .on_press(Message::CopyText(branch))
@@ -488,8 +539,12 @@ pub(crate) fn dispatch_review_modal_content(app: &PohunekApp) -> Element<'_, Mes
             body = body
                 .push(text("Prompt preview").size(14))
                 .push(
-                    scrollable(text(preview.clone()).size(12).font(iced::Font::MONOSPACE))
-                        .height(240),
+                    scrollable(
+                        selectable_text(preview.clone())
+                            .size(12)
+                            .font(iced::Font::MONOSPACE),
+                    )
+                    .height(240),
                 )
                 .push({
                     let mut dispatch_button =
@@ -657,5 +712,21 @@ mod tests {
         let app = PohunekApp::test_default();
 
         assert!(start_agent_options(&app).is_empty());
+    }
+
+    #[test]
+    fn ctrl_enter_is_the_multiline_primary_submit_chord() {
+        let enter = iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter);
+
+        assert!(is_ctrl_enter(&enter, iced::keyboard::Modifiers::CTRL));
+        assert!(is_ctrl_enter(
+            &enter,
+            iced::keyboard::Modifiers::CTRL | iced::keyboard::Modifiers::SHIFT
+        ));
+        assert!(!is_ctrl_enter(&enter, iced::keyboard::Modifiers::empty()));
+        assert!(!is_ctrl_enter(
+            &enter,
+            iced::keyboard::Modifiers::CTRL | iced::keyboard::Modifiers::ALT
+        ));
     }
 }

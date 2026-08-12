@@ -53,6 +53,7 @@ Native GUI client:
 - `crates/gui/src/view/provider.rs`
 - `crates/gui/src/view/session.rs`
 - `crates/gui/src/view/review.rs`
+- `crates/gui/src/view/selectable_text.rs`
 - `crates/gui-core/src/assistant.rs`
 - `crates/gui-core/src/lib.rs`
 - `crates/gui-core/src/sdk.rs`

@@ -18,7 +18,7 @@ use crate::selection::tab_project_scope;
 use crate::view::detail::project_scope_placeholder;
 use crate::PohunekApp;
 
-use super::{card, list_button, muted_style, section_title};
+use super::{card, list_button, muted_style, section_title, selectable_text};
 
 /// Fixed width of the Review tab's left file-list column.
 const FILE_LIST_WIDTH: u32 = 260;
@@ -42,7 +42,7 @@ pub(crate) fn review_tab_body(app: &PohunekApp) -> Element<'_, Message> {
         ReviewDiffStatus::Error(message) => card(
             column![
                 text("Failed to load diff").size(15),
-                text(message.clone()).size(13),
+                selectable_text(message.clone()).size(13),
             ]
             .spacing(6),
         ),
@@ -63,7 +63,7 @@ fn review_idle_placeholder() -> Element<'static, Message> {
     card(
         column![
             text("No review open").size(15),
-            text(
+            selectable_text(
                 "Open a review from a session's worktree (Detail tab → \"Review changes\") or \
                  a GitHub pull request (GitHub tab → \"Review diff\")."
             )
@@ -96,7 +96,7 @@ fn review_loaded_body<'a>(
 
 fn truncated_banner(base: &str) -> Element<'static, Message> {
     container(
-        text(format!(
+        selectable_text(format!(
             "Diff truncated at the size cap; later files in the change set vs {base} are not shown."
         ))
         .size(12),
@@ -148,7 +148,7 @@ fn review_diff_pane<'a>(host: &'a HostView, model: &'a DiffModel) -> Element<'a,
     let mut pane = column![].spacing(2);
     for (hunk_index, hunk) in file.hunks.iter().enumerate() {
         pane = pane.push(
-            text(hunk.header.clone())
+            selectable_text(hunk.header.clone())
                 .size(12)
                 .font(iced::Font::MONOSPACE)
                 .style(muted_style),
@@ -306,7 +306,7 @@ fn review_comment_editor_view(editor: &ReviewCommentEditor) -> Element<'_, Messa
 fn review_comment_row(index: usize, text_value: &str) -> Element<'_, Message> {
     container(
         row![
-            text(text_value).size(12),
+            selectable_text(text_value).size(12),
             button(text("Edit").size(11))
                 .on_press(Message::BeginEditReviewComment(index))
                 .style(iced::widget::button::secondary),
@@ -339,7 +339,7 @@ fn review_tray(host: &HostView) -> Element<'_, Message> {
     for (index, comment) in review.comments.iter().enumerate() {
         tray = tray.push(
             row![
-                text(format!(
+                selectable_text(format!(
                     "{}:{} ({})",
                     comment.path,
                     comment.line,
@@ -348,7 +348,7 @@ fn review_tray(host: &HostView) -> Element<'_, Message> {
                 .size(11)
                 .font(iced::Font::MONOSPACE)
                 .style(muted_style),
-                text(comment.text.clone()).size(12),
+                selectable_text(comment.text.clone()).size(12),
                 button(text("Edit").size(11))
                     .on_press(Message::BeginEditReviewComment(index))
                     .style(iced::widget::button::secondary),
@@ -375,7 +375,7 @@ fn dispatch_action(review: &Review) -> Element<'_, Message> {
             .dispatched_session_id
             .as_ref()
             .map_or("?", |id| id.0.as_str());
-        return text(format!("Dispatched as session {session_id}"))
+        return selectable_text(format!("Dispatched as session {session_id}"))
             .size(12)
             .into();
     }

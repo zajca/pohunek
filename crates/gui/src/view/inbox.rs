@@ -16,7 +16,9 @@ use crate::message::{InboxView, Message, NotificationAction};
 use crate::view::provider::{status_pill, PillTone};
 use crate::PohunekApp;
 
-use super::{agent_kind_label, card, list_button, muted_style, push_meta, STATUS_DOT};
+use super::{
+    agent_kind_label, card, list_button, muted_style, push_meta, selectable_text, STATUS_DOT,
+};
 
 // Calendar conversion offset from the civil-date algorithm's day zero to Unix
 // epoch; changing it would make notification age labels wrong for every row.
@@ -389,7 +391,7 @@ fn inbox_message_content<'a>(
 
     let body = container(
         scrollable(
-            text(record.body.as_str())
+            selectable_text(record.body.as_str())
                 .size(14)
                 .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
         )
@@ -399,7 +401,7 @@ fn inbox_message_content<'a>(
 
     let mut content = column![
         header,
-        text(meta).size(12).style(muted_style),
+        selectable_text(meta).size(12).style(muted_style),
         body,
         inbox_message_actions(app, host_id, record),
         inbox_details_toggle(app),
@@ -490,7 +492,7 @@ fn notification_link_action<'a>(
             .style(iced::widget::button::primary)
             .into()
     } else {
-        text(format!("Linked session {} is no longer live", session_id.0))
+        selectable_text(format!("Linked session {} is no longer live", session_id.0))
             .size(13)
             .style(muted_style)
             .into()
@@ -505,39 +507,40 @@ fn notification_details<'a>(
     record: &'a NotificationRecord,
 ) -> Element<'a, Message> {
     let mut rows = column![
-        text(format!(
+        selectable_text(format!(
             "status: {}",
             notification_status_label(record.status)
         ))
         .size(12),
-        text(format!("host: {host_id}")).size(12),
-        text(format!(
+        selectable_text(format!("host: {host_id}")).size(12),
+        selectable_text(format!(
             "source: {} / {} / {}",
             record.source.provider,
             record.source.provider_event,
             record.source.host_local_source_id
         ))
         .size(12),
-        text(format!("created: {}", record.created_at)).size(12),
+        selectable_text(format!("created: {}", record.created_at)).size(12),
     ]
     .spacing(4);
     if let Some(project_id) = &record.project_id {
-        rows = rows.push(text(format!("project: {project_id}")).size(12));
+        rows = rows.push(selectable_text(format!("project: {project_id}")).size(12));
     }
     if let Some(agent_kind) = &record.agent_kind {
-        rows = rows.push(text(format!("agent: {}", agent_kind_label(agent_kind))).size(12));
+        rows =
+            rows.push(selectable_text(format!("agent: {}", agent_kind_label(agent_kind))).size(12));
     }
     for (key, value) in &record.metadata {
-        rows = rows.push(text(format!("{key}: {value}")).size(12));
+        rows = rows.push(selectable_text(format!("{key}: {value}")).size(12));
     }
     if let Some(source_id) = &record.source_id {
-        rows = rows.push(text(format!("source_id: {source_id}")).size(12));
+        rows = rows.push(selectable_text(format!("source_id: {source_id}")).size(12));
     }
     if let Some(dedupe_key) = &record.dedupe_key {
-        rows = rows.push(text(format!("dedupe_key: {dedupe_key}")).size(12));
+        rows = rows.push(selectable_text(format!("dedupe_key: {dedupe_key}")).size(12));
     }
     if let Some(superseded_by) = &record.superseded_by {
-        rows = rows.push(text(format!("superseded_by: {}", superseded_by.0)).size(12));
+        rows = rows.push(selectable_text(format!("superseded_by: {}", superseded_by.0)).size(12));
     }
     card(rows)
 }

@@ -142,6 +142,7 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             app.notification_filter.host_id = None;
             app.inbox_cursor = None;
             normalize_inbox_cursor(app);
+            tasks.push(keyboard::focus_task(app, keyboard::FocusDirection::Next));
         }
         Message::OpenHostInbox(host_id) => {
             app.modal = ModalView::Inbox;
@@ -149,6 +150,7 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             app.notification_filter.host_id = Some(host_id);
             app.inbox_cursor = None;
             normalize_inbox_cursor(app);
+            tasks.push(keyboard::focus_task(app, keyboard::FocusDirection::Next));
         }
         Message::SetInboxScope(scope) => {
             app.inbox_scope = scope;
@@ -296,13 +298,18 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             app.template_recipe = None;
             app.prompt_editor = text_editor::Content::new();
             app.modal = ModalView::Start;
+            tasks.push(keyboard::focus_task(app, keyboard::FocusDirection::Next));
         }
         Message::OpenAssistantModal => {
             app.assistant = AssistantForm::default();
             app.assistant_editor = text_editor::Content::new();
             app.modal = ModalView::Assistant;
+            tasks.push(keyboard::focus_task(app, keyboard::FocusDirection::Next));
         }
-        Message::OpenKeymapModal => app.modal = ModalView::Keymap,
+        Message::OpenKeymapModal => {
+            app.modal = ModalView::Keymap;
+            tasks.push(keyboard::focus_task(app, keyboard::FocusDirection::Next));
+        }
         Message::CloseModal => {
             if app.modal == ModalView::DispatchReview {
                 if let Ok(host_id) = selected_host_id(app) {
@@ -382,6 +389,7 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                     .set_active_panel(host_id.clone(), ProviderPanel::Linear);
                 app.workspace.select_linear_issue(host_id, issue_id);
                 app.modal = ModalView::ProviderItem;
+                tasks.push(keyboard::focus_task(app, keyboard::FocusDirection::Next));
             }
         }
         Message::OpenGitHubPullRequest(number) => {
@@ -390,6 +398,7 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                     .set_active_panel(host_id.clone(), ProviderPanel::GitHub);
                 app.workspace.select_github_pull_request(host_id, number);
                 app.modal = ModalView::ProviderItem;
+                tasks.push(keyboard::focus_task(app, keyboard::FocusDirection::Next));
             }
         }
         Message::OpenGitHubIssue(number) => {
@@ -398,6 +407,7 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                     .set_active_panel(host_id.clone(), ProviderPanel::GitHub);
                 app.workspace.select_github_issue(host_id, number);
                 app.modal = ModalView::ProviderItem;
+                tasks.push(keyboard::focus_task(app, keyboard::FocusDirection::Next));
             }
         }
         Message::InspectSelectedSession => match inspect_selected_session_task(app) {
@@ -730,6 +740,13 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             for message in keyboard::route_key_press(app, &key, modifiers) {
                 tasks.push(Task::done(message));
             }
+        }
+        Message::FocusNext => tasks.push(keyboard::focus_task(app, keyboard::FocusDirection::Next)),
+        Message::FocusPrevious => {
+            tasks.push(keyboard::focus_task(
+                app,
+                keyboard::FocusDirection::Previous,
+            ));
         }
         Message::CycleBlockedAgent => {
             // Mirrors `SelectSession`'s selection-application, minus its

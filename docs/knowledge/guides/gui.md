@@ -133,6 +133,14 @@ restarts in `UiState::active_tab` (`RightTab`).
 The GUI is keyboard-first. Global shortcuts fire only while no modal is open;
 modal shortcuts apply only while a modal is open. The default keymap is:
 
+`Tab` and `Shift+Tab` are reserved for standard forward/backward focus
+navigation and are not configurable shortcut chords. Focus wraps at either end.
+When a modal is open, traversal is restricted to that modal's fields, so focus
+cannot move into the dimmed workspace behind it. Session-creation modals focus
+their first field when opened. `Enter` submits a focused single-line field;
+inside a multi-line prompt editor, use `Ctrl+Enter` for the modal's primary
+action because bare `Enter` inserts a newline.
+
 | Context | Keybinding name | Default | Behavior |
 |---------|-----------------|---------|----------|
 | Global | `tab_detail` | `1` | Switch to the Detail tab. |
@@ -175,6 +183,9 @@ Key strings are case-insensitive. They can be a one-character key (`i`, `1`,
 `arrowright`) with optional `ctrl`, `alt`, `shift`, and `logo` modifiers joined
 by `+`, such as `ctrl+r` or `shift+enter`.
 
+The parser recognizes `tab`, but bare `tab` and `shift+tab` are rejected in
+`[keybindings]` because the GUI reserves them for focus traversal.
+
 The GUI fails fast on unknown keybinding names, invalid key strings, or two
 different actions using the same chord in the same context. Global and modal
 contexts are independent, so the same chord may be reused once globally and once
@@ -191,6 +202,13 @@ the shortcut router; typing into a field cannot trigger a global shortcut.
 `Escape` is a partial exception: it unfocuses a field on its own without
 closing anything, so closing a modal from inside a focused field takes two
 `Escape` presses.
+
+Read-only operator content in session, project/worktree, provider, Inbox, and
+Review detail surfaces supports native mouse selection. Drag to select, double-
+or triple-click to select a word or line, and use `Ctrl+C` to copy. `Ctrl+A`
+selects the active read-only text block. Selection never makes the content
+editable, and labels inside buttons or other controls remain non-selectable so
+click activation is not intercepted.
 
 ## Project And Worktree Management
 
@@ -576,9 +594,12 @@ When behavior must be checked against implementation, inspect:
   routing, the context chip, and the disabled-without-scope tab styling) and
   the Detail tab's session/project/host/start-work bodies.
 - `crates/gui/src/keyboard.rs` for the keyboard shortcut router (the
-  focus-guard rationale, the global/modal key tables, and the blocked-agent
-  cycling) and `AgentMonitor::blocked_at` in `crates/gui-core/src/state.rs`
+  focus-guard rationale, standard focus traversal, the global/modal key tables,
+  and the blocked-agent cycling) and `AgentMonitor::blocked_at` in
+  `crates/gui-core/src/state.rs`
   for the cycling logic it calls into.
+- `crates/gui/src/view/selectable_text.rs` for the read-only text-selection and
+  clipboard-copy widget used by detail surfaces.
 - `crates/gui/src/view/project.rs` and `crates/gui/src/view/provider.rs` for
   the Worktrees and Linear/GitHub tab bodies the tab bar promotes to full
   panes.

@@ -12,7 +12,7 @@ use crate::message::Message;
 use crate::selection::{scoped_project, selected_project};
 use crate::PohunekApp;
 
-use super::{card, section_title, STATUS_DOT};
+use super::{card, section_title, selectable_text, STATUS_DOT};
 
 /// Project surface: identity, rename, and the New-session entry point.
 /// Worktrees and the Linear/GitHub browsers live in their own tabs
@@ -32,12 +32,12 @@ fn project_detail(app: &PohunekApp) -> Element<'_, Message> {
     let mut detail = column![section_title("Project")].spacing(8);
     if let Some((host_id, project)) = selected_project(app) {
         detail = detail
-            .push(text(format!("{} / {}", host_id, project.id)).size(16))
-            .push(text(format!("label: {}", project.label)).size(14))
-            .push(text(format!("repo: {}", project.repo_root.display())).size(14))
-            .push(text(format!("source: {}", project.source.as_str())).size(14));
+            .push(selectable_text(format!("{} / {}", host_id, project.id)).size(16))
+            .push(selectable_text(format!("label: {}", project.label)).size(14))
+            .push(selectable_text(format!("repo: {}", project.repo_root.display())).size(14))
+            .push(selectable_text(format!("source: {}", project.source.as_str())).size(14));
     } else {
-        detail = detail.push(text("No project selected").size(16));
+        detail = detail.push(selectable_text("No project selected").size(16));
     }
     let detail = detail.push(text("Rename").size(15)).push(
         row![
@@ -151,10 +151,10 @@ fn worktree_row<'a>(
     // them; `WordOrGlyph` falls back to glyph wrapping so a long path folds
     // inside the column instead of overflowing the card.
     let info = column![
-        text(branch)
+        selectable_text(branch)
             .size(14)
             .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
-        text(meta)
+        selectable_text(meta)
             .size(12)
             .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
             .style(|theme: &Theme| {
