@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 futures = { workspace = true }
 iced = { workspace = true, default-features = false, features = [
+    "advanced",
     "wgpu",
     "tiny-skia",
     "crisp",

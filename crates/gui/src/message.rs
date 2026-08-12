@@ -304,6 +304,10 @@ pub(crate) enum Message {
         key: Key,
         modifiers: Modifiers,
     },
+    /// Move keyboard focus to the next focusable field, wrapping at the end.
+    FocusNext,
+    /// Move keyboard focus to the previous focusable field, wrapping at the start.
+    FocusPrevious,
     /// The `b` shortcut: select the next blocked agent, wrapping around.
     CycleBlockedAgent,
     /// Open the Review tab for a session's worktree diff against its base.

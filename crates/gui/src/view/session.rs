@@ -14,7 +14,7 @@ use crate::selection::{selected_host_config, selected_session};
 use crate::view::provider::linked_github_status;
 use crate::PohunekApp;
 
-use super::{card, section_title, session_agent_label};
+use super::{card, section_title, selectable_text, session_agent_label};
 
 /// Session surface: the session card with its actions and metadata.
 pub(crate) fn session_pane(app: &PohunekApp) -> Element<'_, Message> {
@@ -36,38 +36,24 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
                 None => format!("{} / {}", host_id, session.id.0),
             };
             detail = detail
-                .push(text(heading).size(16))
-                .push(text(format!("agent: {}", session_agent_label(session))).size(14))
-                .push(text(origin_label(session)).size(14))
-                .push(text(format!("state: {}", session.state.as_str())).size(14))
-                .push(text(format!("activity: {activity}")).size(14));
-            if let Some(runtime) = &session.runtime {
-                detail = detail.push(text(format!("runtime: {}", runtime.state.as_str())).size(14));
-                if let Some(continuity) = app.workspace.runtime_continuity(host_id, &session.id) {
-                    detail = detail.push(text(runtime_continuity_label(continuity)).size(14));
-                }
-                if let Some(reason) = &runtime.loss_reason {
-                    detail = detail.push(text(format!("runtime reason: {reason}")).size(14));
-                }
-                if let Some(runtime_id) = &runtime.runtime_id {
-                    detail = detail.push(text(format!("runtime id: {runtime_id}")).size(14));
-                }
-                if let Some(worker_id) = &runtime.worker_id {
-                    detail = detail.push(text(format!("worker id: {worker_id}")).size(14));
-                }
-            }
+                .push(selectable_text(heading).size(16))
+                .push(selectable_text(format!("agent: {}", session_agent_label(session))).size(14))
+                .push(selectable_text(origin_label(session)).size(14))
+                .push(selectable_text(format!("state: {}", session.state.as_str())).size(14))
+                .push(selectable_text(format!("activity: {activity}")).size(14));
+            detail = session_runtime_details(detail, app, host_id, session);
             if let Some(project) = session
                 .project_label
                 .as_ref()
                 .or(session.project_id.as_ref())
             {
-                detail = detail.push(text(format!("project: {project}")).size(14));
+                detail = detail.push(selectable_text(format!("project: {project}")).size(14));
             }
             if let Some(branch) = &session.branch {
-                detail = detail.push(text(format!("branch: {branch}")).size(14));
+                detail = detail.push(selectable_text(format!("branch: {branch}")).size(14));
             }
             if let Some(link) = session_link_metadata(session) {
-                detail = detail.push(text(format!(
+                detail = detail.push(selectable_text(format!(
                     "linked: {} {} {}",
                     link.provider.as_str(),
                     link.kind.as_str(),
@@ -80,7 +66,7 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
                         .ok()
                         .and_then(|host| app.workspace.hosts.get(&host.id))
                         .and_then(|host| linked_github_status(host, session));
-                    detail = detail.push(text(format!(
+                    detail = detail.push(selectable_text(format!(
                         "PR status: {}",
                         status.unwrap_or_else(|| "unknown".to_owned())
                     )));
@@ -92,18 +78,20 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
                 }
             }
             if let Some(path) = &session.worktree_path {
-                detail = detail.push(text(format!("worktree: {}", path.display())).size(14));
+                detail =
+                    detail.push(selectable_text(format!("worktree: {}", path.display())).size(14));
             }
-            detail = detail.push(text(format!("cwd: {}", session.cwd.display())).size(14));
+            detail =
+                detail.push(selectable_text(format!("cwd: {}", session.cwd.display())).size(14));
             detail = detail.push(
-                text(format!(
+                selectable_text(format!(
                     "cwd source: {}",
                     cwd_source_label(session.cwd_source)
                 ))
                 .size(14),
             );
             if has_worktree_drift(session) {
-                detail = detail.push(text("worktree drift: yes").size(14));
+                detail = detail.push(selectable_text("worktree drift: yes").size(14));
             }
             detail = detail.push(session_actions(app, host_id, session, external));
             if let Some(observation) = session_observation_view(app, host_id, session) {
@@ -115,10 +103,37 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
             }
         }
         None => {
-            detail = detail.push(text("No session selected").size(16));
+            detail = detail.push(selectable_text("No session selected").size(16));
         }
     }
     card(detail)
+}
+
+fn session_runtime_details<'a>(
+    mut detail: iced::widget::Column<'a, Message>,
+    app: &PohunekApp,
+    host_id: &HostId,
+    session: &SessionInfo,
+) -> iced::widget::Column<'a, Message> {
+    let Some(runtime) = &session.runtime else {
+        return detail;
+    };
+
+    detail = detail.push(selectable_text(format!("runtime: {}", runtime.state.as_str())).size(14));
+    if let Some(continuity) = app.workspace.runtime_continuity(host_id, &session.id) {
+        detail = detail.push(selectable_text(runtime_continuity_label(continuity)).size(14));
+    }
+    if let Some(reason) = &runtime.loss_reason {
+        detail = detail.push(selectable_text(format!("runtime reason: {reason}")).size(14));
+    }
+    if let Some(runtime_id) = &runtime.runtime_id {
+        detail = detail.push(selectable_text(format!("runtime id: {runtime_id}")).size(14));
+    }
+    if let Some(worker_id) = &runtime.worker_id {
+        detail = detail.push(selectable_text(format!("worker id: {worker_id}")).size(14));
+    }
+
+    detail
 }
 
 fn session_observation_view(
@@ -129,26 +144,31 @@ fn session_observation_view(
     let observation = app.workspace.session_observation(host_id, &session.id)?;
     let mut content = column![].spacing(4);
     if let Some(screen) = &observation.screen {
-        content = content
-            .push(text("Terminal screen").size(14))
-            .push(text(screen.visible_lines.join("\n")).size(12));
+        content = content.push(text("Terminal screen").size(14)).push(
+            selectable_text(screen.visible_lines.join("\n"))
+                .size(12)
+                .font(iced::Font::MONOSPACE),
+        );
     }
     if let Some((start, end)) = observation.output_gap {
         content = content.push(
-            text(format!(
+            selectable_text(format!(
                 "output gap: {start}..{end}; showing retained bytes"
             ))
             .size(12),
         );
     }
     if !observation.output_text.is_empty() {
-        content = content
-            .push(text("Retained output").size(14))
-            .push(text(observation.output_text.clone()).size(12));
+        content = content.push(text("Retained output").size(14)).push(
+            selectable_text(observation.output_text.clone())
+                .size(12)
+                .font(iced::Font::MONOSPACE),
+        );
     }
     if let Some(wait) = &observation.wait {
-        content =
-            content.push(text(format!("last wait: {}", wait_reason_label(wait.reason))).size(12));
+        content = content.push(
+            selectable_text(format!("last wait: {}", wait_reason_label(wait.reason))).size(12),
+        );
     }
     Some(content.into())
 }
@@ -320,7 +340,8 @@ fn metadata_view<'a>(app: &'a PohunekApp, session: &'a SessionInfo) -> Element<'
         metadata = metadata.push(text("No metadata").size(13));
     } else {
         for row in rows {
-            metadata = metadata.push(text(format!("{} = {}", row.key, row.value)).size(13));
+            metadata =
+                metadata.push(selectable_text(format!("{} = {}", row.key, row.value)).size(13));
         }
     }
     metadata = metadata
@@ -348,10 +369,13 @@ fn metadata_view<'a>(app: &'a PohunekApp, session: &'a SessionInfo) -> Element<'
 
 /// A labeled "Name" text input bound to the shared start-form name buffer, used
 /// by every session-creation surface so a session can be named at any creation.
-pub(crate) fn session_name_input(app: &PohunekApp) -> Element<'_, Message> {
+pub(crate) fn session_name_input(app: &PohunekApp, on_submit: Message) -> Element<'_, Message> {
     row![
         text("Name").size(14),
-        text_input("optional session name", &app.start.name).on_input(Message::StartNameChanged),
+        text_input("optional session name", &app.start.name)
+            .id(crate::keyboard::start_name_input_id())
+            .on_input(Message::StartNameChanged)
+            .on_submit(on_submit),
     ]
     .spacing(8)
     .align_y(Center)

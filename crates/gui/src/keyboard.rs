@@ -31,9 +31,11 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use iced::advanced::widget::operation::{self, Focusable, Operation, Outcome};
 use iced::keyboard::key::Named;
 use iced::keyboard::{self, Key, Modifiers};
-use iced::Subscription;
+use iced::widget::Id;
+use iced::{Rectangle, Subscription, Task};
 use pohunek_gui_core::{ProviderPanel, RightTab};
 
 use crate::message::{InboxView, ListDirection, Message, ModalView};
@@ -75,6 +77,54 @@ pub(crate) enum KeyAction {
     ListUp,
     ListDown,
     FocusSearch,
+}
+
+/// Direction for standard focus traversal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FocusDirection {
+    Next,
+    Previous,
+}
+
+const START_NAME_INPUT_ID: &str = "start-session-name";
+const START_PROMPT_INPUT_ID: &str = "start-session-prompt";
+const START_BRANCH_INPUT_ID: &str = "start-session-branch";
+const START_BASE_BRANCH_INPUT_ID: &str = "start-session-base-branch";
+const ASSISTANT_REQUEST_INPUT_ID: &str = "assistant-request";
+const ASSISTANT_BRANCH_INPUT_ID: &str = "assistant-branch";
+const ASSISTANT_BASE_BRANCH_INPUT_ID: &str = "assistant-base-branch";
+const READ_ONLY_TEXT_INPUT_ID: &str = "read-only-selectable-text";
+
+pub(crate) fn start_name_input_id() -> Id {
+    Id::new(START_NAME_INPUT_ID)
+}
+
+pub(crate) fn start_prompt_input_id() -> Id {
+    Id::new(START_PROMPT_INPUT_ID)
+}
+
+pub(crate) fn start_branch_input_id() -> Id {
+    Id::new(START_BRANCH_INPUT_ID)
+}
+
+pub(crate) fn start_base_branch_input_id() -> Id {
+    Id::new(START_BASE_BRANCH_INPUT_ID)
+}
+
+pub(crate) fn assistant_request_input_id() -> Id {
+    Id::new(ASSISTANT_REQUEST_INPUT_ID)
+}
+
+pub(crate) fn assistant_branch_input_id() -> Id {
+    Id::new(ASSISTANT_BRANCH_INPUT_ID)
+}
+
+pub(crate) fn assistant_base_branch_input_id() -> Id {
+    Id::new(ASSISTANT_BASE_BRANCH_INPUT_ID)
+}
+
+pub(crate) fn read_only_text_input_id() -> Id {
+    Id::new(READ_ONLY_TEXT_INPUT_ID)
 }
 
 /// Config error raised while building a keymap from `gui.toml`.
@@ -332,6 +382,19 @@ impl KeyChord {
             }
         }
     }
+
+    fn is_focus_navigation(&self) -> bool {
+        matches!(self.key, ChordKey::Named(Named::Tab))
+            && matches!(
+                self.modifiers,
+                ChordModifiers {
+                    shift: false,
+                    control: false,
+                    alt: false,
+                    logo: false,
+                } | ChordModifiers::SHIFT
+            )
+    }
 }
 
 fn normalize_character_key(value: &str) -> String {
@@ -529,6 +592,13 @@ impl KeyMap {
                 unreachable!("every KeyBindingId must have one default binding");
             };
             let context = keymap.bindings[index].context;
+            if chord.is_focus_navigation() {
+                return Err(KeyMapError::InvalidKey {
+                    binding: name.clone(),
+                    value: value.clone(),
+                    reason: "tab and shift+tab are reserved for focus navigation".to_owned(),
+                });
+            }
             if !chord.is_supported_in_context(context) {
                 return Err(KeyMapError::InvalidKey {
                     binding: name.clone(),
@@ -719,11 +789,186 @@ pub(crate) fn route_key_press_with_keymap(
     key: &Key,
     modifiers: Modifiers,
 ) -> Vec<Message> {
+    if let Some(message) = focus_navigation_message(key, modifiers) {
+        return vec![message];
+    }
     if app.modal == ModalView::None {
         route_key_in_context(app, keymap, KeyContext::Global, key, modifiers)
     } else {
         route_key_in_context(app, keymap, KeyContext::Modal, key, modifiers)
     }
+}
+
+fn focus_navigation_message(key: &Key, modifiers: Modifiers) -> Option<Message> {
+    if !matches!(key.as_ref(), Key::Named(Named::Tab))
+        || modifiers.control()
+        || modifiers.alt()
+        || modifiers.logo()
+    {
+        return None;
+    }
+
+    Some(if modifiers.shift() {
+        Message::FocusPrevious
+    } else {
+        Message::FocusNext
+    })
+}
+
+/// Cycles focus within the active modal, or across the main view when no modal is open.
+pub(crate) fn focus_task(app: &PohunekApp, direction: FocusDirection) -> Task<Message> {
+    let scope = if app.modal == ModalView::None {
+        FocusScope::All
+    } else {
+        FocusScope::Ids(modal_focus_ids(app))
+    };
+    let task: Task<()> = iced::advanced::widget::operate(cycle_focus(scope, direction));
+    task.discard()
+}
+
+fn modal_focus_ids(app: &PohunekApp) -> Vec<Id> {
+    match app.modal {
+        ModalView::Start => {
+            let mut ids = vec![start_name_input_id(), start_prompt_input_id()];
+            if app.start.show_advanced && app.start.template.is_none() {
+                ids.push(start_branch_input_id());
+                ids.push(start_base_branch_input_id());
+            }
+            ids
+        }
+        ModalView::Assistant => {
+            let mut ids = vec![assistant_request_input_id()];
+            if app.assistant.show_advanced {
+                ids.push(assistant_branch_input_id());
+                ids.push(assistant_base_branch_input_id());
+            }
+            ids
+        }
+        ModalView::ProviderItem => vec![start_name_input_id()],
+        ModalView::None | ModalView::Keymap | ModalView::Inbox | ModalView::DispatchReview => {
+            Vec::new()
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum FocusScope {
+    All,
+    Ids(Vec<Id>),
+}
+
+impl FocusScope {
+    fn includes(&self, id: Option<&Id>) -> bool {
+        match self {
+            Self::All => id.is_none_or(|id| id != &read_only_text_input_id()),
+            Self::Ids(ids) => id.is_some_and(|id| ids.iter().any(|candidate| candidate == id)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FocusCount {
+    focused: Option<usize>,
+    total: usize,
+}
+
+struct CountFocus {
+    scope: FocusScope,
+    direction: FocusDirection,
+    count: FocusCount,
+}
+
+#[derive(Clone, Debug)]
+struct FocusSummary {
+    scope: FocusScope,
+    direction: FocusDirection,
+    count: FocusCount,
+}
+
+impl Operation<FocusSummary> for CountFocus {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<FocusSummary>)) {
+        operate(self);
+    }
+
+    fn focusable(&mut self, id: Option<&Id>, _bounds: Rectangle, state: &mut dyn Focusable) {
+        if !self.scope.includes(id) {
+            return;
+        }
+        if state.is_focused() {
+            self.count.focused = Some(self.count.total);
+        }
+        self.count.total += 1;
+    }
+
+    fn finish(&self) -> Outcome<FocusSummary> {
+        Outcome::Some(FocusSummary {
+            scope: self.scope.clone(),
+            direction: self.direction,
+            count: self.count,
+        })
+    }
+}
+
+struct ApplyFocus {
+    scope: FocusScope,
+    target: Option<usize>,
+    current: usize,
+}
+
+impl Operation<()> for ApplyFocus {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<()>)) {
+        operate(self);
+    }
+
+    fn focusable(&mut self, id: Option<&Id>, _bounds: Rectangle, state: &mut dyn Focusable) {
+        if !self.scope.includes(id) {
+            state.unfocus();
+            return;
+        }
+
+        if self.target == Some(self.current) {
+            state.focus();
+        } else {
+            state.unfocus();
+        }
+        self.current += 1;
+    }
+
+    fn finish(&self) -> Outcome<()> {
+        Outcome::Some(())
+    }
+}
+
+fn cycle_focus(scope: FocusScope, direction: FocusDirection) -> impl Operation<()> {
+    operation::then(
+        CountFocus {
+            scope,
+            direction,
+            count: FocusCount::default(),
+        },
+        apply_focus,
+    )
+}
+
+fn apply_focus(summary: FocusSummary) -> ApplyFocus {
+    ApplyFocus {
+        scope: summary.scope,
+        target: focus_target(summary.count, summary.direction),
+        current: 0,
+    }
+}
+
+fn focus_target(count: FocusCount, direction: FocusDirection) -> Option<usize> {
+    if count.total == 0 {
+        return None;
+    }
+
+    Some(match (count.focused, direction) {
+        (Some(focused), FocusDirection::Next) => (focused + 1) % count.total,
+        (Some(0) | None, FocusDirection::Previous) => count.total - 1,
+        (Some(focused), FocusDirection::Previous) => focused - 1,
+        (None, FocusDirection::Next) => 0,
+    })
 }
 
 fn route_key_in_context(
@@ -1962,6 +2207,91 @@ mod tests {
             body: String::new(),
             url: format!("https://github.example/repo/issues/{number}"),
             branch: None,
+        }
+    }
+
+    #[test]
+    fn tab_routes_standard_forward_and_backward_focus_navigation() {
+        let app = app_with_project_selection();
+        let keymap = KeyMap::default();
+
+        let forward =
+            route_key_press_with_keymap(&app, &keymap, &Key::Named(Named::Tab), Modifiers::empty());
+        let backward =
+            route_key_press_with_keymap(&app, &keymap, &Key::Named(Named::Tab), Modifiers::SHIFT);
+        let modified =
+            route_key_press_with_keymap(&app, &keymap, &Key::Named(Named::Tab), Modifiers::CTRL);
+
+        assert!(matches!(forward.as_slice(), [Message::FocusNext]));
+        assert!(matches!(backward.as_slice(), [Message::FocusPrevious]));
+        assert!(modified.is_empty());
+    }
+
+    #[test]
+    fn focus_target_wraps_and_uses_standard_empty_focus_edges() {
+        assert_eq!(
+            focus_target(
+                FocusCount {
+                    focused: None,
+                    total: 3,
+                },
+                FocusDirection::Next,
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            focus_target(
+                FocusCount {
+                    focused: None,
+                    total: 3,
+                },
+                FocusDirection::Previous,
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            focus_target(
+                FocusCount {
+                    focused: Some(2),
+                    total: 3,
+                },
+                FocusDirection::Next,
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            focus_target(
+                FocusCount {
+                    focused: Some(0),
+                    total: 3,
+                },
+                FocusDirection::Previous,
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            focus_target(FocusCount::default(), FocusDirection::Next),
+            None
+        );
+        assert!(FocusScope::All.includes(None));
+        assert!(!FocusScope::All.includes(Some(&read_only_text_input_id())));
+    }
+
+    #[test]
+    fn keybindings_reject_reserved_focus_navigation_chords() {
+        for chord in ["tab", "shift+tab"] {
+            let raw = BTreeMap::from([("open_inbox".to_owned(), chord.to_owned())]);
+
+            let err = KeyMap::from_config(&raw).expect_err("reserved focus chord");
+
+            assert!(matches!(
+                err,
+                KeyMapError::InvalidKey {
+                    binding,
+                    reason,
+                    ..
+                } if binding == "open_inbox" && reason.contains("reserved")
+            ));
         }
     }
 

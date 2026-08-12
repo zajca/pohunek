@@ -2,6 +2,8 @@
 
 ## Unreleased (2026-07-21)
 
+- Documented standard Tab/Shift+Tab form focus, Enter/Ctrl+Enter submission,
+  modal focus containment, and mouse selection/copy for native GUI detail text.
 - Documented source-locked, credential-free Hermes compatibility CI and
   extracted release-archive plugin smoke verification.
 - Documented configurable Hermes plugin timeout, output, screen, and concurrency
