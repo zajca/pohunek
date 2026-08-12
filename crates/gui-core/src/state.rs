@@ -8,8 +8,8 @@ use protocol::{
     AgentActivity, Event, NotificationId, NotificationKind, NotificationKindPolicy,
     NotificationPolicy, NotificationRecord, NotificationSeverity, NotificationStatus, OutputOffset,
     ProjectActionResult, ProjectActionsResult, ProjectInfo, ProjectPromptResult, ProjectShowResult,
-    SessionId, SessionInfo, SessionRuntimeIdentity, SessionScreenResult, SessionState,
-    SessionWaitResult, StateSource,
+    RuntimeState, SessionId, SessionInfo, SessionRuntimeIdentity, SessionScreenResult,
+    SessionState, SessionWaitResult, StateSource,
 };
 
 use crate::providers;
@@ -2025,19 +2025,24 @@ impl Workspace {
         self.hosts.get(host_id)?.notifications.get(&id.0)
     }
 
-    /// Build the agents monitor model from current host state.
+    /// Build the prioritized native-GUI session list.
+    ///
+    /// Rows are grouped by operator urgency and sorted by stable host/session
+    /// identity within each group. Activity changes may move a row between
+    /// groups, but never reorder unrelated rows inside one group.
     #[must_use]
-    pub fn agent_monitor(&self) -> AgentMonitor {
-        let mut monitor = AgentMonitor::default();
+    pub fn session_rows(&self) -> Vec<SessionRow> {
+        let mut rows = Vec::new();
         for (host_id, host) in &self.hosts {
             for session in host.sessions.values() {
-                match session.activity {
-                    Some(AgentActivity::Blocked) => monitor.blocked += 1,
-                    Some(AgentActivity::Working) => monitor.working += 1,
-                    Some(AgentActivity::Idle) => monitor.idle += 1,
-                    None => monitor.unknown += 1,
-                }
-                monitor.sessions.push(AgentRow {
+                let needs_action = session.activity == Some(AgentActivity::Blocked)
+                    || host.notifications.values().any(|record| {
+                        record.session_id.as_ref() == Some(&session.id)
+                            && record.status != NotificationStatus::Deleted
+                            && notification_needs_action(record)
+                    });
+                let access = session_access(session);
+                rows.push(SessionRow {
                     host_id: host_id.clone(),
                     session_id: session.id.clone(),
                     name: session.name.clone(),
@@ -2045,22 +2050,22 @@ impl Workspace {
                     project_label: session.project_label.clone(),
                     agent: session.agent.clone(),
                     activity: session.activity,
-                    state: session.state.as_str().to_owned(),
+                    state: session.state,
                     branch: session.branch.clone(),
+                    group: session_group(session, access, needs_action),
+                    access,
+                    can_stop: session_can_stop(session),
+                    can_remove: session_can_remove(session),
                 });
             }
         }
-        // Order by the stable (host, session) identity only — NEVER by the
-        // volatile activity. Activity flips as agents work/block/idle on every
-        // poll, and sorting on it would reshuffle rows under the operator's
-        // cursor, making the list impossible to click. The activity is conveyed
-        // by the per-row dot and the header counts instead.
-        monitor.sessions.sort_by(|left, right| {
-            left.host_id
-                .cmp(&right.host_id)
+        rows.sort_by(|left, right| {
+            left.group
+                .cmp(&right.group)
+                .then_with(|| left.host_id.cmp(&right.host_id))
                 .then_with(|| left.session_id.0.cmp(&right.session_id.0))
         });
-        monitor
+        rows
     }
 }
 
@@ -2340,49 +2345,142 @@ fn trace_ignored_provider_failure(
     );
 }
 
-/// Derived row for the flat agents monitor.
+fn session_access(session: &SessionInfo) -> SessionAccess {
+    if session.external == Some(true) {
+        return SessionAccess::Unavailable;
+    }
+
+    if session.state.is_terminal() {
+        return if session_can_resume(session) {
+            SessionAccess::Resume
+        } else {
+            SessionAccess::Unavailable
+        };
+    }
+
+    match session.runtime.as_ref().map(|runtime| runtime.state) {
+        None | Some(RuntimeState::Live) if session.state == SessionState::Running => {
+            SessionAccess::Attach
+        }
+        None | Some(RuntimeState::Starting | RuntimeState::Reconnecting) => SessionAccess::Pending,
+        Some(RuntimeState::Lost) if session_can_resume(session) => SessionAccess::Resume,
+        Some(
+            RuntimeState::Terminal
+            | RuntimeState::Lost
+            | RuntimeState::Conflict
+            | RuntimeState::Incompatible
+            | RuntimeState::Live,
+        ) => SessionAccess::Unavailable,
+    }
+}
+
+fn session_can_resume(session: &SessionInfo) -> bool {
+    session.capabilities.resume
+        && (session
+            .native_session_id
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+            || session
+                .native_session_path
+                .as_deref()
+                .is_some_and(|value| !value.is_empty()))
+}
+
+fn session_can_stop(session: &SessionInfo) -> bool {
+    if session.external == Some(true) || session.state.is_terminal() {
+        return false;
+    }
+    session.runtime.as_ref().is_none_or(|runtime| {
+        matches!(
+            runtime.state,
+            RuntimeState::Live | RuntimeState::Starting | RuntimeState::Reconnecting
+        )
+    })
+}
+
+fn session_can_remove(session: &SessionInfo) -> bool {
+    if session.external == Some(true) {
+        return false;
+    }
+    if session.runtime.as_ref().is_some_and(|runtime| {
+        matches!(
+            runtime.state,
+            RuntimeState::Conflict | RuntimeState::Incompatible
+        )
+    }) {
+        return false;
+    }
+    session.state.is_terminal()
+        || session_can_stop(session)
+        || session
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.state == RuntimeState::Lost)
+}
+
+fn session_group(session: &SessionInfo, access: SessionAccess, needs_action: bool) -> SessionGroup {
+    if needs_action {
+        return SessionGroup::NeedsAction;
+    }
+    if session.state == SessionState::Starting
+        || session.activity == Some(AgentActivity::Working)
+        || access == SessionAccess::Pending
+    {
+        return SessionGroup::Running;
+    }
+    if access == SessionAccess::Attach
+        && matches!(session.activity, None | Some(AgentActivity::Idle))
+    {
+        return SessionGroup::Idle;
+    }
+    SessionGroup::Unavailable
+}
+
+/// Session-list group in display priority order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SessionGroup {
+    /// A session waiting for operator input or carrying an actionable notification.
+    NeedsAction,
+    /// An attachable live session that is not currently working.
+    Idle,
+    /// A session that is working, starting, or reconnecting.
+    Running,
+    /// A terminal, external, conflicting, incompatible, or otherwise unusable session.
+    Unavailable,
+}
+
+/// Operator access currently available for one session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAccess {
+    /// Attach to the existing live PTY now.
+    Attach,
+    /// Recover from native metadata, then attach to the new PTY.
+    Resume,
+    /// Wait for startup or daemon-to-worker reconnection to finish.
+    Pending,
+    /// No safe open operation is currently available.
+    Unavailable,
+}
+
+/// Derived row for the prioritized session list.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentRow {
+pub struct SessionRow {
     pub host_id: HostId,
     pub session_id: SessionId,
-    /// Owner-set display name, or `None` to show the row by its session id.
+    /// Owner-set display name, or `None` to show the session id.
     pub name: Option<String>,
     pub project_id: Option<String>,
     pub project_label: Option<String>,
     pub agent: String,
     pub activity: Option<AgentActivity>,
-    pub state: String,
-    /// Branch checked out in the session's worktree, when bound.
+    pub state: SessionState,
     pub branch: Option<String>,
-}
-
-/// Derived agents monitor counts and rows.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AgentMonitor {
-    pub blocked: usize,
-    pub working: usize,
-    pub idle: usize,
-    pub unknown: usize,
-    pub sessions: Vec<AgentRow>,
-}
-
-impl AgentMonitor {
-    /// Returns the `index`-th blocked session in stable `sessions` order.
-    ///
-    /// `index` wraps around the blocked-session count, so a caller that
-    /// increments it on every call cycles through every blocked agent
-    /// instead of getting stuck on the first one. Backs the GUI's `b`
-    /// keyboard shortcut. Returns `None` when no agent is blocked.
-    #[must_use]
-    pub fn blocked_at(&self, index: usize) -> Option<(HostId, SessionId)> {
-        let blocked: Vec<&AgentRow> = self
-            .sessions
-            .iter()
-            .filter(|row| row.activity == Some(AgentActivity::Blocked))
-            .collect();
-        let row = *blocked.get(index.checked_rem(blocked.len())?)?;
-        Some((row.host_id.clone(), row.session_id.clone()))
-    }
+    pub group: SessionGroup,
+    pub access: SessionAccess,
+    /// Whether a direct stop request is safe for this runtime state.
+    pub can_stop: bool,
+    /// Whether removal can safely stop or discard the current logical session.
+    pub can_remove: bool,
 }
 
 fn apply_host_event(
@@ -2689,7 +2787,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_monitor_orders_by_identity_not_activity_and_carries_name() {
+    fn session_rows_group_by_priority_and_order_stably_within_groups() {
         let mut named = session("s-2", Some(AgentActivity::Working));
         named.name = Some("triage build".to_owned());
         let mut workspace = Workspace::default();
@@ -2704,60 +2802,90 @@ mod tests {
             ),
         });
 
-        let monitor = workspace.agent_monitor();
-        let ids: Vec<&str> = monitor
-            .sessions
-            .iter()
-            .map(|row| row.session_id.0.as_str())
-            .collect();
-        // Stable (host, id) order regardless of activity, so a row never jumps
-        // out from under the cursor when its activity flips.
-        assert_eq!(ids, ["s-1", "s-2", "s-3"]);
-        assert_eq!(monitor.blocked, 1);
-        assert_eq!(monitor.working, 1);
-        assert_eq!(monitor.idle, 1);
-        assert_eq!(monitor.sessions[1].name.as_deref(), Some("triage build"));
+        let rows = workspace.session_rows();
+        let ids: Vec<&str> = rows.iter().map(|row| row.session_id.0.as_str()).collect();
+        assert_eq!(ids, ["s-1", "s-3", "s-2"]);
+        assert_eq!(rows[0].group, SessionGroup::NeedsAction);
+        assert_eq!(rows[1].group, SessionGroup::Idle);
+        assert_eq!(rows[2].group, SessionGroup::Running);
+        assert_eq!(rows[2].name.as_deref(), Some("triage build"));
     }
 
     #[test]
-    fn blocked_at_cycles_through_blocked_sessions_only() {
+    fn actionable_notification_promotes_linked_session() {
+        let mut notification = notification_record(
+            "n-1",
+            NotificationStatus::Unread,
+            NotificationSeverity::ActionRequired,
+        );
+        notification.session_id = Some(SessionId("s-2".to_owned()));
         let mut workspace = Workspace::default();
         workspace.apply(DomainEvent::HostSnapshotLoaded {
-            snapshot: snapshot(
+            snapshot: snapshot_with_notifications(
                 "local",
                 vec![
-                    session("s-1", Some(AgentActivity::Blocked)),
-                    session("s-2", Some(AgentActivity::Working)),
-                    session("s-3", Some(AgentActivity::Blocked)),
+                    session("s-1", Some(AgentActivity::Idle)),
+                    session("s-2", Some(AgentActivity::Idle)),
                 ],
+                vec![notification],
             ),
         });
-        let monitor = workspace.agent_monitor();
-        let host_id = HostId::new("local");
 
-        assert_eq!(
-            monitor.blocked_at(0),
-            Some((host_id.clone(), SessionId("s-1".to_owned())))
-        );
-        assert_eq!(
-            monitor.blocked_at(1),
-            Some((host_id.clone(), SessionId("s-3".to_owned())))
-        );
-        // Wraps back to the first blocked session rather than stopping.
-        assert_eq!(
-            monitor.blocked_at(2),
-            Some((host_id, SessionId("s-1".to_owned())))
-        );
+        let rows = workspace.session_rows();
+        assert_eq!(rows[0].session_id.0, "s-2");
+        assert_eq!(rows[0].group, SessionGroup::NeedsAction);
+        assert_eq!(rows[1].group, SessionGroup::Idle);
     }
 
     #[test]
-    fn blocked_at_is_none_without_any_blocked_session() {
-        let mut workspace = Workspace::default();
-        workspace.apply(DomainEvent::HostSnapshotLoaded {
-            snapshot: snapshot("local", vec![session("s-1", Some(AgentActivity::Working))]),
-        });
+    fn session_access_and_actions_fail_closed_for_unsafe_runtime_states() {
+        let mut conflict = session_with_runtime("conflict", "runtime-conflict");
+        conflict.runtime.as_mut().expect("runtime").state = RuntimeState::Conflict;
+        let mut incompatible = session_with_runtime("incompatible", "runtime-incompatible");
+        incompatible.runtime.as_mut().expect("runtime").state = RuntimeState::Incompatible;
+        let mut external = session("external", Some(AgentActivity::Idle));
+        external.external = Some(true);
 
-        assert_eq!(workspace.agent_monitor().blocked_at(0), None);
+        for session in [&conflict, &incompatible, &external] {
+            assert_eq!(session_access(session), SessionAccess::Unavailable);
+            assert!(!session_can_stop(session));
+            assert!(!session_can_remove(session));
+        }
+
+        let mut lost = session_with_runtime("lost", "runtime-lost");
+        lost.runtime.as_mut().expect("runtime").state = RuntimeState::Lost;
+        assert_eq!(session_access(&lost), SessionAccess::Unavailable);
+        assert!(!session_can_stop(&lost));
+        assert!(session_can_remove(&lost));
+    }
+
+    #[test]
+    fn terminal_session_requires_capability_and_native_reference_to_resume() {
+        let mut terminal = session("terminal", None);
+        terminal.state = SessionState::Done;
+        assert_eq!(session_access(&terminal), SessionAccess::Unavailable);
+        assert!(session_can_remove(&terminal));
+
+        terminal.native_session_id = Some("native-1".to_owned());
+        assert_eq!(session_access(&terminal), SessionAccess::Resume);
+
+        terminal.capabilities.resume = false;
+        assert_eq!(session_access(&terminal), SessionAccess::Unavailable);
+    }
+
+    #[test]
+    fn lost_session_can_resume_but_remains_in_unavailable_group() {
+        let mut lost = session_with_runtime("lost", "runtime-lost");
+        lost.runtime.as_mut().expect("runtime").state = RuntimeState::Lost;
+        lost.native_session_path = Some("/tmp/native-session.json".to_owned());
+
+        let access = session_access(&lost);
+        assert_eq!(access, SessionAccess::Resume);
+        assert_eq!(
+            session_group(&lost, access, false),
+            SessionGroup::Unavailable
+        );
+        assert!(session_can_remove(&lost));
     }
 
     #[test]

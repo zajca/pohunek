@@ -12,27 +12,24 @@ mod runtime;
 mod selection;
 mod view;
 
-use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Instant;
 
 use iced::widget::text_editor;
 use iced::{window, Subscription, Task, Theme};
 use pohunek_gui_core::{
-    default_state_dir, providers, AttachTemplateValues, HostConfig, HostId, NotificationFilter,
+    default_state_dir, AttachTemplateValues, HostConfig, HostId, NotificationFilter,
     NotificationScope, UiState, Workspace,
 };
-use protocol::{AgentActivity, NotificationId, SessionId};
+use protocol::{NotificationId, SessionId};
 use thiserror::Error;
 
 use attach::window_dimension_to_f32;
 use command::{discover_hosts_task, update};
 use config::AppConfig;
 use message::{
-    AssistantForm, InboxView, Message, MetadataEdit, ModalView, ProjectEdit, StartForm,
-    TemplateRecipe,
+    AssistantForm, InboxView, Message, MetadataEdit, ModalView, StartForm, TemplateRecipe,
 };
 use view::view;
 
@@ -173,8 +170,6 @@ struct PohunekApp {
     template_recipe: Option<TemplateRecipe>,
     /// Which modal, if any, is currently open over the workspace.
     modal: ModalView,
-    /// Active activity filter for the agents monitor; `None` shows all agents.
-    activity_filter: Option<AgentActivity>,
     /// Active inbox host filter; `None` fields do not constrain the notification list.
     notification_filter: NotificationFilter,
     /// `Needs action | All | Archived` scope picked in the inbox modal.
@@ -189,25 +184,9 @@ struct PohunekApp {
     metadata_edit: MetadataEdit,
     /// Edit buffer for renaming the selected session's display name.
     rename_edit: String,
-    project_edit: ProjectEdit,
-    /// Action chosen in the provider browser for launching the selected item.
-    selected_action: Option<String>,
-    /// Per-project provider filters read from each project's in-repo
-    /// `.pohunek/providers.toml`, keyed by repository root. Populated lazily on
-    /// project selection / provider fetch; absent entries fall back to the host
-    /// (`gui.toml`) and built-in layers.
-    project_filters: BTreeMap<PathBuf, providers::filters::ProviderFilterSet>,
-    /// Last session row click (host, session, instant), used to detect a
-    /// double-click that opens the session in a terminal.
-    last_session_click: Option<(HostId, SessionId, Instant)>,
     state_dir: Option<PathBuf>,
     status: Option<String>,
     notified_intents: usize,
-    /// Cursor into the agents monitor's blocked-session list, advanced by the
-    /// `b` keyboard shortcut (`keyboard::route_key_press`) so repeated
-    /// presses cycle through every blocked agent instead of reselecting the
-    /// first one.
-    blocked_cycle_index: usize,
 }
 
 impl PohunekApp {
@@ -236,7 +215,6 @@ impl PohunekApp {
                 assistant_editor: text_editor::Content::new(),
                 template_recipe: None,
                 modal: ModalView::None,
-                activity_filter: None,
                 notification_filter: NotificationFilter::default(),
                 inbox_scope: NotificationScope::default(),
                 inbox_view: InboxView::default(),
@@ -244,14 +222,9 @@ impl PohunekApp {
                 inbox_details_expanded: false,
                 metadata_edit: MetadataEdit::default(),
                 rename_edit: String::new(),
-                project_edit: ProjectEdit::default(),
-                selected_action: None,
-                project_filters: BTreeMap::new(),
-                last_session_click: None,
                 state_dir: boot.state_dir,
                 status: boot.status,
                 notified_intents: 0,
-                blocked_cycle_index: 0,
             },
             task,
         )
@@ -295,7 +268,6 @@ impl PohunekApp {
             assistant_editor: text_editor::Content::new(),
             template_recipe: None,
             modal: ModalView::None,
-            activity_filter: None,
             notification_filter: NotificationFilter::default(),
             inbox_scope: NotificationScope::default(),
             inbox_view: InboxView::default(),
@@ -303,14 +275,9 @@ impl PohunekApp {
             inbox_details_expanded: false,
             metadata_edit: MetadataEdit::default(),
             rename_edit: String::new(),
-            project_edit: ProjectEdit::default(),
-            selected_action: None,
-            project_filters: BTreeMap::new(),
-            last_session_click: None,
             state_dir: None,
             status: None,
             notified_intents: 0,
-            blocked_cycle_index: 0,
         }
     }
 }
@@ -338,16 +305,13 @@ fn theme(_app: &PohunekApp) -> Theme {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use pohunek_gui_core::{ConnState, Selection};
     use protocol::{ProjectInfo, SessionInfo};
 
     use super::*;
-    use crate::attach::{
-        session_can_open, session_is_ready_to_resume, session_requires_resume_before_attach,
-    };
-    use crate::config::{
-        non_empty_config_path, validate_http_endpoint, RawGuiConfig, RawLinearProviderConfig,
-    };
+    use crate::config::RawGuiConfig;
     use crate::selection::{
         selected_assistant_project, selected_project_identity, selected_project_reference,
     };
@@ -411,155 +375,8 @@ mod tests {
         }
     }
 
-    fn app_with_session(host_id: &HostId, session: SessionInfo) -> PohunekApp {
-        let mut host = pohunek_gui_core::HostView {
-            conn: ConnState::Connected,
-            health: None,
-            sessions: BTreeMap::new(),
-            projects: BTreeMap::new(),
-            project_details: BTreeMap::new(),
-            notifications: BTreeMap::new(),
-            prompt: pohunek_gui_core::PromptState::default(),
-            provider: pohunek_gui_core::ProviderState::default(),
-            review: pohunek_gui_core::ReviewTabState::default(),
-            last_agent_state: None,
-            last_error: None,
-            supported_agents: Vec::new(),
-            runtimes: Vec::new(),
-            notification_providers: Vec::new(),
-            observation_capabilities: pohunek_gui_core::ObservationCapabilities::default(),
-        };
-        host.sessions.insert(session.id.0.clone(), session);
-
-        let mut app = PohunekApp {
-            workspace: Workspace::default(),
-            config: Err("test config is intentionally absent".to_owned()),
-            keymap: keyboard::KeyMap::default(),
-            hosts: Vec::new(),
-            ui_state: UiState::default(),
-            start: StartForm::default(),
-            assistant: AssistantForm::default(),
-            prompt_editor: text_editor::Content::new(),
-            assistant_editor: text_editor::Content::new(),
-            template_recipe: None,
-            modal: ModalView::None,
-            activity_filter: None,
-            notification_filter: NotificationFilter::default(),
-            inbox_scope: NotificationScope::default(),
-            inbox_view: InboxView::default(),
-            inbox_cursor: None,
-            inbox_details_expanded: false,
-            metadata_edit: MetadataEdit::default(),
-            rename_edit: String::new(),
-            project_edit: ProjectEdit::default(),
-            selected_action: None,
-            project_filters: BTreeMap::new(),
-            last_session_click: None,
-            state_dir: None,
-            status: None,
-            notified_intents: 0,
-            blocked_cycle_index: 0,
-        };
-        app.workspace.hosts.insert(host_id.clone(), host);
-        app
-    }
-
     #[test]
-    fn terminal_session_resumes_before_attach() {
-        let host_id = HostId::new("local");
-        let stopped = test_session("s-1", protocol::SessionState::Stopped);
-        let running = test_session("s-2", protocol::SessionState::Running);
-        let mut lost = test_session("s-3", protocol::SessionState::Running);
-        lost.runtime = Some(protocol::SessionRuntime {
-            state: protocol::RuntimeState::Lost,
-            runtime_generation: protocol::RuntimeGeneration::new(1),
-            worker_id: Some("worker-old".to_owned()),
-            runtime_id: Some("runtime-old".to_owned()),
-            started_at: None,
-            last_connected_at: None,
-            loss_reason: Some("worker_unavailable".to_owned()),
-        });
-
-        assert!(session_requires_resume_before_attach(
-            &app_with_session(&host_id, stopped.clone()),
-            &host_id,
-            &stopped.id
-        ));
-        assert!(!session_requires_resume_before_attach(
-            &app_with_session(&host_id, running.clone()),
-            &host_id,
-            &running.id
-        ));
-        assert!(session_requires_resume_before_attach(
-            &app_with_session(&host_id, lost.clone()),
-            &host_id,
-            &lost.id
-        ));
-    }
-
-    #[test]
-    fn terminal_session_without_resume_capability_fails_closed() {
-        let host_id = HostId::new("local");
-        let mut stopped = test_session("s-1", protocol::SessionState::Stopped);
-        stopped.capabilities.resume = false;
-        let result = crate::attach::attach_task(
-            &app_with_session(&host_id, stopped.clone()),
-            &host_id,
-            &stopped.id,
-        );
-
-        assert!(matches!(result, Err(error) if error == "session does not support resume"));
-    }
-
-    #[test]
-    fn terminal_session_resume_requires_nonempty_native_metadata() {
-        let host_id = HostId::new("local");
-        let mut hermes = test_session("s-hermes", protocol::SessionState::Done);
-        hermes.agent = "hermes".to_owned();
-        hermes.agent_base = protocol::AgentKind::Hermes;
-        hermes.native_session_id = None;
-        hermes.native_session_path = None;
-
-        assert!(!session_is_ready_to_resume(&hermes));
-        assert!(!session_can_open(&hermes));
-        let result = crate::attach::attach_task(
-            &app_with_session(&host_id, hermes.clone()),
-            &host_id,
-            &hermes.id,
-        );
-        assert!(
-            matches!(result, Err(error) if error == "session does not have native resume metadata"),
-            "a stale OpenSession action must be rejected before resume"
-        );
-
-        hermes.native_session_id = Some(String::new());
-        hermes.native_session_path = Some(String::new());
-        assert!(!session_is_ready_to_resume(&hermes));
-        assert!(!session_can_open(&hermes));
-
-        hermes.native_session_path = Some("/tmp/hermes-session.json".to_owned());
-        assert!(session_is_ready_to_resume(&hermes));
-        assert!(session_can_open(&hermes));
-
-        hermes.capabilities.resume = false;
-        assert!(!session_is_ready_to_resume(&hermes));
-        assert!(!session_can_open(&hermes));
-    }
-
-    #[test]
-    fn live_session_without_native_metadata_remains_attachable() {
-        let mut hermes = test_session("s-hermes-live", protocol::SessionState::Running);
-        hermes.agent = "hermes".to_owned();
-        hermes.agent_base = protocol::AgentKind::Hermes;
-        hermes.native_session_id = None;
-        hermes.native_session_path = None;
-
-        assert!(!session_is_ready_to_resume(&hermes));
-        assert!(session_can_open(&hermes));
-    }
-
-    #[test]
-    fn selected_project_identity_ignores_manual_project_reference() {
+    fn selected_project_identity_uses_workspace_selection() {
         let host_id = HostId::new("local");
         let project = ProjectInfo {
             id: "selected-project".to_owned(),
@@ -604,7 +421,6 @@ mod tests {
             assistant_editor: text_editor::Content::new(),
             template_recipe: None,
             modal: ModalView::None,
-            activity_filter: None,
             notification_filter: NotificationFilter::default(),
             inbox_scope: NotificationScope::default(),
             inbox_view: InboxView::default(),
@@ -612,17 +428,9 @@ mod tests {
             inbox_details_expanded: false,
             metadata_edit: MetadataEdit::default(),
             rename_edit: String::new(),
-            project_edit: ProjectEdit {
-                reference: "manual-project".to_owned(),
-                ..ProjectEdit::default()
-            },
-            selected_action: None,
-            project_filters: BTreeMap::new(),
-            last_session_click: None,
             state_dir: None,
             status: None,
             notified_intents: 0,
-            blocked_cycle_index: 0,
         };
         app.workspace.hosts.insert(host_id.clone(), host);
         app.ui_state.selection = Some(Selection::Project {
@@ -636,8 +444,8 @@ mod tests {
         assert_eq!(project_id, project.id);
         assert_eq!(repo_root, project.repo_root);
         assert_eq!(
-            selected_project_reference(&app).expect("manual reference"),
-            "manual-project"
+            selected_project_reference(&app).expect("reference"),
+            project.id
         );
     }
 
@@ -696,7 +504,6 @@ mod tests {
             assistant_editor: text_editor::Content::new(),
             template_recipe: None,
             modal: ModalView::None,
-            activity_filter: None,
             notification_filter: NotificationFilter::default(),
             inbox_scope: NotificationScope::default(),
             inbox_view: InboxView::default(),
@@ -704,14 +511,9 @@ mod tests {
             inbox_details_expanded: false,
             metadata_edit: MetadataEdit::default(),
             rename_edit: String::new(),
-            project_edit: ProjectEdit::default(),
-            selected_action: None,
-            project_filters: BTreeMap::new(),
-            last_session_click: None,
             state_dir: None,
             status: None,
             notified_intents: 0,
-            blocked_cycle_index: 0,
         };
         app.workspace.hosts.insert(host_id.clone(), host);
         app.hosts.push(HostConfig::local(
@@ -728,19 +530,6 @@ mod tests {
 
         assert_eq!(target.host.id, host_id);
         assert_eq!(target.project_ref, project.id);
-    }
-
-    #[test]
-    fn provider_config_rejects_linear_endpoint_without_http_scheme() {
-        let err = validate_http_endpoint(
-            "linear.example/graphql".to_owned(),
-            "providers.linear.endpoint",
-        )
-        .expect_err("endpoint without scheme");
-
-        assert!(err
-            .to_string()
-            .contains("must start with http:// or https://"));
     }
 
     #[test]
@@ -815,20 +604,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_config_rejects_zero_linear_token_timeout() {
-        let err = RawLinearProviderConfig {
-            token_key: "linear-token-ref".to_owned(),
-            endpoint: "https://linear.example/graphql".to_owned(),
-            token_timeout_ms: 0,
-            filters: Vec::new(),
-        }
-        .into_app_config()
-        .expect_err("zero token timeout");
-
-        assert!(err.to_string().contains("must be greater than zero"));
-    }
-
-    #[test]
     fn gui_config_rejects_zero_terminal_columns() {
         let err = RawGuiConfig {
             terminal_cols: Some(0),
@@ -852,23 +627,5 @@ mod tests {
 
         assert_eq!(size.cols, 132);
         assert_eq!(size.rows, 40);
-    }
-
-    #[test]
-    fn provider_config_accepts_command_name_for_gh_bin() {
-        let path = non_empty_config_path(PathBuf::from("gh"), "providers.github.gh_bin")
-            .expect("command name");
-
-        assert_eq!(path, PathBuf::from("gh"));
-    }
-
-    #[test]
-    fn provider_config_rejects_missing_explicit_gh_path() {
-        let missing =
-            std::env::temp_dir().join(format!("pohunek-gui-missing-gh-bin-{}", std::process::id()));
-        let err = non_empty_config_path(missing, "providers.github.gh_bin")
-            .expect_err("missing explicit path");
-
-        assert!(err.to_string().contains("path does not exist"));
     }
 }

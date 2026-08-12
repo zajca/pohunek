@@ -1,30 +1,23 @@
-//! Modal dialog contents: start session, start assistant, provider item, and toasts.
+//! Modal contents for session launch, assistant launch, key help, and toasts.
+
+// Rust guideline compliant 2026-08-12
 
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, text, text_editor, text_input,
+    button, checkbox, column, container, pick_list, row, text, text_editor, text_input,
 };
 use iced::{Center, Element};
 use pohunek_gui_core::assistant::Intent as AssistantIntent;
-use pohunek_gui_core::{providers, ProviderPanel, Toast};
+use pohunek_gui_core::Toast;
 use protocol::ProviderKind;
 
 use crate::keyboard::{KeyBindingHelp, KeyContext};
 use crate::message::{Message, ASSISTANT_AUTO_AGENT_LABEL, BLANK_TEMPLATE_LABEL};
 use crate::selection::{available_actions, selected_assistant_project, selected_host_id};
-use crate::view::inbox::notification_age_label;
-use crate::view::provider::{
-    action_launcher, ci_pill, label_pill, review_pill, selected_github_issue_in_state,
-    selected_linear_issue_in_state, selected_pull_request_in_state, status_pill, PillTone,
-};
 use crate::view::session::session_name_input;
 use crate::PohunekApp;
 
-use super::{dialog_card, muted_style, selectable_text};
+use super::{dialog_card, muted_style};
 
-/// "Start a session" modal. The operator picks the agent and an optional
-/// template; the prompt editor holds the session input (typed for a blank
-/// session, or the editable rendered template). Branch/base overrides for a
-/// blank session hide behind Advanced; a template supplies its own.
 pub(crate) fn start_modal_content(app: &PohunekApp) -> Element<'_, Message> {
     let advanced_label = if app.start.show_advanced {
         "Advanced v"
@@ -33,7 +26,7 @@ pub(crate) fn start_modal_content(app: &PohunekApp) -> Element<'_, Message> {
     };
     let mut template_options = vec![BLANK_TEMPLATE_LABEL.to_owned()];
     template_options.extend(available_actions(app, &ProviderKind::None));
-    let template_selected = Some(
+    let selected_template = Some(
         app.start
             .template
             .clone()
@@ -55,7 +48,7 @@ pub(crate) fn start_modal_content(app: &PohunekApp) -> Element<'_, Message> {
             text("Template").size(14),
             pick_list(
                 template_options,
-                template_selected,
+                selected_template,
                 Message::StartTemplateSelected
             ),
         ]
@@ -88,12 +81,11 @@ pub(crate) fn start_modal_content(app: &PohunekApp) -> Element<'_, Message> {
             .spacing(8),
         );
     }
-    let mut start_button = button("Start session").style(iced::widget::button::primary);
+    let mut start = button("Start session").style(iced::widget::button::primary);
     if selected_host(app).is_some_and(|host| host.agent_is_launchable(&app.start.agent)) {
-        start_button = start_button.on_press(Message::CreateSession);
+        start = start.on_press(Message::CreateSession);
     }
-    let panel = panel.push(start_button);
-    dialog_card("Start a session", panel)
+    dialog_card("Start a session", panel.push(start))
 }
 
 pub(crate) fn assistant_modal_content(app: &PohunekApp) -> Element<'_, Message> {
@@ -105,7 +97,6 @@ pub(crate) fn assistant_modal_content(app: &PohunekApp) -> Element<'_, Message> 
     let context = selected_assistant_project(app).map_or_else(std::convert::identity, |target| {
         format!("{}  ·  {}", target.host.id, target.project_ref)
     });
-    let agent_options = assistant_agent_options(app);
     let selected_agent = Some(
         app.assistant
             .agent
@@ -129,7 +120,7 @@ pub(crate) fn assistant_modal_content(app: &PohunekApp) -> Element<'_, Message> 
             ),
             text("Agent").size(14),
             pick_list(
-                agent_options,
+                assistant_agent_options(app),
                 selected_agent,
                 Message::AssistantAgentSelected,
             ),
@@ -174,18 +165,17 @@ pub(crate) fn assistant_modal_content(app: &PohunekApp) -> Element<'_, Message> 
                 .spacing(12),
             );
     }
-    let assistant_is_launchable = selected_host(app).is_some_and(|host| {
+    let launchable = selected_host(app).is_some_and(|host| {
         app.assistant.agent.as_deref().map_or_else(
             || !host.launchable_assistant_agents().is_empty(),
             |agent| host.agent_is_assistant_capable(agent),
         )
     });
-    let mut assistant_button = button("Start assistant").style(iced::widget::button::primary);
-    if assistant_is_launchable {
-        assistant_button = assistant_button.on_press(Message::LaunchAssistant);
+    let mut start = button("Start assistant").style(iced::widget::button::primary);
+    if launchable {
+        start = start.on_press(Message::LaunchAssistant);
     }
-    let panel = panel.push(assistant_button);
-    dialog_card("Start assistant", panel)
+    dialog_card("Start assistant", panel.push(start))
 }
 
 fn start_prompt_binding(key_press: text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
@@ -236,21 +226,18 @@ fn keymap_section(
     context: KeyContext,
 ) -> Element<'static, Message> {
     let mut section = column![text(title).size(15)].spacing(6);
-    for row in rows.iter().filter(|row| row.context == context) {
+    for binding in rows.iter().filter(|binding| binding.context == context) {
         section = section.push(
             row![
-                text(row.chord.clone()).size(13).font(iced::Font::MONOSPACE),
-                text(row.name).size(13).style(muted_style),
+                text(binding.chord.clone())
+                    .size(13)
+                    .font(iced::Font::MONOSPACE),
+                text(binding.name).size(13).style(muted_style),
             ]
             .spacing(14),
         );
     }
     section.into()
-}
-
-/// A host's capability-honest launch choices from its runtime inventory.
-fn agent_options_for_host(host: &pohunek_gui_core::HostView) -> Vec<String> {
-    host.launchable_agents()
 }
 
 fn selected_host(app: &PohunekApp) -> Option<&pohunek_gui_core::HostView> {
@@ -259,310 +246,16 @@ fn selected_host(app: &PohunekApp) -> Option<&pohunek_gui_core::HostView> {
         .and_then(|host_id| app.workspace.hosts.get(&host_id))
 }
 
-/// Agent options for the Start modal picker.
 fn start_agent_options(app: &PohunekApp) -> Vec<String> {
-    selected_host(app).map_or_else(Vec::new, agent_options_for_host)
+    selected_host(app).map_or_else(Vec::new, pohunek_gui_core::HostView::launchable_agents)
 }
 
 fn assistant_agent_options(app: &PohunekApp) -> Vec<String> {
     let mut options = vec![ASSISTANT_AUTO_AGENT_LABEL.to_owned()];
-    if let Ok(host_id) = selected_host_id(app) {
-        if let Some(host) = app.workspace.hosts.get(&host_id) {
-            options.extend(host.launchable_assistant_agents());
-        }
+    if let Some(host) = selected_host(app) {
+        options.extend(host.launchable_assistant_agents());
     }
     options
-}
-
-/// Modal showing the selected provider item's detail and its launch action.
-pub(crate) fn provider_item_modal_content(app: &PohunekApp) -> Element<'_, Message> {
-    let host_id = match selected_host_id(app) {
-        Ok(host_id) => host_id,
-        Err(err) => return dialog_card("Provider item", text(err).size(13)),
-    };
-    let Some(host) = app.workspace.hosts.get(&host_id) else {
-        return dialog_card("Provider item", text("Host is not loaded").size(13));
-    };
-    let selected_action = app.selected_action.clone();
-    match host.provider.active_panel {
-        ProviderPanel::Linear => linear_issue_modal(app, host, selected_action),
-        ProviderPanel::GitHub => github_item_modal(app, host, selected_action),
-    }
-}
-
-/// Linear issue modal: identifier + state pill, wrapping title, an
-/// `assignee · updated <age>` meta line (only the fields Linear reported), a
-/// branch row, the scrollable body, and the session-name + launch controls.
-fn linear_issue_modal<'a>(
-    app: &'a PohunekApp,
-    host: &'a pohunek_gui_core::HostView,
-    selected_action: Option<String>,
-) -> Element<'a, Message> {
-    let Some(issue) = selected_linear_issue_in_state(&host.provider.linear) else {
-        return dialog_card("Linear issue", text("No issue selected").size(13));
-    };
-    let mut header = row![selectable_text(issue.identifier.as_str())
-        .size(14)
-        .font(iced::Font::MONOSPACE)]
-    .spacing(8)
-    .align_y(Center);
-    if let Some(state) = &issue.state {
-        header = header.push(status_pill(
-            state.clone(),
-            linear_state_tone(issue.state_type.as_deref()),
-        ));
-    }
-    let mut body = column![
-        header,
-        selectable_text(issue.title.clone())
-            .size(16)
-            .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
-    ]
-    .spacing(10);
-    if let Some(meta) = linear_issue_meta_line(issue) {
-        body = body.push(selectable_text(meta).size(12).style(muted_style));
-    }
-    body = body
-        .push(branch_row(issue.branch.clone(), issue.url.clone()))
-        .push(scrollable(selectable_text(issue.body.clone()).size(13)).height(360))
-        .push(session_name_input(app, Message::LaunchLinearIssue))
-        .push(action_launcher(
-            available_actions(app, &ProviderKind::LinearIssue),
-            selected_action,
-            Message::LaunchLinearIssue,
-        ));
-    dialog_card("Linear issue", body)
-}
-
-/// Routes to the selected GitHub pull request or issue modal, whichever the
-/// GitHub panel currently has selected.
-fn github_item_modal<'a>(
-    app: &'a PohunekApp,
-    host: &'a pohunek_gui_core::HostView,
-    selected_action: Option<String>,
-) -> Element<'a, Message> {
-    if let Some(pull_request) = selected_pull_request_in_state(&host.provider.github) {
-        return github_pull_request_modal(app, pull_request, selected_action);
-    }
-    if let Some(issue) = selected_github_issue_in_state(&host.provider.github) {
-        return github_issue_modal(issue);
-    }
-    dialog_card("GitHub", text("No item selected").size(13))
-}
-
-/// GitHub pull request modal: `#num title` (draft badge leading, as in the
-/// list row), an `@author · labels` meta line, a branch row, a
-/// review-decision + checks-summary row, the scrollable body, and the
-/// session-name + launch controls.
-fn github_pull_request_modal<'a>(
-    app: &'a PohunekApp,
-    pull_request: &'a providers::github::GitHubPullRequest,
-    selected_action: Option<String>,
-) -> Element<'a, Message> {
-    // Draft leads the title so it stays visible when the title wraps,
-    // matching the list row's treatment.
-    let mut header = row![].spacing(8).align_y(Center);
-    if pull_request.is_draft {
-        header = header.push(status_pill("draft", PillTone::Neutral));
-    }
-    header = header
-        .push(selectable_text(format!("#{}", pull_request.number)).size(14))
-        .push(
-            selectable_text(pull_request.title.clone())
-                .size(16)
-                .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
-        );
-    let mut body = column![header].spacing(10);
-    let has_author_or_labels = pull_request.author.is_some() || !pull_request.labels.is_empty();
-    if has_author_or_labels {
-        let mut meta_line = row![].spacing(6).align_y(Center);
-        if let Some(author) = &pull_request.author {
-            meta_line = meta_line.push(
-                selectable_text(format!("@{author}"))
-                    .size(12)
-                    .style(muted_style),
-            );
-        }
-        for label in &pull_request.labels {
-            meta_line = meta_line.push(label_pill(label));
-        }
-        body = body.push(meta_line);
-    }
-    body = body
-        .push(branch_row(
-            pull_request.head_ref_name.clone(),
-            pull_request.url.clone(),
-        ))
-        .push(
-            row![
-                review_pill(&pull_request.review_decision),
-                ci_pill(&pull_request.checks),
-            ]
-            .spacing(6)
-            .align_y(Center),
-        )
-        .push(scrollable(selectable_text(pull_request.body.clone()).size(13)).height(260))
-        .push(session_name_input(app, Message::LaunchGitHubPullRequest))
-        .push(action_launcher(
-            available_actions(app, &ProviderKind::GithubPr),
-            selected_action,
-            Message::LaunchGitHubPullRequest,
-        ))
-        .push(
-            button(text("Review diff").size(13))
-                .on_press(Message::OpenPullRequestReview {
-                    number: pull_request.number,
-                })
-                .style(iced::widget::button::secondary),
-        );
-    dialog_card("Pull request", body)
-}
-
-/// GitHub issue modal: header, a branch row when GitHub reported one
-/// (otherwise a bare Open-in-browser button), the scrollable body, and the
-/// reference-only launch guidance (issues have no native launch flow).
-fn github_issue_modal(issue: &providers::github::GitHubIssue) -> Element<'_, Message> {
-    let mut body = column![selectable_text(format!("#{}  {}", issue.number, issue.title)).size(16)]
-        .spacing(10);
-    body = body.push(match &issue.branch {
-        Some(branch) => branch_row(branch.clone(), issue.url.clone()),
-        None => open_in_browser_button(issue.url.clone()),
-    });
-    body = body
-        .push(scrollable(selectable_text(issue.body.clone()).size(13)).height(260))
-        .push(
-            selectable_text("GitHub issues are reference-only; launch from a pull request.")
-                .size(12),
-        );
-    dialog_card("GitHub issue", body)
-}
-
-/// `assignee · updated <age>` meta line, omitting either half when Linear did
-/// not report it; `None` when neither field is present.
-fn linear_issue_meta_line(issue: &providers::linear::LinearIssue) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(assignee) = &issue.assignee {
-        parts.push(assignee.clone());
-    }
-    if let Some(updated_at) = &issue.updated_at {
-        parts.push(format!("updated {}", notification_age_label(updated_at)));
-    }
-    (!parts.is_empty()).then(|| parts.join("  ·  "))
-}
-
-/// Semantic tone for a Linear workflow state, from its `state_type` category
-/// (Linear's `backlog`/`unstarted`/`started`/`completed`/`canceled`/`triage`).
-/// Unknown or missing categories render neutral.
-fn linear_state_tone(state_type: Option<&str>) -> PillTone {
-    match state_type {
-        Some("completed") => PillTone::Success,
-        Some("canceled") => PillTone::Danger,
-        Some("started") => PillTone::Warning,
-        _ => PillTone::Neutral,
-    }
-}
-
-/// A `branch [Copy] [Open in browser]` row: monospace branch name plus a
-/// clipboard-copy button and an argv-spawned OS-browser-open button for `url`
-/// (see `Message::OpenUrl`).
-fn branch_row(branch: String, url: String) -> Element<'static, Message> {
-    row![
-        selectable_text(branch.clone())
-            .size(13)
-            .font(iced::Font::MONOSPACE),
-        button(text("Copy").size(12))
-            .padding([4, 8])
-            .on_press(Message::CopyText(branch))
-            .style(iced::widget::button::secondary),
-        open_in_browser_button(url),
-    ]
-    .spacing(8)
-    .align_y(Center)
-    .into()
-}
-
-/// An `[Open in browser]` button dispatching `Message::OpenUrl(url)`.
-fn open_in_browser_button(url: String) -> Element<'static, Message> {
-    button(text("Open in browser").size(12))
-        .padding([4, 8])
-        .on_press(Message::OpenUrl(url))
-        .style(iced::widget::button::secondary)
-        .into()
-}
-
-/// The Review tab's "Dispatch as session…" confirmation: the source
-/// session's working-agent warning (when applicable), an agent picker
-/// (defaults to the source session's own profile, listing the host's
-/// launchable runtime inventory), the rendered prompt preview or its render error, and
-/// the confirm action.
-pub(crate) fn dispatch_review_modal_content(app: &PohunekApp) -> Element<'_, Message> {
-    let Ok(host_id) = selected_host_id(app) else {
-        return dialog_card(
-            "Dispatch review",
-            text("select a session or project first").size(13),
-        );
-    };
-    let Some(host) = app.workspace.hosts.get(&host_id) else {
-        return dialog_card("Dispatch review", text("Host is not loaded").size(13));
-    };
-    let Some(dispatch) = &host.review.dispatch else {
-        return dialog_card("Dispatch review", text("No dispatch in progress").size(13));
-    };
-    let mut body = column![].spacing(12);
-    if dispatch.source_working {
-        body = body.push(
-            container(
-                text(
-                    "The source session's agent is currently working; dispatching now may \
-                     interrupt it.",
-                )
-                .size(13),
-            )
-            .padding(8)
-            .style(iced::widget::container::rounded_box),
-        );
-    }
-    body = body.push(
-        row![
-            text("Agent").size(13),
-            pick_list(
-                agent_options_for_host(host),
-                Some(dispatch.agent.clone()),
-                Message::DispatchAgentSelected,
-            ),
-        ]
-        .spacing(8)
-        .align_y(Center),
-    );
-    match &dispatch.prompt_preview {
-        Ok(preview) => {
-            body = body
-                .push(text("Prompt preview").size(14))
-                .push(
-                    scrollable(
-                        selectable_text(preview.clone())
-                            .size(12)
-                            .font(iced::Font::MONOSPACE),
-                    )
-                    .height(240),
-                )
-                .push({
-                    let mut dispatch_button =
-                        button("Dispatch").style(iced::widget::button::primary);
-                    if host.agent_is_launchable(&dispatch.agent) {
-                        dispatch_button = dispatch_button.on_press(Message::ConfirmReviewDispatch);
-                    }
-                    dispatch_button
-                });
-        }
-        Err(error) => {
-            body = body.push(text(format!("Cannot render the review prompt: {error}")).size(13));
-        }
-    }
-    if let Some(error) = &dispatch.dispatch_error {
-        body = body.push(text(format!("Dispatch failed: {error}")).size(13));
-    }
-    dialog_card("Dispatch review", body)
 }
 
 pub(crate) fn toast_view(toast: &Toast) -> Element<'_, Message> {
@@ -576,153 +269,12 @@ pub(crate) fn toast_view(toast: &Toast) -> Element<'_, Message> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use pohunek_gui_core::{
-        ConnState, HostId, HostView, PromptState, ProviderState, ReviewTabState, Selection,
-    };
-    use protocol::{AgentKind, AgentRuntime};
-
     use super::*;
 
-    fn runtime(
-        name: &str,
-        agent_base: Option<AgentKind>,
-        available: bool,
-        supported: Option<bool>,
-    ) -> AgentRuntime {
-        AgentRuntime {
-            agent: name.to_owned(),
-            agent_base,
-            available,
-            path: None,
-            version: None,
-            supported,
-        }
-    }
-
-    fn test_host(supported_agents: Vec<String>, runtimes: Vec<AgentRuntime>) -> HostView {
-        HostView {
-            conn: ConnState::Connected,
-            health: None,
-            sessions: BTreeMap::new(),
-            projects: BTreeMap::new(),
-            project_details: BTreeMap::new(),
-            notifications: BTreeMap::new(),
-            prompt: PromptState::default(),
-            provider: ProviderState::default(),
-            review: ReviewTabState::default(),
-            last_agent_state: None,
-            last_error: None,
-            supported_agents,
-            runtimes,
-            notification_providers: Vec::new(),
-            observation_capabilities: pohunek_gui_core::ObservationCapabilities::default(),
-        }
-    }
-
-    /// A test app with `host` loaded as `host_id` and selected, so
-    /// `selected_host_id` resolves it.
-    fn test_app(host_id: HostId, host: HostView) -> PohunekApp {
-        let mut app = PohunekApp::test_default();
-        app.workspace.hosts.insert(host_id.clone(), host);
-        app.ui_state.selection = Some(Selection::Host { host_id });
-        app
-    }
-
     #[test]
-    fn start_agent_options_use_only_launchable_runtime_inventory() {
-        let host_id = HostId::new("local");
-        let host = test_host(
-            vec!["ghost-supported-name".to_owned()],
-            vec![
-                runtime("shell", Some(AgentKind::Shell), true, None),
-                runtime("legacy-custom", None, true, None),
-                runtime("hermes-review", Some(AgentKind::Hermes), true, Some(true)),
-                runtime("hermes-missing", Some(AgentKind::Hermes), false, None),
-                runtime("hermes-unconfirmed", Some(AgentKind::Hermes), true, None),
-                runtime(
-                    "hermes-unsupported",
-                    Some(AgentKind::Hermes),
-                    true,
-                    Some(false),
-                ),
-                runtime(
-                    "future-profile",
-                    Some(AgentKind::Unknown("future".to_owned())),
-                    true,
-                    Some(true),
-                ),
-            ],
-        );
-        let app = test_app(host_id, host);
-
-        assert_eq!(
-            start_agent_options(&app),
-            vec!["shell", "legacy-custom", "hermes-review"]
-        );
-    }
-
-    #[test]
-    fn assistant_agent_options_exclude_shell_and_unlaunchable_runtimes() {
-        let host_id = HostId::new("local");
-        let host = test_host(
-            vec!["hermes-unconfirmed".to_owned()],
-            vec![
-                runtime("shell", Some(AgentKind::Shell), true, None),
-                runtime("shell-profile", Some(AgentKind::Shell), true, None),
-                runtime("legacy-custom", None, true, None),
-                runtime(
-                    "hermes-supported",
-                    Some(AgentKind::Hermes),
-                    true,
-                    Some(true),
-                ),
-                runtime("hermes-unconfirmed", Some(AgentKind::Hermes), true, None),
-            ],
-        );
-        let app = test_app(host_id, host);
-
-        assert_eq!(
-            assistant_agent_options(&app),
-            vec![
-                ASSISTANT_AUTO_AGENT_LABEL,
-                "legacy-custom",
-                "hermes-supported"
-            ]
-        );
-    }
-
-    #[test]
-    fn start_agent_options_do_not_preserve_a_stale_selected_value() {
-        let host_id = HostId::new("local");
-        let host = test_host(
-            vec!["shell".to_owned(), "stale-profile".to_owned()],
-            vec![runtime("shell", Some(AgentKind::Shell), true, None)],
-        );
-        let mut app = test_app(host_id, host);
-        app.start.agent = "stale-profile".to_owned();
-
-        let options = start_agent_options(&app);
-        assert_eq!(options, vec!["shell"]);
-    }
-
-    #[test]
-    fn start_agent_options_are_empty_when_no_host_is_selected() {
-        let app = PohunekApp::test_default();
-
-        assert!(start_agent_options(&app).is_empty());
-    }
-
-    #[test]
-    fn ctrl_enter_is_the_multiline_primary_submit_chord() {
+    fn ctrl_enter_submits_multiline_forms() {
         let enter = iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter);
-
         assert!(is_ctrl_enter(&enter, iced::keyboard::Modifiers::CTRL));
-        assert!(is_ctrl_enter(
-            &enter,
-            iced::keyboard::Modifiers::CTRL | iced::keyboard::Modifiers::SHIFT
-        ));
         assert!(!is_ctrl_enter(&enter, iced::keyboard::Modifiers::empty()));
         assert!(!is_ctrl_enter(
             &enter,

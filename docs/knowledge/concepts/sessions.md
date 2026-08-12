@@ -82,14 +82,9 @@ and the launch scripts write exactly these five keys through the shared
 of which surface created the session. The daemon treats all metadata as
 opaque owner-controlled strings.
 
-A session created by dispatching a GUI review (Track D.6, see
-[GUI setup](../guides/gui.md#review)) carries `review.source` (the dispatched
-review's app-local id) and `review.dispatched_at` (RFC3339), plus every
-`link.*` key already present on the source session, copied verbatim. Review
-dispatch always targets the source session's own worktree with `cwd` rather
-than minting a new one — git refuses a second worktree on a branch already
-checked out — so a review session's `worktree_path` and `branch` match its
-source session's.
+Sessions created by older native GUI review flows may retain `review.source`
+and `review.dispatched_at` metadata. Those keys remain opaque session metadata,
+but the current native GUI no longer creates or manages reviews.
 
 Notifications can be linked to a session through `session_id`. Provider hook
 adapters attach the id when `POHUNEK_SESSION_ID` is present and shape-valid;

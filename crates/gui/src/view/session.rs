@@ -1,20 +1,53 @@
-//! Session detail pane: summary, rename control, and metadata editor.
+//! Session detail modal, lifecycle actions, and metadata editor.
 
-use iced::widget::{button, column, row, text, text_input};
-use iced::{Center, Element};
-use pohunek_gui_core::{
-    session_link_metadata, session_metadata_rows, HostId, RuntimeContinuity, SessionLinkKind,
-    SessionLinkProvider,
-};
+use iced::widget::{button, column, row, scrollable, text, text_input};
+use iced::{Center, Element, Fill};
+use pohunek_gui_core::{session_metadata_rows, HostId, RuntimeContinuity, SessionAccess};
 use protocol::{CwdSource, SessionInfo};
 
-use crate::attach::{session_can_open, session_requires_resume_before_attach};
 use crate::message::Message;
-use crate::selection::{selected_host_config, selected_session};
-use crate::view::provider::linked_github_status;
+use crate::selection::selected_session;
 use crate::PohunekApp;
 
-use super::{card, section_title, selectable_text, session_agent_label};
+use super::{card, dialog_card, section_title, selectable_text, session_agent_label};
+
+/// Session-detail dialog opened from the prioritized list.
+pub(crate) fn session_modal_content(app: &PohunekApp) -> Element<'_, Message> {
+    dialog_card(
+        "Session",
+        scrollable(session_pane(app)).height(Fill).width(Fill),
+    )
+}
+
+/// Confirms permanent deletion of the selected logical session.
+pub(crate) fn confirm_delete_modal_content(app: &PohunekApp) -> Element<'_, Message> {
+    let description = selected_session(app).map_or_else(
+        || "The selected session is no longer available.".to_owned(),
+        |(host_id, session)| {
+            let name = session.name.as_deref().unwrap_or(session.id.0.as_str());
+            format!(
+                "Delete {name} ({host_id} / {})? This removes its logical record, retained session logs, and any eligible Pohunek-owned worktree.",
+                session.id.0
+            )
+        },
+    );
+    dialog_card(
+        "Delete session",
+        column![
+            text(description).size(14),
+            row![
+                button("Cancel")
+                    .on_press(Message::CloseModal)
+                    .style(iced::widget::button::secondary),
+                button("Delete session")
+                    .on_press(Message::ConfirmDeleteSession)
+                    .style(iced::widget::button::danger),
+            ]
+            .spacing(8),
+        ]
+        .spacing(14),
+    )
+}
 
 /// Session surface: the session card with its actions and metadata.
 pub(crate) fn session_pane(app: &PohunekApp) -> Element<'_, Message> {
@@ -51,31 +84,6 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
             }
             if let Some(branch) = &session.branch {
                 detail = detail.push(selectable_text(format!("branch: {branch}")).size(14));
-            }
-            if let Some(link) = session_link_metadata(session) {
-                detail = detail.push(selectable_text(format!(
-                    "linked: {} {} {}",
-                    link.provider.as_str(),
-                    link.kind.as_str(),
-                    link.id
-                )));
-                if link.provider == SessionLinkProvider::GitHub
-                    && link.kind == SessionLinkKind::PullRequest
-                {
-                    let status = selected_host_config(app)
-                        .ok()
-                        .and_then(|host| app.workspace.hosts.get(&host.id))
-                        .and_then(|host| linked_github_status(host, session));
-                    detail = detail.push(selectable_text(format!(
-                        "PR status: {}",
-                        status.unwrap_or_else(|| "unknown".to_owned())
-                    )));
-                    detail = detail.push(
-                        button("Refresh PR status")
-                            .on_press(Message::FetchGitHubPullRequestStatus)
-                            .style(iced::widget::button::secondary),
-                    );
-                }
             }
             if let Some(path) = &session.worktree_path {
                 detail =
@@ -190,12 +198,21 @@ fn session_actions<'a>(
             .get(host_id)
             .map(|host| host.observation_capabilities)
             .unwrap_or_default();
-        let needs_resume = session_requires_resume_before_attach(app, host_id, &session.id);
-        let can_open = session_can_open(session);
-        let open_label = if needs_resume && !can_open {
-            "Resume unavailable"
-        } else {
+        let row = app
+            .workspace
+            .session_rows()
+            .into_iter()
+            .find(|row| row.host_id == *host_id && row.session_id == session.id);
+        let access = row
+            .as_ref()
+            .map_or(SessionAccess::Unavailable, |row| row.access);
+        let can_open = matches!(access, SessionAccess::Attach | SessionAccess::Resume);
+        let open_label = if access == SessionAccess::Resume {
+            "Resume in terminal"
+        } else if can_open {
             "Open in terminal"
+        } else {
+            "Open unavailable"
         };
         let mut open_button = button(open_label).style(iced::widget::button::primary);
         if can_open {
@@ -230,25 +247,25 @@ fn session_actions<'a>(
                 "Wait for change",
                 observation.session_wait,
                 Message::WaitForSelectedSession,
-            ))
-            .push(
-                button("Stop")
-                    .on_press(Message::StopSelectedSession)
-                    .style(iced::widget::button::danger),
-            )
-            .push(
-                button("Remove")
-                    .on_press(Message::RemoveSelectedSession)
-                    .style(iced::widget::button::danger),
-            );
-        if session.worktree_path.is_some() {
+            ));
+        if row.as_ref().is_some_and(|row| row.can_stop) {
             actions = actions.push(
-                button("Review changes")
-                    .on_press(Message::OpenSessionReview {
+                button("Terminate")
+                    .on_press(Message::StopSession {
                         host_id: host_id.clone(),
                         session_id: session.id.clone(),
                     })
-                    .style(iced::widget::button::secondary),
+                    .style(iced::widget::button::danger),
+            );
+        }
+        if row.as_ref().is_some_and(|row| row.can_remove) {
+            actions = actions.push(
+                button("Delete")
+                    .on_press(Message::RequestDeleteSession {
+                        host_id: host_id.clone(),
+                        session_id: session.id.clone(),
+                    })
+                    .style(iced::widget::button::danger),
             );
         }
     }

@@ -1,18 +1,9 @@
 //! Top-level Iced view tree: shared widget helpers and the view submodules.
 
-// `pub(crate)` so `crate::view::review` can reuse `project_scope_placeholder`
-// for the Review tab's empty state, the same way `provider` below is widened.
 pub(crate) mod detail;
 pub(crate) mod inbox;
 mod modals;
-mod project;
 mod selectable_text;
-// `pub(crate)` so `crate::keyboard` can reuse the "what's selected" lookups
-// (`selected_linear_issue_in_state` and friends) for the provider-item
-// modal's `Enter` shortcut, the same way `inbox` above is widened for its
-// timestamp helpers.
-pub(crate) mod provider;
-pub(crate) mod review;
 mod session;
 mod tree;
 
@@ -26,14 +17,10 @@ use crate::PohunekApp;
 
 use detail::detail_view;
 use inbox::inbox_modal_content;
-use modals::{
-    assistant_modal_content, dispatch_review_modal_content, keymap_modal_content,
-    provider_item_modal_content, start_modal_content,
-};
+use modals::{assistant_modal_content, keymap_modal_content, start_modal_content};
 use selectable_text::selectable_text;
-use tree::{
-    agents_monitor, assistant_entry_button, conn_color, inbox_entry_button, workspace_tree,
-};
+use session::{confirm_delete_modal_content, session_modal_content};
+use tree::{assistant_entry_button, conn_color, inbox_entry_button, workspace_tree};
 
 /// Returns a provider-neutral label for an agent kind received from the wire.
 fn agent_kind_label(kind: &AgentKind) -> String {
@@ -125,10 +112,6 @@ pub(crate) fn view(app: &PohunekApp) -> Element<'_, Message> {
         container(workspace_tree(app))
             .padding(12)
             .height(Fill)
-            .style(iced::widget::container::rounded_box),
-        container(agents_monitor(app))
-            .padding(12)
-            .height(u32::from(app.ui_state.agents_pane_height))
             .style(iced::widget::container::rounded_box)
     ]
     .spacing(12);
@@ -148,18 +131,14 @@ pub(crate) fn view(app: &PohunekApp) -> Element<'_, Message> {
             assistant_modal_content(app),
             Message::CloseModal,
         ),
+        ModalView::Session => modal(base.into(), session_modal_content(app), Message::CloseModal),
+        ModalView::ConfirmDeleteSession => modal(
+            base.into(),
+            confirm_delete_modal_content(app),
+            Message::CloseModal,
+        ),
         ModalView::Keymap => modal(base.into(), keymap_modal_content(app), Message::CloseModal),
-        ModalView::ProviderItem => modal(
-            base.into(),
-            provider_item_modal_content(app),
-            Message::CloseModal,
-        ),
         ModalView::Inbox => modal(base.into(), inbox_modal_content(app), Message::CloseModal),
-        ModalView::DispatchReview => modal(
-            base.into(),
-            dispatch_review_modal_content(app),
-            Message::CloseModal,
-        ),
     }
 }
 
@@ -232,6 +211,38 @@ fn muted_style(theme: &Theme) -> iced::widget::text::Style {
     let mut color = theme.extended_palette().background.base.text;
     color.a = 0.75;
     iced::widget::text::Style { color: Some(color) }
+}
+
+/// Semantic background tone for a compact status pill.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PillTone {
+    Success,
+    Danger,
+    Warning,
+    Neutral,
+}
+
+/// Renders a compact status pill using the theme's semantic palette.
+fn status_pill(label: impl Into<String>, tone: PillTone) -> Element<'static, Message> {
+    let label = label.into();
+    container(text(label).size(11))
+        .padding([1, 6])
+        .style(move |theme: &Theme| {
+            let palette = theme.extended_palette();
+            let pair = match tone {
+                PillTone::Success => palette.success.weak,
+                PillTone::Danger => palette.danger.weak,
+                PillTone::Warning => palette.warning.weak,
+                PillTone::Neutral => palette.secondary.weak,
+            };
+            iced::widget::container::Style {
+                background: Some(Background::Color(pair.color)),
+                text_color: Some(pair.text),
+                border: iced::border::rounded(4.0),
+                ..iced::widget::container::Style::default()
+            }
+        })
+        .into()
 }
 
 /// U+25CF BLACK CIRCLE: a compact filled status dot that renders consistently

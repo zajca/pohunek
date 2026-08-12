@@ -114,21 +114,16 @@ where they are doing it, and when they need you.
 
 **Native desktop GUI (optional reference client)**
 
-- `pohunek-gui` (Iced, Wayland) is a keyboard-first control plane: hosts,
-  sessions, projects, worktrees, and live agent activity in one window. It
-  deliberately embeds **no terminal** — opening a session spawns your own
-  terminal via a configurable `attach_command`.
-- **Agents monitor** with working/blocked/idle counts, `b` cycles through
-  blocked agents; the **Inbox** modal is a cross-host triage view over durable
-  notifications and raises OS notifications only for action-required and
-  error records.
-- **Linear and GitHub integration** (client-side: Linear GraphQL via keyring
-  token, GitHub via `gh`): browse issues and PRs with named filters, then
-  launch a linked agent session from a work item — the session carries
-  `link.*` metadata tying it back to the issue/PR.
-- **Review tab**: browse a session's worktree diff (or a PR diff), leave
-  inline comments, and dispatch the review as a *new agent session* running in
-  the same worktree, prompt rendered from a template.
+- `pohunek-gui` (Iced, Wayland) is a session-first control plane. Its main pane
+  groups cross-host sessions as Needs action, Idle, Running, and Unavailable;
+  the left rail keeps only Assistant, Inbox, hosts, and project context.
+- Clicking a session opens its detail in a modal over the list. Eligible rows
+  expose direct Open/Resume, Terminate, and confirmed Delete actions.
+- The **Inbox** modal is a cross-host triage view over durable notifications and
+  raises OS notifications only for action-required and error records.
+- It deliberately embeds **no terminal** — opening a session spawns your own
+  terminal via a configurable `attach_command`. The native GUI has no
+  Linear/GitHub browser, review, worktree-management, or Agents-monitor panel.
 
 **Launcher and terminal UX**
 
@@ -481,22 +476,13 @@ selected host.
 ```toml
 pohunek_bin = "/usr/local/bin/pohunek"
 attach_command = "$TERMINAL -e sh -c 'exec {bin} attach --host {host} {id}'"
-
-[providers.linear]
-token_key = "linear-token-ref"   # keyring entry name — never a token value
-endpoint = "https://api.linear.app/graphql"
-token_timeout_ms = 5000          # required: caps keyring token lookup
-
-[providers.github]
-gh_bin = "gh"
+notification_command = "notify-send"
 ```
 
-Highlights: persistent right-pane tabs (`1 Detail · 2 Linear · 3 GitHub ·
-4 Worktrees · 5 Review`), `n` opens the Start-session modal, `a` the
-assistant modal, `i` the Inbox, `b` cycles blocked agents, `/` searches
-provider lists,
-`shift+?` shows the full keymap. All bindings are remappable via a
-`[keybindings]` table. Wayland-only on Linux v1.
+Highlights: prioritized session groups, modal session detail, quick lifecycle
+actions, `n` for Start session, `a` for Assistant, `i` for Inbox, `o` to open
+the selected session, and `shift+?` for the full keymap. Supported bindings are
+remappable through `[keybindings]`. Wayland-only on Linux v1.
 
 The bundled GUI is a **reference client**, not the only supported way in. It
 uses the same public protocol and SDKs documented below — so if it does not fit
