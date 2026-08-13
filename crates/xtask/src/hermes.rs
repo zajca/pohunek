@@ -1,6 +1,6 @@
 //! Validates the pinned Hermes CLI and refreshes bounded PTY evidence.
 
-// Rust guideline compliant 2026-08-06
+// Rust guideline compliant 2026-08-13
 
 use std::ffi::OsString;
 use std::fs;
@@ -160,6 +160,11 @@ const GOLDEN_STATES: [&str; 10] = [
 const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 /// A help/version probe should never need more than ten seconds.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Packaged static binaries need extra time for the Hermes install lifecycle.
+///
+/// Thirty seconds preserves a finite CI bound while accommodating the slower
+/// MUSL release binary observed on shared GitHub runners.
+const INTEGRATION_ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// One PTY transcript remains reviewable and cannot consume unbounded memory.
 const MAX_PTY_OUTPUT_BYTES: usize = 512 * 1024;
 /// Timeout diagnostics expose only a short reviewable suffix of safe output.
@@ -452,6 +457,7 @@ enum GoldenStatus {
 #[derive(Clone, Copy, Debug)]
 struct Limits {
     command_timeout: Duration,
+    integration_action_timeout: Duration,
     command_output_bytes: usize,
     pty_output_bytes: usize,
     startup_wait: Duration,
@@ -465,6 +471,7 @@ impl Limits {
     fn production() -> Self {
         Self {
             command_timeout: COMMAND_TIMEOUT,
+            integration_action_timeout: INTEGRATION_ACTION_TIMEOUT,
             command_output_bytes: MAX_COMMAND_OUTPUT_BYTES,
             pty_output_bytes: MAX_PTY_OUTPUT_BYTES,
             startup_wait: STARTUP_WAIT,
@@ -1855,7 +1862,7 @@ fn run_pohunek_integration_action(
         &args,
         cwd,
         env,
-        limits.command_timeout,
+        limits.integration_action_timeout,
         limits.command_output_bytes,
     )?;
     if output.status.code() != Some(0) {
@@ -3787,6 +3794,7 @@ mod tests {
     fn fast_limits() -> Limits {
         Limits {
             command_timeout: Duration::from_secs(2),
+            integration_action_timeout: Duration::from_secs(2),
             command_output_bytes: 16 * 1024,
             pty_output_bytes: 64 * 1024,
             startup_wait: Duration::from_secs(1),
@@ -4841,6 +4849,31 @@ PY
         assert!(error
             .to_string()
             .contains("failed to start Hermes CLI check"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn integration_process_uses_its_dedicated_time_limit() {
+        let isolation = tempfile::tempdir().expect("create integration isolation");
+        let sleeper = script(isolation.path(), "sleeping-pohunek", "#!/bin/sh\nsleep 5\n");
+        let step = IntegrationStep {
+            action: IntegrationAction::Install,
+            expected_state: IntegrationState::Installed,
+        };
+        let mut limits = fast_limits();
+        limits.integration_action_timeout = Duration::from_millis(50);
+
+        let error = run_pohunek_integration_action(
+            &sleeper,
+            Path::new("/controlled/hermes"),
+            &step,
+            isolation.path(),
+            &[],
+            limits,
+        )
+        .expect_err("slow integration action fails closed");
+
+        assert!(error.to_string().contains("time limit"));
     }
 
     #[test]
