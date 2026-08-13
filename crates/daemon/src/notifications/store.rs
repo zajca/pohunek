@@ -25,6 +25,9 @@ pub const NOTIFICATIONS_SUBDIR: &str = "notifications";
 /// File name of the append-only notification action log.
 const NOTIFICATIONS_LOG_NAME: &str = "notifications.jsonl";
 
+/// Temporary log name used for atomic notification-store compaction.
+const NOTIFICATIONS_COMPACTION_NAME: &str = "notifications.jsonl.tmp";
+
 /// File name of the durable notification policy.
 ///
 /// Policy is singleton configuration state, not notification audit history, so
@@ -64,6 +67,13 @@ pub(crate) struct NotificationStore {
 struct StoreState {
     file: File,
     records: BTreeMap<String, NotificationRecord>,
+    action_count: usize,
+}
+
+#[derive(Debug)]
+struct ReplayState {
+    records: BTreeMap<String, NotificationRecord>,
+    action_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,11 +128,15 @@ impl NotificationStore {
             .open(&path)
             .map_err(|source| NotificationError::io(&path, source))?;
         set_owner_private_file_permissions(&path)?;
-        let records = replay(&path)?;
+        let replayed = replay(&path)?;
         Ok(Self {
             dir,
             path,
-            state: Mutex::new(StoreState { file, records }),
+            state: Mutex::new(StoreState {
+                file,
+                records: replayed.records,
+                action_count: replayed.action_count,
+            }),
         })
     }
 
@@ -139,6 +153,75 @@ impl NotificationStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.records.values().cloned().collect()
+    }
+
+    /// Physically rewrite the action log to its current visible records.
+    ///
+    /// Compaction is skipped below `minimum_actions` and when it would not
+    /// remove an update or tombstone. The replacement file is fully flushed and
+    /// opened for future appends before its atomic rename, so a crash leaves
+    /// either the old replayable log or the complete compacted log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationError`] when serialization, file I/O, atomic
+    /// replacement, or parent-directory syncing fails.
+    pub(crate) fn compact_if_needed(
+        &self,
+        minimum_actions: u32,
+    ) -> Result<bool, NotificationError> {
+        let minimum_actions = usize::try_from(minimum_actions).unwrap_or(usize::MAX);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let visible_records: Vec<NotificationRecord> = state
+            .records
+            .values()
+            .filter(|record| record.status != NotificationStatus::Deleted)
+            .cloned()
+            .collect();
+        if state.action_count < minimum_actions || state.action_count <= visible_records.len() {
+            return Ok(false);
+        }
+
+        let temp_path = self.dir.join(NOTIFICATIONS_COMPACTION_NAME);
+        let mut replacement = owner_private_write_options()
+            .open(&temp_path)
+            .map_err(|source| NotificationError::io(&temp_path, source))?;
+        for record in &visible_records {
+            let mut line = serde_json::to_string(&StoreAction::Created {
+                record: record.clone(),
+            })
+            .map_err(NotificationError::serialize)?;
+            line.push('\n');
+            replacement
+                .write_all(line.as_bytes())
+                .map_err(|source| NotificationError::io(&temp_path, source))?;
+        }
+        replacement
+            .flush()
+            .map_err(|source| NotificationError::io(&temp_path, source))?;
+        replacement
+            .sync_all()
+            .map_err(|source| NotificationError::io(&temp_path, source))?;
+        set_owner_private_file_permissions(&temp_path)?;
+        drop(replacement);
+        let replacement = owner_private_append_options()
+            .open(&temp_path)
+            .map_err(|source| NotificationError::io(&temp_path, source))?;
+        fs::rename(&temp_path, &self.path)
+            .map_err(|source| NotificationError::io(&self.path, source))?;
+
+        state.file = replacement;
+        state
+            .records
+            .retain(|_, record| record.status != NotificationStatus::Deleted);
+        state.action_count = visible_records.len();
+        File::open(&self.dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| NotificationError::io(&self.dir, source))?;
+        Ok(true)
     }
 
     /// Create a record or return/update a deduped visible record atomically.
@@ -609,6 +692,7 @@ fn append_action_locked(
         .flush()
         .map_err(|source| NotificationError::io(path, source))?;
     apply_action(&mut state.records, action);
+    state.action_count += 1;
     Ok(())
 }
 
@@ -695,9 +779,10 @@ fn upgrade_projector(
     existing
 }
 
-fn replay(path: &Path) -> Result<BTreeMap<String, NotificationRecord>, NotificationError> {
+fn replay(path: &Path) -> Result<ReplayState, NotificationError> {
     let content = fs::read_to_string(path).map_err(|source| NotificationError::io(path, source))?;
     let mut records = BTreeMap::new();
+    let mut action_count = 0;
     for (index, raw_line) in content.split_inclusive('\n').enumerate() {
         let line_number = index + 1;
         let terminated = raw_line.ends_with('\n');
@@ -707,7 +792,10 @@ fn replay(path: &Path) -> Result<BTreeMap<String, NotificationRecord>, Notificat
             continue;
         }
         match serde_json::from_str::<StoreAction>(line) {
-            Ok(action) => apply_action(&mut records, action),
+            Ok(action) => {
+                apply_action(&mut records, action);
+                action_count += 1;
+            }
             Err(err) if is_tolerated_trailing_partial(terminated, &err) => {
                 warn!(
                     error = %err,
@@ -719,7 +807,10 @@ fn replay(path: &Path) -> Result<BTreeMap<String, NotificationRecord>, Notificat
             Err(err) => return Err(NotificationError::store_parse(path, line_number, err)),
         }
     }
-    Ok(records)
+    Ok(ReplayState {
+        records,
+        action_count,
+    })
 }
 
 fn is_tolerated_trailing_partial(terminated: bool, err: &serde_json::Error) -> bool {
@@ -1125,6 +1216,48 @@ mod tests {
             .filter(|line| !line.trim().is_empty())
             .count();
         assert_eq!(lines, 4);
+    }
+
+    #[test]
+    fn compaction_removes_history_and_tombstones_and_keeps_append_handle_live() {
+        let data_dir = temp_data_dir("compaction");
+        let store = NotificationStore::open(&data_dir).expect("open store");
+        let mut retained = record("n-1", "2026-07-03T10:00:00Z");
+        store
+            .append_created(retained.clone())
+            .expect("append retained record");
+        retained.status = NotificationStatus::Read;
+        retained.read_at = Some("2026-07-03T10:01:00Z".to_owned());
+        store
+            .append_updated(retained.clone())
+            .expect("append retained update");
+
+        let mut deleted = record("n-2", "2026-07-03T10:02:00Z");
+        store
+            .append_created(deleted.clone())
+            .expect("append deleted record");
+        deleted.status = NotificationStatus::Deleted;
+        deleted.deleted_at = Some("2026-07-03T10:03:00Z".to_owned());
+        store
+            .append_deleted(deleted)
+            .expect("append delete tombstone");
+
+        assert!(store.compact_if_needed(1).expect("compact store"));
+        assert_eq!(
+            std::fs::read_to_string(store.path())
+                .expect("read compacted log")
+                .lines()
+                .count(),
+            1
+        );
+
+        let appended = record("n-3", "2026-07-03T10:04:00Z");
+        store
+            .append_created(appended.clone())
+            .expect("append after compaction");
+        let reopened = NotificationStore::open(&data_dir).expect("reopen compacted store");
+
+        assert_eq!(reopened.all(), vec![retained, appended]);
     }
 
     #[test]

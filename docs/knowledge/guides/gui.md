@@ -77,10 +77,10 @@ pohunek-gui
 
 The main pane always groups every loaded session in this priority order:
 
-1. **Needs action** — blocked sessions and sessions with actionable durable
-   notifications.
-2. **Idle** — live, attachable sessions that are not currently working.
-3. **Running** — working, starting, or reconnecting sessions.
+1. **Needs you** — sessions currently blocked, carrying an unresolved approval,
+   or waiting for failure review.
+2. **Running** — working, starting, or reconnecting sessions.
+3. **Ready** — live, attachable sessions at their normal idle prompt.
 4. **Unavailable** — terminal, external, conflicting, incompatible, lost, or
    otherwise unusable sessions.
 
@@ -88,6 +88,8 @@ Rows are stable within a group by host id and session id. Activity or runtime
 changes may move a row between groups, but do not reorder unrelated rows inside
 the same group. Every row identifies its project explicitly as
 `project:<label>`, falling back to the project id or `project:unassigned`.
+Unread informational or historical notifications never move a session into
+Needs you. A current input or approval request is labeled directly on the row.
 
 Each eligible row exposes direct actions:
 
@@ -103,11 +105,13 @@ Clicking the row itself opens session detail in a modal over the unchanged
 session list. The modal contains inspection, terminal observation, fork,
 rename, metadata, terminate, and delete controls according to current
 capabilities. Worktree path and branch can still appear as read-only session
-metadata; the GUI does not browse or manage worktrees.
+metadata; the GUI does not browse or manage worktrees. Session detail separates
+Current attention from Recent activity and links to the host-filtered Activity
+view.
 
 ## Navigation and Keyboard
 
-The left rail contains Assistant, Inbox, hosts, and projects. Select a project
+The left rail contains Assistant, Activity, hosts, and projects. Select a project
 before starting a session. Sessions do not appear in the left tree because the
 main pane is their single navigation surface.
 
@@ -118,7 +122,7 @@ Default global bindings:
 
 | Name | Default | Behavior |
 |------|---------|----------|
-| `open_inbox` | `i` | Open the Inbox modal. |
+| `open_inbox` | `i` | Open the Activity modal. |
 | `open_selected_session` | `o` | Open or resume the selected session in a terminal. |
 | `show_selected_session` | `enter` | Open the selected session detail modal. |
 | `open_keymap_help` | `shift+?` | Show the effective keymap. |
@@ -126,7 +130,7 @@ Default global bindings:
 | `open_assistant` | `a` | Open the Assistant modal. |
 
 Modal bindings include `escape`, `enter`, `shift+enter`, `o`, and `j`/`k` or
-the arrow keys for Inbox navigation. Launch forms reserve Enter for select
+the arrow keys for Activity navigation. Launch forms reserve Enter for select
 confirmation and use Ctrl+Enter for submission. Add a partial `[keybindings]`
 table to override supported names. Unknown removed binding names fail
 configuration validation instead of silently doing nothing.
@@ -151,18 +155,19 @@ project, or to the project linked from the selected session. The shared
 `gui-core::assistant` launcher performs host inspection, snapshot creation,
 knowledge materialization, prompt composition, and `session.new`.
 
-## Inbox
+## Activity
 
-Inbox is a modal over durable cross-host notifications. It offers `Needs action`,
-`All`, and `Archived` scopes, auto-marks a notification read when opened, and
-can select its linked session. Linked actionable notifications also promote the
-session into the main list's Needs action group.
+Activity is a modal over durable cross-host notification history. It offers
+`Recent`, `Unread`, and `Archived` scopes, stays newest-first regardless of read
+state, auto-marks a record read when opened, and can select its linked session.
+Unread is presentation state, not an action queue.
 
 The daemon remains the source of truth for notification lifecycle. The GUI
 raises desktop notifications only for newly created `action_required` or
-`error` records. Acknowledged `action_required` and `error` notifications remain
-actionable until archived; acknowledgement alone does not remove their linked
-session from the Needs action group.
+`error` records. Resolving a durable attention record removes that record from
+current attention, but a session still detected as blocked remains in Needs you.
+The daemon automatically removes old quiet, resolved, and archived history
+according to policy while retaining unresolved actions and errors indefinitely.
 
 ## Troubleshooting
 

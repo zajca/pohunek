@@ -16,13 +16,7 @@ use crate::PohunekApp;
 use super::{caret, conn_dot, indent, list_button};
 
 pub(crate) fn inbox_entry_button(app: &PohunekApp) -> Element<'_, Message> {
-    let unread = app.workspace.unread_notification_count();
-    let label = if unread == 0 {
-        "Inbox".to_owned()
-    } else {
-        format!("Inbox {unread}")
-    };
-    let button = button(text(label).size(14))
+    let button = button(text("Activity").size(14))
         .width(Fill)
         .padding([8, 10])
         .on_press(Message::OpenInbox);
@@ -55,22 +49,13 @@ pub(crate) fn workspace_tree(app: &PohunekApp) -> Element<'_, Message> {
     for (host_id, host) in &app.workspace.hosts {
         let node = TreeNodeId::host(host_id.clone());
         let expanded = app.ui_state.expanded_nodes.contains(&node);
-        let unread = app.workspace.host_unread_notification_count(host_id);
-        let mut host_row = row![
+        let host_row = row![
             caret(expanded, node),
             conn_dot(host.conn.clone()),
             text(host_id.to_string()).size(15)
         ]
         .spacing(6)
         .align_y(Center);
-        if unread > 0 {
-            host_row = host_row.push(
-                button(text(format!("inbox {unread}")).size(12))
-                    .padding([2, 6])
-                    .on_press(Message::OpenHostInbox(host_id.clone()))
-                    .style(iced::widget::button::text),
-            );
-        }
         tree = tree.push(host_row);
         if let Some(error) = &host.last_error {
             tree = tree.push(indent(1, text(error).size(12)));

@@ -983,6 +983,18 @@ fn render_policy_human(host: &str, policy: &NotificationPolicy) -> String {
         "  attention_debounce_secs: {}",
         policy.attention_debounce_secs
     );
+    let retention = &policy.retention;
+    let _ = writeln!(
+        output,
+        "  retention: sweep={}s info={}s warning={}s resolved_attention={}s resolved_error={}s archived={}s compaction_min_actions={}",
+        retention.sweep_interval_secs,
+        retention.info_ttl_secs,
+        retention.warning_ttl_secs,
+        retention.resolved_attention_ttl_secs,
+        retention.resolved_error_ttl_secs,
+        retention.archived_ttl_secs,
+        retention.compaction_min_actions,
+    );
     render_kind_policy(&mut output, "default", &policy.enabled);
     for (provider, provider_policy) in &policy.providers {
         render_kind_policy(&mut output, provider, provider_policy);
@@ -1110,6 +1122,7 @@ mod tests {
                 ("claude".to_owned(), enabled.clone()),
                 ("codex".to_owned(), enabled),
             ]),
+            retention: protocol::NotificationRetentionPolicy::default(),
         }
     }
 
@@ -1257,6 +1270,7 @@ mod tests {
 
         assert_eq!(doc["ok"]["policy"]["attention_debounce_secs"], 5);
         assert_eq!(doc["ok"]["policy"]["attention_dedupe_window_secs"], 120);
+        assert_eq!(doc["ok"]["policy"]["retention"]["info_ttl_secs"], 259_200);
     }
 
     #[test]
@@ -1264,6 +1278,7 @@ mod tests {
         let output = render_policy_human("host-b", &policy());
 
         assert!(output.contains("attention_debounce_secs: 5"));
+        assert!(output.contains("retention: sweep=21600s info=259200s"));
     }
 
     #[test]

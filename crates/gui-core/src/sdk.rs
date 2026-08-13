@@ -679,7 +679,7 @@ async fn load_host_notifications(
                         tracing::Level::DEBUG,
                         host_id = %host_id,
                         error = %err,
-                        "notification seed unsupported; treating as empty inbox"
+                        "notification seed unsupported; treating activity as empty"
                     );
                     return (Vec::new(), None);
                 }
@@ -688,7 +688,7 @@ async fn load_host_notifications(
                     tracing::Level::WARN,
                     host_id = %host_id,
                     error = %err,
-                    "notification seed query failed; marking inbox degraded"
+                    "notification seed query failed; marking activity degraded"
                 );
                 first_error.get_or_insert_with(|| format!("notification.list failed: {err}"));
             }

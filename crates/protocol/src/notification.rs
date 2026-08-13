@@ -2,8 +2,9 @@
 //!
 //! Notifications are durable, per-host records surfaced by provider hooks and
 //! daemon-owned projectors. These types define only the additive wire contract:
-//! storage, defaults, dedupe evaluation, and retention behavior live in the
-//! daemon.
+//! storage, dedupe evaluation, and retention execution live in the daemon. The
+//! protocol owns serde backfills for additive policy fields so persisted policy
+//! documents remain loadable.
 
 use std::collections::BTreeMap;
 
@@ -415,6 +416,67 @@ const fn default_attention_debounce_secs() -> u32 {
     5
 }
 
+/// Six hours keeps maintenance infrequent while cleaning upgraded stores on
+/// the same day.
+const DEFAULT_RETENTION_SWEEP_INTERVAL_SECS: u32 = 21_600;
+
+/// High-volume informational activity is useful for three days.
+const DEFAULT_INFO_TTL_SECS: u32 = 259_200;
+
+/// Warnings retain two weeks of diagnostic context.
+const DEFAULT_WARNING_TTL_SECS: u32 = 1_209_600;
+
+/// Resolved owner-attention history remains available for one week.
+const DEFAULT_RESOLVED_ATTENTION_TTL_SECS: u32 = 604_800;
+
+/// Resolved errors retain one month of incident context.
+const DEFAULT_RESOLVED_ERROR_TTL_SECS: u32 = 2_592_000;
+
+/// Explicit archives retain three months of operator-selected history.
+const DEFAULT_ARCHIVED_TTL_SECS: u32 = 7_776_000;
+
+/// One thousand actions amortizes the cost of an atomic full-log rewrite.
+const DEFAULT_COMPACTION_MIN_ACTIONS: u32 = 1_000;
+
+/// Automatic retention and compaction settings for durable notifications.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "NotificationRetentionPolicy.ts")
+)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationRetentionPolicy {
+    /// Interval between daemon-owned retention sweeps.
+    pub sweep_interval_secs: u32,
+    /// Age after which informational and success records are removed.
+    pub info_ttl_secs: u32,
+    /// Age after which non-actionable warning records are removed.
+    pub warning_ttl_secs: u32,
+    /// Age after which acknowledged attention records are removed.
+    pub resolved_attention_ttl_secs: u32,
+    /// Age after which acknowledged error records are removed.
+    pub resolved_error_ttl_secs: u32,
+    /// Age after which archived records are removed.
+    pub archived_ttl_secs: u32,
+    /// Minimum action-log entries before a retention sweep may compact it.
+    pub compaction_min_actions: u32,
+}
+
+impl Default for NotificationRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            sweep_interval_secs: DEFAULT_RETENTION_SWEEP_INTERVAL_SECS,
+            info_ttl_secs: DEFAULT_INFO_TTL_SECS,
+            warning_ttl_secs: DEFAULT_WARNING_TTL_SECS,
+            resolved_attention_ttl_secs: DEFAULT_RESOLVED_ATTENTION_TTL_SECS,
+            resolved_error_ttl_secs: DEFAULT_RESOLVED_ERROR_TTL_SECS,
+            archived_ttl_secs: DEFAULT_ARCHIVED_TTL_SECS,
+            compaction_min_actions: DEFAULT_COMPACTION_MIN_ACTIONS,
+        }
+    }
+}
+
 /// Durable notification policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -440,6 +502,13 @@ pub struct NotificationPolicy {
     /// notification schema change.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, NotificationKindPolicy>,
+    /// Automatic daemon-owned retention and physical compaction policy.
+    ///
+    /// Additive: persisted policies written before automatic retention receive
+    /// the documented defaults. Unresolved action-required and error records
+    /// are retained regardless of these age limits.
+    #[serde(default)]
+    pub retention: NotificationRetentionPolicy,
 }
 
 impl NotificationPolicy {

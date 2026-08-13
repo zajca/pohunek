@@ -1502,6 +1502,15 @@ function defaultNotificationPolicy(): NotificationPolicy {
       claude: enabledNotificationKinds(),
       hermes: enabledNotificationKinds(),
     },
+    retention: {
+      sweep_interval_secs: 21_600,
+      info_ttl_secs: 259_200,
+      warning_ttl_secs: 1_209_600,
+      resolved_attention_ttl_secs: 604_800,
+      resolved_error_ttl_secs: 2_592_000,
+      archived_ttl_secs: 7_776_000,
+      compaction_min_actions: 1_000,
+    },
   };
 }
 
@@ -1527,10 +1536,12 @@ function isNotificationPolicy(value: unknown): value is NotificationPolicy {
       "attention_debounce_secs",
       "enabled",
       "providers",
+      "retention",
     ].includes(key))
     || !isNonNegativeInteger(value["attention_dedupe_window_secs"])
     || !isNonNegativeInteger(value["attention_debounce_secs"])
     || !isNotificationKindPolicy(value["enabled"])
+    || !isNotificationRetentionPolicy(value["retention"])
   ) {
     return false;
   }
@@ -1541,6 +1552,25 @@ function isNotificationPolicy(value: unknown): value is NotificationPolicy {
       provider.length > 0 && isNotificationKindPolicy(policy)
     ))
   );
+}
+
+function isNotificationRetentionPolicy(
+  value: unknown,
+): value is NotificationPolicy["retention"] {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const keys = [
+    "sweep_interval_secs",
+    "info_ttl_secs",
+    "warning_ttl_secs",
+    "resolved_attention_ttl_secs",
+    "resolved_error_ttl_secs",
+    "archived_ttl_secs",
+    "compaction_min_actions",
+  ];
+  return Object.keys(value).length === keys.length
+    && keys.every((key) => isPositiveInteger(value[key]));
 }
 
 function isNotificationKindPolicy(value: unknown): value is NotificationPolicy["enabled"] {

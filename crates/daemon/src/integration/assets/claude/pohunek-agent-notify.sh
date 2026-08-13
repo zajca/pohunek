@@ -75,13 +75,6 @@ NOTIFICATION_MATCHERS = {
         "body": "Claude is waiting for approval.",
         "attention": True,
     },
-    "idle_prompt": {
-        "kind": "agent_blocked",
-        "severity": "warning",
-        "title": "Claude needs input",
-        "body": "Claude is waiting for input.",
-        "attention": True,
-    },
     "auth_success": {
         "kind": "system",
         "severity": "success",

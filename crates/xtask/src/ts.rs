@@ -601,6 +601,7 @@ fn notification_policy() -> NotificationPolicy {
         attention_debounce_secs: 5,
         enabled,
         providers,
+        retention: protocol::NotificationRetentionPolicy::default(),
     }
 }
 

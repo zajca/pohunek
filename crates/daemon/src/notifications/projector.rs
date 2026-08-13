@@ -267,14 +267,14 @@ impl ProjectorState {
             event::SESSION_UPDATED => {
                 if let Some(payload) = parse_projector_payload::<SessionPayload>(event) {
                     return self
-                        .pending_session_updated(notifications, &payload.session)
+                        .pending_session_updated(notifications, attention, &payload.session)
                         .into_iter()
                         .collect();
                 }
             }
             event::SESSION_STOPPED => {
                 if let Some(payload) = parse_projector_payload::<SessionPayload>(event) {
-                    self.handle_explicit_stop(&payload.session);
+                    self.handle_explicit_stop(attention, &payload.session);
                 }
             }
             _ => {}
@@ -295,9 +295,9 @@ impl ProjectorState {
             self.activity_by_session.remove(&session.id);
         }
         if session.state == SessionState::Stopped {
-            self.handle_explicit_stop(session);
+            self.handle_explicit_stop(attention, session);
         } else {
-            pending.extend(self.pending_session_updated(notifications, session));
+            pending.extend(self.pending_session_updated(notifications, attention, session));
         }
         pending
     }
@@ -312,14 +312,12 @@ impl ProjectorState {
         let previous = self
             .activity_by_session
             .insert(session_id.clone(), activity);
-        // A session that resumes active work no longer needs owner attention or
-        // an unread turn-completed row, so resolve both session dedupe keys
-        // through the coordinator (cancelling still-pending debounced records and
-        // acknowledging already-visible ones). Only the transition edge into
-        // `Working` triggers the resolve so repeated working events do not rescan
-        // the store.
-        // Do not gate on the previous state being `Blocked`: provider hooks create
-        // attention notifications without the daemon observing a blocked edge.
+        // Active work proves that a prior waiting condition has ended. Idle does
+        // not: an approval prompt may be technically idle while still requiring
+        // owner input. Resolve only on the transition edge into `Working`; the
+        // terminal lifecycle paths below resolve stale attention separately.
+        // Do not gate on a previous blocked observation because provider hooks
+        // can create attention without the detector seeing that edge first.
         if activity == AgentActivity::Working && previous != Some(AgentActivity::Working) {
             resolve_session_notifications(attention, session_id);
         }
@@ -346,6 +344,7 @@ impl ProjectorState {
     fn pending_session_updated(
         &mut self,
         notifications: &NotificationService,
+        attention: &AttentionCoordinator,
         session: &SessionInfo,
     ) -> Option<PendingNotification> {
         let previous = self
@@ -353,15 +352,17 @@ impl ProjectorState {
             .insert(session.id.clone(), session.state);
         match session.state {
             SessionState::Failed if previous != Some(SessionState::Failed) => {
+                resolve_session_notifications(attention, &session.id);
                 self.activity_by_session.remove(&session.id);
                 self.pending_failed_notification(notifications, session)
             }
             SessionState::Done if previous != Some(SessionState::Done) => {
+                resolve_session_notifications(attention, &session.id);
                 self.activity_by_session.remove(&session.id);
                 self.pending_finished_notification(notifications, session)
             }
             SessionState::Stopped => {
-                self.handle_explicit_stop(session);
+                self.handle_explicit_stop(attention, session);
                 None
             }
             SessionState::Starting
@@ -371,7 +372,8 @@ impl ProjectorState {
         }
     }
 
-    fn handle_explicit_stop(&mut self, session: &SessionInfo) {
+    fn handle_explicit_stop(&mut self, attention: &AttentionCoordinator, session: &SessionInfo) {
+        resolve_session_notifications(attention, &session.id);
         self.lifecycle_by_session
             .insert(session.id.clone(), SessionState::Stopped);
         self.activity_by_session.remove(&session.id);
@@ -916,6 +918,27 @@ mod tests {
         let resolved = list(&service);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].status, NotificationStatus::Acknowledged);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_keeps_provider_approval_notification_active() {
+        let service = service("keep-hook-idle");
+        let (attention, _task) = AttentionCoordinator::spawn(service.clone());
+        let mut projector = ProjectorState::default();
+
+        service
+            .create(provider_approval_params("s-1"))
+            .expect("create provider approval notification");
+        projector.handle_event(
+            &service,
+            &attention,
+            &agent_state_event("s-1", AgentActivity::Idle),
+        );
+        settle().await;
+
+        let active = list(&service);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].status, NotificationStatus::Unread);
     }
 
     #[tokio::test(start_paused = true)]

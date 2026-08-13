@@ -496,6 +496,9 @@ Runtime state under the user data directory:
 ```text
 ~/.local/share/pohunek/
   metadata.jsonl           # logical sessions, worktrees, and projects (0600)
+  notifications/
+    notifications.jsonl    # durable notification action log (0600)
+    policy.json             # notification, retention, and compaction policy (0600)
   events/                  # local append-only event log (audit/debug, not replicated)
   worktrees/               # managed git worktrees
 ```
@@ -542,6 +545,15 @@ live (see "High-Level Architecture"). An embedded SQLite `state.db`
 (schema-versioned, with forward migrations) is a **deferred** option, to be
 adopted only if scale or query needs justify it; the schema is sketched in
 `docs/plan-phase-1.md` ("Deferred: SQLite Schema").
+
+The notification store is a separate owner-private append-only JSONL action
+log. A daemon-owned maintenance task applies policy TTLs to quiet, resolved, and
+archived records; unread/read action-required and error records are never
+age-pruned. Once the configured action threshold is reached, maintenance writes
+one current action per non-deleted record to a fully flushed temporary file,
+opens it for future appends, atomically renames it over the old log, and syncs
+the parent directory. A crash therefore leaves either the old replayable log or
+the complete compacted log, never a partially replaced store.
 
 Secrets are never written to the metadata stores, the event log, or session
 metadata. They

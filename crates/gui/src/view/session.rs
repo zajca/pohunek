@@ -3,13 +3,16 @@
 use iced::widget::{button, column, row, scrollable, text, text_input};
 use iced::{Center, Element, Fill};
 use pohunek_gui_core::{session_metadata_rows, HostId, RuntimeContinuity, SessionAccess};
-use protocol::{CwdSource, SessionInfo};
+use protocol::{AgentActivity, CwdSource, NotificationStatus, SessionInfo};
 
 use crate::message::Message;
 use crate::selection::selected_session;
 use crate::PohunekApp;
 
-use super::{card, dialog_card, section_title, selectable_text, session_agent_label};
+use super::{
+    card, dialog_card, muted_style, section_title, selectable_text, session_agent_label,
+    status_pill, PillTone,
+};
 
 /// Session-detail dialog opened from the prioritized list.
 pub(crate) fn session_modal_content(app: &PohunekApp) -> Element<'_, Message> {
@@ -59,9 +62,7 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
     match selected_session(app) {
         Some((host_id, session)) => {
             let external = is_external_session(session);
-            let activity = session
-                .activity
-                .map_or("unknown", |activity| activity.as_str());
+            let activity = session.activity.map_or("unknown", session_activity_label);
             // Lead with the display name when set, keeping host/id as a subtitle
             // so the session stays identifiable.
             let heading = match &session.name {
@@ -74,6 +75,7 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
                 .push(selectable_text(origin_label(session)).size(14))
                 .push(selectable_text(format!("state: {}", session.state.as_str())).size(14))
                 .push(selectable_text(format!("activity: {activity}")).size(14));
+            detail = detail.push(session_attention_view(app, host_id, session));
             detail = session_runtime_details(detail, app, host_id, session);
             if let Some(project) = session
                 .project_label
@@ -105,6 +107,7 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
             if let Some(observation) = session_observation_view(app, host_id, session) {
                 detail = detail.push(observation);
             }
+            detail = detail.push(session_activity_view(app, host_id, session));
             if !external {
                 detail = detail.push(rename_view(app));
                 detail = detail.push(metadata_view(app, session));
@@ -115,6 +118,86 @@ fn session_detail(app: &PohunekApp) -> Element<'_, Message> {
         }
     }
     card(detail)
+}
+
+fn session_attention_view(
+    app: &PohunekApp,
+    host_id: &HostId,
+    session: &SessionInfo,
+) -> Element<'static, Message> {
+    let attention = app
+        .workspace
+        .session_rows()
+        .into_iter()
+        .find(|row| row.host_id == *host_id && row.session_id == session.id)
+        .and_then(|row| row.attention);
+    let content = if let Some(attention) = attention {
+        column![
+            row![
+                text("Current attention").size(14),
+                status_pill("Needs you", PillTone::Danger),
+            ]
+            .spacing(6)
+            .align_y(Center),
+            text(attention.title).size(13),
+        ]
+        .spacing(4)
+    } else {
+        column![
+            text("Current attention").size(14),
+            text("Nothing is waiting for you.")
+                .size(12)
+                .style(muted_style),
+        ]
+        .spacing(4)
+    };
+    card(content)
+}
+
+fn session_activity_view(
+    app: &PohunekApp,
+    host_id: &HostId,
+    session: &SessionInfo,
+) -> Element<'static, Message> {
+    let records = app.workspace.session_activity(host_id, &session.id);
+    let mut activity = column![row![
+        text("Recent activity").size(14),
+        iced::widget::space().width(Fill),
+        button("Open Activity")
+            .on_press(Message::OpenHostInbox(host_id.clone()))
+            .style(iced::widget::button::text),
+    ]
+    .align_y(Center),]
+    .spacing(4);
+    if records.is_empty() {
+        activity = activity.push(text("No recorded activity.").size(12).style(muted_style));
+    } else {
+        for record in records.into_iter().take(5) {
+            let read_state = match record.status {
+                NotificationStatus::Unread => "unread",
+                NotificationStatus::Read => "read",
+                NotificationStatus::Acknowledged => "resolved",
+                NotificationStatus::Archived => "archived",
+                NotificationStatus::Deleted => "deleted",
+            };
+            activity = activity.push(
+                text(format!(
+                    "{}  ·  {}  ·  {}",
+                    record.title, read_state, record.created_at
+                ))
+                .size(12),
+            );
+        }
+    }
+    card(activity)
+}
+
+fn session_activity_label(activity: AgentActivity) -> &'static str {
+    match activity {
+        AgentActivity::Idle => "ready",
+        AgentActivity::Working => "working",
+        AgentActivity::Blocked => "waiting for input",
+    }
 }
 
 fn session_runtime_details<'a>(

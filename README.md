@@ -99,7 +99,7 @@ where they are doing it, and when they need you.
 - `pohunek session diff` renders a unified diff of a session's worktree
   against its base — including untracked files — over the wire.
 
-**Durable notifications inbox**
+**Durable notification activity**
 
 - Agent events (approval required, agent blocked, turn completed, session
   finished, errors) become **durable notification records** with lifecycle
@@ -107,20 +107,24 @@ where they are doing it, and when they need you.
 - Fed by installed Codex/Claude hooks *and* daemon-side state projection, with
   source-priority dedupe, a debounce window that drops notifications the agent
   resolves itself, and resolve-on-resume so stale "blocked" entries disappear
-  when the agent starts working again.
+  when the agent returns to working or its normal ready prompt.
 - `pohunek notifications list|watch --all-hosts` fans out across every
-  reachable host client-side; per-kind and per-provider policy plus retention
-  pruning are daemon-enforced.
+  reachable host client-side. Per-kind/provider policy, automatic age retention,
+  and physical JSONL compaction are daemon-enforced; unresolved actions and
+  errors never expire automatically.
 
 **Native desktop GUI (optional reference client)**
 
 - `pohunek-gui` (Iced, Wayland) is a session-first control plane. Its main pane
-  groups cross-host sessions as Needs action, Idle, Running, and Unavailable;
-  the left rail keeps only Assistant, Inbox, hosts, and project context.
+  groups cross-host sessions as Needs you, Running, Ready, and Unavailable;
+  unread history never promotes a ready session. The left rail keeps only
+  Assistant, Activity, hosts, and project context.
 - Clicking a session opens its detail in a modal over the list. Eligible rows
   expose direct Open/Resume, Terminate, and confirmed Delete actions.
-- The **Inbox** modal is a cross-host triage view over durable notifications and
-  raises OS notifications only for action-required and error records.
+- The **Activity** modal is a quiet, chronological cross-host history with
+  Recent, Unread, and Archived views. Current approvals and blocked state are
+  shown directly on session rows and in session detail; failed sessions carry a
+  review signal without conflating unread history with live attention.
 - It deliberately embeds **no terminal** — opening a session spawns your own
   terminal via a configurable `attach_command`. The native GUI has no
   Linear/GitHub browser, review, worktree-management, or Agents-monitor panel.
@@ -480,7 +484,7 @@ notification_command = "notify-send"
 ```
 
 Highlights: prioritized session groups, modal session detail, quick lifecycle
-actions, `n` for Start session, `a` for Assistant, `i` for Inbox, `o` to open
+actions, `n` for Start session, `a` for Assistant, `i` for Activity, `o` to open
 the selected session, and `shift+?` for the full keymap. Supported bindings are
 remappable through `[keybindings]`. Wayland-only on Linux v1.
 
