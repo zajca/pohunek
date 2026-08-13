@@ -13,15 +13,15 @@ use protocol::{
     NotificationDeleteResult, NotificationDeletedEvent, NotificationId, NotificationKind,
     NotificationKindPolicy, NotificationListParams, NotificationListResult, NotificationPolicy,
     NotificationPolicyParams, NotificationPolicyResult, NotificationRecord,
-    NotificationRetentionParams, NotificationRetentionResult, NotificationSeverity,
-    NotificationSource, NotificationStatus, NotificationUpdateParams, NotificationUpdateResult,
-    NotificationUpdatedEvent, ObservationParamsError, OutputOffset, ProcessStartIdentity,
-    ProjectSource, ProtocolError, ProtocolVersion, ProtocolVersionRange, ProviderKind,
-    ReportSequence, Request, Response, RuntimeGeneration, SessionAttachParams, SessionAttachResult,
-    SessionCapabilities, SessionDetachParams, SessionDetachResult, SessionForkParams,
-    SessionForkResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionListFilter, SessionListParams, SessionNewParams, SessionOutputGap, SessionOutputParams,
-    SessionOutputResult, SessionReleaseAgentParams, SessionReleaseAgentResult,
+    NotificationRetentionParams, NotificationRetentionPolicy, NotificationRetentionResult,
+    NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
+    NotificationUpdateResult, NotificationUpdatedEvent, ObservationParamsError, OutputOffset,
+    ProcessStartIdentity, ProjectSource, ProtocolError, ProtocolVersion, ProtocolVersionRange,
+    ProviderKind, ReportSequence, Request, Response, RuntimeGeneration, SessionAttachParams,
+    SessionAttachResult, SessionCapabilities, SessionDetachParams, SessionDetachResult,
+    SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams, SessionOutputGap,
+    SessionOutputParams, SessionOutputResult, SessionReleaseAgentParams, SessionReleaseAgentResult,
     SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
     SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionRuntimeIdentity,
     SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
@@ -194,6 +194,7 @@ fn notification_policy() -> NotificationPolicy {
                 },
             ),
         ]),
+        retention: protocol::NotificationRetentionPolicy::default(),
     }
 }
 
@@ -634,6 +635,15 @@ fn notification_policy_params_json_shape_roundtrips() {
                         "error": true,
                         "system": false
                     }
+                },
+                "retention": {
+                    "sweep_interval_secs": 21600,
+                    "info_ttl_secs": 259_200,
+                    "warning_ttl_secs": 1_209_600,
+                    "resolved_attention_ttl_secs": 604_800,
+                    "resolved_error_ttl_secs": 2_592_000,
+                    "archived_ttl_secs": 7_776_000,
+                    "compaction_min_actions": 1000
                 }
             }
         })
@@ -687,6 +697,18 @@ fn notification_policy_defaults_attention_debounce_secs_when_field_absent() {
     // 5 is the documented default backfilled by `default_attention_debounce_secs`.
     assert_eq!(policy.attention_debounce_secs, 5);
     assert_eq!(policy.attention_dedupe_window_secs, 120);
+    assert_eq!(policy.retention, NotificationRetentionPolicy::default());
+}
+
+#[test]
+fn notification_retention_policy_roundtrips_and_rejects_unknown_fields() {
+    let retention = NotificationRetentionPolicy::default();
+
+    assert_eq!(line_roundtrip(&retention), retention);
+    let mut value = serde_json::to_value(retention).expect("serialize retention policy");
+    value["future_ttl_secs"] = json!(60);
+    serde_json::from_value::<NotificationRetentionPolicy>(value)
+        .expect_err("unknown retention policy field must fail");
 }
 
 #[test]

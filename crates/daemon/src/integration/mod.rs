@@ -83,7 +83,6 @@ const STOP_FAILURE_ACTION: &str = "stop_failure";
 const CLAUDE_NOTIFICATION_MATCHERS: &[&str] = &[
     "permission_prompt",
     "elicitation_dialog",
-    "idle_prompt",
     "auth_success",
     "elicitation_complete",
     "elicitation_response",
@@ -2113,13 +2112,12 @@ mod tests {
                 .iter()
                 .filter(|command| command.contains("pohunek-agent-notify.sh"))
                 .count(),
-            6,
+            5,
             "reinstall must keep one notification hook per matcher"
         );
         for matcher in [
             "permission_prompt",
             "elicitation_dialog",
-            "idle_prompt",
             "auth_success",
             "elicitation_complete",
             "elicitation_response",
@@ -2242,12 +2240,6 @@ mod tests {
                 "action_required",
                 Some("attention:session-123"),
             ),
-            (
-                "idle_prompt",
-                "agent_blocked",
-                "warning",
-                Some("attention:session-123"),
-            ),
             ("auth_success", "system", "success", None),
             ("elicitation_complete", "system", "info", None),
             ("elicitation_response", "system", "info", None),
@@ -2267,6 +2259,21 @@ mod tests {
                 dedupe_key,
             );
         }
+    }
+
+    #[test]
+    fn claude_idle_prompt_does_not_create_an_attention_notification() {
+        let (status, stdout, stderr, requests) = run_notification_asset(
+            "claude",
+            &["notification", "idle_prompt"],
+            &json!({"hook_event_id": "evt-idle"}),
+            true,
+        );
+
+        assert!(status.success(), "hook exited with {status}: {stderr}");
+        assert!(stdout.is_empty(), "hook must not print stdout");
+        assert!(stderr.is_empty(), "hook must not print stderr");
+        assert!(requests.is_empty(), "idle prompt must remain quiet");
     }
 
     #[test]

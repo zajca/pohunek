@@ -370,19 +370,14 @@ pub struct NotificationRow {
     pub record: NotificationRecord,
 }
 
-/// Coarse inbox modal scope, replacing the five per-axis filter-chip rows.
-///
-/// Unlike [`NotificationFilter`] (an AND of independent axes), `NeedsAction`
-/// is an OR over status and severity, so it is modeled as its own selector
-/// rather than as another `NotificationFilter` field.
+/// Coarse activity-feed scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NotificationScope {
-    /// Unread notifications, plus read ones severe enough to still demand
-    /// attention (`ActionRequired`/`Error`). The inbox modal's default view.
+    /// Recent non-archived activity, regardless of read state.
     #[default]
-    NeedsAction,
-    /// Every non-deleted notification, regardless of lifecycle status.
-    All,
+    Recent,
+    /// Only activity the operator has not opened yet.
+    Unread,
     /// Only archived notifications.
     Archived,
 }
@@ -392,37 +387,13 @@ impl NotificationScope {
     #[must_use]
     pub fn matches(self, record: &NotificationRecord) -> bool {
         match self {
-            Self::NeedsAction => notification_needs_action(record),
-            Self::All => true,
+            Self::Recent => !matches!(
+                record.status,
+                NotificationStatus::Archived | NotificationStatus::Deleted
+            ),
+            Self::Unread => record.status == NotificationStatus::Unread,
             Self::Archived => record.status == NotificationStatus::Archived,
         }
-    }
-}
-
-/// Whether `record` belongs in the inbox modal's default "Needs action" scope.
-///
-/// True for anything still unread, or anything severe enough
-/// (`ActionRequired`/`Error`) to keep demanding attention even once read.
-/// Archiving a record always drops it out of scope, since the operator has
-/// already dealt with it.
-#[must_use]
-fn notification_needs_action(record: &NotificationRecord) -> bool {
-    record.status != NotificationStatus::Archived
-        && (record.status == NotificationStatus::Unread || notification_raises_intent(record))
-}
-
-/// Sort tier for the inbox modal: unresolved agent/approval prompts pinned to
-/// the top, then unread, then read; recency breaks ties within a tier.
-fn inbox_row_tier(record: &NotificationRecord) -> u8 {
-    if matches!(
-        record.kind,
-        NotificationKind::AgentBlocked | NotificationKind::ApprovalRequired
-    ) {
-        0
-    } else if record.status == NotificationStatus::Unread {
-        1
-    } else {
-        2
     }
 }
 
@@ -1990,29 +1961,21 @@ impl Workspace {
         rows
     }
 
-    /// Notification rows for the inbox modal: `scope` narrows by
-    /// lifecycle/severity, `filter` narrows by host as with
-    /// [`Workspace::notifications`], and rows are sorted for triage —
-    /// unresolved agent/approval prompts first, then unread by recency, then
-    /// read.
+    /// Notification rows for the activity modal.
+    ///
+    /// `scope` narrows by lifecycle, `filter` narrows by host as with
+    /// [`Workspace::notifications`], and the stable newest-first ordering is
+    /// preserved. Read state never moves a row under the operator's cursor.
     #[must_use]
     pub fn inbox_rows(
         &self,
         scope: NotificationScope,
         filter: &NotificationFilter,
     ) -> Vec<NotificationRow> {
-        let mut rows: Vec<NotificationRow> = self
-            .notifications(filter)
+        self.notifications(filter)
             .into_iter()
             .filter(|row| scope.matches(&row.record))
-            .collect();
-        rows.sort_by(|left, right| {
-            inbox_row_tier(&left.record)
-                .cmp(&inbox_row_tier(&right.record))
-                .then_with(|| right.record.created_at.cmp(&left.record.created_at))
-                .then_with(|| left.record.id.0.cmp(&right.record.id.0))
-        });
-        rows
+            .collect()
     }
 
     /// Look up one notification record by host and id.
@@ -2025,6 +1988,34 @@ impl Workspace {
         self.hosts.get(host_id)?.notifications.get(&id.0)
     }
 
+    /// Return one session's durable activity, newest first.
+    #[must_use]
+    pub fn session_activity(
+        &self,
+        host_id: &HostId,
+        session_id: &SessionId,
+    ) -> Vec<NotificationRecord> {
+        let Some(host) = self.hosts.get(host_id) else {
+            return Vec::new();
+        };
+        let mut records: Vec<NotificationRecord> = host
+            .notifications
+            .values()
+            .filter(|record| {
+                record.session_id.as_ref() == Some(session_id)
+                    && record.status != NotificationStatus::Deleted
+            })
+            .cloned()
+            .collect();
+        records.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| left.id.0.cmp(&right.id.0))
+        });
+        records
+    }
+
     /// Build the prioritized native-GUI session list.
     ///
     /// Rows are grouped by operator urgency and sorted by stable host/session
@@ -2035,12 +2026,7 @@ impl Workspace {
         let mut rows = Vec::new();
         for (host_id, host) in &self.hosts {
             for session in host.sessions.values() {
-                let needs_action = session.activity == Some(AgentActivity::Blocked)
-                    || host.notifications.values().any(|record| {
-                        record.session_id.as_ref() == Some(&session.id)
-                            && record.status != NotificationStatus::Deleted
-                            && notification_needs_action(record)
-                    });
+                let attention = active_session_attention(host, session);
                 let access = session_access(session);
                 rows.push(SessionRow {
                     host_id: host_id.clone(),
@@ -2052,7 +2038,8 @@ impl Workspace {
                     activity: session.activity,
                     state: session.state,
                     branch: session.branch.clone(),
-                    group: session_group(session, access, needs_action),
+                    group: session_group(session, access, attention.is_some()),
+                    attention,
                     access,
                     can_stop: session_can_stop(session),
                     can_remove: session_can_remove(session),
@@ -2418,9 +2405,9 @@ fn session_can_remove(session: &SessionInfo) -> bool {
             .is_some_and(|runtime| runtime.state == RuntimeState::Lost)
 }
 
-fn session_group(session: &SessionInfo, access: SessionAccess, needs_action: bool) -> SessionGroup {
-    if needs_action {
-        return SessionGroup::NeedsAction;
+fn session_group(session: &SessionInfo, access: SessionAccess, needs_you: bool) -> SessionGroup {
+    if needs_you {
+        return SessionGroup::NeedsYou;
     }
     if session.state == SessionState::Starting
         || session.activity == Some(AgentActivity::Working)
@@ -2431,7 +2418,7 @@ fn session_group(session: &SessionInfo, access: SessionAccess, needs_action: boo
     if access == SessionAccess::Attach
         && matches!(session.activity, None | Some(AgentActivity::Idle))
     {
-        return SessionGroup::Idle;
+        return SessionGroup::Ready;
     }
     SessionGroup::Unavailable
 }
@@ -2439,10 +2426,10 @@ fn session_group(session: &SessionInfo, access: SessionAccess, needs_action: boo
 /// Session-list group in display priority order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SessionGroup {
-    /// A session waiting for operator input or carrying an actionable notification.
-    NeedsAction,
+    /// A session currently waiting for operator input, approval, or failure review.
+    NeedsYou,
     /// An attachable live session that is not currently working.
-    Idle,
+    Ready,
     /// A session that is working, starting, or reconnecting.
     Running,
     /// A terminal, external, conflicting, incompatible, or otherwise unusable session.
@@ -2476,11 +2463,70 @@ pub struct SessionRow {
     pub state: SessionState,
     pub branch: Option<String>,
     pub group: SessionGroup,
+    /// Current live owner-attention signal, distinct from unread history.
+    pub attention: Option<SessionAttention>,
     pub access: SessionAccess,
     /// Whether a direct stop request is safe for this runtime state.
     pub can_stop: bool,
     /// Whether removal can safely stop or discard the current logical session.
     pub can_remove: bool,
+}
+
+/// Current owner-attention signal displayed directly on a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAttention {
+    /// Attention category used for the compact session-row label.
+    pub kind: NotificationKind,
+    /// Most relevant current notification title or detector fallback.
+    pub title: String,
+}
+
+fn active_session_attention(host: &HostView, session: &SessionInfo) -> Option<SessionAttention> {
+    let blocked = session.activity == Some(AgentActivity::Blocked);
+    let failed = session.state == SessionState::Failed;
+    let record = host
+        .notifications
+        .values()
+        .filter(|record| {
+            record.session_id.as_ref() == Some(&session.id)
+                && matches!(
+                    record.status,
+                    NotificationStatus::Unread | NotificationStatus::Read
+                )
+                && (record.kind == NotificationKind::ApprovalRequired
+                    || blocked && record.kind == NotificationKind::AgentBlocked
+                    || failed
+                        && (record.kind == NotificationKind::Error
+                            || record.severity == NotificationSeverity::Error))
+        })
+        .max_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| right.id.0.cmp(&left.id.0))
+        });
+    record.map_or_else(
+        || {
+            if blocked {
+                Some(SessionAttention {
+                    kind: NotificationKind::AgentBlocked,
+                    title: "Waiting for input".to_owned(),
+                })
+            } else if failed {
+                Some(SessionAttention {
+                    kind: NotificationKind::Error,
+                    title: "Session failed".to_owned(),
+                })
+            } else {
+                None
+            }
+        },
+        |record| {
+            Some(SessionAttention {
+                kind: record.kind,
+                title: record.title.clone(),
+            })
+        },
+    )
 }
 
 fn apply_host_event(
@@ -2805,20 +2851,28 @@ mod tests {
         let rows = workspace.session_rows();
         let ids: Vec<&str> = rows.iter().map(|row| row.session_id.0.as_str()).collect();
         assert_eq!(ids, ["s-1", "s-3", "s-2"]);
-        assert_eq!(rows[0].group, SessionGroup::NeedsAction);
-        assert_eq!(rows[1].group, SessionGroup::Idle);
+        assert_eq!(rows[0].group, SessionGroup::NeedsYou);
+        assert_eq!(rows[1].group, SessionGroup::Ready);
         assert_eq!(rows[2].group, SessionGroup::Running);
         assert_eq!(rows[2].name.as_deref(), Some("triage build"));
     }
 
     #[test]
-    fn actionable_notification_promotes_linked_session() {
+    fn approval_notification_promotes_linked_session_without_promoting_unread_history() {
         let mut notification = notification_record(
             "n-1",
             NotificationStatus::Unread,
             NotificationSeverity::ActionRequired,
         );
+        notification.kind = NotificationKind::ApprovalRequired;
         notification.session_id = Some(SessionId("s-2".to_owned()));
+        let mut history = notification_record(
+            "n-2",
+            NotificationStatus::Unread,
+            NotificationSeverity::Info,
+        );
+        history.kind = NotificationKind::TurnCompleted;
+        history.session_id = Some(SessionId("s-1".to_owned()));
         let mut workspace = Workspace::default();
         workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot_with_notifications(
@@ -2827,14 +2881,38 @@ mod tests {
                     session("s-1", Some(AgentActivity::Idle)),
                     session("s-2", Some(AgentActivity::Idle)),
                 ],
-                vec![notification],
+                vec![notification, history],
             ),
         });
 
         let rows = workspace.session_rows();
         assert_eq!(rows[0].session_id.0, "s-2");
-        assert_eq!(rows[0].group, SessionGroup::NeedsAction);
-        assert_eq!(rows[1].group, SessionGroup::Idle);
+        assert_eq!(rows[0].group, SessionGroup::NeedsYou);
+        assert_eq!(
+            rows[0].attention.as_ref().map(|value| value.kind),
+            Some(NotificationKind::ApprovalRequired)
+        );
+        assert_eq!(rows[1].group, SessionGroup::Ready);
+        assert!(rows[1].attention.is_none());
+    }
+
+    #[test]
+    fn failed_session_has_current_review_attention_without_a_notification() {
+        let mut failed = session("failed", None);
+        failed.state = SessionState::Failed;
+        let mut workspace = Workspace::default();
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
+            snapshot: snapshot("local", vec![failed]),
+        });
+
+        let rows = workspace.session_rows();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].group, SessionGroup::NeedsYou);
+        assert_eq!(
+            rows[0].attention.as_ref().map(|attention| attention.kind),
+            Some(NotificationKind::Error)
+        );
     }
 
     #[test]
@@ -3142,6 +3220,7 @@ mod tests {
                     attention_debounce_secs: 5,
                     enabled: kind_policy.clone(),
                     providers: BTreeMap::from([("future-agent".to_owned(), kind_policy)]),
+                    retention: protocol::NotificationRetentionPolicy::default(),
                 },
             },
         });
@@ -4176,7 +4255,7 @@ mod tests {
     }
 
     #[test]
-    fn needs_action_scope_excludes_archived_and_untroubled_read_records() {
+    fn activity_scopes_separate_recent_unread_and_archived_records() {
         let mut workspace = Workspace::default();
         workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("local", vec![]),
@@ -4208,20 +4287,22 @@ mod tests {
             workspace.apply(notification_created("local", record));
         }
 
-        let rows = workspace.inbox_rows(
-            NotificationScope::NeedsAction,
-            &NotificationFilter::default(),
-        );
-        let ids: Vec<&str> = rows.iter().map(|row| row.record.id.0.as_str()).collect();
+        let recent =
+            workspace.inbox_rows(NotificationScope::Recent, &NotificationFilter::default());
+        let unread =
+            workspace.inbox_rows(NotificationScope::Unread, &NotificationFilter::default());
+        let archived =
+            workspace.inbox_rows(NotificationScope::Archived, &NotificationFilter::default());
 
-        assert!(ids.contains(&"n-unread"));
-        assert!(ids.contains(&"n-read-error"));
-        assert!(!ids.contains(&"n-archived-error"));
-        assert!(!ids.contains(&"n-read-info"));
+        assert_eq!(recent.len(), 3);
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].record.id.0, "n-unread");
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].record.id.0, "n-archived-error");
     }
 
     #[test]
-    fn inbox_rows_pin_action_kinds_above_unread_above_read() {
+    fn activity_rows_remain_newest_first_regardless_of_read_or_action_state() {
         let mut workspace = Workspace::default();
         workspace.apply(DomainEvent::HostSnapshotLoaded {
             snapshot: snapshot("local", vec![]),
@@ -4232,26 +4313,29 @@ mod tests {
             NotificationSeverity::Info,
         );
         blocked_but_read.kind = NotificationKind::AgentBlocked;
+        blocked_but_read.created_at = "2026-01-01T00:00:00Z".to_owned();
         let mut unread_system = notification_record(
             "n-unread",
             NotificationStatus::Unread,
             NotificationSeverity::Info,
         );
         unread_system.kind = NotificationKind::System;
+        unread_system.created_at = "2026-01-03T00:00:00Z".to_owned();
         let mut read_system = notification_record(
             "n-read",
             NotificationStatus::Read,
             NotificationSeverity::Info,
         );
         read_system.kind = NotificationKind::System;
+        read_system.created_at = "2026-01-02T00:00:00Z".to_owned();
         for record in [read_system, unread_system, blocked_but_read] {
             workspace.apply(notification_created("local", record));
         }
 
-        let rows = workspace.inbox_rows(NotificationScope::All, &NotificationFilter::default());
+        let rows = workspace.inbox_rows(NotificationScope::Recent, &NotificationFilter::default());
         let ids: Vec<&str> = rows.iter().map(|row| row.record.id.0.as_str()).collect();
 
-        assert_eq!(ids, vec!["n-blocked", "n-unread", "n-read"]);
+        assert_eq!(ids, vec!["n-unread", "n-read", "n-blocked"]);
     }
 
     #[test]
@@ -4284,7 +4368,7 @@ mod tests {
             host_id: Some(HostId::new("host-a")),
             ..NotificationFilter::default()
         };
-        let rows = workspace.inbox_rows(NotificationScope::All, &filter);
+        let rows = workspace.inbox_rows(NotificationScope::Recent, &filter);
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].record.id.0, "n-a");

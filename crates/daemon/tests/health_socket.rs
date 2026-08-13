@@ -728,6 +728,7 @@ fn all_enabled_notification_policy() -> NotificationPolicy {
             system: true,
         },
         providers: BTreeMap::new(),
+        retention: protocol::NotificationRetentionPolicy::default(),
     }
 }
 

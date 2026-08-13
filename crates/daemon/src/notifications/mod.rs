@@ -3,6 +3,7 @@
 mod coordinator;
 mod policy;
 mod projector;
+mod retention;
 mod store;
 
 use std::collections::BTreeMap;
@@ -32,6 +33,8 @@ pub use policy::{
 };
 #[doc(inline)]
 pub use projector::{attention_dedupe_key, turn_dedupe_key, NotificationProjector};
+#[doc(inline)]
+pub use retention::NotificationRetentionTask;
 #[doc(inline)]
 pub use store::NOTIFICATIONS_SUBDIR;
 
@@ -235,11 +238,28 @@ pub enum NotificationError {
         source: time::error::Parse,
     },
 
+    /// A daemon-owned notification timestamp could not be formatted.
+    #[error("notification timestamp formatting failed: {source}")]
+    TimestampFormat {
+        /// Formatting failure.
+        #[source]
+        source: time::error::Format,
+    },
+
     /// A pagination cursor was malformed.
     #[error("invalid notification cursor `{cursor}`")]
     InvalidCursor {
         /// Rejected cursor.
         cursor: String,
+    },
+
+    /// A notification policy contains an unusable retention value.
+    #[error("invalid notification policy field `{field}`: {reason}")]
+    InvalidPolicy {
+        /// Rejected policy field.
+        field: &'static str,
+        /// Stable explanation.
+        reason: &'static str,
     },
 }
 
@@ -251,7 +271,8 @@ impl NotificationError {
             Self::StoreIo { .. }
             | Self::Serialize { .. }
             | Self::StoreParse { .. }
-            | Self::PolicyParse { .. } => ProtocolError::new(
+            | Self::PolicyParse { .. }
+            | Self::TimestampFormat { .. } => ProtocolError::new(
                 ErrorClass::Runtime,
                 "notification_store_error",
                 self.to_string(),
@@ -310,6 +331,12 @@ impl NotificationError {
                 "invalid_notification_cursor",
                 self.to_string(),
                 None,
+            ),
+            Self::InvalidPolicy { .. } => ProtocolError::new(
+                ErrorClass::Runtime,
+                "invalid_notification_policy",
+                self.to_string(),
+                Some("set every retention duration and compaction threshold above zero".to_owned()),
             ),
         }
     }
@@ -376,6 +403,13 @@ struct NotificationServiceInner {
     next_id: AtomicU64,
 }
 
+/// Outcome of one daemon-owned notification maintenance sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AutoRetentionResult {
+    pub(crate) pruned: usize,
+    pub(crate) compacted: bool,
+}
+
 impl NotificationService {
     /// Open the durable notification service under `data_dir`.
     ///
@@ -401,6 +435,7 @@ impl NotificationService {
     ) -> Result<Self, NotificationError> {
         let store = NotificationStore::open(data_dir)?;
         let policy = store.load_policy(policy)?;
+        validate_policy(&policy)?;
         let (events, _) = broadcast::channel(NOTIFICATION_EVENT_CAPACITY);
         Ok(Self {
             inner: Arc::new(NotificationServiceInner {
@@ -554,6 +589,7 @@ impl NotificationService {
 
     /// Replace the notification policy.
     pub fn set_policy(&self, policy: NotificationPolicy) -> Result<(), NotificationError> {
+        validate_policy(&policy)?;
         let mut guard = self
             .inner
             .policy
@@ -585,10 +621,52 @@ impl NotificationService {
         for id in &ids {
             let _ = self.delete(NotificationDeleteParams { id: id.clone() })?;
         }
+        let _ = self
+            .inner
+            .store
+            .compact_if_needed(self.policy().retention.compaction_min_actions)?;
         Ok(NotificationRetentionResult {
             dry_run: false,
             pruned: ids,
         })
+    }
+
+    /// Run one automatic retention and compaction sweep at `now`.
+    ///
+    /// Active action-required and error records are retained. Each expired
+    /// record emits the normal deletion event before the append-only store is
+    /// compacted when its configured action threshold is reached.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotificationError`] when timestamp parsing, deletion, or
+    /// physical compaction fails.
+    pub(crate) fn run_auto_retention_at(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<AutoRetentionResult, NotificationError> {
+        let policy = self.policy();
+        let ids = policy::records_matching_auto_retention(
+            &self.inner.store.all(),
+            &policy.retention,
+            now,
+        )?;
+        let deleted_at = now
+            .format(&Rfc3339)
+            .map_err(|source| NotificationError::TimestampFormat { source })?;
+        let mut pruned = 0;
+        for id in &ids {
+            let Some(record) = self.inner.store.delete_transition(id, &deleted_at)? else {
+                continue;
+            };
+            self.emit_deleted(&record.id);
+            pruned += 1;
+        }
+        let compacted = self
+            .inner
+            .store
+            .compact_if_needed(policy.retention.compaction_min_actions)?;
+        Ok(AutoRetentionResult { pruned, compacted })
     }
 
     #[cfg(test)]
@@ -1056,6 +1134,38 @@ fn inside_attention_window(
     Ok(seconds <= window_secs)
 }
 
+fn validate_policy(policy: &NotificationPolicy) -> Result<(), NotificationError> {
+    let retention = &policy.retention;
+    let values = [
+        (
+            "retention.sweep_interval_secs",
+            retention.sweep_interval_secs,
+        ),
+        ("retention.info_ttl_secs", retention.info_ttl_secs),
+        ("retention.warning_ttl_secs", retention.warning_ttl_secs),
+        (
+            "retention.resolved_attention_ttl_secs",
+            retention.resolved_attention_ttl_secs,
+        ),
+        (
+            "retention.resolved_error_ttl_secs",
+            retention.resolved_error_ttl_secs,
+        ),
+        ("retention.archived_ttl_secs", retention.archived_ttl_secs),
+        (
+            "retention.compaction_min_actions",
+            retention.compaction_min_actions,
+        ),
+    ];
+    if let Some((field, _)) = values.into_iter().find(|(_, value)| *value == 0) {
+        return Err(NotificationError::InvalidPolicy {
+            field,
+            reason: "value must be greater than zero",
+        });
+    }
+    Ok(())
+}
+
 pub(crate) fn parse_timestamp(value: &str) -> Result<OffsetDateTime, NotificationError> {
     OffsetDateTime::parse(value, &Rfc3339).map_err(|source| NotificationError::InvalidTimestamp {
         value: value.to_owned(),
@@ -1084,6 +1194,7 @@ mod tests {
     };
 
     use super::{
+        parse_timestamp,
         policy::{default_policy, policy_enables_kind, DEFAULT_ATTENTION_DEDUPE_WINDOW_SECS},
         NotificationError, NotificationService,
     };
@@ -2135,12 +2246,90 @@ mod tests {
                 system: true,
             },
             providers: BTreeMap::new(),
+            retention: protocol::NotificationRetentionPolicy::default(),
         };
 
         service.set_policy(policy.clone()).expect("set policy");
 
         let reopened = NotificationService::open(&data_dir).expect("reopen service");
         assert_eq!(reopened.policy(), policy);
+    }
+
+    #[test]
+    fn automatic_retention_prunes_quiet_activity_but_keeps_unresolved_errors() {
+        let service =
+            NotificationService::open(&temp_data_dir("automatic-retention")).expect("open service");
+        let mut policy = service.policy();
+        policy.enabled = all_kinds_enabled_policy();
+        policy.providers.clear();
+        policy.retention.info_ttl_secs = 60;
+        policy.retention.compaction_min_actions = 1;
+        service.set_policy(policy).expect("set retention policy");
+
+        let info = service
+            .create_at(
+                params(
+                    "pohunek",
+                    "activity",
+                    "info-1",
+                    NotificationKind::System,
+                    NotificationSeverity::Info,
+                    Some("info-1"),
+                    None,
+                ),
+                "2026-01-01T00:00:00Z",
+            )
+            .expect("create info activity");
+        let error = service
+            .create_at(
+                params(
+                    "pohunek",
+                    "error",
+                    "error-1",
+                    NotificationKind::Error,
+                    NotificationSeverity::Error,
+                    Some("error-1"),
+                    None,
+                ),
+                "2026-01-01T00:00:00Z",
+            )
+            .expect("create error activity");
+
+        let result = service
+            .run_auto_retention_at(
+                parse_timestamp("2026-01-01T00:02:00Z").expect("valid sweep timestamp"),
+            )
+            .expect("run automatic retention");
+        let remaining = service
+            .list(NotificationListParams::default())
+            .expect("list remaining activity")
+            .notifications;
+
+        assert_eq!(result.pruned, 1);
+        assert!(result.compacted);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, error.record.id);
+        assert_ne!(remaining[0].id, info.record.id);
+    }
+
+    #[test]
+    fn policy_rejects_zero_retention_values() {
+        let service =
+            NotificationService::open(&temp_data_dir("invalid-retention")).expect("open service");
+        let mut policy = service.policy();
+        policy.retention.sweep_interval_secs = 0;
+
+        let error = service
+            .set_policy(policy)
+            .expect_err("reject zero interval");
+
+        assert!(matches!(
+            error,
+            NotificationError::InvalidPolicy {
+                field: "retention.sweep_interval_secs",
+                ..
+            }
+        ));
     }
 
     #[test]

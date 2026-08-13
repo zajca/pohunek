@@ -1488,6 +1488,7 @@ fn sample_policy() -> protocol::NotificationPolicy {
             system: false,
         },
         providers: BTreeMap::new(),
+        retention: protocol::NotificationRetentionPolicy::default(),
     }
 }
 

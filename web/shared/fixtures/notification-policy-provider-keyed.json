@@ -26,5 +26,14 @@
       "system": false,
       "turn_completed": true
     }
+  },
+  "retention": {
+    "archived_ttl_secs": 7776000,
+    "compaction_min_actions": 1000,
+    "info_ttl_secs": 259200,
+    "resolved_attention_ttl_secs": 604800,
+    "resolved_error_ttl_secs": 2592000,
+    "sweep_interval_secs": 21600,
+    "warning_ttl_secs": 1209600
   }
 }

@@ -1,4 +1,4 @@
-//! Inbox modal: notification list and message-detail layers, plus the
+//! Activity modal: notification history and message-detail layers, plus the
 //! age/date formatting they share.
 
 use std::collections::BTreeSet;
@@ -59,7 +59,7 @@ const INBOX_MODAL_HEIGHT_RATIO: f32 = 0.8;
 // with a real host id, which comes from config-defined host slugs.
 const INBOX_ALL_HOSTS_LABEL: &str = "All hosts";
 
-/// Routes the inbox modal to its current layer: the notification list, or one
+/// Routes the activity modal to its current layer: the notification list, or one
 /// message's detail (auto-marked read by `Message::SelectNotification`).
 pub(crate) fn inbox_modal_content(app: &PohunekApp) -> Element<'_, Message> {
     match &app.inbox_view {
@@ -71,12 +71,16 @@ pub(crate) fn inbox_modal_content(app: &PohunekApp) -> Element<'_, Message> {
     }
 }
 
-/// Layer 1: header with unread count, the scope/host controls, and the
-/// notification list. Rows are pre-sorted for triage by `Workspace::inbox_rows`.
+/// Layer 1: quiet history header, lifecycle controls, and recent activity.
 fn inbox_list_content(app: &PohunekApp) -> Element<'_, Message> {
-    let unread = app.workspace.unread_notification_count();
     let header = row![
-        text(format!("Inbox · {unread} unread")).size(20),
+        column![
+            text("Activity").size(20),
+            text("Session and integration history. Unread does not mean action is required.")
+                .size(12)
+                .style(muted_style),
+        ]
+        .spacing(2),
         iced::widget::space().width(Fill),
         button("Close")
             .on_press(Message::CloseModal)
@@ -105,8 +109,8 @@ fn inbox_list_content(app: &PohunekApp) -> Element<'_, Message> {
         column![
             header,
             inbox_controls(app),
-            notification_policy_card(app),
-            card(list)
+            card(list),
+            notification_policy_card(app)
         ]
         .spacing(12),
     )
@@ -114,13 +118,13 @@ fn inbox_list_content(app: &PohunekApp) -> Element<'_, Message> {
 
 fn notification_policy_card(app: &PohunekApp) -> Element<'_, Message> {
     let Some(host_id) = notification_policy_host(app) else {
-        return card(text("Select a host to manage its notification policy").size(12));
+        return card(text("Select a host to manage its activity policy").size(12));
     };
     let load = button("Load notification policy")
         .on_press(Message::LoadNotificationPolicy(host_id.clone()))
         .style(iced::widget::button::secondary);
     let Some(policy) = app.workspace.notification_policy(&host_id) else {
-        return card(column![text(format!("Notification policy · {host_id}")), load].spacing(6));
+        return card(column![text(format!("Activity policy · {host_id}")), load].spacing(6));
     };
 
     let mut providers = BTreeSet::new();
@@ -131,7 +135,7 @@ fn notification_policy_card(app: &PohunekApp) -> Element<'_, Message> {
 
     let mut rows = column![
         row![
-            text(format!("Notification policy · {host_id}")).size(14),
+            text(format!("Activity policy · {host_id}")).size(14),
             iced::widget::space().width(Fill),
             load,
             button("Save")
@@ -141,6 +145,16 @@ fn notification_policy_card(app: &PohunekApp) -> Element<'_, Message> {
         .spacing(6)
         .align_y(Center),
         policy_kind_row(&host_id, None, "base", &policy.enabled),
+        text(format!(
+            "Automatic retention · info {} · warnings {} · resolved attention {} · resolved errors {} · archived {}",
+            duration_label(policy.retention.info_ttl_secs),
+            duration_label(policy.retention.warning_ttl_secs),
+            duration_label(policy.retention.resolved_attention_ttl_secs),
+            duration_label(policy.retention.resolved_error_ttl_secs),
+            duration_label(policy.retention.archived_ttl_secs),
+        ))
+        .size(11)
+        .style(muted_style),
     ]
     .spacing(6);
     for provider in providers {
@@ -222,12 +236,8 @@ fn policy_kind_row(
 /// host `pick_list` that replaces the old per-axis filter-chip rows.
 fn inbox_controls(app: &PohunekApp) -> Element<'_, Message> {
     let mut controls = row![
-        inbox_scope_button(
-            "Needs action",
-            NotificationScope::NeedsAction,
-            app.inbox_scope
-        ),
-        inbox_scope_button("All", NotificationScope::All, app.inbox_scope),
+        inbox_scope_button("Recent", NotificationScope::Recent, app.inbox_scope),
+        inbox_scope_button("Unread", NotificationScope::Unread, app.inbox_scope),
         inbox_scope_button("Archived", NotificationScope::Archived, app.inbox_scope),
     ]
     .spacing(6)
@@ -285,14 +295,13 @@ fn inbox_host_picker(app: &PohunekApp) -> Option<Element<'_, Message>> {
 
 fn inbox_empty_label(scope: NotificationScope) -> &'static str {
     match scope {
-        NotificationScope::NeedsAction => "All clear.",
-        NotificationScope::All => "No notifications",
-        NotificationScope::Archived => "No archived notifications",
+        NotificationScope::Recent => "No recent activity",
+        NotificationScope::Unread => "No unread activity",
+        NotificationScope::Archived => "No archived activity",
     }
 }
 
-/// One inbox row: severity dot (+ an `action` pill for agent-blocked/approval
-/// prompts) and title on the first line, age right-aligned; host, linked
+/// One activity row: severity dot and title on the first line, age right-aligned; host, linked
 /// session, and kind on a muted second line. Clicking opens the message layer.
 fn notification_row(
     app: &PohunekApp,
@@ -301,10 +310,6 @@ fn notification_row(
     selected: bool,
 ) -> Element<'static, Message> {
     let unread = record.status == NotificationStatus::Unread;
-    let needs_action = matches!(
-        record.kind,
-        NotificationKind::AgentBlocked | NotificationKind::ApprovalRequired
-    );
     let session_label = record
         .session_id
         .as_ref()
@@ -328,9 +333,6 @@ fn notification_row(
     let mut title_row = row![notification_dot(record.severity)]
         .spacing(6)
         .align_y(Center);
-    if needs_action {
-        title_row = title_row.push(status_pill("action", PillTone::Danger));
-    }
     title_row = title_row
         .push(title)
         .push(iced::widget::space().width(Fill))
@@ -424,9 +426,25 @@ fn inbox_message_actions<'a>(
     if let Some(link) = notification_link_action(app, host_id, record) {
         actions = actions.push(link);
     }
-    if record.status != NotificationStatus::Acknowledged {
+    if !matches!(
+        record.status,
+        NotificationStatus::Acknowledged | NotificationStatus::Archived
+    ) {
+        let resolve_label = if matches!(
+            record.kind,
+            NotificationKind::AgentBlocked
+                | NotificationKind::ApprovalRequired
+                | NotificationKind::Error
+        ) || matches!(
+            record.severity,
+            NotificationSeverity::ActionRequired | NotificationSeverity::Error
+        ) {
+            "Resolve"
+        } else {
+            "Acknowledge"
+        };
         actions = actions.push(notification_action_button(
-            "Acknowledge",
+            resolve_label,
             host_id,
             &record.id,
             NotificationAction::Acknowledge,
@@ -592,6 +610,17 @@ fn notification_status_label(status: NotificationStatus) -> &'static str {
         NotificationStatus::Acknowledged => "ack",
         NotificationStatus::Archived => "archived",
         NotificationStatus::Deleted => "deleted",
+    }
+}
+
+fn duration_label(seconds: u32) -> String {
+    let seconds = u64::from(seconds);
+    if seconds % SECONDS_PER_DAY == 0 {
+        format!("{}d", seconds / SECONDS_PER_DAY)
+    } else if seconds % SECONDS_PER_HOUR == 0 {
+        format!("{}h", seconds / SECONDS_PER_HOUR)
+    } else {
+        format!("{seconds}s")
     }
 }
 

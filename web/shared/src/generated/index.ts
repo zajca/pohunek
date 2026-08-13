@@ -44,6 +44,7 @@ export type { NotificationPolicyParams } from "./NotificationPolicyParams";
 export type { NotificationPolicyResult } from "./NotificationPolicyResult";
 export type { NotificationRecord } from "./NotificationRecord";
 export type { NotificationRetentionParams } from "./NotificationRetentionParams";
+export type { NotificationRetentionPolicy } from "./NotificationRetentionPolicy";
 export type { NotificationRetentionResult } from "./NotificationRetentionResult";
 export type { NotificationSeverity } from "./NotificationSeverity";
 export type { NotificationSource } from "./NotificationSource";

@@ -178,7 +178,7 @@ struct PohunekApp {
     modal: ModalView,
     /// Active inbox host filter; `None` fields do not constrain the notification list.
     notification_filter: NotificationFilter,
-    /// `Needs action | All | Archived` scope picked in the inbox modal.
+    /// `Recent | Unread | Archived` scope picked in the activity modal.
     inbox_scope: NotificationScope,
     /// Which layer of the inbox modal is showing.
     inbox_view: InboxView,

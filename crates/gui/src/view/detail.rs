@@ -5,23 +5,23 @@
 use iced::widget::{button, column, container, row, scrollable, text};
 use iced::{Center, Element, Fill, Theme};
 use pohunek_gui_core::{SessionAccess, SessionGroup, SessionRow};
-use protocol::AgentActivity;
+use protocol::{AgentActivity, NotificationKind};
 
 use crate::message::Message;
 use crate::selection::selected_project;
 use crate::view::modals::toast_view;
 use crate::PohunekApp;
 
-use super::{card, list_button, push_meta, STATUS_DOT};
+use super::{card, list_button, push_meta, status_pill, PillTone, STATUS_DOT};
 
 /// Renders the primary session-first workspace.
 pub(crate) fn detail_view(app: &PohunekApp) -> Element<'_, Message> {
     let rows = app.workspace.session_rows();
     let mut content = column![session_header(app)].spacing(12);
     for group in [
-        SessionGroup::NeedsAction,
-        SessionGroup::Idle,
+        SessionGroup::NeedsYou,
         SessionGroup::Running,
+        SessionGroup::Ready,
         SessionGroup::Unavailable,
     ] {
         content = content.push(session_group(group, &rows));
@@ -98,13 +98,27 @@ fn session_row(row: &SessionRow) -> Element<'static, Message> {
     }
     push_meta(&mut metadata, row.state.as_str());
     if let Some(activity) = row.activity {
-        push_meta(&mut metadata, activity.as_str());
+        push_meta(&mut metadata, activity_label(activity));
+    }
+    if let Some(attention) = &row.attention {
+        push_meta(&mut metadata, &attention.title);
+    }
+
+    let mut heading = row![text(title).size(15)].spacing(6).align_y(Center);
+    if let Some(attention) = &row.attention {
+        let label = match attention.kind {
+            NotificationKind::ApprovalRequired => "Approval needed",
+            NotificationKind::AgentBlocked => "Input needed",
+            NotificationKind::Error => "Review failure",
+            _ => "Needs you",
+        };
+        heading = heading.push(status_pill(label, PillTone::Danger));
     }
 
     let target_host = row.host_id.clone();
     let target_session = row.session_id.clone();
     let info = list_button(
-        column![text(title).size(15), text(metadata).size(12)].spacing(2),
+        column![heading, text(metadata).size(12)].spacing(2),
         Message::SelectSession {
             host_id: target_host.clone(),
             session_id: target_session.clone(),
@@ -177,8 +191,8 @@ fn project_context_label<'a>(label: Option<&'a str>, id: Option<&'a str>) -> &'a
 
 fn group_label(group: SessionGroup) -> &'static str {
     match group {
-        SessionGroup::NeedsAction => "Needs action",
-        SessionGroup::Idle => "Idle",
+        SessionGroup::NeedsYou => "Needs you",
+        SessionGroup::Ready => "Ready",
         SessionGroup::Running => "Running",
         SessionGroup::Unavailable => "Unavailable",
     }
@@ -186,10 +200,18 @@ fn group_label(group: SessionGroup) -> &'static str {
 
 fn group_empty_label(group: SessionGroup) -> &'static str {
     match group {
-        SessionGroup::NeedsAction => "Nothing needs your attention.",
-        SessionGroup::Idle => "No idle attachable sessions.",
+        SessionGroup::NeedsYou => "No session is waiting for you.",
+        SessionGroup::Ready => "No ready sessions.",
         SessionGroup::Running => "No sessions are currently working or starting.",
         SessionGroup::Unavailable => "No unavailable sessions.",
+    }
+}
+
+fn activity_label(activity: AgentActivity) -> &'static str {
+    match activity {
+        AgentActivity::Idle => "ready",
+        AgentActivity::Working => "working",
+        AgentActivity::Blocked => "waiting for input",
     }
 }
 
@@ -215,8 +237,8 @@ mod tests {
 
     #[test]
     fn group_labels_match_priority_sections() {
-        assert_eq!(group_label(SessionGroup::NeedsAction), "Needs action");
-        assert_eq!(group_label(SessionGroup::Idle), "Idle");
+        assert_eq!(group_label(SessionGroup::NeedsYou), "Needs you");
+        assert_eq!(group_label(SessionGroup::Ready), "Ready");
         assert_eq!(group_label(SessionGroup::Running), "Running");
         assert_eq!(group_label(SessionGroup::Unavailable), "Unavailable");
     }

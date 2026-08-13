@@ -100,14 +100,16 @@ without sharing a producer-specific source id. Within the policy's attention
 dedupe window, Codex and Claude provider records outrank daemon projector
 records for the same session attention key.
 
-Session notifications self-resolve. When the daemon observes a session's
-activity return to `working`, the projector acknowledges any `unread` or `read`
+Session notifications self-resolve. When the daemon observes a session enter
+`working`, or the session reaches a terminal lifecycle state, the projector
+acknowledges any `unread` or `read`
 `agent_blocked` and `approval_required` records for that session's
 `attention:<session_id>` key and any `turn_completed` records for
 `turn:<session_id>`. This keeps transient waiting-for-input and completed-turn
 signals from lingering as unread after the agent has resumed; other kinds such
 as `error` and `session_finished` are never auto-resolved and wait for explicit
-owner action.
+owner action. An `idle` observation alone does not resolve attention because an
+approval prompt can be technically idle while still requiring owner input.
 
 Session notifications are also debounced before they ever become visible. An
 `agent_blocked`, `approval_required`, or session-scoped `turn_completed` create
@@ -116,10 +118,10 @@ memory by the daemon for the policy's `attention_debounce_secs` window (5
 seconds by default) instead of being persisted immediately; `notification.create`
 still reports `created: true` with a minted id, but the record does not appear
 in `notification.list` and no `notification_created` event fires while it is
-pending. If the session's activity returns to `working` inside that window, the
-pending record is dropped entirely and nothing is ever created — the same
-self-resolve edge described above, applied before the record surfaces rather
-than after. Only a genuinely outstanding session signal, still unresolved once
+pending. If the session enters `working` or reaches a terminal lifecycle state
+inside that window, the pending record is dropped entirely and nothing is ever
+created — the same self-resolve edge described above, applied before the record
+surfaces rather than after. Only a genuinely outstanding session signal, still unresolved once
 the window elapses, is committed and broadcast. This is distinct from
 `attention_dedupe_window_secs`, which merges duplicate attention reports across
 producers rather than delaying when a session notification surfaces.
@@ -135,11 +137,20 @@ policy, while the deterministically ordered `providers` object holds complete
 overrides by open provider wire name. A missing provider key falls back to
 `enabled`. The old fixed `codex` and `claude` policy fields are not accepted.
 
-The GUI's Inbox modal opens a notification's message detail when it is
-selected from the list, auto-marking it read. If the record links to a session
+The GUI's Activity modal opens a notification's message detail when it is
+selected from the chronological history, auto-marking it read. If the record links to a session
 still known on the same host, the detail offers a primary Open session action
 that closes the modal and selects that session; if the linked session is gone,
-explanatory text replaces the button so the record is not a dead end.
+explanatory text replaces the button so the record is not a dead end. The main
+session list derives Needs you only from live blocked state and active approval
+records, never from unread informational history. Session detail presents
+Current attention separately from Recent activity.
+
+The notification policy also owns automatic retention. Informational/success,
+warning, acknowledged attention, acknowledged error, and archived records have
+separate TTLs. Unresolved action-required and error records have no automatic
+TTL. After a sweep appends deletion events, the daemon atomically compacts the
+JSONL action log once its configured action threshold is reached.
 
 Every session has an immutable launch identity: `agent` is the selected profile
 name and `agent_base` is the base kind (`shell`, `codex`, `claude`, or

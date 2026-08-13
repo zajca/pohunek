@@ -205,8 +205,8 @@ All params and result type names below refer to structs exported by
 | `notification.update` | `NotificationUpdateParams` | `NotificationUpdateResult` | Updates one record's lifecycle status. Allowed transitions are `unread -> read`, `read -> acknowledged`, `unread -> acknowledged`, `unread/read/acknowledged -> archived`, and any non-deleted status to deleted. |
 | `notification.delete` | `NotificationDeleteParams` | `NotificationDeleteResult` | Logically deletes one record. Unknown or already-deleted ids return `deleted: false`. |
 | `notification.policy.get` | `null` | `NotificationPolicyResult` | Reads the daemon's notification policy. Non-null params are `daemon/bad_request`. |
-| `notification.policy.set` | `NotificationPolicyParams` | `NotificationPolicyResult` | Replaces and persists the daemon notification policy at `<data_dir>/notifications/policy.json`. |
-| `notification.retention.prune` | `NotificationRetentionParams` or `null` | `NotificationRetentionResult` | Explicitly deletes records selected by retention filters, or reports matches when `dry_run` is true. |
+| `notification.policy.set` | `NotificationPolicyParams` | `NotificationPolicyResult` | Validates, replaces, and persists the daemon notification and automatic-retention policy at `<data_dir>/notifications/policy.json`. |
+| `notification.retention.prune` | `NotificationRetentionParams` or `null` | `NotificationRetentionResult` | Explicitly deletes records selected by retention filters, or reports matches when `dry_run` is true. Applied pruning may also compact the action log at the policy threshold. |
 | `project.list` | `ProjectListParams` or `null` | `Vec<ProjectInfo>` | Lists known projects on the target host. |
 | `project.add` | `ProjectAddParams` | `ProjectInfo` | Registers a host-local git project path. |
 | `project.show` | `ProjectShowParams` | `ProjectShowResult` | Shows a project plus live worktree state. |
@@ -670,6 +670,8 @@ Important fields:
 - `enabled`: base per-kind flags used when a provider has no explicit entry.
 - `providers`: optional deterministically ordered object mapping provider wire
   names to complete per-kind overrides. Missing keys fall back to `enabled`.
+- `retention`: automatic daemon-owned cleanup and physical-compaction settings.
+  Persisted policies without this additive field receive the defaults.
 
 For example:
 
@@ -702,6 +704,15 @@ For example:
       "error": true,
       "system": false
     }
+  },
+  "retention": {
+    "sweep_interval_secs": 21600,
+    "info_ttl_secs": 259200,
+    "warning_ttl_secs": 1209600,
+    "resolved_attention_ttl_secs": 604800,
+    "resolved_error_ttl_secs": 2592000,
+    "archived_ttl_secs": 7776000,
+    "compaction_min_actions": 1000
   }
 }
 ```
@@ -714,6 +725,15 @@ Default policy enables `agent_blocked`, `approval_required`, and `error`.
 `turn_completed`, `session_finished`, and `system` are implemented but disabled
 by default. The daemon materializes complete default entries for `codex`,
 `claude`, and `hermes`; a missing provider key still falls back to `enabled`.
+
+Every retention duration and `compaction_min_actions` must be greater than zero.
+The daemon runs one sweep at startup and then every `sweep_interval_secs` using
+the current policy. Informational/success, warning, acknowledged attention,
+acknowledged error, and archived records use their respective TTLs. Unread or
+read action-required and error records are never deleted automatically. After
+eligible records receive normal deletion events, the store atomically rewrites
+the action log to one current action per non-deleted record once the configured
+action threshold is reached.
 
 Policy is enforced daemon-side for all notification producers. If a producer
 creates a disabled kind, `notification.create` returns
@@ -737,10 +757,12 @@ acknowledges any unread `turn:<session_id>` twin with `superseded_by` pointing a
 the attention record because `agent_blocked`/`approval_required` subsumes "the
 turn completed and is waiting".
 
-When a session's activity enters `working`, the daemon resolves both
+When a session enters `working`, or reaches a terminal lifecycle state, the daemon resolves both
 `attention:<session_id>` and `turn:<session_id>`. Pending records with those
 keys are dropped before they ever persist, and already-visible unread/read
-matching records are acknowledged with `notification_updated`.
+matching records are acknowledged with `notification_updated`. An `idle`
+observation alone does not resolve attention because a live approval prompt can
+be technically idle while still requiring owner input.
 
 #### Session notification debounce
 
@@ -753,8 +775,8 @@ in `notification.list` until it flushes. No `notification_created` event is
 emitted for a pending record.
 
 The daemon holds the pending record for `attention_debounce_secs`. If the
-session resolves back to `working` within that window, the pending record is
-dropped entirely: nothing is ever persisted, and no event fires. Only if the
+session enters `working` or reaches a terminal lifecycle state within that
+window, the pending record is dropped entirely: nothing is ever persisted, and no event fires. Only if the
 window elapses with the session signal still outstanding does the daemon commit
 the record through the store and emit `notification_created`, exactly as an
 immediate create would. Debounce does not apply to `session_finished`, `error`,
@@ -784,7 +806,7 @@ Codex notification support requires modern lifecycle hooks for
 Claude notification support requires hook events for `Notification`, `Stop`,
 and `StopFailure`. `Notification` matcher values map as follows:
 `permission_prompt` and `elicitation_dialog` create `approval_required`,
-`idle_prompt` creates `agent_blocked`, and `auth_success`,
+while the normal `idle_prompt` creates no notification. `auth_success`,
 `elicitation_complete`, and `elicitation_response` create `system`. `Stop`
 creates `turn_completed`; `StopFailure` creates `error`.
 
@@ -851,7 +873,7 @@ Canonical public codes currently emitted include:
 | `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback` |
 | `transport` | `framing`, `host_unreachable`, `request_timeout` |
 | `discovery` | `netbird_cli_missing`, `netbird_state_unavailable`, `host_unknown`, `remote_discovery_failed` |
-| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor` |
+| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy` |
 
 Protocol v2 additionally emits these runtime codes for provider-neutral agent
 and observation behavior: `agent_kind_unsupported`,
@@ -1019,7 +1041,8 @@ The CLI exposes durable notifications through `pohunek notifications`:
   `--kind <kind>`, and exactly one of `--enabled` or `--disabled`.
 - `pohunek notifications retention prune`: explicitly prune records selected by
   `--status`, `--before`, and `--limit`, with exactly one of `--dry-run` or
-  `--apply`.
+  `--apply`. Automatic age-based retention runs independently in the daemon
+  from the persisted policy returned by `policy get`.
 
 Commands that support `--all-hosts` render per-host successes and structured
 per-host errors. Cross-host notification aggregation is client-side; no central

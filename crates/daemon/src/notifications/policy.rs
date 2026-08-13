@@ -4,8 +4,10 @@ use std::collections::BTreeMap;
 
 use protocol::{
     NotificationId, NotificationKind, NotificationKindPolicy, NotificationPolicy,
-    NotificationRecord, NotificationRetentionParams, NotificationStatus,
+    NotificationRecord, NotificationRetentionParams, NotificationRetentionPolicy,
+    NotificationSeverity, NotificationStatus,
 };
+use time::{Duration, OffsetDateTime};
 
 use super::{parse_timestamp, NotificationError};
 
@@ -42,6 +44,7 @@ pub fn default_policy() -> NotificationPolicy {
             ("codex".to_owned(), provider_policy.clone()),
             ("hermes".to_owned(), provider_policy),
         ]),
+        retention: NotificationRetentionPolicy::default(),
     }
 }
 
@@ -103,9 +106,236 @@ pub(crate) fn records_matching_retention(
     Ok(ids)
 }
 
+/// Return records eligible for the automatic age-based retention sweep.
+///
+/// Active action-required and error records deliberately have no TTL. Reading
+/// a notification is presentation state only; acknowledgement or archival is
+/// required before an actionable incident can age out.
+pub(crate) fn records_matching_auto_retention(
+    records: &[NotificationRecord],
+    retention: &NotificationRetentionPolicy,
+    now: OffsetDateTime,
+) -> Result<Vec<NotificationId>, NotificationError> {
+    let mut ids = Vec::new();
+    for record in records {
+        if record.status == NotificationStatus::Deleted {
+            continue;
+        }
+        if auto_retention_deadline(record, retention)?.is_some_and(|deadline| deadline <= now) {
+            ids.push(record.id.clone());
+        }
+    }
+    Ok(ids)
+}
+
+fn auto_retention_deadline(
+    record: &NotificationRecord,
+    retention: &NotificationRetentionPolicy,
+) -> Result<Option<OffsetDateTime>, NotificationError> {
+    let (timestamp, ttl_secs) = match record.status {
+        NotificationStatus::Archived => (
+            record.archived_at.as_deref().unwrap_or(&record.created_at),
+            retention.archived_ttl_secs,
+        ),
+        NotificationStatus::Acknowledged
+            if matches!(
+                record.severity,
+                NotificationSeverity::ActionRequired | NotificationSeverity::Error
+            ) || matches!(
+                record.kind,
+                NotificationKind::AgentBlocked
+                    | NotificationKind::ApprovalRequired
+                    | NotificationKind::Error
+            ) =>
+        {
+            let ttl = if record.severity == NotificationSeverity::Error
+                || record.kind == NotificationKind::Error
+            {
+                retention.resolved_error_ttl_secs
+            } else {
+                retention.resolved_attention_ttl_secs
+            };
+            (
+                record.acked_at.as_deref().unwrap_or(&record.created_at),
+                ttl,
+            )
+        }
+        NotificationStatus::Unread | NotificationStatus::Read
+            if matches!(
+                record.severity,
+                NotificationSeverity::ActionRequired | NotificationSeverity::Error
+            ) || matches!(
+                record.kind,
+                NotificationKind::AgentBlocked
+                    | NotificationKind::ApprovalRequired
+                    | NotificationKind::Error
+            ) =>
+        {
+            return Ok(None);
+        }
+        NotificationStatus::Unread
+        | NotificationStatus::Read
+        | NotificationStatus::Acknowledged => {
+            let ttl = if record.severity == NotificationSeverity::Warning {
+                retention.warning_ttl_secs
+            } else {
+                retention.info_ttl_secs
+            };
+            (record.created_at.as_str(), ttl)
+        }
+        NotificationStatus::Deleted => return Ok(None),
+    };
+    Ok(Some(
+        parse_timestamp(timestamp)? + Duration::seconds(i64::from(ttl_secs)),
+    ))
+}
+
 fn retention_limit(params: &NotificationRetentionParams) -> usize {
     params
         .limit
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(usize::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use protocol::{
+        NotificationId, NotificationKind, NotificationRecord, NotificationRetentionPolicy,
+        NotificationSeverity, NotificationSource, NotificationStatus,
+    };
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+
+    use super::records_matching_auto_retention;
+
+    fn timestamp(value: &str) -> OffsetDateTime {
+        OffsetDateTime::parse(value, &Rfc3339).expect("valid test timestamp")
+    }
+
+    fn record(
+        id: &str,
+        kind: NotificationKind,
+        severity: NotificationSeverity,
+        status: NotificationStatus,
+    ) -> NotificationRecord {
+        NotificationRecord {
+            id: NotificationId(id.to_owned()),
+            source: NotificationSource {
+                provider: "pohunek".to_owned(),
+                provider_event: "test".to_owned(),
+                host_local_source_id: format!("source-{id}"),
+            },
+            kind,
+            severity,
+            status,
+            title: id.to_owned(),
+            body: id.to_owned(),
+            metadata: BTreeMap::new(),
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            session_id: None,
+            agent_kind: None,
+            source_id: None,
+            dedupe_key: None,
+            project_id: None,
+            read_at: None,
+            acked_at: (status == NotificationStatus::Acknowledged)
+                .then(|| "2026-01-02T00:00:00Z".to_owned()),
+            archived_at: (status == NotificationStatus::Archived)
+                .then(|| "2026-01-02T00:00:00Z".to_owned()),
+            deleted_at: None,
+            superseded_by: None,
+        }
+    }
+
+    #[test]
+    fn automatic_retention_never_expires_unresolved_actions_or_errors() {
+        let records = vec![
+            record(
+                "action",
+                NotificationKind::ApprovalRequired,
+                NotificationSeverity::ActionRequired,
+                NotificationStatus::Unread,
+            ),
+            record(
+                "error",
+                NotificationKind::Error,
+                NotificationSeverity::Error,
+                NotificationStatus::Read,
+            ),
+        ];
+
+        let matched = records_matching_auto_retention(
+            &records,
+            &NotificationRetentionPolicy::default(),
+            timestamp("2030-01-01T00:00:00Z"),
+        )
+        .expect("evaluate retention");
+
+        assert!(matched.is_empty());
+    }
+
+    #[test]
+    fn automatic_retention_uses_activity_resolution_and_archive_ttls() {
+        let records = vec![
+            record(
+                "info",
+                NotificationKind::TurnCompleted,
+                NotificationSeverity::Success,
+                NotificationStatus::Unread,
+            ),
+            record(
+                "warning",
+                NotificationKind::System,
+                NotificationSeverity::Warning,
+                NotificationStatus::Read,
+            ),
+            record(
+                "resolved-action",
+                NotificationKind::AgentBlocked,
+                NotificationSeverity::ActionRequired,
+                NotificationStatus::Acknowledged,
+            ),
+            record(
+                "resolved-error",
+                NotificationKind::Error,
+                NotificationSeverity::Error,
+                NotificationStatus::Acknowledged,
+            ),
+            record(
+                "archived",
+                NotificationKind::System,
+                NotificationSeverity::Info,
+                NotificationStatus::Archived,
+            ),
+        ];
+        let retention = NotificationRetentionPolicy {
+            sweep_interval_secs: 60,
+            info_ttl_secs: 10,
+            warning_ttl_secs: 20,
+            resolved_attention_ttl_secs: 30,
+            resolved_error_ttl_secs: 40,
+            archived_ttl_secs: 50,
+            compaction_min_actions: 1,
+        };
+
+        let matched = records_matching_auto_retention(
+            &records,
+            &retention,
+            timestamp("2026-01-02T00:01:00Z"),
+        )
+        .expect("evaluate retention");
+
+        assert_eq!(
+            matched,
+            vec![
+                NotificationId("info".to_owned()),
+                NotificationId("warning".to_owned()),
+                NotificationId("resolved-action".to_owned()),
+                NotificationId("resolved-error".to_owned()),
+                NotificationId("archived".to_owned()),
+            ]
+        );
+    }
 }

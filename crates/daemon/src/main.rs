@@ -25,7 +25,8 @@ use pohunek_daemon::discovery::DiscoveryCache;
 use pohunek_daemon::events::{spawn_drain, EventLog};
 use pohunek_daemon::lock::InstanceLock;
 use pohunek_daemon::notifications::{
-    AttentionCoordinator, NotificationProjector, NotificationService, NOTIFICATIONS_SUBDIR,
+    AttentionCoordinator, NotificationProjector, NotificationRetentionTask, NotificationService,
+    NOTIFICATIONS_SUBDIR,
 };
 use pohunek_daemon::runtime::{
     SubprocessWorkerEnvironment, SubprocessWorkerLauncher, UnitTemplate, WorkerLauncher,
@@ -161,6 +162,7 @@ async fn run() -> Result<(), DaemonError> {
         &sessions,
         &notifications,
     )?;
+    let notification_retention = NotificationRetentionTask::spawn(notifications.clone());
     // Spawn the debounce coordinator: it owns the lifecycle of session-scoped
     // agent_blocked/approval_required and turn_completed notifications, holding
     // them for the policy debounce window so transient signals never surface.
@@ -235,6 +237,7 @@ async fn run() -> Result<(), DaemonError> {
     //     Stop the projector before the coordinator so any last defers/resolves
     //     it drains are still accepted, then drop the coordinator's pending
     //     (in-memory, deliberately not persisted).
+    notification_retention.shutdown().await;
     notification_projector.shutdown().await;
     attention_task.shutdown().await;
     sessions.shutdown_agent_state_hooks().await;

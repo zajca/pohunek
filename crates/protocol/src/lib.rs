@@ -77,9 +77,9 @@ pub use notification::{
     NotificationDeleteParams, NotificationDeleteResult, NotificationDeletedEvent, NotificationId,
     NotificationKind, NotificationKindPolicy, NotificationListParams, NotificationListResult,
     NotificationPolicy, NotificationPolicyParams, NotificationPolicyResult, NotificationRecord,
-    NotificationRetentionParams, NotificationRetentionResult, NotificationSeverity,
-    NotificationSource, NotificationStatus, NotificationUpdateParams, NotificationUpdateResult,
-    NotificationUpdatedEvent,
+    NotificationRetentionParams, NotificationRetentionPolicy, NotificationRetentionResult,
+    NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
+    NotificationUpdateResult, NotificationUpdatedEvent,
 };
 #[doc(inline)]
 pub use project::{
