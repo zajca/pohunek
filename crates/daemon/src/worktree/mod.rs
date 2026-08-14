@@ -9,10 +9,11 @@
 //!
 //! Three setup failures are treated as **non-fatal warnings** (mirroring
 //! Kandev's `FetchWarning` / `BaseBranchFallbackWarning` / `SetupScriptWarning`):
-//! a failed `git fetch` falls back to the local base ref, a missing base branch
-//! falls back to the repository's default branch, and a failing setup script
-//! keeps the worktree. None of them aborts session creation — the worktree is
-//! kept, the warning surfaced, and the user decides whether to intervene.
+//! a failed `git fetch` falls back to the local base ref, a base branch missing
+//! both locally and on `origin` falls back to the repository's default branch,
+//! and a failing setup script keeps the worktree. None of them aborts session
+//! creation — the worktree is kept, the warning surfaced, and the user decides
+//! whether to intervene.
 //!
 //! Ownership is implicit, exactly as in Kandev: the daemon owns a worktree iff
 //! it has a [`WorktreeBinding`] recording that path. `bind` refuses to adopt a
@@ -52,6 +53,9 @@ const SETUP_SCRIPT_REL: &str = ".pohunek/setup";
 /// Interpreter used to run the setup script, so a script without an executable
 /// bit (the common case for a committed `.pohunek/setup`) still runs.
 const SETUP_SCRIPT_INTERPRETER: &str = "sh";
+
+/// Git's temporary ref for the tip fetched by the immediately preceding fetch.
+const FETCH_HEAD_REF: &str = "FETCH_HEAD";
 
 /// How often [`wait_with_timeout`] polls a running setup script for completion.
 /// Small enough that a quick script returns promptly, large enough that the busy
@@ -112,6 +116,12 @@ pub struct WorktreeBound {
     pub reused: bool,
     /// Non-fatal warnings raised while binding.
     pub warnings: Vec<SessionWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BaseRef {
+    name: String,
+    prefetched: bool,
 }
 
 /// Outcome of [`WorktreeManager::cleanup_project`].
@@ -327,12 +337,17 @@ impl WorktreeManager {
         }
 
         let mut warnings = Vec::new();
-        let base_branch = Self::resolve_base_branch(&repository, req, &mut warnings)?;
+        let resolved_base = Self::resolve_base_branch(&repository, req, &mut warnings)?;
+        let base_branch = resolved_base.name;
         // Resolve the start-point for a new branch: the freshly fetched ref when
         // a fetch succeeds, else the (recorded) local base. The logical
         // `base_branch` name is what we persist/display; `start_point` is what
         // `git worktree add` actually branches from.
-        let start_point = Self::fetch_start_point(&repository, &base_branch, &mut warnings);
+        let start_point = if resolved_base.prefetched {
+            FETCH_HEAD_REF.to_owned()
+        } else {
+            Self::fetch_start_point(&repository, &base_branch, &mut warnings)
+        };
         // Pre-create hook: fires only on the fresh-create path (the reuse / recreate
         // / foreign-conflict branches above all returned before here). The worktree
         // does not exist yet, so it runs IN THE REPOSITORY — `POHUNEK_BASE_BRANCH`
@@ -693,8 +708,8 @@ impl WorktreeManager {
         Ok(())
     }
 
-    /// Resolve the base ref, falling back to the repository's default branch
-    /// when the requested base is missing (non-fatal `base_branch_fallback`).
+    /// Resolve the base ref, fetching a remote-only requested branch before
+    /// falling back to the repository's default branch.
     ///
     /// The default branch is resolved **lazily** — only when no base was
     /// requested or a fallback is needed — so a repository in detached HEAD can
@@ -703,7 +718,7 @@ impl WorktreeManager {
         repository: &Path,
         req: &WorktreeRequest,
         warnings: &mut Vec<SessionWarning>,
-    ) -> Result<String, ProtocolError> {
+    ) -> Result<BaseRef, ProtocolError> {
         let Some(requested) = req
             .base_branch
             .as_deref()
@@ -711,13 +726,36 @@ impl WorktreeManager {
             .filter(|b| !b.is_empty())
         else {
             // No base requested: branch from the repository's current branch.
-            return Self::default_branch(repository);
+            return Self::default_branch(repository).map(|name| BaseRef {
+                name,
+                prefetched: false,
+            });
         };
 
         // `requested` was validated for flag injection by the caller.
         match branch_exists(repository, requested) {
-            Ok(true) => Ok(requested.to_owned()),
+            Ok(true) => Ok(BaseRef {
+                name: requested.to_owned(),
+                prefetched: false,
+            }),
             Ok(false) => {
+                if has_origin(repository) {
+                    match fetch_origin(repository, requested) {
+                        Ok(()) => {
+                            return Ok(BaseRef {
+                                name: requested.to_owned(),
+                                prefetched: true,
+                            });
+                        }
+                        Err(message) => warnings.push(SessionWarning {
+                            kind: SessionWarningKind::Fetch,
+                            message: format!(
+                                "Could not fetch requested base branch {requested:?} from origin; trying the repository default branch."
+                            ),
+                            detail: Some(message),
+                        }),
+                    }
+                }
                 let default_branch = Self::default_branch(repository)?;
                 if default_branch == requested {
                     return Err(error(
@@ -736,7 +774,10 @@ impl WorktreeManager {
                         "git could not resolve refs/heads/{requested}; recovered using the repository's current branch {default_branch:?}"
                     )),
                 });
-                Ok(default_branch)
+                Ok(BaseRef {
+                    name: default_branch,
+                    prefetched: false,
+                })
             }
             // Three-valued: a "could not tell" error is loud, not a silent
             // fallback, so we do not mask a broken repository as a missing branch.
@@ -796,7 +837,7 @@ impl WorktreeManager {
         match fetch_origin(repository, base_branch) {
             // The fetched tip is in FETCH_HEAD; branch from it so the worktree
             // starts up to date rather than from the stale local ref.
-            Ok(()) => "FETCH_HEAD".to_owned(),
+            Ok(()) => FETCH_HEAD_REF.to_owned(),
             Err(message) => {
                 warnings.push(SessionWarning {
                     kind: SessionWarningKind::Fetch,
