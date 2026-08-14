@@ -85,7 +85,7 @@ ulid = "1"
 # Single source of truth for the released version. Every crate opts in via
 # `version.workspace = true`, so `scripts/release` only bumps it here.
 [workspace.package]
-version = "0.31.4"
+version = "0.31.5"
 edition = "2021"
 license = "MIT"
 rust-version = "1.96"
