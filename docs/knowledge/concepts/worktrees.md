@@ -12,7 +12,9 @@ intents: [project, debug, help]
 Pohunek sessions can run in place or in a dedicated Git worktree. A worktree is
 requested through `pohunek session new` with a repository or project plus a
 branch. The base branch is taken from `--base-branch`, then the project's
-configured default, then the repository default.
+configured default, then the repository default. When an explicit base branch
+is not present locally, Pohunek fetches that branch from `origin` before it
+considers falling back to the repository default.
 
 Worktrees are useful when an agent should make branch-scoped edits without
 touching the main checkout. They also make remote project sessions practical:

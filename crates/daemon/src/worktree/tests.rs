@@ -534,6 +534,48 @@ fn successful_fetch_starts_the_worktree_from_the_fetched_commit() {
 }
 
 #[test]
+fn remote_only_base_branch_is_fetched_before_default_branch_fallback() {
+    let upstream = init_repo("remote-base-upstream");
+    git_in(&upstream, &["checkout", "-q", "-b", "stacked/base"]);
+    fs::write(upstream.join("STACKED.md"), "stacked\n").expect("write stacked file");
+    git_in(&upstream, &["add", "."]);
+    git_in(&upstream, &["commit", "-q", "-m", "stacked base"]);
+    let stacked_tip = git_stdout(&upstream, &["rev-parse", "HEAD"]);
+    git_in(&upstream, &["checkout", "-q", "main"]);
+
+    let downstream = unique_dir("remote-base-downstream-parent").join("clone");
+    let clone = Command::new("git")
+        .args(["clone", "-q"])
+        .arg(&upstream)
+        .arg(&downstream)
+        .output()
+        .expect("git clone");
+    assert!(
+        clone.status.success(),
+        "git clone failed: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    assert_ne!(
+        git_stdout(&downstream, &["branch", "--list", "stacked/base"]),
+        "stacked/base",
+        "the requested base must not exist as a local branch before binding"
+    );
+
+    let mgr = manager("remote-base");
+    let mut req = request("s-1", &downstream, "feat/x");
+    req.base_branch = Some("stacked/base".to_owned());
+    let bound = mgr.bind(&req).expect("bind fetches the remote-only base");
+
+    assert_eq!(bound.base_branch, "stacked/base");
+    assert!(
+        bound.warnings.is_empty(),
+        "a successful remote-only base fetch must not warn: {:?}",
+        bound.warnings
+    );
+    assert_eq!(git_stdout(&bound.path, &["rev-parse", "HEAD"]), stacked_tip);
+}
+
+#[test]
 fn second_session_on_same_branch_gets_a_clear_in_use_error() {
     let mgr = manager("same-branch");
     let repo = init_repo("same-branch-repo");
