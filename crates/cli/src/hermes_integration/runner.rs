@@ -4,7 +4,7 @@
 //! clears the inherited environment, owns each child process group, and never
 //! retains subprocess output in an error.
 
-// Rust guideline compliant 2026-08-12
+// Rust guideline compliant 2026-08-14
 
 #![expect(
     clippy::map_err_ignore,
@@ -36,7 +36,11 @@ const PINNED_HERMES_VERSION_LINE: &str = "Hermes Agent v0.20.0 (2026.8.3)";
 /// Hermes appends source-provenance metadata after this delimiter for Git installs.
 const HERMES_VERSION_METADATA_DELIMITER: &str = " · ";
 /// A local lifecycle query must finish promptly and never block the CLI indefinitely.
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// Cold-starting the pinned Hermes runtime can exceed ten seconds on shared
+/// runners. Twenty seconds preserves a finite operator-facing bound while
+/// leaving scheduling margin for each fixed lifecycle probe.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 /// This caps each pipe independently while still draining it to prevent a pipe deadlock.
 const MAX_STREAM_BYTES: usize = 64 * 1024;
 /// Polling keeps timeout latency bounded without busy-spinning.
