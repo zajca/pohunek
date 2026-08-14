@@ -1,6 +1,6 @@
 //! Validates the pinned Hermes CLI and refreshes bounded PTY evidence.
 
-// Rust guideline compliant 2026-08-13
+// Rust guideline compliant 2026-08-14
 
 use std::ffi::OsString;
 use std::fs;
@@ -160,11 +160,12 @@ const GOLDEN_STATES: [&str; 10] = [
 const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 /// A help/version probe should never need more than ten seconds.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-/// Packaged static binaries need extra time for the Hermes install lifecycle.
+/// Packaged binaries need extra time for the Hermes install lifecycle.
 ///
-/// Thirty seconds preserves a finite CI bound while accommodating the slower
-/// MUSL release binary observed on shared GitHub runners.
-const INTEGRATION_ACTION_TIMEOUT: Duration = Duration::from_secs(30);
+/// One install launches several independently bounded cold-start Hermes and
+/// Python probes. Two minutes preserves a finite CI bound with scheduling
+/// margin for all probes and also accommodates the slower MUSL release binary.
+const INTEGRATION_ACTION_TIMEOUT: Duration = Duration::from_mins(2);
 /// One PTY transcript remains reviewable and cannot consume unbounded memory.
 const MAX_PTY_OUTPUT_BYTES: usize = 512 * 1024;
 /// Timeout diagnostics expose only a short reviewable suffix of safe output.
