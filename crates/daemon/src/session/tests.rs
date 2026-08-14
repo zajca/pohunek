@@ -27,12 +27,16 @@ use crate::integration::{
 };
 use crate::procwatch::{ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessInspector};
 use crate::project::detect::project_id;
-use crate::runtime::WorkerError;
+use crate::runtime::{Worker, WorkerError};
 
 use super::{
-    native_report_is_current, worker_error_to_protocol, RuntimeExit, RuntimeHandle, SessionEntry,
-    SessionRegistry, SessionRegistryConfig, ShellCommand, MAX_SESSION_NAME_BYTES,
+    native_report_is_current, worker_error_to_protocol, RuntimeExit, RuntimeHandle,
+    RuntimeWatchIdentity, SessionEntry, SessionRegistry, SessionRegistryConfig, ShellCommand,
+    MAX_SESSION_NAME_BYTES,
 };
+
+/// Bounds retries around intentional same-runtime snapshot races in transition tests.
+const CONCURRENT_TRANSITION_RETRY_LIMIT: usize = 32;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static NATIVE_REPORT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -5397,8 +5401,6 @@ async fn reconnect_rejects_a_replacement_worker_before_mutating_registry() {
 
 #[tokio::test]
 async fn reconnect_persistence_failure_retries_without_orphaning_live_handle() {
-    const CONCURRENT_RETRY_LIMIT: usize = 32;
-
     let registry = SessionRegistry::new(SessionRegistryConfig {
         stop_grace: Duration::from_millis(50),
         store_path: Some(temp_store_path("reconnect-persist-retry")),
@@ -5440,26 +5442,7 @@ async fn reconnect_persistence_failure_retries_without_orphaning_live_handle() {
             .state,
         RuntimeState::Reconnecting
     );
-    // Other session tasks may commit between the durable write and the memory
-    // compare. Production retries that explicit outcome, so exercise the same
-    // bounded behavior instead of depending on test-executor scheduling.
-    let mut applied = false;
-    for _ in 0..CONCURRENT_RETRY_LIMIT {
-        match registry
-            .adopt_reconnected_worker(&created.id, &expected, worker.clone())
-            .await
-        {
-            super::RuntimeTransitionOutcome::Applied(_) => {
-                applied = true;
-                break;
-            }
-            super::RuntimeTransitionOutcome::RetryableConcurrentChange => {
-                tokio::task::yield_now().await;
-            }
-            outcome => panic!("unexpected reconnect retry outcome: {outcome:?}"),
-        }
-    }
-    assert!(applied, "reconnect retry remained concurrently stale");
+    assert_reconnect_transition_applied(&registry, &created.id, &expected, &worker).await;
     assert_eq!(
         next_runtime_event(&mut events).await,
         protocol::event::SESSION_RUNTIME_RECONNECTED
@@ -5480,12 +5463,7 @@ async fn reconnect_persistence_failure_retries_without_orphaning_live_handle() {
         .as_ref()
         .expect("registry store")
         .fail_next_parent_sync_after_rename();
-    assert!(matches!(
-        registry
-            .adopt_reconnected_worker(&created.id, &expected, worker)
-            .await,
-        super::RuntimeTransitionOutcome::Applied(_)
-    ));
+    assert_reconnect_transition_applied(&registry, &created.id, &expected, &worker).await;
     assert_eq!(
         next_runtime_event(&mut events).await,
         protocol::event::SESSION_RUNTIME_RECONNECTED
@@ -5539,16 +5517,7 @@ async fn lost_transition_retries_precommit_failure_before_single_event() {
             .state,
         RuntimeState::Reconnecting
     );
-    assert!(matches!(
-        registry
-            .mark_worker_lost(
-                &created.id,
-                &expected,
-                &WorkerError::Protocol("test lost retry".to_owned()),
-            )
-            .await,
-        super::RuntimeTransitionOutcome::Applied(_)
-    ));
+    assert_lost_transition_applied(&registry, &created.id, &expected).await;
     assert_eq!(
         next_runtime_event(&mut events).await,
         protocol::event::SESSION_RUNTIME_LOST
@@ -5736,7 +5705,7 @@ async fn spontaneous_exit_uses_durable_base_after_uncaptured_resize() {
 async fn live_worker_and_identity(
     registry: &SessionRegistry,
     id: &SessionId,
-) -> (crate::runtime::Worker, super::RuntimeWatchIdentity) {
+) -> (Worker, RuntimeWatchIdentity) {
     let sessions = registry.inner.sessions.lock().await;
     let entry = sessions.get(id).expect("live entry");
     let RuntimeHandle::Worker(worker) = &entry.runtime else {
@@ -5744,8 +5713,49 @@ async fn live_worker_and_identity(
     };
     (
         worker.clone(),
-        super::RuntimeWatchIdentity::from_info(&entry.info).expect("watch identity"),
+        RuntimeWatchIdentity::from_info(&entry.info).expect("watch identity"),
     )
+}
+
+async fn assert_reconnect_transition_applied(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    expected: &RuntimeWatchIdentity,
+    worker: &Worker,
+) {
+    // A live worker task may commit a same-runtime snapshot between the durable
+    // write and memory compare. Production retries this explicit outcome.
+    for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
+        match registry
+            .adopt_reconnected_worker(id, expected, worker.clone())
+            .await
+        {
+            super::RuntimeTransitionOutcome::Applied(_) => return,
+            super::RuntimeTransitionOutcome::RetryableConcurrentChange => {
+                tokio::task::yield_now().await;
+            }
+            outcome => panic!("unexpected reconnect retry outcome: {outcome:?}"),
+        }
+    }
+    panic!("reconnect retry remained concurrently stale");
+}
+
+async fn assert_lost_transition_applied(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    expected: &RuntimeWatchIdentity,
+) {
+    let error = WorkerError::Protocol("test lost retry".to_owned());
+    for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
+        match registry.mark_worker_lost(id, expected, &error).await {
+            super::RuntimeTransitionOutcome::Applied(_) => return,
+            super::RuntimeTransitionOutcome::RetryableConcurrentChange => {
+                tokio::task::yield_now().await;
+            }
+            outcome => panic!("unexpected lost retry outcome: {outcome:?}"),
+        }
+    }
+    panic!("lost retry remained concurrently stale");
 }
 
 async fn next_runtime_event(events: &mut tokio::sync::broadcast::Receiver<Event>) -> String {
