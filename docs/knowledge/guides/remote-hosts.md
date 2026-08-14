@@ -12,6 +12,13 @@ intents: [setup, project, debug, help]
 Remote behavior is host-aware. The CLI uses `--host <host>` for commands that
 target a host, and session targets can use `<host>/<session-id>`.
 
+Opt-in dynamic shell completion (`pohunek setup completions <shell> --dynamic`)
+uses the same model. Host candidates come from the owner-private discovery
+cache. For a session target, an explicit `host/id` prefix wins, then `--host`,
+then `local`; completion performs a bounded live `session.list` query and emits
+no diagnostics when discovery or a daemon is unavailable. Static completion is
+the default and performs no discovery or daemon I/O.
+
 Use these commands for orientation:
 
 - `pohunek host discover --json` to enumerate NetBird peers and probe daemons.

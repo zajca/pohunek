@@ -68,6 +68,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
 tracing-appender = "0.2"
 clap = { version = "4", features = ["derive"] }
+clap_complete = { version = "4", features = ["unstable-dynamic"] }
 # Advisory file locking (flock) and socket-mode chmod for the single-instance
 # lock and 0600 socket. Minimal, standard FFI surface; needed for milestone 2.
 libc = "0.2"
