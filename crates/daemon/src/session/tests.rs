@@ -842,6 +842,23 @@ async fn wait_for_line_count(path: &std::path::Path, expected: usize) -> String 
     );
 }
 
+async fn wait_for_resume_binding_removed(registry: &SessionRegistry, id: &SessionId) {
+    for _ in 0..500 {
+        let bindings = registry
+            .inner
+            .store
+            .as_ref()
+            .expect("registry store")
+            .load_resume()
+            .expect("load resume bindings");
+        if bindings.iter().all(|binding| binding.session_id != id.0) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for resume binding removal for {}", id.0);
+}
+
 fn transition(activity: AgentActivity) -> ActivityTransition {
     ActivityTransition {
         activity,
@@ -7038,6 +7055,7 @@ async fn incompatible_hermes_resume_has_no_runtime_or_store_side_effects() {
         .wait_for_exit(&created.id, Duration::from_secs(2))
         .await
         .expect("fresh Hermes process exits");
+    wait_for_resume_binding_removed(&registry, &created.id).await;
     let marker_before = fs::read_to_string(&marker).expect("fresh launch marker");
     let store_before = fs::read(&store_path).expect("durable session store");
 
