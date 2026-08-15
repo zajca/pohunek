@@ -15,6 +15,7 @@ implementation behavior must be verified against the source tree.
 Current CLI and command surface:
 
 - `crates/cli/src/main.rs`
+- `crates/cli/src/completion.rs`
 - `crates/cli/src/commands/mod.rs`
 - `crates/cli/src/commands/assistant/mod.rs`
 - `crates/cli/src/commands/assistant/bootstrap.rs`

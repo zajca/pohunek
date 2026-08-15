@@ -124,6 +124,21 @@ fn release_workflow_packages_complete_daemon_runtime_set() {
     }
 }
 
+#[test]
+fn release_workflow_packages_static_shell_completions() {
+    let workflow = read(&repo_root().join(".github/workflows/release.yml"));
+    for expected in [
+        r#""${bindir}/pohunek" completions bash > "${staging}/completions/pohunek.bash""#,
+        r#""${bindir}/pohunek" completions zsh > "${staging}/completions/_pohunek""#,
+        r#""${bindir}/pohunek" completions fish > "${staging}/completions/pohunek.fish""#,
+    ] {
+        assert!(
+            workflow.contains(expected),
+            "missing packaged completion: {expected}"
+        );
+    }
+}
+
 struct Fixture {
     root: PathBuf,
     archive: PathBuf,
