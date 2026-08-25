@@ -215,13 +215,25 @@ fn agent_status(agent: AgentKind) -> Result<IntegrationAgentStatus, ProtocolErro
         }
     }
 
-    let warning = drift_warning(
+    let warning = drift_warnings(
         &agent,
         &config_dir,
-        primary_content.as_deref(),
-        notify_content.is_none(),
-    );
+        &[
+            (
+                ManagedAssetKind::StateHook,
+                primary_content.as_deref(),
+                expected_primary_asset(&agent),
+            ),
+            (
+                ManagedAssetKind::NotificationHook,
+                notify_content.as_deref(),
+                notify_asset,
+            ),
+        ],
+    )
+    .join("; ");
     let state = install_state(
+        &agent,
         primary_content.as_deref(),
         notify_content.as_deref(),
         notify_asset,
@@ -238,7 +250,7 @@ fn agent_status(agent: AgentKind) -> Result<IntegrationAgentStatus, ProtocolErro
             .and_then(parse_integration_version),
         expected_version: EXPECTED_INTEGRATION_VERSION,
         state,
-        warning,
+        warning: (!warning.is_empty()).then_some(warning),
     })
 }
 
@@ -260,33 +272,51 @@ fn parse_integration_version(content: &str) -> Option<u32> {
     })
 }
 
-/// Return a concise non-fatal warning for missing or drifted files.
-fn drift_warning(
-    agent: &AgentKind,
+/// Independently classifies each read-only managed hook asset.
+#[derive(Debug, Clone, Copy)]
+enum ManagedAssetKind {
+    StateHook,
+    NotificationHook,
+}
+
+impl ManagedAssetKind {
+    fn description(self) -> &'static str {
+        match self {
+            Self::StateHook => "state hook",
+            Self::NotificationHook => "notification hook",
+        }
+    }
+}
+
+/// Return a concise non-fatal warning for every independently drifted asset.
+fn drift_warnings(
+    _agent: &AgentKind,
     config_dir: &Path,
-    primary_content: Option<&str>,
-    notify_missing: bool,
-) -> Option<String> {
+    assets: &[(ManagedAssetKind, Option<&str>, &'static str)],
+) -> Vec<String> {
     if !config_dir.is_dir() {
-        return Some("agent config dir does not exist".to_owned());
+        return vec!["agent config dir does not exist".to_owned()];
     }
-    let Some(primary) = primary_content else {
-        return Some("managed state hook is missing".to_owned());
-    };
-    if notify_missing {
-        return Some("partial install: notification hook is missing".to_owned());
+
+    let mut warnings = Vec::new();
+    for (asset_kind, content, expected_asset) in assets {
+        let asset_kind_description = asset_kind.description();
+        let Some(content) = content else {
+            warnings.push(format!("managed {asset_kind_description} is missing"));
+            continue;
+        };
+        if *content != *expected_asset {
+            warnings.push(format!(
+                "{asset_kind_description} version marker is missing, invalid, or outdated"
+            ));
+        }
     }
-    if parse_integration_version(primary) != Some(EXPECTED_INTEGRATION_VERSION) {
-        return Some("hook version marker is missing, invalid, or outdated".to_owned());
-    }
-    if primary != expected_primary_asset(agent) {
-        return Some("hook version matches but its content was modified".to_owned());
-    }
-    None
+    warnings
 }
 
 /// Aggregate health from both managed files; version drift wins over edits.
 fn install_state(
+    agent: &AgentKind,
     primary_content: Option<&str>,
     notify_content: Option<&str>,
     expected_notify_asset: &str,
@@ -295,24 +325,12 @@ fn install_state(
     if no_managed_files {
         return IntegrationInstallState::NotInstalled;
     }
-    let versions_current =
-        primary_content.and_then(parse_integration_version) == Some(EXPECTED_INTEGRATION_VERSION);
-    let contents_current = primary_content
-        == Some(expected_primary_asset_for_state(primary_content))
+    let contents_current = primary_content == Some(expected_primary_asset(agent))
         && notify_content == Some(expected_notify_asset);
-    if contents_current || versions_current {
+    if contents_current {
         IntegrationInstallState::Current
     } else {
         IntegrationInstallState::Outdated
-    }
-}
-
-/// Infer the embedded primary asset from the content that is present.
-fn expected_primary_asset_for_state(primary_content: Option<&str>) -> &'static str {
-    if primary_content == Some(CODEX_HOOK_ASSET) {
-        CODEX_HOOK_ASSET
-    } else {
-        CLAUDE_HOOK_ASSET
     }
 }
 
@@ -1032,8 +1050,6 @@ mod tests {
     const STATE_RELEASE_REQUEST_COUNT: usize = 1;
     /// Integration asset version expected after PID-bearing state hooks ship.
     const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=4";
-    /// Notification hook version used by status drift fixtures.
-    const NOTIFY_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=4";
     /// Action argument for state-hook `SessionStart` reporting.
     const STATE_SESSION_ACTION: &str = "session";
     /// Action argument for state-hook release reporting.
@@ -2023,9 +2039,9 @@ mod tests {
             .expect("write outdated primary hook");
         fs::write(
             codex.join("pohunek-agent-notify.sh"),
-            NOTIFY_ASSET_VERSION_HEADER,
+            CODEX_NOTIFY_HOOK_ASSET,
         )
-        .expect("write malformed notify marker");
+        .expect("write current notify marker");
 
         let reports = with_config_dirs(&claude, &codex, || {
             super::status(protocol::IntegrationStatusParams { agent: None })
@@ -2050,7 +2066,7 @@ mod tests {
     }
 
     #[test]
-    fn status_reports_version_matched_user_modification_as_current_with_warning() {
+    fn status_reports_version_matched_user_modification_as_outdated_with_warning() {
         let codex = temp_dir("status-user-modified");
         fs::create_dir_all(&codex).expect("create Codex dir");
         let modified_hook = CODEX_HOOK_ASSET.replace("set -eu\n", "set -eu\n# user edit\n");
@@ -2073,14 +2089,69 @@ mod tests {
         .next()
         .expect("Codex status");
 
-        assert_eq!(report.state, protocol::IntegrationInstallState::Current);
-        assert!(report
-            .warning
-            .is_some_and(|warning| warning.contains("content was modified")));
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(
+            report.warning.as_deref(),
+            Some("state hook version marker is missing, invalid, or outdated")
+        );
     }
 
     #[test]
-    fn status_reports_partial_install_as_current_with_warning() {
+    fn status_reports_modified_notification_hook_independently() {
+        let codex = temp_dir("status-notify-modified");
+        fs::create_dir_all(&codex).expect("create Codex dir");
+        fs::write(codex.join("pohunek-agent-state.sh"), CODEX_HOOK_ASSET)
+            .expect("write current state hook");
+        let modified_notification =
+            CODEX_NOTIFY_HOOK_ASSET.replace("set -eu\n", "set -eu\n# user edit\n");
+        fs::write(codex.join("pohunek-agent-notify.sh"), modified_notification)
+            .expect("write modified notification hook");
+
+        let report = with_config_dirs(&codex, &codex, || {
+            super::status(protocol::IntegrationStatusParams {
+                agent: Some(AgentKind::Codex),
+            })
+        })
+        .expect("status modified notification")
+        .agents
+        .into_iter()
+        .next()
+        .expect("Codex status");
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert!(report
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("notification hook")));
+    }
+
+    #[test]
+    fn status_reports_missing_notification_hook_independently() {
+        let codex = temp_dir("status-notify-missing");
+        fs::create_dir_all(&codex).expect("create Codex dir");
+        fs::write(codex.join("pohunek-agent-state.sh"), CODEX_HOOK_ASSET)
+            .expect("write current state hook");
+
+        let report = with_config_dirs(&codex, &codex, || {
+            super::status(protocol::IntegrationStatusParams {
+                agent: Some(AgentKind::Codex),
+            })
+        })
+        .expect("status missing notification")
+        .agents
+        .into_iter()
+        .next()
+        .expect("Codex status");
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(
+            report.warning.as_deref(),
+            Some("managed notification hook is missing")
+        );
+    }
+
+    #[test]
+    fn status_reports_partial_install_as_outdated_with_warning() {
         let codex = temp_dir("status-partial");
         fs::create_dir_all(&codex).expect("create Codex dir");
         fs::write(codex.join("pohunek-agent-state.sh"), CODEX_HOOK_ASSET)
@@ -2098,7 +2169,7 @@ mod tests {
         .expect("Codex status");
 
         assert_eq!(report.managed_hook_paths.len(), 1);
-        assert_eq!(report.state, protocol::IntegrationInstallState::Current);
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
         assert!(report
             .warning
             .is_some_and(|warning| warning.contains("notification hook is missing")));

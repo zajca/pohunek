@@ -3,4 +3,4 @@
 /**
  * Derived installation health for one managed hook integration.
  */
-export type IntegrationInstallState = "NotInstalled" | "Current" | "Outdated";
+export type IntegrationInstallState = "not_installed" | "current" | "outdated";

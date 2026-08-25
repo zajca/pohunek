@@ -190,10 +190,6 @@ pub(crate) enum HermesAction {
     /// Install the managed plugin and its explicit policy.
     Install,
     /// Inspect the managed plugin lifecycle state.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "tests still exercise the Hermes action mapping")
-    )]
     Status,
     /// Run the deterministic diagnostic inventory.
     Doctor,
@@ -589,7 +585,7 @@ fn render_status_human(result: &IntegrationStatusResult) -> String {
             agent_label(&report.agent),
             report.available,
             state_label(report.state),
-            version_label(report.installed_version),
+            version_label(report.installed_version, report.expected_version)
         );
         let _ = writeln!(output, "  hook: {}", report.expected_hook_path);
         for path in &report.managed_hook_paths {
@@ -610,10 +606,10 @@ fn state_label(state: IntegrationInstallState) -> &'static str {
     }
 }
 
-fn version_label(version: Option<u32>) -> &'static str {
-    match version {
-        Some(_) => "reported",
-        None => "unknown",
+fn version_label(installed: Option<u32>, expected: u32) -> String {
+    match installed {
+        Some(version) => format!("{version}/{expected}"),
+        None => format!("unknown/{expected}"),
     }
 }
 
@@ -761,21 +757,22 @@ mod status_tests {
             .lines()
             .filter(|line| line.starts_with("claude "))
             .collect();
-        assert!(rows.len() == 1 && rows[0].contains("current") && rows[0].ends_with("reported"));
+        assert!(rows.len() == 1 && rows[0].contains("current") && rows[0].ends_with("4/4"));
         assert!(output.contains("  hook: /home/u/.claude/hooks/pohunek-agent-state.sh"));
         assert!(output.contains("  managed: /home/u/.claude/hooks/pohunek-agent-notify.sh"));
         let rows: Vec<&str> = output
             .lines()
             .filter(|line| line.starts_with("codex "))
             .collect();
-        assert!(rows.len() == 1 && rows[0].contains("outdated") && rows[0].ends_with("unknown"));
-        assert!(output.contains("  warning: hook version marker is missing or invalid"));
+        assert!(rows.len() == 1 && rows[0].contains("outdated") && rows[0].ends_with("unknown/4"));
+        assert!(output
+            .contains("  warning: state hook version marker is missing, invalid, or outdated"));
     }
 
     #[test]
-    fn renders_unknown_version_without_disclosing_values() {
-        assert_eq!(version_label(Some(4)), "reported");
-        assert_eq!(version_label(None), "unknown");
+    fn renders_installed_and_expected_versions() {
+        assert_eq!(version_label(Some(4), 5), "4/5");
+        assert_eq!(version_label(None, 5), "unknown/5");
     }
 }
 

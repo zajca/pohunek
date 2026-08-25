@@ -597,11 +597,13 @@ enum IntegrationAction {
         #[arg(long)]
         json: bool,
     },
-    /// Inspect the locally managed Hermes operator plugin.
+    /// Inspect local Hermes or daemon-backed Codex/Claude integration status.
     Status {
-        /// Restrict status to Codex or Claude; omit for both hook agents.
+        /// Restrict status; Hermes requires an explicit local target.
         #[arg(long, value_enum)]
         agent: Option<commands::integration::HookAgentArg>,
+        #[command(flatten)]
+        hermes: HermesStatusCliOptions,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -715,6 +717,36 @@ struct HermesRequiredTarget {
     /// Select one absolute, owner-private Hermes home.
     #[arg(long)]
     hermes_home: Option<PathBuf>,
+}
+
+/// Read-only Hermes status options.
+#[derive(Debug, Args)]
+struct HermesStatusCliOptions {
+    #[command(flatten)]
+    target: HermesRequiredTarget,
+    /// Use one absolute Hermes executable instead of a bounded absolute PATH lookup.
+    #[arg(long)]
+    hermes_bin: Option<PathBuf>,
+}
+
+impl From<HermesStatusCliOptions> for commands::integration::HermesOptions {
+    fn from(value: HermesStatusCliOptions) -> Self {
+        Self {
+            profile: value.target.hermes_profile,
+            home: value.target.hermes_home,
+            hermes_bin: value.hermes_bin,
+            pohunek_bin: None,
+            access_mode: None,
+            allowed_hosts: vec![],
+            tool_timeout_ms: None,
+            request_timeout_ms: None,
+            max_output_bytes: None,
+            max_screen_bytes: None,
+            max_concurrency: None,
+            confirm_wildcard: false,
+            confirm_modified: false,
+        }
+    }
 }
 
 /// Read-only Hermes doctor options.
@@ -1688,12 +1720,24 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                         }
                     }
                 }
-                IntegrationAction::Status { agent, json } => {
-                    if agent == Some(commands::integration::HookAgentArg::Hermes) {
-                        return Err(commands::integration::unsupported_action(agent));
+                IntegrationAction::Status {
+                    agent,
+                    hermes,
+                    json,
+                } => {
+                    if let Some(agent) = agent {
+                        if agent == commands::integration::HookAgentArg::Hermes {
+                            return run_integration_hermes_action(
+                                commands::integration::HermesAction::Status,
+                                agent,
+                                &hermes.into(),
+                                json,
+                            );
+                        }
+                        return Err(commands::integration::unsupported_action(Some(agent)));
                     }
                     let paths = Paths::resolve()?;
-                    commands::integration::run_status(&paths, agent, json).await?;
+                    commands::integration::run_status(&paths, None, json).await?;
                     return Ok(ExitCode::SUCCESS);
                 }
                 IntegrationAction::Doctor {

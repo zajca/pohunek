@@ -121,6 +121,7 @@ pub struct IntegrationAgentStatus {
 
 /// Derived installation health for one managed hook integration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationInstallState.ts"))]
 pub enum IntegrationInstallState {

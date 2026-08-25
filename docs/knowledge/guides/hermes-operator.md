@@ -88,9 +88,9 @@ pohunek integration uninstall --agent hermes \
   --hermes-home /absolute/owner/private/hermes-home --json
 ```
 
-`status`, `doctor`, `update`, and `uninstall` are Hermes-only actions. Asking
-for them with Codex or Claude returns a typed unsupported-action error; their
-existing `integration install` behavior remains separate.
+`doctor`, `update`, and `uninstall` are Hermes-only actions. Asking for them
+with Codex or Claude returns a typed unsupported-action error; their separate
+daemon-backed status reports managed-hook drift, while install remains available.
 
 ## Access policy and targets
 

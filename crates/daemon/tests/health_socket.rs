@@ -17,17 +17,18 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use protocol::{
     event, method, AgentActivity, AgentKind, AssistantMaterializeParams,
-    AssistantMaterializeResult, AttachHeader, ErrorClass, Event, NotificationCreateParams,
-    NotificationCreateResult, NotificationDeleteParams, NotificationDeleteResult, NotificationKind,
-    NotificationKindPolicy, NotificationListParams, NotificationListResult, NotificationPolicy,
-    NotificationPolicyParams, NotificationPolicyResult, NotificationRetentionParams,
-    NotificationRetentionResult, NotificationSeverity, NotificationSource, NotificationStatus,
-    NotificationUpdateParams, NotificationUpdateResult, ReportSequence, Request as ProtocolRequest,
-    Response, SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult,
-    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter,
-    SessionListParams, SessionNewParams, SessionRemoveResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionResizeParams, SessionResizeResult, SessionState,
-    SessionStopResult, StateSource, TerminalDimensions, PROTOCOL_VERSION,
+    AssistantMaterializeResult, AttachHeader, ErrorClass, Event, IntegrationStatusParams,
+    IntegrationStatusResult, NotificationCreateParams, NotificationCreateResult,
+    NotificationDeleteParams, NotificationDeleteResult, NotificationKind, NotificationKindPolicy,
+    NotificationListParams, NotificationListResult, NotificationPolicy, NotificationPolicyParams,
+    NotificationPolicyResult, NotificationRetentionParams, NotificationRetentionResult,
+    NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
+    NotificationUpdateResult, ReportSequence, Request as ProtocolRequest, Response,
+    SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
+    SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
+    SessionNewParams, SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, StateSource,
+    TerminalDimensions, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -232,6 +233,29 @@ async fn spawn_server(
             .await;
     });
     (tx, handle)
+}
+
+#[tokio::test]
+async fn integration_status_dispatches_at_daemon_boundary() {
+    let _xdg = XdgGuard::set_all("integration-status-rpc").await;
+    let socket = temp_socket("integration-status-rpc");
+    let (shutdown, server) = spawn_server(&socket, "test").await;
+    let mut framed = connect(&socket).await;
+    let request = Request::make(
+        "integration-status",
+        method::INTEGRATION_STATUS,
+        serde_json::to_value(IntegrationStatusParams { agent: None }).expect("serialize params"),
+    );
+    let payload = ok_payload(exchange(&mut framed, &request).await);
+
+    let result: IntegrationStatusResult =
+        serde_json::from_value(payload).expect("deserialize status result");
+    assert_eq!(result.agents.len(), 2);
+    assert!(result.agents.iter().all(|agent| !agent.available));
+
+    framed.get_mut().shutdown().await.expect("close client");
+    shutdown.send(()).expect("send integration status shutdown");
+    server.await.expect("integration status server task");
 }
 
 /// Build a `SessionRegistry` wired to a real `SubprocessWorkerLauncher` (the

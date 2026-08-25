@@ -199,6 +199,7 @@ All params and result type names below refer to structs exported by
 | `session.diff` | `SessionDiffParams` | `SessionDiffResult` | Computes a unified diff of a session's worktree against a base ref. `base: null` defers to the worktree binding's recorded base branch, then the repository default. A session without a bound worktree returns `session_no_worktree`; a hostile explicit `base` (empty, leading `-`, or a control character) returns `invalid_branch`; a `base` that cannot be resolved to a merge-base against `HEAD` returns `session_diff_base_unresolved`. See `SessionDiffResult` under Core Payloads for the size cap and truncation semantics. |
 | `subscribe` | `null` | `{subscribed: true}` then event stream | Consumes the connection into a one-way event stream. |
 | `integration.install` | `IntegrationInstallParams` or `null` | `IntegrationInstallResult` | Installs agent hooks for active-agent state, native session id capture, and provider notifications. |
+| `integration.status` | `IntegrationStatusParams` or `null` | `IntegrationStatusResult` | Returns a read-only per-agent report for managed Codex and Claude hooks: availability, expected and present asset paths, installed versus expected version, aggregate health (`not_installed`, `current`, or `outdated`), and a non-secret drift warning. It never mutates provider configuration. |
 | `assistant.materialize` | `AssistantMaterializeParams` | `AssistantMaterializeResult` | Materializes the assistant knowledge bundle on the daemon host. |
 | `notification.create` | `NotificationCreateParams` | `NotificationCreateResult` | Creates a host-local notification. Daemon policy is enforced for every producer, including provider hooks and daemon projectors. Dedupe may return `created: false` with an existing or upgraded record. `agent_blocked`/`approval_required` with `attention:<session_id>` and `turn_completed` with `turn:<session_id>` are deferred: the result still reports `created: true` with a minted id, but the record is held pending until `attention_debounce_secs` elapses; see `NotificationPolicy`. |
 | `notification.list` | `NotificationListParams` or `null` | `NotificationListResult` | Lists notification records with exact-match filters and cursor pagination. Deleted records are excluded unless `status: deleted` is requested. |
@@ -798,6 +799,11 @@ answer different questions:
 current Codex and Claude builds only. There is no fallback for older provider
 hook APIs.
 
+`integration.status` is the corresponding read-only drift report. It checks each
+managed script independently against its embedded asset and reports versions as
+`installed/expected`; it does not imply that provider registration files are
+intact unless the returned warning is absent.
+
 Codex notification support requires modern lifecycle hooks for
 `PermissionRequest` and `Stop`. The installer writes managed command hooks to
 `hooks.json` and records trust metadata in `config.toml`; the legacy Codex
@@ -994,9 +1000,10 @@ pohunek integration doctor --agent hermes --hermes-profile default --json
 
 `--hermes-profile default`, a named `--hermes-profile`, and an absolute
 `--hermes-home` are explicit target selections; a profile and home cannot be
-combined. `status`, `doctor`, `update`, and `uninstall` are Hermes-only and
-return `configuration/integration_action_unsupported` for another agent. The
-existing daemon-backed Codex/Claude `integration install` behavior is unchanged.
+combined. `doctor`, `update`, and `uninstall` are Hermes-only and return
+`configuration/integration_action_unsupported` for another agent. Hermes status
+uses the same local target contract; daemon-backed Codex/Claude status uses the
+new RPC without those local Hermes flags, and their install behavior is unchanged.
 
 The installation policy is Pohunek-owned, owner-private, and external to the
 immutable plugin checksum set. It fixes the absolute `pohunek` executable,

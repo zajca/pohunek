@@ -59,6 +59,9 @@ For durable notification issues:
    not enough. Claude requires `Notification`, `Stop`, and `StopFailure` hooks.
    Reinstall preserves user hooks unless their command exactly matches a
    Pohunek-managed hook command.
+   First inspect drift with `pohunek integration status --agent <codex-or-claude>
+   --json`: each managed hook must be current independently and versions are
+   reported as `installed/expected`.
 9. If a notification is missing its session link, inspect the hook environment
    setup. Hook adapters silently drop an invalid `POHUNEK_SESSION_ID` and still
    create the notification without linkage.

@@ -255,6 +255,7 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::DAEMON_DOCTOR => daemon::handle_daemon_doctor(request).await,
         method::ASSISTANT_MATERIALIZE => assistant::handle_assistant_materialize(request).await,
         method::INTEGRATION_INSTALL => integration::handle_integration_install(request),
+        method::INTEGRATION_STATUS => integration::handle_integration_status(request),
         method::HOST_INSPECT => host::handle_host_inspect(request, &state.health, &state.sessions),
         method::HOST_DISCOVER => host::handle_host_discover(request, &state.discovery).await,
         method::NOTIFICATION_CREATE => {
