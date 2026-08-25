@@ -884,6 +884,7 @@ struct MockInspectorState {
     descendants: HashMap<Pid, Vec<ProcessFact>>,
     descendants_error: Option<std::io::ErrorKind>,
     foreground_groups: HashMap<Pid, Option<Pid>>,
+    foreground_error: Option<std::io::ErrorKind>,
     cwd: HashMap<Pid, PathBuf>,
     exits: HashMap<Pid, tokio::sync::watch::Sender<bool>>,
     ownership_markers: HashMap<Pid, OwnershipMarkers>,
@@ -910,6 +911,13 @@ impl MockInspector {
             .lock()
             .expect("mock inspector lock")
             .descendants_error = Some(kind);
+    }
+
+    fn fail_foreground_with(&self, kind: std::io::ErrorKind) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .foreground_error = Some(kind);
     }
 
     fn fire_exit(&self, pid: Pid) {
@@ -1023,14 +1031,11 @@ impl ProcessInspector for MockInspector {
     }
 
     fn foreground_process_group(&self, root_pid: Pid) -> std::io::Result<Option<Pid>> {
-        Ok(self
-            .inner
-            .lock()
-            .expect("mock inspector lock")
-            .foreground_groups
-            .get(&root_pid)
-            .copied()
-            .flatten())
+        let inner = self.inner.lock().expect("mock inspector lock");
+        if let Some(kind) = inner.foreground_error {
+            return Err(std::io::Error::new(kind, "mock foreground failure"));
+        }
+        Ok(inner.foreground_groups.get(&root_pid).copied().flatten())
     }
 }
 
@@ -1085,6 +1090,116 @@ async fn foreign_foreground_process_does_not_hijack_reconciliation() {
     assert_eq!(inspected.active_agent, None);
     assert_eq!(inspected.active_agent_pid, None);
     assert_eq!(inspected.cwd, root_cwd);
+}
+
+#[tokio::test]
+async fn foreground_member_matches_pgid_without_crossing_groups() {
+    let (registry, inspector, created) = mock_procwatch_registry("foreground-member").await;
+
+    // The wrapper is the recognized leader but not an identified agent. Its PGID
+    // identifies the group; a same-kind process in another group must never win.
+    let mut wrapper = codex_fact(400, created.pid);
+    wrapper.pgid = 399;
+    let mut member = claude_fact(410, 400);
+    member.pgid = 399;
+    let unrelated = codex_fact(420, created.pid);
+    inspector.set_descendants(created.pid, vec![wrapper, member, unrelated]);
+    inspector.set_foreground_group(created.pid, Some(399));
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let selected = registry.inspect(&created.id).await.expect("inspect");
+
+    assert_eq!(selected.active_agent.as_deref(), Some("claude"));
+    assert_eq!(selected.active_agent_base, Some(AgentKind::Claude));
+    assert_eq!(selected.active_agent_pid, Some(410));
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn foreground_replacement_replaces_hook_identity_and_detector() {
+    let (registry, inspector, created) = mock_direct_codex_registry("foreground-replace").await;
+    inspector.set_descendants(created.pid, vec![claude_fact(500, created.pid)]);
+    inspector.set_cwd(500, temp_dir("foreground-replacement"));
+    inspector.set_foreground_group(created.pid, Some(500));
+
+    let report = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: CODEX_HOOK_SOURCE.to_owned(),
+            agent: "codex".to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
+            pid: Some(created.pid),
+            agent_session_id: Some("stale-codex-native".to_owned()),
+            agent_session_path: Some("/tmp/stale-codex.jsonl".to_owned()),
+        })
+        .await;
+    assert!(report.recorded);
+    let initial_detector = registry.inner.sessions.lock().await[&created.id]
+        .detector_config
+        .subscribe();
+    assert!(initial_detector.borrow().manifest.is_some());
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let replaced = registry.inspect(&created.id).await.expect("inspect");
+    let replacement_detector = registry.inner.sessions.lock().await[&created.id]
+        .detector_config
+        .subscribe();
+
+    assert_eq!(replaced.active_agent.as_deref(), Some("claude"));
+    assert_eq!(replaced.active_agent_base, Some(AgentKind::Claude));
+    assert_eq!(replaced.active_agent_pid, Some(500));
+    assert_eq!(replaced.active_agent_session_id, None);
+    assert_eq!(replaced.active_agent_session_path, None);
+    assert_eq!(
+        replacement_detector.borrow().detection,
+        DetectorConfig::for_agent(&AgentKind::Claude).detection
+    );
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn transient_foreground_error_preserves_last_known_claim() {
+    let (registry, inspector, created) = mock_procwatch_registry("foreground-error").await;
+    inspector.set_descendants(created.pid, vec![codex_fact(600, created.pid)]);
+    inspector.set_foreground_group(created.pid, Some(600));
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("initial inspect")
+            .active_agent_pid,
+        Some(600)
+    );
+
+    inspector.fail_foreground_with(std::io::ErrorKind::PermissionDenied);
+    inspector.set_descendants(created.pid, vec![codex_fact(610, created.pid)]);
+    inspector.fire_exit(600);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+
+    let preserved = registry
+        .inspect(&created.id)
+        .await
+        .expect("preserved inspect");
+    assert_eq!(preserved.active_agent.as_deref(), Some("codex"));
+    assert_eq!(preserved.active_agent_pid, Some(600));
+    assert_eq!(
+        registry.inner.sessions.lock().await[&created.id].foreground_process_group,
+        Some(600)
+    );
+
+    let _ = registry.stop(&created.id).await;
 }
 
 fn title_activity(config: &DetectorConfig, title: &str) -> Option<AgentActivity> {
@@ -4343,6 +4458,7 @@ async fn report_agent_returns_false_for_unknown_agent() {
 fn codex_fact(process_id: Pid, parent_id: Pid) -> ProcessFact {
     ProcessFact {
         pid: process_id,
+        pgid: process_id,
         ppid: parent_id,
         start_identity: u64::from(process_id),
         comm: "codex".to_owned(),
@@ -4353,6 +4469,7 @@ fn codex_fact(process_id: Pid, parent_id: Pid) -> ProcessFact {
 fn claude_fact(process_id: Pid, parent_id: Pid) -> ProcessFact {
     ProcessFact {
         pid: process_id,
+        pgid: process_id,
         ppid: parent_id,
         start_identity: u64::from(process_id),
         comm: "claude".to_owned(),

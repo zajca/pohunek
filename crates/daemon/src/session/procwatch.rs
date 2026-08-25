@@ -19,8 +19,13 @@ use super::{
 };
 
 const PROCWATCH_SOURCE: &str = "pohunek:procwatch";
-/// Last observed foreground group for one reconciliation pass.
-type ForegroundGroups = HashMap<SessionId, Option<Pid>>;
+/// Result of one terminal-foreground probe.
+enum ForegroundProbe {
+    /// The probe succeeded, including the no-controlling-terminal case.
+    Observed(Option<Pid>),
+    /// The OS inspection failed and the previous observation must remain valid.
+    TransientError,
+}
 
 impl SessionRegistry {
     pub(super) fn spawn_procwatch(
@@ -53,7 +58,7 @@ impl SessionRegistry {
         id: &SessionId,
         root_pid: Pid,
         cached: Option<Pid>,
-    ) -> Option<Pid> {
+    ) -> ForegroundProbe {
         match self.inner.inspector.foreground_process_group(root_pid) {
             Ok(foreground) => {
                 if cached != foreground {
@@ -64,7 +69,7 @@ impl SessionRegistry {
                         "session foreground process group changed"
                     );
                 }
-                foreground
+                ForegroundProbe::Observed(foreground)
             }
             Err(err) => {
                 debug!(
@@ -73,7 +78,7 @@ impl SessionRegistry {
                     error = %err,
                     "failed to inspect foreground process group"
                 );
-                None
+                ForegroundProbe::TransientError
             }
         }
     }
@@ -99,7 +104,6 @@ impl SessionRegistry {
             None => HashMap::new(),
         };
 
-        let cached_foreground_groups = ForegroundGroups::default();
         let (to_spawn, updated, focus_pid) = {
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(id) else {
@@ -141,11 +145,10 @@ impl SessionRegistry {
             }
 
             let updated = self.reconcile_active_agent(entry, now);
-            entry.foreground_process_group = self.probe_foreground_group(
-                id,
-                root_pid,
-                cached_foreground_groups.get(id).copied().flatten(),
-            );
+            let probe = self.probe_foreground_group(id, root_pid, entry.foreground_process_group);
+            if let ForegroundProbe::Observed(foreground) = probe {
+                entry.foreground_process_group = foreground;
+            }
             let foreground_update = choose_foreground_agent(entry, root_pid, now);
             let focus_pid = entry
                 .active_agent
@@ -217,6 +220,7 @@ impl SessionRegistry {
                     fact.pid,
                     ObservedAgent {
                         pid: fact.pid,
+                        pgid: Some(fact.pgid),
                         agent_base,
                         first_seen: now,
                         cwd,
@@ -486,12 +490,25 @@ fn choose_foreground_observed(
     entry: &SessionEntry,
     foreground_group: Pid,
 ) -> Option<ObservedAgent> {
-    entry.observed_agents.iter().find_map(|observed| {
-        (observed.pid == foreground_group).then(|| {
-            first_observed_agent_for_base(entry, &observed.agent_base)
-                .unwrap_or_else(|| observed.clone())
+    let group_members: Vec<_> = entry
+        .observed_agents
+        .iter()
+        .filter(|observed| {
+            observed.pid == foreground_group || observed.pgid == Some(foreground_group)
         })
-    })
+        .collect();
+    let leader_base = group_members
+        .iter()
+        .find(|observed| observed.pid == foreground_group)
+        .map(|leader| &leader.agent_base);
+    let matching = group_members
+        .iter()
+        .filter(|observed| Some(&observed.agent_base) == leader_base)
+        .min_by_key(|observed| observed.first_seen)
+        .or(group_members
+            .iter()
+            .min_by_key(|observed| observed.first_seen))?;
+    Some((*matching).clone())
 }
 
 fn auto_report_for_foreground(
@@ -521,6 +538,11 @@ fn auto_report_for_foreground(
     entry.info.active_agent = Some(agent);
     entry.info.active_agent_base = Some(observed.agent_base.clone());
     entry.info.active_agent_pid = Some(observed.pid);
+    entry.info.active_agent_session_id = None;
+    entry.info.active_agent_session_path = None;
+    let _ = entry
+        .detector_config
+        .send(DetectorConfig::for_agent(&observed.agent_base));
     entry.info.updated_at = timestamp_now();
     entry.info.clone()
 }

@@ -489,6 +489,7 @@ type NativeIdentityReport = crate::store::NativeIdentityOrdering;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ObservedAgent {
     pid: Pid,
+    pgid: Option<Pid>,
     agent_base: AgentKind,
     first_seen: Instant,
     cwd: Option<PathBuf>,

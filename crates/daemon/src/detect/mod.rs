@@ -520,7 +520,7 @@ mod tests {
         ActivityTransition, DetectionConfig, Detector, DetectorConfig, Manifest, ManifestRegion,
         MatchContext,
     };
-    use crate::procwatch::ProcessFact;
+    use crate::procwatch::{Pid, ProcessFact};
 
     fn instant() -> Instant {
         Instant::now()
@@ -565,39 +565,36 @@ mod tests {
         Manifest::parse_str(source).expect("manifest should parse")
     }
 
+    fn fact(process_id: Pid, comm: &str, cmdline: &[&str]) -> ProcessFact {
+        ProcessFact {
+            pid: process_id,
+            pgid: process_id,
+            ppid: 1,
+            start_identity: u64::from(process_id),
+            comm: comm.to_owned(),
+            cmdline: cmdline
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
+        }
+    }
+
     #[test]
     fn identify_agent_matches_builtin_process_sections() {
         assert_eq!(
-            super::identify_agent(&ProcessFact {
-                pid: 100,
-                ppid: 1,
-                start_identity: 100,
-                comm: "codex".to_owned(),
-                cmdline: vec!["/usr/bin/codex".to_owned()],
-            }),
+            super::identify_agent(&fact(100, "codex", &["/usr/bin/codex"])),
             Some(AgentKind::Codex)
         );
         assert_eq!(
-            super::identify_agent(&ProcessFact {
-                pid: 101,
-                ppid: 1,
-                start_identity: 101,
-                comm: "node".to_owned(),
-                cmdline: vec![
-                    "node".to_owned(),
-                    "/opt/claude-code/bin/claude.js".to_owned()
-                ],
-            }),
+            super::identify_agent(&fact(
+                101,
+                "node",
+                &["node", "/opt/claude-code/bin/claude.js"],
+            )),
             Some(AgentKind::Claude)
         );
         assert_eq!(
-            super::identify_agent(&ProcessFact {
-                pid: 102,
-                ppid: 1,
-                start_identity: 102,
-                comm: "sleep".to_owned(),
-                cmdline: vec!["sleep".to_owned(), "30".to_owned()],
-            }),
+            super::identify_agent(&fact(102, "sleep", &["sleep", "30"])),
             None
         );
 
@@ -620,13 +617,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                super::identify_agent(&ProcessFact {
-                    pid,
-                    ppid: 1,
-                    start_identity: u64::from(pid),
-                    comm: comm.to_owned(),
-                    cmdline: cmdline.into_iter().map(str::to_owned).collect(),
-                }),
+                super::identify_agent(&fact(pid, comm, &cmdline)),
                 Some(AgentKind::Hermes)
             );
         }
@@ -657,13 +648,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                super::identify_agent(&ProcessFact {
-                    pid,
-                    ppid: 1,
-                    start_identity: u64::from(pid),
-                    comm: comm.to_owned(),
-                    cmdline: cmdline.into_iter().map(str::to_owned).collect(),
-                }),
+                super::identify_agent(&fact(pid, comm, &cmdline)),
                 None,
                 "unrelated process must not be identified as Hermes"
             );

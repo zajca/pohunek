@@ -27,6 +27,8 @@ pub type Pid = u32;
 pub struct ProcessFact {
     /// Process id.
     pub pid: Pid,
+    /// Process-group id used to identify terminal foreground members exactly.
+    pub pgid: Pid,
     /// Parent process id.
     pub ppid: Pid,
     /// Kernel process start time, used with `pid` to reject pid reuse.

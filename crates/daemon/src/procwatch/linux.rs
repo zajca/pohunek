@@ -24,11 +24,16 @@ const PROC_ROOT: &str = "/proc";
 /// The syscall currently defines no behavioral flags for our use case; `0`
 /// requests the default pidfd suitable for readiness polling.
 const PIDFD_OPEN_FLAGS: libc::c_uint = 0;
-/// The `/proc/<pid>/stat` pgrp field after the parenthesized command.
+/// `/proc/<pid>/stat` process-group field number (`pgrp`).
+const STAT_PGRP_FIELD: usize = 5;
+/// `/proc/<pid>/stat` controlling-terminal foreground group field number
+/// (`tpgid`). The value is signed; `-1` means no controlling terminal.
+const STAT_TPGID_FIELD: usize = 8;
+/// First `/proc/<pid>/stat` field that appears after the parenthesized command.
 ///
-/// Field 3 (`state`) is first after the command terminator; skipping four
-/// values reaches field 7 (`pgrp`) without parsing the command text.
-const STAT_PGRP_OFFSET_AFTER_COMMAND: usize = 4;
+/// Kernel numbering starts at field 1 (`pid`), but the parser removes fields 1–2
+/// with the command, leaving field 3 (`state`) at offset zero.
+const FIRST_FIELD_AFTER_COMMAND: usize = 3;
 
 /// Linux process inspector backed by procfs and pidfds.
 #[derive(Debug, Clone, Copy, Default)]
@@ -135,6 +140,31 @@ fn foreground_process_group(root_pid: Pid) -> io::Result<Option<Pid>> {
 }
 
 fn read_stat_process_group(process_id: Pid) -> io::Result<Option<Pid>> {
+    read_stat_field(process_id, STAT_TPGID_FIELD)
+}
+
+#[cfg(test)]
+fn parse_stat_process_group(stat: &str) -> Option<Pid> {
+    let command_end = stat.rfind(')')?;
+    let fields = stat.get(command_end + 1..)?;
+    fields
+        .split_whitespace()
+        .nth(STAT_TPGID_OFFSET_AFTER_COMMAND)
+        .and_then(|value| value.parse().ok())
+}
+
+/// Offset from field 3 (`state`) to field 8 (`tpgid`) after the command.
+#[cfg(test)]
+const STAT_TPGID_OFFSET_AFTER_COMMAND: usize = 5;
+
+/// Reads one numeric `/proc/<pid>/stat` field by its kernel-defined number.
+/// A malformed or unparsable value yields `None`. Kernel uses `-1` when a
+/// process has no controlling terminal; parsing that as unsigned maps it
+/// naturally to `None`.
+fn read_stat_field<T>(process_id: Pid, field_number: usize) -> io::Result<Option<T>>
+where
+    T: std::str::FromStr,
+{
     let stat = match fs::read_to_string(proc_path(process_id).join("stat")) {
         Ok(stat) => stat,
         Err(err) if is_process_race(&err) => return Ok(None),
@@ -146,20 +176,10 @@ fn read_stat_process_group(process_id: Pid) -> io::Result<Option<Pid>> {
     let Some(fields) = stat.get(command_end + 1..) else {
         return Ok(None);
     };
-    Ok(parse_stat_process_group_fields(fields))
-}
-
-#[cfg(test)]
-fn parse_stat_process_group(stat: &str) -> Option<Pid> {
-    let command_end = stat.rfind(')')?;
-    parse_stat_process_group_fields(stat.get(command_end + 1..)?)
-}
-
-fn parse_stat_process_group_fields(fields: &str) -> Option<Pid> {
-    fields
+    Ok(fields
         .split_whitespace()
-        .nth(STAT_PGRP_OFFSET_AFTER_COMMAND)
-        .and_then(|value| value.parse().ok())
+        .nth(field_number.saturating_sub(FIRST_FIELD_AFTER_COMMAND))
+        .and_then(|value| value.parse().ok()))
 }
 
 /// Reads `POHUNEK_DAEMON_ID` / `POHUNEK_SESSION_ID` from `/proc/<pid>/environ`.
@@ -309,11 +329,15 @@ fn read_process_fact(process_id: Pid, euid: u32) -> io::Result<Option<ProcessFac
     let Some((comm, parent_id)) = read_status(process_id)? else {
         return Ok(None);
     };
+    let Some(pgid) = read_stat_field::<Pid>(process_id, STAT_PGRP_FIELD)? else {
+        return Ok(None);
+    };
     let Some(start_identity) = read_start_identity(process_id)? else {
         return Ok(None);
     };
     Ok(Some(ProcessFact {
         pid: process_id,
+        pgid,
         ppid: parent_id,
         start_identity,
         comm,
@@ -428,15 +452,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stat_process_group_reads_field_after_command() {
+    fn stat_foreground_group_reads_tpgid_after_command() {
         assert_eq!(
             parse_stat_process_group("123 (agent with spaces) S 1 2 3 456 7 8"),
-            Some(456)
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn stat_foreground_group_parses_signed_absent_value() {
+        assert_eq!(parse_stat_process_group("123 (agent) S 1 2 3 456 -1"), None);
+    }
+
+    #[test]
+    fn stat_foreground_group_handles_escaped_parenthesis_in_command() {
+        assert_eq!(
+            parse_stat_process_group("123 (escaped \\() name) S 1 2 3 456 789"),
+            Some(789)
         );
     }
 
     #[test]
     fn malformed_stat_has_no_process_group() {
-        assert_eq!(parse_stat_process_group("123 (agent) S"), None);
+        assert_eq!(
+            parse_stat_process_group("123 (agent with \\() parenthesis) S 1 2 3"),
+            None
+        );
     }
 }

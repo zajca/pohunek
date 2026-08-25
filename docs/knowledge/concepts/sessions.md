@@ -169,6 +169,12 @@ backed by a live process and age out when unbound. `active_agent`,
 filtering, and detector behavior; they do not change the launch `agent` /
 `agent_base`.
 
+Foreground reconciliation selects the recognized process-group leader first;
+when the leader is an unidentified wrapper, it selects a recognized member of
+the same foreground PGID. It never selects a nested agent by kind from another
+process group. Replacing an active agent clears stale native identity metadata
+and switches the detector configuration with the new agent.
+
 The same runtime model keeps `cwd` current. A session starts with its launch
 directory, then procwatch reads the cwd of the focus process on each tick: the
 active nested-agent PID when one is bound, otherwise the root PTY child. OSC 7

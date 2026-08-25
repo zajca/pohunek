@@ -2054,6 +2054,7 @@ mod tests {
         let snapshot = identity_snapshot("native-launch");
         let root = crate::procwatch::ProcessFact {
             pid: 50,
+            pgid: 50,
             ppid: 1,
             start_identity: 500,
             comm: "codex".to_owned(),
@@ -2061,6 +2062,7 @@ mod tests {
         };
         let descendant = crate::procwatch::ProcessFact {
             pid: 60,
+            pgid: 50,
             ppid: 50,
             start_identity: 600,
             comm: "claude".to_owned(),
