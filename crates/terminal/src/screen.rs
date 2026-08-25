@@ -84,6 +84,19 @@ impl ScreenTracker {
         ScreenRegion { lines }
     }
 
+    /// Returns the first non-empty visible lines, counting from the top.
+    #[must_use]
+    pub fn top_non_empty_lines(&self, count: usize) -> ScreenRegion {
+        let lines = self
+            .visible_lines()
+            .into_iter()
+            .filter(|line| !line.is_empty())
+            .take(count)
+            .collect();
+
+        ScreenRegion { lines }
+    }
+
     /// Returns a raw terminal-column slice with blank cells preserved.
     ///
     /// Wide glyphs are emitted only when the requested range includes both
@@ -178,6 +191,25 @@ impl ScreenTracker {
             .map_or(lines.len(), |relative| top + 1 + relative);
 
         lines[top + 1..end].join("\n")
+    }
+
+    /// Returns the last non-empty line above the prompt-box top border.
+    ///
+    /// Returns an empty string when no Codex-style prompt box is present or no
+    /// content remains above its top border.
+    #[must_use]
+    pub fn last_non_empty_above_prompt_box(&self) -> String {
+        let lines = self.visible_lines();
+        let Some(top_border) = Self::prompt_box_top_border_index(&lines) else {
+            return String::new();
+        };
+
+        lines[..top_border]
+            .iter()
+            .rev()
+            .find(|line| !line.is_empty())
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Visible text after the last horizontal-rule line.
@@ -481,6 +513,47 @@ mod tests {
         tracker.feed("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\r\nonly one rule".as_bytes());
 
         assert_eq!(tracker.prompt_box_body(), "");
+    }
+
+    #[test]
+    fn top_non_empty_lines_returns_requested_head_without_blank_rows() {
+        let mut tracker = ScreenTracker::new(6, 20);
+
+        tracker.feed(b"first\r\n\r\nsecond\r\n\r\nthird");
+
+        assert_eq!(
+            tracker.top_non_empty_lines(2).lines,
+            vec!["first".to_string(), "second".to_string()]
+        );
+    }
+
+    #[test]
+    fn top_non_empty_lines_returns_all_available_non_empty_lines_when_fewer_exist() {
+        let mut tracker = ScreenTracker::new(3, 20);
+
+        tracker.feed(b"\r\nonly content");
+
+        assert_eq!(tracker.top_non_empty_lines(2).lines, vec!["only content"]);
+    }
+
+    #[test]
+    fn last_non_empty_above_prompt_box_returns_nearest_content_line() {
+        let mut tracker = ScreenTracker::new(7, 40);
+
+        tracker.feed(
+            "older status\r\nlatest status\r\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\r\n\u{203a} type here\r\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}".as_bytes(),
+        );
+
+        assert_eq!(tracker.last_non_empty_above_prompt_box(), "latest status");
+    }
+
+    #[test]
+    fn last_non_empty_above_prompt_box_is_empty_without_a_complete_box() {
+        let mut tracker = ScreenTracker::new(3, 40);
+
+        tracker.feed("status\r\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}".as_bytes());
+
+        assert_eq!(tracker.last_non_empty_above_prompt_box(), "");
     }
 
     #[test]

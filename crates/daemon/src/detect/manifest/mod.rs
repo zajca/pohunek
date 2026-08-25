@@ -152,6 +152,8 @@ pub enum ManifestRegion {
     WholeRecent,
     BottomLines(usize),
     BottomNonEmptyLines(usize),
+    TopNonEmptyLines(usize),
+    LastNonEmptyAbovePromptBox,
     AfterLastPromptMarker,
     PromptBoxBody,
     AfterLastHorizontalRule,
@@ -168,6 +170,7 @@ impl FromStr for ManifestRegion {
             "after_last_prompt_marker" => Ok(Self::AfterLastPromptMarker),
             "prompt_box_body" => Ok(Self::PromptBoxBody),
             "after_last_horizontal_rule" => Ok(Self::AfterLastHorizontalRule),
+            "last_non_empty_above_prompt_box" => Ok(Self::LastNonEmptyAbovePromptBox),
             _ => parse_parameterized_region(value).ok_or(()),
         }
     }
@@ -179,6 +182,9 @@ fn parse_parameterized_region(value: &str) -> Option<ManifestRegion> {
         .or_else(|| {
             parse_region_count(value, "bottom_non_empty_lines")
                 .map(ManifestRegion::BottomNonEmptyLines)
+        })
+        .or_else(|| {
+            parse_region_count(value, "top_non_empty_lines").map(ManifestRegion::TopNonEmptyLines)
         })
 }
 
@@ -661,6 +667,46 @@ mod tests {
                 .match_context(&context)
                 .map(|matched| matched.region),
             Some(ManifestRegion::BottomNonEmptyLines(2))
+        );
+    }
+
+    #[test]
+    fn parses_top_non_empty_lines_region() {
+        let manifest = Manifest::parse_str(
+            r#"
+            [[rules]]
+            id = "top-setup"
+            state = "blocked"
+            priority = 1
+            region = "top_non_empty_lines(3)"
+            contains = "trust this repository"
+            "#,
+        )
+        .expect("manifest should parse");
+
+        assert_eq!(
+            manifest.required_regions(),
+            vec![ManifestRegion::TopNonEmptyLines(3)]
+        );
+    }
+
+    #[test]
+    fn parses_prompt_adjacent_region() {
+        let manifest = Manifest::parse_str(
+            r#"
+            [[rules]]
+            id = "status-blocked"
+            state = "blocked"
+            priority = 1
+            region = "last_non_empty_above_prompt_box"
+            contains = "approval required"
+            "#,
+        )
+        .expect("manifest should parse");
+
+        assert_eq!(
+            manifest.required_regions(),
+            vec![ManifestRegion::LastNonEmptyAbovePromptBox]
         );
     }
 
