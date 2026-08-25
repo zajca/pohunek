@@ -17,7 +17,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use protocol::{
-    AgentKind, ErrorClass, IntegrationInstallReport, IntegrationInstallResult, ProtocolError,
+    AgentKind, ErrorClass, IntegrationAgentStatus, IntegrationInstallReport,
+    IntegrationInstallResult, IntegrationInstallState, IntegrationStatusParams,
+    IntegrationStatusResult, ProtocolError, EXPECTED_INTEGRATION_VERSION,
 };
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -37,6 +39,8 @@ pub use protocol::{
 const STATE_HOOK_INSTALL_NAME: &str = "pohunek-agent-state.sh";
 /// Installed notification hook script file name (shared by both agents).
 const NOTIFY_HOOK_INSTALL_NAME: &str = "pohunek-agent-notify.sh";
+/// Marker prefix used to identify the installed managed asset version.
+const INTEGRATION_VERSION_PREFIX: &str = "# POHUNEK_INTEGRATION_VERSION=";
 /// The Claude hook script, embedded at compile time.
 const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/pohunek-agent-state.sh");
 /// The Claude notification hook script, embedded at compile time.
@@ -149,6 +153,175 @@ pub fn install(agent: Option<AgentKind>) -> Result<IntegrationInstallResult, Pro
         None => install_all_present()?,
     };
     Ok(IntegrationInstallResult { installed })
+}
+
+/// Inspect managed Codex and Claude hook files without writing anything.
+///
+/// Unsupported agents are rejected so callers cannot mistake an empty report
+/// for "nothing is installed". Missing config directories are reported as
+/// unavailable rather than treated as errors.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError`] for unsupported agents or when the agent config
+/// directory cannot be resolved.
+pub fn status(params: IntegrationStatusParams) -> Result<IntegrationStatusResult, ProtocolError> {
+    let reports = match params.agent {
+        Some(agent) => vec![agent_status(agent)?],
+        None => vec![
+            agent_status(AgentKind::Claude)?,
+            agent_status(AgentKind::Codex)?,
+        ],
+    };
+    Ok(IntegrationStatusResult { agents: reports })
+}
+
+/// Build one agent's read-only status report.
+fn agent_status(agent: AgentKind) -> Result<IntegrationAgentStatus, ProtocolError> {
+    let (config_dir, notify_asset) = match agent {
+        AgentKind::Claude => (claude_config_dir()?, CLAUDE_NOTIFY_HOOK_ASSET),
+        AgentKind::Codex => (codex_config_dir()?, CODEX_NOTIFY_HOOK_ASSET),
+        AgentKind::Shell | AgentKind::Hermes => {
+            return Err(ProtocolError::new(
+                ErrorClass::Runtime,
+                "agent_not_installable",
+                format!("{} has no managed hook integration", agent.as_wire()),
+                None,
+            ));
+        }
+        AgentKind::Unknown(value) => return Err(ProtocolError::agent_kind_unsupported(&value)),
+    };
+    let expected_hook_path = managed_hook_path(&config_dir, &agent, STATE_HOOK_INSTALL_NAME)
+        .display()
+        .to_string();
+    let expected_notify_path = managed_hook_path(&config_dir, &agent, NOTIFY_HOOK_INSTALL_NAME)
+        .display()
+        .to_string();
+
+    let mut managed_hook_paths = Vec::new();
+    let mut primary_content = None;
+    let mut notify_content = None;
+    for (path, content_slot) in [
+        (&expected_hook_path, &mut primary_content),
+        (&expected_notify_path, &mut notify_content),
+    ] {
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                managed_hook_paths.push(path.clone());
+                *content_slot = Some(content);
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(io_error("read", Path::new(path), &err)),
+        }
+    }
+
+    let warning = drift_warning(
+        &agent,
+        &config_dir,
+        primary_content.as_deref(),
+        notify_content.is_none(),
+    );
+    let state = install_state(
+        primary_content.as_deref(),
+        notify_content.as_deref(),
+        notify_asset,
+        managed_hook_paths.is_empty(),
+    );
+
+    Ok(IntegrationAgentStatus {
+        agent,
+        available: config_dir.is_dir(),
+        expected_hook_path,
+        managed_hook_paths,
+        installed_version: primary_content
+            .as_deref()
+            .and_then(parse_integration_version),
+        expected_version: EXPECTED_INTEGRATION_VERSION,
+        state,
+        warning,
+    })
+}
+
+/// Resolve the platform-specific managed hook path for an agent.
+fn managed_hook_path(config_dir: &Path, agent: &AgentKind, file_name: &str) -> PathBuf {
+    if *agent == AgentKind::Codex {
+        config_dir.join(file_name)
+    } else {
+        config_dir.join("hooks").join(file_name)
+    }
+}
+
+/// Parse the first exact integration-version marker in a hook asset.
+fn parse_integration_version(content: &str) -> Option<u32> {
+    content.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(INTEGRATION_VERSION_PREFIX)
+            .and_then(|version| version.parse::<u32>().ok())
+    })
+}
+
+/// Return a concise non-fatal warning for missing or drifted files.
+fn drift_warning(
+    agent: &AgentKind,
+    config_dir: &Path,
+    primary_content: Option<&str>,
+    notify_missing: bool,
+) -> Option<String> {
+    if !config_dir.is_dir() {
+        return Some("agent config dir does not exist".to_owned());
+    }
+    let Some(primary) = primary_content else {
+        return Some("managed state hook is missing".to_owned());
+    };
+    if notify_missing {
+        return Some("partial install: notification hook is missing".to_owned());
+    }
+    if parse_integration_version(primary) != Some(EXPECTED_INTEGRATION_VERSION) {
+        return Some("hook version marker is missing, invalid, or outdated".to_owned());
+    }
+    if primary != expected_primary_asset(agent) {
+        return Some("hook version matches but its content was modified".to_owned());
+    }
+    None
+}
+
+/// Aggregate health from both managed files; version drift wins over edits.
+fn install_state(
+    primary_content: Option<&str>,
+    notify_content: Option<&str>,
+    expected_notify_asset: &str,
+    no_managed_files: bool,
+) -> IntegrationInstallState {
+    if no_managed_files {
+        return IntegrationInstallState::NotInstalled;
+    }
+    let versions_current =
+        primary_content.and_then(parse_integration_version) == Some(EXPECTED_INTEGRATION_VERSION);
+    let contents_current = primary_content
+        == Some(expected_primary_asset_for_state(primary_content))
+        && notify_content == Some(expected_notify_asset);
+    if contents_current || versions_current {
+        IntegrationInstallState::Current
+    } else {
+        IntegrationInstallState::Outdated
+    }
+}
+
+/// Infer the embedded primary asset from the content that is present.
+fn expected_primary_asset_for_state(primary_content: Option<&str>) -> &'static str {
+    if primary_content == Some(CODEX_HOOK_ASSET) {
+        CODEX_HOOK_ASSET
+    } else {
+        CLAUDE_HOOK_ASSET
+    }
+}
+
+/// Return the exact embedded state-hook asset for one supported agent.
+fn expected_primary_asset(agent: &AgentKind) -> &'static str {
+    match agent {
+        AgentKind::Codex => CODEX_HOOK_ASSET,
+        _ => CLAUDE_HOOK_ASSET,
+    }
 }
 
 /// Install for every supported agent whose config dir exists.
@@ -822,16 +995,19 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::sync::Mutex;
     use std::thread;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use protocol::method;
+    use protocol::AgentKind;
     use serde_json::{json, Value};
 
     use super::{
         codex_command_hook_trusted_hash, codex_hook_trust_key, hook_command, install_claude,
-        install_codex, shell_single_quote, toml_basic_string, CLAUDE_HOOK_ASSET, CODEX_HOOK_ASSET,
+        install_codex, shell_single_quote, toml_basic_string, CLAUDE_HOOK_ASSET,
+        CLAUDE_NOTIFY_HOOK_ASSET, CODEX_HOOK_ASSET, CODEX_NOTIFY_HOOK_ASSET,
         CODEX_SESSION_START_TRUST_EVENT, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID,
         ENV_SOCKET_PATH, HOOK_TIMEOUT_SECS,
     };
@@ -856,6 +1032,8 @@ mod tests {
     const STATE_RELEASE_REQUEST_COUNT: usize = 1;
     /// Integration asset version expected after PID-bearing state hooks ship.
     const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=4";
+    /// Notification hook version used by status drift fixtures.
+    const NOTIFY_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=4";
     /// Action argument for state-hook `SessionStart` reporting.
     const STATE_SESSION_ACTION: &str = "session";
     /// Action argument for state-hook release reporting.
@@ -1790,6 +1968,181 @@ mod tests {
             settings["hooks"][CLAUDE_SESSION_END_EVENT][0]["matcher"],
             json!("*")
         );
+    }
+
+    #[test]
+    fn status_reports_missing_config_without_mutation() {
+        let root = temp_dir("status-missing");
+        fs::create_dir_all(&root).expect("create temp root");
+        let claude = root.join(".claude");
+        let codex = root.join(".codex");
+
+        let result = with_config_dirs(&claude, &codex, || {
+            super::status(protocol::IntegrationStatusParams { agent: None })
+        })
+        .expect("status missing");
+
+        assert_eq!(result.agents.len(), 2);
+        for report in &result.agents {
+            assert!(!report.available);
+            assert_eq!(report.managed_hook_paths, Vec::<String>::new());
+            assert_eq!(report.installed_version, None);
+            assert_eq!(report.expected_version, 4);
+            assert_eq!(
+                report.state,
+                protocol::IntegrationInstallState::NotInstalled
+            );
+            assert!(report.warning.is_some());
+        }
+        assert!(!claude.exists());
+        assert!(!codex.exists());
+    }
+
+    #[test]
+    fn status_reports_current_partial_outdated_and_modified_hooks() {
+        let root = temp_dir("status-drift");
+        let claude = root.join(".claude");
+        let codex = root.join(".codex");
+        fs::create_dir_all(claude.join("hooks")).expect("create Claude hooks");
+        fs::create_dir_all(&codex).expect("create Codex dir");
+        fs::write(
+            claude.join("hooks/pohunek-agent-state.sh"),
+            CLAUDE_HOOK_ASSET,
+        )
+        .expect("write current state hook");
+        fs::write(
+            claude.join("hooks/pohunek-agent-notify.sh"),
+            CLAUDE_NOTIFY_HOOK_ASSET,
+        )
+        .expect("write current notify hook");
+        let wrong_agent_hook = CODEX_HOOK_ASSET.replace(
+            "# POHUNEK_INTEGRATION_VERSION=4",
+            "# POHUNEK_INTEGRATION_VERSION=3",
+        );
+        fs::write(codex.join("pohunek-agent-state.sh"), wrong_agent_hook)
+            .expect("write outdated primary hook");
+        fs::write(
+            codex.join("pohunek-agent-notify.sh"),
+            NOTIFY_ASSET_VERSION_HEADER,
+        )
+        .expect("write malformed notify marker");
+
+        let reports = with_config_dirs(&claude, &codex, || {
+            super::status(protocol::IntegrationStatusParams { agent: None })
+        })
+        .expect("status drift")
+        .agents;
+        let claude_status = reports.first().expect("Claude status");
+        let codex_status = reports.last().expect("Codex status");
+
+        assert_eq!(
+            claude_status.state,
+            protocol::IntegrationInstallState::Current
+        );
+        assert_eq!(claude_status.warning, None);
+        assert_eq!(claude_status.installed_version, Some(4));
+        assert_eq!(
+            codex_status.state,
+            protocol::IntegrationInstallState::Outdated
+        );
+        assert_eq!(codex_status.installed_version, Some(3));
+        assert!(codex_status.warning.is_some());
+    }
+
+    #[test]
+    fn status_reports_version_matched_user_modification_as_current_with_warning() {
+        let codex = temp_dir("status-user-modified");
+        fs::create_dir_all(&codex).expect("create Codex dir");
+        let modified_hook = CODEX_HOOK_ASSET.replace("set -eu\n", "set -eu\n# user edit\n");
+        fs::write(codex.join("pohunek-agent-state.sh"), modified_hook)
+            .expect("write modified hook");
+        fs::write(
+            codex.join("pohunek-agent-notify.sh"),
+            CODEX_NOTIFY_HOOK_ASSET,
+        )
+        .expect("write notify hook");
+
+        let report = with_config_dirs(&codex, &codex, || {
+            super::status(protocol::IntegrationStatusParams {
+                agent: Some(AgentKind::Codex),
+            })
+        })
+        .expect("status modified")
+        .agents
+        .into_iter()
+        .next()
+        .expect("Codex status");
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Current);
+        assert!(report
+            .warning
+            .is_some_and(|warning| warning.contains("content was modified")));
+    }
+
+    #[test]
+    fn status_reports_partial_install_as_current_with_warning() {
+        let codex = temp_dir("status-partial");
+        fs::create_dir_all(&codex).expect("create Codex dir");
+        fs::write(codex.join("pohunek-agent-state.sh"), CODEX_HOOK_ASSET)
+            .expect("write only the primary hook");
+
+        let report = with_config_dirs(&codex, &codex, || {
+            super::status(protocol::IntegrationStatusParams {
+                agent: Some(AgentKind::Codex),
+            })
+        })
+        .expect("status partial")
+        .agents
+        .into_iter()
+        .next()
+        .expect("Codex status");
+
+        assert_eq!(report.managed_hook_paths.len(), 1);
+        assert_eq!(report.state, protocol::IntegrationInstallState::Current);
+        assert!(report
+            .warning
+            .is_some_and(|warning| warning.contains("notification hook is missing")));
+    }
+
+    /// Serializes the process-global config-dir overrides used by status tests.
+    static STATUS_CONFIG_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Restores the pre-test environment when the scoped assertion finishes.
+    struct ConfigDirGuard {
+        claude_dir: Option<std::ffi::OsString>,
+        codex_dir: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.claude_dir.take() {
+                std::env::set_var(super::CLAUDE_CONFIG_DIR_ENV, value);
+            } else {
+                std::env::remove_var(super::CLAUDE_CONFIG_DIR_ENV);
+            }
+            if let Some(value) = self.codex_dir.take() {
+                std::env::set_var(super::CODEX_HOME_ENV, value);
+            } else {
+                std::env::remove_var(super::CODEX_HOME_ENV);
+            }
+        }
+    }
+
+    fn with_config_dirs<T>(
+        claude_dir: &Path,
+        codex_dir: &Path,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        let _lock = STATUS_CONFIG_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = ConfigDirGuard {
+            claude_dir: std::env::var_os(super::CLAUDE_CONFIG_DIR_ENV),
+            codex_dir: std::env::var_os(super::CODEX_HOME_ENV),
+        };
+        std::env::set_var(super::CLAUDE_CONFIG_DIR_ENV, claude_dir);
+        std::env::set_var(super::CODEX_HOME_ENV, codex_dir);
+        operation()
     }
 
     #[test]

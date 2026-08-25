@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use clap::ValueEnum;
 use protocol::{
     method, AgentKind, ErrorClass, IntegrationInstallParams, IntegrationInstallResult,
-    ProtocolError,
+    IntegrationInstallState, IntegrationStatusParams, IntegrationStatusResult, ProtocolError,
 };
 use serde::Serialize;
 
@@ -190,6 +190,10 @@ pub(crate) enum HermesAction {
     /// Install the managed plugin and its explicit policy.
     Install,
     /// Inspect the managed plugin lifecycle state.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "tests still exercise the Hermes action mapping")
+    )]
     Status,
     /// Run the deterministic diagnostic inventory.
     Doctor,
@@ -236,6 +240,30 @@ pub(crate) async fn run_install(
         print!("{}", crate::commands::render_json(&result)?);
     } else {
         print!("{}", render_install_human(&result));
+    }
+    Ok(())
+}
+
+/// Run the read-only Codex and Claude integration status RPC.
+///
+/// # Errors
+///
+/// Returns [`CliError`] if the local daemon is unreachable or rejects the call.
+pub(crate) async fn run_status(
+    paths: &Paths,
+    agent: Option<HookAgentArg>,
+    json: bool,
+) -> Result<(), CliError> {
+    let params = IntegrationStatusParams {
+        agent: agent.map(Into::into),
+    };
+    let mut client = Client::connect(LOCAL_HOST, paths).await?;
+    let result: IntegrationStatusResult = client.call::<method::IntegrationStatus>(params).await?;
+
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        print!("{}", render_status_human(&result));
     }
     Ok(())
 }
@@ -549,6 +577,46 @@ fn render_install_human(result: &IntegrationInstallResult) -> String {
     output
 }
 
+fn render_status_human(result: &IntegrationStatusResult) -> String {
+    if result.agents.is_empty() {
+        return "no agents selected\n".to_owned();
+    }
+    let mut output = String::from("AGENT       AVAILABLE  STATE         VERSION\n");
+    for report in &result.agents {
+        let _ = writeln!(
+            output,
+            "{:<11} {:<9} {:<13} {}",
+            agent_label(&report.agent),
+            report.available,
+            state_label(report.state),
+            version_label(report.installed_version),
+        );
+        let _ = writeln!(output, "  hook: {}", report.expected_hook_path);
+        for path in &report.managed_hook_paths {
+            let _ = writeln!(output, "  managed: {path}");
+        }
+        if let Some(warning) = &report.warning {
+            let _ = writeln!(output, "  warning: {warning}");
+        }
+    }
+    output
+}
+
+fn state_label(state: IntegrationInstallState) -> &'static str {
+    match state {
+        IntegrationInstallState::NotInstalled => "not_installed",
+        IntegrationInstallState::Current => "current",
+        IntegrationInstallState::Outdated => "outdated",
+    }
+}
+
+fn version_label(version: Option<u32>) -> &'static str {
+    match version {
+        Some(_) => "reported",
+        None => "unknown",
+    }
+}
+
 #[expect(
     clippy::struct_excessive_bools,
     reason = "the serialized lifecycle contract intentionally exposes independent findings"
@@ -648,6 +716,67 @@ fn render_hermes_human(result: &HermesResult) -> String {
         }
     }
     output
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::{render_status_human, version_label};
+    use protocol::{
+        AgentKind, IntegrationAgentStatus, IntegrationInstallState, IntegrationStatusResult,
+    };
+
+    #[test]
+    fn renders_status_table_with_paths_warnings_and_versions() {
+        let result = IntegrationStatusResult {
+            agents: vec![
+                IntegrationAgentStatus {
+                    agent: AgentKind::Claude,
+                    available: true,
+                    expected_hook_path: "/home/u/.claude/hooks/pohunek-agent-state.sh".to_owned(),
+                    managed_hook_paths: vec![
+                        "/home/u/.claude/hooks/pohunek-agent-state.sh".to_owned(),
+                        "/home/u/.claude/hooks/pohunek-agent-notify.sh".to_owned(),
+                    ],
+                    installed_version: Some(4),
+                    expected_version: 4,
+                    state: IntegrationInstallState::Current,
+                    warning: None,
+                },
+                IntegrationAgentStatus {
+                    agent: AgentKind::Codex,
+                    available: true,
+                    expected_hook_path: "/home/u/.codex/pohunek-agent-state.sh".to_owned(),
+                    managed_hook_paths: vec!["/home/u/.codex/pohunek-agent-state.sh".to_owned()],
+                    installed_version: None,
+                    expected_version: 4,
+                    state: IntegrationInstallState::Outdated,
+                    warning: Some("hook version marker is missing or invalid".to_owned()),
+                },
+            ],
+        };
+
+        let output = render_status_human(&result);
+
+        let rows: Vec<&str> = output
+            .lines()
+            .filter(|line| line.starts_with("claude "))
+            .collect();
+        assert!(rows.len() == 1 && rows[0].contains("current") && rows[0].ends_with("reported"));
+        assert!(output.contains("  hook: /home/u/.claude/hooks/pohunek-agent-state.sh"));
+        assert!(output.contains("  managed: /home/u/.claude/hooks/pohunek-agent-notify.sh"));
+        let rows: Vec<&str> = output
+            .lines()
+            .filter(|line| line.starts_with("codex "))
+            .collect();
+        assert!(rows.len() == 1 && rows[0].contains("outdated") && rows[0].ends_with("unknown"));
+        assert!(output.contains("  warning: hook version marker is missing or invalid"));
+    }
+
+    #[test]
+    fn renders_unknown_version_without_disclosing_values() {
+        assert_eq!(version_label(Some(4)), "reported");
+        assert_eq!(version_label(None), "unknown");
+    }
 }
 
 #[cfg(test)]

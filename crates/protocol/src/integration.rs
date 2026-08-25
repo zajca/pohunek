@@ -45,6 +45,13 @@ pub const ENV_WORKER_PROTOCOL_VERSION: &str = "POHUNEK_WORKER_PROTOCOL_VERSION";
 /// source of truth.
 pub const ENV_PROTOCOL_VERSION: &str = "POHUNEK_PROTOCOL_VERSION";
 
+/// Expected integration asset version reported by `integration.status`.
+///
+/// This matches the version marker embedded in the daemon's state-hook assets.
+/// It is exposed through `protocol` because CLI and web consumers need the same
+/// expected value without linking the daemon implementation.
+pub const EXPECTED_INTEGRATION_VERSION: u32 = 4;
+
 /// Parameters for `integration.install`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -64,6 +71,65 @@ pub struct IntegrationInstallParams {
 pub struct IntegrationInstallResult {
     /// One report per agent the hook was installed for.
     pub installed: Vec<IntegrationInstallReport>,
+}
+
+/// Request parameters for `integration.status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationStatusParams.ts"))]
+pub struct IntegrationStatusParams {
+    /// Restrict the read-only report to one agent. When omitted, report every
+    /// supported hook agent regardless of whether its config dir exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub agent: Option<AgentKind>,
+}
+
+/// Result returned by `integration.status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationStatusResult.ts"))]
+pub struct IntegrationStatusResult {
+    /// One read-only report per requested (or supported) hook agent.
+    pub agents: Vec<IntegrationAgentStatus>,
+}
+
+/// Read-only installation state for one managed hook integration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationAgentStatus.ts"))]
+pub struct IntegrationAgentStatus {
+    /// Agent the report describes.
+    pub agent: AgentKind,
+    /// Whether the agent's configuration directory exists.
+    pub available: bool,
+    /// Expected primary state-hook path, even when the file is absent.
+    pub expected_hook_path: String,
+    /// Managed scripts present on disk. Paths never contain secret values.
+    pub managed_hook_paths: Vec<String>,
+    /// Version parsed from the installed primary state hook.
+    pub installed_version: Option<u32>,
+    /// Version currently embedded in this build.
+    pub expected_version: u32,
+    /// Aggregate install health derived from the files above.
+    pub state: IntegrationInstallState,
+    /// Non-fatal drift explanation, such as an owner-modified current hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub warning: Option<String>,
+}
+
+/// Derived installation health for one managed hook integration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationInstallState.ts"))]
+pub enum IntegrationInstallState {
+    /// The expected config directory exists but no managed hooks were found.
+    NotInstalled,
+    /// Every managed script exists at the expected asset version.
+    Current,
+    /// At least one managed script has a different version or malformed marker.
+    Outdated,
 }
 
 /// Per-agent record of what the installer wrote.
