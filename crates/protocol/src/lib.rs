@@ -96,7 +96,7 @@ pub use session::{
     RuntimeInventoryStatus, RuntimeState, SessionAttachParams, SessionAttachResult,
     SessionCapabilities, SessionDetachParams, SessionDetachResult, SessionDiffParams,
     SessionDiffResult, SessionEvent, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
-    SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
+    SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams,
     SessionNativeRecoveredEvent, SessionNewParams, SessionNewResult, SessionOutputGap,
     SessionOutputParams, SessionOutputResult, SessionReleaseAgentParams, SessionReleaseAgentResult,
     SessionRemoveResult, SessionRenameParams, SessionRenameResult, SessionReportAgentParams,

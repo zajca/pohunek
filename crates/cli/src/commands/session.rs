@@ -19,7 +19,7 @@ use protocol::Request;
 use protocol::{
     method, AgentActivity, CwdSource, ForkCwdMode, OutputOffset, RuntimeGeneration,
     SessionDiffParams, SessionForkParams, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
+    SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
     SessionOutputParams, SessionRemoveResult, SessionRenameParams, SessionResizeParams,
     SessionRuntimeIdentity, SessionScreenParams, SessionSetMetadataParams, SessionState,
     SessionStopResult, SessionWaitParams, SessionWarningKind, StateSource, TerminalWatermark,
@@ -650,11 +650,13 @@ pub(crate) async fn run_input(
     paths: &Paths,
     target: &Target,
     text: &str,
+    wait_until: &[AgentActivity],
+    timeout_ms: Option<u32>,
     json: bool,
 ) -> Result<(), CliError> {
     let mut client = Client::connect(host, paths).await?;
     let input = client
-        .call::<method::SessionInput>(input_params(target, text))
+        .call::<method::SessionInput>(input_params(target, text, wait_until, timeout_ms))
         .await?;
 
     if json {
@@ -1082,16 +1084,28 @@ fn build_fork_request(
     request_with_params(method::SESSION_FORK, &fork_params(target, name, cols, rows))
 }
 
-fn input_params(target: &Target, text: &str) -> SessionInputParams {
+fn input_params(
+    target: &Target,
+    text: &str,
+    wait_until: &[AgentActivity],
+    timeout_ms: Option<u32>,
+) -> SessionInputParams {
     SessionInputParams {
         session_id: SessionId(target.session_id.clone()),
         text: text.to_owned(),
+        wait: (!wait_until.is_empty() || timeout_ms.is_some()).then(|| SessionInputWait {
+            until: wait_until.to_vec(),
+            timeout_ms: timeout_ms.map(u64::from),
+        }),
     }
 }
 
 #[cfg(test)]
 fn build_input_request(target: &Target, text: &str) -> Result<Request, CliError> {
-    request_with_params(method::SESSION_INPUT, &input_params(target, text))
+    request_with_params(
+        method::SESSION_INPUT,
+        &input_params(target, text, &[], None),
+    )
 }
 
 fn rename_params(target: &Target, name: Option<String>) -> SessionRenameParams {
@@ -2612,7 +2626,14 @@ mod tests {
 
     #[test]
     fn renders_input_result_with_target_id() {
-        let output = render_input_human("s-42", &protocol::SessionInputResult { accepted: true });
+        let output = render_input_human(
+            "s-42",
+            &protocol::SessionInputResult {
+                accepted: true,
+                activity: None,
+                activity_source: None,
+            },
+        );
 
         assert_eq!(output, "session s-42: input accepted\n");
     }
@@ -2706,7 +2727,11 @@ mod tests {
 
     #[test]
     fn renders_input_result_as_json_that_deserializes() {
-        let result = protocol::SessionInputResult { accepted: true };
+        let result = protocol::SessionInputResult {
+            accepted: true,
+            activity: None,
+            activity_source: None,
+        };
         let doc = crate::commands::render_json(&result).expect("json doc");
         let parsed: protocol::SessionInputResult = crate::commands::parse_json_ok(&doc);
         assert_eq!(parsed, result);

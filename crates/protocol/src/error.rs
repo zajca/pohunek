@@ -152,6 +152,24 @@ impl ProtocolError {
         )
     }
 
+    /// The canonical rejection for confirmed delivery into a blocked agent.
+    #[must_use]
+    pub fn session_agent_blocked() -> Self {
+        Self::observation(
+            "session_agent_blocked",
+            "the agent awaits owner action; delivery cannot be confirmed",
+        )
+    }
+
+    /// The canonical rejection for a bounded input wait whose deadline elapsed.
+    #[must_use]
+    pub fn session_input_timeout() -> Self {
+        Self::observation(
+            "session_input_timeout",
+            "the bounded input wait timed out before the agent reached a requested state",
+        )
+    }
+
     /// The canonical rejection for a missing or incompatible managed runtime.
     #[must_use]
     pub fn agent_runtime_unsupported() -> Self {

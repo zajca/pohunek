@@ -1065,6 +1065,12 @@ enum SessionAction {
         /// Read text from stdin instead of argv. Alias: `--input-stdin`.
         #[arg(long = "stdin", alias = "input-stdin")]
         input_stdin: bool,
+        /// Agent activities that complete the input wait (repeatable).
+        #[arg(long = "until", value_parser = commands::session::parse_activity_filter)]
+        wait_until: Vec<protocol::AgentActivity>,
+        /// Bounded input-wait duration in milliseconds.
+        #[arg(long = "timeout", value_parser = commands::session::parse_wait_timeout_ms)]
+        timeout_ms: Option<u32>,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -1542,6 +1548,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     target,
                     text,
                     input_stdin,
+                    wait_until,
+                    timeout_ms,
                     json,
                 } => {
                     let host = effective_host(&global_host, Some(&target));
@@ -1551,7 +1559,16 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                         text.expect("clap requires positional text or --stdin")
                     };
                     let target = commands::session::resolve_target(&host, &paths, &target).await?;
-                    commands::session::run_input(&host, &paths, &target, &text, json).await?;
+                    commands::session::run_input(
+                        &host,
+                        &paths,
+                        &target,
+                        &text,
+                        &wait_until,
+                        timeout_ms,
+                        json,
+                    )
+                    .await?;
                 }
                 SessionAction::Screen { target, json } => {
                     let host = effective_host(&global_host, Some(&target));
@@ -2577,6 +2594,7 @@ mod tests {
                         text,
                         input_stdin,
                         json,
+                        ..
                     },
             } => {
                 assert_eq!(target.session_id, "s-42");
@@ -2609,6 +2627,7 @@ mod tests {
                         text,
                         input_stdin,
                         json,
+                        ..
                     },
             } => {
                 assert_eq!(target.host.as_deref(), Some("host-a"));
@@ -2720,6 +2739,45 @@ mod tests {
         ])
         .expect_err("timeout above shared maximum");
         assert_eq!(invalid.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn session_input_parses_optional_wait_flags() {
+        let cli = Cli::try_parse_from([
+            "pohunek",
+            "session",
+            "input",
+            "s-42",
+            "hello",
+            "--until",
+            "idle",
+            "--until",
+            "blocked",
+            "--timeout",
+            "1000",
+        ])
+        .expect("parse input wait");
+
+        match cli.command {
+            Commands::Session {
+                action:
+                    SessionAction::Input {
+                        wait_until,
+                        timeout_ms,
+                        ..
+                    },
+            } => {
+                assert_eq!(
+                    wait_until,
+                    vec![
+                        protocol::AgentActivity::Idle,
+                        protocol::AgentActivity::Blocked
+                    ]
+                );
+                assert_eq!(timeout_ms, Some(1000));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

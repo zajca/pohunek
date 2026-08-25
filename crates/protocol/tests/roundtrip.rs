@@ -1334,6 +1334,7 @@ fn session_input_params_json_shape_roundtrips() {
     let params = SessionInputParams {
         session_id: SessionId("s-42".to_owned()),
         text: "write tests first".to_owned(),
+        wait: None,
     };
 
     let value = serde_json::to_value(&params).expect("serialize input params");
@@ -1352,8 +1353,16 @@ fn session_input_params_json_shape_roundtrips() {
 #[test]
 fn session_input_result_json_shape_roundtrips() {
     for result in [
-        SessionInputResult { accepted: true },
-        SessionInputResult { accepted: false },
+        SessionInputResult {
+            accepted: true,
+            activity: None,
+            activity_source: None,
+        },
+        SessionInputResult {
+            accepted: false,
+            activity: Some(AgentActivity::Idle),
+            activity_source: Some(StateSource::Screen),
+        },
     ] {
         let value = serde_json::to_value(&result).expect("serialize input result");
         assert_eq!(value, json!({ "accepted": result.accepted }));

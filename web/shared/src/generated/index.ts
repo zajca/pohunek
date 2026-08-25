@@ -97,6 +97,7 @@ export type { SessionId } from "./SessionId";
 export type { SessionInfo } from "./SessionInfo";
 export type { SessionInputParams } from "./SessionInputParams";
 export type { SessionInputResult } from "./SessionInputResult";
+export type { SessionInputWait } from "./SessionInputWait";
 export type { SessionListFilter } from "./SessionListFilter";
 export type { SessionListParams } from "./SessionListParams";
 export type { SessionNativeRecoveredEvent } from "./SessionNativeRecoveredEvent";

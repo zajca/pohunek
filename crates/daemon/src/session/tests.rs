@@ -3819,6 +3819,7 @@ async fn osc_7_output_updates_cwd_before_next_procwatch_tick() {
         .input(protocol::SessionInputParams {
             session_id: created.id.clone(),
             text: "trigger".to_owned(),
+            wait: None,
         })
         .await
         .expect("trigger OSC 7 output");

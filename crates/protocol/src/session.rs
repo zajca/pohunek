@@ -456,6 +456,26 @@ pub struct SessionInputParams {
     pub session_id: SessionId,
     /// Text to inject. The daemon applies agent-specific submit framing.
     pub text: String,
+    /// Optional bounded wait after delivery; absent keeps fire-and-forget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub wait: Option<SessionInputWait>,
+}
+
+/// Optional delivery-wait contract attached to a `session.input` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionInputWait.ts"))]
+pub struct SessionInputWait {
+    /// Agent activities that complete the wait once observed after submission.
+    /// An empty list defaults to `idle` and `blocked`.
+    #[serde(default)]
+    pub until: Vec<AgentActivity>,
+    /// Bounded wait duration in milliseconds. When omitted, the daemon applies
+    /// the shared bounded-wait ceiling; zero is rejected before any delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub timeout_ms: Option<u64>,
 }
 
 /// Result returned by `session.input`.
@@ -465,6 +485,14 @@ pub struct SessionInputParams {
 pub struct SessionInputResult {
     /// Whether the daemon accepted the input for delivery.
     pub accepted: bool,
+    /// Final detected agent activity when a wait was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub activity: Option<AgentActivity>,
+    /// Evidence source behind [`Self::activity`] when a wait was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub activity_source: Option<StateSource>,
 }
 
 /// Reports an invalid bounded-observation request.
