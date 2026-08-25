@@ -19,6 +19,8 @@ with `pohunek attach`.
 
 Automation can observe a managed terminal without attaching. Use
 `pohunek session screen <target> --json` for one rendered snapshot,
+`pohunek session read <target> --source recent --lines 100 --json` for bounded
+current-screen text,
 `pohunek session output <target> --json` for a bounded newest retained tail,
 and `pohunek session wait <target> ... --timeout-ms <1..8000> --json` for one
 bounded state/activity/terminal/output change. Continue output with the exact

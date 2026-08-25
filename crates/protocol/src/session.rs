@@ -781,10 +781,6 @@ impl<'de> Deserialize<'de> for SessionReadParams {
 }
 
 /// Bounded terminal text returned by `session.read`.
-///
-/// The revision is the worker output offset represented by this snapshot. It is
-/// independent from the repaint watermark so callers can detect whether output
-/// was appended while they inspected an older response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionReadResult.ts"))]
@@ -794,13 +790,19 @@ pub struct SessionReadResult {
     pub text: String,
     /// Source actually used to produce the capture.
     pub source_used: SessionReadSource,
+    /// Runtime identity that supplied and validated this capture.
+    #[serde(flatten)]
+    pub runtime: SessionRuntimeIdentity,
+    /// Worker output offset represented by this snapshot.
+    pub revision: TerminalWatermark,
+    /// Whether the terminal is in its alternate screen buffer.
+    ///
+    /// Recent sources fall back to visible rows when history is unavailable.
+    pub alternate_screen: bool,
     /// Effective line limit applied by the daemon.
     pub lines_requested: u32,
-    /// Whether the effective limit discarded older content.
+    /// Whether any line or byte limit discarded content.
     pub truncated: bool,
-    /// Monotonic worker output offset at the snapshot point.
-    #[cfg_attr(feature = "ts", ts(type = "string"))]
-    pub revision: u64,
 }
 
 /// Visible terminal cursor in a rendered screen snapshot.

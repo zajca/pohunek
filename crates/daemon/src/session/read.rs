@@ -2,15 +2,10 @@
 
 use protocol::{
     ErrorClass, ProtocolError, SessionReadFormat, SessionReadParams, SessionReadResult,
-    SessionReadSource, MAX_SESSION_READ_LINES,
+    SessionReadSource, TerminalWatermark, MAX_SESSION_READ_LINES, MAX_SESSION_READ_RESPONSE_BYTES,
 };
 
-use super::{session_not_found, session_not_running, RuntimeHandle, SessionId, SessionRegistry};
-
-/// Maximum terminal rows retained by the daemon's screen tracker.
-///
-/// This bounds recent captures without introducing another configurable limit.
-const MAX_READ_ROWS: usize = MAX_SESSION_READ_LINES as usize;
+use super::{observation_worker_error, runtime_identity, SessionId, SessionRegistry};
 
 impl SessionRegistry {
     /// Return a bounded terminal capture without taking attach ownership.
@@ -22,92 +17,57 @@ impl SessionRegistry {
         if self.inner.external.contains_id(id).await {
             return Err(external_read_only(id));
         }
-        let (worker, runtime_state) = {
-            let sessions = self.inner.sessions.lock().await;
-            let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
-            let RuntimeHandle::Worker(worker) = &entry.runtime else {
-                return Err(session_not_running(id));
-            };
-            (worker.clone(), entry.info.state)
-        };
-        if runtime_state != protocol::SessionState::Running {
-            return Err(session_not_running(id));
-        }
 
-        let snapshot = worker
+        let managed = match self.managed_session(id).await {
+            Ok(managed) => managed,
+            Err(error) if error.code == "session_has_no_managed_terminal" => {
+                return Err(external_read_only(id));
+            }
+            Err(error) => return Err(error),
+        };
+
+        let snapshot = managed
+            .worker
             .terminal_snapshot()
             .await
-            .map_err(|_error| ProtocolError::session_terminal_unavailable())?;
-        self.verify_read_identity(id, snapshot.watermark).await?;
+            .map_err(observation_worker_error)?;
+        self.verify_managed_identity(id, &managed).await?;
+
         let requested_source = params.source().unwrap_or(SessionReadSource::Visible);
         let requested_format = params.format().unwrap_or(SessionReadFormat::Text);
         if matches!(requested_format, SessionReadFormat::Ansi) {
             return Err(ansi_unavailable());
         }
+        let effective_lines = params.lines().unwrap_or(MAX_SESSION_READ_LINES);
 
-        let mut lines = match requested_source {
-            SessionReadSource::Visible => snapshot.visible_lines,
-            SessionReadSource::Recent | SessionReadSource::RecentUnwrapped => {
-                tail_lines(snapshot.visible_lines, params.lines())
+        let mut alternate_screen = snapshot.alternate_screen;
+        let source_used = requested_source;
+        if requested_source == SessionReadSource::Recent {
+            alternate_screen = false;
+        }
+        let mut lines = snapshot.visible_lines;
+        if requested_source == SessionReadSource::Detection {
+            for line in &mut lines {
+                *line = line.trim_end().to_owned();
             }
-            SessionReadSource::Detection => {
-                let detection = snapshot
-                    .visible_lines
-                    .iter()
-                    .map(|line| line.trim_end().to_owned())
-                    .collect();
-                tail_lines(detection, params.lines())
-            }
-        };
-        if requested_source == SessionReadSource::RecentUnwrapped {
+        } else if requested_source == SessionReadSource::RecentUnwrapped {
+            alternate_screen = false;
             for line in &mut lines {
                 *line = line.replace('\n', " ");
             }
         }
-        let truncated = lines.len()
-            > usize::try_from(params.lines().unwrap_or(MAX_SESSION_READ_LINES))
-                .unwrap_or(usize::MAX);
-        lines.truncate(MAX_READ_ROWS);
+        let mut truncated = lines.len() > usize::try_from(effective_lines).unwrap_or(usize::MAX);
+        lines.truncate(usize::try_from(effective_lines).unwrap_or(usize::MAX));
         Ok(SessionReadResult {
-            text: lines.join("\n"),
-            source_used: requested_source,
-            lines_requested: params.lines().unwrap_or(MAX_SESSION_READ_LINES),
+            text: truncate_read_text(lines.join("\n"), &mut truncated),
+            source_used,
+            runtime: runtime_identity(managed.runtime_id, managed.runtime_generation)?,
+            revision: TerminalWatermark::new(snapshot.watermark),
+            alternate_screen,
+            lines_requested: effective_lines,
             truncated,
-            revision: snapshot.watermark,
         })
     }
-
-    async fn verify_read_identity(
-        &self,
-        id: &SessionId,
-        observed_revision: u64,
-    ) -> Result<(), ProtocolError> {
-        let sessions = self.inner.sessions.lock().await;
-        let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
-        let RuntimeHandle::Worker(_worker) = &entry.runtime else {
-            return Err(session_not_running(id));
-        };
-        if !entry
-            .info
-            .runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.state == protocol::RuntimeState::Live)
-        {
-            return Err(session_not_running(id));
-        }
-        let _ = observed_revision;
-        Ok(())
-    }
-}
-
-fn tail_lines(mut lines: Vec<String>, requested: Option<u32>) -> Vec<String> {
-    let count = usize::try_from(requested.unwrap_or(protocol::MAX_SESSION_READ_LINES))
-        .unwrap_or(usize::MAX);
-    if lines.len() > count {
-        let start = lines.len() - count;
-        lines.drain(..start);
-    }
-    lines
 }
 
 fn external_read_only(id: &SessionId) -> ProtocolError {
@@ -126,4 +86,38 @@ fn ansi_unavailable() -> ProtocolError {
         "ANSI session reads are unavailable from the current worker snapshot",
         None,
     )
+}
+
+fn truncate_read_text(mut text: String, truncated: &mut bool) -> String {
+    while serde_json::to_string(&text)
+        .is_ok_and(|encoded| encoded.len() + 2 > MAX_SESSION_READ_RESPONSE_BYTES)
+    {
+        *truncated = true;
+        let safe_end = std::str::from_utf8(&text.as_bytes()[..text.len() - 1])
+            .map_or(text.len() - 1, str::len);
+        text.truncate(safe_end);
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{truncate_read_text, MAX_SESSION_READ_RESPONSE_BYTES};
+
+    #[test]
+    fn read_text_truncates_on_serialized_bytes_and_sets_truncated() {
+        let mut truncated = false;
+        let text = truncate_read_text("\0".repeat(MAX_SESSION_READ_RESPONSE_BYTES), &mut truncated);
+        assert!(truncated);
+        let encoded = serde_json::to_string(&text).expect("serialize truncated text");
+        assert!(encoded.len() <= MAX_SESSION_READ_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn read_text_within_limit_does_not_set_truncated() {
+        let mut truncated = false;
+        let text = truncate_read_text("plain".to_owned(), &mut truncated);
+        assert_eq!(text, "plain");
+        assert!(!truncated);
+    }
 }

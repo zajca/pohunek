@@ -189,6 +189,7 @@ All params and result type names below refer to structs exported by
 | `session.resize` | `SessionResizeParams` | `SessionResizeResult` | Resizes the PTY on the control connection. |
 | `session.input` | `SessionInputParams` | `SessionInputResult` | Injects text using agent-specific input framing. Hermes accepts at most `MAX_SESSION_INPUT_BYTES` UTF-8 bytes, permits LF and tab but rejects other C0/C1 controls without rewriting them, and returns `session_input_blocked` while approval-visible activity is blocked. Unsafe or oversized Hermes text returns `session_input_rejected`. |
 | `session.screen` | `SessionScreenParams` | `SessionScreenResult` | Reads one bounded, rendered, runtime-bound terminal snapshot without acquiring attach ownership or resizing the terminal. |
+| `session.read` | `SessionReadParams` | `SessionReadResult` | Reads bounded text from the current rendered terminal without attaching. `lines` is capped at 1,000 and defaults to that ceiling. JSON-escaped text is additionally capped by `MAX_SESSION_READ_RESPONSE_BYTES`; byte truncation sets `truncated`. ANSI is a reserved request value that v2 always rejects. |
 | `session.output` | `SessionOutputParams` | `SessionOutputResult` | Reads a newest retained tail or continues from an exact runtime-scoped output cursor. A request with `wait_ms` uses a dedicated connection. |
 | `session.wait` | `SessionWaitParams` | `SessionWaitResult` | Performs one bounded long poll for state, activity, metadata, terminal, output, or runtime change. It always uses a dedicated connection. |
 | `session.report_agent` | `SessionReportAgentParams` | `SessionReportAgentResult` | Hook callback for nested agents running inside an existing session. It records an active-agent claim, optional process binding, and optional active native metadata without changing launch identity or resume binding; ignored reports return `recorded: false`. Claims are reconciled with process facts and can be auto-released when no live backing process remains. |
@@ -382,6 +383,19 @@ with response-envelope headroom. The daemon additionally defaults to at most
 200 rows and 500 columns. Oversize results return the payload-free
 `runtime/session_output_limit_exceeded` error.
 
+`session.read` accepts an optional source (`visible`, `recent`,
+`recent_unwrapped`, or `detection`; default `visible`) and optional `lines`
+(`1..=1000`, default `1000`). Current workers expose only the current rendered
+screen, so every source reads those rows; `recent` and `recent_unwrapped`
+report `alternate_screen: false` to make fallback from a TUI explicit.
+`source_used` reports the requested source, not a synthesized history source.
+The result carries exact runtime identity after post-snapshot verification,
+canonical decimal-string `revision`, effective `lines_requested`, and
+`truncated`. The daemon caps JSON-escaped text at
+`MAX_SESSION_READ_RESPONSE_BYTES` (1,048,418 bytes). `format: "ansi"` is
+reserved for future raw capture support and currently returns
+`runtime/session_read_ansi_unavailable`.
+
 `session.output` uses an optional nested runtime identity and an exclusive
 cursor. Omitting `after_offset` requests the newest retained tail. A cursor
 requires its exact runtime identity, and `wait_ms` requires a cursor:
@@ -527,7 +541,8 @@ deadline. It does not imply a healthy, idle, or terminal session.
 
 Observation errors are stable and payload-free: `session_terminal_unavailable`,
 `session_has_no_managed_terminal`, `session_runtime_changed`,
-`session_output_limit_exceeded`, `session_wait_limit_exceeded`,
+`session_read_ansi_unavailable`, `session_output_limit_exceeded`,
+`session_wait_limit_exceeded`,
 `session_waiter_limit_reached`, and `worker_feature_unavailable`. Restart from a
 fresh screen/tail after runtime change. A worker on the immediately preceding
 private protocol remains usable for existing lifecycle and attach operations,
@@ -879,7 +894,8 @@ Protocol v2 additionally emits these runtime codes for provider-neutral agent
 and observation behavior: `agent_kind_unsupported`,
 `agent_fork_unsupported`, `session_terminal_unavailable`,
 `session_has_no_managed_terminal`, `session_runtime_changed`,
-`session_output_limit_exceeded`, `session_wait_limit_exceeded`,
+`session_read_ansi_unavailable`, `session_output_limit_exceeded`,
+`session_wait_limit_exceeded`,
 `session_waiter_limit_reached`, `worker_feature_unavailable`, and
 `plugin_self_target_denied`, `agent_runtime_unsupported`,
 `session_input_rejected`, and `session_input_blocked`. Daemon startup may additionally return
@@ -1161,6 +1177,8 @@ Request APIs:
 - `Client::selected_version() -> Option<ProtocolVersion>`: returns the fixed
   per-connection selection after the first response.
 - `Client::session_screen(SessionScreenParams)`: reads one rendered snapshot on
+  the current connection.
+- `Client::session_read(SessionReadParams)`: reads bounded current-screen text on
   the current connection.
 - `Client::session_output(SessionOutputParams)`: uses the current connection for
   an immediate read and automatically opens a dedicated connection when

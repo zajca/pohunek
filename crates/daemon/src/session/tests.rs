@@ -13,9 +13,10 @@ use protocol::{
     AgentActivity, AgentKind, CwdSource, Event, ForkCwdMode, OutputOffset, ProcessStartIdentity,
     ProjectSource, ReportSequence, RuntimeGeneration, RuntimeState, SessionAttachParams,
     SessionForkParams, SessionId, SessionInfo, SessionNativeRecoveredEvent, SessionNewParams,
-    SessionOutputParams, SessionReleaseAgentParams, SessionReportAgentParams,
-    SessionReportNativeIdParams, SessionRuntime, SessionRuntimeIdentity, SessionState,
-    SessionWaitParams, SessionWaitReason, StateSource, TerminalWatermark,
+    SessionOutputParams, SessionReadFormat, SessionReadParams, SessionReadSource,
+    SessionReleaseAgentParams, SessionReportAgentParams, SessionReportNativeIdParams,
+    SessionRuntime, SessionRuntimeIdentity, SessionState, SessionWaitParams, SessionWaitReason,
+    StateSource, TerminalWatermark,
 };
 
 use crate::agent::LaunchCommand;
@@ -698,6 +699,80 @@ async fn worker_identity_changes_project_live_into_the_logical_session() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_read_covers_sources_truncation_ansi_and_external_rejection() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "printf 'alpha\\nbeta\\n'; sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+
+    let read = |source: SessionReadSource, lines: Option<u32>| {
+        let id = created.id.clone();
+        SessionReadParams::new(id, Some(source), lines, None).expect("valid read params")
+    };
+    let visible = registry
+        .session_read(&read(SessionReadSource::Visible, Some(1)))
+        .await
+        .expect("visible read");
+    assert_eq!(visible.text.split('\n').count(), 1);
+    assert!(visible.truncated);
+    assert_eq!(visible.source_used, SessionReadSource::Visible);
+    assert!(!visible.alternate_screen);
+    assert_eq!(
+        visible.runtime.runtime_generation(),
+        RuntimeGeneration::new(1)
+    );
+
+    let recent = registry
+        .session_read(&read(SessionReadSource::Recent, None))
+        .await
+        .expect("recent read");
+    assert_eq!(
+        recent.source_used,
+        SessionReadSource::Recent,
+        "source_used must report the requested source"
+    );
+    assert!(!recent.alternate_screen);
+
+    let unwrapped = registry
+        .session_read(&read(SessionReadSource::RecentUnwrapped, None))
+        .await
+        .expect("unwrapped read");
+    assert_eq!(unwrapped.source_used, SessionReadSource::RecentUnwrapped);
+    assert!(!unwrapped.alternate_screen);
+    let rendered_lines: Vec<&str> = unwrapped.text.split('\n').collect();
+    for line in rendered_lines {
+        assert!(
+            !line.ends_with(' '),
+            "unwrapped read must not preserve trailing spaces"
+        );
+    }
+
+    let detection = registry
+        .session_read(&read(SessionReadSource::Detection, Some(1)))
+        .await
+        .expect("detection read");
+    assert_eq!(detection.source_used, SessionReadSource::Detection);
+    assert!(detection.truncated);
+
+    let ansi = SessionReadParams::new(
+        created.id.clone(),
+        None,
+        None,
+        Some(SessionReadFormat::Ansi),
+    )
+    .expect("valid ANSI params");
+    let ansi_error = registry
+        .session_read(&ansi)
+        .await
+        .expect_err("ANSI is unavailable");
+    assert_eq!(ansi_error.code, "session_read_ansi_unavailable");
 
     let _ = registry.stop(&created.id).await;
 }
@@ -4705,6 +4780,33 @@ async fn external_rescan_skips_processes_marked_by_any_pohunek_daemon() {
     assert_eq!(sessions.len(), 1, "unmarked agent surfaces as external");
     assert_eq!(sessions[0].external, Some(true));
     assert_eq!(sessions[0].pid, FOREIGN_AGENT_PID);
+}
+
+#[tokio::test]
+async fn session_read_rejects_external_observe_only_sessions() {
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    inspector.set_descendants(1, vec![codex_fact(FOREIGN_AGENT_PID, 1)]);
+    inspector.set_cwd(FOREIGN_AGENT_PID, temp_dir("external-session-read"));
+
+    registry
+        .rescan_external_agents(&TranscriptIndex::default())
+        .await;
+    let external = registry.list().await.into_iter().next().expect("external");
+
+    let params = SessionReadParams::new(external.id, None, None, None).expect("read params");
+    let error = registry
+        .session_read(&params)
+        .await
+        .expect_err("external sessions cannot be read");
+    assert_eq!(error.code, "session_external_read_only");
 }
 
 #[tokio::test]

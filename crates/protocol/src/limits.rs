@@ -103,6 +103,14 @@ pub const MAX_SESSION_OUTPUT_BYTES: usize = ((MAX_CONTROL_LINE_BYTES
 pub const MAX_SESSION_SCREEN_RESPONSE_BYTES: usize =
     MAX_CONTROL_LINE_BYTES - OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES;
 
+/// Maximum serialized `session.read` result bytes.
+///
+/// Read text is JSON-escaped before measurement, so the dedicated reserve keeps
+/// the full newline-delimited control response within the framing limit while
+/// allowing truncation to be represented accurately.
+pub const MAX_SESSION_READ_RESPONSE_BYTES: usize =
+    MAX_CONTROL_LINE_BYTES - OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES;
+
 /// Maximum line count accepted and returned by `session.read`.
 ///
 /// One thousand rows covers every supported terminal geometry while bounding

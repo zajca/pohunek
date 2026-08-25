@@ -701,7 +701,7 @@ pub(crate) fn parse_read_source(value: &str) -> Result<SessionReadSource, String
     match value {
         "visible" => Ok(SessionReadSource::Visible),
         "recent" => Ok(SessionReadSource::Recent),
-        "recent-unwrapped" | "recent_unwrapped" => Ok(SessionReadSource::RecentUnwrapped),
+        "recent_unwrapped" => Ok(SessionReadSource::RecentUnwrapped),
         "detection" => Ok(SessionReadSource::Detection),
         _ => Err("source must be visible, recent, recent-unwrapped, or detection".to_owned()),
     }

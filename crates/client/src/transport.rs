@@ -10,10 +10,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures::{SinkExt, StreamExt};
 use protocol::{
     AttachHeader, Event, Method, ProtocolError, ProtocolVersion, ProtocolVersionRange, Request,
-    Response, SessionId, SessionOutputParams, SessionOutputResult, SessionResizeParams,
-    SessionResizeResult, SessionResumeResult, SessionScreenParams, SessionScreenResult,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionWaitParams, SessionWaitResult,
-    ENV_DAEMON_ID, ENV_SESSION_ID, MAX_CONTROL_LINE_BYTES,
+    Response, SessionId, SessionOutputParams, SessionOutputResult, SessionReadParams,
+    SessionReadResult, SessionResizeParams, SessionResizeResult, SessionResumeResult,
+    SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
+    SessionWaitParams, SessionWaitResult, ENV_DAEMON_ID, ENV_SESSION_ID, MAX_CONTROL_LINE_BYTES,
 };
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -302,6 +302,14 @@ impl Client {
         params: SessionScreenParams,
     ) -> Result<SessionScreenResult, ClientError> {
         self.call::<protocol::method::SessionScreen>(params).await
+    }
+
+    /// Read bounded current-screen text without attaching.
+    pub async fn session_read(
+        &mut self,
+        params: SessionReadParams,
+    ) -> Result<SessionReadResult, ClientError> {
+        self.call::<protocol::method::SessionRead>(params).await
     }
 
     /// Read bounded retained output, using a dedicated connection when it waits.

@@ -21,7 +21,8 @@ use protocol::{
     SessionAttachResult, SessionCapabilities, SessionDetachParams, SessionDetachResult,
     SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
     SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams, SessionOutputGap,
-    SessionOutputParams, SessionOutputResult, SessionReleaseAgentParams, SessionReleaseAgentResult,
+    SessionOutputParams, SessionOutputResult, SessionReadFormat, SessionReadParams,
+    SessionReadResult, SessionReadSource, SessionReleaseAgentParams, SessionReleaseAgentResult,
     SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
     SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionRuntimeIdentity,
     SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
@@ -2710,6 +2711,69 @@ fn session_output_params_reject_invalid_limits_and_cursor_shapes() {
         serde_json::from_value::<SessionOutputParams>(invalid)
             .expect_err("invalid output request must fail");
     }
+}
+
+#[test]
+fn session_read_contract_uses_decimal_revision_and_exact_wire_shape() {
+    let params = SessionReadParams::new(
+        SessionId("s-42".to_owned()),
+        Some(SessionReadSource::RecentUnwrapped),
+        Some(20),
+        Some(SessionReadFormat::Ansi),
+    )
+    .expect("valid read params");
+    let params_json = json!({
+        "session_id": "s-42",
+        "source": "recent_unwrapped",
+        "lines": 20,
+        "format": "ansi"
+    });
+    assert_eq!(
+        serde_json::to_value(&params).expect("serialize read params"),
+        params_json
+    );
+    assert_eq!(
+        serde_json::from_value::<SessionReadParams>(params_json).expect("parse read params"),
+        params
+    );
+    serde_json::from_value::<SessionReadParams>(json!({
+        "session_id": "s-42",
+        "unknown": true
+    }))
+    .expect_err("unknown read field must fail");
+
+    let result = SessionReadResult {
+        text: "one\ntwo".to_owned(),
+        source_used: SessionReadSource::RecentUnwrapped,
+        runtime: SessionRuntimeIdentity::new(
+            "runtime-1",
+            RuntimeGeneration::new(9_007_199_254_740_993),
+        )
+        .expect("valid runtime"),
+        revision: TerminalWatermark::new(9_007_199_254_740_994),
+        alternate_screen: false,
+        lines_requested: 20,
+        truncated: true,
+    };
+    let expected = json!({
+        "text": "one\ntwo",
+        "source_used": "recent_unwrapped",
+        "runtime_id": "runtime-1",
+        "runtime_generation": "9007199254740993",
+        "revision": "9007199254740994",
+        "alternate_screen": false,
+        "lines_requested": 20,
+        "truncated": true
+    });
+    assert_eq!(
+        serde_json::to_value(&result).expect("serialize read"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<SessionReadResult>(expected).expect("parse read"),
+        result
+    );
+    assert_eq!(line_roundtrip(&result), result);
 }
 
 #[test]

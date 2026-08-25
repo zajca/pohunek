@@ -73,6 +73,8 @@ mod target;
 
 pub use attach::{RedeemedAttach, RedeemedRuntime};
 
+pub(crate) use observation::{observation_worker_error, runtime_identity};
+
 use attach::{generate_daemon_instance_id, ActiveAttach, PendingAttach};
 use hooks::SessionHookRequest;
 #[cfg(test)]

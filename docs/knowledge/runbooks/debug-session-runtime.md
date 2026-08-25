@@ -78,6 +78,7 @@ For non-destructive terminal diagnosis, start without a historical cursor:
 
 ```bash
 pohunek session screen <target> --json
+pohunek session read <target> --source recent --lines 100 --json
 pohunek session output <target> --max-bytes 65536 --json
 ```
 
