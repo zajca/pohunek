@@ -655,6 +655,7 @@ impl SessionRegistry {
             input_rules,
             snapshot,
             active_agent: None,
+            foreground_process_group: None,
             last_agent_report: None,
             last_native_report: None,
             observed_agents: Vec::new(),

@@ -19,6 +19,8 @@ use super::{
 };
 
 const PROCWATCH_SOURCE: &str = "pohunek:procwatch";
+/// Last observed foreground group for one reconciliation pass.
+type ForegroundGroups = HashMap<SessionId, Option<Pid>>;
 
 impl SessionRegistry {
     pub(super) fn spawn_procwatch(
@@ -46,6 +48,36 @@ impl SessionRegistry {
         });
     }
 
+    fn probe_foreground_group(
+        &self,
+        id: &SessionId,
+        root_pid: Pid,
+        cached: Option<Pid>,
+    ) -> Option<Pid> {
+        match self.inner.inspector.foreground_process_group(root_pid) {
+            Ok(foreground) => {
+                if cached != foreground {
+                    debug!(
+                        session_id = %id.0,
+                        root_pid,
+                        foreground_pgid = foreground,
+                        "session foreground process group changed"
+                    );
+                }
+                foreground
+            }
+            Err(err) => {
+                debug!(
+                    session_id = %id.0,
+                    root_pid,
+                    error = %err,
+                    "failed to inspect foreground process group"
+                );
+                None
+            }
+        }
+    }
+
     pub(super) async fn rescan_procwatch_at(&self, id: &SessionId, root_pid: Pid, now: Instant) {
         let observed_refresh = match self.inner.inspector.descendants(root_pid) {
             Ok(facts) => Some(self.observed_agents_from_facts(id, facts, now)),
@@ -67,6 +99,7 @@ impl SessionRegistry {
             None => HashMap::new(),
         };
 
+        let cached_foreground_groups = ForegroundGroups::default();
         let (to_spawn, updated, focus_pid) = {
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(id) else {
@@ -108,12 +141,18 @@ impl SessionRegistry {
             }
 
             let updated = self.reconcile_active_agent(entry, now);
+            entry.foreground_process_group = self.probe_foreground_group(
+                id,
+                root_pid,
+                cached_foreground_groups.get(id).copied().flatten(),
+            );
+            let foreground_update = choose_foreground_agent(entry, root_pid, now);
             let focus_pid = entry
                 .active_agent
                 .as_ref()
                 .and_then(|active| active.pid)
                 .unwrap_or(root_pid);
-            (to_spawn, updated, focus_pid)
+            (to_spawn, foreground_update.or(updated), focus_pid)
         };
 
         for (pid, watch, cancel) in to_spawn {
@@ -417,6 +456,73 @@ fn choose_observed_agent(entry: &SessionEntry) -> Option<ObservedAgent> {
         .iter()
         .min_by_key(|observed| observed.first_seen)
         .cloned()
+}
+
+fn choose_foreground_agent(
+    entry: &mut SessionEntry,
+    root_pid: Pid,
+    now: Instant,
+) -> Option<SessionInfo> {
+    let foreground_group = entry.foreground_process_group?;
+    if foreground_group == root_pid || foreground_group == entry.info.pid {
+        let active = entry.active_agent.clone()?;
+        return Some(clear_active_agent(
+            entry,
+            ActiveAgentReport {
+                seq: active.seq.map(|seq| seq.saturating_add(1)),
+                ..active
+            },
+        ));
+    }
+
+    let observed = choose_foreground_observed(entry, foreground_group)?;
+    if entry.active_agent.as_ref().and_then(|active| active.pid) == Some(observed.pid) {
+        return None;
+    }
+    Some(auto_report_for_foreground(entry, &observed, now))
+}
+
+fn choose_foreground_observed(
+    entry: &SessionEntry,
+    foreground_group: Pid,
+) -> Option<ObservedAgent> {
+    entry.observed_agents.iter().find_map(|observed| {
+        (observed.pid == foreground_group).then(|| {
+            first_observed_agent_for_base(entry, &observed.agent_base)
+                .unwrap_or_else(|| observed.clone())
+        })
+    })
+}
+
+fn auto_report_for_foreground(
+    entry: &mut SessionEntry,
+    observed: &ObservedAgent,
+    now: Instant,
+) -> SessionInfo {
+    // Foreground identity is a stronger fact than first-seen ordering. Build the
+    // report directly so an unrelated hook source cannot suppress reconciliation.
+    let agent = agent_kind_label(&observed.agent_base).to_owned();
+    entry.active_agent = Some(ActiveAgentReport {
+        source: PROCWATCH_SOURCE.to_owned(),
+        agent: agent.clone(),
+        seq: Some(
+            entry
+                .active_agent
+                .as_ref()
+                .and_then(|active| active.seq)
+                .unwrap_or(0)
+                .saturating_add(1),
+        ),
+        pid: Some(observed.pid),
+        reported_at: now,
+        activity_reported: false,
+    });
+    entry.last_agent_report = entry.active_agent.clone();
+    entry.info.active_agent = Some(agent);
+    entry.info.active_agent_base = Some(observed.agent_base.clone());
+    entry.info.active_agent_pid = Some(observed.pid);
+    entry.info.updated_at = timestamp_now();
+    entry.info.clone()
 }
 
 fn first_observed_agent_for_base(

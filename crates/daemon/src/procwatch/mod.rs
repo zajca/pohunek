@@ -4,7 +4,7 @@
 //! against OS process facts. Linux is implemented first; other platforms can add
 //! backends behind the same trait without changing reconciliation code.
 
-// Rust guideline compliant 2026-07-07
+// Rust guideline compliant 2026-08-25
 
 use std::fmt::Debug;
 use std::io;
@@ -179,4 +179,14 @@ pub trait ProcessInspector: Debug + Send + Sync + 'static {
     ///
     /// Returns OS I/O errors that are not normal process-exit races.
     fn ownership_markers(&self, pid: Pid) -> io::Result<OwnershipMarkers>;
+
+    /// Returns the foreground process group of `pid`'s controlling terminal.
+    ///
+    /// A process with no controlling terminal yields `None`. Implementations
+    /// treat process-exit races as `None`, mirroring the other inspection APIs.
+    ///
+    /// # Errors
+    ///
+    /// Returns OS I/O errors that are not normal process-exit races.
+    fn foreground_process_group(&self, root_pid: Pid) -> io::Result<Option<Pid>>;
 }

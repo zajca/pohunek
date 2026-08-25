@@ -1,12 +1,12 @@
 //! Linux `/proc` and pidfd process inspection.
 
-// Rust guideline compliant 2026-07-07
+// Rust guideline compliant 2026-08-25
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
@@ -24,6 +24,11 @@ const PROC_ROOT: &str = "/proc";
 /// The syscall currently defines no behavioral flags for our use case; `0`
 /// requests the default pidfd suitable for readiness polling.
 const PIDFD_OPEN_FLAGS: libc::c_uint = 0;
+/// The `/proc/<pid>/stat` pgrp field after the parenthesized command.
+///
+/// Field 3 (`state`) is first after the command terminator; skipping four
+/// values reaches field 7 (`pgrp`) without parsing the command text.
+const STAT_PGRP_OFFSET_AFTER_COMMAND: usize = 4;
 
 /// Linux process inspector backed by procfs and pidfds.
 #[derive(Debug, Clone, Copy, Default)]
@@ -72,6 +77,89 @@ impl ProcessInspector for LinuxInspector {
     fn ownership_markers(&self, pid: Pid) -> io::Result<OwnershipMarkers> {
         ownership_markers(pid)
     }
+
+    fn foreground_process_group(&self, root_pid: Pid) -> io::Result<Option<Pid>> {
+        foreground_process_group(root_pid)
+    }
+}
+
+/// Reads the terminal foreground group without signaling the target process.
+fn foreground_process_group(root_pid: Pid) -> io::Result<Option<Pid>> {
+    let euid = current_euid()?;
+    if !same_user(root_pid, euid) {
+        return Ok(None);
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "tcgetpgrp is the Linux API for reading terminal ownership"
+    )]
+    let terminal_group = (|| {
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "process id is bounded by PID_MAX, far below pid_t::MAX"
+        )]
+        let root = root_pid as libc::pid_t;
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "pid_t process ids are positive on supported Linux systems"
+        )]
+        let root = root as Pid;
+        let fd = fs::File::open(proc_path(root).join("fd/0"))?;
+        // SAFETY: `fd` is a valid open descriptor and `tcgetpgrp` only reads its
+        // terminal foreground process group.
+        let group = unsafe { libc::tcgetpgrp(fd.as_raw_fd()) };
+        if group < 0 {
+            return match io::Error::last_os_error() {
+                err if err.raw_os_error() == Some(libc::ENOTTY)
+                    || err.raw_os_error() == Some(libc::ENXIO) =>
+                {
+                    Ok(None)
+                }
+                err => Err(err),
+            };
+        }
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "successful tcgetpgrp returns a non-negative group id"
+        )]
+        Ok(Some(group as Pid))
+    })();
+
+    match terminal_group {
+        Ok(Some(group)) => Ok(Some(group)),
+        Ok(None) => read_stat_process_group(root_pid),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => read_stat_process_group(root_pid),
+        Err(err) => Err(err),
+    }
+}
+
+fn read_stat_process_group(process_id: Pid) -> io::Result<Option<Pid>> {
+    let stat = match fs::read_to_string(proc_path(process_id).join("stat")) {
+        Ok(stat) => stat,
+        Err(err) if is_process_race(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let Some(command_end) = stat.rfind(')') else {
+        return Ok(None);
+    };
+    let Some(fields) = stat.get(command_end + 1..) else {
+        return Ok(None);
+    };
+    Ok(parse_stat_process_group_fields(fields))
+}
+
+#[cfg(test)]
+fn parse_stat_process_group(stat: &str) -> Option<Pid> {
+    let command_end = stat.rfind(')')?;
+    parse_stat_process_group_fields(stat.get(command_end + 1..)?)
+}
+
+fn parse_stat_process_group_fields(fields: &str) -> Option<Pid> {
+    fields
+        .split_whitespace()
+        .nth(STAT_PGRP_OFFSET_AFTER_COMMAND)
+        .and_then(|value| value.parse().ok())
 }
 
 /// Reads `POHUNEK_DAEMON_ID` / `POHUNEK_SESSION_ID` from `/proc/<pid>/environ`.
@@ -333,4 +421,22 @@ fn pidfd_open(pid: Pid) -> io::Result<OwnedFd> {
     // SAFETY: `pidfd_open` returned a fresh file descriptor owned by this process,
     // and `OwnedFd` takes responsibility for closing it exactly once.
     Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stat_process_group_reads_field_after_command() {
+        assert_eq!(
+            parse_stat_process_group("123 (agent with spaces) S 1 2 3 456 7 8"),
+            Some(456)
+        );
+    }
+
+    #[test]
+    fn malformed_stat_has_no_process_group() {
+        assert_eq!(parse_stat_process_group("123 (agent) S"), None);
+    }
 }

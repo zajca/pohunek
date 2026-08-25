@@ -461,6 +461,7 @@ struct SessionEntry {
     /// re-persist can never overwrite the launch-time program/args/resume shape.
     snapshot: ResumeSnapshot,
     active_agent: Option<ActiveAgentReport>,
+    foreground_process_group: Option<Pid>,
     last_agent_report: Option<ActiveAgentReport>,
     last_native_report: Option<NativeIdentityReport>,
     observed_agents: Vec<ObservedAgent>,

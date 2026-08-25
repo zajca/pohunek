@@ -883,6 +883,7 @@ struct MockInspector {
 struct MockInspectorState {
     descendants: HashMap<Pid, Vec<ProcessFact>>,
     descendants_error: Option<std::io::ErrorKind>,
+    foreground_groups: HashMap<Pid, Option<Pid>>,
     cwd: HashMap<Pid, PathBuf>,
     exits: HashMap<Pid, tokio::sync::watch::Sender<bool>>,
     ownership_markers: HashMap<Pid, OwnershipMarkers>,
@@ -937,6 +938,14 @@ impl MockInspector {
             .expect("mock inspector lock")
             .ownership_markers
             .insert(pid, markers);
+    }
+
+    fn set_foreground_group(&self, pid: Pid, group: Option<Pid>) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .foreground_groups
+            .insert(pid, group);
     }
 }
 
@@ -1012,6 +1021,70 @@ impl ProcessInspector for MockInspector {
             .cloned()
             .unwrap_or_default())
     }
+
+    fn foreground_process_group(&self, root_pid: Pid) -> std::io::Result<Option<Pid>> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("mock inspector lock")
+            .foreground_groups
+            .get(&root_pid)
+            .copied()
+            .flatten())
+    }
+}
+
+#[tokio::test]
+async fn foreground_leader_selects_agent_and_shell_return_clears_claim() {
+    let (registry, inspector, created) = mock_procwatch_registry("foreground-leader").await;
+    let first = codex_fact(300, created.pid);
+    let replacement = claude_fact(310, created.pid);
+    inspector.set_descendants(created.pid, vec![first]);
+    inspector.set_cwd(300, temp_dir("foreground-first"));
+    inspector.set_foreground_group(created.pid, Some(300));
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+
+    let active = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(active.active_agent.as_deref(), Some("codex"));
+    assert_eq!(active.active_agent_pid, Some(300));
+
+    inspector.set_descendants(created.pid, vec![replacement]);
+    inspector.set_cwd(310, temp_dir("foreground-replacement"));
+    inspector.set_foreground_group(created.pid, Some(310));
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let rebound = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(rebound.active_agent.as_deref(), Some("claude"));
+    assert_eq!(rebound.active_agent_pid, Some(310));
+
+    inspector.set_foreground_group(created.pid, Some(created.pid));
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let cleared = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(cleared.active_agent, None);
+    assert_eq!(cleared.active_agent_base, None);
+    assert_eq!(cleared.active_agent_pid, None);
+}
+
+#[tokio::test]
+async fn foreign_foreground_process_does_not_hijack_reconciliation() {
+    let (registry, inspector, created) = mock_procwatch_registry("foreground-foreign").await;
+    inspector.set_descendants(created.pid, Vec::new());
+    let root_cwd = temp_dir("foreign-foreground-root");
+    inspector.set_cwd(created.pid, root_cwd.clone());
+    inspector.set_foreground_group(created.pid, Some(FOREIGN_AGENT_PID));
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let inspected = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(inspected.active_agent, None);
+    assert_eq!(inspected.active_agent_pid, None);
+    assert_eq!(inspected.cwd, root_cwd);
 }
 
 fn title_activity(config: &DetectorConfig, title: &str) -> Option<AgentActivity> {
