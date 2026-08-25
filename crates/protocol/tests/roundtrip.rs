@@ -1352,24 +1352,32 @@ fn session_input_params_json_shape_roundtrips() {
 
 #[test]
 fn session_input_result_json_shape_roundtrips() {
-    for result in [
-        SessionInputResult {
-            accepted: true,
-            activity: None,
-            activity_source: None,
-        },
-        SessionInputResult {
-            accepted: false,
-            activity: Some(AgentActivity::Idle),
-            activity_source: Some(StateSource::Screen),
-        },
-    ] {
-        let value = serde_json::to_value(&result).expect("serialize input result");
-        assert_eq!(value, json!({ "accepted": result.accepted }));
+    let omitted = SessionInputResult {
+        accepted: true,
+        activity: None,
+        activity_source: None,
+    };
+    let value = serde_json::to_value(&omitted).expect("serialize omitted input result");
+    assert_eq!(value, json!({ "accepted": true }));
+    let back = line_roundtrip(&omitted);
+    assert_eq!(back, omitted);
 
-        let back = line_roundtrip(&result);
-        assert_eq!(back, result);
-    }
+    let populated = SessionInputResult {
+        accepted: false,
+        activity: Some(AgentActivity::Idle),
+        activity_source: Some(StateSource::Screen),
+    };
+    let value = serde_json::to_value(&populated).expect("serialize populated input result");
+    assert_eq!(
+        value,
+        json!({
+            "accepted": false,
+            "activity": "idle",
+            "activity_source": "screen"
+        })
+    );
+    let back = line_roundtrip(&populated);
+    assert_eq!(back, populated);
 }
 
 #[test]

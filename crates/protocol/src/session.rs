@@ -471,11 +471,12 @@ pub struct SessionInputWait {
     /// An empty list defaults to `idle` and `blocked`.
     #[serde(default)]
     pub until: Vec<AgentActivity>,
-    /// Bounded wait duration in milliseconds. When omitted, the daemon applies
-    /// the shared bounded-wait ceiling; zero is rejected before any delivery.
+    /// Bounded wait duration in milliseconds from `1` to
+    /// [`MAX_SESSION_WAIT_MS`]. When omitted, the daemon applies that ceiling;
+    /// zero is rejected before any delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
-    pub timeout_ms: Option<u64>,
+    pub timeout_ms: Option<u32>,
 }
 
 /// Result returned by `session.input`.

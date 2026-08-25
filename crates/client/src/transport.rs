@@ -10,10 +10,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures::{SinkExt, StreamExt};
 use protocol::{
     AttachHeader, Event, Method, ProtocolError, ProtocolVersion, ProtocolVersionRange, Request,
-    Response, SessionId, SessionOutputParams, SessionOutputResult, SessionResizeParams,
-    SessionResizeResult, SessionResumeResult, SessionScreenParams, SessionScreenResult,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionWaitParams, SessionWaitResult,
-    ENV_DAEMON_ID, ENV_SESSION_ID, MAX_CONTROL_LINE_BYTES,
+    Response, SessionId, SessionInputParams, SessionInputResult, SessionOutputParams,
+    SessionOutputResult, SessionResizeParams, SessionResizeResult, SessionResumeResult,
+    SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
+    SessionWaitParams, SessionWaitResult, ENV_DAEMON_ID, ENV_SESSION_ID, MAX_CONTROL_LINE_BYTES,
 };
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -325,6 +325,20 @@ impl Client {
         let timeout_ms = params.timeout_ms();
         self.call_dedicated::<protocol::method::SessionWait>(params, timeout_ms)
             .await
+    }
+
+    /// Deliver input with an optional dedicated bounded delivery-wait connection.
+    pub async fn session_input(
+        &mut self,
+        params: SessionInputParams,
+    ) -> Result<SessionInputResult, ClientError> {
+        let timeout_ms = params.wait.as_ref().and_then(|wait| wait.timeout_ms);
+        if let Some(timeout_ms) = timeout_ms {
+            self.call_dedicated::<protocol::method::SessionInput>(params, timeout_ms)
+                .await
+        } else {
+            self.call::<protocol::method::SessionInput>(params).await
+        }
     }
 
     /// Resume one logical session through the typed lifecycle API.

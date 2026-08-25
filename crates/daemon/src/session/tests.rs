@@ -3480,6 +3480,115 @@ fn hermes_programmatic_input_fails_closed_while_blocked() {
         .expect("Codex blocked-input behavior remains unchanged");
 }
 
+#[tokio::test]
+async fn session_input_wait_rejects_invalid_contract_before_delivery() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+
+    for timeout_ms in [Some(0), Some(protocol::MAX_SESSION_WAIT_MS + 1)] {
+        let error = registry
+            .input(protocol::SessionInputParams {
+                session_id: created.id.clone(),
+                text: "must not be delivered".to_owned(),
+                wait: Some(protocol::SessionInputWait {
+                    until: vec![AgentActivity::Idle],
+                    timeout_ms,
+                }),
+            })
+            .await
+            .expect_err("invalid wait contract must be rejected");
+        if timeout_ms == Some(0) {
+            assert_eq!(error.code, "session_input_invalid_wait");
+        } else {
+            assert_eq!(error.code, "session_wait_limit_exceeded");
+        }
+    }
+
+    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    assert!(
+        !output.contains("must not be delivered"),
+        "invalid wait must not deliver input; output={output:?}"
+    );
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_deduplicates_targets_and_requires_new_event() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let mut events = registry.subscribe();
+
+    let report_task = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            registry
+                .report_agent(protocol::SessionReportAgentParams {
+                    session_id,
+                    source: "test:pohunek-input-wait".to_owned(),
+                    agent: "codex".to_owned(),
+                    activity: Some(AgentActivity::Idle),
+                    seq: Some(protocol::ReportSequence::new(1)),
+                    pid: None,
+                    agent_session_id: None,
+                    agent_session_path: None,
+                })
+                .await
+        }
+    });
+
+    let result = registry
+        .input(protocol::SessionInputParams {
+            session_id: created.id.clone(),
+            text: "\n".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: vec![
+                    AgentActivity::Idle,
+                    AgentActivity::Blocked,
+                    AgentActivity::Idle,
+                ],
+                timeout_ms: Some(1_000),
+            }),
+        })
+        .await
+        .expect("input waits for a new matching state event");
+    assert!(result.accepted);
+    assert_eq!(result.activity, Some(AgentActivity::Idle));
+    assert_eq!(result.activity_source, Some(StateSource::Report));
+
+    let report = report_task.await.expect("report task joins");
+    assert!(report.recorded);
+    while let Ok(event) = tokio::time::timeout(Duration::from_millis(20), events.recv()).await {
+        let _ = event;
+    }
+
+    let _ = registry.stop(&created.id).await;
+}
+
+async fn read_session_output_after_rejection(registry: &SessionRegistry, id: &SessionId) -> String {
+    let output = registry
+        .screen(id)
+        .await
+        .expect("inspect terminal after rejected input");
+    output.visible_lines.join("\n")
+}
+
 #[test]
 fn bare_codex_launch_receives_initial_input_as_prompt_arg() {
     let resolved = crate::agent::ProfileRegistry::default()

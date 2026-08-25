@@ -656,7 +656,7 @@ pub(crate) async fn run_input(
 ) -> Result<(), CliError> {
     let mut client = Client::connect(host, paths).await?;
     let input = client
-        .call::<method::SessionInput>(input_params(target, text, wait_until, timeout_ms))
+        .session_input(input_params(target, text, wait_until, timeout_ms))
         .await?;
 
     if json {
@@ -1095,7 +1095,7 @@ fn input_params(
         text: text.to_owned(),
         wait: (!wait_until.is_empty() || timeout_ms.is_some()).then(|| SessionInputWait {
             until: wait_until.to_vec(),
-            timeout_ms: timeout_ms.map(u64::from),
+            timeout_ms,
         }),
     }
 }
