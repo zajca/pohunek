@@ -10,6 +10,8 @@ import type {
   HostRecord,
   IntegrationInstallParams,
   IntegrationInstallResult,
+  IntegrationStatusParams,
+  IntegrationStatusResult,
   JsonValue,
   NotificationCreateParams,
   NotificationCreateResult,
@@ -85,6 +87,7 @@ export interface Methods {
   "host.discover": { params: HostDiscoverParams; output: HostRecord[] };
   "host.inspect": { params: null; output: HostCapabilities };
   "integration.install": { params: IntegrationInstallParams; output: IntegrationInstallResult };
+  "integration.status": { params: IntegrationStatusParams; output: IntegrationStatusResult };
   "notification.create": { params: NotificationCreateParams; output: NotificationCreateResult };
   "notification.delete": { params: NotificationDeleteParams; output: NotificationDeleteResult };
   "notification.list": { params: NotificationListParams; output: NotificationListResult };

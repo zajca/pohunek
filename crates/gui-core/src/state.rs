@@ -4646,11 +4646,12 @@ mod tests {
     }
 
     #[test]
-    fn discovered_transport_prefers_netbird_ip_over_short_name() {
+    fn discovered_transport_prefers_address_over_short_name() {
         let record = HostRecord {
             name: Some("dev".to_owned()),
             fqdn: Some("dev.example.netbird.cloud".to_owned()),
-            netbird_ip: Some("100.92.30.40".to_owned()),
+            address: Some("100.92.30.40".to_owned()),
+            overlay: "netbird".to_owned(),
             class: HostClass::ReachableDaemon {
                 daemon_version: "0.5.0".to_owned(),
             },

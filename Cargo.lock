@@ -3271,6 +3271,7 @@ dependencies = [
  "futures",
  "libc",
  "pohunek-netbird",
+ "pohunek-overlay",
  "pohunek-protocol",
  "serde_json",
  "thiserror 2.0.18",
@@ -3290,6 +3291,7 @@ dependencies = [
  "pohunek-knowledge",
  "pohunek-logging",
  "pohunek-netbird",
+ "pohunek-overlay",
  "pohunek-paths",
  "pohunek-protocol",
  "pohunek-session-worker",
@@ -3382,6 +3384,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "pohunek-overlay"
+version = "0.31.5"
+dependencies = [
+ "pohunek-netbird",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

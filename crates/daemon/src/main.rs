@@ -201,6 +201,7 @@ async fn run() -> Result<(), DaemonError> {
     )
     .with_notifications(notifications.clone())
     .with_attention_coordinator(attention_coordinator.clone());
+    let transport = overlay::NetbirdTransport::new();
     let remote_port = match netbird::remote_port() {
         Ok(port) => Some(port),
         Err(err) => {
@@ -229,7 +230,7 @@ async fn run() -> Result<(), DaemonError> {
     let unix_serve = server.serve(async move {
         unix_shutdown.cancelled().await;
     });
-    let remote_serve = serve_remote(remote_state, remote_port, shutdown);
+    let remote_serve = serve_remote(remote_state, remote_port, &transport, shutdown);
     tokio::join!(unix_serve, remote_serve);
 
     // 11. Flush the append-only event log before exit so events buffered at
@@ -479,10 +480,15 @@ fn next_retry_interval(current: Duration) -> Duration {
 }
 
 /// Serve the remote transport when its port configuration is valid.
-async fn serve_remote(state: DaemonState, port: Option<u16>, shutdown: CancellationToken) {
+async fn serve_remote(
+    state: DaemonState,
+    port: Option<u16>,
+    transport: &overlay::NetbirdTransport,
+    shutdown: CancellationToken,
+) {
     if let Some(port) = port {
         serve_remote_with_retry(
-            || bind_remote_server(state.clone(), port),
+            || bind_remote_server(state.clone(), port, transport),
             shutdown,
             REMOTE_BIND_INITIAL_RETRY_INTERVAL,
         )
@@ -498,7 +504,11 @@ async fn serve_remote(state: DaemonState, port: Option<u16>, shutdown: Cancellat
 /// and the configured remote port, and binds a [`RemoteServer`] when an address
 /// resolves. Missing `NetBird` CLI disables the remote listener; unavailable
 /// state, a missing self IP, and bind failures are retried by the caller.
-async fn bind_remote_server(state: DaemonState, port: u16) -> RemoteBind {
+async fn bind_remote_server(
+    state: DaemonState,
+    port: u16,
+    overlay: &dyn overlay::OverlayTransport,
+) -> RemoteBind {
     let status = match netbird::run_status_async().await {
         Ok(status) => status,
         Err(netbird::NetbirdError::CliMissing) => {
@@ -516,7 +526,7 @@ async fn bind_remote_server(state: DaemonState, port: u16) -> RemoteBind {
         return RemoteBind::Retry;
     };
 
-    match RemoteServer::bind(addr, state).await {
+    match RemoteServer::bind(addr, state, overlay).await {
         Ok(remote) => {
             info!(addr = %remote.local_addr(), "serving control protocol over NetBird");
             RemoteBind::Bound(remote)

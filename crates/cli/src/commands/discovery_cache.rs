@@ -274,7 +274,8 @@ mod tests {
         HostRecord {
             name: Some(name.to_owned()),
             fqdn: Some(format!("{name}.example")),
-            netbird_ip: Some("100.64.0.1".to_owned()),
+            address: Some("100.64.0.1".to_owned()),
+            overlay: "netbird".to_owned(),
             class: protocol::HostClass::Unreachable,
         }
     }

@@ -233,7 +233,8 @@ function reachablePeerRecord(): HostRecord {
   return {
     name: PEER_HOST,
     fqdn: `${PEER_HOST}.test.invalid`,
-    netbird_ip: LOOPBACK_HOST,
+    address: LOOPBACK_HOST,
+    overlay: "netbird",
     classification: "reachable_daemon",
     daemon_version: PEER_DAEMON_VERSION,
   };

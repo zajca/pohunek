@@ -554,7 +554,8 @@ async fn request_response_typed_call_sends_method_params_and_decodes_output() {
         {
             "name": "host-a",
             "fqdn": "host-a.example.test",
-            "netbird_ip": "100.1.2.3",
+            "address": "100.1.2.3",
+            "overlay": "netbird",
             "classification": "candidate"
         }
     ]));

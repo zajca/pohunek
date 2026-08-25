@@ -58,7 +58,8 @@ mod tests {
         let records = vec![HostRecord {
             name: Some("host-b".to_owned()),
             fqdn: Some("host-b.netbird.cloud".to_owned()),
-            netbird_ip: Some("100.92.30.40".to_owned()),
+            address: Some("100.92.30.40".to_owned()),
+            overlay: "netbird".to_owned(),
             class: HostClass::Unreachable,
         }];
         let cache = DiscoveryCache::default();

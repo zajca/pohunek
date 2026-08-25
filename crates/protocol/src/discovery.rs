@@ -43,10 +43,10 @@ pub enum HostClass {
     Candidate,
 }
 
-/// One enumerated host with its classification.
+/// One enumerated host with its overlay identity and classification.
 ///
 /// Field order and names are part of the wire contract the rofi switcher parses
-/// (`name`, `netbird_ip`, and the flattened `classification`).
+/// (`name`, `address`, `overlay`, and the flattened `classification`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "HostRecord.ts"))]
@@ -55,8 +55,10 @@ pub struct HostRecord {
     pub name: Option<String>,
     /// The peer's fully qualified `NetBird` name.
     pub fqdn: Option<String>,
-    /// The peer's `NetBird` IP as a string.
-    pub netbird_ip: Option<String>,
+    /// The peer's dialable address as a string.
+    pub address: Option<String>,
+    /// Which overlay transport discovered this peer (e.g. `"netbird"`).
+    pub overlay: String,
     /// Classification (flattened so its fields sit alongside the record).
     #[serde(flatten)]
     pub class: HostClass,
@@ -84,7 +86,8 @@ mod tests {
         let record = HostRecord {
             name: Some("host-b".to_owned()),
             fqdn: Some("host-b.netbird.cloud".to_owned()),
-            netbird_ip: Some("100.92.30.40".to_owned()),
+            address: Some("100.92.30.40".to_owned()),
+            overlay: "netbird".to_owned(),
             class: HostClass::ReachableDaemon {
                 daemon_version: "0.1.0".to_owned(),
             },
@@ -93,7 +96,8 @@ mod tests {
         assert_eq!(value["classification"], "reachable_daemon");
         assert_eq!(value["daemon_version"], "0.1.0");
         assert_eq!(value["name"], "host-b");
-        assert_eq!(value["netbird_ip"], "100.92.30.40");
+        assert_eq!(value["address"], "100.92.30.40");
+        assert_eq!(value["overlay"], "netbird");
 
         let back: HostRecord = serde_json::from_value(value).expect("deserialize");
         assert_eq!(back, record);

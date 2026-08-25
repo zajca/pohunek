@@ -227,7 +227,7 @@ async fn discover_status(
         .map(|peer| async move {
             let name = peer.fqdn.as_deref().map(short_hostname).map(str::to_owned);
             let fqdn = peer.fqdn.clone();
-            let netbird_ip = peer.netbird_ip.clone();
+            let address = peer.netbird_ip.clone();
             let class = match probe_target(&peer, options.port()) {
                 Some(addr) => classify(addr, options.probe_timeout(), origin).await,
                 None => HostClass::Candidate,
@@ -235,7 +235,8 @@ async fn discover_status(
             HostRecord {
                 name,
                 fqdn,
-                netbird_ip,
+                address,
+                overlay: "netbird".to_owned(),
                 class,
             }
         })

@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::{SinkExt, StreamExt};
+use overlay::OverlayTransport as _;
 use protocol::{
     AttachHeader, Event, Method, ProtocolError, ProtocolVersion, ProtocolVersionRange, Request,
     Response, SessionId, SessionOutputParams, SessionOutputResult, SessionResizeParams,
@@ -881,10 +882,16 @@ async fn resolve_remote_addr(
 ) -> Result<SocketAddr, ClientError> {
     let discovery_host = host.clone();
     let task = tokio::task::spawn_blocking(move || {
-        let status = netbird::run_status()?;
-        let ip = netbird::resolve_host(&status, &discovery_host)?;
-        let port = netbird::remote_port()?;
-        Ok(SocketAddr::new(ip, port))
+        let transport = overlay::NetbirdTransport::new();
+        let port = netbird::remote_port().map_err(|err| ClientError::RemoteDiscoveryFailed {
+            detail: err.to_string(),
+        })?;
+        let resolved = transport
+            .resolve_host(&discovery_host, port)
+            .map_err(|err| ClientError::RemoteDiscoveryFailed {
+                detail: err.to_string(),
+            })?;
+        Ok(resolved.addr)
     });
 
     match tokio::time::timeout(connect_timeout, task).await {

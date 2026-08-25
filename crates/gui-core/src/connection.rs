@@ -375,7 +375,7 @@ pub async fn discover_hosts(
 
 pub(crate) fn discovered_transport_host(record: &HostRecord) -> Result<String, CoreError> {
     record
-        .netbird_ip
+        .address
         .clone()
         .or_else(|| record.fqdn.clone())
         .or_else(|| record.name.clone())

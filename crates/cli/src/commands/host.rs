@@ -78,7 +78,7 @@ pub(crate) async fn run_inspect(host: &str, paths: &Paths, json: bool) -> Result
 /// Render the discovered hosts as an aligned table.
 fn render_records_human(records: &[HostRecord]) -> String {
     let name_of = |r: &HostRecord| r.name.clone().unwrap_or_else(|| "-".to_owned());
-    let ip_of = |r: &HostRecord| r.netbird_ip.clone().unwrap_or_else(|| "-".to_owned());
+    let ip_of = |r: &HostRecord| r.address.clone().unwrap_or_else(|| "-".to_owned());
 
     let name_width = records
         .iter()
@@ -218,7 +218,8 @@ mod tests {
             HostRecord {
                 name: Some("host-b".to_owned()),
                 fqdn: Some("host-b.netbird.cloud".to_owned()),
-                netbird_ip: Some("100.92.30.40".to_owned()),
+                address: Some("100.92.30.40".to_owned()),
+                overlay: "netbird".to_owned(),
                 class: HostClass::ReachableDaemon {
                     daemon_version: "0.1.0".to_owned(),
                 },
@@ -226,7 +227,8 @@ mod tests {
             HostRecord {
                 name: Some("host-c".to_owned()),
                 fqdn: Some("host-c.netbird.cloud".to_owned()),
-                netbird_ip: Some("100.92.30.41".to_owned()),
+                address: Some("100.92.30.41".to_owned()),
+                overlay: "netbird".to_owned(),
                 class: HostClass::Candidate,
             },
         ];

@@ -77,14 +77,14 @@ pub enum DaemonError {
         source: io::Error,
     },
 
-    /// The resolved `NetBird` bind address was rejected (fails closed). The remote
-    /// TCP control listener only ever binds an address inside the `NetBird` CGNAT
-    /// range; any other address is refused before a socket is opened.
-    #[error("refusing to bind control listener to non-NetBird address {addr}: {reason}")]
-    NetbirdBind {
+    /// The resolved overlay bind address was rejected (fails closed). The remote
+    /// TCP control listener only ever binds an address inside the selected
+    /// overlay's trusted range; any other address is refused before a socket.
+    #[error("refusing to bind control listener to non-overlay address {addr}: {reason}")]
+    OverlayBind {
         /// The rejected bind address.
         addr: IpAddr,
-        /// Why the address was rejected (from the `NetBird` validator).
+        /// Why the address was rejected (from the overlay validator).
         reason: String,
     },
 

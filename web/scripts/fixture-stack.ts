@@ -120,7 +120,8 @@ function peerHostRecord(): HostRecord {
   return {
     name: FIXTURE_PEER_HOST,
     fqdn: `${FIXTURE_PEER_HOST}.test.invalid`,
-    netbird_ip: FIXTURE_LOOPBACK_HOST,
+    address: FIXTURE_LOOPBACK_HOST,
+    overlay: "netbird",
     classification: "reachable_daemon",
     daemon_version: FIXTURE_PEER_DAEMON_VERSION,
   };

@@ -175,10 +175,10 @@ class HostsPipeline implements HostsPipelineHandle {
           reachability: record.classification,
           daemon_version: record.daemon_version,
         });
-        if (record.netbird_ip !== null) {
+        if (record.address !== null) {
           nextTargets.set(host, {
             kind: "tcp",
-            host: record.netbird_ip,
+            host: record.address,
             port: this.options.remotePort,
           });
         }
@@ -226,7 +226,7 @@ function localEntry(health: DaemonHealthResult): BackendHostEntry {
 }
 
 function hostIdentifier(record: HostRecord): string | undefined {
-  return record.name ?? record.fqdn ?? record.netbird_ip ?? undefined;
+  return record.name ?? record.fqdn ?? record.address ?? undefined;
 }
 
 function elapsedMilliseconds(startedAt: number): number {

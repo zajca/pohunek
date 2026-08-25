@@ -9,6 +9,7 @@ description = "pohunek SDK client: typed client errors and daemon transport cont
 [dependencies]
 futures = { workspace = true }
 pohunek-netbird = { workspace = true }
+overlay = { workspace = true }
 pohunek-protocol = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
