@@ -537,6 +537,18 @@ mod tests {
     }
 
     #[test]
+    fn top_non_empty_lines_preserves_cjk_wide_glyph_rows() {
+        let mut tracker = ScreenTracker::new(3, 20);
+
+        tracker.feed("\r\n信任仓库界".as_bytes());
+
+        assert_eq!(
+            tracker.top_non_empty_lines(2).lines,
+            vec!["信任仓库界".to_string()]
+        );
+    }
+
+    #[test]
     fn last_non_empty_above_prompt_box_returns_nearest_content_line() {
         let mut tracker = ScreenTracker::new(7, 40);
 
@@ -545,6 +557,18 @@ mod tests {
         );
 
         assert_eq!(tracker.last_non_empty_above_prompt_box(), "latest status");
+    }
+
+    #[test]
+    fn last_non_empty_above_prompt_box_preserves_cjk_wide_glyph_row() {
+        let mut tracker = ScreenTracker::new(6, 40);
+
+        tracker.feed(
+            "审批需要确认界\r\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\r\n\u{203a} type here\r\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}"
+                .as_bytes(),
+        );
+
+        assert_eq!(tracker.last_non_empty_above_prompt_box(), "审批需要确认界");
     }
 
     #[test]

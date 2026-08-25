@@ -895,6 +895,31 @@ mod tests {
     }
 
     #[test]
+    fn top_non_empty_lines_region_matches_cjk_wide_glyph_content() {
+        let started_at = instant();
+        let mut detector_config = config();
+        detector_config.manifest = Some(manifest(
+            r#"
+            [[rules]]
+            id = "top-trust-cjk-blocked"
+            state = "blocked"
+            priority = 1
+            region = "top_non_empty_lines(1)"
+            contains = "信任仓库"
+            "#,
+        ));
+        let mut detector = Detector::new(4, 20, started_at, detector_config);
+
+        assert_eq!(
+            detector.feed(
+                started_at,
+                "\x1b[2J\x1b[H\r\n信任仓库界\r\n\r\nlater output".as_bytes()
+            ),
+            vec![transition(AgentActivity::Blocked, StateSource::Screen)]
+        );
+    }
+
+    #[test]
     fn last_non_empty_above_prompt_box_region_matches_status_line() {
         let started_at = instant();
         let mut detector_config = config();
@@ -914,6 +939,31 @@ mod tests {
             detector.feed(
                 started_at,
                 "\x1b[2J\x1b[Holder status\r\napproval required\r\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\r\n\u{203a} type here\r\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}".as_bytes()
+            ),
+            vec![transition(AgentActivity::Blocked, StateSource::Screen)]
+        );
+    }
+
+    #[test]
+    fn last_non_empty_above_prompt_box_region_matches_cjk_wide_glyph_content() {
+        let started_at = instant();
+        let mut detector_config = config();
+        detector_config.manifest = Some(manifest(
+            r#"
+            [[rules]]
+            id = "above-prompt-cjk-blocked"
+            state = "blocked"
+            priority = 1
+            region = "last_non_empty_above_prompt_box"
+            contains = "审批需要"
+            "#,
+        ));
+        let mut detector = Detector::new(5, 20, started_at, detector_config);
+
+        assert_eq!(
+            detector.feed(
+                started_at,
+                "\x1b[2J\x1b[H审批需要确认界\r\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\r\n\u{203a} type here\r\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}".as_bytes()
             ),
             vec![transition(AgentActivity::Blocked, StateSource::Screen)]
         );
