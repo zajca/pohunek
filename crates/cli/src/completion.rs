@@ -7,9 +7,12 @@
 //! mesh state, or invalid local environment into shell noise.
 
 use std::ffi::{OsStr, OsString};
+use std::fs;
 use std::future::Future;
-use std::io::{self, Write as _};
+use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -30,6 +33,9 @@ const COMPLETE_ENV: &str = "POHUNEK_COMPLETE";
 /// Dynamic completion is interactive, so all discovery and daemon I/O shares a
 /// short deadline rather than inheriting the normal multi-second CLI timeouts.
 const COMPLETION_DEADLINE: Duration = Duration::from_millis(750);
+
+/// Shell completion scripts are public data owned by the installing user.
+const COMPLETION_FILE_MODE: u32 = 0o644;
 
 /// Shells supported by the public completion commands.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -128,10 +134,25 @@ pub(crate) fn install(
 }
 
 fn write_script(path: &Path, shell: CompletionShell, dynamic: bool) -> Result<(), CliError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, render_script(shell, dynamic))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+
+    let file_name = path.file_name().map_or_else(
+        || "pohunek-completion.tmp".to_owned(),
+        |name| format!(".{}.tmp", name.to_string_lossy()),
+    );
+    let temp_path = parent.join(file_name);
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(COMPLETION_FILE_MODE)
+        .open(&temp_path)?;
+    file.write_all(&render_script(shell, dynamic))?;
+    file.flush()?;
+    drop(file);
+    fs::set_permissions(&temp_path, fs::Permissions::from_mode(COMPLETION_FILE_MODE))?;
+    fs::rename(&temp_path, path)?;
     Ok(())
 }
 
@@ -678,10 +699,26 @@ mod tests {
         assert!(static_script.contains("complete"));
 
         write_script(&path, CompletionShell::Bash, true).expect("replace with dynamic completion");
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("read dynamic completion"),
-            dynamic_bootstrap(CompletionShell::Bash)
-        );
+        let dynamic_script = std::fs::read_to_string(&path).expect("read dynamic completion");
+        assert_eq!(dynamic_script, dynamic_bootstrap(CompletionShell::Bash));
+        #[cfg(not(unix))]
+        let _ = dynamic_script;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let mode = std::fs::metadata(&path)
+                .map(|metadata| metadata.permissions())
+                .map(|permissions| permissions.mode())
+                .expect("completion permissions");
+            #[allow(
+                clippy::semicolon_outside_block,
+                reason = "clippy's semicolon formatting lints conflict on this block"
+            )]
+            {
+                assert_eq!(mode & 0o777, COMPLETION_FILE_MODE);
+            }
+        }
         std::fs::remove_dir_all(&root).expect("remove completion fixture");
     }
 
