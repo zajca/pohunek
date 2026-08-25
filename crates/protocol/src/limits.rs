@@ -102,3 +102,9 @@ pub const MAX_SESSION_OUTPUT_BYTES: usize = ((MAX_CONTROL_LINE_BYTES
 /// keeps the full newline-delimited control response within the framing limit.
 pub const MAX_SESSION_SCREEN_RESPONSE_BYTES: usize =
     MAX_CONTROL_LINE_BYTES - OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES;
+
+/// Maximum line count accepted and returned by `session.read`.
+///
+/// One thousand rows covers every supported terminal geometry while bounding
+/// JSON escaping and daemon-side allocation independently of terminal size.
+pub const MAX_SESSION_READ_LINES: u32 = 1_000;

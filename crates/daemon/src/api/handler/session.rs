@@ -8,10 +8,10 @@
 use protocol::{
     Request, Response, SessionAttachParams, SessionDetachParams, SessionDiffParams,
     SessionForkParams, SessionForkResult, SessionId, SessionInputParams, SessionListParams,
-    SessionNewParams, SessionNewResult, SessionOutputParams, SessionReleaseAgentParams,
-    SessionRenameParams, SessionReportAgentParams, SessionReportNativeIdParams,
-    SessionResizeParams, SessionResumeResult, SessionScreenParams, SessionSetMetadataParams,
-    SessionWaitParams,
+    SessionNewParams, SessionNewResult, SessionOutputParams, SessionReadParams,
+    SessionReleaseAgentParams, SessionRenameParams, SessionReportAgentParams,
+    SessionReportNativeIdParams, SessionResizeParams, SessionResumeResult, SessionScreenParams,
+    SessionSetMetadataParams, SessionWaitParams,
 };
 
 use super::util::{error_value, ok_value, parse_optional_params, parse_params};
@@ -239,6 +239,17 @@ pub(super) async fn handle_session_screen(
         Err(err) => return error_value(request, err),
     };
     match sessions.screen(params.session_id()).await {
+        Ok(result) => ok_value(request, &result),
+        Err(err) => error_value(request, err),
+    }
+}
+
+pub(super) async fn handle_session_read(request: &Request, sessions: &SessionRegistry) -> Response {
+    let params = match parse_params::<SessionReadParams>(request) {
+        Ok(params) => params,
+        Err(err) => return error_value(request, err),
+    };
+    match sessions.session_read(&params).await {
         Ok(result) => ok_value(request, &result),
         Err(err) => error_value(request, err),
     }

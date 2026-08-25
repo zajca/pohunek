@@ -22,12 +22,13 @@ use crate::{
     SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionDiffParams,
     SessionDiffResult, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
     SessionInputParams, SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult,
-    SessionOutputParams, SessionOutputResult, SessionReleaseAgentParams, SessionReleaseAgentResult,
-    SessionRemoveResult, SessionRenameParams, SessionRenameResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionResumeResult, SessionScreenParams,
-    SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult,
-    SessionWaitParams, SessionWaitResult, WorktreeRemoveParams, WorktreeRemoveResult,
+    SessionOutputParams, SessionOutputResult, SessionReadParams, SessionReadResult,
+    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams,
+    SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionResumeResult, SessionScreenParams, SessionScreenResult,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult, SessionWaitParams,
+    SessionWaitResult, WorktreeRemoveParams, WorktreeRemoveResult,
 };
 
 /// A typed control-protocol method contract.
@@ -255,6 +256,15 @@ method_table!(
     SessionOutputResult,
     "SessionOutputParams",
     "SessionOutputResult";
+
+    /// Read a bounded point-in-time terminal text capture.
+    SessionRead,
+    SESSION_READ,
+    "session.read",
+    SessionReadParams,
+    SessionReadResult,
+    "SessionReadParams",
+    "SessionReadResult";
 
     /// Wait on a bounded dedicated connection for session activity.
     SessionWait,

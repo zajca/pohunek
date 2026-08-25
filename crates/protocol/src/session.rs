@@ -14,7 +14,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use crate::{
     envelope::StateSource, OutputOffset, ProcessStartIdentity, ProtocolError, ReportSequence,
     RuntimeGeneration, TerminalWatermark, MAX_RUNTIME_ID_BYTES, MAX_SESSION_ID_BYTES,
-    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_WAIT_MS,
+    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_WAIT_MS,
 };
 
 /// The kind of agent backing a session.
@@ -565,6 +565,15 @@ pub enum ObservationParamsError {
     /// `has_more` disagreed with the returned and runtime end offsets.
     #[error("has_more must equal next_offset < runtime_end_offset")]
     InvalidOutputHasMore,
+
+    /// A requested screen-read line count exceeded the protocol ceiling.
+    #[error("lines must be at most {maximum}, got {actual}")]
+    ReadLinesTooMany {
+        /// Protocol maximum.
+        maximum: u32,
+        /// Requested value.
+        actual: u32,
+    },
 }
 
 fn validate_identifier(value: &str, field: &'static str) -> Result<(), ObservationParamsError> {
@@ -620,6 +629,178 @@ impl SessionScreenParams {
     pub const fn session_id(&self) -> &SessionId {
         &self.session_id
     }
+}
+
+/// Text source selected for `session.read`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionReadSource.ts"))]
+#[serde(rename_all = "snake_case")]
+pub enum SessionReadSource {
+    /// Current visible terminal rows.
+    Visible,
+    /// Recent rendered text with wrapping preserved.
+    Recent,
+    /// Recent rendered text after removing soft wraps.
+    RecentUnwrapped,
+    /// Detection-oriented recent text.
+    Detection,
+}
+
+impl SessionReadSource {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Visible => "visible",
+            Self::Recent => "recent",
+            Self::RecentUnwrapped => "recent_unwrapped",
+            Self::Detection => "detection",
+        }
+    }
+}
+
+/// Encoding selected for `session.read`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionReadFormat.ts"))]
+#[serde(rename_all = "snake_case")]
+pub enum SessionReadFormat {
+    /// Sanitized terminal text.
+    Text,
+    /// ANSI stream that reproduces the captured state when available.
+    Ansi,
+}
+
+impl SessionReadFormat {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Ansi => "ansi",
+        }
+    }
+}
+
+/// Parameters for `session.read`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionReadParams.ts"))]
+#[serde(deny_unknown_fields)]
+pub struct SessionReadParams {
+    /// Session whose managed terminal should be read.
+    session_id: SessionId,
+    /// Requested source. Omission uses [`SessionReadSource::Visible`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    source: Option<SessionReadSource>,
+    /// Maximum returned lines. Omission uses the protocol ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    lines: Option<u32>,
+    /// Requested encoding. Omission uses [`SessionReadFormat::Text`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    format: Option<SessionReadFormat>,
+}
+
+impl SessionReadParams {
+    /// Creates a bounded session-screen read request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObservationParamsError::ReadLinesTooMany`] when `lines`
+    /// exceeds [`MAX_SESSION_READ_LINES`].
+    pub fn new(
+        session_id: SessionId,
+        source: Option<SessionReadSource>,
+        lines: Option<u32>,
+        format: Option<SessionReadFormat>,
+    ) -> Result<Self, ObservationParamsError> {
+        if let Some(actual) = lines.filter(|count| *count > MAX_SESSION_READ_LINES) {
+            return Err(ObservationParamsError::ReadLinesTooMany {
+                maximum: MAX_SESSION_READ_LINES,
+                actual,
+            });
+        }
+        Ok(Self {
+            session_id,
+            source,
+            lines,
+            format,
+        })
+    }
+
+    /// Returns the requested logical session.
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// Returns the requested source or its default.
+    #[must_use]
+    pub const fn source(&self) -> Option<SessionReadSource> {
+        self.source
+    }
+
+    /// Returns the requested line limit.
+    #[must_use]
+    pub const fn lines(&self) -> Option<u32> {
+        self.lines
+    }
+
+    /// Returns the requested encoding or its default.
+    #[must_use]
+    pub const fn format(&self) -> Option<SessionReadFormat> {
+        self.format
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionReadParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireParams {
+            session_id: SessionId,
+            #[serde(default)]
+            source: Option<SessionReadSource>,
+            #[serde(default)]
+            lines: Option<u32>,
+            #[serde(default)]
+            format: Option<SessionReadFormat>,
+        }
+
+        let wire = WireParams::deserialize(deserializer)?;
+        Self::new(wire.session_id, wire.source, wire.lines, wire.format)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Bounded terminal text returned by `session.read`.
+///
+/// The revision is the worker output offset represented by this snapshot. It is
+/// independent from the repaint watermark so callers can detect whether output
+/// was appended while they inspected an older response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionReadResult.ts"))]
+#[serde(deny_unknown_fields)]
+pub struct SessionReadResult {
+    /// Captured terminal text in the requested format.
+    pub text: String,
+    /// Source actually used to produce the capture.
+    pub source_used: SessionReadSource,
+    /// Effective line limit applied by the daemon.
+    pub lines_requested: u32,
+    /// Whether the effective limit discarded older content.
+    pub truncated: bool,
+    /// Monotonic worker output offset at the snapshot point.
+    #[cfg_attr(feature = "ts", ts(type = "string"))]
+    pub revision: u64,
 }
 
 /// Visible terminal cursor in a rendered screen snapshot.
