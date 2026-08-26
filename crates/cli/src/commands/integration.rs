@@ -736,7 +736,10 @@ mod status_tests {
                     installed_version: Some(4),
                     expected_version: 4,
                     state: IntegrationInstallState::Current,
-                    warning: None,
+                    warning: Some(
+                        "notification hook version marker is missing, invalid, or outdated"
+                            .to_owned(),
+                    ),
                 },
                 IntegrationAgentStatus {
                     agent: AgentKind::Codex,
@@ -746,7 +749,9 @@ mod status_tests {
                     installed_version: None,
                     expected_version: 4,
                     state: IntegrationInstallState::Outdated,
-                    warning: Some("hook version marker is missing or invalid".to_owned()),
+                    warning: Some(
+                        "state hook version marker is missing, invalid, or outdated".to_owned(),
+                    ),
                 },
             ],
         };
@@ -760,6 +765,9 @@ mod status_tests {
         assert!(rows.len() == 1 && rows[0].contains("current") && rows[0].ends_with("4/4"));
         assert!(output.contains("  hook: /home/u/.claude/hooks/pohunek-agent-state.sh"));
         assert!(output.contains("  managed: /home/u/.claude/hooks/pohunek-agent-notify.sh"));
+        assert!(output.contains(
+            "  warning: notification hook version marker is missing, invalid, or outdated"
+        ));
         let rows: Vec<&str> = output
             .lines()
             .filter(|line| line.starts_with("codex "))
