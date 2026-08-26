@@ -89,13 +89,16 @@ fn ansi_unavailable() -> ProtocolError {
 }
 
 fn truncate_read_text(mut text: String, truncated: &mut bool) -> String {
-    while serde_json::to_string(&text)
-        .is_ok_and(|encoded| encoded.len() + 2 > MAX_SESSION_READ_RESPONSE_BYTES)
-    {
+    let mut encoded_len = text.len().saturating_mul(7);
+    while encoded_len + 2 > MAX_SESSION_READ_RESPONSE_BYTES {
         *truncated = true;
         let safe_end = std::str::from_utf8(&text.as_bytes()[..text.len() - 1])
             .map_or(text.len() - 1, str::len);
         text.truncate(safe_end);
+        if safe_end == 0 {
+            break;
+        }
+        encoded_len = text.len().saturating_mul(7);
     }
     text
 }
