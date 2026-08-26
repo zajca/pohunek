@@ -1183,7 +1183,6 @@ async fn transient_foreground_error_preserves_last_known_claim() {
 
     inspector.fail_foreground_with(std::io::ErrorKind::PermissionDenied);
     inspector.set_descendants(created.pid, vec![]);
-    inspector.fire_exit(600);
     registry
         .rescan_procwatch_at(&created.id, created.pid, Instant::now())
         .await;
@@ -1198,6 +1197,9 @@ async fn transient_foreground_error_preserves_last_known_claim() {
         registry.inner.sessions.lock().await[&created.id].foreground_process_group,
         Some(600)
     );
+
+    inspector.set_descendants(created.pid, vec![codex_fact(600, created.pid)]);
+    inspector.set_foreground_group(created.pid, Some(600));
 
     let _ = registry.stop(&created.id).await;
 }
