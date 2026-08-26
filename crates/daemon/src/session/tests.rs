@@ -1098,7 +1098,11 @@ async fn foreground_member_matches_pgid_without_crossing_groups() {
 
     // The wrapper is the recognized leader but not an identified agent. Its PGID
     // identifies the group; a same-kind process in another group must never win.
-    let mut wrapper = codex_fact(400, created.pid);
+    let mut wrapper = ProcessFact {
+        comm: "wrapper".to_owned(),
+        cmdline: vec!["/usr/bin/wrapper".to_owned()],
+        ..codex_fact(400, created.pid)
+    };
     wrapper.pgid = 399;
     let mut member = claude_fact(410, 400);
     member.pgid = 399;
