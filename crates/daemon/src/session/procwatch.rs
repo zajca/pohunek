@@ -144,12 +144,16 @@ impl SessionRegistry {
                 }
             }
 
-            let updated = self.reconcile_active_agent(entry, now);
             let probe = self.probe_foreground_group(id, root_pid, entry.foreground_process_group);
             if let ForegroundProbe::Observed(foreground) = probe {
                 entry.foreground_process_group = foreground;
             }
             let foreground_update = choose_foreground_agent(entry, root_pid, now);
+            let updated = if foreground_update.is_some() {
+                None
+            } else {
+                self.reconcile_active_agent(entry, now)
+            };
             let focus_pid = entry
                 .active_agent
                 .as_ref()
