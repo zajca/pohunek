@@ -12,7 +12,6 @@ path = "src/lib.rs"
 
 [dependencies]
 thiserror = { workspace = true }
-netbird = { workspace = true }
 
 [lints]
 workspace = true

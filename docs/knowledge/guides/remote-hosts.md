@@ -2,7 +2,7 @@
 type: Guide
 id: guide/remote-hosts
 title: Remote hosts
-description: Use host discovery and host-qualified targets to inspect and operate Pohunek across NetBird peers.
+description: Use host discovery and host-qualified targets to inspect and operate Pohunek across configured overlay peers.
 source_kind: manual
 intents: [setup, project, debug, help]
 ---
@@ -14,9 +14,12 @@ target a host, and session targets can use `<host>/<session-id>`.
 
 Use these commands for orientation:
 
-- `pohunek host discover --json` to enumerate NetBird peers and probe daemons.
+- `pohunek host discover --json` to enumerate configured overlay peers and probe
+  daemons. Each record carries its overlay, optional provider peer identity,
+  address, and that overlay's effective daemon port. Address-less peers remain
+  visible as candidates instead of being discarded.
 - `pohunek host list --json` to list known live peers. These commands need the
-  local NetBird CLI/state, but do not connect to local `pohunekd`; a short
+  local overlay CLI/state, but do not connect to local `pohunekd`; a short
   owner-private cache avoids repeated probing, and `--refresh` bypasses it.
   Status loading and peer probes are bounded by a complete discovery deadline.
 - `pohunek host inspect <host> --json` to inspect one host's daemon
@@ -29,7 +32,7 @@ confirmation model; non-interactive remote starts require `--yes`.
 Durable notifications keep the same host-authoritative model. Each daemon owns
 only its local notification store, and cross-host notification views are
 client-side fan-out. `pohunek notifications list --all-hosts` queries the local
-daemon plus reachable daemon peers discovered directly from local NetBird state, then
+daemon plus reachable daemon peers discovered directly from local overlay state, then
 renders per-host successes and structured per-host errors. The matching watch
 command with `--all-hosts` opens one subscription per reachable host and streams
 notification create, update, and delete events as they arrive.
@@ -50,7 +53,14 @@ The assistant design keeps the same boundary. A remote assistant must use a
 knowledge bundle materialized on the remote host, version-matched to the remote
 binary, and readable by the selected remote agent profile.
 
-The Hermes operator uses the same direct NetBird path but never performs host
+The Hermes operator uses the same direct overlay path but never performs host
 discovery on a model's behalf. Its policy allows only explicitly listed hosts;
 a wildcard requires explicit install-time confirmation. See
 [Hermes operator](hermes-operator.md#access-policy-and-targets).
+
+Unqualified names that resolve in more than one overlay fail closed. Clients
+keep the overlay-qualified peer identity for display and caching, and reuse the
+exact discovered socket route for control calls and the separate raw attach
+connection. A failure in one configured overlay does not hide healthy peers
+from another overlay; discovery reports an error only when every provider
+fails.

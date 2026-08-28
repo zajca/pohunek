@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
   DEFAULT_DISCOVER_INTERVAL_SECONDS,
-  DEFAULT_REMOTE_PORT,
   BackendConfigError,
   loadBackendConfig,
 } from "@pohunek/backend";
@@ -21,11 +20,10 @@ describe("backend configuration", () => {
     expect(config.port).toBe(8080);
     expect(config.allowLoopbackBind).toBe(false);
     expect(config.daemonSocketPath).toBe(`${TEST_RUNTIME_DIR}/pohunek/daemon.sock`);
-    expect(config.remotePort).toBe(DEFAULT_REMOTE_PORT);
     expect(config.discoverIntervalSeconds).toBe(DEFAULT_DISCOVER_INTERVAL_SECONDS);
   });
 
-  test("accepts explicit socket, remote port, interval, loopback, and assets", () => {
+  test("accepts explicit socket, interval, loopback, and assets", () => {
     const config = loadBackendConfig({
       POHUNEK_BACKEND_BIND_HOST: "127.0.0.1",
       POHUNEK_BACKEND_PORT: "0",
@@ -33,12 +31,10 @@ describe("backend configuration", () => {
       POHUNEK_BACKEND_DAEMON_SOCKET: "/tmp/custom-daemon.sock",
       POHUNEK_BACKEND_DISCOVER_INTERVAL: "0.05",
       POHUNEK_BACKEND_STATIC_DIR: TEST_STATIC_DIR,
-      POHUNEK_REMOTE_PORT: " 19000 ",
     });
 
     expect(config.allowLoopbackBind).toBe(true);
     expect(config.daemonSocketPath).toBe("/tmp/custom-daemon.sock");
-    expect(config.remotePort).toBe(19_000);
     expect(config.discoverIntervalSeconds).toBe(0.05);
     expect(config.staticAssetsDir).toBe(TEST_STATIC_DIR);
   });
@@ -56,18 +52,6 @@ describe("backend configuration", () => {
       { POHUNEK_BACKEND_BIND_HOST: "100.64.0.10", POHUNEK_BACKEND_PORT: "8080" },
       "XDG_RUNTIME_DIR",
     );
-  });
-
-  test("rejects present but invalid remote ports", () => {
-    for (const remotePort of ["", "0", "-1", "65536", "80.5", "not-a-port"]) {
-      expectConfigError(
-        {
-          ...baseEnv(),
-          POHUNEK_REMOTE_PORT: remotePort,
-        },
-        "POHUNEK_REMOTE_PORT",
-      );
-    }
   });
 
   test("rejects invalid optional values instead of silently defaulting", () => {

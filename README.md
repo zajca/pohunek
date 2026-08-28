@@ -74,12 +74,14 @@ where they are doing it, and when they need you.
 - Every command takes `--host <name>`; session targets accept
   `<host>/<session-id>`. The CLI talks **directly** to each host's daemon —
   there is no coordinator, no SaaS, no state sync.
-- Remote transport is a TCP listener bound **only** to the host's
-  NetBird/WireGuard address, never `0.0.0.0`. Reachability and encryption come
-  from the mesh; local access is an owner-only Unix socket.
-- **Tokenless discovery**: `pohunek host discover` enumerates local NetBird
-  peers and probes which run a reachable daemon. It needs local NetBird but not
-  local `pohunekd`, and uses a short owner-private cache; `--refresh` re-probes.
+- Remote transport is one TCP listener per configured overlay, bound **only**
+  to that provider's validated member address and port, never `0.0.0.0`.
+  NetBird/WireGuard is the default provider; local access is an owner-only Unix
+  socket.
+- **Tokenless discovery**: `pohunek host discover` aggregates configured
+  overlay peers and probes which run a reachable daemon. It needs provider-local
+  state but not local `pohunekd`, and uses a short owner-private cache;
+  `--refresh` re-probes.
   Status loading and peer probing have explicit bounded deadlines.
   `host inspect` queries live capabilities straight from the selected daemon.
 
@@ -688,7 +690,8 @@ workspace in `web/` for the TypeScript packages.
 | `crates/prompt` | Shared prompt rendering + `link.*` metadata schema (CLI, GUI, scripts). |
 | `crates/knowledge` | Knowledge-bundle primitives for the assistant and offline docs. |
 | `crates/terminal` | VT screen tracking and attach compositing. |
-| `crates/netbird` | NetBird status parsing, host resolution, bind validation. |
+| `crates/netbird` | NetBird status parsing, host resolution, bind validation, and overlay adapter. |
+| `crates/overlay` | Provider-neutral overlay contract, configured registry, and per-overlay routing. |
 | `crates/paths` / `crates/hostcheck` | XDG/socket contract; host environment probes. |
 | `crates/xtask` | Workspace automation: docs build/check, TS type generation. |
 | `web/` | `@pohunek/protocol`, `@pohunek/sdk`, `@pohunek/backend`, `@pohunek/client-core`, `@pohunek/frontend`, `@pohunek/testkit`. |

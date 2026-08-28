@@ -78,7 +78,20 @@ pub(crate) async fn run_inspect(host: &str, paths: &Paths, json: bool) -> Result
 /// Render the discovered hosts as an aligned table.
 fn render_records_human(records: &[HostRecord]) -> String {
     let name_of = |r: &HostRecord| r.name.clone().unwrap_or_else(|| "-".to_owned());
-    let ip_of = |r: &HostRecord| r.address.clone().unwrap_or_else(|| "-".to_owned());
+    let route_of = |record: &HostRecord| {
+        record.address.as_deref().map_or_else(
+            || format!("{}://-:{}", record.overlay, record.port),
+            |address| match address.parse::<std::net::IpAddr>() {
+                Ok(address) => format!(
+                    "{}://{}",
+                    record.overlay,
+                    std::net::SocketAddr::new(address, record.port)
+                ),
+                Err(_) => format!("{}://{address}:{}", record.overlay, record.port),
+            },
+        )
+    };
+    let route_header = "ROUTE";
 
     let name_width = records
         .iter()
@@ -86,26 +99,26 @@ fn render_records_human(records: &[HostRecord]) -> String {
         .max()
         .unwrap_or(0)
         .max("NAME".len());
-    let ip_width = records
+    let route_width = records
         .iter()
-        .map(|r| ip_of(r).len())
+        .map(|record| route_of(record).len())
         .max()
         .unwrap_or(0)
-        .max("NETBIRD_IP".len());
+        .max(route_header.len());
 
     let mut output = String::new();
     let _ = writeln!(
         output,
-        "{:<name_width$}  {:<ip_width$}  STATUS         VERSION",
-        "NAME", "NETBIRD_IP",
+        "{:<name_width$}  {:<route_width$}  STATUS         VERSION",
+        "NAME", route_header,
     );
     for r in records {
         let (status, version) = class_columns(&r.class);
         let _ = writeln!(
             output,
-            "{:<name_width$}  {:<ip_width$}  {status:<13}  {version}",
+            "{:<name_width$}  {:<route_width$}  {status:<13}  {version}",
             name_of(r),
-            ip_of(r),
+            route_of(r),
         );
     }
     output
@@ -219,7 +232,9 @@ mod tests {
                 name: Some("host-b".to_owned()),
                 fqdn: Some("host-b.netbird.cloud".to_owned()),
                 address: Some("100.92.30.40".to_owned()),
+                port: 18722,
                 overlay: "netbird".to_owned(),
+                peer_id: Some("100.92.30.40".to_owned()),
                 class: HostClass::ReachableDaemon {
                     daemon_version: "0.1.0".to_owned(),
                 },
@@ -228,13 +243,15 @@ mod tests {
                 name: Some("host-c".to_owned()),
                 fqdn: Some("host-c.netbird.cloud".to_owned()),
                 address: Some("100.92.30.41".to_owned()),
+                port: 18722,
                 overlay: "netbird".to_owned(),
+                peer_id: Some("100.92.30.41".to_owned()),
                 class: HostClass::Candidate,
             },
         ];
         let output = render_records_human(&records);
         let header = output.lines().next().expect("header");
-        for column in ["NAME", "NETBIRD_IP", "STATUS", "VERSION"] {
+        for column in ["NAME", "ROUTE", "STATUS", "VERSION"] {
             assert!(header.contains(column), "header missing {column}: {header}");
         }
         assert!(output.contains("host-b"));

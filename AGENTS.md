@@ -42,7 +42,7 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | Crate | Role |
 |-------|------|
 | `crates/protocol` | Shared control-protocol envelopes + version negotiation. The wire contract. |
-| `crates/client`   | SDK client: typed errors, daemon transport, standalone host discovery with bounded NetBird probing. |
+| `crates/client`   | SDK client: typed errors, daemon transport, standalone configured-overlay discovery with bounded probing. |
 | `crates/daemon`   | Host control plane (`pohunekd`): logical registry, worker reconciliation, public protocol, detection/hooks. |
 | `crates/worker-protocol` | Private versioned daemon-to-worker protocol and framing. |
 | `crates/session-worker` | Durable per-session PTY owner (`pohunek-sessiond`). |
@@ -51,6 +51,7 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | `crates/knowledge`| Knowledge-bundle primitives for the assistant and offline docs. |
 | `crates/terminal` | Shared VT screen tracking and attach compositing primitives. |
 | `crates/netbird`  | NetBird status parsing, host resolution, bind-address validation. |
+| `crates/overlay`  | Provider-neutral overlay contract, configured registry, routing identity, and per-overlay ports. |
 | `crates/paths`    | Shared XDG path and local socket contract for daemon, CLI, and GUI clients. |
 | `crates/hostcheck`| Host environment probes shared by `doctor` and the daemon's `doctor` RPC. |
 | `crates/logging` | Process-safe size rotation and retention for daemon and per-session worker logs. |

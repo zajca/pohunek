@@ -61,17 +61,14 @@ impl Client {
     pub(crate) fn into_sdk(self) -> pohunek_client::Client {
         self.inner
     }
-}
 
-/// Open an attach byte stream for `host`.
-pub(crate) async fn attach_raw(
-    host: &str,
-    paths: &Paths,
-    stream_id: &str,
-) -> Result<RawStream, CliError> {
-    pohunek_client::attach_raw(host, &paths.socket, stream_id)
-        .await
-        .map_err(map_connect_error)
+    /// Open raw attach bytes on this client's selected route.
+    pub(crate) async fn attach_raw(&self, stream_id: &str) -> Result<RawStream, CliError> {
+        self.inner
+            .attach_raw(stream_id)
+            .await
+            .map_err(map_connect_error)
+    }
 }
 
 fn map_connect_error(err: pohunek_client::ClientError) -> CliError {

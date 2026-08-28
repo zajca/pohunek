@@ -119,8 +119,14 @@ mod tests {
         let doc = render_json(&serde_json::json!({"value": 42})).expect("render envelope");
         let value: serde_json::Value = serde_json::from_str(&doc).expect("parse envelope");
         assert_eq!(value["cli_version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(value["protocol"]["minimum"], 2);
-        assert_eq!(value["protocol"]["maximum"], 2);
+        assert_eq!(
+            value["protocol"]["minimum"],
+            protocol::PROTOCOL_VERSION.get()
+        );
+        assert_eq!(
+            value["protocol"]["maximum"],
+            protocol::PROTOCOL_VERSION.get()
+        );
         assert_eq!(value["ok"]["value"], 42);
         assert!(value.get("err").is_none());
     }

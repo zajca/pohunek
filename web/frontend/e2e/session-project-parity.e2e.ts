@@ -57,8 +57,8 @@ test("manages host-scoped projects and eligible owned worktrees", async ({ page,
   await page.goto(stack.backend.url);
   await page.getByRole("button", { name: "Projects" }).click();
   await expect(page).toHaveURL(new RegExp(`/hosts/${FIXTURE_LOCAL_HOST}/projects$`));
-  await page.getByRole("combobox", { name: "Project host" }).selectOption("fixture-peer");
-  await expect(page).toHaveURL(/\/hosts\/fixture-peer\/projects$/u);
+  await page.getByRole("combobox", { name: "Project host" }).selectOption("netbird:fixture-peer");
+  await expect(page).toHaveURL(/\/hosts\/netbird:fixture-peer\/projects$/u);
   await expect(page.getByRole("button", { name: "Add project" })).toBeEnabled();
   await page.getByRole("combobox", { name: "Project host" }).selectOption(FIXTURE_LOCAL_HOST);
   await expect(page).toHaveURL(new RegExp(`/hosts/${FIXTURE_LOCAL_HOST}/projects$`));

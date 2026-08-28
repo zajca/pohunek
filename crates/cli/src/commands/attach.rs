@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 use tokio::time;
 
 use self::shortcut::{MenuInputMode, Shortcut, ShortcutDecoder};
-use crate::client::{attach_raw, Client, RawStream};
+use crate::client::{Client, RawStream};
 use crate::commands::{request_id, request_with_params};
 use crate::error::CliError;
 use crate::paths::Paths;
@@ -584,7 +584,7 @@ async fn run_attach_once(
     // Open the raw second connection over the same transport as the control
     // connection. The SDK writes the daemon attach prelude before returning, so
     // the CLI only owns terminal resize/forward/detach behavior.
-    match attach_raw(host, paths, &attach.stream_id).await? {
+    match client.attach_raw(&attach.stream_id).await? {
         // Box the large attach future to keep this enclosing future small.
         RawStream::Local(stream) => {
             Box::pin(attach_over_stream(

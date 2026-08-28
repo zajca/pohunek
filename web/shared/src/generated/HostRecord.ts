@@ -4,7 +4,8 @@
  * One enumerated host with its overlay identity and classification.
  *
  * Field order and names are part of the wire contract the rofi switcher parses
- * (`name`, `address`, `overlay`, and the flattened `classification`).
+ * (`name`, `address`, `port`, `overlay`, `peer_id`, and the flattened
+ * `classification`).
  */
 export type HostRecord =
   & {
@@ -13,17 +14,25 @@ export type HostRecord =
      */
     name: string | null;
     /**
-     * The peer's fully qualified `NetBird` name.
+     * The peer's provider-qualified DNS name.
      */
     fqdn: string | null;
     /**
-     * The peer's dialable address as a string.
+     * The peer's dialable IP address without a port.
      */
     address: string | null;
+    /**
+     * Effective daemon port configured for this overlay route.
+     */
+    port: number;
     /**
      * Which overlay transport discovered this peer (e.g. `"netbird"`).
      */
     overlay: string;
+    /**
+     * The overlay's stable peer identity (e.g. its `NetBird` address string).
+     */
+    peer_id: string | null;
   }
   & (
     | {

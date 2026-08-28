@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::{SinkExt, StreamExt};
-use overlay::OverlayTransport as _;
+use overlay::OverlayRegistry;
 use protocol::{
     AttachHeader, Event, Method, ProtocolError, ProtocolVersion, ProtocolVersionRange, Request,
     Response, SessionId, SessionOutputParams, SessionOutputResult, SessionResizeParams,
@@ -196,7 +196,49 @@ impl Client {
         if is_local_host(host) {
             Self::connect_local_with_options(socket_path, options).await
         } else {
-            let addr = resolve_remote_addr(host.to_owned(), options.connect_timeout).await?;
+            let registry = crate::default_overlay_registry()?;
+            let addr =
+                resolve_remote_addr(host.to_owned(), options.connect_timeout, registry).await?;
+            Self::connect_tcp_addr_with_options(host, addr, options).await
+        }
+    }
+
+    /// Connect through an explicit configured overlay registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed registry, provider, connection, and protocol errors.
+    pub async fn connect_with_registry(
+        host: &str,
+        socket_path: impl AsRef<Path>,
+        registry: OverlayRegistry,
+    ) -> Result<Self, ClientError> {
+        Self::connect_with_registry_and_options(
+            host,
+            socket_path,
+            registry,
+            ClientOptions::default(),
+        )
+        .await
+    }
+
+    /// Connect through an explicit registry with transport settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed registry, provider, connection, and protocol errors.
+    pub async fn connect_with_registry_and_options(
+        host: &str,
+        socket_path: impl AsRef<Path>,
+        registry: OverlayRegistry,
+        options: ClientOptions,
+    ) -> Result<Self, ClientError> {
+        RequestOrigin::from_environment()?;
+        if is_local_host(host) {
+            Self::connect_local_with_options(socket_path, options).await
+        } else {
+            let addr =
+                resolve_remote_addr(host.to_owned(), options.connect_timeout, registry).await?;
             Self::connect_tcp_addr_with_options(host, addr, options).await
         }
     }
@@ -436,6 +478,27 @@ impl Client {
                 })
             }
         }
+    }
+
+    /// Open an attach stream on this client's exact selected endpoint.
+    ///
+    /// Remote clients reuse the already-resolved socket route rather than
+    /// resolving the host again, preventing control/raw route drift.
+    ///
+    /// # Errors
+    ///
+    /// Returns connection, I/O, origin-environment, or serialization errors.
+    pub async fn attach_raw(&self, stream_id: &str) -> Result<RawStream, ClientError> {
+        let mut stream = match &self.endpoint {
+            Endpoint::Local(socket_path) => {
+                connect_raw_local_with_options(socket_path, self.options).await?
+            }
+            Endpoint::Remote { host, addr } => {
+                connect_raw_tcp_addr_with_options(host, *addr, self.options).await?
+            }
+        };
+        stream.write_attach_header(stream_id).await?;
+        Ok(stream)
     }
 }
 
@@ -691,7 +754,8 @@ pub async fn connect_raw_with_options(
     if is_local_host(host) {
         connect_raw_local_with_options(socket_path, options).await
     } else {
-        let addr = resolve_remote_addr(host.to_owned(), options.connect_timeout).await?;
+        let registry = crate::default_overlay_registry()?;
+        let addr = resolve_remote_addr(host.to_owned(), options.connect_timeout, registry).await?;
         connect_raw_tcp_addr_with_options(host, addr, options).await
     }
 }
@@ -879,19 +943,17 @@ pub fn is_local_host(host: &str) -> bool {
 async fn resolve_remote_addr(
     host: String,
     connect_timeout: Duration,
+    registry: OverlayRegistry,
 ) -> Result<SocketAddr, ClientError> {
+    if let Ok(addr) = host.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
     let discovery_host = host.clone();
     let task = tokio::task::spawn_blocking(move || {
-        let transport = overlay::NetbirdTransport::new();
-        let port = netbird::remote_port().map_err(|err| ClientError::RemoteDiscoveryFailed {
-            detail: err.to_string(),
-        })?;
-        let resolved = transport
-            .resolve_host(&discovery_host, port)
-            .map_err(|err| ClientError::RemoteDiscoveryFailed {
-                detail: err.to_string(),
-            })?;
-        Ok(resolved.addr)
+        registry
+            .resolve_host(&discovery_host)
+            .map(|route| route.addr)
+            .map_err(ClientError::from)
     });
 
     match tokio::time::timeout(connect_timeout, task).await {
@@ -1234,6 +1296,41 @@ mod tests {
             .expect("subscribe succeeds");
         let received = server.await.expect("subscription fixture");
         assert_test_request_origin(&received);
+    }
+
+    #[tokio::test]
+    async fn client_attach_raw_reuses_the_selected_tcp_endpoint() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind selected endpoint");
+        let address = listener.local_addr().expect("selected endpoint address");
+        let decoy = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind decoy endpoint");
+        let server = tokio::spawn(async move {
+            let (_control, _) = listener.accept().await.expect("accept control connection");
+            let (raw, _) = listener.accept().await.expect("accept raw connection");
+            let mut raw = BufReader::new(raw);
+            let mut line = String::new();
+            raw.read_line(&mut line).await.expect("read attach header");
+            line
+        });
+        let client = Client::connect_tcp_addr("overlay-qualified-peer", address)
+            .await
+            .expect("connect selected endpoint");
+
+        let raw = client
+            .attach_raw("stream-same-route")
+            .await
+            .expect("attach exact endpoint");
+        let line = server.await.expect("selected endpoint server");
+        assert_eq!(line, "{\"attach\":\"stream-same-route\"}\n");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), decoy.accept())
+                .await
+                .is_err()
+        );
+        drop(raw);
     }
 
     async fn spawn_dedicated_capture_server(

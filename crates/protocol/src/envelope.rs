@@ -5,13 +5,13 @@
 //!
 //! ```jsonc
 //! // request
-//! {"v":{"minimum":2,"maximum":2},"id":"req-7f3","method":"session.new","params":{...}}
+//! {"v":{"minimum":3,"maximum":3},"id":"req-7f3","method":"session.new","params":{...}}
 //! // response (ok)
-//! {"v":2,"id":"req-7f3","ok":{...}}
+//! {"v":3,"id":"req-7f3","ok":{...}}
 //! // response (typed error)
-//! {"v":2,"id":"req-7f3","err":{"class":"runtime","code":"...","msg":"...","recover":"..."}}
+//! {"v":3,"id":"req-7f3","err":{"class":"runtime","code":"...","msg":"...","recover":"..."}}
 //! // event (on a subscription connection)
-//! {"v":2,"event":"agent_state","session_id":"s-42","activity":"blocked","source":"osc_title","ts":"..."}
+//! {"v":3,"event":"agent_state","session_id":"s-42","activity":"blocked","source":"osc_title","ts":"..."}
 //! ```
 //!
 //! `params`, `ok`, and event payloads are kept as `serde_json::Value` for the

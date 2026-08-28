@@ -88,6 +88,10 @@ pub enum DaemonError {
         reason: String,
     },
 
+    /// Configured overlay registry could not be constructed safely.
+    #[error("overlay configuration failed: {0}")]
+    OverlayConfig(#[from] overlay::OverlayError),
+
     /// Durable logical sessions could not be loaded for startup reconciliation.
     #[error("session worker reconciliation failed: {0}")]
     Reconcile(#[source] protocol::ProtocolError),

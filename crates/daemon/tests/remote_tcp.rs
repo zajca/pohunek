@@ -19,8 +19,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
-#[expect(unused_imports, reason = "trait import needed only in some cfg paths")]
-use overlay::OverlayTransport as _;
 use protocol::{
     method, AttachHeader, HostCapabilities, Request as ProtocolRequest, Response,
     SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
@@ -661,7 +659,7 @@ async fn bind_rejects_non_netbird_address() {
     );
     let addr: SocketAddr = "127.0.0.1:18722".parse().expect("parse loopback addr");
 
-    let transport = overlay::NetbirdTransport::new();
+    let transport = netbird::NetbirdTransport::new();
     let result = RemoteServer::bind(addr, state, &transport).await;
     match result {
         Err(DaemonError::OverlayBind { addr: rejected, .. }) => {

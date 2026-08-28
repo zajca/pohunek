@@ -72,9 +72,20 @@ pub enum ClientError {
     #[error("daemon error: {0}")]
     Protocol(#[from] ProtocolError),
 
-    /// `NetBird` discovery failed before a remote daemon could be dialed.
+    /// One provider failed before a remote daemon could be dialed.
     #[error(transparent)]
-    Netbird(#[from] netbird::NetbirdError),
+    Overlay(#[from] overlay::OverlayError),
+
+    /// Configured registry construction or route selection failed.
+    #[error(transparent)]
+    OverlayRegistry(#[from] overlay::RegistryError),
+
+    /// Every configured provider failed during aggregated discovery.
+    #[error("all configured overlays failed discovery")]
+    OverlayDiscoveryFailed {
+        /// Per-overlay typed failures retained without flattening.
+        failures: Vec<overlay::OverlayFailure>,
+    },
 
     /// Bounded remote-host discovery or its overall deadline failed.
     #[error("remote host discovery failed: {detail}")]
@@ -209,7 +220,28 @@ impl ClientError {
                 None,
             ),
             ClientError::Protocol(err) => err.clone(),
-            ClientError::Netbird(err) => netbird_error_to_protocol_error(err),
+            ClientError::Overlay(error) => overlay_error_to_protocol(error),
+            ClientError::OverlayRegistry(error) => registry_error_to_protocol(error),
+            ClientError::OverlayDiscoveryFailed { failures } => {
+                if let [failure] = failures.as_slice() {
+                    overlay_error_to_protocol(&failure.error)
+                } else {
+                    let overlays = failures
+                        .iter()
+                        .map(|failure| failure.overlay.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    ProtocolError::new(
+                        ErrorClass::Discovery,
+                        "overlay_discovery_failed",
+                        format!("all configured overlays failed discovery: {overlays}"),
+                        Some(
+                            "run `pohunek doctor` and repair at least one configured overlay"
+                                .to_owned(),
+                        ),
+                    )
+                }
+            }
             ClientError::RemoteDiscoveryFailed { detail } => ProtocolError::new(
                 ErrorClass::Discovery,
                 "remote_discovery_failed",
@@ -276,31 +308,123 @@ impl ClientError {
     }
 }
 
+fn overlay_error_to_protocol(error: &overlay::OverlayError) -> ProtocolError {
+    let overlay = error.overlay().as_str();
+    match error {
+        overlay::OverlayError::CliMissing(_) => ProtocolError::new(
+            ErrorClass::Discovery,
+            format!("{overlay}_cli_missing"),
+            format!("the {overlay} CLI was not found on PATH"),
+            Some(format!(
+                "install the {overlay} CLI and ensure it is on PATH; run `pohunek doctor` to verify"
+            )),
+        ),
+        overlay::OverlayError::StateUnavailable { detail, .. } => ProtocolError::new(
+            ErrorClass::Discovery,
+            format!("{overlay}_state_unavailable"),
+            format!("{overlay} local state is unavailable: {detail}"),
+            Some(format!(
+                "ensure the {overlay} daemon is running and this host is logged in; run `pohunek doctor` to verify"
+            )),
+        ),
+        overlay::OverlayError::InvalidConfig { detail, .. } => ProtocolError::new(
+            ErrorClass::Configuration,
+            format!("{overlay}_configuration_invalid"),
+            format!("{overlay} configuration is invalid: {detail}"),
+            Some("fix the overlay configuration and restart the command".to_owned()),
+        ),
+        overlay::OverlayError::ListenerAddressMissing(_) => ProtocolError::new(
+            ErrorClass::Discovery,
+            format!("{overlay}_listener_address_missing"),
+            format!("{overlay} has no safe local listener address"),
+            Some(format!(
+                "ensure {overlay} is connected and has a current member address; run `pohunek doctor`"
+            )),
+        ),
+        overlay::OverlayError::HostUnknown { host, .. } => ProtocolError::new(
+            ErrorClass::Discovery,
+            "host_unknown",
+            format!("host '{host}' was not found among {overlay} peers"),
+            Some(
+                "run `pohunek host list` to see reachable peers and check the host name".to_owned(),
+            ),
+        ),
+        overlay::OverlayError::PeerCollision { host, .. } => ProtocolError::new(
+            ErrorClass::Discovery,
+            "overlay_peer_collision",
+            format!("host '{host}' matches multiple peers inside {overlay}"),
+            Some("use a unique provider peer identity or concrete discovered route".to_owned()),
+        ),
+        _ => ProtocolError::new(
+            ErrorClass::Discovery,
+            "overlay_error",
+            error.to_string(),
+            Some("run `pohunek doctor` and inspect the configured overlay".to_owned()),
+        ),
+    }
+}
+
+fn registry_error_to_protocol(error: &overlay::RegistryError) -> ProtocolError {
+    match error {
+        overlay::RegistryError::HostUnknown(host) => ProtocolError::new(
+            ErrorClass::Discovery,
+            "host_unknown",
+            format!("host '{host}' was not found among configured overlay peers"),
+            Some("run `pohunek host list` to see reachable overlay peers".to_owned()),
+        ),
+        overlay::RegistryError::AmbiguousHost { host, overlays } => ProtocolError::new(
+            ErrorClass::Discovery,
+            "overlay_host_ambiguous",
+            format!("host '{host}' exists on multiple overlays: {overlays:?}"),
+            Some("select the overlay-qualified address shown by `pohunek host list`".to_owned()),
+        ),
+        overlay::RegistryError::HostUnavailable { failures, .. } if failures.len() == 1 => {
+            overlay_error_to_protocol(&failures[0].error)
+        }
+        overlay::RegistryError::HostUnavailable { host, failures } => ProtocolError::new(
+            ErrorClass::Discovery,
+            "overlay_host_unavailable",
+            format!(
+                "no healthy overlay could resolve host '{host}'; failures: {}",
+                failures
+                    .iter()
+                    .map(|failure| failure.overlay.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Some("repair a configured overlay or use a concrete discovered route".to_owned()),
+        ),
+        overlay::RegistryError::Empty
+        | overlay::RegistryError::InvalidId { .. }
+        | overlay::RegistryError::DuplicateId(_)
+        | overlay::RegistryError::InvalidPort(_) => ProtocolError::new(
+            ErrorClass::Configuration,
+            "overlay_registry_invalid",
+            error.to_string(),
+            Some("fix the configured overlay registry before retrying".to_owned()),
+        ),
+        _ => ProtocolError::new(
+            ErrorClass::Configuration,
+            "overlay_registry_invalid",
+            error.to_string(),
+            Some("fix the configured overlay registry before retrying".to_owned()),
+        ),
+    }
+}
+
 fn exact_version_range(version: ProtocolVersion) -> ProtocolVersionRange {
     ProtocolVersionRange::new(version, version)
         .expect("a protocol version is always a valid exact range")
 }
 
-fn netbird_error_to_protocol_error(err: &netbird::NetbirdError) -> ProtocolError {
-    match err {
-        netbird::NetbirdError::CliMissing => ProtocolError::netbird_cli_missing(),
-        netbird::NetbirdError::StateUnavailable(detail) | netbird::NetbirdError::Parse(detail) => {
-            ProtocolError::netbird_state_unavailable(detail.clone())
-        }
-        netbird::NetbirdError::InvalidConfig(detail) => ProtocolError::new(
-            ErrorClass::Configuration,
-            "netbird_invalid_config",
-            detail.clone(),
-            Some("fix the invalid NetBird-related configuration and retry".to_owned()),
-        ),
-        netbird::NetbirdError::HostUnknown(host) => ProtocolError::host_unknown(host),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use netbird::NetbirdError;
+    use overlay::{OverlayError, OverlayId};
+
+    fn netbird_id() -> OverlayId {
+        OverlayId::new("netbird").expect("id")
+    }
 
     #[test]
     fn local_daemon_unreachable_maps_to_daemon_error_with_recovery_hint() {
@@ -373,47 +497,39 @@ mod tests {
     }
 
     #[test]
-    fn netbird_cli_missing_maps_to_discovery_code() {
-        let structured = ClientError::from(NetbirdError::CliMissing).to_protocol_error();
+    fn overlay_cli_missing_maps_to_discovery_code() {
+        let structured =
+            ClientError::Overlay(OverlayError::CliMissing(netbird_id())).to_protocol_error();
 
         assert_eq!(structured.class, ErrorClass::Discovery);
         assert_eq!(structured.code, "netbird_cli_missing");
     }
 
     #[test]
-    fn netbird_state_unavailable_maps_to_discovery_code() {
-        let structured =
-            ClientError::from(NetbirdError::StateUnavailable("daemon down".to_owned()))
-                .to_protocol_error();
+    fn overlay_state_unavailable_maps_to_discovery_code() {
+        let structured = ClientError::Overlay(OverlayError::StateUnavailable {
+            overlay: netbird_id(),
+            detail: "daemon down".to_owned(),
+        })
+        .to_protocol_error();
 
         assert_eq!(structured.class, ErrorClass::Discovery);
         assert_eq!(structured.code, "netbird_state_unavailable");
     }
 
     #[test]
-    fn netbird_parse_error_maps_to_state_unavailable_and_includes_detail() {
-        let structured =
-            ClientError::from(NetbirdError::Parse("bad json".to_owned())).to_protocol_error();
+    fn overlay_parse_detail_is_preserved_without_flattening() {
+        let structured = ClientError::Overlay(OverlayError::StateUnavailable {
+            overlay: netbird_id(),
+            detail: "failed to parse status: bad json".to_owned(),
+        })
+        .to_protocol_error();
 
         assert_eq!(structured.class, ErrorClass::Discovery);
         assert_eq!(structured.code, "netbird_state_unavailable");
         assert!(
             structured.msg.contains("bad json"),
             "msg includes parse detail: {}",
-            structured.msg
-        );
-    }
-
-    #[test]
-    fn netbird_invalid_config_maps_to_configuration_error() {
-        let structured = ClientError::from(NetbirdError::InvalidConfig("bad port".to_owned()))
-            .to_protocol_error();
-
-        assert_eq!(structured.class, ErrorClass::Configuration);
-        assert_eq!(structured.code, "netbird_invalid_config");
-        assert!(
-            structured.msg.contains("bad port"),
-            "msg includes config detail: {}",
             structured.msg
         );
     }
@@ -451,8 +567,11 @@ mod tests {
 
     #[test]
     fn host_unknown_maps_to_discovery_code_and_names_host() {
-        let structured = ClientError::from(NetbirdError::HostUnknown("build-box".to_owned()))
-            .to_protocol_error();
+        let structured = ClientError::Overlay(OverlayError::HostUnknown {
+            host: "build-box".to_owned(),
+            overlay: netbird_id(),
+        })
+        .to_protocol_error();
 
         assert_eq!(structured.class, ErrorClass::Discovery);
         assert_eq!(structured.code, "host_unknown");

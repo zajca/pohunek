@@ -8,8 +8,7 @@ use crate::status::{NetbirdError, NetbirdStatus};
 /// Resolve a host name to a `NetBird` IP using a parsed [`NetbirdStatus`].
 ///
 /// Matching is case-insensitive and tried in this order:
-/// 1. If `name` itself parses as an IP inside `100.64.0.0/10`, it is returned
-///    directly (lets a user dial a raw `NetBird` IP without a peer entry).
+/// 1. If `name` parses as an IP, it must match a current peer entry.
 /// 2. A peer whose `fqdn` equals `name`.
 /// 3. A peer whose short hostname (the first DNS label of its `fqdn`) equals
 ///    `name`.
@@ -30,58 +29,66 @@ use crate::status::{NetbirdError, NetbirdStatus};
 pub fn resolve_host(status: &NetbirdStatus, name: &str) -> Result<IpAddr, NetbirdError> {
     let needle = name.trim();
 
-    // 1. A raw NetBird IP dials through directly.
+    // 1. A raw NetBird IP is accepted only when current peer state contains it.
     if let Ok(ip) = needle.parse::<IpAddr>() {
-        if is_netbird_ip(ip) {
+        if is_netbird_ip(ip) && status.peers().iter().any(|peer| peer.ip() == Some(ip)) {
             return Ok(ip);
         }
     }
 
     // 2. Exact fqdn match.
-    if let Some(ip) = status
-        .peers()
-        .iter()
-        .filter(|peer| {
+    if let Some(ip) = unique_peer_ip(
+        status.peers().iter().filter(|peer| {
             peer.fqdn
                 .as_deref()
                 .is_some_and(|fqdn| fqdn.eq_ignore_ascii_case(needle))
-        })
-        .find_map(|peer| peer.ip().filter(|ip| is_netbird_ip(*ip)))
-    {
+        }),
+        name,
+    )? {
         return Ok(ip);
     }
 
     // 3. Short hostname (first DNS label) match.
-    if let Some(ip) = status
-        .peers()
-        .iter()
-        .filter(|peer| {
+    if let Some(ip) = unique_peer_ip(
+        status.peers().iter().filter(|peer| {
             peer.fqdn
                 .as_deref()
                 .and_then(short_hostname)
                 .is_some_and(|short| short.eq_ignore_ascii_case(needle))
-        })
-        .find_map(|peer| peer.ip().filter(|ip| is_netbird_ip(*ip)))
-    {
+        }),
+        name,
+    )? {
         return Ok(ip);
     }
 
     // 4. Literal IP string equal to a peer's netbirdIp (e.g. a CIDR-bearing
     //    peer string the caller pasted verbatim is normalized by `Peer::ip`).
-    if let Some(ip) = status
-        .peers()
-        .iter()
-        .filter(|peer| {
+    if let Some(ip) = unique_peer_ip(
+        status.peers().iter().filter(|peer| {
             peer.netbird_ip
                 .as_deref()
                 .is_some_and(|raw| raw.eq_ignore_ascii_case(needle))
-        })
-        .find_map(|peer| peer.ip().filter(|ip| is_netbird_ip(*ip)))
-    {
+        }),
+        name,
+    )? {
         return Ok(ip);
     }
 
     Err(NetbirdError::HostUnknown(name.to_owned()))
+}
+
+fn unique_peer_ip<'a>(
+    peers: impl Iterator<Item = &'a crate::Peer>,
+    name: &str,
+) -> Result<Option<IpAddr>, NetbirdError> {
+    let addresses = peers
+        .filter_map(|peer| peer.ip().filter(|ip| is_netbird_ip(*ip)))
+        .collect::<Vec<_>>();
+    match addresses.as_slice() {
+        [] => Ok(None),
+        [address] => Ok(Some(*address)),
+        _ => Err(NetbirdError::HostAmbiguous(name.to_owned())),
+    }
 }
 
 /// The short hostname: the first DNS label of a fully qualified name.
@@ -127,10 +134,9 @@ mod tests {
     }
 
     #[test]
-    fn resolves_raw_netbird_ip_even_without_peer() {
-        // 100.64.0.99 is not a peer in the fixture but is a valid NetBird IP.
-        let ip = resolve_host(&status(), "100.64.0.99").unwrap();
-        assert_eq!(ip, "100.64.0.99".parse::<IpAddr>().unwrap());
+    fn rejects_raw_netbird_ip_without_peer_state() {
+        let error = resolve_host(&status(), "100.64.0.99").unwrap_err();
+        assert!(matches!(error, NetbirdError::HostUnknown(_)));
     }
 
     #[test]
@@ -169,6 +175,22 @@ mod tests {
             NetbirdError::HostUnknown(name) => assert_eq!(name, "no-such-host"),
             other => panic!("expected HostUnknown, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn duplicate_short_names_are_ambiguous() {
+        let status = parse_status(
+            r#"{"peers":[
+                {"fqdn":"build.one.example","netbirdIp":"100.64.0.2"},
+                {"fqdn":"build.two.example","netbirdIp":"100.64.0.3"}
+            ]}"#,
+        )
+        .expect("inline status parses");
+
+        assert!(matches!(
+            resolve_host(&status, "build"),
+            Err(NetbirdError::HostAmbiguous(host)) if host == "build"
+        ));
     }
 
     #[test]

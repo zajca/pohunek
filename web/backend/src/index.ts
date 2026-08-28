@@ -9,7 +9,6 @@ export type {
 } from "./bind";
 export {
   DEFAULT_DISCOVER_INTERVAL_SECONDS,
-  DEFAULT_REMOTE_PORT,
   DEFAULT_STATIC_ASSETS_DIR,
   BackendConfigError,
   loadBackendConfig,

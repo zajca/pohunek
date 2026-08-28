@@ -14,12 +14,17 @@ Source of truth:
 
 ## Compatibility Model
 
-The current public protocol version is `2` (`PROTOCOL_VERSION`), and this build
-supports the inclusive range `2..=2` (`SUPPORTED_PROTOCOL_VERSIONS`). Requests
+The current public protocol version is `3` (`PROTOCOL_VERSION`), and this build
+supports the inclusive range `3..=3` (`SUPPORTED_PROTOCOL_VERSIONS`). Requests
 carry `v: {minimum, maximum}`. The first valid response selects the highest
 overlapping version as an integer `v`, and that selection is fixed for the
 lifetime of the connection. Subscription events use the same selected version.
 A non-overlapping range returns `daemon/version_mismatch`.
+
+Protocol v3 is the coordinated overlay-routing boundary. It changes
+`HostRecord.address` to an optional IP-only value and adds required `port` and
+`overlay` fields plus optional `peer_id`. Every daemon and bundled client must
+be upgraded together; no v2 compatibility shim is provided.
 
 The former exact integer request envelope is deliberately rejected. Protocol
 v2 is a one-time coordinated pre-1.0 boundary: every CLI, GUI, web backend/SDK,
@@ -53,7 +58,7 @@ The daemon exposes the same protocol on two transports:
 | Transport | Endpoint | Security boundary |
 |---|---|---|
 | Local | Unix socket at the configured runtime path | Owner-only socket directory and mode |
-| Remote | TCP listener bound to the host's NetBird address | NetBird/WireGuard reachability and policy |
+| Remote | One TCP listener per configured overlay, bound to that provider's validated local member address and port | Overlay reachability and provider policy; NetBird/WireGuard is the default production provider |
 
 The JSON control stream is newline-delimited UTF-8 JSON. One JSON value is sent
 per line. The current daemon and Rust SDK cap control lines at 1 MiB.
@@ -93,7 +98,7 @@ center can validate the relay boundary before any stability promise is made.
 ### Request
 
 ```json
-{"v":{"minimum":2,"maximum":2},"id":"req-7f3","method":"session.list","params":{}}
+{"v":{"minimum":3,"maximum":3},"id":"req-7f3","method":"session.list","params":{}}
 ```
 
 Fields:
@@ -132,14 +137,14 @@ authentication or a broader mutation policy.
 Successful response:
 
 ```json
-{"v":2,"id":"req-7f3","ok":{"status":"ok"}}
+{"v":3,"id":"req-7f3","ok":{"status":"ok"}}
 ```
 
 Error response:
 
 ```json
 {
-  "v": 2,
+  "v": 3,
   "id": "req-7f3",
   "err": {
     "class": "daemon",
@@ -159,7 +164,7 @@ Events are pushed only after a successful `subscribe` request. They are also
 newline-delimited JSON, one event per line:
 
 ```json
-{"v":2,"event":"agent_state","session_id":"s-42","activity":"blocked","source":"osc_title"}
+{"v":3,"event":"agent_state","session_id":"s-42","activity":"blocked","source":"osc_title"}
 ```
 
 Event payload fields are flattened at the top level beside `v`, `event`, and the
@@ -175,7 +180,7 @@ All params and result type names below refer to structs exported by
 | `daemon.health` | `null` | `{status, daemon_version, protocol_version}` | Liveness and version probe. |
 | `daemon.doctor` | `null` | `DaemonDoctorResult` | Runs daemon-local checks. Non-null params are `daemon/bad_request`. |
 | `host.inspect` | `null` | `HostCapabilities` | Live capability snapshot for the daemon's host. |
-| `host.discover` | `HostDiscoverParams` or `null` | `Vec<HostRecord>` | Enumerates NetBird peers and classifies daemon reachability. |
+| `host.discover` | `HostDiscoverParams` or `null` | `Vec<HostRecord>` | Enumerates peers from configured overlay transports and classifies daemon reachability. |
 | `session.new` | `SessionNewParams` | `SessionNewResult` | Starts an agent PTY session. Bare and profile-based Hermes launches first require an executable whose isolated, bounded `--version` probe matches the pinned supported release; failure returns payload-free `agent_runtime_unsupported` before session, worker, or worktree creation. Optional `metadata` is written atomically with the session (see the `metadata` field note under `SessionInfo` below); the CLI exposes it as repeatable `--meta key=value`. |
 | `session.list` | `SessionListParams` or `null` | `Vec<SessionInfo>` | Lists sessions; filters use AND semantics. |
 | `session.inspect` | `SessionId` | `SessionInfo` | `SessionId` is a JSON string, e.g. `"s-1"`. |
@@ -263,6 +268,18 @@ defaults.
 
 This section names the high-value fields clients commonly branch on. The full
 wire shapes are the exported `crates/protocol` structs.
+
+### `HostRecord`
+
+- `overlay`: required stable transport ID used to qualify peer identity.
+- `peer_id`: optional stable provider peer identity; absence is preserved.
+- `address`: optional dialable IP address without a port. `null` keeps an
+  address-less or rejected-spoof candidate visible but non-dialable.
+- `port`: required effective daemon port for this overlay route.
+- `name` and `fqdn`: optional display selectors, never sufficient by themselves
+  to bypass collision checks.
+- The flattened host class remains `candidate`, `reachable_daemon`,
+  `unreachable`, or `version_mismatch`.
 
 ### `SessionInfo`
 
@@ -863,16 +880,16 @@ Classes:
 | `daemon` | Daemon-level failures: bad request, unknown method, version mismatch, daemon unavailable. |
 | `transport` | Framing, connection, or host reachability failures. |
 | `runtime` | Session, PTY, agent, project, worktree, or assistant runtime failures. |
-| `discovery` | NetBird CLI/state/host discovery failures. |
+| `discovery` | Overlay CLI/state/host discovery failures. |
 
 Canonical public codes currently emitted include:
 
 | Class | Codes |
 |---|---|
-| `configuration` | `paths_unavailable`, `netbird_invalid_config`, `invalid_discovery_options` |
+| `configuration` | `paths_unavailable`, `netbird_configuration_invalid`, `overlay_registry_invalid`, `invalid_discovery_options` |
 | `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback` |
 | `transport` | `framing`, `host_unreachable`, `request_timeout` |
-| `discovery` | `netbird_cli_missing`, `netbird_state_unavailable`, `host_unknown`, `remote_discovery_failed` |
+| `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `remote_discovery_failed` |
 | `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy` |
 
 Protocol v2 additionally emits these runtime codes for provider-neutral agent
@@ -911,7 +928,7 @@ and `recover` for unknown codes.
 ack:
 
 ```json
-{"v":2,"id":"sub-1","ok":{"subscribed":true}}
+{"v":3,"id":"sub-1","ok":{"subscribed":true}}
 ```
 
 The daemon then writes these events:
@@ -1136,20 +1153,28 @@ Public exports:
   still have completed remotely.
 - `next_request_id(method)`: shared correlation-id generator used by SDK-backed
   clients.
-- `discover_hosts()`: local-NetBird peer discovery with default bounded probes.
-- `discover_hosts_with_options(options)`: the same discovery with an explicit
-  non-zero daemon port, per-probe timeout, overall deadline, and concurrency
-  bound. It needs local NetBird state but no local `pohunekd`.
+- `ConfiguredTransport` and `OverlayRegistry`: validated provider registry with
+  stable overlay IDs and one non-zero daemon port per provider.
+- `discover_hosts(registry)`: aggregated configured-overlay discovery with
+  default bounded probes.
+- `discover_hosts_with_options(registry, options)`: the same discovery with an
+  explicit per-probe timeout, overall deadline, and concurrency bound. Provider
+  failures are isolated unless every configured overlay fails.
 - Raw and attach helpers: `connect_raw*` and `attach_raw*`.
 
 Connection APIs:
 
 - `Client::connect(host, socket_path)`: `""` and `"local"` use the Unix socket;
-  any other host is resolved through NetBird and dialed over TCP.
+  any other host is resolved through the default configured overlay registry
+  and dialed over its exact per-overlay route.
+- `Client::connect_with_registry(host, socket_path, registry)`: the same routing
+  with a caller-supplied registry; ambiguous names fail closed.
 - `Client::connect_local(socket_path)`: direct Unix socket.
 - `Client::connect_tcp_addr(host, addr)`: direct TCP with host context preserved
   for remote errors.
 - `*_with_options` variants accept `ClientOptions`.
+- `Client::attach_raw(stream_id)`: opens the raw attach connection on the exact
+  endpoint selected for that client, without re-resolving the peer.
 
 Request APIs:
 

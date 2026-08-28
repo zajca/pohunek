@@ -2055,7 +2055,7 @@ fn request_roundtrip() {
 #[test]
 fn request_missing_params_defaults_to_null() {
     // A parameterless method may omit `params` entirely on the wire.
-    let raw = r#"{"v":{"minimum":2,"maximum":2},"id":"req-1","method":"daemon.health"}"#;
+    let raw = r#"{"v":{"minimum":3,"maximum":3},"id":"req-1","method":"daemon.health"}"#;
     let req: Request = serde_json::from_str(raw).expect("deserialize");
     assert_eq!(req.method(), method::DAEMON_HEALTH);
     assert_eq!(req.params(), &Value::Null);
@@ -2185,7 +2185,7 @@ fn event_with_id_roundtrip() {
 
 #[test]
 fn request_unknown_fields_are_rejected() {
-    let raw = r#"{"v":{"minimum":2,"maximum":2},"id":"req-1","method":"daemon.health","params":null,"future_field":true}"#;
+    let raw = r#"{"v":{"minimum":3,"maximum":3},"id":"req-1","method":"daemon.health","params":null,"future_field":true}"#;
     serde_json::from_str::<Request>(raw).expect_err("unknown request field must fail");
 }
 
@@ -2304,7 +2304,7 @@ fn version_mismatch_message_names_both_versions_and_recover_hint() {
 fn protocol_version_serializes_as_bare_integer() {
     // The `v` field must be a plain integer on the wire, not an object.
     let line = serde_json::to_string(&PROTOCOL_VERSION).expect("serialize");
-    assert_eq!(line, "2");
+    assert_eq!(line, "3");
 }
 
 #[test]
@@ -2976,7 +2976,7 @@ fn native_report_and_error_payloads_reject_unknown_or_invalid_fields() {
     }))
     .expect_err("unknown error payload field must fail");
     serde_json::from_value::<Response>(json!({
-        "v": 2,
+        "v": 3,
         "id": "req-1",
         "err": {"class":"runtime","code":"x","msg":"redacted"},
         "data_base64": "secret"
@@ -3093,7 +3093,7 @@ fn m1_observation_errors_are_stable_and_payload_free() {
     assert_eq!(
         serde_json::to_value(response).expect("serialize redacted error envelope"),
         json!({
-            "v": 2,
+            "v": 3,
             "id": "req-runtime-change",
             "err": {
                 "class": "runtime",
@@ -3425,7 +3425,7 @@ fn host_capabilities_ignores_unknown_fields_for_additive_evolution() {
     // A newer host may add capability fields; an older peer must still parse it.
     let raw = r#"{
         "daemon_version": "0.2.0",
-        "protocol_version": 2,
+        "protocol_version": 3,
         "supported_agents": ["shell"],
         "runtimes": [],
         "git_available": false,

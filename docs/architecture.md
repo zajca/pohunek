@@ -210,10 +210,10 @@ There is one logical protocol exposed over two transports:
 - **Local:** Unix domain socket at `$XDG_RUNTIME_DIR/pohunek/daemon.sock`
   (directory mode `0700`, socket mode `0600`). This is the only access control
   needed for the single-user model: the socket is owner-private.
-- **Remote:** TCP listener bound **only** to the host's NetBird address
-  (`100.x.y.z`), never `0.0.0.0`. Reachability and authentication are provided by
-  NetBird/WireGuard; which peers may reach the port is governed by NetBird
-  policies.
+- **Remote:** one TCP listener per configured overlay, bound **only** to the
+  provider's validated current local member address and per-overlay port, never
+  `0.0.0.0`. Reachability and authentication are provided by that overlay;
+  NetBird/WireGuard is the default production provider.
 
 The control protocol is **newline-delimited JSON**: one JSON request per line,
 one JSON response line for ordinary requests. Long-lived subscriptions keep the
@@ -225,7 +225,7 @@ cross-host operations are traceable in both hosts' logs.
 
 ### Protocol versioning
 
-Public protocol v2 requests carry an explicit inclusive
+Public protocol requests carry an explicit inclusive
 `{minimum, maximum}` version range. The daemon selects the highest overlap in
 the first response; that integer version remains fixed for every later response
 or event on the connection. A genuinely incompatible pair fails with
@@ -407,9 +407,24 @@ process and screen detection remain the daemon's fallback. `on_session_end` is
 not a process-exit signal. A higher-sequence continuation identity reported by
 `pre_llm_call` supersedes the launch identity for a later native resume.
 
-## NetBird Discovery
+## Overlay Registry and Discovery
 
-Discovery is tokenless and NetBird-local. There is no signed manifest exchange.
+The daemon, SDK, CLI, GUI core, and web backend consume one configured overlay
+registry. Each entry has a stable overlay ID, a transport implementation, and
+its own non-zero daemon port. Daemon listeners run concurrently for every
+entry; discovery aggregates providers concurrently while isolating a failed
+provider from healthy results. An unqualified selector matching multiple
+providers fails closed. Control and raw attach reuse the same selected socket
+route.
+
+Discovery preserves provider peer identity separately from display names and
+addresses. Stable client identity is overlay-qualified, so equal names,
+addresses, or provider IDs cannot collide across overlays. Address-less peers
+remain candidates. The public `HostRecord` carries `overlay`, optional
+`peer_id`, optional IP-only `address`, and the effective per-overlay `port`.
+
+The production NetBird adapter remains tokenless and local. There is no signed
+manifest exchange.
 
 1. The daemon/CLI reads local NetBird state via `netbird status --json` (no
    management-API token) to enumerate peers, NetBird addresses, and names.
@@ -423,7 +438,9 @@ Discovery is tokenless and NetBird-local. There is no signed manifest exchange.
 NetBird's `status --json` format is treated as an unstable external input: parsed
 defensively (optional fields default, unknown fields ignored) and pinned with
 recorded fixtures in tests. NetBird/VPN names and addresses are display and
-routing hints only.
+routing hints only. Raw IP selectors must match current peer state, ambiguous
+peer names are rejected, and spoofed addresses outside NetBird's CGNAT range
+remain non-dialable candidates.
 
 ## Projects and Worktree Isolation
 

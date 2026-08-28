@@ -13,7 +13,8 @@ import { startFixtureDaemon, type FixtureDaemonHandle, type FixtureProject } fro
 
 export const FIXTURE_LOOPBACK_HOST = "127.0.0.1";
 export const FIXTURE_LOCAL_HOST = "local";
-export const FIXTURE_PEER_HOST = "fixture-peer";
+const FIXTURE_PEER_NAME = "fixture-peer";
+export const FIXTURE_PEER_HOST = `netbird:${FIXTURE_PEER_NAME}`;
 export const FIXTURE_LOCAL_SESSION_ID = "s-local-seed";
 export const FIXTURE_PEER_SESSION_ID = "s-peer-seed";
 export const FIXTURE_NOTIFICATION_ID = "n-local-seed";
@@ -74,7 +75,7 @@ export async function startFixtureStack(options: FixtureStackOptions = {}): Prom
         tcp: { host: FIXTURE_LOOPBACK_HOST, port: DYNAMIC_PORT },
       },
       daemonVersion: FIXTURE_LOCAL_DAEMON_VERSION,
-      host: { discoveredHosts: [peerHostRecord()] },
+      host: { discoveredHosts: [peerHostRecord(peerAddress.port)] },
       initialSessions: [
         localSession(),
         externalSession(),
@@ -92,7 +93,6 @@ export async function startFixtureStack(options: FixtureStackOptions = {}): Prom
         port: DYNAMIC_PORT,
         allowLoopbackBind: true,
         daemonSocketPath: socketPath,
-        remotePort: peerAddress.port,
         discoverIntervalSeconds: DEFAULT_DISCOVER_INTERVAL_SECONDS,
         staticAssetsDir: options.staticAssetsDir ?? DEFAULT_STATIC_ASSETS_DIR,
       },
@@ -116,12 +116,14 @@ export async function startFixtureStack(options: FixtureStackOptions = {}): Prom
   };
 }
 
-function peerHostRecord(): HostRecord {
+function peerHostRecord(port: number): HostRecord {
   return {
-    name: FIXTURE_PEER_HOST,
-    fqdn: `${FIXTURE_PEER_HOST}.test.invalid`,
+    name: FIXTURE_PEER_NAME,
+    fqdn: `${FIXTURE_PEER_NAME}.test.invalid`,
     address: FIXTURE_LOOPBACK_HOST,
+    port,
     overlay: "netbird",
+    peer_id: FIXTURE_PEER_NAME,
     classification: "reachable_daemon",
     daemon_version: FIXTURE_PEER_DAEMON_VERSION,
   };

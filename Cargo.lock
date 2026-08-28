@@ -3277,6 +3277,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -3380,6 +3381,7 @@ version = "0.31.5"
 name = "pohunek-netbird"
 version = "0.31.5"
 dependencies = [
+ "pohunek-overlay",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3390,7 +3392,6 @@ dependencies = [
 name = "pohunek-overlay"
 version = "0.31.5"
 dependencies = [
- "pohunek-netbird",
  "thiserror 2.0.18",
 ]
 

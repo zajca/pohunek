@@ -1,6 +1,5 @@
 //! Reconnecting host transport: event streams, wire parsing, and attach spawn.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use futures::{stream, StreamExt};
@@ -356,30 +355,36 @@ pub async fn discover_hosts(
     let mut hosts = vec![local.clone()];
     for record in records {
         if matches!(record.class, HostClass::ReachableDaemon { .. }) {
-            let host = discovered_transport_host(&record)?;
-            let id = record
-                .name
-                .clone()
-                .or_else(|| record.fqdn.clone())
-                .unwrap_or_else(|| host.clone());
-            let socket_path = match &local.transport {
-                HostTransport::Local { socket_path }
-                | HostTransport::Remote { socket_path, .. } => socket_path.clone(),
-                HostTransport::Tcp { .. } => PathBuf::new(),
-            };
-            hosts.push(HostConfig::remote(id, host, socket_path));
+            let addr = discovered_transport_addr(&record)?;
+            let identity = record
+                .peer_id
+                .as_deref()
+                .or(record.fqdn.as_deref())
+                .or(record.name.as_deref())
+                .unwrap_or_else(|| record.address.as_deref().expect("reachable route address"));
+            hosts.push(HostConfig::tcp(
+                format!("{}:{identity}", record.overlay),
+                addr,
+            ));
         }
     }
     Ok(hosts)
 }
 
-pub(crate) fn discovered_transport_host(record: &HostRecord) -> Result<String, CoreError> {
-    record
+pub(crate) fn discovered_transport_addr(
+    record: &HostRecord,
+) -> Result<std::net::SocketAddr, CoreError> {
+    let address = record
         .address
         .clone()
-        .or_else(|| record.fqdn.clone())
-        .or_else(|| record.name.clone())
-        .ok_or(CoreError::MissingDiscoveredHostName)
+        .ok_or(CoreError::MissingDiscoveredHostName)?;
+    address
+        .parse::<std::net::IpAddr>()
+        .map(|address| std::net::SocketAddr::new(address, record.port))
+        .map_err(|_| CoreError::InvalidDiscoveredAddress {
+            address,
+            port: record.port,
+        })
 }
 
 fn required_typed<T>(value: &Value, field: &'static str) -> Result<T, CoreError>

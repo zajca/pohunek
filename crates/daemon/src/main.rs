@@ -4,13 +4,12 @@
 //! single-instance lock, bind the control socket (with stale-socket recovery and
 //! owner-private permissions), and serve `daemon.health` until SIGINT/SIGTERM.
 //!
-//! Milestone 11: when `NetBird` is available and reports a self IP, additionally
-//! bind a TCP control listener on that `NetBird` address and serve it alongside the
-//! local Unix socket under one shutdown. `NetBird` being temporarily unavailable
-//! is not an error: the daemon stays local-only while retrying the remote listener.
+//! The daemon binds one TCP control listener for each configured overlay and
+//! serves them alongside the local Unix socket under one shutdown. A provider
+//! being temporarily unavailable is not an error: the daemon stays reachable
+//! through healthy transports while retrying that listener.
 
 use std::future::Future;
-use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +19,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use overlay::{ConfiguredTransport, OverlayRegistry};
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo, RemoteServer};
 use pohunek_daemon::discovery::DiscoveryCache;
 use pohunek_daemon::events::{spawn_drain, EventLog};
@@ -68,17 +68,17 @@ const WORKER_BINARY_NAME: &str = "pohunek-sessiond";
 /// to reach disk.
 const EVENT_LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Initial delay between attempts to enable the optional remote listener.
+/// Initial delay between attempts to enable an optional remote listener.
 ///
-/// `NetBird` can report incomplete state while its local daemon and interface are
-/// starting. Five seconds avoids repeatedly spawning the CLI while making a
-/// newly ready host discoverable without an operator restart.
+/// An overlay can report incomplete state while its local service and interface
+/// are starting. Five seconds avoids repeatedly querying the provider while
+/// making a newly ready host discoverable without an operator restart.
 const REMOTE_BIND_INITIAL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Longest delay between remote-listener retry attempts.
 ///
-/// A local-only daemon is valid when `NetBird` is not logged in, so retries back
-/// off to avoid continuously spawning its CLI and filling logs. Five minutes
+/// A local-only daemon is valid when an overlay is not ready, so retries back
+/// off to avoid continuously querying its state and filling logs. Five minutes
 /// still recovers reasonably quickly after a delayed login or interface setup.
 const REMOTE_BIND_MAX_RETRY_INTERVAL: Duration = Duration::from_mins(5);
 
@@ -184,16 +184,17 @@ async fn run() -> Result<(), DaemonError> {
         .map_err(DaemonError::Reconcile)?;
 
     // 8. Bind the control socket (stale-socket recovery + 0600).
+    let registry = netbird::configured_registry()?;
     let health = HealthInfo::new(DAEMON_VERSION);
-    let discovery = DiscoveryCache::default();
+    let discovery = DiscoveryCache::new(registry.clone());
     let state = DaemonState::new_with_discovery(health, sessions.clone(), discovery.clone())
         .with_notifications(notifications.clone())
         .with_attention_coordinator(attention_coordinator.clone());
     let server = ControlServer::bind_with_state(&paths.socket, state).await?;
     info!(socket = %server.socket_path().display(), "ready; serving control protocol");
 
-    // 9. Keep attempting to bind a NetBird TCP control listener alongside the
-    //    Unix socket. NetBird may become ready after this daemon starts.
+    // 9. Keep attempting to bind every configured overlay listener alongside
+    //    the Unix socket. Providers may become ready after this daemon starts.
     let remote_state = DaemonState::new_with_discovery(
         HealthInfo::new(DAEMON_VERSION),
         sessions.clone(),
@@ -201,15 +202,6 @@ async fn run() -> Result<(), DaemonError> {
     )
     .with_notifications(notifications.clone())
     .with_attention_coordinator(attention_coordinator.clone());
-    let transport = overlay::NetbirdTransport::new();
-    let remote_port = match netbird::remote_port() {
-        Ok(port) => Some(port),
-        Err(err) => {
-            warn!(reason = %err, "invalid remote port configuration; remote listener disabled");
-            None
-        }
-    };
-
     // Reconciliation and every required local listener are ready. A manual
     // foreground launch has no NOTIFY_SOCKET and this is a no-op.
     pohunek_daemon::notify::ready()?;
@@ -230,7 +222,7 @@ async fn run() -> Result<(), DaemonError> {
     let unix_serve = server.serve(async move {
         unix_shutdown.cancelled().await;
     });
-    let remote_serve = serve_remote(remote_state, remote_port, &transport, shutdown);
+    let remote_serve = serve_remote(remote_state, &registry, shutdown);
     tokio::join!(unix_serve, remote_serve);
 
     // 11. Flush the append-only event log before exit so events buffered at
@@ -423,7 +415,7 @@ async fn shutdown_event_logs(drains: EventLogDrains) {
     }
 }
 
-/// Repeatedly bind and serve the optional `NetBird` TCP control listener.
+/// Repeatedly bind and serve one optional overlay TCP control listener.
 ///
 /// A `NetBird` daemon may start after `pohunekd`, or temporarily emit an
 /// incomplete status snapshot while it initializes. Retrying keeps the local
@@ -480,55 +472,63 @@ fn next_retry_interval(current: Duration) -> Duration {
 }
 
 /// Serve the remote transport when its port configuration is valid.
-async fn serve_remote(
-    state: DaemonState,
-    port: Option<u16>,
-    transport: &overlay::NetbirdTransport,
-    shutdown: CancellationToken,
-) {
-    if let Some(port) = port {
-        serve_remote_with_retry(
-            || bind_remote_server(state.clone(), port, transport),
-            shutdown,
-            REMOTE_BIND_INITIAL_RETRY_INTERVAL,
-        )
-        .await;
-    } else {
+async fn serve_remote(state: DaemonState, registry: &OverlayRegistry, shutdown: CancellationToken) {
+    let mut tasks = Vec::with_capacity(registry.entries().len());
+    for configured in registry.entries().iter().cloned() {
+        let state = state.clone();
+        let shutdown = shutdown.clone();
+        tasks.push(tokio::spawn(async move {
+            serve_remote_with_retry(
+                || bind_remote_server(state.clone(), configured.clone()),
+                shutdown,
+                REMOTE_BIND_INITIAL_RETRY_INTERVAL,
+            )
+            .await;
+        }));
+    }
+
+    if tasks.is_empty() {
         shutdown.cancelled().await;
+        return;
+    }
+    for task in tasks {
+        let _ = task.await;
     }
 }
 
-/// Bind the optional `NetBird` TCP control listener once.
+/// Bind one overlay's TCP control listener once.
 ///
-/// Queries `NetBird` state, decides the bind address from it ([`remote_bind_addr`])
-/// and the configured remote port, and binds a [`RemoteServer`] when an address
-/// resolves. Missing `NetBird` CLI disables the remote listener; unavailable
-/// state, a missing self IP, and bind failures are retried by the caller.
-async fn bind_remote_server(
-    state: DaemonState,
-    port: u16,
-    overlay: &dyn overlay::OverlayTransport,
-) -> RemoteBind {
-    let status = match netbird::run_status_async().await {
-        Ok(status) => status,
-        Err(netbird::NetbirdError::CliMissing) => {
-            info!("NetBird CLI missing; remote control listener disabled");
+/// Queries the overlay for its explicit listener address and binds a
+/// [`RemoteServer`] on that overlay's configured port. Missing CLI disables
+/// that listener; unavailable state, a missing self address, and bind failures
+/// are retried by the caller.
+async fn bind_remote_server(state: DaemonState, configured: ConfiguredTransport) -> RemoteBind {
+    let overlay_id = configured.id().clone();
+    let port = configured.port();
+    let transport = Arc::clone(configured.transport());
+    let listener_transport = Arc::clone(&transport);
+    let address = match tokio::task::spawn_blocking(move || listener_transport.listener_addr())
+        .await
+    {
+        Ok(Ok(address)) => address,
+        Ok(Err(overlay::OverlayError::CliMissing(_))) => {
+            info!(overlay = %overlay_id, port, "overlay CLI missing; listener disabled");
             return RemoteBind::Disabled;
         }
-        Err(err) => {
-            info!(reason = %err, "NetBird state unavailable; serving local-only");
+        Ok(Err(error)) => {
+            info!(overlay = %overlay_id, port, reason = %error, "overlay state unavailable; serving local-only");
+            return RemoteBind::Retry;
+        }
+        Err(join) => {
+            warn!(overlay = %overlay_id, port, reason = %join, "overlay listener task failed");
             return RemoteBind::Retry;
         }
     };
+    let addr = std::net::SocketAddr::new(address, port);
 
-    let Some(addr) = remote_bind_addr(&status, port) else {
-        info!("NetBird present but no self IP resolved; serving local-only");
-        return RemoteBind::Retry;
-    };
-
-    match RemoteServer::bind(addr, state, overlay).await {
+    match RemoteServer::bind(addr, state, transport.as_ref()).await {
         Ok(remote) => {
-            info!(addr = %remote.local_addr(), "serving control protocol over NetBird");
+            info!(overlay = %overlay_id, addr = %remote.local_addr(), "serving control protocol over overlay");
             RemoteBind::Bound(remote)
         }
         Err(err) => {
@@ -548,18 +548,6 @@ enum RemoteBind {
     Retry,
     /// The configuration cannot enable remote transport during this run.
     Disabled,
-}
-
-/// Decide the remote TCP bind address from parsed `NetBird` state.
-///
-/// Returns `Some((self_ip, port))` when `NetBird` reports this host's own IP, else
-/// `None`. `NetbirdStatus::self_netbird_ip` already filters to the `NetBird` CGNAT
-/// range, and the authoritative fail-closed gate is [`RemoteServer::bind`]'s
-/// validation, so this helper does not re-validate the range (which would only
-/// risk diverging from that single source of truth). Pure and unit-tested.
-#[must_use]
-fn remote_bind_addr(status: &netbird::NetbirdStatus, port: u16) -> Option<SocketAddr> {
-    status.self_netbird_ip().map(|ip| SocketAddr::new(ip, port))
 }
 
 /// Create a directory (and parents) with mode 0700 if it does not exist.
@@ -616,40 +604,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        next_retry_interval, remote_bind_addr, serve_remote_with_retry, RemoteBind,
-        REMOTE_BIND_MAX_RETRY_INTERVAL,
+        next_retry_interval, serve_remote_with_retry, RemoteBind, REMOTE_BIND_MAX_RETRY_INTERVAL,
     };
-
-    /// A remote bind port distinct from the production default, so the test
-    /// asserts the helper threads the passed-in port rather than a constant.
-    const TEST_PORT: u16 = 19000;
-
-    #[test]
-    fn remote_bind_addr_is_none_when_self_ip_absent() {
-        // Empty status: no root netbirdIp and no localPeerState => no self IP.
-        let status = netbird::parse_status("{}").expect("parse empty status");
-        assert!(remote_bind_addr(&status, TEST_PORT).is_none());
-    }
-
-    #[test]
-    fn remote_bind_addr_is_none_when_offline_without_self_ip() {
-        // Daemon present but not connected and reporting no self IP.
-        let status = netbird::parse_status(
-            r#"{"daemonStatus":"NeedsLogin","peers":{"connected":0,"total":0,"details":[]}}"#,
-        )
-        .expect("parse offline status");
-        assert!(remote_bind_addr(&status, TEST_PORT).is_none());
-    }
-
-    #[test]
-    fn remote_bind_addr_uses_self_netbird_ip_and_port() {
-        let status =
-            netbird::parse_status(r#"{"netbirdIp":"100.92.10.20","daemonStatus":"Connected"}"#)
-                .expect("parse current status");
-        let addr = remote_bind_addr(&status, TEST_PORT).expect("self IP resolves to a bind addr");
-        assert_eq!(addr.ip().to_string(), "100.92.10.20");
-        assert_eq!(addr.port(), TEST_PORT);
-    }
 
     #[test]
     fn remote_retry_interval_caps_at_configured_maximum() {

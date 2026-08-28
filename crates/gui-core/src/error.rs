@@ -33,6 +33,8 @@ pub enum CoreError {
     MissingSessionEventPayload,
     #[error("host discovery record does not contain a usable host name")]
     MissingDiscoveredHostName,
+    #[error("host discovery address '{address}:{port}' is invalid")]
+    InvalidDiscoveredAddress { address: String, port: u16 },
     #[error("provider `{provider}` context is missing a branch field")]
     MissingPromptBranch { provider: &'static str },
     #[error("provider link metadata is missing `{field}`")]

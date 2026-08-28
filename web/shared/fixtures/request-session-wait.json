@@ -11,7 +11,7 @@
     "timeout_ms": 1000
   },
   "v": {
-    "maximum": 2,
-    "minimum": 2
+    "maximum": 3,
+    "minimum": 3
   }
 }

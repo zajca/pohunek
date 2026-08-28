@@ -17,7 +17,6 @@ export interface BackendHostEntry {
 
 export interface StartHostsPipelineOptions {
   readonly daemonSocketPath: string;
-  readonly remotePort: number;
   readonly discoverIntervalSeconds: number;
   readonly logger?: BackendLogger;
 }
@@ -179,7 +178,7 @@ class HostsPipeline implements HostsPipelineHandle {
           nextTargets.set(host, {
             kind: "tcp",
             host: record.address,
-            port: this.options.remotePort,
+            port: record.port,
           });
         }
         continue;
@@ -226,7 +225,12 @@ function localEntry(health: DaemonHealthResult): BackendHostEntry {
 }
 
 function hostIdentifier(record: HostRecord): string | undefined {
-  return record.name ?? record.fqdn ?? record.address ?? undefined;
+  const identity =
+    record.peer_id ??
+    record.fqdn ??
+    record.name ??
+    (record.address === null ? undefined : `${record.address}:${record.port}`);
+  return identity === undefined ? undefined : `${record.overlay}:${identity}`;
 }
 
 function elapsedMilliseconds(startedAt: number): number {

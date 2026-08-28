@@ -21,7 +21,8 @@ import {
 const LOOPBACK_HOST = "127.0.0.1";
 const LOCAL_DAEMON_VERSION = "2.0.0-local-test";
 const PEER_DAEMON_VERSION = "2.0.0-peer-test";
-const PEER_HOST = "peer-one";
+const PEER_NAME = "peer-one";
+const PEER_HOST = `netbird:${PEER_NAME}`;
 const TEST_COLS = 80;
 const TEST_ROWS = 24;
 const DISCOVER_INTERVAL_SECONDS = 0.02;
@@ -150,7 +151,6 @@ describe("@pohunek/backend", () => {
       try {
         await startHostsPipeline({
           daemonSocketPath: socketPath,
-          remotePort: 18_722,
           discoverIntervalSeconds: 1,
           logger: silentLogger,
         });
@@ -191,7 +191,7 @@ async function startBackendFixture(): Promise<BackendFixture> {
   const local = await startFixtureDaemon({
     listen: { unixSocketPath: socketPath },
     daemonVersion: LOCAL_DAEMON_VERSION,
-    host: { discoveredHosts: [reachablePeerRecord()] },
+    host: { discoveredHosts: [reachablePeerRecord(peerAddress.port)] },
   });
 
   let backend: BackendHandle;
@@ -202,7 +202,6 @@ async function startBackendFixture(): Promise<BackendFixture> {
         port: 0,
         allowLoopbackBind: true,
         daemonSocketPath: socketPath,
-        remotePort: peerAddress.port,
         discoverIntervalSeconds: DISCOVER_INTERVAL_SECONDS,
         staticAssetsDir: assets,
       },
@@ -229,12 +228,14 @@ async function startBackendFixture(): Promise<BackendFixture> {
   };
 }
 
-function reachablePeerRecord(): HostRecord {
+function reachablePeerRecord(port: number): HostRecord {
   return {
-    name: PEER_HOST,
-    fqdn: `${PEER_HOST}.test.invalid`,
+    name: PEER_NAME,
+    fqdn: `${PEER_NAME}.test.invalid`,
     address: LOOPBACK_HOST,
+    port,
     overlay: "netbird",
+    peer_id: PEER_NAME,
     classification: "reachable_daemon",
     daemon_version: PEER_DAEMON_VERSION,
   };

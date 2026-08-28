@@ -48,6 +48,9 @@ pub enum NetbirdError {
     /// The requested host name did not match any `NetBird` peer.
     #[error("host '{0}' was not found among NetBird peers")]
     HostUnknown(String),
+    /// The selector matched more than one current peer.
+    #[error("host '{0}' is ambiguous among NetBird peers")]
+    HostAmbiguous(String),
 }
 
 /// This host's local peer state (shape B: `localPeerState`).
@@ -188,6 +191,16 @@ impl NetbirdStatus {
     #[must_use]
     pub fn peers(&self) -> &[Peer] {
         &self.peers.0
+    }
+
+    /// Return this host's provider-qualified name, when available.
+    #[must_use]
+    pub fn self_fqdn(&self) -> Option<&str> {
+        self.fqdn.as_deref().or_else(|| {
+            self.local_peer_state
+                .as_ref()
+                .and_then(|state| state.fqdn.as_deref())
+        })
     }
 
     /// The daemon/root status string, if present (for doctor messaging).

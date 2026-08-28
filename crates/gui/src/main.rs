@@ -1,6 +1,6 @@
 //! Native Iced shell for the pohunek control plane.
 
-// Rust guideline compliant 2026-07-21
+// Rust guideline compliant 2026-08-28
 #![forbid(unsafe_code)]
 
 mod attach;
@@ -256,7 +256,7 @@ impl PohunekApp {
             config.attach_command.clone(),
             AttachTemplateValues {
                 bin: config.pohunek_bin.clone(),
-                host: host.attach_host().to_owned(),
+                host: host.attach_host(),
                 id: session_id.0.clone(),
             },
         ))

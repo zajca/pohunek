@@ -2723,7 +2723,7 @@ mod tests {
     use serde_json::Value;
 
     use crate::connection::{
-        discovered_transport_host, parse_agent_state, parse_event_message, subscribe_request,
+        discovered_transport_addr, parse_agent_state, parse_event_message, subscribe_request,
         Backoff,
     };
     use crate::link::action_prompt_provider;
@@ -4651,15 +4651,17 @@ mod tests {
             name: Some("dev".to_owned()),
             fqdn: Some("dev.example.netbird.cloud".to_owned()),
             address: Some("100.92.30.40".to_owned()),
+            port: 18722,
             overlay: "netbird".to_owned(),
+            peer_id: Some("100.92.30.40".to_owned()),
             class: HostClass::ReachableDaemon {
                 daemon_version: "0.5.0".to_owned(),
             },
         };
 
         assert_eq!(
-            discovered_transport_host(&record).expect("transport host"),
-            "100.92.30.40"
+            discovered_transport_addr(&record).expect("transport address"),
+            "100.92.30.40:18722".parse().expect("socket address")
         );
     }
 

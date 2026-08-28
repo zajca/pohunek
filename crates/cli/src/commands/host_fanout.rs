@@ -185,10 +185,20 @@ async fn fetch_records(paths: &Paths) -> Result<Vec<HostRecord>, CliError> {
 
 fn reachable_target(record: &HostRecord) -> Option<HostTarget> {
     match &record.class {
-        HostClass::ReachableDaemon { .. } => record
-            .name
-            .as_deref()
-            .map(|name| HostTarget::new(name, name)),
+        HostClass::ReachableDaemon { .. } => {
+            let address = record.address.as_deref()?.parse().ok()?;
+            let target = std::net::SocketAddr::new(address, record.port).to_string();
+            let identity = record
+                .peer_id
+                .as_deref()
+                .or(record.fqdn.as_deref())
+                .or(record.name.as_deref())
+                .unwrap_or(&target);
+            Some(HostTarget::new(
+                format!("{}:{identity}", record.overlay),
+                target,
+            ))
+        }
         HostClass::VersionMismatch { .. } | HostClass::Unreachable | HostClass::Candidate => None,
     }
 }
@@ -222,7 +232,9 @@ mod tests {
             name: Some(name.to_owned()),
             fqdn: Some(format!("{name}.example.net")),
             address: Some("100.92.30.40".to_owned()),
+            port: 18722,
             overlay: "netbird".to_owned(),
+            peer_id: Some(name.to_owned()),
             class,
         }
     }

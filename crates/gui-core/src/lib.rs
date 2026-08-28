@@ -3,7 +3,7 @@
 //! This crate intentionally has no Iced dependency. The native view layer wraps
 //! these async helpers in Iced `Task` and `Subscription` values.
 
-// Rust guideline compliant 2026-07-21
+// Rust guideline compliant 2026-08-28
 #![forbid(unsafe_code)]
 
 pub mod assistant;
@@ -220,11 +220,11 @@ impl HostConfig {
 
     /// Value substituted into `{host}` for attach commands.
     #[must_use]
-    pub fn attach_host(&self) -> &str {
+    pub fn attach_host(&self) -> String {
         match &self.transport {
-            HostTransport::Local { .. } => "",
-            HostTransport::Remote { host, .. } => host,
-            HostTransport::Tcp { .. } => self.id.as_str(),
+            HostTransport::Local { .. } => String::new(),
+            HostTransport::Remote { host, .. } => host.clone(),
+            HostTransport::Tcp { addr } => addr.to_string(),
         }
     }
 }
@@ -314,4 +314,17 @@ pub struct ObservationCapabilities {
     pub output_read: bool,
     /// Whether the host can wait for provider-neutral session predicates.
     pub session_wait: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tcp_attach_uses_the_exact_selected_route() {
+        let addr = "127.0.0.1:17421".parse().expect("test socket address");
+        let host = HostConfig::tcp("memory/peer-a", addr);
+
+        assert_eq!(host.attach_host(), addr.to_string());
+    }
 }

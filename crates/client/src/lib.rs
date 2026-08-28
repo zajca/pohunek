@@ -14,6 +14,7 @@ pub use discovery::{
     DISCOVERY_LOCK_WAIT_MARGIN, MAX_DISCOVERY_DEADLINE,
 };
 pub use error::ClientError;
+pub use overlay::{ConfiguredTransport, OverlayRegistry};
 pub use protocol;
 pub use transport::{
     attach_raw, attach_raw_local, attach_raw_local_with_options, attach_raw_tcp_addr,
@@ -22,3 +23,13 @@ pub use transport::{
     connect_raw_with_options, is_local_host, next_request_id, Client, ClientOptions, RawStream,
     Subscription, LOCAL_HOST,
 };
+
+/// Load the production overlay registry from fail-fast provider configuration.
+///
+/// # Errors
+///
+/// Returns a typed provider configuration error when the registry cannot be
+/// constructed.
+pub fn default_overlay_registry() -> Result<OverlayRegistry, ClientError> {
+    netbird::configured_registry().map_err(ClientError::from)
+}
