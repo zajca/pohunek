@@ -4664,8 +4664,8 @@ mod tests {
             "100.92.30.40:18722".parse().expect("socket address")
         );
         let host = discovered_host_config(&record).expect("discovered host config");
-        assert_eq!(host.id.as_str(), "netbird:peer-7");
-        assert_eq!(host.attach_host(), "netbird:peer-7@18722");
+        assert_eq!(host.id.as_str(), "netbird:peer~cGVlci03");
+        assert_eq!(host.attach_host(), "netbird:peer~cGVlci03@18722");
         assert!(matches!(host.transport, HostTransport::Remote { .. }));
     }
 
@@ -4728,8 +4728,11 @@ mod tests {
         reassigned.peer_id = Some("different-key".to_owned());
         let reassigned = discovered_host_config(&reassigned).expect("reassigned GUI route");
         assert_ne!(reassigned, first);
-        assert_eq!(first.attach_host(), "netbird:stable-key@18722");
-        assert_eq!(reassigned.attach_host(), "netbird:different-key@18722");
+        assert_eq!(first.attach_host(), "netbird:peer~c3RhYmxlLWtleQ@18722");
+        assert_eq!(
+            reassigned.attach_host(),
+            "netbird:peer~ZGlmZmVyZW50LWtleQ@18722"
+        );
     }
 
     #[test]
@@ -4747,10 +4750,13 @@ mod tests {
         };
 
         let host = discovered_host_config(&record).expect("FQDN GUI route");
-        assert_eq!(host.id.as_str(), "netbird:dev.example.netbird.cloud");
+        assert_eq!(
+            host.id.as_str(),
+            "netbird:fqdn~ZGV2LmV4YW1wbGUubmV0YmlyZC5jbG91ZA"
+        );
         assert_eq!(
             host.attach_host(),
-            "netbird:dev.example.netbird.cloud@18722"
+            "netbird:fqdn~ZGV2LmV4YW1wbGUubmV0YmlyZC5jbG91ZA@18722"
         );
     }
 

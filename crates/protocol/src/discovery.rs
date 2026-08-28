@@ -60,7 +60,7 @@ pub struct HostRecord {
     pub port: u16,
     /// Which overlay transport discovered this peer (e.g. `"netbird"`).
     pub overlay: String,
-    /// The overlay's stable peer identity (e.g. its `NetBird` address string).
+    /// The overlay's stable provider peer identity (e.g. a `NetBird` public key).
     pub peer_id: Option<String>,
     /// Classification (flattened so its fields sit alongside the record).
     #[serde(flatten)]

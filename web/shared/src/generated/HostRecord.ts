@@ -28,7 +28,7 @@ export type HostRecord =
      */
     overlay: string;
     /**
-     * The overlay's stable peer identity (e.g. its `NetBird` address string).
+     * The overlay's stable provider peer identity (e.g. a `NetBird` public key).
      */
     peer_id: string | null;
   }

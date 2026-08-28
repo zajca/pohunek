@@ -420,6 +420,13 @@ explicit `@<port>` suffix preserves a port learned from discovery while the
 selector is still resolved against current provider state. Control and raw
 attach reuse the same selected socket route within one SDK client.
 
+Client-generated stable selectors are typed as `peer~<base64url>` or
+`fqdn~<base64url>` with no padding. The registry decodes them before provider
+resolution and preserves the identity kind, so a stable peer ID is matched only
+against the provider's peer-ID field. The base64url alphabet avoids `/`, `+`,
+`=`, and `@`, keeping selectors unambiguous in session targets, relay URLs, and
+the exact-port grammar.
+
 Daemon construction requires a validated registry up front. The shared
 discovery cache has no registry-less state, including when the Unix control
 server is created through its public constructor.
@@ -438,6 +445,13 @@ stable identity through current provider state. External attach receives the
 same selector with its explicit discovered port; the resulting SDK client keeps
 the exact resolved endpoint only long enough to keep control and raw attach on
 one route.
+
+CLI fan-out and dynamic completion retain the same canonical identity plus
+discovered port, never the cached probe IP. The web relay forces a fresh local
+daemon discovery before each remote tunnel upgrade and accepts the cached route
+only if the requested identity still owns it. Active daemon overlay listeners
+revalidate their provider-owned local address periodically; an address change
+binds the replacement before the stale listener is dropped.
 
 The production NetBird adapter remains tokenless and local. There is no signed
 manifest exchange. NetBird `publicKey` or legacy `pubKey` is the stable peer

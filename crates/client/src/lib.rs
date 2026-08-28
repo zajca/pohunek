@@ -14,7 +14,9 @@ pub use discovery::{
     DISCOVERY_LOCK_WAIT_MARGIN, MAX_DISCOVERY_DEADLINE,
 };
 pub use error::ClientError;
-pub use overlay::{ConfiguredTransport, OverlayRegistry};
+pub use overlay::{
+    ConfiguredTransport, ExternalIdentity, ExternalIdentityKind, OverlayRegistry, RegistryError,
+};
 pub use protocol;
 pub use transport::{
     attach_raw, attach_raw_local, attach_raw_local_with_options, attach_raw_tcp_addr,

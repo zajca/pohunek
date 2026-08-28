@@ -15,7 +15,12 @@ use std::num::NonZeroU16;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use futures::future::join_all;
+
+const PEER_IDENTITY_PREFIX: &str = "peer~";
+const FQDN_IDENTITY_PREFIX: &str = "fqdn~";
 
 /// Why an overlay bind address was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -112,6 +117,14 @@ pub enum RegistryError {
     /// A provider-qualified host omitted its provider or selector.
     #[error("invalid provider-qualified host '{0}': expected '<overlay>:<selector>'")]
     InvalidQualifiedHost(String),
+    /// A canonical external identity was malformed or empty.
+    #[error("invalid external peer identity '{selector}': {detail}")]
+    InvalidExternalIdentity {
+        /// Rejected canonical selector.
+        selector: String,
+        /// Stable, non-secret validation detail.
+        detail: &'static str,
+    },
     /// A provider-qualified host named an overlay that is not configured.
     #[error("overlay '{0}' is not configured")]
     OverlayNotConfigured(OverlayId),
@@ -134,6 +147,108 @@ pub enum RegistryError {
         /// Per-overlay typed failures retained for diagnostics.
         failures: Vec<OverlayFailure>,
     },
+}
+
+/// Provider identity kind retained by a canonical external selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalIdentityKind {
+    /// Stable provider peer identifier.
+    PeerId,
+    /// Provider-qualified DNS name used only when no peer identifier exists.
+    Fqdn,
+}
+
+/// Slash-safe provider identity used in CLI targets and relay paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalIdentity {
+    kind: ExternalIdentityKind,
+    value: String,
+}
+
+impl ExternalIdentity {
+    /// Construct a stable provider peer identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::InvalidExternalIdentity`] when `value` is empty.
+    pub fn peer_id(value: impl Into<String>) -> Result<Self, RegistryError> {
+        Self::new(ExternalIdentityKind::PeerId, value.into())
+    }
+
+    /// Construct an FQDN fallback identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::InvalidExternalIdentity`] when `value` is empty.
+    pub fn fqdn(value: impl Into<String>) -> Result<Self, RegistryError> {
+        Self::new(ExternalIdentityKind::Fqdn, value.into())
+    }
+
+    fn new(kind: ExternalIdentityKind, value: String) -> Result<Self, RegistryError> {
+        if value.is_empty() {
+            return Err(RegistryError::InvalidExternalIdentity {
+                selector: String::new(),
+                detail: "the decoded identity must be non-empty",
+            });
+        }
+        Ok(Self { kind, value })
+    }
+
+    /// Return the provider identity kind.
+    #[must_use]
+    pub fn kind(&self) -> ExternalIdentityKind {
+        self.kind
+    }
+
+    /// Return the decoded provider value.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// Encode this identity as a slash-safe canonical selector.
+    #[must_use]
+    pub fn selector(&self) -> String {
+        let prefix = match self.kind {
+            ExternalIdentityKind::PeerId => PEER_IDENTITY_PREFIX,
+            ExternalIdentityKind::Fqdn => FQDN_IDENTITY_PREFIX,
+        };
+        format!("{prefix}{}", URL_SAFE_NO_PAD.encode(self.value.as_bytes()))
+    }
+
+    fn parse_selector(selector: &str) -> Result<Option<Self>, RegistryError> {
+        let (kind, encoded) = if let Some(encoded) = selector.strip_prefix(PEER_IDENTITY_PREFIX) {
+            (ExternalIdentityKind::PeerId, encoded)
+        } else if let Some(encoded) = selector.strip_prefix(FQDN_IDENTITY_PREFIX) {
+            (ExternalIdentityKind::Fqdn, encoded)
+        } else {
+            return Ok(None);
+        };
+        if encoded.is_empty() {
+            return Err(RegistryError::InvalidExternalIdentity {
+                selector: selector.to_owned(),
+                detail: "the encoded identity must be non-empty",
+            });
+        }
+        let bytes = URL_SAFE_NO_PAD.decode(encoded).map_err(|_error| {
+            RegistryError::InvalidExternalIdentity {
+                selector: selector.to_owned(),
+                detail: "expected unpadded base64url after the identity prefix",
+            }
+        })?;
+        if URL_SAFE_NO_PAD.encode(&bytes) != encoded {
+            return Err(RegistryError::InvalidExternalIdentity {
+                selector: selector.to_owned(),
+                detail: "expected canonical unpadded base64url",
+            });
+        }
+        let value =
+            String::from_utf8(bytes).map_err(|_error| RegistryError::InvalidExternalIdentity {
+                selector: selector.to_owned(),
+                detail: "the decoded identity must be UTF-8",
+            })?;
+        Self::new(kind, value).map(Some)
+    }
 }
 
 /// One provider failure retained by registry aggregation.
@@ -268,6 +383,14 @@ pub trait OverlayTransport: Send + Sync + fmt::Debug {
 
     /// Resolve a user selector to one exact, policy-approved peer.
     fn resolve_peer<'a>(&'a self, host: &'a str) -> OverlayFuture<'a, ResolvedPeer>;
+
+    /// Resolve one typed canonical identity to an exact current peer.
+    fn resolve_peer_identity<'a>(
+        &'a self,
+        identity: &'a ExternalIdentity,
+    ) -> OverlayFuture<'a, ResolvedPeer> {
+        self.resolve_peer(identity.value())
+    }
 
     /// Enumerate visible remote peers while preserving address-less candidates.
     fn discover_peers(&self) -> OverlayFuture<'_, Vec<DiscoveredPeer>>;
@@ -474,7 +597,12 @@ impl OverlayRegistry {
             .find(|entry| entry.id() == &overlay)
             .ok_or_else(|| RegistryError::OverlayNotConfigured(overlay.clone()))?;
 
-        match entry.transport.resolve_peer(selector).await {
+        let identity = ExternalIdentity::parse_selector(selector)?;
+        let resolved = match identity.as_ref() {
+            Some(identity) => entry.transport.resolve_peer_identity(identity).await,
+            None => entry.transport.resolve_peer(selector).await,
+        };
+        match resolved {
             Ok(peer) => Ok(OverlayRoute {
                 overlay,
                 peer_id: peer.peer_id,

@@ -3,8 +3,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
 
 use overlay::{
-    BindAddrError, ConfiguredTransport, DiscoveredPeer, OverlayError, OverlayFuture, OverlayId,
-    OverlayRegistry, OverlayTransport, RegistryError, ResolvedPeer,
+    BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, OverlayError,
+    OverlayFuture, OverlayId, OverlayRegistry, OverlayTransport, RegistryError, ResolvedPeer,
 };
 
 #[derive(Debug)]
@@ -199,6 +199,31 @@ async fn qualified_host_uses_only_named_overlay_and_its_port() {
     assert!(matches!(
         registry.resolve_host("missing:build").await,
         Err(RegistryError::OverlayNotConfigured(id)) if id.as_str() == "missing"
+    ));
+}
+
+#[tokio::test]
+async fn canonical_identity_is_slash_safe_and_decoded_before_provider_resolution() {
+    let listener = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let address = "100.64.0.2".parse().expect("peer address");
+    let raw_peer_id = "real/key+with=padding@reserved";
+    let mut transport = MemoryTransport::new("memory", listener);
+    transport.add_member(address);
+    transport.add_peer(raw_peer_id, Some(raw_peer_id), Some(address));
+    let registry = OverlayRegistry::new(vec![configured(transport, 17001)]).expect("registry");
+    let external = ExternalIdentity::peer_id(raw_peer_id).expect("external identity");
+    let selector = external.selector();
+
+    assert!(!selector.contains(['/', '+', '=', '@']));
+    let route = registry
+        .resolve_host(&format!("memory:{selector}"))
+        .await
+        .expect("canonical identity route");
+    assert_eq!(route.peer_id.as_deref(), Some(raw_peer_id));
+    assert_eq!(route.addr, SocketAddr::new(address, 17001));
+    assert!(matches!(
+        registry.resolve_host("memory:peer~YWJ=").await,
+        Err(RegistryError::InvalidExternalIdentity { .. })
     ));
 }
 

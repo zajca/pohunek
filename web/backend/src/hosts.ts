@@ -1,6 +1,7 @@
 import type { DaemonHealthResult, HostRecord } from "@pohunek/protocol";
 import { connectLocal } from "@pohunek/sdk";
 import type { DaemonTarget } from "./relay";
+import { externalFqdnSelector, externalPeerSelector } from "./identity";
 import { errorClass, stdoutLogger, type BackendLogger } from "./log";
 
 const LOCAL_HOST = "local";
@@ -42,7 +43,7 @@ export class BackendStartupError extends Error {
 
 export interface HostsPipelineHandle {
   snapshot(): readonly BackendHostEntry[];
-  targetForHost(host: string): DaemonTarget | undefined;
+  resolveTargetForHost(host: string): Promise<DaemonTarget | undefined>;
   refresh(): Promise<void>;
   close(): Promise<void>;
 }
@@ -91,7 +92,12 @@ class HostsPipeline implements HostsPipelineHandle {
     return this.hosts.map((entry) => ({ ...entry }));
   }
 
-  public targetForHost(host: string): DaemonTarget | undefined {
+  public async resolveTargetForHost(host: string): Promise<DaemonTarget | undefined> {
+    if (host === LOCAL_HOST) {
+      return this.targets.get(host);
+    }
+    await this.activeRefresh;
+    await this.refresh();
     return this.targets.get(host);
   }
 
@@ -225,11 +231,11 @@ function localEntry(health: DaemonHealthResult): BackendHostEntry {
 }
 
 function hostIdentifier(record: HostRecord): string | undefined {
-  const identity =
-    record.peer_id ??
-    record.fqdn ??
-    record.name ??
-    (record.address === null ? undefined : `${record.address}:${record.port}`);
+  const identity = record.peer_id !== null && record.peer_id.length > 0
+    ? externalPeerSelector(record.peer_id)
+    : record.fqdn !== null && record.fqdn.length > 0
+      ? externalFqdnSelector(record.fqdn)
+      : undefined;
   return identity === undefined ? undefined : `${record.overlay}:${identity}`;
 }
 

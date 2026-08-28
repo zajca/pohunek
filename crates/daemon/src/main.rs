@@ -83,6 +83,13 @@ const REMOTE_BIND_INITIAL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// still recovers reasonably quickly after a delayed login or interface setup.
 const REMOTE_BIND_MAX_RETRY_INTERVAL: Duration = Duration::from_mins(5);
 
+/// Interval for revalidating an active overlay listener address.
+///
+/// Provider-owned interface addresses can change while the daemon remains up.
+/// Thirty seconds bounds stale listener exposure without continuously polling
+/// the provider CLI.
+const REMOTE_LISTENER_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // The startup future is large (reconciliation, listeners, event logs); box
@@ -425,35 +432,77 @@ async fn shutdown_event_logs(drains: EventLogDrains) {
 /// A `NetBird` daemon may start after `pohunekd`, or temporarily emit an
 /// incomplete status snapshot while it initializes. Retrying keeps the local
 /// control plane available immediately while allowing remote discovery to
-/// recover without an operator restart.
+/// recover without an operator restart. An active listener is revalidated on a
+/// fixed interval; changed addresses are rebound before the stale listener is
+/// dropped, while unavailable provider state drops it fail-closed and retries.
 async fn serve_remote_with_retry<F, Fut>(
     mut bind: F,
     shutdown: CancellationToken,
-    retry_interval: Duration,
+    initial_retry_interval: Duration,
+    reconcile_interval: Duration,
 ) where
-    F: FnMut() -> Fut,
+    F: FnMut(Option<std::net::SocketAddr>) -> Fut,
     Fut: Future<Output = RemoteBind>,
 {
-    let mut retry_interval = retry_interval;
+    let mut retry_interval = initial_retry_interval;
+    let mut active: Option<RemoteServer> = None;
     loop {
-        let attempt = tokio::select! {
-            () = shutdown.cancelled() => return,
-            attempt = bind() => attempt,
-        };
-        match attempt {
-            RemoteBind::Bound(remote) => {
-                remote
-                    .serve(async move {
-                        shutdown.cancelled().await;
-                    })
-                    .await;
-                return;
+        if let Some(remote) = active.take() {
+            let current_addr = remote.local_addr();
+            let remote_shutdown = shutdown.clone();
+            let mut serving = Box::pin(remote.serve(async move {
+                remote_shutdown.cancelled().await;
+            }));
+            let transition = loop {
+                tokio::select! {
+                    () = &mut serving => return,
+                    () = tokio::time::sleep(reconcile_interval) => {
+                        let attempt = tokio::select! {
+                            () = shutdown.cancelled() => return,
+                            attempt = bind(Some(current_addr)) => attempt,
+                        };
+                        match attempt {
+                            RemoteBind::Unchanged => {}
+                            other => break other,
+                        }
+                    }
+                }
+            };
+            drop(serving);
+            match transition {
+                RemoteBind::Bound(remote) => {
+                    info!(old_addr = %current_addr, new_addr = %remote.local_addr(), "overlay listener address changed; rebound remote control listener");
+                    active = Some(remote);
+                    retry_interval = initial_retry_interval;
+                    continue;
+                }
+                RemoteBind::Retry => {}
+                RemoteBind::Disabled => {
+                    shutdown.cancelled().await;
+                    return;
+                }
+                RemoteBind::Unchanged => unreachable!("unchanged transitions continue serving"),
             }
-            RemoteBind::Disabled => {
-                shutdown.cancelled().await;
-                return;
+        } else {
+            let attempt = tokio::select! {
+                () = shutdown.cancelled() => return,
+                attempt = bind(None) => attempt,
+            };
+            match attempt {
+                RemoteBind::Bound(remote) => {
+                    active = Some(remote);
+                    retry_interval = initial_retry_interval;
+                    continue;
+                }
+                RemoteBind::Disabled => {
+                    shutdown.cancelled().await;
+                    return;
+                }
+                RemoteBind::Retry => {}
+                RemoteBind::Unchanged => {
+                    error!("remote bind reported unchanged without an active listener");
+                }
             }
-            RemoteBind::Retry => {}
         }
 
         debug!(
@@ -494,9 +543,10 @@ where
         let shutdown = shutdown.clone();
         let task = tokio::spawn(async move {
             serve_remote_with_retry(
-                || bind_remote_server(state.clone(), configured.clone()),
+                |current_addr| bind_remote_server(state.clone(), configured.clone(), current_addr),
                 shutdown,
                 REMOTE_BIND_INITIAL_RETRY_INTERVAL,
+                REMOTE_LISTENER_RECONCILE_INTERVAL,
             )
             .await;
         });
@@ -561,7 +611,11 @@ where
 /// [`RemoteServer`] on that overlay's configured port. Missing CLI disables
 /// that listener; unavailable state, a missing self address, and bind failures
 /// are retried by the caller.
-async fn bind_remote_server(state: DaemonState, configured: ConfiguredTransport) -> RemoteBind {
+async fn bind_remote_server(
+    state: DaemonState,
+    configured: ConfiguredTransport,
+    current_addr: Option<std::net::SocketAddr>,
+) -> RemoteBind {
     let overlay_id = configured.id().clone();
     let port = configured.port();
     let transport = Arc::clone(configured.transport());
@@ -577,6 +631,9 @@ async fn bind_remote_server(state: DaemonState, configured: ConfiguredTransport)
         }
     };
     let addr = std::net::SocketAddr::new(address, port);
+    if current_addr == Some(addr) {
+        return RemoteBind::Unchanged;
+    }
 
     match RemoteServer::bind(addr, state, transport.as_ref()).await {
         Ok(remote) => {
@@ -596,6 +653,8 @@ async fn bind_remote_server(state: DaemonState, configured: ConfiguredTransport)
 enum RemoteBind {
     /// The listener is bound and ready to serve.
     Bound(RemoteServer),
+    /// Current provider state still validates the active listener address.
+    Unchanged,
     /// The condition may recover without restarting the daemon.
     Retry,
     /// The configuration cannot enable remote transport during this run.
@@ -643,10 +702,13 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, RwLock};
     use std::time::Duration;
 
-    use overlay::OverlayId;
+    use overlay::{
+        BindAddrError, ConfiguredTransport, DiscoveredPeer, OverlayError, OverlayFuture, OverlayId,
+        OverlayTransport, ResolvedPeer,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio_util::sync::CancellationToken;
@@ -658,8 +720,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        next_retry_interval, serve_remote_with_retry, supervise_remote_tasks, RemoteBind,
-        REMOTE_BIND_MAX_RETRY_INTERVAL,
+        bind_remote_server, next_retry_interval, serve_remote_with_retry, supervise_remote_tasks,
+        RemoteBind, REMOTE_BIND_MAX_RETRY_INTERVAL,
     };
 
     #[test]
@@ -679,12 +741,13 @@ mod tests {
         let retry_interval = Duration::from_secs(1);
 
         let supervisor = tokio::spawn(serve_remote_with_retry(
-            move || {
+            move |_| {
                 bind_attempts.fetch_add(1, Ordering::Relaxed);
                 std::future::ready(RemoteBind::Retry)
             },
             supervisor_shutdown,
             retry_interval,
+            Duration::from_secs(30),
         ));
 
         tokio::task::yield_now().await;
@@ -723,7 +786,10 @@ mod tests {
         let retry_interval = Duration::from_secs(1);
 
         let supervisor = tokio::spawn(serve_remote_with_retry(
-            move || {
+            move |current_addr| {
+                if current_addr.is_some() {
+                    return std::future::ready(RemoteBind::Unchanged);
+                }
                 let attempt = bind_attempts.fetch_add(1, Ordering::Relaxed);
                 let result = if attempt == 0 {
                     RemoteBind::Retry
@@ -734,6 +800,7 @@ mod tests {
             },
             supervisor_shutdown,
             retry_interval,
+            Duration::from_secs(30),
         ));
 
         tokio::task::yield_now().await;
@@ -767,6 +834,90 @@ mod tests {
         supervisor
             .await
             .expect("remote supervisor exits after shutdown");
+    }
+
+    #[derive(Debug)]
+    struct MutableListenerTransport {
+        id: OverlayId,
+        address: Arc<RwLock<std::net::IpAddr>>,
+    }
+
+    impl OverlayTransport for MutableListenerTransport {
+        fn id(&self) -> &OverlayId {
+            &self.id
+        }
+
+        fn validate_bind_addr(&self, addr: std::net::IpAddr) -> Result<(), BindAddrError> {
+            if *self.address.read().expect("listener address read lock") == addr {
+                Ok(())
+            } else {
+                Err(BindAddrError::NotMember(addr))
+            }
+        }
+
+        fn listener_addr(&self) -> OverlayFuture<'_, std::net::IpAddr> {
+            let address = *self.address.read().expect("listener address read lock");
+            Box::pin(async move { Ok(address) })
+        }
+
+        fn resolve_peer<'a>(&'a self, host: &'a str) -> OverlayFuture<'a, ResolvedPeer> {
+            let error = OverlayError::HostUnknown {
+                host: host.to_owned(),
+                overlay: self.id.clone(),
+            };
+            Box::pin(async move { Err(error) })
+        }
+
+        fn discover_peers(&self) -> OverlayFuture<'_, Vec<DiscoveredPeer>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_supervisor_rebinds_when_listener_address_changes() {
+        let first_ip = "127.0.0.1".parse().expect("first IP");
+        let second_ip = "127.0.0.2".parse().expect("second IP");
+        let probe = TcpListener::bind((first_ip, 0)).await.expect("port probe");
+        let port = probe.local_addr().expect("probe address").port();
+        drop(probe);
+        let address = Arc::new(RwLock::new(first_ip));
+        let transport = Arc::new(MutableListenerTransport {
+            id: OverlayId::new("mutable").expect("overlay id"),
+            address: Arc::clone(&address),
+        });
+        let configured = ConfiguredTransport::new(transport, port).expect("configured transport");
+        let state = DaemonState::new(
+            HealthInfo::new("test"),
+            SessionRegistry::default(),
+            netbird::configured_registry().expect("configured registry"),
+        );
+        let shutdown = CancellationToken::new();
+        let supervisor_shutdown = shutdown.clone();
+        let reconcile_interval = Duration::from_secs(1);
+        let supervisor = tokio::spawn(serve_remote_with_retry(
+            move |current_addr| bind_remote_server(state.clone(), configured.clone(), current_addr),
+            supervisor_shutdown,
+            Duration::from_secs(1),
+            reconcile_interval,
+        ));
+
+        tokio::task::yield_now().await;
+        TcpStream::connect((first_ip, port))
+            .await
+            .expect("initial listener accepts connections");
+
+        *address.write().expect("listener address write lock") = second_ip;
+        tokio::time::advance(reconcile_interval).await;
+        tokio::task::yield_now().await;
+        TcpStream::connect((second_ip, port))
+            .await
+            .expect("rebound listener accepts connections");
+        TcpStream::connect((first_ip, port))
+            .await
+            .expect_err("stale listener no longer accepts connections");
+
+        shutdown.cancel();
+        supervisor.await.expect("supervisor exits after shutdown");
     }
 
     #[tokio::test]

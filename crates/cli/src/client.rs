@@ -33,17 +33,6 @@ impl Client {
         Self::connect_with_options(host, paths, options).await
     }
 
-    /// Connect to one route already validated by overlay discovery.
-    pub(crate) async fn connect_trusted_tcp_addr(
-        host: &str,
-        addr: std::net::SocketAddr,
-    ) -> Result<Self, CliError> {
-        let inner = pohunek_client::Client::connect_trusted_tcp_addr(host, addr)
-            .await
-            .map_err(map_connect_error)?;
-        Ok(Self { inner })
-    }
-
     async fn connect_with_options(
         host: &str,
         paths: &Paths,
@@ -202,9 +191,14 @@ mod tests {
         let registry =
             OverlayRegistry::new(vec![configured("policy", address, registry_addr.port())])
                 .expect("registry");
-        let route =
-            pohunek_client::remote_host_with_port("policy:stable-peer", discovered_addr.port())
-                .expect("discovered route");
+        let identity = pohunek_client::ExternalIdentity::peer_id("stable-peer")
+            .expect("stable identity")
+            .selector();
+        let route = pohunek_client::remote_host_with_port(
+            &format!("policy:{identity}"),
+            discovered_addr.port(),
+        )
+        .expect("discovered route");
         let command = render_attach_command(
             "{bin} attach --host {host} {id}",
             &AttachTemplateValues {
@@ -217,7 +211,8 @@ mod tests {
             .split_whitespace()
             .skip_while(|part| *part != "--host")
             .nth(1)
-            .expect("rendered host argument");
+            .expect("rendered host argument")
+            .trim_matches('\'');
 
         let client = Client::connect_with_registry(selector, registry)
             .await

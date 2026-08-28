@@ -76,9 +76,14 @@ caching, reconnects, and external attach. Each new connection re-resolves that
 identity through current provider state; only control and raw attach opened by
 one SDK client reuse its exact selected socket endpoint. The explicit
 `<overlay>:<selector>@<port>` form carries the discovered port without trusting
-a cached IP. A socket-address literal cannot bypass current overlay membership.
-NetBird uses `publicKey` or legacy `pubKey` as `peer_id`; when absent,
-`peer_id` stays null and clients fall back to FQDN. A bare IPv6 literal such as
+a cached IP. Generated selectors encode typed identities as unpadded base64url:
+`peer~<base64url>` for provider peer IDs and `fqdn~<base64url>` for the fallback. This
+keeps raw `/`, `+`, `=`, and `@` characters out of target and exact-port grammar.
+A socket-address literal cannot bypass current overlay membership. NetBird uses
+`publicKey` or legacy `pubKey` as `peer_id`; when absent, `peer_id` stays null
+and clients fall back to FQDN. The web relay forces a new local-daemon discovery
+before each remote tunnel upgrade and refuses an identity that no longer owns
+the cached address. A bare IPv6 literal such as
 `fd00::2` remains an unqualified selector; only an explicit configured-overlay
 prefix such as `netbird:fd00::2` qualifies it. A failure in one configured
 overlay does not hide healthy peers from another overlay; discovery reports an

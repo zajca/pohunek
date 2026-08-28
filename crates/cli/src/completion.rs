@@ -6,14 +6,11 @@
 //! deliberately silent: pressing Tab must never turn a missing daemon, stale
 //! mesh state, or invalid local environment into shell noise.
 
-use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::future::Future;
 use std::io::{self, Write};
 use std::iter;
-use std::net::{IpAddr, SocketAddr};
-use std::num::NonZeroU16;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -23,7 +20,7 @@ use clap::{Command, CommandFactory, ValueEnum};
 use clap_complete::engine::ValueCompleter;
 use clap_complete::{ArgValueCompleter, CompleteEnv, CompletionCandidate};
 use pohunek_client::{Client, ClientOptions};
-use protocol::{HostClass, HostRecord, SessionInfo, SessionListParams};
+use protocol::{HostRecord, SessionInfo, SessionListParams};
 use serde::Serialize;
 
 use crate::error::CliError;
@@ -420,11 +417,7 @@ async fn query_sessions(host: &str) -> Option<Vec<SessionInfo>> {
             .await
             .ok()?
     } else {
-        let records = crate::commands::host::fetch_records(&paths.cache_dir, false)
-            .await
-            .ok()?;
-        let route = completion_host_route(&records, host)?;
-        Client::connect_trusted_tcp_addr_with_options(host, route, options)
+        Client::connect_with_options(host, &paths.socket, options)
             .await
             .ok()?
     };
@@ -432,15 +425,6 @@ async fn query_sessions(host: &str) -> Option<Vec<SessionInfo>> {
         .call::<protocol::method::SessionList>(SessionListParams::default())
         .await
         .ok()
-}
-
-fn completion_route(record: &HostRecord) -> Option<SocketAddr> {
-    if !matches!(record.class, HostClass::ReachableDaemon { .. }) {
-        return None;
-    }
-    let address: IpAddr = record.address.as_deref()?.parse().ok()?;
-    let port = NonZeroU16::new(record.port)?;
-    Some(SocketAddr::new(address, port.get()))
 }
 
 fn host_names(records: &[HostRecord]) -> Vec<String> {
@@ -457,48 +441,16 @@ fn host_names(records: &[HostRecord]) -> Vec<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CompletionHost {
     target: String,
-    route: SocketAddr,
 }
 
 fn completion_hosts(records: &[HostRecord]) -> Vec<CompletionHost> {
-    let mut names = BTreeMap::<&str, usize>::new();
-    let mut qualified = Vec::new();
-    for record in records {
-        let Some(route) = completion_route(record) else {
-            continue;
-        };
-        let target = format!("{}:{}", record.overlay, route.ip());
-        if !valid_host(&target) {
-            continue;
-        }
-        let name = record.name.as_deref().filter(|name| valid_host(name));
-        if let Some(name) = name {
-            *names.entry(name).or_default() += 1;
-        }
-        qualified.push((CompletionHost { target, route }, name));
-    }
-
-    qualified
-        .into_iter()
-        .flat_map(|(host, name)| {
-            let short =
-                name.filter(|name| names.get(name) == Some(&1))
-                    .map(|name| CompletionHost {
-                        target: name.to_owned(),
-                        route: host.route,
-                    });
-            iter::once(host).chain(short)
+    records
+        .iter()
+        .filter_map(crate::commands::host_fanout::reachable_target)
+        .map(|target| CompletionHost {
+            target: target.transport_target,
         })
         .collect()
-}
-
-fn completion_host_route(records: &[HostRecord], target: &str) -> Option<SocketAddr> {
-    let mut routes = completion_hosts(records)
-        .into_iter()
-        .filter(|host| host.target == target)
-        .map(|host| host.route);
-    let route = routes.next()?;
-    routes.next().is_none().then_some(route)
 }
 
 fn session_candidates(
@@ -584,6 +536,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use protocol::HostClass;
+
     use super::*;
 
     fn host_record(name: &str, class: HostClass) -> HostRecord {
@@ -713,12 +667,16 @@ mod tests {
         ];
         assert_eq!(
             host_names(&records),
-            vec!["host-b", "local", "netbird:100.64.0.2"]
+            vec![
+                "local",
+                "netbird:peer~cGVlci1iYWQvbmFtZQ@18722",
+                "netbird:peer~cGVlci1ob3N0LWI@18722"
+            ]
         );
     }
 
     #[test]
-    fn completion_collisions_offer_only_qualified_targets_and_never_pick_first() {
+    fn completion_collisions_preserve_distinct_provider_qualified_identities() {
         let reachable = HostClass::ReachableDaemon {
             daemon_version: "1.0.0".to_owned(),
         };
@@ -734,21 +692,16 @@ mod tests {
 
         assert_eq!(
             host_names(&records),
-            vec!["first:100.64.0.2", "local", "second:100.64.0.3"]
-        );
-        assert_eq!(completion_host_route(&records, "build"), None);
-        assert_eq!(
-            completion_host_route(&records, "first:100.64.0.2"),
-            Some("100.64.0.2:17001".parse().expect("first route"))
-        );
-        assert_eq!(
-            completion_host_route(&records, "second:100.64.0.3"),
-            Some("100.64.0.3:17002".parse().expect("second route"))
+            vec![
+                "first:peer~cGVlci1idWlsZA@17001",
+                "local",
+                "second:peer~cGVlci1idWlsZA@17002"
+            ]
         );
     }
 
     #[test]
-    fn completion_route_uses_the_discovered_address_and_overlay_port() {
+    fn completion_target_uses_stable_identity_and_discovered_port() {
         let record = host_record(
             "host-b",
             HostClass::ReachableDaemon {
@@ -756,31 +709,29 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            completion_route(&record),
-            Some("100.64.0.2:18722".parse().expect("expected route"))
-        );
+        let hosts = completion_hosts(&[record]);
+        assert_eq!(hosts[0].target, "netbird:peer~cGVlci1ob3N0LWI@18722");
     }
 
     #[test]
-    fn completion_route_rejects_non_dialable_records() {
+    fn completion_target_rejects_non_dialable_records() {
         let reachable = HostClass::ReachableDaemon {
             daemon_version: "1.0.0".to_owned(),
         };
         let mut record = host_record("host-b", reachable.clone());
         record.address = None;
-        assert_eq!(completion_route(&record), None);
+        assert!(completion_hosts(&[record.clone()]).is_empty());
 
         record.address = Some("not-an-ip".to_owned());
-        assert_eq!(completion_route(&record), None);
+        assert!(completion_hosts(&[record.clone()]).is_empty());
 
         record.address = Some("100.64.0.2".to_owned());
         record.port = 0;
-        assert_eq!(completion_route(&record), None);
+        assert!(completion_hosts(&[record.clone()]).is_empty());
 
         record.port = 18_722;
         record.class = HostClass::Candidate;
-        assert_eq!(completion_route(&record), None);
+        assert!(completion_hosts(&[record]).is_empty());
     }
 
     #[test]

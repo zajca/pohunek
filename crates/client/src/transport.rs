@@ -1352,7 +1352,11 @@ mod tests {
             .expect("second listener");
         let current_ip = Arc::new(RwLock::new(first_ip));
         let registry = mutable_policy_registry(Arc::clone(&current_ip), port);
-        let route = remote_host_with_port("policy:stable-peer", port).expect("stable route");
+        let identity = overlay::ExternalIdentity::peer_id("stable-peer")
+            .expect("stable identity")
+            .selector();
+        let route =
+            remote_host_with_port(&format!("policy:{identity}"), port).expect("stable route");
 
         let first_client =
             Client::connect_with_registry(&route, "/unused/local.sock", registry.clone())

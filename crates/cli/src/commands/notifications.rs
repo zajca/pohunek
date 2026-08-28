@@ -549,10 +549,7 @@ fn effective_notification_host(global: &str, target: &NotificationTarget) -> Str
 }
 
 async fn connect_target(paths: &Paths, target: &HostTarget) -> Result<Client, CliError> {
-    match target.trusted_addr {
-        Some(addr) => Client::connect_trusted_tcp_addr(&target.host_id, addr).await,
-        None => Client::connect(&target.transport_target, paths).await,
-    }
+    Client::connect(&target.transport_target, paths).await
 }
 
 async fn list_on_target(

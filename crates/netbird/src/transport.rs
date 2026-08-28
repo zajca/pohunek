@@ -4,8 +4,8 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use overlay::{
-    BindAddrError, ConfiguredTransport, DiscoveredPeer, OverlayError, OverlayFuture, OverlayId,
-    OverlayRegistry, OverlayTransport, ResolvedPeer,
+    BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, OverlayError,
+    OverlayFuture, OverlayId, OverlayRegistry, OverlayTransport, ResolvedPeer,
 };
 
 use crate::{NetbirdError, NetbirdStatus, Peer};
@@ -61,6 +61,16 @@ impl OverlayTransport for NetbirdTransport {
         Box::pin(async move {
             let status = load_status(self.id()).await?;
             resolve_from_status(&status, host, self.id())
+        })
+    }
+
+    fn resolve_peer_identity<'a>(
+        &'a self,
+        identity: &'a ExternalIdentity,
+    ) -> OverlayFuture<'a, ResolvedPeer> {
+        Box::pin(async move {
+            let status = load_status(self.id()).await?;
+            resolve_identity_from_status(&status, identity, self.id())
         })
     }
 
@@ -129,15 +139,29 @@ fn resolve_from_status(
     id: &OverlayId,
 ) -> Result<ResolvedPeer, OverlayError> {
     let peer = crate::host::resolve_peer(status, host).map_err(|error| map_error(error, id))?;
+    Ok(resolved_peer(peer))
+}
+
+fn resolve_identity_from_status(
+    status: &NetbirdStatus,
+    identity: &ExternalIdentity,
+    id: &OverlayId,
+) -> Result<ResolvedPeer, OverlayError> {
+    let peer = crate::host::resolve_peer_identity(status, identity)
+        .map_err(|error| map_error(error, id))?;
+    Ok(resolved_peer(peer))
+}
+
+fn resolved_peer(peer: &Peer) -> ResolvedPeer {
     let address = peer
         .ip()
         .expect("NetBird peer resolution only returns policy-valid addresses");
-    Ok(ResolvedPeer {
+    ResolvedPeer {
         peer_id: peer.peer_id().map(str::to_owned),
         display_name: short_name(peer),
         fqdn: peer.fqdn.clone(),
         address,
-    })
+    }
 }
 
 fn discover_from_status(status: &NetbirdStatus) -> Vec<DiscoveredPeer> {

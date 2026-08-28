@@ -22,7 +22,8 @@ const LOOPBACK_HOST = "127.0.0.1";
 const LOCAL_DAEMON_VERSION = "2.0.0-local-test";
 const PEER_DAEMON_VERSION = "2.0.0-peer-test";
 const PEER_NAME = "peer-one";
-const PEER_HOST = `netbird:${PEER_NAME}`;
+const PEER_PUBLIC_KEY = "peer/one+key==";
+const PEER_HOST = "netbird:peer~cGVlci9vbmUra2V5PT0";
 const TEST_COLS = 80;
 const TEST_ROWS = 24;
 const DISCOVER_INTERVAL_SECONDS = 0.02;
@@ -124,6 +125,43 @@ describe("@pohunek/backend", () => {
     }
   });
 
+  test("tunnel open refreshes identity ownership before dialing cached address", async () => {
+    const fixture = await startBackendFixture(60);
+    try {
+      const peerAddress = fixture.peer.tcpAddress;
+      if (peerAddress === undefined) {
+        throw new Error("peer fixture did not expose a TCP address");
+      }
+      fixture.local.scenario.setDiscoveredHosts([
+        {
+          ...reachablePeerRecord(peerAddress.port),
+          peer_id: "different-peer-key",
+        },
+      ]);
+
+      let cachedOwnerConnected = false;
+      try {
+        const cachedOwner = await Client.connectWs(fixture.backend.url, PEER_HOST);
+        cachedOwnerConnected = true;
+        await cachedOwner.close();
+      } catch {
+        cachedOwnerConnected = false;
+      }
+      expect(cachedOwnerConnected).toBe(false);
+
+      const reassignedHost = "netbird:peer~ZGlmZmVyZW50LXBlZXIta2V5";
+      const reassigned = await Client.connectWs(fixture.backend.url, reassignedHost);
+      try {
+        const health = await reassigned.call("daemon.health", null);
+        expect(health.daemon_version).toBe(PEER_DAEMON_VERSION);
+      } finally {
+        await reassigned.close();
+      }
+    } finally {
+      await fixture.close();
+    }
+  });
+
   test("serves assets and falls back to index.html for client-side routes", async () => {
     const fixture = await startBackendFixture();
     try {
@@ -169,7 +207,9 @@ describe("@pohunek/backend", () => {
   });
 });
 
-async function startBackendFixture(): Promise<BackendFixture> {
+async function startBackendFixture(
+  discoverIntervalSeconds: number = DISCOVER_INTERVAL_SECONDS,
+): Promise<BackendFixture> {
   const root = await mkdtemp(join(tmpdir(), "pohunek-backend-test-"));
   const assets = join(root, "assets");
   await mkdir(assets);
@@ -202,7 +242,7 @@ async function startBackendFixture(): Promise<BackendFixture> {
         port: 0,
         allowLoopbackBind: true,
         daemonSocketPath: socketPath,
-        discoverIntervalSeconds: DISCOVER_INTERVAL_SECONDS,
+        discoverIntervalSeconds,
         staticAssetsDir: assets,
       },
       silentLogger,
@@ -235,7 +275,7 @@ function reachablePeerRecord(port: number): HostRecord {
     address: LOOPBACK_HOST,
     port,
     overlay: "netbird",
-    peer_id: PEER_NAME,
+    peer_id: PEER_PUBLIC_KEY,
     classification: "reachable_daemon",
     daemon_version: PEER_DAEMON_VERSION,
   };

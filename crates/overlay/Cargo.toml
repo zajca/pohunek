@@ -11,6 +11,7 @@ name = "overlay"
 path = "src/lib.rs"
 
 [dependencies]
+base64 = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
 

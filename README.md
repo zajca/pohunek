@@ -348,9 +348,13 @@ waiting for owner approval.
 Every command accepts `--host <name>` (default `local`), and nearly all of
 them `--json` for machine-readable output (the exceptions are `attach`,
 `daemon start`, and `prompt render`). Session targets are `<session-id>` or
-`<host>/<session-id>`. A discovered route may use
-`<overlay>:<stable-selector>@<port>`; the selector is re-resolved through
-current overlay state while the discovered daemon port is retained.
+`<host>/<session-id>`. A discovered route uses
+`<overlay>:<canonical-identity>@<port>`. Canonical identities are typed
+`peer~<base64url>` or `fqdn~<base64url>` selectors without padding, so provider
+keys containing `/`, `+`, `=`, or the route separator `@` remain safe inside
+session targets and URLs. The selector is decoded and re-resolved through
+current provider state before every new connection while the discovered daemon
+port is retained.
 
 | Command | What it does |
 |---|---|

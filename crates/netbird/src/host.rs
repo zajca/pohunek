@@ -2,6 +2,8 @@
 
 use std::net::IpAddr;
 
+use overlay::{ExternalIdentity, ExternalIdentityKind};
+
 use crate::is_netbird_ip;
 use crate::status::{NetbirdError, NetbirdStatus};
 
@@ -104,6 +106,28 @@ pub(crate) fn resolve_peer<'a>(
     Err(NetbirdError::HostUnknown(name.to_owned()))
 }
 
+pub(crate) fn resolve_peer_identity<'a>(
+    status: &'a NetbirdStatus,
+    identity: &ExternalIdentity,
+) -> Result<&'a crate::Peer, NetbirdError> {
+    let peers = status.peers().iter();
+    let peer = match identity.kind() {
+        ExternalIdentityKind::PeerId => unique_peer(
+            peers.filter(|peer| peer.peer_id() == Some(identity.value())),
+            identity.value(),
+        )?,
+        ExternalIdentityKind::Fqdn => unique_peer(
+            peers.filter(|peer| {
+                peer.fqdn
+                    .as_deref()
+                    .is_some_and(|fqdn| fqdn.eq_ignore_ascii_case(identity.value()))
+            }),
+            identity.value(),
+        )?,
+    };
+    peer.ok_or_else(|| NetbirdError::HostUnknown(identity.value().to_owned()))
+}
+
 fn unique_peer<'a>(
     peers: impl Iterator<Item = &'a crate::Peer>,
     name: &str,
@@ -161,6 +185,30 @@ mod tests {
             resolve_host(&second, "stable-key").expect("second address"),
             "100.64.0.3".parse::<IpAddr>().expect("second IP")
         );
+    }
+
+    #[test]
+    fn typed_peer_identity_does_not_follow_reassigned_address() {
+        let identity = ExternalIdentity::peer_id("stable/key+=").expect("stable identity");
+        let owned = parse_status(
+            r#"{"peers":[{"publicKey":"stable/key+=","fqdn":"host.example","netbirdIp":"100.64.0.2"}]}"#,
+        )
+        .expect("owned status");
+        let reassigned = parse_status(
+            r#"{"peers":[{"publicKey":"different-key","fqdn":"other.example","netbirdIp":"100.64.0.2"}]}"#,
+        )
+        .expect("reassigned status");
+
+        assert_eq!(
+            resolve_peer_identity(&owned, &identity)
+                .expect("identity owner")
+                .ip(),
+            Some("100.64.0.2".parse().expect("address"))
+        );
+        assert!(matches!(
+            resolve_peer_identity(&reassigned, &identity),
+            Err(NetbirdError::HostUnknown(host)) if host == "stable/key+="
+        ));
     }
 
     #[test]

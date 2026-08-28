@@ -366,13 +366,17 @@ pub async fn discover_hosts(
 
 pub(crate) fn discovered_host_config(record: &HostRecord) -> Result<HostConfig, CoreError> {
     discovered_transport_addr(record)?;
-    let identity = record
-        .peer_id
-        .as_deref()
-        .filter(|identity| !identity.is_empty())
-        .or(record.fqdn.as_deref().filter(|fqdn| !fqdn.is_empty()))
-        .ok_or(CoreError::MissingDiscoveredStableIdentity)?;
-    let selector = format!("{}:{identity}", record.overlay);
+    let identity = if let Some(peer_id) =
+        record.peer_id.as_deref().filter(|value| !value.is_empty())
+    {
+        pohunek_client::ExternalIdentity::peer_id(peer_id)
+            .map_err(pohunek_client::ClientError::from)?
+    } else if let Some(fqdn) = record.fqdn.as_deref().filter(|value| !value.is_empty()) {
+        pohunek_client::ExternalIdentity::fqdn(fqdn).map_err(pohunek_client::ClientError::from)?
+    } else {
+        return Err(CoreError::MissingDiscoveredStableIdentity);
+    };
+    let selector = format!("{}:{}", record.overlay, identity.selector());
     let route = pohunek_client::remote_host_with_port(&selector, record.port)?;
     Ok(HostConfig::remote(selector, route, ""))
 }

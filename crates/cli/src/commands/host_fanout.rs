@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::net::SocketAddr;
 
 use futures::{stream, StreamExt as _};
 use protocol::{HostClass, HostRecord, ProtocolError};
@@ -42,9 +41,6 @@ pub(crate) struct HostTarget {
     pub(crate) host_id: String,
     /// Transport target passed to the SDK client.
     pub(crate) transport_target: String,
-    /// Provider-validated route retained separately from untrusted selectors.
-    #[serde(skip)]
-    pub(crate) trusted_addr: Option<SocketAddr>,
 }
 
 impl HostTarget {
@@ -54,17 +50,6 @@ impl HostTarget {
         Self {
             host_id: host_id.into(),
             transport_target: transport_target.into(),
-            trusted_addr: None,
-        }
-    }
-
-    /// Create a target from one route validated by overlay discovery.
-    #[must_use]
-    pub(crate) fn trusted_remote(host_id: impl Into<String>, addr: SocketAddr) -> Self {
-        Self {
-            host_id: host_id.into(),
-            transport_target: addr.to_string(),
-            trusted_addr: Some(addr),
         }
     }
 }
@@ -198,22 +183,29 @@ async fn fetch_records(paths: &Paths) -> Result<Vec<HostRecord>, CliError> {
     crate::commands::host::fetch_records(&paths.cache_dir, false).await
 }
 
-fn reachable_target(record: &HostRecord) -> Option<HostTarget> {
+pub(crate) fn reachable_target(record: &HostRecord) -> Option<HostTarget> {
     match &record.class {
         HostClass::ReachableDaemon { .. } => {
-            let address = record.address.as_deref()?.parse().ok()?;
-            let addr = std::net::SocketAddr::new(address, record.port);
-            let target = addr.to_string();
-            let identity = record
+            record
+                .address
+                .as_deref()?
+                .parse::<std::net::IpAddr>()
+                .ok()?;
+            let identity = if let Some(peer_id) = record
                 .peer_id
                 .as_deref()
-                .or(record.fqdn.as_deref())
-                .or(record.name.as_deref())
-                .unwrap_or(&target);
-            Some(HostTarget::trusted_remote(
-                format!("{}:{identity}", record.overlay),
-                addr,
-            ))
+                .filter(|identity| !identity.is_empty())
+            {
+                pohunek_client::ExternalIdentity::peer_id(peer_id).ok()?
+            } else if let Some(fqdn) = record.fqdn.as_deref().filter(|fqdn| !fqdn.is_empty()) {
+                pohunek_client::ExternalIdentity::fqdn(fqdn).ok()?
+            } else {
+                return None;
+            };
+            let host_id = format!("{}:{}", record.overlay, identity.selector());
+            let transport_target =
+                pohunek_client::remote_host_with_port(&host_id, record.port).ok()?;
+            Some(HostTarget::new(host_id, transport_target))
         }
         HostClass::VersionMismatch { .. } | HostClass::Unreachable | HostClass::Candidate => None,
     }
@@ -293,7 +285,10 @@ mod tests {
             .iter()
             .map(|target| target.host_id.as_str())
             .collect();
-        assert_eq!(ids, ["local", "netbird:host-a", "netbird:host-b"]);
+        assert_eq!(
+            ids,
+            ["local", "netbird:peer~aG9zdC1h", "netbird:peer~aG9zdC1i"]
+        );
         assert_eq!(
             targets
                 .iter()
@@ -301,18 +296,42 @@ mod tests {
                 .count(),
             1
         );
-        assert!(targets[0].trusted_addr.is_none());
-        assert!(targets[1..]
-            .iter()
-            .all(|target| target.trusted_addr.is_some()));
         let transport_targets: Vec<_> = targets
             .iter()
             .map(|target| target.transport_target.as_str())
             .collect();
         assert_eq!(
             transport_targets,
-            ["local", "100.92.30.40:18722", "100.92.30.40:18722"]
+            [
+                "local",
+                "netbird:peer~aG9zdC1h@18722",
+                "netbird:peer~aG9zdC1i@18722"
+            ]
         );
+    }
+
+    #[test]
+    fn cached_ip_changes_never_change_or_supply_the_fan_out_route() {
+        let mut original = record(
+            "host-a",
+            HostClass::ReachableDaemon {
+                daemon_version: "0.1.0".to_owned(),
+            },
+        );
+        original.peer_id = Some("stable/key+=".to_owned());
+        let first = reachable_target(&original).expect("original target");
+
+        let mut moved = original.clone();
+        moved.address = Some("100.92.30.41".to_owned());
+        let moved = reachable_target(&moved).expect("moved target");
+        assert_eq!(moved, first);
+
+        let mut reassigned = original;
+        reassigned.peer_id = Some("different-key".to_owned());
+        let reassigned = reachable_target(&reassigned).expect("reassigned target");
+        assert_ne!(reassigned, first);
+        assert!(!first.transport_target.contains("100.92.30.40"));
+        assert!(first.transport_target.ends_with("@18722"));
     }
 
     #[tokio::test]
