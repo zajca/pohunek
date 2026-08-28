@@ -590,20 +590,24 @@ async fn integration_status_sdk_helper_sends_typed_read_only_request() {
     let daemon = spawn_unix_echo_daemon(json!({
         "agents": [{
             "agent": "codex",
-            "available": false,
+            "available": true,
             "expected_asset_paths": [
                 "/isolated/.codex/pohunek-agent-state.sh",
                 "/isolated/.codex/pohunek-agent-notify.sh"
             ],
-            "present_asset_paths": [],
+            "present_asset_paths": [
+                "/isolated/.codex/pohunek-agent-state.sh",
+                "/isolated/.codex/pohunek-agent-notify.sh"
+            ],
             "registration_paths": [
                 "/isolated/.codex/hooks.json",
                 "/isolated/.codex/config.toml"
             ],
-            "installed_version": null,
+            "installed_version": 4,
             "expected_version": 4,
-            "state": "not_installed",
-            "warnings": ["agent config directory does not exist"]
+            "state": "current",
+            "recovery": "none",
+            "warnings": []
         }]
     }));
     let mut client = Client::connect_local(&daemon.socket_path)
@@ -621,7 +625,11 @@ async fn integration_status_sdk_helper_sends_typed_read_only_request() {
     assert_eq!(result.agents[0].agent, protocol::AgentKind::Codex);
     assert_eq!(
         result.agents[0].state,
-        protocol::IntegrationInstallState::NotInstalled
+        protocol::IntegrationInstallState::Current
+    );
+    assert_eq!(
+        result.agents[0].recovery,
+        protocol::IntegrationRecovery::None
     );
     let request_line = daemon
         .request_line
