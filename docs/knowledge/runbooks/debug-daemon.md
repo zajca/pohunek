@@ -73,7 +73,15 @@ For durable notification issues:
    effective-UID-owned real directories with no group/world write access;
    ancestors above that explicit trust anchor are not inspected. Unsafe asset or
    parent ownership/permissions and duplicate managed registrations are
-   `outdated`. Follow the typed recovery action: `reinstall` means the installer
+   `outdated`. A missing Claude `hooks/` child under a trusted config root is a
+   reinstallable absence; installation creates it as owner-private mode `0700`
+   and leaves an existing real user directory's mode unchanged. Claude
+   `settings.json`, Codex `hooks.json`, and Codex `config.toml` are each opened
+   no-follow and require effective-UID ownership plus no group/world write bits;
+   their metadata and bounded content come from the same descriptor. Codex
+   managed trust uses a canonical single-handler group, so a sibling handler is
+   drift even when the managed command itself is unchanged. Follow the typed
+   recovery action: `reinstall` means the installer
    can repair every finding, while `repair_configuration` means provider files,
    symlinked, special, foreign-owned, or group/world-writable managed assets or
    parents, invalid registration roots, incompatible TOML table shapes, and

@@ -30,6 +30,14 @@ The assistant must:
   be real, effective-UID-owned, and not group/world writable. Ancestors above the
   selected root are outside this chain so normal home/XDG paths are not rejected
   solely because a shared system ancestor exists.
+- Treat Claude `settings.json`, Codex `hooks.json`, and Codex `config.toml` as
+  owner-private registration authority. Status reads metadata and bounded
+  content from one no-follow descriptor and requires a regular effective-UID-
+  owned file without group/world write access. A missing Claude `hooks/` child
+  below a trusted config root is safe absence; installation creates it as
+  `0700`, never chmods an existing real user directory, and rejects unsafe path
+  shapes. Codex trust identity covers a canonical single-handler managed group,
+  so sibling handlers cannot inherit the managed trust record.
 - Avoid weakening owner-only profile checks, name guards, path containment, or
   remote safety gates.
 - Treat worker control sockets and journals as owner-private runtime authority.

@@ -826,11 +826,20 @@ resolved agent config root and ends at the asset's direct parent; every path in
 that chain must be a real directory owned by the daemon's effective UID without
 group or world write access. System ancestors above the config root are outside
 this check, so ordinary safe home/XDG roots are not rejected merely because an
-ancestor such as `/tmp` is shared. Provider configuration is separately opened
-without following symlinks, verified as a regular file from the same descriptor,
-and read with its own named byte limit; provider inspection is nonblocking so
-FIFOs cannot stall the daemon worker. An oversized file is `outdated` with an
-actionable warning. The CLI routes Codex and Claude status to
+ancestor such as `/tmp` is shared. Each Claude `settings.json`, Codex
+`hooks.json`, and Codex `config.toml` is opened without following symlinks and
+must be a regular file owned by the daemon effective UID without group/world
+write access; metadata and bounded content come from the same descriptor.
+Provider inspection is nonblocking so FIFOs cannot stall the daemon worker. A
+missing Claude `hooks/` child under an otherwise trusted config root is a
+reinstallable absence and can still report `not_installed`; an existing symlink,
+wrong type, foreign owner, or group/world-writable child requires
+`repair_configuration`. The installer creates a missing Claude `hooks/`
+directory as mode `0700`, but never changes permissions on an existing real user
+directory. Codex trust records describe a canonical single-handler managed
+group, so adding a sibling handler makes status non-current until reinstall
+separates the managed handler while preserving the user sibling. An oversized
+file is `outdated` with an actionable warning. The CLI routes Codex and Claude status to
 the effective global `--host`; mutating hook installation and every Hermes
 lifecycle action remain local. Human recovery hints and warning commands for a
 remote report explicitly name the daemon host where the operator must run the
