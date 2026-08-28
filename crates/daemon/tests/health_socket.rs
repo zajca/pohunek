@@ -23,14 +23,17 @@ use protocol::{
     NotificationListParams, NotificationListResult, NotificationPolicy, NotificationPolicyParams,
     NotificationPolicyResult, NotificationRetentionParams, NotificationRetentionResult,
     NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
-    NotificationUpdateResult, ReportSequence, Request as ProtocolRequest, Response,
-    SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
-    SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
-    SessionNewParams, SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
+    NotificationUpdateResult, ProcessStartIdentity, ReportSequence, Request as ProtocolRequest,
+    Response, SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult,
+    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter,
+    SessionListParams, SessionNewParams, SessionRemoveResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
     SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, StateSource,
     TerminalDimensions, PROTOCOL_VERSION,
 };
 use serde_json::Value;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{oneshot, Mutex, MutexGuard};
@@ -996,103 +999,31 @@ async fn wait_for_notification_event(
     }
 }
 
-/// Python reporter the stub agents run on launch to simulate the `SessionStart`
-/// hook: it reads the daemon-injected handshake env and fires one
-/// `session.report_native_id` RPC. Kept as a separate file (not a heredoc) so
-/// the stub shell script stays trivial to template.
-const STUB_REPORTER_PY: &str = r#"import json
-import os
-import socket
-import time
-from datetime import datetime, timedelta, timezone
-
-session_id = os.environ.get("POHUNEK_SESSION_ID")
-socket_path = os.environ.get("POHUNEK_SOCKET_PATH")
-protocol_raw = os.environ.get("POHUNEK_PROTOCOL_VERSION")
-native = os.environ.get("POHUNEK_STUB_NATIVE_ID")
-agent = os.environ.get("POHUNEK_STUB_AGENT")
-runtime_id = os.environ.get("POHUNEK_RUNTIME_ID")
-
-if not (session_id and socket_path and protocol_raw and native and agent and runtime_id):
-    raise SystemExit(0)
-
-pid = os.getppid()
-try:
-    with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
-        stat = handle.read()
-    start_identity = int(stat[stat.rfind(")") + 2:].split()[19])
-except Exception:
-    raise SystemExit(0)
-
-sequence = int(time.time() * 1000)
-
-request = {
-    "v": {"minimum": int(protocol_raw), "maximum": int(protocol_raw)},
-    "id": "stub-report",
-    "method": "session.report_native_id",
-    "params": {
-        "session_id": session_id,
-        "runtime_id": runtime_id,
-        "agent": agent,
-        "pid": pid,
-        "pid_start_identity": str(start_identity),
-        "sequence": str(sequence),
-        "expires_at": (
-            datetime.now(timezone.utc) + timedelta(seconds=30)
-        ).isoformat().replace("+00:00", "Z"),
-        "native_session_id": native,
-    },
-}
-
-try:
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    client.settimeout(1.0)
-    client.connect(socket_path)
-    client.sendall((json.dumps(request) + "\n").encode())
-    try:
-        client.recv(4096)
-    except Exception:
-        pass
-    client.close()
-except Exception:
-    pass
-"#;
-
-/// Build a stub agent script that logs its argv (one line per launch), fires the
-/// native-id report via [`STUB_REPORTER_PY`] using the injected handshake env,
-/// then idles. The argv log lets the test assert the resume argv after restart.
-fn stub_agent_script(argv_log: &Path, reporter_py: &Path, agent: &str, native_id: &str) -> String {
+/// Build a stub agent script that logs its argv and then idles.
+fn stub_agent_script(argv_log: &Path) -> String {
     format!(
         "#!/bin/sh\n\
 printf '%s\\n' \"$*\" >> '{argv}'\n\
-if [ \"${{POHUNEK_ENV:-}}\" = \"1\" ] && command -v python3 >/dev/null 2>&1; then\n\
-  POHUNEK_STUB_NATIVE_ID='{native}' POHUNEK_STUB_AGENT='{agent}' python3 '{reporter}' || true\n\
-fi\n\
 /bin/sleep 30\n",
         argv = argv_log.display(),
-        native = native_id,
-        agent = agent,
-        reporter = reporter_py.display(),
     )
 }
 
-/// Poll `inspect` until the session reports the expected captured native id.
-async fn wait_for_native_id(
-    framed: &mut Framed<UnixStream, LinesCodec>,
-    id: &SessionId,
-    native_id: &str,
-) -> SessionInfo {
-    for _ in 0..250 {
-        let info = inspect_session(framed, id).await;
-        if info.native_session_id.as_deref() == Some(native_id) {
-            return info;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!(
-        "native id {native_id} was not captured for session {}",
-        id.0
-    );
+fn process_start_identity(pid: u32) -> ProcessStartIdentity {
+    let stat =
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read child process identity");
+    let fields = stat
+        .rsplit_once(") ")
+        .expect("process stat contains command terminator")
+        .1
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>();
+    let start_identity = fields
+        .get(19)
+        .expect("process stat contains start identity")
+        .parse()
+        .expect("process start identity is numeric");
+    ProcessStartIdentity::new(start_identity)
 }
 
 async fn wait_for_persisted_resume_and_worktree(
@@ -2952,12 +2883,7 @@ async fn worktree_session_persists_recovery_and_worktree_metadata() {
     let store_path = data_dir.join("metadata.jsonl");
     let worktree_root = data_dir.join("worktrees");
     let argv_log = temp_dir("wt-resume-argv").join("argv.log");
-    let reporter_py = temp_dir("wt-resume-reporter").join("reporter.py");
-    write_executable(&reporter_py, STUB_REPORTER_PY);
-    write_executable(
-        &bin_dir.join(bin_name),
-        &stub_agent_script(&argv_log, &reporter_py, bin_name, native_id),
-    );
+    write_executable(&bin_dir.join(bin_name), &stub_agent_script(&argv_log));
 
     let socket = temp_socket("wt-resume");
     let config = SessionRegistryConfig {
@@ -2969,7 +2895,7 @@ async fn worktree_session_persists_recovery_and_worktree_metadata() {
 
     let _path = PathGuard::prepend(&bin_dir).await;
 
-    // --- Create phase: a worktree-bound stub agent reports its native id. ---
+    // --- Create phase: report a native id after the session commit. ---
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
     let mut control = connect(&socket).await;
     let created: SessionInfo = serde_json::from_value(ok_payload(
@@ -2980,7 +2906,38 @@ async fn worktree_session_persists_recovery_and_worktree_metadata() {
     assert_eq!(created.branch.as_deref(), Some("feat/x"));
     assert_eq!(created.cwd, worktree_path);
 
-    let captured = wait_for_native_id(&mut control, &created.id, native_id).await;
+    let runtime_id = created
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.runtime_id.as_deref())
+        .expect("created worktree session exposes its runtime id");
+    let report_req = Request::make(
+        "wt-resume-report-native-id",
+        method::SESSION_REPORT_NATIVE_ID,
+        serde_json::to_value(
+            SessionReportNativeIdParams::new(
+                created.id.clone(),
+                runtime_id,
+                bin_name,
+                created.pid,
+                process_start_identity(created.pid),
+                ReportSequence::new(1),
+                (OffsetDateTime::now_utc() + time::Duration::seconds(30))
+                    .format(&Rfc3339)
+                    .expect("format native identity expiry"),
+                native_id,
+                None,
+            )
+            .expect("valid worktree native identity claim"),
+        )
+        .expect("serialize worktree report-native-id params"),
+    );
+    let reported: SessionReportNativeIdResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &report_req).await))
+            .expect("worktree report-native-id result");
+    assert!(reported.recorded, "worktree native id must be recorded");
+
+    let captured = inspect_session(&mut control, &created.id).await;
     assert_eq!(captured.native_session_id.as_deref(), Some(native_id));
 
     // Both records coexist in one unified metadata file while recovery remains
