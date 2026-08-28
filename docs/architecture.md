@@ -366,6 +366,18 @@ Kandev's hard-won handling:
 These per-agent input rules live in the agent adapter next to its launch command,
 state manifest, and resume command.
 
+An optional bounded input wait is scoped to the exact runtime that accepted the
+write. The daemon marks the instant submit framing completes, then accepts only
+a matching `agent_state` evidence record observed later on that runtime.
+Each event carries its runtime identity and exact decimal-string activity
+revision, while the registry retains the latest evidence for each activity so
+broadcast lag cannot erase a rapid target transition. Runtime exit returns
+`session_not_running`; replacement returns `session_runtime_changed`. Rust and
+TypeScript SDK wait helpers reject a success response unless it includes the
+matching activity, source, runtime identity, and activity revision, preventing a
+same-version daemon that ignored the additive `wait` request from confirming
+delivery.
+
 ### Hermes operator plugin
 
 The pinned local Hermes Agent `0.20.0` runtime may load a Pohunek-owned plugin

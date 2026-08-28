@@ -211,6 +211,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
   private readonly sessionInitialAttachDimensions = new Map<string, TerminalDimensions[]>();
   private readonly sessionResizes = new Map<string, ScenarioResize[]>();
   private readonly observations = new Map<string, FixtureObservation>();
+  private readonly activityRevisions = new Map<string, bigint>();
   private endpointsValue: FixtureDaemonEndpoint[] = [];
   private discoveredHosts: HostRecord[];
   private nextSessionId = 1;
@@ -300,6 +301,9 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
 
   public setAgentState(sessionId: string, activity: AgentActivity, source: StateSource): void {
     const session = this.requireSession(sessionId);
+    const observation = this.observation(sessionId);
+    const revision = (this.activityRevisions.get(sessionId) ?? 0n) + 1n;
+    this.activityRevisions.set(sessionId, revision);
     session.activity = activity;
     session.state_source = source;
     session.updated_at = timestamp();
@@ -309,12 +313,18 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       session_id: sessionId,
       activity,
       source,
+      runtime: {
+        runtime_id: observation.runtime_id,
+        runtime_generation: observation.runtime_generation.toString(),
+      },
+      revision: revision.toString(),
     });
   }
 
   public removeSession(sessionId: string): void {
     const session = this.requireSession(sessionId);
     this.sessions.delete(sessionId);
+    this.activityRevisions.delete(sessionId);
     this.pty.closeSession(sessionId);
     this.emitEvent({
       v: PROTOCOL_VERSION,

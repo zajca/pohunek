@@ -332,10 +332,13 @@ impl Client {
         &mut self,
         params: SessionInputParams,
     ) -> Result<SessionInputResult, ClientError> {
-        if let Some(wait) = &params.wait {
+        if let Some(wait) = params.wait.clone() {
             let timeout_ms = wait.timeout_ms.unwrap_or(protocol::MAX_SESSION_WAIT_MS);
-            self.call_dedicated::<protocol::method::SessionInput>(params, timeout_ms)
-                .await
+            let result = self
+                .call_dedicated::<protocol::method::SessionInput>(params, timeout_ms)
+                .await?;
+            validate_input_wait_result(&wait, &result)?;
+            Ok(result)
         } else {
             self.call::<protocol::method::SessionInput>(params).await
         }
@@ -450,6 +453,42 @@ impl Client {
             }
         }
     }
+}
+
+fn validate_input_wait_result(
+    wait: &protocol::SessionInputWait,
+    result: &SessionInputResult,
+) -> Result<(), ClientError> {
+    if !result.accepted {
+        return Err(ClientError::InputWaitContract {
+            detail: "the daemon reported that delivered input was not accepted",
+        });
+    }
+    let activity = result.activity.ok_or(ClientError::InputWaitContract {
+        detail: "the response omitted the post-submission activity",
+    })?;
+    if result.activity_source.is_none()
+        || result.runtime.is_none()
+        || result.activity_revision.is_none()
+    {
+        return Err(ClientError::InputWaitContract {
+            detail: "the response omitted runtime-scoped activity evidence",
+        });
+    }
+    let target_matches = if wait.until.is_empty() {
+        matches!(
+            activity,
+            protocol::AgentActivity::Idle | protocol::AgentActivity::Blocked
+        )
+    } else {
+        wait.until.contains(&activity)
+    };
+    if !target_matches {
+        return Err(ClientError::InputWaitContract {
+            detail: "the response activity did not match the requested wait target",
+        });
+    }
+    Ok(())
 }
 
 /// Build a unique correlation id for one SDK control request.
@@ -1213,7 +1252,12 @@ mod tests {
         let result = serde_json::json!({
             "accepted": true,
             "activity": "idle",
-            "activity_source": "report"
+            "activity_source": "report",
+            "runtime": {
+                "runtime_id": "runtime-1",
+                "runtime_generation": "1"
+            },
+            "activity_revision": "2"
         });
         let (address, server) = spawn_dedicated_capture_server(result).await;
         let mut client = Client::connect_tcp_addr("fixture-remote", address)
@@ -1236,6 +1280,35 @@ mod tests {
         let request = server.await.expect("capture server");
         assert_eq!(request.method(), protocol::method::SESSION_INPUT);
         assert_test_request_origin(&request);
+    }
+
+    #[tokio::test]
+    async fn input_wait_rejects_legacy_success_without_runtime_evidence() {
+        let result = serde_json::json!({"accepted": true});
+        let (address, server) = spawn_dedicated_capture_server(result).await;
+        let mut client = Client::connect_tcp_addr("fixture-remote", address)
+            .await
+            .expect("connect remote");
+        let params = SessionInputParams {
+            session_id: SessionId("s-target".to_owned()),
+            text: "hello".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: vec![protocol::AgentActivity::Idle],
+                timeout_ms: None,
+            }),
+        };
+
+        let error = client
+            .session_input(params)
+            .await
+            .expect_err("legacy success must fail closed");
+        assert!(matches!(error, ClientError::InputWaitContract { .. }));
+        assert_eq!(
+            error.to_protocol_error().code,
+            "session_input_wait_contract_mismatch"
+        );
+        let request = server.await.expect("capture server");
+        assert_eq!(request.method(), protocol::method::SESSION_INPUT);
     }
 
     #[tokio::test]

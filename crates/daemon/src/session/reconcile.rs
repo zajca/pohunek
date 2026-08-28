@@ -745,6 +745,7 @@ impl SessionRegistry {
         let entry = SessionEntry {
             info: info.clone(),
             activity_revision: 0,
+            activity_evidence: HashMap::new(),
             runtime: RuntimeHandle::Worker(worker.clone()),
             desired_state: DesiredState::Running,
             detector_cancel: detector_cancel.clone(),
@@ -852,6 +853,7 @@ impl SessionRegistry {
         let entry = SessionEntry {
             info: info.clone(),
             activity_revision: 0,
+            activity_evidence: HashMap::new(),
             runtime: RuntimeHandle::Unavailable(state),
             desired_state: record.desired_state,
             detector_cancel: CancellationToken::new(),

@@ -1,8 +1,8 @@
 //! Per-session activity detector task and activity recording.
 
 use super::{
-    broadcast, debug, event, event_payload, is_terminal, log_lag_warn, timestamp_now, watch,
-    ActivityTransition, AgentActivity, AgentStateEvent, CancellationToken, Detector,
+    broadcast, debug, event, event_payload, is_terminal, log_lag_warn, record_activity_evidence,
+    timestamp_now, watch, ActivityTransition, AgentActivity, CancellationToken, Detector,
     DetectorConfig, Instant, LagWarnThrottle, SessionId, SessionRegistry,
 };
 
@@ -117,25 +117,21 @@ impl SessionRegistry {
             entry.info.activity = Some(transition.activity);
             entry.info.state_source = transition.source;
             entry.info.updated_at = timestamp_now();
-            entry.activity_revision = entry
-                .activity_revision
-                .checked_add(1)
-                .expect("session activity revision overflowed");
+            let evidence = record_activity_evidence(entry, transition.activity, transition.source);
             let rescan = (transition.activity == AgentActivity::Working)
                 .then(|| std::sync::Arc::clone(&entry.procwatch_rescan));
-            (transition, rescan)
+            (rescan, evidence)
         };
-        if let Some(rescan) = updated.1 {
+        if let Some(rescan) = updated.0 {
             rescan.notify_one();
         }
 
+        let Some(evidence) = updated.1 else {
+            return;
+        };
         let event = crate::events::event(
             event::AGENT_STATE,
-            event_payload(AgentStateEvent {
-                session_id: id.clone(),
-                activity: updated.0.activity,
-                source: updated.0.source,
-            }),
+            event_payload(evidence.event(id.clone())),
         );
         let _ = self.inner.events.send(event);
     }

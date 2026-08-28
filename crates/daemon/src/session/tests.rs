@@ -30,9 +30,9 @@ use crate::project::detect::project_id;
 use crate::runtime::{Worker, WorkerError};
 
 use super::{
-    native_report_is_current, worker_error_to_protocol, RuntimeExit, RuntimeHandle,
-    RuntimeWatchIdentity, SessionEntry, SessionRegistry, SessionRegistryConfig, ShellCommand,
-    MAX_SESSION_NAME_BYTES,
+    native_report_is_current, worker_error_to_protocol, InputSubmission, RuntimeExit,
+    RuntimeHandle, RuntimeWatchIdentity, SessionEntry, SessionRegistry, SessionRegistryConfig,
+    ShellCommand, MAX_SESSION_NAME_BYTES,
 };
 
 /// Bounds retries around intentional same-runtime snapshot races in transition tests.
@@ -3653,10 +3653,13 @@ async fn session_input_wait_resnapshots_after_broadcast_lag() {
         .expect("create shell session");
     let mut events = registry.subscribe();
     let submitted_revision = registry
-        .input_activity_snapshot(&created.id)
+        .input_activity_snapshot(&created.id, None)
         .await
-        .expect("snapshot activity")
-        .revision;
+        .expect("snapshot activity");
+    let submission = InputSubmission {
+        runtime: submitted_revision.runtime.clone(),
+        completed_at: Instant::now(),
+    };
     for sequence in 1..=130 {
         assert!(
             report_input_activity(&registry, &created.id, AgentActivity::Working, sequence,)
@@ -3677,7 +3680,7 @@ async fn session_input_wait_resnapshots_after_broadcast_lag() {
                 until: vec![AgentActivity::Idle],
                 timeout_ms: Some(100),
             },
-            submitted_revision,
+            submission,
             &mut events,
         )
         .await
@@ -3685,6 +3688,206 @@ async fn session_input_wait_resnapshots_after_broadcast_lag() {
 
     assert_eq!(result.activity, Some(AgentActivity::Idle));
     assert_eq!(result.activity_source, Some(StateSource::Report));
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_uses_rapid_target_event_after_latest_state_changes() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let mut events = registry.subscribe();
+    let submitted = registry
+        .input_activity_snapshot(&created.id, None)
+        .await
+        .expect("capture submitted revision");
+    let submission = InputSubmission {
+        runtime: submitted.runtime.clone(),
+        completed_at: Instant::now(),
+    };
+
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Idle, 1)
+            .await
+            .recorded
+    );
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Working, 2)
+            .await
+            .recorded
+    );
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect latest activity")
+            .activity,
+        Some(AgentActivity::Working)
+    );
+
+    let result = registry
+        .await_input_settled(
+            &created.id,
+            protocol::SessionInputWait {
+                until: vec![AgentActivity::Idle],
+                timeout_ms: Some(100),
+            },
+            submission,
+            &mut events,
+        )
+        .await
+        .expect("queued target event settles despite a newer non-target snapshot");
+
+    assert_eq!(result.activity, Some(AgentActivity::Idle));
+    assert_eq!(result.runtime.as_ref(), Some(&submitted.runtime));
+    assert!(result.activity_revision > Some(submitted.revision));
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_rejects_replaced_runtime() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let mut events = registry.subscribe();
+    let submitted = registry
+        .input_activity_snapshot(&created.id, None)
+        .await
+        .expect("capture original runtime");
+    let submission = InputSubmission {
+        runtime: submitted.runtime,
+        completed_at: Instant::now(),
+    };
+    let replacement = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("session entry");
+        let runtime = entry.info.runtime.as_mut().expect("managed runtime");
+        runtime.runtime_id = Some("runtime-replacement".to_owned());
+        runtime.runtime_generation =
+            protocol::RuntimeGeneration::new(runtime.runtime_generation.get() + 1);
+        entry.info.clone()
+    };
+    registry.emit(protocol::event::SESSION_UPDATED, &replacement);
+
+    let error = registry
+        .await_input_settled(
+            &created.id,
+            protocol::SessionInputWait {
+                until: vec![AgentActivity::Idle],
+                timeout_ms: Some(100),
+            },
+            submission,
+            &mut events,
+        )
+        .await
+        .expect_err("replacement runtime must not confirm prior input");
+
+    assert_eq!(error.code, "session_runtime_changed");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_rejects_runtime_exit() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let mut events = registry.subscribe();
+    let submitted = registry
+        .input_activity_snapshot(&created.id, None)
+        .await
+        .expect("capture running runtime");
+    let submission = InputSubmission {
+        runtime: submitted.runtime,
+        completed_at: Instant::now(),
+    };
+    registry.stop(&created.id).await.expect("stop session");
+
+    let error = registry
+        .await_input_settled(
+            &created.id,
+            protocol::SessionInputWait {
+                until: vec![AgentActivity::Idle],
+                timeout_ms: Some(100),
+            },
+            submission,
+            &mut events,
+        )
+        .await
+        .expect_err("exited runtime must not confirm prior input");
+
+    assert_eq!(error.code, "session_not_running");
+}
+
+#[tokio::test]
+async fn duplicate_agent_report_sequence_is_idempotent_for_input_waits() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let submitted = registry
+        .input_activity_snapshot(&created.id, None)
+        .await
+        .expect("capture initial revision");
+    let submission = InputSubmission {
+        runtime: submitted.runtime.clone(),
+        completed_at: Instant::now(),
+    };
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Idle, 7)
+            .await
+            .recorded
+    );
+    let first = registry
+        .input_activity_snapshot(&created.id, Some(&submitted.runtime))
+        .await
+        .expect("capture first accepted report");
+
+    let duplicate = report_input_activity(&registry, &created.id, AgentActivity::Blocked, 7).await;
+    assert!(!duplicate.recorded);
+    let after_duplicate = registry
+        .input_activity_snapshot(&created.id, Some(&submitted.runtime))
+        .await
+        .expect("capture duplicate outcome");
+    assert_eq!(after_duplicate.revision, first.revision);
+    assert_eq!(after_duplicate.activity, Some(AgentActivity::Idle));
+
+    let mut events = registry.subscribe();
+    let error = registry
+        .await_input_settled(
+            &created.id,
+            protocol::SessionInputWait {
+                until: vec![AgentActivity::Blocked],
+                timeout_ms: Some(25),
+            },
+            submission,
+            &mut events,
+        )
+        .await
+        .expect_err("duplicate sequence must not synthesize blocked evidence");
+    assert_eq!(error.code, "session_input_timeout");
     let _ = registry.stop(&created.id).await;
 }
 

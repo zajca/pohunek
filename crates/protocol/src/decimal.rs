@@ -113,6 +113,11 @@ decimal_wire_type!(
     "TerminalWatermark.ts"
 );
 decimal_wire_type!(
+    /// Monotonic agent-activity revision scoped to one logical session.
+    ActivityRevision,
+    "ActivityRevision.ts"
+);
+decimal_wire_type!(
     /// Monotonic lifecycle-report sequence.
     ReportSequence,
     "ReportSequence.ts"

@@ -42,9 +42,14 @@ validates the whole wait contract, so zero or over-limit timeouts cannot deliver
 text; duplicate `--until` values are deduplicated in first-occurrence order;
 omitted targets default to `idle` and `blocked`; the timeout range is `1..8000` ms (default
 8000). Waiting uses a dedicated SDK/CLI transport with bounded-wait headroom,
-acquires one observation waiter slot, and returns `session_input_timeout`
-rather than accepting activity evidence observed before submit framing
-completes.
+acquires one observation waiter slot, and returns exact post-submit evidence as
+`activity`, `activity_source`, `runtime`, and decimal-string
+`activity_revision`. Rapid matching transitions remain valid even when the
+latest activity changes again or the event receiver lags. The wait returns
+`session_not_running` if that runtime exits, `session_runtime_changed` if it is
+replaced, and `session_input_timeout` when no target arrives. Rust and TypeScript
+SDK helpers fail closed with `session_input_wait_contract_mismatch` when a daemon
+ignores `wait` or omits runtime-scoped evidence.
 
 `pohunek session diff <target> [--base <ref>] [--json]` prints a unified diff
 of a session's worktree against a base ref: raw diff text on stdout by

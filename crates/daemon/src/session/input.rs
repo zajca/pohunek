@@ -2,14 +2,14 @@
 
 use pohunek_worker_protocol::{InputFragment as WorkerInputFragment, SecretBytes};
 
-use protocol::AgentStateEvent;
+use protocol::{ActivityRevision, AgentStateEvent, SessionRuntimeIdentity};
 
 use super::{
     adapter_for, broadcast, session_not_found, session_not_running, unavailable_runtime_error,
-    worker_error_to_protocol, AgentActivity, AgentKind, Duration, ErrorClass, InputRules,
-    LaunchCommand, LaunchCommandPlan, ProtocolError, ResolvedAgent, RuntimeHandle, SessionId,
-    SessionInputParams, SessionInputResult, SessionInputWait, SessionRegistry,
-    SessionRegistryConfig, SessionState,
+    worker_error_to_protocol, ActivityEvidence, AgentActivity, AgentKind, Duration, ErrorClass,
+    InputRules, LaunchCommand, LaunchCommandPlan, ProtocolError, ResolvedAgent, RuntimeHandle,
+    SessionEntry, SessionId, SessionInputParams, SessionInputResult, SessionInputWait,
+    SessionRegistry, SessionRegistryConfig, SessionState,
 };
 
 pub(super) const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
@@ -19,11 +19,17 @@ pub(super) const SUBMIT: &[u8] = b"\r";
 /// Activities that settle a wait when the caller supplies no explicit targets.
 const DEFAULT_INPUT_WAIT_UNTIL: [AgentActivity; 2] = [AgentActivity::Idle, AgentActivity::Blocked];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct InputActivitySnapshot {
     pub(super) activity: Option<AgentActivity>,
-    pub(super) source: protocol::StateSource,
-    pub(super) revision: u64,
+    pub(super) revision: ActivityRevision,
+    pub(super) runtime: SessionRuntimeIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct InputSubmission {
+    pub(super) runtime: SessionRuntimeIdentity,
+    pub(super) completed_at: std::time::Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +51,8 @@ impl SessionRegistry {
                 accepted: true,
                 activity: None,
                 activity_source: None,
+                runtime: None,
+                activity_revision: None,
             });
         };
 
@@ -62,17 +70,19 @@ impl SessionRegistry {
         let mut events = self.subscribe();
         let _waiter_permit = self.acquire_waiter(&params.session_id)?;
         if self
-            .input_activity_snapshot(&params.session_id)
+            .input_activity_snapshot(&params.session_id, None)
             .await?
             .activity
             == Some(AgentActivity::Blocked)
         {
             return Err(ProtocolError::session_agent_blocked());
         }
-        self.write_input_to_session(&params.session_id, &params.text)
+        let submission = self
+            .write_input_to_session(&params.session_id, &params.text)
             .await?;
-        let submitted = self.input_activity_snapshot(&params.session_id).await?;
-        self.await_input_settled(&params.session_id, wait, submitted.revision, &mut events)
+        self.input_activity_snapshot(&params.session_id, Some(&submission.runtime))
+            .await?;
+        self.await_input_settled(&params.session_id, wait, submission, &mut events)
             .await
     }
 
@@ -80,18 +90,16 @@ impl SessionRegistry {
         &self,
         session_id: &SessionId,
         text: &str,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<InputSubmission, ProtocolError> {
         self.ensure_not_external(session_id).await?;
-        let (runtime, rules) = {
+        let (runtime, rules, runtime_identity) = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions
                 .get(session_id)
                 .ok_or_else(|| session_not_found(&session_id.0))?;
-            if entry.info.state != SessionState::Running {
-                return Err(session_not_running(session_id));
-            }
+            let runtime_identity = input_runtime_identity(entry, session_id)?;
             entry.input_rules.validate_activity(entry.info.activity)?;
-            (entry.runtime.clone(), entry.input_rules)
+            (entry.runtime.clone(), entry.input_rules, runtime_identity)
         };
 
         let writes = build_input_writes(text, rules)?;
@@ -121,21 +129,29 @@ impl SessionRegistry {
             }
         }
 
-        Ok(())
+        Ok(InputSubmission {
+            runtime: runtime_identity,
+            completed_at: std::time::Instant::now(),
+        })
     }
 
     pub(super) async fn input_activity_snapshot(
         &self,
         session_id: &SessionId,
+        expected_runtime: Option<&SessionRuntimeIdentity>,
     ) -> Result<InputActivitySnapshot, ProtocolError> {
         let sessions = self.inner.sessions.lock().await;
         let entry = sessions
             .get(session_id)
             .ok_or_else(|| session_not_found(&session_id.0))?;
+        let runtime = input_runtime_identity(entry, session_id)?;
+        if expected_runtime.is_some_and(|expected| expected != &runtime) {
+            return Err(ProtocolError::session_runtime_changed());
+        }
         Ok(InputActivitySnapshot {
             activity: entry.info.activity,
-            source: entry.info.state_source,
-            revision: entry.activity_revision,
+            revision: ActivityRevision::new(entry.activity_revision),
+            runtime,
         })
     }
 
@@ -143,7 +159,7 @@ impl SessionRegistry {
         &self,
         session_id: &SessionId,
         wait: SessionInputWait,
-        submitted_revision: u64,
+        submission: InputSubmission,
         events: &mut broadcast::Receiver<protocol::Event>,
     ) -> Result<SessionInputResult, ProtocolError> {
         let targets: &[AgentActivity] = if wait.until.is_empty() {
@@ -164,7 +180,12 @@ impl SessionRegistry {
                 }
                 () = tokio::time::sleep_until(deadline) => {
                     if let Some(result) = self
-                        .evaluate_input_wait(session_id, targets, submitted_revision)
+                        .evaluate_input_wait(
+                            session_id,
+                            targets,
+                            &submission,
+                            None,
+                        )
                         .await?
                     {
                         return Ok(result);
@@ -178,25 +199,42 @@ impl SessionRegistry {
                         ));
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Ok(event) if event.event() != protocol::event::AGENT_STATE => continue,
                     Ok(event) => {
-                    let state: AgentStateEvent = serde_json::from_value(event.payload().clone())
-                        .map_err(|_error| {
-                            ProtocolError::new(
-                                ErrorClass::Daemon,
-                                "daemon_event_invalid",
-                                "agent state event payload was invalid during input wait",
-                                None,
-                            )
-                        })?;
-                    if state.session_id != *session_id {
-                        continue;
-                    }
+                        self.input_activity_snapshot(session_id, Some(&submission.runtime)).await?;
+                        if event.event() == protocol::event::AGENT_STATE {
+                            let state: AgentStateEvent = serde_json::from_value(event.payload().clone())
+                                .map_err(|_error| {
+                                    ProtocolError::new(
+                                        ErrorClass::Daemon,
+                                        "daemon_event_invalid",
+                                        "agent state event payload was invalid during input wait",
+                                        None,
+                                    )
+                            })?;
+                            if state.session_id == *session_id
+                                && state.runtime.as_ref() == Some(&submission.runtime)
+                                && targets.contains(&state.activity)
+                            {
+                                if let Some(revision) = state.revision {
+                                    if let Some(result) = self
+                                        .evaluate_input_wait(
+                                            session_id,
+                                            targets,
+                                            &submission,
+                                            Some(revision),
+                                        )
+                                        .await?
+                                    {
+                                        return Ok(result);
+                                    }
+                                }
+                            }
+                        }
                     }
                 },
             }
             if let Some(result) = self
-                .evaluate_input_wait(session_id, targets, submitted_revision)
+                .evaluate_input_wait(session_id, targets, &submission, None)
                 .await?
             {
                 return Ok(result);
@@ -208,20 +246,29 @@ impl SessionRegistry {
         &self,
         session_id: &SessionId,
         targets: &[AgentActivity],
-        submitted_revision: u64,
+        submission: &InputSubmission,
+        event_revision: Option<ActivityRevision>,
     ) -> Result<Option<SessionInputResult>, ProtocolError> {
-        let snapshot = self.input_activity_snapshot(session_id).await?;
-        let Some(activity) = snapshot.activity else {
-            return Ok(None);
-        };
-        if snapshot.revision <= submitted_revision || !targets.contains(&activity) {
-            return Ok(None);
+        let sessions = self.inner.sessions.lock().await;
+        let entry = sessions
+            .get(session_id)
+            .ok_or_else(|| session_not_found(&session_id.0))?;
+        let current_runtime = input_runtime_identity(entry, session_id)?;
+        if current_runtime != submission.runtime {
+            return Err(ProtocolError::session_runtime_changed());
         }
-        Ok(Some(SessionInputResult {
-            accepted: true,
-            activity: Some(activity),
-            activity_source: Some(snapshot.source),
-        }))
+        Ok(entry
+            .activity_evidence
+            .values()
+            .filter(|evidence| {
+                evidence.runtime == submission.runtime
+                    && evidence.observed_at > submission.completed_at
+                    && targets.contains(&evidence.activity)
+                    && event_revision.is_none_or(|revision| evidence.revision == revision)
+            })
+            .min_by_key(|evidence| evidence.revision)
+            .cloned()
+            .map(input_wait_result))
     }
 
     fn validate_input_wait(wait: &SessionInputWait) -> Result<(), ProtocolError> {
@@ -239,6 +286,39 @@ impl SessionRegistry {
         }
 
         Ok(())
+    }
+}
+
+fn input_runtime_identity(
+    entry: &SessionEntry,
+    session_id: &SessionId,
+) -> Result<SessionRuntimeIdentity, ProtocolError> {
+    if entry.info.state != SessionState::Running {
+        return Err(session_not_running(session_id));
+    }
+    let runtime = entry
+        .info
+        .runtime
+        .as_ref()
+        .ok_or_else(ProtocolError::session_terminal_unavailable)?;
+    if runtime.state != protocol::RuntimeState::Live {
+        return Err(unavailable_runtime_error(session_id, runtime.state));
+    }
+    let runtime_id = runtime
+        .runtime_id
+        .clone()
+        .ok_or_else(ProtocolError::session_terminal_unavailable)?;
+    SessionRuntimeIdentity::new(runtime_id, runtime.runtime_generation)
+        .map_err(|_error| ProtocolError::session_terminal_unavailable())
+}
+
+fn input_wait_result(evidence: ActivityEvidence) -> SessionInputResult {
+    SessionInputResult {
+        accepted: true,
+        activity: Some(evidence.activity),
+        activity_source: Some(evidence.source),
+        runtime: Some(evidence.runtime),
+        activity_revision: Some(evidence.revision),
     }
 }
 

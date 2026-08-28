@@ -114,6 +114,13 @@ conflicting pair is rejected before a control line is written. Omit `origin`
 for ordinary browser or host-side clients that are not running inside a managed
 session.
 
+`client.sessionInput({ ..., wait })` opens a dedicated bounded connection and
+accepts success only when the daemon returns the requested activity, its source,
+the exact runtime identity, and a canonical decimal activity revision. Missing
+or contradictory evidence fails closed as
+`session_input_wait_contract_mismatch`; it is never treated as delivery
+confirmation from a daemon that ignored `wait`.
+
 ## Attach
 
 First request an attach stream over the control connection, then redeem it on a

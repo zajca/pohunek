@@ -354,6 +354,8 @@ describe("Client request/response", () => {
       accepted: true,
       activity: "idle",
       activity_source: "report",
+      runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+      activity_revision: "2",
     } as const;
     const daemon = await startUnixDaemon([
       { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), screen) },
@@ -401,6 +403,8 @@ describe("Client request/response", () => {
       accepted: true,
       activity: "idle",
       activity_source: "screen",
+      runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+      activity_revision: "2",
     } as const;
     const daemon = await startUnixDaemon([
       {
@@ -443,6 +447,69 @@ describe("Client request/response", () => {
       await client.close();
     } finally {
       await daemon.close();
+    }
+  });
+
+  test("input wait rejects a legacy success without runtime evidence", async () => {
+    const daemon = await startUnixDaemon([
+      {
+        kind: "reply",
+        line: (line) => okResponseLine(requestIdFromLine(line), { accepted: true }),
+      },
+    ]);
+    try {
+      const client = await connectClient(daemon);
+      const error = await expectClientError(client.sessionInput({
+        session_id: "s-target",
+        text: "hello",
+        wait: { until: ["idle"] },
+      }));
+
+      expect(error.toProtocolError().code).toBe("session_input_wait_contract_mismatch");
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("input wait rejects malformed runtime-scoped evidence", async () => {
+    const malformedResults = [
+      {
+        accepted: true,
+        activity: "idle",
+        activity_source: "unknown",
+        runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+        activity_revision: "2",
+      },
+      {
+        accepted: true,
+        activity: "idle",
+        activity_source: "report",
+        runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+        activity_revision: "18446744073709551616",
+      },
+    ];
+
+    for (const result of malformedResults) {
+      const daemon = await startUnixDaemon([
+        {
+          kind: "reply",
+          line: (line) => okResponseLine(requestIdFromLine(line), result),
+        },
+      ]);
+      try {
+        const client = await connectClient(daemon);
+        const error = await expectClientError(client.sessionInput({
+          session_id: "s-target",
+          text: "hello",
+          wait: { until: ["idle"] },
+        }));
+
+        expect(error.toProtocolError().code).toBe("session_input_wait_contract_mismatch");
+        await client.close();
+      } finally {
+        await daemon.close();
+      }
     }
   });
 

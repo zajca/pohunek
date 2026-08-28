@@ -44,8 +44,8 @@ pub use assistant::{
 pub use capabilities::{AgentRuntime, HostCapabilities};
 #[doc(inline)]
 pub use decimal::{
-    DecimalWireError, OutputOffset, ProcessStartIdentity, ReportSequence, RuntimeGeneration,
-    TerminalWatermark,
+    ActivityRevision, DecimalWireError, OutputOffset, ProcessStartIdentity, ReportSequence,
+    RuntimeGeneration, TerminalWatermark,
 };
 #[doc(inline)]
 pub use discovery::{HostClass, HostDiscoverParams, HostRecord};

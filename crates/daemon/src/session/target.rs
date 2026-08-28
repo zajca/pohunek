@@ -1,6 +1,6 @@
 //! Launch-target resolution (project / in-place / worktree) and PTY registration.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use pohunek_worker_protocol::{
     read_frame, Dimensions, FrameKind, Initialize, InitializeLimits,
@@ -643,6 +643,7 @@ impl SessionRegistry {
         let entry = SessionEntry {
             info: info.clone(),
             activity_revision: 0,
+            activity_evidence: HashMap::new(),
             runtime: started.handle.clone(),
             desired_state: DesiredState::Running,
             detector_cancel: detector_cancel.clone(),

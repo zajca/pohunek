@@ -10,8 +10,10 @@ import {
   type SessionOutputResult,
   type SessionInputParams,
   type SessionInputResult,
+  type SessionInputWait,
   type SessionScreenParams,
   type SessionScreenResult,
+  type StateSource,
   type SessionWaitParams,
   type SessionWaitResult,
 } from "@pohunek/protocol";
@@ -27,6 +29,14 @@ import { WsTransport } from "./transport-ws";
 const RUN_TOKEN_RANDOM_BYTES = 16;
 // Dedicated long polls need transport cleanup headroom beyond the wire timeout.
 const DEDICATED_REQUEST_HEADROOM_MS = 1_000;
+const MAX_U64 = 18_446_744_073_709_551_615n;
+const STATE_SOURCES = new Set<StateSource>([
+  "osc_title",
+  "osc_progress",
+  "screen",
+  "process",
+  "report",
+]);
 const RUN_TOKEN = `${randomToken()}${Date.now().toString(16)}`;
 let nextSequence = 0;
 
@@ -99,11 +109,12 @@ export class Client {
 
   public async sessionInput(params: SessionInputParams): Promise<SessionInputResult> {
     if (params.wait !== undefined) {
-      return this.callDedicated(
+      const result = await this.callDedicated(
         "session.input",
         params,
         params.wait.timeout_ms ?? MAX_SESSION_WAIT_MS,
       );
+      return validateInputWaitResult(params.wait.until, result);
     }
     return this.call("session.input", params);
   }
@@ -291,6 +302,56 @@ export class Client {
       throw ClientError.json(error);
     }
   }
+}
+
+function validateInputWaitResult(
+  until: SessionInputWait["until"],
+  value: unknown,
+): SessionInputResult {
+  if (typeof value !== "object" || value === null) {
+    throw ClientError.inputWaitContract("the daemon returned a non-object result");
+  }
+  const result = value as Record<string, unknown>;
+  if (result["accepted"] !== true) {
+    throw ClientError.inputWaitContract("the daemon did not confirm accepted delivery");
+  }
+  const activity = result["activity"];
+  const targets = until.length === 0 ? ["idle", "blocked"] : until;
+  if (typeof activity !== "string" || !targets.includes(activity)) {
+    throw ClientError.inputWaitContract(
+      "the response activity did not match the requested wait target",
+    );
+  }
+  if (!isStateSource(result["activity_source"])) {
+    throw ClientError.inputWaitContract("the response omitted a valid activity source");
+  }
+  if (!isRuntimeIdentity(result["runtime"])) {
+    throw ClientError.inputWaitContract("the response omitted a valid runtime identity");
+  }
+  if (!isCanonicalDecimal(result["activity_revision"])) {
+    throw ClientError.inputWaitContract("the response omitted a valid activity revision");
+  }
+  return value as SessionInputResult;
+}
+
+function isRuntimeIdentity(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const runtime = value as Record<string, unknown>;
+  return typeof runtime["runtime_id"] === "string"
+    && runtime["runtime_id"].length > 0
+    && isCanonicalDecimal(runtime["runtime_generation"]);
+}
+
+function isStateSource(value: unknown): value is StateSource {
+  return typeof value === "string" && STATE_SOURCES.has(value as StateSource);
+}
+
+function isCanonicalDecimal(value: unknown): boolean {
+  return typeof value === "string"
+    && /^(0|[1-9][0-9]*)$/.test(value)
+    && BigInt(value) <= MAX_U64;
 }
 
 function applyRequestOrigin(request: Request, configured: RequestOrigin | undefined): Request {

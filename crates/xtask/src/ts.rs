@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use protocol::{
-    event, method, AgentActivity, AgentKind, AgentStateEvent, AttachEvent, CwdSource, Event,
-    NotificationId, NotificationKind, NotificationKindPolicy, NotificationPolicy,
+    event, method, ActivityRevision, AgentActivity, AgentKind, AgentStateEvent, AttachEvent,
+    CwdSource, Event, NotificationId, NotificationKind, NotificationKindPolicy, NotificationPolicy,
     NotificationRecord, NotificationSeverity, NotificationSource, NotificationStatus, OutputOffset,
     ProtocolError, Request, Response, RuntimeGeneration, SessionCapabilities, SessionEvent,
     SessionId, SessionInfo, SessionListFilter, SessionListParams, SessionOutputGap,
@@ -389,6 +389,11 @@ fn base_fixtures(values: &FixtureValues) -> Result<Vec<NamedFixture>, XtaskError
                     session_id: SessionId(SESSION_FIXTURE_ID.to_owned()),
                     activity: AgentActivity::Blocked,
                     source: StateSource::Report,
+                    runtime: Some(
+                        SessionRuntimeIdentity::new("runtime-fixture-1", RuntimeGeneration::new(3))
+                            .expect("fixture runtime identity is valid"),
+                    ),
+                    revision: Some(ActivityRevision::new(7)),
                 })?,
             )
             .expect("fixture event name and payload are valid"),

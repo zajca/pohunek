@@ -187,7 +187,7 @@ All params and result type names below refer to structs exported by
 | `session.attach` | `SessionAttachParams` | `SessionAttachResult` | Mints a one-shot attach stream id. |
 | `session.detach` | `SessionDetachParams` | `SessionDetachResult` | Cancels an active attach stream. After a worker stream failure, the first call returns its optional typed `error` and consumes that short-lived result; unknown or already-consumed streams return `detached: false` without `error`. |
 | `session.resize` | `SessionResizeParams` | `SessionResizeResult` | Resizes the PTY on the control connection. |
-| `session.input` | `SessionInputParams` | `SessionInputResult` | Injects text using agent-specific input framing. Hermes accepts at most `MAX_SESSION_INPUT_BYTES` UTF-8 bytes, permits LF and tab but rejects other C0/C1 controls without rewriting them, and returns `session_input_blocked` while approval-visible activity is blocked. Unsafe or oversized Hermes text returns `session_input_rejected`. With `wait`, the daemon validates the complete contract before delivery, deduplicates targets in first-occurrence order, acquires a waiter permit, and accepts only a matching activity revision newer than the snapshot taken after submit framing completes. Lagged event receivers re-snapshot current activity, and shutdown cancels the wait. The wait is bounded by `timeout_ms: 1..8000` (default 8000), always uses a dedicated connection with transport headroom, and returns `session_input_timeout` on expiry. |
+| `session.input` | `SessionInputParams` | `SessionInputResult` | Injects text using agent-specific input framing. Hermes accepts at most `MAX_SESSION_INPUT_BYTES` UTF-8 bytes, permits LF and tab but rejects other C0/C1 controls without rewriting them, and returns `session_input_blocked` while approval-visible activity is blocked. Unsafe or oversized Hermes text returns `session_input_rejected`. With `wait`, the daemon validates the complete contract before delivery, deduplicates targets in first-occurrence order, acquires a waiter permit, captures the runtime that accepted the write, and accepts only matching activity evidence observed after submit framing completes. The result includes `activity`, `activity_source`, `runtime`, and decimal-string `activity_revision`; Rust and TypeScript SDK wait helpers require all four and return `session_input_wait_contract_mismatch` when a same-version daemon ignores `wait` or omits evidence. Exact event evidence and retained per-activity revisions preserve rapid transitions across a newer snapshot or broadcast lag. Runtime exit returns `session_not_running`; replacement returns `session_runtime_changed`; shutdown cancels the wait. The wait is bounded by `timeout_ms: 1..8000` (default 8000), always uses a dedicated connection with transport headroom, and returns `session_input_timeout` on expiry. |
 | `session.screen` | `SessionScreenParams` | `SessionScreenResult` | Reads one bounded, rendered, runtime-bound terminal snapshot without acquiring attach ownership or resizing the terminal. |
 | `session.output` | `SessionOutputParams` | `SessionOutputResult` | Reads a newest retained tail or continues from an exact runtime-scoped output cursor. A request with `wait_ms` uses a dedicated connection with bounded-wait headroom. |
 | `session.wait` | `SessionWaitParams` | `SessionWaitResult` | Performs one bounded long poll for state, activity, metadata, terminal, output, or runtime change. It always uses a dedicated connection. |
@@ -870,7 +870,7 @@ Canonical public codes currently emitted include:
 | Class | Codes |
 |---|---|
 | `configuration` | `paths_unavailable`, `netbird_invalid_config`, `invalid_discovery_options` |
-| `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback` |
+| `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback` |
 | `transport` | `framing`, `host_unreachable`, `request_timeout` |
 | `discovery` | `netbird_cli_missing`, `netbird_state_unavailable`, `host_unknown`, `remote_discovery_failed` |
 | `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy` |
@@ -928,7 +928,7 @@ The daemon then writes these events:
 | `session_runtime_conflict` | `{session: SessionInfo}` | Runtime discovery found duplicate, mismatched, or otherwise ambiguous live identity. The daemon quarantines the conflict and does not kill a worker automatically. |
 | `session_runtime_discovered` | `{entry: RuntimeInventoryEntry}` | Startup reconciliation classified a discovered durable worker that is not a plainly managed runtime (orphaned, conflicting, incompatible, or identity-mismatched). Emitted once per non-managed discovery so operators can inspect quarantined runtimes. |
 | `session_native_recovered` | `{session: SessionInfo, previous_runtime_id?: string, runtime_id?: string}` | Explicit provider-native recovery created a new worker and runtime generation for the same logical session. `previous_runtime_id` can be absent for a one-time migrated legacy session; production worker recovery includes the new `runtime_id`. |
-| `agent_state` | `{session_id: SessionId, activity: AgentActivity, source: StateSource}` | Agent activity changed. `source` may be `report` when a hook report supplied explicit active-agent state. |
+| `agent_state` | `{session_id: SessionId, activity: AgentActivity, source: StateSource, runtime?: SessionRuntimeIdentity, revision?: ActivityRevision}` | Agent activity changed. `source` may be `report` when a hook report supplied explicit active-agent state. Current daemons emit `runtime` and decimal-string `revision`, making the transition exact evidence rather than a hint to re-read only the latest snapshot; the fields remain additive for general v2 subscribers, while input-wait success requires them through `SessionInputResult`. |
 | `attach_opened` | `{session_id: SessionId, stream_id: string}` | A pending attach token was redeemed and a raw stream opened. |
 | `attach_closed` | `{session_id: SessionId, stream_id: string}` | A raw attach stream ended or was detached. |
 | `notification_created` | `{record: NotificationRecord}` | A durable notification record was created. |
@@ -1166,6 +1166,9 @@ Request APIs:
 - `Client::session_output(SessionOutputParams)`: uses the current connection for
   an immediate read and automatically opens a dedicated connection when
   `wait_ms` is present.
+- `Client::session_input(SessionInputParams)`: uses a dedicated connection when
+  `wait` is present and rejects successful responses that omit runtime-scoped
+  activity evidence.
 - `Client::session_wait(SessionWaitParams)`: automatically opens a dedicated
   connection for the bounded long poll.
 - `Client::session_resume`, `session_resize`, and `session_set_metadata`: typed
@@ -1280,6 +1283,9 @@ Request APIs:
 
 - `client.call(method, params)`: typed call keyed by the generated `Methods`
   map. A configured origin is added to the wire request.
+- `client.sessionInput(params)`: uses a dedicated connection when `wait` is
+  present and rejects successful responses that omit runtime-scoped activity
+  evidence.
 - `client.handshake()`: calls `daemon.health` and enforces strict protocol
   version equality.
 - `client.request(request)`: validates the optional atomic wire origin, applies
@@ -1315,7 +1321,7 @@ SDK error mapping:
 - SDK-originated errors map into the public protocol taxonomy through
   `ClientErrorClass` and `ClientErrorCode`: `daemon_unreachable`, `framing`,
   `host_unreachable`, `remote_daemon_unavailable`, `request_timeout`, `io_error`,
-  `json_error`, and `version_mismatch`.
+  `json_error`, `session_input_wait_contract_mismatch`, and `version_mismatch`.
 - `ClientError.toProtocolError()` returns the structured `ProtocolError` for
   CLI/API rendering, and `recoverHint()` returns the optional recovery text.
 

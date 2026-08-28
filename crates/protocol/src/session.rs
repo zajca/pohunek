@@ -12,9 +12,9 @@ use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
-    envelope::StateSource, OutputOffset, ProcessStartIdentity, ProtocolError, ReportSequence,
-    RuntimeGeneration, TerminalWatermark, MAX_RUNTIME_ID_BYTES, MAX_SESSION_ID_BYTES,
-    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_WAIT_MS,
+    envelope::StateSource, ActivityRevision, OutputOffset, ProcessStartIdentity, ProtocolError,
+    ReportSequence, RuntimeGeneration, TerminalWatermark, MAX_RUNTIME_ID_BYTES,
+    MAX_SESSION_ID_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_WAIT_MS,
 };
 
 /// The kind of agent backing a session.
@@ -494,6 +494,14 @@ pub struct SessionInputResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub activity_source: Option<StateSource>,
+    /// Runtime that produced the activity evidence for a waited delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub runtime: Option<SessionRuntimeIdentity>,
+    /// Exact post-submission activity revision that completed the wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub activity_revision: Option<ActivityRevision>,
 }
 
 /// Reports an invalid bounded-observation request.
@@ -2161,6 +2169,14 @@ pub struct AgentStateEvent {
     pub activity: AgentActivity,
     /// Signal source that produced the activity value.
     pub source: StateSource,
+    /// Runtime that produced this activity transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub runtime: Option<SessionRuntimeIdentity>,
+    /// Exact monotonic revision assigned to this activity transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub revision: Option<ActivityRevision>,
 }
 
 /// Payload shared by attach lifecycle events.
@@ -2571,23 +2587,46 @@ mod tests {
     }
 
     #[test]
-    fn agent_state_event_payload_matches_legacy_json_payload() {
+    fn agent_state_event_payload_matches_json_payload() {
         let typed = serde_json::to_value(AgentStateEvent {
             session_id: SessionId("s-1".to_owned()),
             activity: AgentActivity::Working,
             source: StateSource::Report,
+            runtime: Some(
+                SessionRuntimeIdentity::new("runtime-1", RuntimeGeneration::new(2))
+                    .expect("valid runtime identity"),
+            ),
+            revision: Some(ActivityRevision::new(3)),
         })
         .expect("serialize typed agent-state event");
         let legacy = serde_json::json!({
             "session_id": SessionId("s-1".to_owned()),
             "activity": AgentActivity::Working,
             "source": StateSource::Report,
+            "runtime": {
+                "runtime_id": "runtime-1",
+                "runtime_generation": "2"
+            },
+            "revision": "3",
         });
 
         assert_eq!(
             serde_json::to_string(&typed).expect("typed json string"),
             serde_json::to_string(&legacy).expect("legacy json string")
         );
+    }
+
+    #[test]
+    fn agent_state_event_accepts_v2_payload_without_wait_evidence() {
+        let event: AgentStateEvent = serde_json::from_value(serde_json::json!({
+            "session_id": "s-1",
+            "activity": "working",
+            "source": "report",
+        }))
+        .expect("parse pre-evidence agent-state event");
+
+        assert_eq!(event.runtime, None);
+        assert_eq!(event.revision, None);
     }
 
     #[test]

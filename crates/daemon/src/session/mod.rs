@@ -12,13 +12,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use protocol::{
-    event, AgentActivity, AgentKind, AgentStateEvent, AttachEvent, CwdSource, ErrorClass, Event,
-    ProjectRemoveResult, ProtocolError, RuntimeInventoryEntry, RuntimeInventoryResult,
-    RuntimeState, SessionAttachParams, SessionEvent, SessionForkParams, SessionId, SessionInfo,
-    SessionInputParams, SessionInputResult, SessionInputWait, SessionNativeRecoveredEvent,
-    SessionNewParams, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionRuntime, SessionSetMetadataResult, SessionState,
+    event, ActivityRevision, AgentActivity, AgentKind, AgentStateEvent, AttachEvent, CwdSource,
+    ErrorClass, Event, ProjectRemoveResult, ProtocolError, RuntimeInventoryEntry,
+    RuntimeInventoryResult, RuntimeState, SessionAttachParams, SessionEvent, SessionForkParams,
+    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait,
+    SessionNativeRecoveredEvent, SessionNewParams, SessionReleaseAgentParams,
+    SessionReleaseAgentResult, SessionRemoveResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionRuntime, SessionRuntimeIdentity, SessionSetMetadataResult, SessionState,
     SessionStopResult, SessionWarning, StateSource, WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 use serde_json::Value;
@@ -77,7 +78,7 @@ use hooks::SessionHookRequest;
 #[cfg(test)]
 use hooks::{parse_agent_activity, spawn_agent_state_hook_dispatcher};
 #[cfg(test)]
-use input::build_input_writes;
+use input::{build_input_writes, InputSubmission};
 use input::{input_rules_for_agent, plan_initial_input_delivery};
 use lag::{log_lag_warn, LagWarnThrottle};
 use resume::ResumeSnapshot;
@@ -445,6 +446,8 @@ struct SessionEntry {
     info: SessionInfo,
     /// Monotonic in-memory cursor advanced for every emitted activity report.
     activity_revision: u64,
+    /// Latest runtime-scoped evidence for each observed activity.
+    activity_evidence: HashMap<AgentActivity, ActivityEvidence>,
     runtime: RuntimeHandle,
     desired_state: DesiredState,
     detector_cancel: CancellationToken,
@@ -466,6 +469,53 @@ struct SessionEntry {
     last_agent_report: Option<ActiveAgentReport>,
     last_native_report: Option<NativeIdentityReport>,
     observed_agents: Vec<ObservedAgent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActivityEvidence {
+    activity: AgentActivity,
+    source: StateSource,
+    runtime: SessionRuntimeIdentity,
+    revision: ActivityRevision,
+    observed_at: Instant,
+}
+
+impl ActivityEvidence {
+    fn event(&self, session_id: SessionId) -> AgentStateEvent {
+        AgentStateEvent {
+            session_id,
+            activity: self.activity,
+            source: self.source,
+            runtime: Some(self.runtime.clone()),
+            revision: Some(self.revision),
+        }
+    }
+}
+
+fn record_activity_evidence(
+    entry: &mut SessionEntry,
+    activity: AgentActivity,
+    source: StateSource,
+) -> Option<ActivityEvidence> {
+    entry.activity_revision = entry
+        .activity_revision
+        .checked_add(1)
+        .expect("session activity revision overflowed");
+    let runtime = entry.info.runtime.as_ref().and_then(|runtime| {
+        if runtime.state != RuntimeState::Live {
+            return None;
+        }
+        SessionRuntimeIdentity::new(runtime.runtime_id.clone()?, runtime.runtime_generation).ok()
+    })?;
+    let evidence = ActivityEvidence {
+        activity,
+        source,
+        runtime,
+        revision: ActivityRevision::new(entry.activity_revision),
+        observed_at: Instant::now(),
+    };
+    entry.activity_evidence.insert(activity, evidence.clone());
+    Some(evidence)
 }
 
 /// Runtime transport selected for one logical session.
@@ -1746,7 +1796,7 @@ impl SessionRegistry {
         let reported_activity = params.activity;
         let report_sequence = params.seq.map(protocol::ReportSequence::get);
         let active_detector_config = detector_config_for_resolved_agent(&resolved);
-        let (info, rescan) = {
+        let (info, rescan, evidence) = {
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(&params.session_id) else {
                 debug!(
@@ -1794,29 +1844,26 @@ impl SessionRegistry {
             entry.info.active_agent_pid = pid;
             entry.info.active_agent_session_id = valid_session_id;
             entry.info.active_agent_session_path = valid_session_path;
-            if let Some(activity) = reported_activity {
+            let evidence = reported_activity.and_then(|activity| {
                 entry.info.activity = Some(activity);
                 entry.info.state_source = StateSource::Report;
-                entry.activity_revision = entry
-                    .activity_revision
-                    .checked_add(1)
-                    .expect("session activity revision overflowed");
-            }
+                record_activity_evidence(entry, activity, StateSource::Report)
+            });
             let _ = entry.detector_config.send(active_detector_config);
             entry.info.updated_at = timestamp_now();
-            (entry.info.clone(), Arc::clone(&entry.procwatch_rescan))
+            (
+                entry.info.clone(),
+                Arc::clone(&entry.procwatch_rescan),
+                evidence,
+            )
         };
 
         self.emit(event::SESSION_UPDATED, &info);
         rescan.notify_one();
-        if let Some(activity) = reported_activity {
+        if let Some(evidence) = evidence {
             let event = crate::events::event(
                 event::AGENT_STATE,
-                event_payload(AgentStateEvent {
-                    session_id: params.session_id.clone(),
-                    activity,
-                    source: StateSource::Report,
-                }),
+                event_payload(evidence.event(params.session_id.clone())),
             );
             let _ = self.inner.events.send(event);
         }
@@ -3479,7 +3526,15 @@ fn report_is_current(
     if current.source != source || current.agent != agent {
         return true;
     }
-    seq_is_current(current.seq, seq)
+    report_seq_is_newer(current.seq, seq)
+}
+
+fn report_seq_is_newer(current: Option<u64>, incoming: Option<u64>) -> bool {
+    match (current, incoming) {
+        (Some(current), Some(incoming)) => incoming > current,
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
 }
 
 fn native_report_is_current(

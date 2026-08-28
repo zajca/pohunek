@@ -4,15 +4,15 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
 use protocol::{
-    event, method, negotiate, AgentActivity, AgentKind, AgentRuntime, AssistantMaterializeParams,
-    AssistantMaterializeResult, AttachHeader, ConceptDeprecation, ConceptIntent, ConceptMeta,
-    ConceptType, CwdSource, DaemonDoctorResult, DoctorCheck, DoctorReport, DoctorStatus,
-    ErrorClass, Event, ForkCwdMode, HostCapabilities, IntegrationInstallParams,
-    IntegrationInstallReport, IntegrationInstallResult, NotificationCreateParams,
-    NotificationCreateResult, NotificationCreatedEvent, NotificationDeleteParams,
-    NotificationDeleteResult, NotificationDeletedEvent, NotificationId, NotificationKind,
-    NotificationKindPolicy, NotificationListParams, NotificationListResult, NotificationPolicy,
-    NotificationPolicyParams, NotificationPolicyResult, NotificationRecord,
+    event, method, negotiate, ActivityRevision, AgentActivity, AgentKind, AgentRuntime,
+    AssistantMaterializeParams, AssistantMaterializeResult, AttachHeader, ConceptDeprecation,
+    ConceptIntent, ConceptMeta, ConceptType, CwdSource, DaemonDoctorResult, DoctorCheck,
+    DoctorReport, DoctorStatus, ErrorClass, Event, ForkCwdMode, HostCapabilities,
+    IntegrationInstallParams, IntegrationInstallReport, IntegrationInstallResult,
+    NotificationCreateParams, NotificationCreateResult, NotificationCreatedEvent,
+    NotificationDeleteParams, NotificationDeleteResult, NotificationDeletedEvent, NotificationId,
+    NotificationKind, NotificationKindPolicy, NotificationListParams, NotificationListResult,
+    NotificationPolicy, NotificationPolicyParams, NotificationPolicyResult, NotificationRecord,
     NotificationRetentionParams, NotificationRetentionPolicy, NotificationRetentionResult,
     NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
     NotificationUpdateResult, NotificationUpdatedEvent, ObservationParamsError, OutputOffset,
@@ -1386,6 +1386,8 @@ fn session_input_result_json_shape_roundtrips() {
         accepted: true,
         activity: None,
         activity_source: None,
+        runtime: None,
+        activity_revision: None,
     };
     let value = serde_json::to_value(&omitted).expect("serialize omitted input result");
     assert_eq!(value, json!({ "accepted": true }));
@@ -1393,17 +1395,27 @@ fn session_input_result_json_shape_roundtrips() {
     assert_eq!(back, omitted);
 
     let populated = SessionInputResult {
-        accepted: false,
+        accepted: true,
         activity: Some(AgentActivity::Idle),
         activity_source: Some(StateSource::Screen),
+        runtime: Some(
+            SessionRuntimeIdentity::new("runtime-42", RuntimeGeneration::new(3))
+                .expect("valid runtime identity"),
+        ),
+        activity_revision: Some(ActivityRevision::new(7)),
     };
     let value = serde_json::to_value(&populated).expect("serialize populated input result");
     assert_eq!(
         value,
         json!({
-            "accepted": false,
+            "accepted": true,
             "activity": "idle",
-            "activity_source": "screen"
+            "activity_source": "screen",
+            "runtime": {
+                "runtime_id": "runtime-42",
+                "runtime_generation": "3"
+            },
+            "activity_revision": "7"
         })
     );
     let back = line_roundtrip(&populated);
@@ -2179,7 +2191,12 @@ fn agent_state_event_carries_activity_in_flattened_payload() {
         json!({
             "session_id": "s-42",
             "activity": AgentActivity::Blocked,
-            "source": StateSource::OscTitle
+            "source": StateSource::OscTitle,
+            "runtime": {
+                "runtime_id": "runtime-42",
+                "runtime_generation": "3"
+            },
+            "revision": "7"
         }),
     )
     .expect("valid event");
@@ -2196,7 +2213,12 @@ fn agent_state_event_carries_activity_in_flattened_payload() {
             "event": "agent_state",
             "session_id": "s-42",
             "activity": "blocked",
-            "source": "osc_title"
+            "source": "osc_title",
+            "runtime": {
+                "runtime_id": "runtime-42",
+                "runtime_generation": "3"
+            },
+            "revision": "7"
         })
     );
     assert!(

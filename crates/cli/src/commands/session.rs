@@ -2649,6 +2649,8 @@ mod tests {
                 accepted: true,
                 activity: None,
                 activity_source: None,
+                runtime: None,
+                activity_revision: None,
             },
         );
 
@@ -2663,6 +2665,14 @@ mod tests {
                 accepted: true,
                 activity: Some(AgentActivity::Blocked),
                 activity_source: Some(StateSource::Report),
+                runtime: Some(
+                    protocol::SessionRuntimeIdentity::new(
+                        "runtime-42",
+                        protocol::RuntimeGeneration::new(1),
+                    )
+                    .expect("valid runtime identity"),
+                ),
+                activity_revision: Some(protocol::ActivityRevision::new(2)),
             },
         );
 
@@ -2765,6 +2775,8 @@ mod tests {
             accepted: true,
             activity: None,
             activity_source: None,
+            runtime: None,
+            activity_revision: None,
         };
         let doc = crate::commands::render_json(&result).expect("json doc");
         let parsed: protocol::SessionInputResult = crate::commands::parse_json_ok(&doc);

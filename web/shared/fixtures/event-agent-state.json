@@ -1,6 +1,11 @@
 {
   "activity": "blocked",
   "event": "agent_state",
+  "revision": "7",
+  "runtime": {
+    "runtime_generation": "3",
+    "runtime_id": "runtime-fixture-1"
+  },
   "session_id": "s-fixture-1",
   "source": "report",
   "v": 2
