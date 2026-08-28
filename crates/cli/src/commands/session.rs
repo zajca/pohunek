@@ -18,12 +18,13 @@ use base64::Engine as _;
 use protocol::Request;
 use protocol::{
     method, AgentActivity, CwdSource, ForkCwdMode, OutputOffset, RuntimeGeneration,
-    SessionDiffParams, SessionForkParams, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
-    SessionOutputParams, SessionRemoveResult, SessionRenameParams, SessionResizeParams,
-    SessionRuntimeIdentity, SessionScreenParams, SessionSetMetadataParams, SessionState,
-    SessionStopResult, SessionWaitParams, SessionWarningKind, StateSource, TerminalWatermark,
-    MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
+    SessionDetectionParams, SessionDetectionResult, SessionDiffParams, SessionForkParams,
+    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter,
+    SessionListParams, SessionNewParams, SessionOutputParams, SessionRemoveResult,
+    SessionRenameParams, SessionResizeParams, SessionRuntimeIdentity, SessionScreenParams,
+    SessionSetMetadataParams, SessionState, SessionStopResult, SessionWaitParams,
+    SessionWarningKind, StateSource, TerminalWatermark, MAX_SESSION_INPUT_BYTES,
+    MAX_SESSION_OUTPUT_BYTES,
 };
 
 use crate::client::Client;
@@ -686,6 +687,43 @@ pub(crate) async fn run_screen(
         }
     }
     Ok(())
+}
+
+pub(crate) async fn run_detection(
+    host: &str,
+    paths: &Paths,
+    target: &Target,
+    json: bool,
+) -> Result<(), CliError> {
+    let client = Client::connect(host, paths).await?;
+    let result = client
+        .into_sdk()
+        .session_detection(SessionDetectionParams::new(SessionId(
+            target.session_id.clone(),
+        )))
+        .await?;
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        print!("{}", render_detection_human(&result));
+    }
+    Ok(())
+}
+
+fn render_detection_human(result: &SessionDetectionResult) -> String {
+    let mut rendered = String::new();
+    for preview in &result.previews {
+        rendered.push_str("--- ");
+        rendered.push_str(&preview.region);
+        rendered.push_str(" ---\n");
+        if preview.text.is_empty() {
+            rendered.push_str("<empty>\n");
+        } else {
+            rendered.push_str(&preview.text);
+            rendered.push('\n');
+        }
+    }
+    rendered
 }
 
 /// Cursor and filtering arguments for `session output`.
@@ -2710,6 +2748,31 @@ mod tests {
         let doc = crate::commands::render_json(&result).expect("json doc");
         let parsed: protocol::SessionInputResult = crate::commands::parse_json_ok(&doc);
         assert_eq!(parsed, result);
+    }
+
+    #[test]
+    fn renders_detection_previews_with_empty_regions_visible() {
+        let result = SessionDetectionResult {
+            session_id: SessionId("s-42".to_owned()),
+            supported_regions: protocol::DetectionRegionKind::ALL.to_vec(),
+            previews: vec![
+                protocol::DetectionRegionPreview {
+                    kind: protocol::DetectionRegionKind::TopNonEmptyLines,
+                    region: "top_non_empty_lines(8)".to_owned(),
+                    text: "trust this repository".to_owned(),
+                },
+                protocol::DetectionRegionPreview {
+                    kind: protocol::DetectionRegionKind::LastNonEmptyAbovePromptBox,
+                    region: "last_non_empty_above_prompt_box".to_owned(),
+                    text: String::new(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            render_detection_human(&result),
+            "--- top_non_empty_lines(8) ---\ntrust this repository\n--- last_non_empty_above_prompt_box ---\n<empty>\n"
+        );
     }
 
     #[test]

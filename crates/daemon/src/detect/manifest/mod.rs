@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::str::FromStr;
 
 use crate::procwatch::ProcessFact;
@@ -157,6 +158,48 @@ pub enum ManifestRegion {
     AfterLastPromptMarker,
     PromptBoxBody,
     AfterLastHorizontalRule,
+}
+
+impl ManifestRegion {
+    /// Returns the public diagnostic kind for this manifest region.
+    #[must_use]
+    pub const fn kind(&self) -> protocol::DetectionRegionKind {
+        match self {
+            Self::OscTitle => protocol::DetectionRegionKind::OscTitle,
+            Self::OscProgress => protocol::DetectionRegionKind::OscProgress,
+            Self::WholeRecent => protocol::DetectionRegionKind::WholeRecent,
+            Self::BottomLines(_) => protocol::DetectionRegionKind::BottomLines,
+            Self::BottomNonEmptyLines(_) => protocol::DetectionRegionKind::BottomNonEmptyLines,
+            Self::TopNonEmptyLines(_) => protocol::DetectionRegionKind::TopNonEmptyLines,
+            Self::LastNonEmptyAbovePromptBox => {
+                protocol::DetectionRegionKind::LastNonEmptyAbovePromptBox
+            }
+            Self::AfterLastPromptMarker => protocol::DetectionRegionKind::AfterLastPromptMarker,
+            Self::PromptBoxBody => protocol::DetectionRegionKind::PromptBoxBody,
+            Self::AfterLastHorizontalRule => protocol::DetectionRegionKind::AfterLastHorizontalRule,
+        }
+    }
+}
+
+impl fmt::Display for ManifestRegion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OscTitle => f.write_str("osc_title"),
+            Self::OscProgress => f.write_str("osc_progress"),
+            Self::WholeRecent => f.write_str("whole_recent"),
+            Self::BottomLines(count) => write!(f, "bottom_lines({count})"),
+            Self::BottomNonEmptyLines(count) => {
+                write!(f, "bottom_non_empty_lines({count})")
+            }
+            Self::TopNonEmptyLines(count) => {
+                write!(f, "top_non_empty_lines({count})")
+            }
+            Self::LastNonEmptyAbovePromptBox => f.write_str("last_non_empty_above_prompt_box"),
+            Self::AfterLastPromptMarker => f.write_str("after_last_prompt_marker"),
+            Self::PromptBoxBody => f.write_str("prompt_box_body"),
+            Self::AfterLastHorizontalRule => f.write_str("after_last_horizontal_rule"),
+        }
+    }
 }
 
 impl FromStr for ManifestRegion {
@@ -708,6 +751,45 @@ mod tests {
             manifest.required_regions(),
             vec![ManifestRegion::LastNonEmptyAbovePromptBox]
         );
+    }
+
+    #[test]
+    fn new_regions_share_the_global_matcher_complexity_budget() {
+        let top_matchers = (0..512)
+            .map(|_| r#"{ contains = "top" }"#)
+            .collect::<Vec<_>>()
+            .join(",");
+        let prompt_matchers = (0..513)
+            .map(|_| r#"{ contains = "prompt" }"#)
+            .collect::<Vec<_>>()
+            .join(",");
+        let source = format!(
+            r#"
+            [[rules]]
+            id = "top"
+            state = "blocked"
+            priority = 2
+            region = "top_non_empty_lines(8)"
+            [rules.gates]
+            all = [{top_matchers}]
+
+            [[rules]]
+            id = "prompt-adjacent"
+            state = "idle"
+            priority = 1
+            region = "last_non_empty_above_prompt_box"
+            [rules.gates]
+            all = [{prompt_matchers}]
+            "#,
+        );
+
+        assert!(matches!(
+            Manifest::parse_str(&source),
+            Err(ManifestError::TooManyMatchers {
+                count: 1025,
+                max: 1024
+            })
+        ));
     }
 
     #[test]

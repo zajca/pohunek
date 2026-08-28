@@ -19,15 +19,16 @@ use crate::{
     ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams, ProjectPromptParams,
     ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
     ProjectShowParams, ProjectShowResult, RuntimeInventoryResult, SessionAttachParams,
-    SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionDiffParams,
-    SessionDiffResult, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
-    SessionInputParams, SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult,
-    SessionOutputParams, SessionOutputResult, SessionReleaseAgentParams, SessionReleaseAgentResult,
-    SessionRemoveResult, SessionRenameParams, SessionRenameResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionResumeResult, SessionScreenParams,
-    SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult,
-    SessionWaitParams, SessionWaitResult, WorktreeRemoveParams, WorktreeRemoveResult,
+    SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionDetectionParams,
+    SessionDetectionResult, SessionDiffParams, SessionDiffResult, SessionForkParams,
+    SessionForkResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
+    SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
+    SessionOutputResult, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    SessionRenameParams, SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionResumeResult, SessionScreenParams, SessionScreenResult,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult, SessionWaitParams,
+    SessionWaitResult, WorktreeRemoveParams, WorktreeRemoveResult,
 };
 
 /// A typed control-protocol method contract.
@@ -246,6 +247,15 @@ method_table!(
     SessionScreenResult,
     "SessionScreenParams",
     "SessionScreenResult";
+
+    /// Preview the regions supplied to the active detection manifest.
+    SessionDetection,
+    SESSION_DETECTION,
+    "session.detection",
+    SessionDetectionParams,
+    SessionDetectionResult,
+    "SessionDetectionParams",
+    "SessionDetectionResult";
 
     /// Read bounded retained PTY output without taking attach ownership.
     SessionOutput,

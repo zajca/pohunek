@@ -1,9 +1,9 @@
 //! Per-session activity detector task and activity recording.
 
 use super::{
-    broadcast, debug, event, event_payload, is_terminal, log_lag_warn, timestamp_now, watch,
-    ActivityTransition, AgentActivity, AgentStateEvent, CancellationToken, Detector,
-    DetectorConfig, Instant, LagWarnThrottle, SessionId, SessionRegistry,
+    broadcast, debug, event, event_payload, is_terminal, log_lag_warn, timestamp_now,
+    ActivityTransition, AgentActivity, AgentStateEvent, Detector, DetectorConfig, DetectorInputs,
+    Instant, LagWarnThrottle, SessionId, SessionRegistry,
 };
 
 fn detection_interval(config: &DetectorConfig) -> tokio::time::Interval {
@@ -13,15 +13,15 @@ fn detection_interval(config: &DetectorConfig) -> tokio::time::Interval {
 }
 
 impl SessionRegistry {
-    pub(super) fn spawn_detector(
-        &self,
-        id: SessionId,
-        mut output_rx: broadcast::Receiver<Vec<u8>>,
-        size: (u16, u16),
-        cancel: CancellationToken,
-        mut resize_rx: watch::Receiver<(u16, u16)>,
-        mut detector_config_rx: watch::Receiver<DetectorConfig>,
-    ) {
+    pub(super) fn spawn_detector(&self, id: SessionId, inputs: DetectorInputs) {
+        let DetectorInputs {
+            output: mut output_rx,
+            initial_size: size,
+            cancel,
+            resize: mut resize_rx,
+            config: mut detector_config_rx,
+            preview: mut preview_rx,
+        } = inputs;
         let registry = self.clone();
         tokio::spawn(async move {
             let detector_config = detector_config_rx.borrow().clone();
@@ -61,6 +61,12 @@ impl SessionRegistry {
                         tick.tick().await;
                         detector.reconfigure(Instant::now(), detector_config);
                     }
+                    request = preview_rx.recv() => {
+                        let Some(reply) = request else {
+                            break;
+                        };
+                        let _ = reply.send(detector.region_previews());
+                    }
                     received = output_rx.recv() => {
                         match received {
                             Ok(chunk) => {
@@ -92,6 +98,34 @@ impl SessionRegistry {
                 log_lag_warn(&id, warn_kind);
             }
         });
+    }
+
+    /// Returns on-demand previews from the live detector task.
+    pub async fn detection(
+        &self,
+        id: &SessionId,
+    ) -> Result<protocol::SessionDetectionResult, protocol::ProtocolError> {
+        let preview = {
+            let sessions = self.inner.sessions.lock().await;
+            sessions
+                .get(id)
+                .map(|entry| entry.detector_preview.clone())
+                .ok_or_else(|| super::session_not_found(&id.0))?
+        };
+        let (reply, response) = tokio::sync::oneshot::channel();
+        preview
+            .send(reply)
+            .await
+            .map_err(|_send_error| protocol::ProtocolError::session_terminal_unavailable())?;
+        let previews = response
+            .await
+            .map_err(|_receive_error| protocol::ProtocolError::session_terminal_unavailable())?;
+
+        Ok(protocol::SessionDetectionResult {
+            session_id: id.clone(),
+            supported_regions: protocol::DetectionRegionKind::ALL.to_vec(),
+            previews,
+        })
     }
 
     pub(super) async fn record_activity(&self, id: &SessionId, transition: ActivityTransition) {

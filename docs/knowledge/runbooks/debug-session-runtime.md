@@ -78,8 +78,15 @@ For non-destructive terminal diagnosis, start without a historical cursor:
 
 ```bash
 pohunek session screen <target> --json
+pohunek session detection <target> --json
 pohunek session output <target> --max-bytes 65536 --json
 ```
+
+Use `session detection` when activity classification is surprising. Its
+`supported_regions` array identifies the engine's accepted region kinds, while
+`previews` shows the exact current text supplied to each region required by the
+active manifest. Empty text is meaningful: for example,
+`last_non_empty_above_prompt_box` is empty without a complete prompt box.
 
 Carry the returned `runtime_id`, `runtime_generation`, and `next_offset` into a
 continued output read or `session wait`. `session_runtime_changed` means the

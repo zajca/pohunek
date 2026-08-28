@@ -189,6 +189,7 @@ All params and result type names below refer to structs exported by
 | `session.resize` | `SessionResizeParams` | `SessionResizeResult` | Resizes the PTY on the control connection. |
 | `session.input` | `SessionInputParams` | `SessionInputResult` | Injects text using agent-specific input framing. Hermes accepts at most `MAX_SESSION_INPUT_BYTES` UTF-8 bytes, permits LF and tab but rejects other C0/C1 controls without rewriting them, and returns `session_input_blocked` while approval-visible activity is blocked. Unsafe or oversized Hermes text returns `session_input_rejected`. |
 | `session.screen` | `SessionScreenParams` | `SessionScreenResult` | Reads one bounded, rendered, runtime-bound terminal snapshot without acquiring attach ownership or resizing the terminal. |
+| `session.detection` | `SessionDetectionParams` | `SessionDetectionResult` | Read-only detector diagnostic. Returns the complete supported region-kind set and current text previews for regions required by the session's active manifest. |
 | `session.output` | `SessionOutputParams` | `SessionOutputResult` | Reads a newest retained tail or continues from an exact runtime-scoped output cursor. A request with `wait_ms` uses a dedicated connection. |
 | `session.wait` | `SessionWaitParams` | `SessionWaitResult` | Performs one bounded long poll for state, activity, metadata, terminal, output, or runtime change. It always uses a dedicated connection. |
 | `session.report_agent` | `SessionReportAgentParams` | `SessionReportAgentResult` | Hook callback for nested agents running inside an existing session. It records an active-agent claim, optional process binding, and optional active native metadata without changing launch identity or resume binding; ignored reports return `recorded: false`. Claims are reconciled with process facts and can be auto-released when no live backing process remains. |
@@ -381,6 +382,55 @@ The protocol ceiling for the serialized result is
 with response-envelope headroom. The daemon additionally defaults to at most
 200 rows and 500 columns. Oversize results return the payload-free
 `runtime/session_output_limit_exceeded` error.
+
+`session.detection` accepts the same single-session parameter shape:
+
+```json
+{"session_id":"s-42"}
+```
+
+It asks the live detector task to render its active manifest regions on demand;
+previews are not copied for every PTY output chunk. The result lists every
+region kind supported by this engine, then only the regions required by the
+active manifest in manifest order:
+
+```json
+{
+  "session_id": "s-42",
+  "supported_regions": [
+    "osc_title",
+    "osc_progress",
+    "whole_recent",
+    "bottom_lines",
+    "bottom_non_empty_lines",
+    "top_non_empty_lines",
+    "last_non_empty_above_prompt_box",
+    "after_last_prompt_marker",
+    "prompt_box_body",
+    "after_last_horizontal_rule"
+  ],
+  "previews": [
+    {
+      "kind": "top_non_empty_lines",
+      "region": "top_non_empty_lines(8)",
+      "text": "Do you trust the contents of this directory?"
+    }
+  ]
+}
+```
+
+Parameterized manifest syntax is `bottom_lines(N)`,
+`bottom_non_empty_lines(N)`, or `top_non_empty_lines(N)`; the preview's
+`region` preserves the canonical count while `kind` stays count-independent.
+`top_non_empty_lines(N)` returns the first `N` non-empty visible rows.
+`last_non_empty_above_prompt_box` returns the nearest non-empty row above the
+second horizontal rule counted from the bottom, or an empty preview when a
+complete prompt box or preceding content is absent. All screen regions use the
+same visible-grid, wide-glyph, and soft-wrap semantics as activity matching.
+Unknown region names remain a typed manifest parse failure, so older engines
+reject manifests that use regions they do not implement instead of silently
+over-matching another surface. A stopped or unavailable detector returns
+`session_terminal_unavailable`.
 
 `session.output` uses an optional nested runtime identity and an exclusive
 cursor. Omitting `after_offset` requests the newest retained tail. A cursor
@@ -1162,6 +1212,8 @@ Request APIs:
   per-connection selection after the first response.
 - `Client::session_screen(SessionScreenParams)`: reads one rendered snapshot on
   the current connection.
+- `Client::session_detection(SessionDetectionParams)`: requests current active
+  manifest-region previews from the live detector task.
 - `Client::session_output(SessionOutputParams)`: uses the current connection for
   an immediate read and automatically opens a dedicated connection when
   `wait_ms` is present.

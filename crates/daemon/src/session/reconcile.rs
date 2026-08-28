@@ -11,11 +11,12 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::{
-    event, event_payload, identity_claim_expiry_is_valid, runtime_error, timestamp_now, watch,
-    ActiveAgentReport, CancellationToken, DesiredState, DetectorConfig, Notify, ObservedAgent,
-    ProtocolError, ResumeSnapshot, RuntimeHandle, RuntimeState, RuntimeWatchIdentity, SessionEntry,
-    SessionId, SessionRecord, SessionRef, SessionRefKind, SessionRegistry, SessionRuntime,
-    SessionState, StateSource, Worker, WorkerError, WORKER_CONNECT_RETRY,
+    event, event_payload, identity_claim_expiry_is_valid, mpsc, runtime_error, timestamp_now,
+    watch, ActiveAgentReport, CancellationToken, DesiredState, DetectorConfig, DetectorInputs,
+    Notify, ObservedAgent, ProtocolError, ResumeSnapshot, RuntimeHandle, RuntimeState,
+    RuntimeWatchIdentity, SessionEntry, SessionId, SessionRecord, SessionRef, SessionRefKind,
+    SessionRegistry, SessionRuntime, SessionState, StateSource, Worker, WorkerError,
+    WORKER_CONNECT_RETRY,
 };
 use crate::procwatch::ProcessInspector;
 use crate::session::target::open_detector_output;
@@ -741,6 +742,7 @@ impl SessionRegistry {
         let (detector_resize, detector_resize_rx) =
             watch::channel((record.info.rows, record.info.cols));
         let (detector_config, detector_config_rx) = watch::channel(default_detector_config.clone());
+        let (detector_preview, detector_preview_rx) = mpsc::channel(1);
         let info = record.info.clone();
         let entry = SessionEntry {
             info: info.clone(),
@@ -749,6 +751,7 @@ impl SessionRegistry {
             detector_cancel: detector_cancel.clone(),
             detector_resize,
             detector_config,
+            detector_preview,
             default_detector_config,
             procwatch_cancel: procwatch_cancel.clone(),
             runtime_watch_cancel: runtime_watch_cancel.clone(),
@@ -768,11 +771,14 @@ impl SessionRegistry {
         self.inner.sessions.lock().await.insert(id.clone(), entry);
         self.spawn_detector(
             id.clone(),
-            detector_output,
-            (info.rows, info.cols),
-            detector_cancel,
-            detector_resize_rx,
-            detector_config_rx,
+            DetectorInputs {
+                output: detector_output,
+                initial_size: (info.rows, info.cols),
+                cancel: detector_cancel,
+                resize: detector_resize_rx,
+                config: detector_config_rx,
+                preview: detector_preview_rx,
+            },
         );
         self.spawn_procwatch(id.clone(), child.pid, procwatch_cancel, procwatch_rescan);
         let expected = RuntimeWatchIdentity::from_info(&info)
@@ -847,6 +853,7 @@ impl SessionRegistry {
         let default_detector_config = DetectorConfig::for_agent(&record.info.agent_base);
         let (detector_resize, _) = watch::channel((record.info.rows, record.info.cols));
         let (detector_config, _) = watch::channel(default_detector_config.clone());
+        let (detector_preview, _) = mpsc::channel::<super::DetectionPreviewRequest>(1);
         let info = record.info.clone();
         let entry = SessionEntry {
             info: info.clone(),
@@ -855,6 +862,7 @@ impl SessionRegistry {
             detector_cancel: CancellationToken::new(),
             detector_resize,
             detector_config,
+            detector_preview,
             default_detector_config,
             procwatch_cancel: CancellationToken::new(),
             runtime_watch_cancel: CancellationToken::new(),

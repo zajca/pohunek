@@ -14,6 +14,7 @@ implementation behavior must be verified against the source tree.
 
 Current CLI and command surface:
 
+- `crates/cli/src/lib.rs`
 - `crates/cli/src/main.rs`
 - `crates/cli/src/commands/mod.rs`
 - `crates/cli/src/commands/assistant/mod.rs`
@@ -121,11 +122,14 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/main.rs`
 - `crates/daemon/src/lib.rs`
 - `crates/daemon/src/api/handler/mod.rs`
+- `crates/daemon/src/api/handler/session.rs`
 - `crates/daemon/src/session/mod.rs`
 - `crates/daemon/src/session/observation.rs`
 - `crates/daemon/src/session/diff.rs`
 - `crates/daemon/src/session/hooks.rs`
 - `crates/daemon/src/session/detector.rs`
+- `crates/daemon/src/session/reconcile.rs`
+- `crates/daemon/src/session/target.rs`
 - `crates/daemon/src/session/procwatch.rs`
 - `crates/daemon/src/runtime/`
 - `crates/daemon/src/notify.rs`
@@ -171,6 +175,7 @@ Agent runtime and profile resolution:
 - `crates/daemon/src/detect/manifests/claude.toml`
 - `crates/daemon/src/detect/manifests/hermes.toml`
 - `crates/daemon/src/detect/manifests/shell.toml`
+- `crates/terminal/src/screen.rs`
 
 Hermes compatibility evidence:
 

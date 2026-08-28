@@ -622,6 +622,102 @@ impl SessionScreenParams {
     }
 }
 
+/// Detection region supported by the manifest engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "DetectionRegionKind.ts"))]
+#[serde(rename_all = "snake_case")]
+pub enum DetectionRegionKind {
+    /// Latest OSC terminal title.
+    OscTitle,
+    /// Latest OSC progress payload.
+    OscProgress,
+    /// Whole recent visible screen.
+    WholeRecent,
+    /// Bounded visible rows counted from the bottom.
+    BottomLines,
+    /// Bounded non-empty rows counted from the bottom.
+    BottomNonEmptyLines,
+    /// Bounded non-empty rows counted from the top.
+    TopNonEmptyLines,
+    /// Nearest non-empty row above a prompt box.
+    LastNonEmptyAbovePromptBox,
+    /// Visible text after the last prompt marker.
+    AfterLastPromptMarker,
+    /// Visible text inside the prompt box.
+    PromptBoxBody,
+    /// Visible text after the last horizontal rule.
+    AfterLastHorizontalRule,
+}
+
+impl DetectionRegionKind {
+    /// All region kinds accepted by this protocol implementation.
+    pub const ALL: [Self; 10] = [
+        Self::OscTitle,
+        Self::OscProgress,
+        Self::WholeRecent,
+        Self::BottomLines,
+        Self::BottomNonEmptyLines,
+        Self::TopNonEmptyLines,
+        Self::LastNonEmptyAbovePromptBox,
+        Self::AfterLastPromptMarker,
+        Self::PromptBoxBody,
+        Self::AfterLastHorizontalRule,
+    ];
+}
+
+/// One active manifest region rendered for diagnosis.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "DetectionRegionPreview.ts"))]
+#[serde(deny_unknown_fields)]
+pub struct DetectionRegionPreview {
+    /// Region kind independent of any parameterized count.
+    pub kind: DetectionRegionKind,
+    /// Canonical manifest syntax, including a count when parameterized.
+    pub region: String,
+    /// Current rendered text supplied to matchers.
+    pub text: String,
+}
+
+/// Parameters for `session.detection`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionDetectionParams.ts"))]
+#[serde(deny_unknown_fields)]
+pub struct SessionDetectionParams {
+    /// Session whose active detector should be inspected.
+    session_id: SessionId,
+}
+
+impl SessionDetectionParams {
+    /// Creates a detector-diagnostic request.
+    #[must_use]
+    pub const fn new(session_id: SessionId) -> Self {
+        Self { session_id }
+    }
+
+    /// Returns the requested logical session.
+    #[must_use]
+    pub const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+}
+
+/// Active detector regions returned by `session.detection`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionDetectionResult.ts"))]
+#[serde(deny_unknown_fields)]
+pub struct SessionDetectionResult {
+    /// Logical session whose detector supplied the previews.
+    pub session_id: SessionId,
+    /// Complete region set supported by this detector engine.
+    pub supported_regions: Vec<DetectionRegionKind>,
+    /// Regions required by the active manifest, in manifest order.
+    pub previews: Vec<DetectionRegionPreview>,
+}
+
 /// Visible terminal cursor in a rendered screen snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]

@@ -8,7 +8,7 @@
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use protocol::{AgentActivity, AgentKind, StateSource};
+use protocol::{AgentActivity, AgentKind, DetectionRegionPreview, StateSource};
 
 use crate::procwatch::ProcessFact;
 
@@ -317,6 +317,25 @@ impl Detector {
         if let Some(item) = self.manifest_evidence(freshness) {
             evidence.push(item);
         }
+    }
+
+    /// Renders every region required by the active manifest.
+    #[must_use]
+    pub fn region_previews(&self) -> Vec<DetectionRegionPreview> {
+        let Some(manifest) = &self.manifest else {
+            return Vec::new();
+        };
+        let context = self.match_context(manifest, ContextFreshness::all());
+
+        manifest
+            .required_regions()
+            .into_iter()
+            .map(|region| DetectionRegionPreview {
+                kind: region.kind(),
+                region: region.to_string(),
+                text: context.region_text(&region).unwrap_or_default().to_owned(),
+            })
+            .collect()
     }
 
     fn manifest_evidence(&self, freshness: ContextFreshness) -> Option<ActivityEvidence> {
@@ -970,6 +989,41 @@ mod tests {
     }
 
     #[test]
+    fn region_previews_render_new_regions_with_canonical_names() {
+        let started_at = instant();
+        let mut detector_config = config();
+        detector_config.manifest = Some(manifest(
+            r#"
+            [[rules]]
+            id = "top"
+            state = "blocked"
+            priority = 2
+            region = "top_non_empty_lines(2)"
+            contains = "trust"
+
+            [[rules]]
+            id = "prompt-adjacent"
+            state = "idle"
+            priority = 1
+            region = "last_non_empty_above_prompt_box"
+            contains = "complete"
+            "#,
+        ));
+        let mut detector = Detector::new(7, 40, started_at, detector_config);
+        detector.feed(
+            started_at,
+            "trust this directory\r\ncompleted for 2s\r\n─────\r\n› type here\r\n─────".as_bytes(),
+        );
+
+        let previews = detector.region_previews();
+        assert_eq!(previews.len(), 2);
+        assert_eq!(previews[0].region, "top_non_empty_lines(2)");
+        assert_eq!(previews[0].text, "trust this directory\ncompleted for 2s");
+        assert_eq!(previews[1].region, "last_non_empty_above_prompt_box");
+        assert_eq!(previews[1].text, "completed for 2s");
+    }
+
+    #[test]
     fn after_last_prompt_marker_region_matches_text_below_the_marker() {
         let started_at = instant();
         let mut detector_config = config();
@@ -1548,6 +1602,22 @@ mod tests {
     }
 
     #[test]
+    fn codex_manifest_maps_bounded_workspace_trust_prompt_to_blocked() {
+        let started_at = instant();
+        let mut detector_config = super::DetectorConfig::codex();
+        detector_config.detection = config().detection;
+        let mut detector = Detector::new(12, 100, started_at, detector_config);
+
+        assert_eq!(
+            detector.feed(
+                started_at,
+                b"\x1b[2J\x1b[HDo you trust the contents of this directory?\r\n\r\n1. Yes\r\n2. No\r\n\r\nold transcript output"
+            ),
+            vec![transition(AgentActivity::Blocked, StateSource::Screen)]
+        );
+    }
+
+    #[test]
     fn claude_manifest_maps_ink_selection_form_to_blocked() {
         let started_at = instant();
         let mut detector_config = super::DetectorConfig::claude();
@@ -1611,6 +1681,19 @@ mod tests {
             ),
             vec![transition(AgentActivity::Idle, StateSource::Screen)]
         );
+    }
+
+    #[test]
+    fn claude_manifest_maps_prompt_adjacent_completion_status_to_idle() {
+        let matched = super::claude_manifest()
+            .match_context(&MatchContext::default().with_region_text(
+                ManifestRegion::LastNonEmptyAbovePromptBox,
+                "✻ Cogitated for 26s",
+            ))
+            .expect("Claude completion fixture should match");
+
+        assert_eq!(matched.activity, AgentActivity::Idle);
+        assert_eq!(matched.region, ManifestRegion::LastNonEmptyAbovePromptBox);
     }
 
     #[test]

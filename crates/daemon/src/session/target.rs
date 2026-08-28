@@ -9,14 +9,15 @@ use pohunek_worker_protocol::{
 };
 
 use super::{
-    build_pty_command, debug, detect_at, event, launch_adapter_for, plan_initial_input_delivery,
-    runtime_error, timestamp_now, warn, watch, AgentKind, Arc, CancellationToken, CwdSource,
-    DesiredState, DetectedProject, DetectorConfig, InputRules, LaunchCommand, LaunchOpts, Manifest,
-    Notify, Ordering, PathBuf, ProjectRecord, ProtocolError, ResolvedAgent, ResumeBinding,
-    ResumeSnapshot, RuntimeHandle, RuntimeRecord, RuntimeState, RuntimeWatchIdentity, SessionEntry,
-    SessionId, SessionInfo, SessionNewParams, SessionRecord, SessionRefKind, SessionRegistry,
-    SessionRuntime, SessionState, SessionTransaction, SessionWarning, ShellCommand, StateSource,
-    TransactionKind, Worker, WorkerLaunchMode, WorktreeRequest, DEFAULT_WORKER_SUBSCRIBER_BYTES,
+    build_pty_command, debug, detect_at, event, launch_adapter_for, mpsc,
+    plan_initial_input_delivery, runtime_error, timestamp_now, warn, watch, AgentKind, Arc,
+    CancellationToken, CwdSource, DesiredState, DetectedProject, DetectorConfig, DetectorInputs,
+    InputRules, LaunchCommand, LaunchOpts, Manifest, Notify, Ordering, PathBuf, ProjectRecord,
+    ProtocolError, ResolvedAgent, ResumeBinding, ResumeSnapshot, RuntimeHandle, RuntimeRecord,
+    RuntimeState, RuntimeWatchIdentity, SessionEntry, SessionId, SessionInfo, SessionNewParams,
+    SessionRecord, SessionRefKind, SessionRegistry, SessionRuntime, SessionState,
+    SessionTransaction, SessionWarning, ShellCommand, StateSource, TransactionKind, Worker,
+    WorkerLaunchMode, WorktreeRequest, DEFAULT_WORKER_SUBSCRIBER_BYTES,
     DEFAULT_WORKER_TERMINAL_RETENTION, DEFAULT_WORKER_WRITE_DEDUP_ENTRIES,
     SESSION_RECORD_SCHEMA_VERSION, WORKER_CONNECT_RETRY,
 };
@@ -600,6 +601,7 @@ impl SessionRegistry {
         let (detector_resize, detector_resize_rx) = watch::channel((rows, cols));
         let default_detector_config = DetectorConfig::for_profile(&agent_base, manifest_override);
         let (detector_config, detector_config_rx) = watch::channel(default_detector_config.clone());
+        let (detector_preview, detector_preview_rx) = mpsc::channel(1);
         let root_pid = started.root_pid;
 
         let now = timestamp_now();
@@ -647,6 +649,7 @@ impl SessionRegistry {
             detector_cancel: detector_cancel.clone(),
             detector_resize,
             detector_config,
+            detector_preview,
             default_detector_config,
             procwatch_cancel: procwatch_cancel.clone(),
             runtime_watch_cancel: runtime_watch_cancel.clone(),
@@ -672,11 +675,14 @@ impl SessionRegistry {
         }
         self.spawn_detector(
             id.clone(),
-            started.detector_output,
-            (rows, cols),
-            detector_cancel,
-            detector_resize_rx,
-            detector_config_rx,
+            DetectorInputs {
+                output: started.detector_output,
+                initial_size: (rows, cols),
+                cancel: detector_cancel,
+                resize: detector_resize_rx,
+                config: detector_config_rx,
+                preview: detector_preview_rx,
+            },
         );
         self.spawn_procwatch(id.clone(), root_pid, procwatch_cancel, procwatch_rescan);
         let expected = RuntimeWatchIdentity::from_info(&info)

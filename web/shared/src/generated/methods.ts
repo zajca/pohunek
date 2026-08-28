@@ -42,6 +42,8 @@ import type {
   SessionAttachResult,
   SessionDetachParams,
   SessionDetachResult,
+  SessionDetectionParams,
+  SessionDetectionResult,
   SessionDiffParams,
   SessionDiffResult,
   SessionForkParams,
@@ -102,6 +104,7 @@ export interface Methods {
   "project.show": { params: ProjectShowParams; output: ProjectShowResult };
   "session.attach": { params: SessionAttachParams; output: SessionAttachResult };
   "session.detach": { params: SessionDetachParams; output: SessionDetachResult };
+  "session.detection": { params: SessionDetectionParams; output: SessionDetectionResult };
   "session.diff": { params: SessionDiffParams; output: SessionDiffResult };
   "session.fork": { params: SessionForkParams; output: SessionForkResult };
   "session.input": { params: SessionInputParams; output: SessionInputResult };

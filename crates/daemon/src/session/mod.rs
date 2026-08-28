@@ -22,7 +22,7 @@ use protocol::{
     SessionStopResult, SessionWarning, StateSource, WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 use serde_json::Value;
-use tokio::sync::{broadcast, mpsc, watch, Mutex, Notify};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -448,6 +448,7 @@ struct SessionEntry {
     detector_cancel: CancellationToken,
     detector_resize: watch::Sender<(u16, u16)>,
     detector_config: watch::Sender<DetectorConfig>,
+    detector_preview: mpsc::Sender<DetectionPreviewRequest>,
     default_detector_config: DetectorConfig,
     procwatch_cancel: CancellationToken,
     runtime_watch_cancel: CancellationToken,
@@ -464,6 +465,17 @@ struct SessionEntry {
     last_agent_report: Option<ActiveAgentReport>,
     last_native_report: Option<NativeIdentityReport>,
     observed_agents: Vec<ObservedAgent>,
+}
+
+type DetectionPreviewRequest = oneshot::Sender<Vec<protocol::DetectionRegionPreview>>;
+
+struct DetectorInputs {
+    output: broadcast::Receiver<Vec<u8>>,
+    initial_size: (u16, u16),
+    cancel: CancellationToken,
+    resize: watch::Receiver<(u16, u16)>,
+    config: watch::Receiver<DetectorConfig>,
+    preview: mpsc::Receiver<DetectionPreviewRequest>,
 }
 
 /// Runtime transport selected for one logical session.
