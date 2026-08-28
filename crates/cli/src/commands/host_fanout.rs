@@ -254,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn all_hosts_resolves_local_and_reachable_discovered_hosts_in_host_id_order() {
+    fn all_hosts_orders_local_and_overlay_qualified_reachable_hosts_by_host_id() {
         let records = vec![
             record("host-c", HostClass::Unreachable),
             record(
@@ -277,10 +277,15 @@ mod tests {
             .iter()
             .map(|target| target.host_id.as_str())
             .collect();
-        assert_eq!(ids, ["host-a", "host-b", "local"]);
-        assert!(targets
+        assert_eq!(ids, ["local", "netbird:host-a", "netbird:host-b"]);
+        let transport_targets: Vec<_> = targets
             .iter()
-            .all(|target| target.host_id == target.transport_target));
+            .map(|target| target.transport_target.as_str())
+            .collect();
+        assert_eq!(
+            transport_targets,
+            ["local", "100.92.30.40:18722", "100.92.30.40:18722"]
+        );
     }
 
     #[tokio::test]
