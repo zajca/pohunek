@@ -219,7 +219,11 @@ impl ClientError {
                 ErrorClass::Daemon,
                 "session_input_wait_contract_mismatch",
                 format!("invalid session.input wait response: {detail}"),
-                Some("upgrade the daemon and client together before using input wait".to_owned()),
+                Some(
+                    "delivery outcome is unknown; do not retry blindly; upgrade the daemon and \
+                     client together, then inspect the session before deciding whether to resend"
+                        .to_owned(),
+                ),
             ),
             ClientError::Protocol(err) => err.clone(),
             ClientError::Netbird(err) => netbird_error_to_protocol_error(err),

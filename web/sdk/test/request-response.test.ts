@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, type ProtocolError, type SessionInfo } from "@pohunek/protocol";
+import { MAX_CONTROL_LINE_BYTES, MAX_SESSION_WAIT_MS, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, type ProtocolError, type SessionInfo } from "@pohunek/protocol";
 import {
   Client,
   ClientError,
@@ -467,7 +467,32 @@ describe("Client request/response", () => {
         wait: { until: ["idle"] },
       }));
 
-      expect(error.toProtocolError().code).toBe("session_input_wait_contract_mismatch");
+      const structured = error.toProtocolError();
+      expect(structured.code).toBe("session_input_wait_contract_mismatch");
+      expect(structured.recover).toContain("outcome is unknown");
+      expect(structured.recover).toContain("do not retry blindly");
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("input wait rejects invalid timeouts before transport", async () => {
+    const daemon = await startUnixDaemon([{ kind: "silent" }]);
+    try {
+      const client = await connectClient(daemon);
+      for (const [timeoutMs, expectedCode] of [
+        [0, "session_input_invalid_wait"],
+        [MAX_SESSION_WAIT_MS + 1, "session_wait_limit_exceeded"],
+      ] as const) {
+        const error = await expectClientError(client.sessionInput({
+          session_id: "s-target",
+          text: "hello",
+          wait: { until: ["idle"], timeout_ms: timeoutMs },
+        }));
+        expect(error.toProtocolError().code).toBe(expectedCode);
+      }
+      await daemon.expectNoRequest(50);
       await client.close();
     } finally {
       await daemon.close();
@@ -498,6 +523,30 @@ describe("Client request/response", () => {
         runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
         activity_epoch: "d-epoch-1",
         activity_revision: "18446744073709551616",
+      },
+      {
+        accepted: true,
+        activity: "idle",
+        activity_source: "report",
+        runtime: { runtime_id: "r".repeat(129), runtime_generation: "1" },
+        activity_epoch: "d-epoch-1",
+        activity_revision: "2",
+      },
+      {
+        accepted: true,
+        activity: "idle",
+        activity_source: "report",
+        runtime: { runtime_id: "ž".repeat(65), runtime_generation: "1" },
+        activity_epoch: "d-epoch-1",
+        activity_revision: "2",
+      },
+      {
+        accepted: true,
+        activity: "idle",
+        activity_source: "report",
+        runtime: { runtime_id: "runtime\u0000control", runtime_generation: "1" },
+        activity_epoch: "d-epoch-1",
+        activity_revision: "2",
       },
     ];
 

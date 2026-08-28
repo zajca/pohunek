@@ -333,7 +333,7 @@ impl Client {
         params: SessionInputParams,
     ) -> Result<SessionInputResult, ClientError> {
         if let Some(wait) = params.wait.clone() {
-            let timeout_ms = wait.timeout_ms.unwrap_or(protocol::MAX_SESSION_WAIT_MS);
+            let timeout_ms = validated_input_wait_timeout(&wait)?;
             let result = self
                 .call_dedicated::<protocol::method::SessionInput>(params, timeout_ms)
                 .await?;
@@ -452,6 +452,20 @@ impl Client {
                 })
             }
         }
+    }
+}
+
+fn validated_input_wait_timeout(wait: &protocol::SessionInputWait) -> Result<u32, ClientError> {
+    match wait.timeout_ms {
+        Some(0) => Err(ClientError::Protocol(ProtocolError::observation(
+            "session_input_invalid_wait",
+            "timeout_ms must be greater than zero",
+        ))),
+        Some(timeout_ms) if timeout_ms > protocol::MAX_SESSION_WAIT_MS => Err(
+            ClientError::Protocol(ProtocolError::session_wait_limit_exceeded()),
+        ),
+        Some(timeout_ms) => Ok(timeout_ms),
+        None => Ok(protocol::MAX_SESSION_WAIT_MS),
     }
 }
 
@@ -1309,8 +1323,53 @@ mod tests {
             error.to_protocol_error().code,
             "session_input_wait_contract_mismatch"
         );
+        let recovery = error
+            .to_protocol_error()
+            .recover
+            .expect("contract mismatch recovery");
+        assert!(recovery.contains("outcome is unknown"));
+        assert!(recovery.contains("do not retry blindly"));
         let request = server.await.expect("capture server");
         assert_eq!(request.method(), protocol::method::SESSION_INPUT);
+    }
+
+    #[tokio::test]
+    async fn input_wait_rejects_invalid_timeout_before_dedicated_transport() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind invalid-wait fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let mut client = Client::connect_tcp_addr("fixture-remote", address)
+            .await
+            .expect("connect shared client");
+        let (_shared_stream, _) = listener.accept().await.expect("accept shared client");
+
+        for (timeout_ms, expected_code) in [
+            (0, "session_input_invalid_wait"),
+            (
+                protocol::MAX_SESSION_WAIT_MS + 1,
+                "session_wait_limit_exceeded",
+            ),
+        ] {
+            let error = client
+                .session_input(SessionInputParams {
+                    session_id: SessionId("s-target".to_owned()),
+                    text: "hello".to_owned(),
+                    wait: Some(protocol::SessionInputWait {
+                        until: vec![protocol::AgentActivity::Idle],
+                        timeout_ms: Some(timeout_ms),
+                    }),
+                })
+                .await
+                .expect_err("invalid wait timeout must fail locally");
+            assert_eq!(error.to_protocol_error().code, expected_code);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), listener.accept())
+                    .await
+                    .is_err(),
+                "invalid wait opened a dedicated connection"
+            );
+        }
     }
 
     #[tokio::test]

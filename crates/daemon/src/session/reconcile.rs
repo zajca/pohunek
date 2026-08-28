@@ -1,6 +1,6 @@
 //! Startup adoption of durable session workers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,10 +12,11 @@ use sha2::{Digest, Sha256};
 
 use super::{
     event, event_payload, identity_claim_expiry_is_valid, runtime_error, timestamp_now, watch,
-    ActiveAgentReport, CancellationToken, DesiredState, DetectorConfig, Notify, ObservedAgent,
-    ProtocolError, ResumeSnapshot, RuntimeHandle, RuntimeState, RuntimeWatchIdentity, SessionEntry,
-    SessionId, SessionRecord, SessionRef, SessionRefKind, SessionRegistry, SessionRuntime,
-    SessionState, StateSource, Worker, WorkerError, WORKER_CONNECT_RETRY,
+    ActiveAgentReport, CancellationToken, DesiredState, DetectorConfig, Mutex, Notify,
+    ObservedAgent, ProtocolError, ResumeSnapshot, RuntimeHandle, RuntimeState,
+    RuntimeWatchIdentity, SessionEntry, SessionId, SessionRecord, SessionRef, SessionRefKind,
+    SessionRegistry, SessionRuntime, SessionState, StateSource, Worker, WorkerError,
+    WORKER_CONNECT_RETRY,
 };
 use crate::procwatch::ProcessInspector;
 use crate::session::target::open_detector_output;
@@ -745,7 +746,8 @@ impl SessionRegistry {
         let entry = SessionEntry {
             info: info.clone(),
             activity_revision: 0,
-            activity_evidence: HashMap::new(),
+            activity_evidence: VecDeque::new(),
+            input_gate: Arc::new(Mutex::new(())),
             runtime: RuntimeHandle::Worker(worker.clone()),
             desired_state: DesiredState::Running,
             detector_cancel: detector_cancel.clone(),
@@ -853,7 +855,8 @@ impl SessionRegistry {
         let entry = SessionEntry {
             info: info.clone(),
             activity_revision: 0,
-            activity_evidence: HashMap::new(),
+            activity_evidence: VecDeque::new(),
+            input_gate: Arc::new(Mutex::new(())),
             runtime: RuntimeHandle::Unavailable(state),
             desired_state: record.desired_state,
             detector_cancel: CancellationToken::new(),

@@ -21,7 +21,7 @@ use protocol::{
 use crate::agent::LaunchCommand;
 use crate::agent::{InputRules, ResumeMode, SessionRefKind};
 use crate::detect::{ActivityTransition, DetectorConfig, ManifestRegion, MatchContext};
-use crate::external::TranscriptIndex;
+use crate::external::{external_session_id, TranscriptIndex};
 use crate::integration::{
     ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
@@ -3510,6 +3510,40 @@ async fn session_input_wait_rejects_invalid_contract_before_delivery() {
 }
 
 #[tokio::test]
+async fn session_input_wait_preserves_external_read_only_error() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: observable_input_shell(),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create managed session fixture");
+    let external_id = external_session_id(91_337);
+    let mut external = created.clone();
+    external.id = external_id.clone();
+    external.pid = 91_337;
+    external.external = Some(true);
+    registry.inner.external.upsert(external).await;
+
+    let error = registry
+        .input(protocol::SessionInputParams {
+            session_id: external_id,
+            text: "must-not-write".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: vec![AgentActivity::Idle],
+                timeout_ms: Some(100),
+            }),
+        })
+        .await
+        .expect_err("external waited input remains read-only");
+
+    assert_eq!(error.code, "session_external_read_only");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
 async fn session_input_wait_times_out_with_typed_error() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
@@ -3633,7 +3667,7 @@ async fn session_input_wait_deadline_includes_submit_delay() {
     let agents_dir = temp_agents_dir_with(
         "input-wait-overall-deadline",
         "input-wait-deadline-claude",
-        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'read line; echo got:$line; sleep 30']\n",
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
         agents_dir: Some(agents_dir),
@@ -3664,21 +3698,30 @@ async fn session_input_wait_deadline_includes_submit_delay() {
     .expect_err("submit delay must consume the overall deadline");
 
     assert_eq!(error.code, "session_input_timeout");
-    tokio::time::sleep(Duration::from_millis(275)).await;
+    registry
+        .input(protocol::SessionInputParams {
+            session_id: created.id.clone(),
+            text: "next-input".to_owned(),
+            wait: None,
+        })
+        .await
+        .expect("next input succeeds without submitting timed-out text");
+    tokio::time::sleep(Duration::from_millis(50)).await;
     let output = read_session_output_after_rejection(&registry, &created.id).await;
     assert!(
         !output.contains("got:deadline-before-submit"),
         "output={output:?}"
     );
+    assert!(output.contains("got:next-input"), "output={output:?}");
     let _ = registry.stop(&created.id).await;
 }
 
 #[tokio::test]
-async fn session_input_wait_deadline_bounds_body_write_ack() {
+async fn session_input_wait_timeout_after_atomic_plan_does_not_stage_body() {
     let agents_dir = temp_agents_dir_with(
-        "input-wait-body-ack-deadline",
-        "input-wait-body-ack-claude",
-        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'read line; echo got:$line; sleep 30']\n",
+        "input-wait-plan-ack-deadline",
+        "input-wait-plan-ack-claude",
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
         agents_dir: Some(agents_dir),
@@ -3687,7 +3730,7 @@ async fn session_input_wait_deadline_bounds_body_write_ack() {
         ..SessionRegistryConfig::default()
     });
     let mut create = params();
-    create.agent = "input-wait-body-ack-claude".to_owned();
+    create.agent = "input-wait-plan-ack-claude".to_owned();
     let created = registry
         .create(create)
         .await
@@ -3696,78 +3739,245 @@ async fn session_input_wait_deadline_bounds_body_write_ack() {
 
     let error = tokio::time::timeout(
         Duration::from_millis(150),
-        registry.write_waited_input_with_ack_delays(
+        registry.write_waited_input_with_ack_delay(
             &created.id,
-            "body-ack-timeout",
+            "atomic-plan-timeout",
             deadline,
             Duration::from_millis(250),
-            Duration::ZERO,
         ),
     )
     .await
-    .expect("body write must respect the overall deadline")
-    .expect_err("delayed body ACK must time out");
+    .expect("atomic plan must respect the overall deadline")
+    .expect_err("delayed plan ACK must time out");
 
     assert_eq!(error.code, "session_input_timeout");
     tokio::time::sleep(Duration::from_millis(275)).await;
+    registry
+        .input(protocol::SessionInputParams {
+            session_id: created.id.clone(),
+            text: "next-input".to_owned(),
+            wait: None,
+        })
+        .await
+        .expect("next input succeeds after the late plan ACK is consumed");
+    tokio::time::sleep(Duration::from_millis(50)).await;
     let output = read_session_output_after_rejection(&registry, &created.id).await;
     assert!(
-        !output.contains("got:body-ack-timeout"),
+        output.contains("got:atomic-plan-timeout"),
         "output={output:?}"
     );
-    registry
-        .inspect(&created.id)
-        .await
-        .expect("late body ACK is consumed without desynchronizing control");
+    assert!(output.contains("got:next-input"), "output={output:?}");
+    assert!(!output.contains("got:atomic-plan-timeoutnext-input"));
     let _ = registry.stop(&created.id).await;
 }
 
 #[tokio::test]
-async fn session_input_wait_deadline_bounds_submit_write_ack() {
+async fn session_input_wait_rechecks_blocked_activity_after_submit_delay() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new(
+            "/bin/sh",
+            ["-c", "while IFS= read -r line; do echo got:$line; done"],
+        ),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&created.id)
+        .expect("session entry")
+        .input_rules = InputRules::hermes(false, Duration::from_millis(150));
+    let report = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            registry
+                .inner
+                .sessions
+                .lock()
+                .await
+                .get_mut(&session_id)
+                .expect("session entry")
+                .info
+                .activity = Some(AgentActivity::Blocked);
+        }
+    });
+
+    let error = registry
+        .input(protocol::SessionInputParams {
+            session_id: created.id.clone(),
+            text: "blocked-during-delay".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: vec![AgentActivity::Idle],
+                timeout_ms: Some(500),
+            }),
+        })
+        .await
+        .expect_err("blocked boundary must reject input before the atomic plan");
+
+    assert_eq!(error.code, "session_input_blocked");
+    report.await.expect("blocked mutation task joins");
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&created.id)
+        .expect("session entry")
+        .info
+        .activity = Some(AgentActivity::Working);
+    registry
+        .input(protocol::SessionInputParams {
+            session_id: created.id.clone(),
+            text: "next-input".to_owned(),
+            wait: None,
+        })
+        .await
+        .expect("next input succeeds after blocked state clears");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    assert!(
+        !output.contains("got:blocked-during-delay"),
+        "output={output:?}"
+    );
+    assert!(output.contains("got:next-input"), "output={output:?}");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_serializes_waited_transactions() {
     let agents_dir = temp_agents_dir_with(
-        "input-wait-submit-ack-deadline",
-        "input-wait-submit-ack-deadline-claude",
-        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'read line; echo got:$line; sleep 30']\n",
+        "input-wait-serialized",
+        "input-wait-serialized-claude",
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
         agents_dir: Some(agents_dir),
-        claude_submit_delay: Duration::ZERO,
+        claude_submit_delay: Duration::from_millis(100),
         stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     });
     let mut create = params();
-    create.agent = "input-wait-submit-ack-deadline-claude".to_owned();
+    create.agent = "input-wait-serialized-claude".to_owned();
     let created = registry
         .create(create)
         .await
         .expect("create Claude session");
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let first = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            registry
+                .write_waited_input_with_ack_delay(
+                    &session_id,
+                    "first-waited",
+                    deadline,
+                    Duration::ZERO,
+                )
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let second = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            registry
+                .write_waited_input_with_ack_delay(
+                    &session_id,
+                    "second-waited",
+                    deadline,
+                    Duration::ZERO,
+                )
+                .await
+        }
+    });
 
-    let error = tokio::time::timeout(
-        Duration::from_millis(150),
-        registry.write_waited_input_with_ack_delays(
-            &created.id,
-            "submit-ack-timeout",
-            deadline,
-            Duration::ZERO,
-            Duration::from_millis(250),
-        ),
-    )
-    .await
-    .expect("submit write must respect the overall deadline")
-    .expect_err("delayed submit ACK must time out");
-
-    assert_eq!(error.code, "session_input_timeout");
-    tokio::time::sleep(Duration::from_millis(275)).await;
-    let output = read_session_output_after_rejection(&registry, &created.id).await;
-    assert!(
-        output.contains("got:submit-ack-timeout"),
-        "output={output:?}"
-    );
-    registry
-        .inspect(&created.id)
+    first
         .await
-        .expect("late submit ACK is consumed without desynchronizing control");
+        .expect("first waited task joins")
+        .expect("first waited transaction succeeds");
+    second
+        .await
+        .expect("second waited task joins")
+        .expect("second waited transaction succeeds");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    let first_position = output.find("got:first-waited").expect("first output");
+    let second_position = output.find("got:second-waited").expect("second output");
+    assert!(first_position < second_position, "output={output:?}");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_serializes_waited_and_fire_and_forget_transactions() {
+    let agents_dir = temp_agents_dir_with(
+        "input-wait-fire-serialized",
+        "input-wait-fire-serialized-claude",
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        claude_submit_delay: Duration::from_millis(100),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let mut create = params();
+    create.agent = "input-wait-fire-serialized-claude".to_owned();
+    let created = registry
+        .create(create)
+        .await
+        .expect("create Claude session");
+    let first = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            registry
+                .write_waited_input_with_ack_delay(
+                    &session_id,
+                    "first-waited",
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                    Duration::ZERO,
+                )
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let second = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id,
+                    text: "second-fire".to_owned(),
+                    wait: None,
+                })
+                .await
+        }
+    });
+
+    first
+        .await
+        .expect("waited task joins")
+        .expect("waited transaction succeeds");
+    second
+        .await
+        .expect("fire task joins")
+        .expect("fire-and-forget transaction succeeds");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    let first_position = output.find("got:first-waited").expect("waited output");
+    let second_position = output.find("got:second-fire").expect("fire output");
+    assert!(first_position < second_position, "output={output:?}");
     let _ = registry.stop(&created.id).await;
 }
 
@@ -3808,11 +4018,10 @@ async fn session_input_wait_accepts_activity_between_submit_flush_and_ack() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
 
     let submission = registry
-        .write_waited_input_with_ack_delays(
+        .write_waited_input_with_ack_delay(
             &created.id,
             "submit-boundary",
             deadline,
-            Duration::ZERO,
             Duration::from_millis(500),
         )
         .await
@@ -3885,6 +4094,53 @@ async fn session_input_wait_timeout_recheck_rejects_evidence_after_deadline() {
         .await
         .expect_err("timeout recheck must reject post-deadline evidence");
     assert_eq!(error.code, "session_input_timeout");
+    tokio::time::resume();
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_retains_pre_deadline_evidence_after_late_same_activity() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let snapshot = registry
+        .input_activity_snapshot(&created.id, None)
+        .await
+        .expect("capture causal boundary");
+    tokio::time::pause();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+    let expected_revision = protocol::ActivityRevision::new(snapshot.revision.get() + 1);
+    let submission = InputSubmission {
+        runtime: snapshot.runtime,
+        activity_epoch: registry.daemon_instance_id().to_owned(),
+        after_revision: snapshot.revision,
+        deadline,
+    };
+    tokio::time::advance(Duration::from_millis(5)).await;
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Idle, 1)
+            .await
+            .recorded
+    );
+    tokio::time::advance(Duration::from_millis(6)).await;
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Idle, 2)
+            .await
+            .recorded
+    );
+
+    let result = registry
+        .evaluate_input_wait(&created.id, &[AgentActivity::Idle], &submission, None)
+        .await
+        .expect("evaluate retained evidence")
+        .expect("pre-deadline evidence remains available");
+    assert_eq!(result.activity_revision, Some(expected_revision));
     tokio::time::resume();
     let _ = registry.stop(&created.id).await;
 }

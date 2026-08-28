@@ -77,6 +77,7 @@ impl SessionRegistry {
         Self::validate_input_wait(&wait)?;
         let deadline_ms = wait.timeout_ms.unwrap_or(protocol::MAX_SESSION_WAIT_MS);
         let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(deadline_ms));
+        self.ensure_not_external(&params.session_id).await?;
         let mut events = self.subscribe();
         let _waiter_permit = self.acquire_waiter(&params.session_id)?;
         if self
@@ -101,7 +102,8 @@ impl SessionRegistry {
         session_id: &SessionId,
         text: &str,
     ) -> Result<(), ProtocolError> {
-        self.ensure_not_external(session_id).await?;
+        let input_gate = self.input_gate(session_id).await?;
+        let _input_guard = input_gate.lock_owned().await;
         let (runtime, rules) = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions
@@ -143,25 +145,21 @@ impl SessionRegistry {
         text: &str,
         deadline: tokio::time::Instant,
     ) -> Result<InputSubmission, ProtocolError> {
-        self.write_waited_input_with_ack_delays(
-            session_id,
-            text,
-            deadline,
-            Duration::ZERO,
-            Duration::ZERO,
-        )
-        .await
+        self.write_waited_input_with_ack_delay(session_id, text, deadline, Duration::ZERO)
+            .await
     }
 
-    pub(super) async fn write_waited_input_with_ack_delays(
+    pub(super) async fn write_waited_input_with_ack_delay(
         &self,
         session_id: &SessionId,
         text: &str,
         deadline: tokio::time::Instant,
-        body_ack_delay: Duration,
-        submit_ack_delay: Duration,
+        plan_ack_delay: Duration,
     ) -> Result<InputSubmission, ProtocolError> {
-        self.ensure_not_external(session_id).await?;
+        let input_gate = self.input_gate(session_id).await?;
+        let _input_guard = self
+            .lock_input_before_deadline(input_gate, deadline)
+            .await?;
         let (worker, rules, runtime) = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions
@@ -178,30 +176,20 @@ impl SessionRegistry {
             (worker, entry.input_rules, runtime)
         };
         let writes = build_input_writes(text, rules)?;
-        if !writes.body.is_empty() {
-            self.write_worker_before_deadline(
-                worker.clone(),
-                vec![WorkerInputFragment {
-                    bytes: SecretBytes::new(writes.body),
-                    delay_after_ms: duration_millis(body_ack_delay),
-                }],
-                deadline,
-            )
-            .await?;
+        if writes.submit_delay >= deadline.saturating_duration_since(tokio::time::Instant::now()) {
+            return Err(ProtocolError::session_input_timeout());
         }
         self.wait_before_submit(writes.submit_delay, deadline)
             .await?;
         let boundary = self
             .input_activity_snapshot(session_id, Some(&runtime))
             .await?;
-        if tokio::time::Instant::now() >= deadline {
-            return Err(ProtocolError::session_input_timeout());
-        }
+        rules.validate_activity(boundary.activity)?;
         self.write_worker_before_deadline(
             worker,
             vec![WorkerInputFragment {
-                bytes: SecretBytes::new(SUBMIT.to_vec()),
-                delay_after_ms: duration_millis(submit_ack_delay),
+                bytes: SecretBytes::new(submitted_input(writes.body)),
+                delay_after_ms: duration_millis(plan_ack_delay),
             }],
             deadline,
         )
@@ -215,6 +203,35 @@ impl SessionRegistry {
             after_revision: boundary.revision,
             deadline,
         })
+    }
+
+    async fn input_gate(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<std::sync::Arc<tokio::sync::Mutex<()>>, ProtocolError> {
+        self.ensure_not_external(session_id).await?;
+        let sessions = self.inner.sessions.lock().await;
+        sessions
+            .get(session_id)
+            .map(|entry| std::sync::Arc::clone(&entry.input_gate))
+            .ok_or_else(|| session_not_found(&session_id.0))
+    }
+
+    async fn lock_input_before_deadline(
+        &self,
+        input_gate: std::sync::Arc<tokio::sync::Mutex<()>>,
+        deadline: tokio::time::Instant,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, ProtocolError> {
+        tokio::select! {
+            biased;
+            () = self.inner.event_log_shutdown.cancelled() => Err(input_wait_shutdown_error(
+                "daemon shutdown cancelled input while waiting for the session input gate",
+            )),
+            () = tokio::time::sleep_until(deadline) => {
+                Err(ProtocolError::session_input_timeout())
+            }
+            guard = input_gate.lock_owned() => Ok(guard),
+        }
     }
 
     async fn write_worker_before_deadline(
@@ -387,7 +404,7 @@ impl SessionRegistry {
         }
         Ok(entry
             .activity_evidence
-            .values()
+            .iter()
             .filter(|evidence| {
                 evidence.runtime == submission.runtime
                     && evidence.activity_epoch == submission.activity_epoch
@@ -523,4 +540,9 @@ pub(super) fn build_input_writes(
 
 fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn submitted_input(mut body: Vec<u8>) -> Vec<u8> {
+    body.extend_from_slice(SUBMIT);
+    body
 }

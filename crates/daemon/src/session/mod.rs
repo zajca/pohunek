@@ -106,6 +106,14 @@ const MAX_RUNTIME_TRANSITION_COMMIT_ATTEMPTS: usize = 8;
 const DEFAULT_WORKER_SUBSCRIBER_BYTES: u64 = 1_000_000;
 /// Number of completed input plans retained by a worker for deduplication.
 const DEFAULT_WORKER_WRITE_DEDUP_ENTRIES: u32 = 4_096;
+/// Maximum number of recent activity observations retained per session.
+///
+/// The time window is authoritative for ordinary report rates; the hard cap
+/// prevents a misbehaving local hook from growing daemon memory without bound.
+const MAX_ACTIVITY_EVIDENCE_HISTORY: usize = 4_096;
+/// Keeps evidence through the longest public input-wait deadline.
+const ACTIVITY_EVIDENCE_RETENTION: Duration =
+    Duration::from_millis(protocol::MAX_SESSION_WAIT_MS as u64);
 /// Final runtime retention while no daemon is present.
 const DEFAULT_WORKER_TERMINAL_RETENTION: Duration = Duration::from_hours(24);
 /// Initial durable logical-session record schema.
@@ -446,8 +454,10 @@ struct SessionEntry {
     info: SessionInfo,
     /// Monotonic in-memory cursor advanced for every emitted activity report.
     activity_revision: u64,
-    /// Latest runtime-scoped evidence for each observed activity.
-    activity_evidence: HashMap<AgentActivity, ActivityEvidence>,
+    /// Bounded runtime-scoped activity history for input-wait evidence.
+    activity_evidence: VecDeque<ActivityEvidence>,
+    /// Serializes complete input framing transactions for this logical session.
+    input_gate: Arc<Mutex<()>>,
     runtime: RuntimeHandle,
     desired_state: DesiredState,
     detector_cancel: CancellationToken,
@@ -518,7 +528,22 @@ fn record_activity_evidence(
         revision: ActivityRevision::new(entry.activity_revision),
         observed_at: tokio::time::Instant::now(),
     };
-    entry.activity_evidence.insert(activity, evidence.clone());
+    if let Some(cutoff) = evidence
+        .observed_at
+        .checked_sub(ACTIVITY_EVIDENCE_RETENTION)
+    {
+        while entry
+            .activity_evidence
+            .front()
+            .is_some_and(|previous| previous.observed_at < cutoff)
+        {
+            entry.activity_evidence.pop_front();
+        }
+    }
+    entry.activity_evidence.push_back(evidence.clone());
+    while entry.activity_evidence.len() > MAX_ACTIVITY_EVIDENCE_HISTORY {
+        entry.activity_evidence.pop_front();
+    }
     Some(evidence)
 }
 

@@ -119,11 +119,14 @@ accepts success only when the daemon returns the requested activity, its source,
 the exact runtime identity, a nonempty daemon activity epoch, and a canonical
 decimal activity revision. The wait timeout is the daemon's overall
 delivery-and-activity deadline measured before delivery; the transport adds only
-fixed response headroom. Deduplicate evidence by `(activity_epoch, runtime,
+fixed response headroom. The SDK rejects a timeout outside `1..=8000` before
+opening the dedicated connection. Deduplicate evidence by `(activity_epoch, runtime,
 activity_revision)`, since daemon reconnect preserves the runtime but starts a
 new epoch-scoped revision sequence. Missing or contradictory evidence fails closed as
 `session_input_wait_contract_mismatch`; it is never treated as delivery
-confirmation from a daemon that ignored `wait`.
+confirmation from a daemon that ignored `wait`. Its recovery hint treats delivery
+as unknown and forbids blind retry; inspect the session before deciding whether
+to resend.
 
 ## Attach
 

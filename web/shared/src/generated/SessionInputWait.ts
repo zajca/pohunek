@@ -12,9 +12,10 @@ export type SessionInputWait = {
    */
   until: Array<AgentActivity>;
   /**
-   * Overall delivery-and-wait deadline in milliseconds from `1` to
-   * [`MAX_SESSION_WAIT_MS`], measured before delivery begins. When omitted,
-   * the daemon applies that ceiling; zero is rejected before any delivery.
+   * Overall gate, delivery, and activity-wait deadline in milliseconds from
+   * `1` to [`MAX_SESSION_WAIT_MS`], measured before delivery begins. When
+   * omitted, the daemon applies that ceiling; zero is rejected before any
+   * delivery.
    */
   timeout_ms?: number;
 };

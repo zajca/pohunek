@@ -168,7 +168,7 @@ export class ClientError extends Error {
         ClientErrorClass.Daemon,
         ClientErrorCode.InputWaitContract,
         msg,
-        "upgrade the daemon and client together before using input wait",
+        "delivery outcome is unknown; do not retry blindly; upgrade the daemon and client together, then inspect the session before deciding whether to resend",
       ),
     );
   }

@@ -41,13 +41,15 @@ waiting for a matching activity observed only after submission. The daemon first
 validates the whole wait contract, so zero or over-limit timeouts cannot deliver
 text; duplicate `--until` values are deduplicated in first-occurrence order;
 omitted targets default to `idle` and `blocked`; the timeout range is `1..8000`
-ms (default 8000). The timeout is one overall deadline measured before delivery,
-so body and submit worker acknowledgements plus submit delay consume it, and the
-SDK transport needs only its fixed response headroom. A timed-out worker exchange
-continues consuming its late acknowledgement to keep the shared control stream
-synchronized; after submit flush, timeout does not imply that delivery was
-rolled back. The daemon captures a revision boundary immediately before the
-final submit write and excludes both pre-submit and post-deadline evidence. Waiting
+ms (default 8000). The timeout is one overall deadline measured before the
+per-session input gate, so gate contention, submit delay, atomic worker-plan
+acknowledgement, and activity waiting all consume it. The daemon does not stage
+waited text: after the delay it captures the causal revision boundary, rechecks
+blocked activity, and only then sends body plus submit as one worker plan. This
+trades a slightly earlier boundary for safety against stale staged text. A
+timed-out worker exchange continues consuming its late acknowledgement to keep
+the shared control stream synchronized; after the atomic plan is sent, delivery
+outcome is unknown and callers must not retry blindly. Waiting
 acquires one observation waiter slot and returns exact post-submit evidence as
 `activity`, `activity_source`, `runtime`, `activity_epoch`, and decimal-string
 `activity_revision`. Clients deduplicate by `(activity_epoch, runtime,
@@ -57,8 +59,10 @@ activity changes again, arrives before submit ACK, or the event receiver lags. T
 `session_not_running` if that runtime exits, `session_runtime_changed` if it is
 replaced, and `session_input_timeout` when delivery acknowledgement or a target
 does not arrive before the deadline. Rust and TypeScript
-SDK helpers fail closed with `session_input_wait_contract_mismatch` when a daemon
-ignores `wait` or omits runtime-scoped evidence.
+SDK helpers validate the timeout locally and fail closed with
+`session_input_wait_contract_mismatch` when a daemon ignores `wait` or omits
+runtime-scoped evidence. Its recovery guidance says to inspect the session rather
+than blindly resending input because delivery may already have happened.
 
 `pohunek session diff <target> [--base <ref>] [--json]` prints a unified diff
 of a session's worktree against a base ref: raw diff text on stdout by

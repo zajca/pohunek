@@ -1,4 +1,5 @@
 import {
+  MAX_RUNTIME_ID_BYTES,
   MAX_SESSION_WAIT_MS,
   PROTOCOL_VERSION,
   SUPPORTED_PROTOCOL_VERSIONS,
@@ -30,6 +31,7 @@ const RUN_TOKEN_RANDOM_BYTES = 16;
 // Dedicated calls need response headroom beyond the daemon's overall wire deadline.
 const DEDICATED_REQUEST_HEADROOM_MS = 1_000;
 const MAX_U64 = 18_446_744_073_709_551_615n;
+const UTF8_ENCODER = new TextEncoder();
 const STATE_SOURCES = new Set<StateSource>([
   "osc_title",
   "osc_progress",
@@ -109,10 +111,11 @@ export class Client {
 
   public async sessionInput(params: SessionInputParams): Promise<SessionInputResult> {
     if (params.wait !== undefined) {
+      const timeoutMs = validatedInputWaitTimeout(params.wait);
       const result = await this.callDedicated(
         "session.input",
         params,
-        params.wait.timeout_ms ?? MAX_SESSION_WAIT_MS,
+        timeoutMs,
       );
       return validateInputWaitResult(params.wait.until, result);
     }
@@ -304,6 +307,25 @@ export class Client {
   }
 }
 
+function validatedInputWaitTimeout(wait: SessionInputWait): number {
+  const timeoutMs = wait.timeout_ms ?? MAX_SESSION_WAIT_MS;
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+    throw ClientError.protocol({
+      class: "runtime",
+      code: "session_input_invalid_wait",
+      msg: "timeout_ms must be greater than zero",
+    });
+  }
+  if (timeoutMs > MAX_SESSION_WAIT_MS) {
+    throw ClientError.protocol({
+      class: "runtime",
+      code: "session_wait_limit_exceeded",
+      msg: "the requested wait exceeds the configured maximum",
+    });
+  }
+  return timeoutMs;
+}
+
 function validateInputWaitResult(
   until: SessionInputWait["until"],
   value: unknown,
@@ -344,6 +366,8 @@ function isRuntimeIdentity(value: unknown): boolean {
   const runtime = value as Record<string, unknown>;
   return typeof runtime["runtime_id"] === "string"
     && runtime["runtime_id"].length > 0
+    && UTF8_ENCODER.encode(runtime["runtime_id"]).byteLength <= MAX_RUNTIME_ID_BYTES
+    && !/\p{Cc}/u.test(runtime["runtime_id"])
     && isCanonicalDecimal(runtime["runtime_generation"]);
 }
 

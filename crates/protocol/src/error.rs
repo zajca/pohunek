@@ -166,7 +166,7 @@ impl ProtocolError {
     pub fn session_input_timeout() -> Self {
         Self::observation(
             "session_input_timeout",
-            "the bounded input wait timed out before the agent reached a requested state",
+            "the overall input deadline elapsed before delivery and requested activity were confirmed",
         )
     }
 

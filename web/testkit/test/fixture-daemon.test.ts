@@ -107,6 +107,84 @@ describe("@pohunek/testkit fixture daemon", () => {
     }
   });
 
+  test("session input wait returns runtime-scoped activity evidence", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-wait") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const created = await client.call("session.new", {
+        agent: "codex",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      });
+      setTimeout(() => {
+        daemon.scenario.setAgentState(created.id, "idle", "report");
+      }, 20);
+
+      const result = await client.call("session.input", {
+        session_id: created.id,
+        text: "hello",
+        wait: { until: ["idle"], timeout_ms: 200 },
+      });
+
+      expect(result.accepted).toBe(true);
+      expect(result.activity).toBe("idle");
+      expect(result.activity_source).toBe("report");
+      expect(result.runtime?.runtime_id).toBe(`runtime-${created.id}`);
+      expect(result.activity_epoch?.startsWith("d-testkit-")).toBe(true);
+      expect(result.activity_revision).toBe("1");
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("session input wait rejects invalid timeout contracts", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-invalid") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const created = await client.call("session.new", {
+        agent: "codex",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      });
+
+      await expectProtocolError(client.call("session.input", {
+        session_id: created.id,
+        text: "hello",
+        wait: { until: ["idle"], timeout_ms: 0 },
+      }), "session_input_invalid_wait");
+      await expectProtocolError(client.call("session.input", {
+        session_id: created.id,
+        text: "hello",
+        wait: { until: ["idle"], timeout_ms: MAX_SESSION_WAIT_MS + 1 },
+      }), "session_wait_limit_exceeded");
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("session input wait returns a typed timeout without matching activity", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-timeout") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const created = await client.call("session.new", {
+        agent: "codex",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      });
+
+      await expectProtocolError(client.call("session.input", {
+        session_id: created.id,
+        text: "hello",
+        wait: { until: ["idle"], timeout_ms: 10 },
+      }), "session_input_timeout");
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
   test("models Hermes capability boundaries and rejects unknown launch agents", async () => {
     const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("hermes-capabilities") } });
     try {

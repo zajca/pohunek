@@ -367,18 +367,22 @@ These per-agent input rules live in the agent adapter next to its launch command
 state manifest, and resume command.
 
 An optional bounded input wait uses one overall deadline measured before
-delivery, so profile submit delay consumes the same budget advertised to Rust
-and TypeScript transports. For waited input, the daemon deadline-bounds the body
-write acknowledgement, owns the submit delay, captures a runtime-scoped activity
-revision immediately before the separate deadline-bounded submit write, and
-accepts revisions above that lower bound even when they arrive before the worker
-acknowledges the submit. Timed-out worker exchanges remain cancellation-shielded
-until their late acknowledgement is consumed, preventing the shared control
-stream from becoming desynchronized. A fixed upper deadline rejects evidence
-observed later, including the timeout recheck.
+delivery. Waiting for the per-session input gate and the profile submit delay
+consume the same budget advertised to Rust and TypeScript transports. The daemon
+does not stage waited text in the PTY: it waits first, then captures a
+runtime-scoped activity revision, revalidates blocked activity, and sends body
+plus submit as one worker input plan. This moves the causal boundary slightly
+earlier than a pre-staged Enter, but prevents timeout, blocked approval, or a
+concurrent input from leaving unsubmitted text for a later request. The input
+gate serializes the complete framing transaction against both waited and
+fire-and-forget calls. Timed-out worker exchanges remain cancellation-shielded
+until their late acknowledgement is consumed; once the atomic plan was sent,
+delivery outcome is unknown and clients must not retry blindly. A fixed upper
+deadline rejects evidence observed later, including the timeout recheck.
 Each event carries its runtime identity, daemon `activity_epoch`, and exact
 decimal-string activity revision. The registry retains the latest evidence for
-each activity so broadcast lag cannot erase a rapid target transition. The
+the full maximum wait window, subject to a hard per-session memory bound, so a
+later report of the same activity cannot erase valid pre-deadline evidence. The
 dedupe cursor is `(activity_epoch, runtime, revision)` because a replacement
 daemon adopts the same runtime but starts a fresh revision sequence. Runtime
 exit returns `session_not_running`; replacement returns

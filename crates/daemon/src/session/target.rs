@@ -1,6 +1,6 @@
 //! Launch-target resolution (project / in-place / worktree) and PTY registration.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, VecDeque};
 
 use pohunek_worker_protocol::{
     read_frame, Dimensions, FrameKind, Initialize, InitializeLimits,
@@ -12,7 +12,7 @@ use super::{
     build_pty_command, debug, detect_at, event, launch_adapter_for, plan_initial_input_delivery,
     runtime_error, timestamp_now, warn, watch, AgentKind, Arc, CancellationToken, CwdSource,
     DesiredState, DetectedProject, DetectorConfig, InputRules, LaunchCommand, LaunchOpts, Manifest,
-    Notify, Ordering, PathBuf, ProjectRecord, ProtocolError, ResolvedAgent, ResumeBinding,
+    Mutex, Notify, Ordering, PathBuf, ProjectRecord, ProtocolError, ResolvedAgent, ResumeBinding,
     ResumeSnapshot, RuntimeHandle, RuntimeRecord, RuntimeState, RuntimeWatchIdentity, SessionEntry,
     SessionId, SessionInfo, SessionNewParams, SessionRecord, SessionRefKind, SessionRegistry,
     SessionRuntime, SessionState, SessionTransaction, SessionWarning, ShellCommand, StateSource,
@@ -643,7 +643,8 @@ impl SessionRegistry {
         let entry = SessionEntry {
             info: info.clone(),
             activity_revision: 0,
-            activity_evidence: HashMap::new(),
+            activity_evidence: VecDeque::new(),
+            input_gate: Arc::new(Mutex::new(())),
             runtime: started.handle.clone(),
             desired_state: DesiredState::Running,
             detector_cancel: detector_cancel.clone(),
