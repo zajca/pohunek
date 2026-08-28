@@ -3590,14 +3590,19 @@ async fn session_input_wait_rejects_blocked_session_before_delivery() {
 
 #[tokio::test]
 async fn session_input_wait_ignores_activity_reported_during_submit_delay() {
+    let agents_dir = temp_agents_dir_with(
+        "input-wait-submit-delay",
+        "input-wait-claude",
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
+    );
     let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        agents_dir: Some(agents_dir),
         claude_submit_delay: Duration::from_millis(100),
         stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     });
     let mut create = params();
-    create.agent = "claude".to_owned();
+    create.agent = "input-wait-claude".to_owned();
     let created = registry
         .create(create)
         .await
