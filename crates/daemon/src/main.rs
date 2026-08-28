@@ -507,21 +507,14 @@ async fn bind_remote_server(state: DaemonState, configured: ConfiguredTransport)
     let overlay_id = configured.id().clone();
     let port = configured.port();
     let transport = Arc::clone(configured.transport());
-    let listener_transport = Arc::clone(&transport);
-    let address = match tokio::task::spawn_blocking(move || listener_transport.listener_addr())
-        .await
-    {
-        Ok(Ok(address)) => address,
-        Ok(Err(overlay::OverlayError::CliMissing(_))) => {
+    let address = match transport.listener_addr().await {
+        Ok(address) => address,
+        Err(overlay::OverlayError::CliMissing(_)) => {
             info!(overlay = %overlay_id, port, "overlay CLI missing; listener disabled");
             return RemoteBind::Disabled;
         }
-        Ok(Err(error)) => {
+        Err(error) => {
             info!(overlay = %overlay_id, port, reason = %error, "overlay state unavailable; serving local-only");
-            return RemoteBind::Retry;
-        }
-        Err(join) => {
-            warn!(overlay = %overlay_id, port, reason = %join, "overlay listener task failed");
             return RemoteBind::Retry;
         }
     };

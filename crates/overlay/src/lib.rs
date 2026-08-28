@@ -9,9 +9,13 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU16;
+use std::pin::Pin;
 use std::sync::Arc;
+
+use futures::future::join_all;
 
 /// Why an overlay bind address was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -242,6 +246,9 @@ pub struct OverlayDiagnostic {
     pub error: Option<OverlayError>,
 }
 
+/// Provider operation future that remains cancellable when dropped.
+pub type OverlayFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, OverlayError>> + Send + 'a>>;
+
 /// Contract implemented by every overlay provider.
 pub trait OverlayTransport: Send + Sync + fmt::Debug {
     /// Return the stable machine identifier for this provider.
@@ -251,13 +258,13 @@ pub trait OverlayTransport: Send + Sync + fmt::Debug {
     fn validate_bind_addr(&self, addr: IpAddr) -> Result<(), BindAddrError>;
 
     /// Return this host's current safe listener address.
-    fn listener_addr(&self) -> Result<IpAddr, OverlayError>;
+    fn listener_addr(&self) -> OverlayFuture<'_, IpAddr>;
 
     /// Resolve a user selector to one exact, policy-approved peer.
-    fn resolve_peer(&self, host: &str) -> Result<ResolvedPeer, OverlayError>;
+    fn resolve_peer<'a>(&'a self, host: &'a str) -> OverlayFuture<'a, ResolvedPeer>;
 
-    /// Enumerate visible peers while preserving address-less candidates.
-    fn discover_peers(&self) -> Result<Vec<DiscoveredPeer>, OverlayError>;
+    /// Enumerate visible remote peers while preserving address-less candidates.
+    fn discover_peers(&self) -> OverlayFuture<'_, Vec<DiscoveredPeer>>;
 }
 
 /// One transport paired with its configured daemon port.
@@ -302,8 +309,8 @@ impl ConfiguredTransport {
     /// # Errors
     ///
     /// Returns the provider's typed discovery error unchanged.
-    pub fn discover_peers(&self) -> Result<Vec<RoutedPeer>, OverlayError> {
-        self.transport.discover_peers().map(|peers| {
+    pub async fn discover_peers(&self) -> Result<Vec<RoutedPeer>, OverlayError> {
+        self.transport.discover_peers().await.map(|peers| {
             peers
                 .into_iter()
                 .map(|peer| RoutedPeer {
@@ -321,9 +328,8 @@ impl ConfiguredTransport {
     }
 
     /// Return this entry's current listener diagnostic.
-    #[must_use]
-    pub fn diagnostic(&self) -> OverlayDiagnostic {
-        match self.transport.listener_addr() {
+    pub async fn diagnostic(&self) -> OverlayDiagnostic {
+        match self.transport.listener_addr().await {
             Ok(address) => OverlayDiagnostic {
                 overlay: self.id().clone(),
                 port: self.port(),
@@ -392,31 +398,33 @@ impl OverlayRegistry {
     /// # Errors
     ///
     /// Returns typed unknown, ambiguous, or aggregated provider failures.
-    pub fn resolve_host(&self, host: &str) -> Result<OverlayRoute, RegistryError> {
+    pub async fn resolve_host(&self, host: &str) -> Result<OverlayRoute, RegistryError> {
         let mut routes = Vec::new();
         let mut failures = Vec::new();
         let mut collision_overlays = Vec::new();
-        for entry in self.entries() {
-            match entry.transport.resolve_peer(host) {
+        let results = join_all(self.entries().iter().map(|entry| async move {
+            (
+                entry.id().clone(),
+                entry.port(),
+                entry.transport.resolve_peer(host).await,
+            )
+        }))
+        .await;
+        for (overlay, port, result) in results {
+            match result {
                 Ok(peer) => routes.push(OverlayRoute {
-                    overlay: entry.id().clone(),
+                    overlay,
                     peer_id: peer.peer_id,
                     display_name: peer.display_name,
                     fqdn: peer.fqdn,
-                    addr: SocketAddr::new(peer.address, entry.port()),
+                    addr: SocketAddr::new(peer.address, port),
                 }),
                 Err(OverlayError::HostUnknown { .. }) => {}
                 Err(error @ OverlayError::PeerCollision { .. }) => {
-                    collision_overlays.push(entry.id().clone());
-                    failures.push(OverlayFailure {
-                        overlay: entry.id().clone(),
-                        error,
-                    });
+                    collision_overlays.push(overlay.clone());
+                    failures.push(OverlayFailure { overlay, error });
                 }
-                Err(error) => failures.push(OverlayFailure {
-                    overlay: entry.id().clone(),
-                    error,
-                }),
+                Err(error) => failures.push(OverlayFailure { overlay, error }),
             }
         }
         if !collision_overlays.is_empty() {
@@ -443,12 +451,8 @@ impl OverlayRegistry {
     }
 
     /// Collect one typed diagnostic per configured overlay.
-    #[must_use]
-    pub fn diagnostics(&self) -> Vec<OverlayDiagnostic> {
-        self.entries()
-            .iter()
-            .map(ConfiguredTransport::diagnostic)
-            .collect()
+    pub async fn diagnostics(&self) -> Vec<OverlayDiagnostic> {
+        join_all(self.entries().iter().map(ConfiguredTransport::diagnostic)).await
     }
 }
 

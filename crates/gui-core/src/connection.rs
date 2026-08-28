@@ -265,7 +265,10 @@ pub(crate) async fn connect_client(
             Ok(Client::connect_with_options(host, socket_path, options).await?)
         }
         HostTransport::Tcp { addr } => {
-            Ok(Client::connect_tcp_addr_with_options(config.id.as_str(), *addr, options).await?)
+            Ok(
+                Client::connect_trusted_tcp_addr_with_options(config.id.as_str(), *addr, options)
+                    .await?,
+            )
         }
     }
 }

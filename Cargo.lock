@@ -3414,7 +3414,9 @@ dependencies = [
 name = "pohunek-overlay"
 version = "0.31.5"
 dependencies = [
+ "futures",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

@@ -132,7 +132,7 @@ async fn subscription_remote_ack_error_maps_to_remote_protocol_and_preserves_cod
         spawn_tcp_subscription_daemon(response_error_line_for(&request, source.clone()), vec![])
             .await;
 
-    let client = Client::connect_tcp_addr(HOST, daemon.addr)
+    let client = Client::connect_trusted_tcp_addr(HOST, daemon.addr)
         .await
         .expect("connect tcp subscription test daemon");
     let err = client
@@ -352,7 +352,7 @@ async fn remote_subscription_wrong_version_event_preserves_host_context() {
     )
     .await;
 
-    let client = Client::connect_tcp_addr(HOST, daemon.addr)
+    let client = Client::connect_trusted_tcp_addr(HOST, daemon.addr)
         .await
         .expect("connect remote subscription daemon");
     let mut subscription = client

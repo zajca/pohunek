@@ -425,7 +425,7 @@ async fn query_sessions(host: &str) -> Option<Vec<SessionInfo>> {
             .iter()
             .find(|record| record.name.as_deref() == Some(host))?;
         let route = completion_route(record)?;
-        Client::connect_tcp_addr_with_options(host, route, options)
+        Client::connect_trusted_tcp_addr_with_options(host, route, options)
             .await
             .ok()?
     };

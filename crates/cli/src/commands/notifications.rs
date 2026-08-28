@@ -548,13 +548,20 @@ fn effective_notification_host(global: &str, target: &NotificationTarget) -> Str
     target.host.as_deref().unwrap_or(global).to_owned()
 }
 
+async fn connect_target(paths: &Paths, target: &HostTarget) -> Result<Client, CliError> {
+    match target.trusted_addr {
+        Some(addr) => Client::connect_trusted_tcp_addr(&target.host_id, addr).await,
+        None => Client::connect(&target.transport_target, paths).await,
+    }
+}
+
 async fn list_on_target(
     paths: &Paths,
     target: HostTarget,
     params: NotificationListParams,
     agent: Option<protocol::AgentKind>,
 ) -> Result<NotificationListResult, protocol::ProtocolError> {
-    let client = Client::connect(&target.transport_target, paths)
+    let client = connect_target(paths, &target)
         .await
         .map_err(error_details)?;
     let mut sdk = client.into_sdk();
@@ -576,7 +583,7 @@ async fn policy_get_on_target(
     paths: &Paths,
     target: HostTarget,
 ) -> Result<NotificationPolicyResult, protocol::ProtocolError> {
-    let client = Client::connect(&target.transport_target, paths)
+    let client = connect_target(paths, &target)
         .await
         .map_err(error_details)?;
     let mut sdk = client.into_sdk();
@@ -593,7 +600,7 @@ async fn policy_set_on_target(
     kind: NotificationKind,
     enabled: bool,
 ) -> Result<NotificationPolicyResult, protocol::ProtocolError> {
-    let mut client = Client::connect(&target.transport_target, paths)
+    let mut client = connect_target(paths, &target)
         .await
         .map_err(error_details)?
         .into_sdk();
@@ -616,7 +623,7 @@ async fn retention_prune_on_target(
     target: HostTarget,
     params: NotificationRetentionParams,
 ) -> Result<NotificationRetentionResult, protocol::ProtocolError> {
-    let client = Client::connect(&target.transport_target, paths)
+    let client = connect_target(paths, &target)
         .await
         .map_err(error_details)?;
     let mut sdk = client.into_sdk();
@@ -631,7 +638,7 @@ async fn watch_one(
     target: HostTarget,
     mode: WatchOutputMode,
 ) -> Result<(), protocol::ProtocolError> {
-    let client = Client::connect(&target.transport_target, paths)
+    let client = connect_target(paths, &target)
         .await
         .map_err(error_details)?;
     let request = Request::new(

@@ -422,6 +422,8 @@ addresses. Stable client identity is overlay-qualified, so equal names,
 addresses, or provider IDs cannot collide across overlays. Address-less peers
 remain candidates. The public `HostRecord` carries `overlay`, optional
 `peer_id`, optional IP-only `address`, and the effective per-overlay `port`.
+Provider discovery returns remote peers only; GUI, web, and CLI fan-out
+consumers add the explicit local Unix-socket target themselves.
 
 The production NetBird adapter remains tokenless and local. There is no signed
 manifest exchange.
@@ -440,7 +442,9 @@ defensively (optional fields default, unknown fields ignored) and pinned with
 recorded fixtures in tests. NetBird/VPN names and addresses are display and
 routing hints only. Raw IP selectors must match current peer state, ambiguous
 peer names are rejected, and spoofed addresses outside NetBird's CGNAT range
-remain non-dialable candidates.
+remain non-dialable candidates. Registry-resolving clients never interpret a
+socket-address literal as a policy bypass; only routes already validated by
+discovery use the explicit trusted-address connection API.
 
 ## Projects and Worktree Isolation
 

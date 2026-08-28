@@ -3,8 +3,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
 
 use overlay::{
-    BindAddrError, ConfiguredTransport, DiscoveredPeer, OverlayError, OverlayId, OverlayRegistry,
-    OverlayTransport, RegistryError, ResolvedPeer,
+    BindAddrError, ConfiguredTransport, DiscoveredPeer, OverlayError, OverlayFuture, OverlayId,
+    OverlayRegistry, OverlayTransport, RegistryError, ResolvedPeer,
 };
 
 #[derive(Debug)]
@@ -93,23 +93,26 @@ impl OverlayTransport for MemoryTransport {
         }
     }
 
-    fn listener_addr(&self) -> Result<IpAddr, OverlayError> {
-        self.listener.clone()
+    fn listener_addr(&self) -> OverlayFuture<'_, IpAddr> {
+        let listener = self.listener.clone();
+        Box::pin(async move { listener })
     }
 
-    fn resolve_peer(&self, host: &str) -> Result<ResolvedPeer, OverlayError> {
-        self.resolutions.get(host).cloned().unwrap_or_else(|| {
+    fn resolve_peer<'a>(&'a self, host: &'a str) -> OverlayFuture<'a, ResolvedPeer> {
+        let result = self.resolutions.get(host).cloned().unwrap_or_else(|| {
             self.listener.clone().and_then(|_| {
                 Err(OverlayError::HostUnknown {
                     host: host.to_owned(),
                     overlay: self.id.clone(),
                 })
             })
-        })
+        });
+        Box::pin(async move { result })
     }
 
-    fn discover_peers(&self) -> Result<Vec<DiscoveredPeer>, OverlayError> {
-        self.listener.clone().map(|_| self.peers.clone())
+    fn discover_peers(&self) -> OverlayFuture<'_, Vec<DiscoveredPeer>> {
+        let result = self.listener.clone().map(|_| self.peers.clone());
+        Box::pin(async move { result })
     }
 }
 
@@ -117,8 +120,8 @@ fn configured(transport: MemoryTransport, port: u16) -> ConfiguredTransport {
     ConfiguredTransport::new(Arc::new(transport), port).expect("configured transport")
 }
 
-#[test]
-fn contract_preserves_missing_identity_and_rejects_spoofed_address() {
+#[tokio::test]
+async fn contract_preserves_missing_identity_and_rejects_spoofed_address() {
     let listener = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let safe = "100.64.0.2".parse().expect("safe address");
     let spoofed = "203.0.113.9".parse().expect("spoofed address");
@@ -129,7 +132,7 @@ fn contract_preserves_missing_identity_and_rejects_spoofed_address() {
     transport.add_peer("spoofed", Some("peer-spoofed"), Some(spoofed));
     let entry = configured(transport, 17421);
 
-    let peers = entry.discover_peers().expect("discovery");
+    let peers = entry.discover_peers().await.expect("discovery");
     assert_eq!(peers.len(), 3);
     assert_eq!(peers[0].addr, Some(SocketAddr::new(safe, 17421)));
     assert_eq!(peers[1].peer_id, None);
@@ -138,8 +141,8 @@ fn contract_preserves_missing_identity_and_rejects_spoofed_address() {
     assert_eq!(peers[2].addr, None);
 }
 
-#[test]
-fn registry_isolates_failure_but_rejects_name_collisions() {
+#[tokio::test]
+async fn registry_isolates_failure_but_rejects_name_collisions() {
     let listener = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let healthy_address = "100.64.0.2".parse().expect("healthy address");
     let mut healthy = MemoryTransport::new("healthy", listener);
@@ -153,6 +156,7 @@ fn registry_isolates_failure_but_rejects_name_collisions() {
 
     let route = registry
         .resolve_host("build")
+        .await
         .expect("healthy overlay wins");
     assert_eq!(route.overlay.as_str(), "healthy");
     assert_eq!(route.addr, SocketAddr::new(healthy_address, 17002));
@@ -165,7 +169,7 @@ fn registry_isolates_failure_but_rejects_name_collisions() {
     ])
     .expect("collision registry");
     assert!(matches!(
-        registry.resolve_host("build"),
+        registry.resolve_host("build").await,
         Err(RegistryError::AmbiguousHost { overlays, .. })
             if overlays.iter().any(|id| id.as_str() == "collision")
                 && overlays.iter().any(|id| id.as_str() == "healthy")
@@ -189,8 +193,8 @@ fn registry_rejects_duplicate_ids_and_zero_ports() {
     ));
 }
 
-#[test]
-fn diagnostics_and_concurrent_listeners_keep_per_overlay_ports() {
+#[tokio::test]
+async fn diagnostics_and_concurrent_listeners_keep_per_overlay_ports() {
     let listener = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let first_socket = TcpListener::bind(SocketAddr::new(listener, 0)).expect("first listener");
     let first_port = first_socket.local_addr().expect("first address").port();
@@ -203,7 +207,7 @@ fn diagnostics_and_concurrent_listeners_keep_per_overlay_ports() {
         configured(MemoryTransport::new("memory-b", listener), second_port),
     ])
     .expect("registry");
-    let diagnostics = registry.diagnostics();
+    let diagnostics = registry.diagnostics().await;
     assert_eq!(
         diagnostics[0].listener,
         Some(SocketAddr::new(listener, first_port))

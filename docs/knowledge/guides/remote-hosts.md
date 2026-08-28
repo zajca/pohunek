@@ -24,7 +24,9 @@ Use these commands for orientation:
 - `pohunek host discover --json` to enumerate configured overlay peers and probe
   daemons. Each record carries its overlay, optional provider peer identity,
   address, and that overlay's effective daemon port. Address-less peers remain
-  visible as candidates instead of being discarded.
+  visible as candidates instead of being discarded. Discovery emits remote
+  peers only; GUI, web, and `--all-hosts` consumers add the explicit local target
+  through its Unix socket.
 - `pohunek host list --json` to list known live peers. These commands need the
   local overlay CLI/state, but do not connect to local `pohunekd`; a short
   owner-private cache avoids repeated probing, and `--refresh` bypasses it.
@@ -68,6 +70,8 @@ a wildcard requires explicit install-time confirmation. See
 Unqualified names that resolve in more than one overlay fail closed. Clients
 keep the overlay-qualified peer identity for display and caching, and reuse the
 exact discovered socket route for control calls and the separate raw attach
-connection. A failure in one configured overlay does not hide healthy peers
+connection through the explicit trusted-route API. A socket-address literal
+cannot bypass current overlay membership and configured-port policy. A failure
+in one configured overlay does not hide healthy peers
 from another overlay; discovery reports an error only when every provider
 fails.

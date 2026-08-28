@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::net::SocketAddr;
 
 use futures::{stream, StreamExt as _};
 use protocol::{HostClass, HostRecord, ProtocolError};
@@ -41,6 +42,9 @@ pub(crate) struct HostTarget {
     pub(crate) host_id: String,
     /// Transport target passed to the SDK client.
     pub(crate) transport_target: String,
+    /// Provider-validated route retained separately from untrusted selectors.
+    #[serde(skip)]
+    pub(crate) trusted_addr: Option<SocketAddr>,
 }
 
 impl HostTarget {
@@ -50,6 +54,17 @@ impl HostTarget {
         Self {
             host_id: host_id.into(),
             transport_target: transport_target.into(),
+            trusted_addr: None,
+        }
+    }
+
+    /// Create a target from one route validated by overlay discovery.
+    #[must_use]
+    pub(crate) fn trusted_remote(host_id: impl Into<String>, addr: SocketAddr) -> Self {
+        Self {
+            host_id: host_id.into(),
+            transport_target: addr.to_string(),
+            trusted_addr: Some(addr),
         }
     }
 }
@@ -187,16 +202,17 @@ fn reachable_target(record: &HostRecord) -> Option<HostTarget> {
     match &record.class {
         HostClass::ReachableDaemon { .. } => {
             let address = record.address.as_deref()?.parse().ok()?;
-            let target = std::net::SocketAddr::new(address, record.port).to_string();
+            let addr = std::net::SocketAddr::new(address, record.port);
+            let target = addr.to_string();
             let identity = record
                 .peer_id
                 .as_deref()
                 .or(record.fqdn.as_deref())
                 .or(record.name.as_deref())
                 .unwrap_or(&target);
-            Some(HostTarget::new(
+            Some(HostTarget::trusted_remote(
                 format!("{}:{identity}", record.overlay),
-                target,
+                addr,
             ))
         }
         HostClass::VersionMismatch { .. } | HostClass::Unreachable | HostClass::Candidate => None,
@@ -254,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn all_hosts_orders_local_and_overlay_qualified_reachable_hosts_by_host_id() {
+    fn all_hosts_adds_one_local_and_routes_only_discovered_peers_as_remote() {
         let records = vec![
             record("host-c", HostClass::Unreachable),
             record(
@@ -278,6 +294,17 @@ mod tests {
             .map(|target| target.host_id.as_str())
             .collect();
         assert_eq!(ids, ["local", "netbird:host-a", "netbird:host-b"]);
+        assert_eq!(
+            targets
+                .iter()
+                .filter(|target| target.host_id == LOCAL_HOST)
+                .count(),
+            1
+        );
+        assert!(targets[0].trusted_addr.is_none());
+        assert!(targets[1..]
+            .iter()
+            .all(|target| target.trusted_addr.is_some()));
         let transport_targets: Vec<_> = targets
             .iter()
             .map(|target| target.transport_target.as_str())

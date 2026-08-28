@@ -33,6 +33,17 @@ impl Client {
         Self::connect_with_options(host, paths, options).await
     }
 
+    /// Connect to one route already validated by overlay discovery.
+    pub(crate) async fn connect_trusted_tcp_addr(
+        host: &str,
+        addr: std::net::SocketAddr,
+    ) -> Result<Self, CliError> {
+        let inner = pohunek_client::Client::connect_trusted_tcp_addr(host, addr)
+            .await
+            .map_err(map_connect_error)?;
+        Ok(Self { inner })
+    }
+
     async fn connect_with_options(
         host: &str,
         paths: &Paths,

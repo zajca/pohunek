@@ -11,7 +11,11 @@ name = "overlay"
 path = "src/lib.rs"
 
 [dependencies]
+futures = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
 
 [lints]
 workspace = true

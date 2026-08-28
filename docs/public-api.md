@@ -1159,19 +1159,23 @@ Public exports:
   default bounded probes.
 - `discover_hosts_with_options(registry, options)`: the same discovery with an
   explicit per-probe timeout, overall deadline, and concurrency bound. Provider
-  failures are isolated unless every configured overlay fails.
+  failures are isolated unless every configured overlay fails. Providers return
+  remote peers only; clients that need a local entry add their Unix-socket target
+  explicitly.
 - Raw and attach helpers: `connect_raw*` and `attach_raw*`.
 
 Connection APIs:
 
 - `Client::connect(host, socket_path)`: `""` and `"local"` use the Unix socket;
   any other host is resolved through the default configured overlay registry
-  and dialed over its exact per-overlay route.
+  and dialed over its exact per-overlay route. A socket-address literal is not a
+  bypass and must resolve under current provider policy.
 - `Client::connect_with_registry(host, socket_path, registry)`: the same routing
   with a caller-supplied registry; ambiguous names fail closed.
 - `Client::connect_local(socket_path)`: direct Unix socket.
-- `Client::connect_tcp_addr(host, addr)`: direct TCP with host context preserved
-  for remote errors.
+- `Client::connect_trusted_tcp_addr(host, addr)`: direct TCP for a route already
+  validated by configured overlay discovery, with host context preserved for
+  remote errors.
 - `*_with_options` variants accept `ClientOptions`.
 - `Client::attach_raw(stream_id)`: opens the raw attach connection on the exact
   endpoint selected for that client, without re-resolving the peer.

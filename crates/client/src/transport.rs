@@ -199,7 +199,7 @@ impl Client {
             let registry = crate::default_overlay_registry()?;
             let addr =
                 resolve_remote_addr(host.to_owned(), options.connect_timeout, registry).await?;
-            Self::connect_tcp_addr_with_options(host, addr, options).await
+            Self::connect_trusted_tcp_addr_with_options(host, addr, options).await
         }
     }
 
@@ -239,7 +239,7 @@ impl Client {
         } else {
             let addr =
                 resolve_remote_addr(host.to_owned(), options.connect_timeout, registry).await?;
-            Self::connect_tcp_addr_with_options(host, addr, options).await
+            Self::connect_trusted_tcp_addr_with_options(host, addr, options).await
         }
     }
 
@@ -266,16 +266,20 @@ impl Client {
         })
     }
 
-    /// Connect to a daemon on `addr`, preserving `host` for remote errors.
-    pub async fn connect_tcp_addr(
+    /// Connect to a daemon on a caller-validated `addr`.
+    ///
+    /// This explicit escape hatch preserves `host` for remote errors. Callers
+    /// must pass a route already validated by configured overlay discovery;
+    /// untrusted selectors belong in [`Self::connect_with_registry`].
+    pub async fn connect_trusted_tcp_addr(
         host: impl Into<String>,
         addr: SocketAddr,
     ) -> Result<Self, ClientError> {
-        Self::connect_tcp_addr_with_options(host, addr, ClientOptions::default()).await
+        Self::connect_trusted_tcp_addr_with_options(host, addr, ClientOptions::default()).await
     }
 
-    /// Connect to a daemon on `addr` with explicit transport settings.
-    pub async fn connect_tcp_addr_with_options(
+    /// Connect to a daemon on a caller-validated `addr` with transport settings.
+    pub async fn connect_trusted_tcp_addr_with_options(
         host: impl Into<String>,
         addr: SocketAddr,
         options: ClientOptions,
@@ -945,21 +949,8 @@ async fn resolve_remote_addr(
     connect_timeout: Duration,
     registry: OverlayRegistry,
 ) -> Result<SocketAddr, ClientError> {
-    if let Ok(addr) = host.parse::<SocketAddr>() {
-        return Ok(addr);
-    }
-    let discovery_host = host.clone();
-    let task = tokio::task::spawn_blocking(move || {
-        registry
-            .resolve_host(&discovery_host)
-            .map(|route| route.addr)
-            .map_err(ClientError::from)
-    });
-
-    match tokio::time::timeout(connect_timeout, task).await {
-        Ok(result) => result.map_err(|err| ClientError::RemoteDiscoveryFailed {
-            detail: err.to_string(),
-        })?,
+    match tokio::time::timeout(connect_timeout, registry.resolve_host(&host)).await {
+        Ok(result) => result.map(|route| route.addr).map_err(ClientError::from),
         Err(_elapsed) => Err(ClientError::RemoteDiscoveryFailed {
             detail: format!("timed out resolving remote host '{host}' after {connect_timeout:?}"),
         }),
@@ -1043,9 +1034,78 @@ fn response_id_mismatch_error(
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+
     use super::*;
+    use overlay::{
+        BindAddrError, ConfiguredTransport, DiscoveredPeer, OverlayError, OverlayFuture, OverlayId,
+        OverlayTransport, ResolvedPeer,
+    };
     use tokio::io::{AsyncBufReadExt as _, BufReader};
     use tokio::net::TcpListener;
+
+    #[derive(Debug)]
+    struct PolicyTransport {
+        id: OverlayId,
+        member: IpAddr,
+    }
+
+    impl OverlayTransport for PolicyTransport {
+        fn id(&self) -> &OverlayId {
+            &self.id
+        }
+
+        fn validate_bind_addr(&self, addr: IpAddr) -> Result<(), BindAddrError> {
+            if addr == self.member {
+                Ok(())
+            } else {
+                Err(BindAddrError::NotMember(addr))
+            }
+        }
+
+        fn listener_addr(&self) -> OverlayFuture<'_, IpAddr> {
+            let member = self.member;
+            Box::pin(async move { Ok(member) })
+        }
+
+        fn resolve_peer<'a>(&'a self, host: &'a str) -> OverlayFuture<'a, ResolvedPeer> {
+            let result = if host == self.member.to_string() || host == "member" {
+                Ok(ResolvedPeer {
+                    peer_id: Some("policy-member".to_owned()),
+                    display_name: Some("member".to_owned()),
+                    fqdn: Some("member.test".to_owned()),
+                    address: self.member,
+                })
+            } else {
+                Err(OverlayError::HostUnknown {
+                    host: host.to_owned(),
+                    overlay: self.id.clone(),
+                })
+            };
+            Box::pin(async move { result })
+        }
+
+        fn discover_peers(&self) -> OverlayFuture<'_, Vec<DiscoveredPeer>> {
+            let peer = DiscoveredPeer {
+                peer_id: Some("policy-member".to_owned()),
+                display_name: Some("member".to_owned()),
+                fqdn: Some("member.test".to_owned()),
+                address: Some(self.member),
+            };
+            Box::pin(async move { Ok(vec![peer]) })
+        }
+    }
+
+    fn policy_registry(member: IpAddr, port: u16) -> OverlayRegistry {
+        let transport = Arc::new(PolicyTransport {
+            id: OverlayId::new("policy").expect("policy overlay id"),
+            member,
+        });
+        let configured =
+            ConfiguredTransport::new(transport, port).expect("configured policy transport");
+        OverlayRegistry::new(vec![configured]).expect("policy registry")
+    }
 
     #[test]
     fn origin_markers_are_atomic_and_payload_free_on_failure() {
@@ -1089,6 +1149,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_connect_rejects_socket_literal_before_dialing() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind policy fixture");
+        let address = listener.local_addr().expect("policy fixture address");
+        let selector = address.to_string();
+        let error = Client::connect_with_registry(
+            &selector,
+            "/unused/local.sock",
+            policy_registry(address.ip(), address.port()),
+        )
+        .await
+        .expect_err("socket literal must not bypass overlay policy");
+
+        assert!(matches!(
+            error,
+            ClientError::OverlayRegistry(overlay::RegistryError::HostUnknown(host))
+                if host == selector
+        ));
+        tokio::time::timeout(Duration::from_millis(25), listener.accept())
+            .await
+            .expect_err("rejected selector must not reach the socket");
+    }
+
+    #[tokio::test]
+    async fn registry_connect_uses_policy_member_and_configured_port() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind policy fixture");
+        let address = listener.local_addr().expect("policy fixture address");
+        let accepted = tokio::spawn(async move {
+            let (_stream, peer) = listener.accept().await.expect("accept policy client");
+            peer
+        });
+
+        let client = Client::connect_with_registry(
+            &address.ip().to_string(),
+            "/unused/local.sock",
+            policy_registry(address.ip(), address.port()),
+        )
+        .await
+        .expect("current member IP resolves through provider policy");
+
+        accepted.await.expect("policy accept task");
+        drop(client);
+    }
+
+    #[tokio::test]
     async fn remote_raw_request_carries_complete_origin_pair() {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1116,7 +1224,7 @@ mod tests {
             request
         });
 
-        let mut client = Client::connect_tcp_addr("fixture-remote", address)
+        let mut client = Client::connect_trusted_tcp_addr("fixture-remote", address)
             .await
             .expect("connect remote");
         client.origin = Some(RequestOrigin {
@@ -1204,7 +1312,7 @@ mod tests {
             "timed_out": true
         });
         let (address, server) = spawn_dedicated_capture_server(result).await;
-        let mut client = Client::connect_tcp_addr("fixture-remote", address)
+        let mut client = Client::connect_trusted_tcp_addr("fixture-remote", address)
             .await
             .expect("connect remote");
         client.origin = Some(test_request_origin());
@@ -1238,7 +1346,7 @@ mod tests {
             "output_offset": "0"
         });
         let (address, server) = spawn_dedicated_capture_server(result).await;
-        let mut client = Client::connect_tcp_addr("fixture-remote", address)
+        let mut client = Client::connect_trusted_tcp_addr("fixture-remote", address)
             .await
             .expect("connect remote");
         client.origin = Some(test_request_origin());
@@ -1283,7 +1391,7 @@ mod tests {
             .await;
             request
         });
-        let mut client = Client::connect_tcp_addr("fixture-remote", address)
+        let mut client = Client::connect_trusted_tcp_addr("fixture-remote", address)
             .await
             .expect("connect remote");
         client.origin = Some(test_request_origin());
@@ -1315,7 +1423,7 @@ mod tests {
             raw.read_line(&mut line).await.expect("read attach header");
             line
         });
-        let client = Client::connect_tcp_addr("overlay-qualified-peer", address)
+        let client = Client::connect_trusted_tcp_addr("overlay-qualified-peer", address)
             .await
             .expect("connect selected endpoint");
 

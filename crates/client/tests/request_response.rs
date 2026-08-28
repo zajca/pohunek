@@ -86,7 +86,8 @@ async fn request_response_connect_local_sends_json_request_line_and_returns_ok_p
 }
 
 #[tokio::test]
-async fn request_response_connect_tcp_addr_sends_json_request_line_and_returns_ok_payload() {
+async fn request_response_connect_trusted_tcp_addr_sends_json_request_line_and_returns_ok_payload()
+{
     let (result, request_line) = run_remote(Reply::Line(response_ok_line())).await;
 
     assert_eq!(result.expect("remote request succeeds"), ok_payload());
@@ -352,7 +353,7 @@ async fn waiting_output_uses_a_dedicated_remote_tcp_connection() {
         (handshake, output_request)
     });
 
-    let mut client = Client::connect_tcp_addr(HOST, addr)
+    let mut client = Client::connect_trusted_tcp_addr(HOST, addr)
         .await
         .expect("connect tcp daemon");
     client.handshake().await.expect("negotiate protocol");
@@ -1084,7 +1085,7 @@ async fn run_local(reply: Reply) -> (Result<Value, ClientError>, String) {
 
 async fn run_remote(reply: Reply) -> (Result<Value, ClientError>, String) {
     let daemon = spawn_tcp_daemon(reply).await;
-    let mut client = Client::connect_tcp_addr(HOST, daemon.addr)
+    let mut client = Client::connect_trusted_tcp_addr(HOST, daemon.addr)
         .await
         .expect("connect tcp test daemon");
     let result = client.request(&test_request()).await;

@@ -4,8 +4,8 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use overlay::{
-    BindAddrError, ConfiguredTransport, DiscoveredPeer, OverlayError, OverlayId, OverlayRegistry,
-    OverlayTransport, ResolvedPeer,
+    BindAddrError, ConfiguredTransport, DiscoveredPeer, OverlayError, OverlayFuture, OverlayId,
+    OverlayRegistry, OverlayTransport, ResolvedPeer,
 };
 
 use crate::{NetbirdError, NetbirdStatus, Peer};
@@ -48,21 +48,27 @@ impl OverlayTransport for NetbirdTransport {
         })
     }
 
-    fn listener_addr(&self) -> Result<IpAddr, OverlayError> {
-        let status = load_status(self.id())?;
-        status
-            .self_netbird_ip()
-            .ok_or_else(|| OverlayError::ListenerAddressMissing(self.id.clone()))
+    fn listener_addr(&self) -> OverlayFuture<'_, IpAddr> {
+        Box::pin(async move {
+            let status = load_status(self.id()).await?;
+            status
+                .self_netbird_ip()
+                .ok_or_else(|| OverlayError::ListenerAddressMissing(self.id.clone()))
+        })
     }
 
-    fn resolve_peer(&self, host: &str) -> Result<ResolvedPeer, OverlayError> {
-        let status = load_status(self.id())?;
-        resolve_from_status(&status, host, self.id())
+    fn resolve_peer<'a>(&'a self, host: &'a str) -> OverlayFuture<'a, ResolvedPeer> {
+        Box::pin(async move {
+            let status = load_status(self.id()).await?;
+            resolve_from_status(&status, host, self.id())
+        })
     }
 
-    fn discover_peers(&self) -> Result<Vec<DiscoveredPeer>, OverlayError> {
-        let status = load_status(self.id())?;
-        Ok(discover_from_status(&status))
+    fn discover_peers(&self) -> OverlayFuture<'_, Vec<DiscoveredPeer>> {
+        Box::pin(async move {
+            let status = load_status(self.id()).await?;
+            Ok(discover_from_status(&status))
+        })
     }
 }
 
@@ -87,8 +93,10 @@ pub fn configured_registry() -> Result<OverlayRegistry, OverlayError> {
     })
 }
 
-fn load_status(id: &OverlayId) -> Result<NetbirdStatus, OverlayError> {
-    crate::run_status().map_err(|error| map_error(error, id))
+async fn load_status(id: &OverlayId) -> Result<NetbirdStatus, OverlayError> {
+    crate::run_status_async()
+        .await
+        .map_err(|error| map_error(error, id))
 }
 
 fn map_error(error: NetbirdError, id: &OverlayId) -> OverlayError {
@@ -131,17 +139,7 @@ fn resolve_from_status(
 }
 
 fn discover_from_status(status: &NetbirdStatus) -> Vec<DiscoveredPeer> {
-    let mut peers = Vec::with_capacity(status.peers().len() + 1);
-    if let Some(address) = status.self_netbird_ip() {
-        peers.push(DiscoveredPeer {
-            peer_id: Some(address.to_string()),
-            display_name: status.self_fqdn().and_then(short_fqdn),
-            fqdn: status.self_fqdn().map(str::to_owned),
-            address: Some(address),
-        });
-    }
-    peers.extend(status.peers().iter().map(map_peer));
-    peers
+    status.peers().iter().map(map_peer).collect()
 }
 
 fn map_peer(peer: &Peer) -> DiscoveredPeer {
@@ -195,13 +193,37 @@ mod tests {
         );
 
         let peers = discover_from_status(&status);
-        assert_eq!(peers.len(), 4);
-        assert_eq!(peers[1].peer_id.as_deref(), Some("100.64.0.2"));
-        assert_eq!(peers[1].address, Some("100.64.0.2".parse().expect("safe")));
-        assert_eq!(peers[2].peer_id, None);
+        assert_eq!(peers.len(), 3);
+        assert_eq!(peers[0].peer_id.as_deref(), Some("100.64.0.2"));
+        assert_eq!(peers[0].address, Some("100.64.0.2".parse().expect("safe")));
+        assert_eq!(peers[1].peer_id, None);
+        assert_eq!(peers[1].address, None);
+        assert_eq!(peers[2].peer_id.as_deref(), Some("127.0.0.1"));
         assert_eq!(peers[2].address, None);
-        assert_eq!(peers[3].peer_id.as_deref(), Some("127.0.0.1"));
-        assert_eq!(peers[3].address, None);
+        assert!(peers
+            .iter()
+            .all(|peer| peer.address != status.self_netbird_ip()));
+    }
+
+    #[test]
+    fn discovery_excludes_local_self_from_remote_peers() {
+        let status = status(
+            r#"{
+                "netbirdIp":"100.64.0.1",
+                "fqdn":"self.example",
+                "peers":[
+                    {"fqdn":"remote.example","netbirdIp":"100.64.0.2"}
+                ]
+            }"#,
+        );
+
+        let peers = discover_from_status(&status);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].fqdn.as_deref(), Some("remote.example"));
+        assert_eq!(
+            peers[0].address,
+            Some("100.64.0.2".parse().expect("remote"))
+        );
     }
 
     #[test]

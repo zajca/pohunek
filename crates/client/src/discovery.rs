@@ -193,18 +193,8 @@ async fn discover_with_registry(
         let mut results = stream::iter(registry.entries().iter().cloned().enumerate())
             .map(|(index, configured)| async move {
                 let overlay = configured.id().clone();
-                let result = tokio::task::spawn_blocking(move || configured.discover_peers()).await;
-                match result {
-                    Ok(result) => (index, overlay, result),
-                    Err(join) => (
-                        index,
-                        overlay.clone(),
-                        Err(overlay::OverlayError::StateUnavailable {
-                            overlay,
-                            detail: format!("discovery task failed: {join}"),
-                        }),
-                    ),
-                }
+                let result = configured.discover_peers().await;
+                (index, overlay, result)
             })
             .buffer_unordered(registry.entries().len())
             .collect::<Vec<_>>()
@@ -361,6 +351,7 @@ fn short_hostname(fqdn: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     use protocol::{ProtocolVersion, ProtocolVersionRange, PROTOCOL_VERSION};
@@ -369,7 +360,7 @@ mod tests {
 
     use super::*;
     use overlay::{
-        BindAddrError, ConfiguredTransport, DiscoveredPeer, OverlayError, OverlayId,
+        BindAddrError, ConfiguredTransport, DiscoveredPeer, OverlayError, OverlayFuture, OverlayId,
         OverlayTransport, ResolvedPeer,
     };
 
@@ -408,19 +399,73 @@ mod tests {
             Ok(())
         }
 
-        fn listener_addr(&self) -> Result<IpAddr, OverlayError> {
-            Ok(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        fn listener_addr(&self) -> OverlayFuture<'_, IpAddr> {
+            Box::pin(async { Ok(IpAddr::V4(Ipv4Addr::LOCALHOST)) })
         }
 
-        fn resolve_peer(&self, host: &str) -> Result<ResolvedPeer, OverlayError> {
-            Err(OverlayError::HostUnknown {
+        fn resolve_peer<'a>(&'a self, host: &'a str) -> OverlayFuture<'a, ResolvedPeer> {
+            let error = OverlayError::HostUnknown {
                 host: host.to_owned(),
                 overlay: self.id.clone(),
-            })
+            };
+            Box::pin(async move { Err(error) })
         }
 
-        fn discover_peers(&self) -> Result<Vec<DiscoveredPeer>, OverlayError> {
-            self.discovery.clone()
+        fn discover_peers(&self) -> OverlayFuture<'_, Vec<DiscoveredPeer>> {
+            let discovery = self.discovery.clone();
+            Box::pin(async move { discovery })
+        }
+    }
+
+    #[derive(Debug)]
+    struct PendingTransport {
+        id: OverlayId,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl OverlayTransport for PendingTransport {
+        fn id(&self) -> &OverlayId {
+            &self.id
+        }
+
+        fn validate_bind_addr(&self, _addr: IpAddr) -> Result<(), BindAddrError> {
+            Ok(())
+        }
+
+        fn listener_addr(&self) -> OverlayFuture<'_, IpAddr> {
+            Box::pin(std::future::pending())
+        }
+
+        fn resolve_peer<'a>(&'a self, _host: &'a str) -> OverlayFuture<'a, ResolvedPeer> {
+            Box::pin(std::future::pending())
+        }
+
+        fn discover_peers(&self) -> OverlayFuture<'_, Vec<DiscoveredPeer>> {
+            Box::pin(DropSignal {
+                dropped: Arc::clone(&self.dropped),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct DropSignal {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl std::future::Future for DropSignal {
+        type Output = Result<Vec<DiscoveredPeer>, OverlayError>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
         }
     }
 
@@ -722,5 +767,35 @@ mod tests {
                     && failures[0].overlay.as_str() == "broken-a"
                     && failures[1].overlay.as_str() == "broken-b"
         ));
+    }
+
+    #[tokio::test]
+    async fn discovery_deadline_cancels_provider_future() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let pending = ConfiguredTransport::new(
+            Arc::new(PendingTransport {
+                id: OverlayId::new("pending").expect("id"),
+                dropped: Arc::clone(&dropped),
+            }),
+            17001,
+        )
+        .expect("pending transport");
+        let registry = OverlayRegistry::new(vec![pending]).expect("pending registry");
+        let options = DiscoveryOptions::new()
+            .with_deadline(Duration::from_millis(10))
+            .expect("test deadline");
+
+        let error = discover_with_registry(&registry, options, None)
+            .await
+            .expect_err("pending provider must hit the complete deadline");
+
+        assert!(matches!(
+            error,
+            crate::ClientError::RemoteDiscoveryFailed { .. }
+        ));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "deadline must drop the provider-owned future"
+        );
     }
 }
