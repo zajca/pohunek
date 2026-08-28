@@ -52,6 +52,10 @@ terminal_rows = 24
 
 Use an absolute `pohunek_bin` when a desktop launcher may have a different
 `PATH`. `attach_command` supports exactly `{bin}`, `{host}`, and `{id}`.
+For a discovered remote host, `{host}` is a provider-qualified
+`<overlay>:<address>` selector without a port. The spawned CLI revalidates that
+selector through the named provider and applies the provider's configured port;
+the GUI never passes its trusted `SocketAddr` as general CLI input.
 `notification_command` defaults to `notify-send` and receives title and body as
 separate arguments.
 

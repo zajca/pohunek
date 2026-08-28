@@ -31,7 +31,7 @@ Local launches can bootstrap or verify the daemon before starting a session.
 Remote launches preserve the existing remote session safety model and require a
 knowledge bundle materialized on the host that runs the agent.
 
-All clients use the same public protocol v2. Each request advertises an
+All clients use the same public protocol v3. Each request advertises an
 inclusive `minimum`/`maximum` version range; the first response selects the
 highest overlap for that connection. The old integer-v1 request envelope is not
 accepted. Waiting observation calls open dedicated connections so they do not

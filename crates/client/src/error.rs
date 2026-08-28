@@ -366,17 +366,24 @@ fn overlay_error_to_protocol(error: &overlay::OverlayError) -> ProtocolError {
 
 fn registry_error_to_protocol(error: &overlay::RegistryError) -> ProtocolError {
     match error {
-        overlay::RegistryError::HostUnknown(host) => ProtocolError::new(
+        overlay::RegistryError::HostUnknown(host)
+        | overlay::RegistryError::InvalidQualifiedHost(host) => ProtocolError::new(
             ErrorClass::Discovery,
             "host_unknown",
             format!("host '{host}' was not found among configured overlay peers"),
             Some("run `pohunek host list` to see reachable overlay peers".to_owned()),
         ),
+        overlay::RegistryError::OverlayNotConfigured(overlay) => ProtocolError::new(
+            ErrorClass::Discovery,
+            "host_unknown",
+            format!("overlay '{overlay}' is not configured"),
+            Some("run `pohunek host list` to see configured overlay selectors".to_owned()),
+        ),
         overlay::RegistryError::AmbiguousHost { host, overlays } => ProtocolError::new(
             ErrorClass::Discovery,
             "overlay_host_ambiguous",
             format!("host '{host}' exists on multiple overlays: {overlays:?}"),
-            Some("select the overlay-qualified address shown by `pohunek host list`".to_owned()),
+            Some("select the provider-qualified selector shown by `pohunek host list`".to_owned()),
         ),
         overlay::RegistryError::HostUnavailable { failures, .. } if failures.len() == 1 => {
             overlay_error_to_protocol(&failures[0].error)

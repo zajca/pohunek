@@ -1,8 +1,9 @@
 # Hermes Operator Plugin Migration and Rollback
 
-This migration applies after the fleet has crossed the one-time M1 public
-protocol transition. M3 does not change public protocol version `2`; it adds a
-local, profile-owned Hermes plugin lifecycle to the CLI.
+This is a historical M1-to-M3 migration record. At that time, M3 did not change
+the then-current public protocol v2; it added a local, profile-owned Hermes
+plugin lifecycle to the CLI. Current releases use protocol v3 and follow the
+[current update runbook](../knowledge/runbooks/update-after-release.md).
 
 ## Upgrade order
 
@@ -12,9 +13,9 @@ local, profile-owned Hermes plugin lifecycle to the CLI.
 2. On each host, install the matching `pohunek-sessiond`, `pohunekd`, and local
    clients. Restart/reconcile the daemon and leave live workers alone; the
    daemon handles its current/previous private worker compatibility window.
-3. Upgrade remaining clients and verify each relevant host pair negotiates a
-   public protocol range. M2 and M3 need no new fleet-wide boundary once this is
-   true.
+3. Historically, upgrade remaining clients and verify each relevant host pair
+   negotiated a public protocol range. M2 and M3 required no additional
+   fleet-wide boundary after the M1 transition.
 4. Select one Hermes profile or custom absolute home and install the plugin with
    explicit `--access-mode` and `--allow-host` values. Start with `manage` and
    `local` for a canary.

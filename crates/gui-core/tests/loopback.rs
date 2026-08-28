@@ -2583,7 +2583,7 @@ async fn stop_session(host: &HostConfig, id: &SessionId) {
 
 async fn client(host: &HostConfig) -> Client {
     match host.transport {
-        pohunek_gui_core::HostTransport::Tcp { addr } => {
+        pohunek_gui_core::HostTransport::Tcp { addr, .. } => {
             Client::connect_trusted_tcp_addr(host.id.as_str(), addr)
                 .await
                 .expect("connect tcp")

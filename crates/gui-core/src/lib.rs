@@ -170,8 +170,11 @@ pub enum HostTransport {
     Local { socket_path: PathBuf },
     /// Remote daemon resolved by the SDK through `NetBird`.
     Remote { host: String, socket_path: PathBuf },
-    /// Remote daemon over a concrete TCP address.
-    Tcp { addr: SocketAddr },
+    /// Remote daemon over a trusted TCP route with a policy-resolved attach selector.
+    Tcp {
+        addr: SocketAddr,
+        attach_host: String,
+    },
 }
 
 /// Static connection config for one host.
@@ -196,9 +199,30 @@ impl HostConfig {
     /// Build a TCP host config.
     #[must_use]
     pub fn tcp(id: impl Into<String>, addr: SocketAddr) -> Self {
+        let id = id.into();
+        Self {
+            id: HostId::new(id.clone()),
+            transport: HostTransport::Tcp {
+                addr,
+                attach_host: id,
+            },
+        }
+    }
+
+    /// Build a trusted TCP config whose external attach command re-resolves a
+    /// provider-qualified selector through CLI overlay policy.
+    #[must_use]
+    pub fn tcp_with_attach_host(
+        id: impl Into<String>,
+        addr: SocketAddr,
+        attach_host: impl Into<String>,
+    ) -> Self {
         Self {
             id: HostId::new(id),
-            transport: HostTransport::Tcp { addr },
+            transport: HostTransport::Tcp {
+                addr,
+                attach_host: attach_host.into(),
+            },
         }
     }
 
@@ -224,7 +248,7 @@ impl HostConfig {
         match &self.transport {
             HostTransport::Local { .. } => String::new(),
             HostTransport::Remote { host, .. } => host.clone(),
-            HostTransport::Tcp { addr } => addr.to_string(),
+            HostTransport::Tcp { attach_host, .. } => attach_host.clone(),
         }
     }
 }
@@ -321,10 +345,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tcp_attach_uses_the_exact_selected_route() {
+    fn tcp_attach_uses_the_policy_resolved_selector() {
         let addr = "127.0.0.1:17421".parse().expect("test socket address");
-        let host = HostConfig::tcp("memory/peer-a", addr);
+        let host = HostConfig::tcp_with_attach_host("memory:peer-a", addr, "memory:100.64.0.2");
 
-        assert_eq!(host.attach_host(), addr.to_string());
+        assert_eq!(host.attach_host(), "memory:100.64.0.2");
     }
 }

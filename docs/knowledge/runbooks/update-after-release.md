@@ -13,22 +13,21 @@ since: 0.3.3
 Use this runbook after replacing an installed Pohunek binary from a component
 release archive or rebuilding it from source.
 
-## One-time public protocol v2 boundary
+## Current public protocol v3 boundary
 
-The v2 range-negotiation release cannot communicate with the former integer-v1
-request envelope. Before replacing any component, inventory every CLI, GUI, web
-backend/SDK, custom client, and local or NetBird-reachable daemon that must talk
-to another peer. Drain cross-host automation, upgrade that complete set in one
-maintenance window, and then verify every host with `pohunek health --json` and
-`pohunek host inspect <host> --json`. The response must advertise protocol range
-`2..=2` for this release.
+The current release supports only protocol `3..=3` and cannot communicate with
+protocol-v2 peers. Before replacing any component, inventory every CLI, GUI,
+web backend/SDK, custom client, and local or NetBird-reachable daemon that must
+talk to another peer. Drain cross-host automation, upgrade that complete set in
+one maintenance window, and then verify every host with `pohunek health --json`
+and `pohunek host inspect <host> --json`. The response must advertise protocol
+range `3..=3` for this release.
 
-There is no compatibility shim for the old request envelope or fixed
-`codex`/`claude` notification-policy fields. Do not downgrade one peer to v1:
-it will be isolated from v2 peers, and policy/state written by v2 is not a v1
-rollback mechanism. Restore the coordinated v2 component set instead. Once the
-boundary is crossed, later peers select the highest overlapping version, so M2,
-M3, and additive provider work do not require another lockstep transition.
+There is no v2 compatibility shim. Do not downgrade one peer independently: it
+will be isolated from v3 peers, and protocol-v3 overlay state is not a v2
+rollback mechanism. Restore the coordinated v3 component set instead. The
+historical v2 release introduced range negotiation from integer-v1; that
+history does not widen the current supported range.
 
 1. Download the component archive for the binary being updated: CLI (`pohunek`),
    daemon (`pohunekd` plus `pohunek-sessiond` and its systemd units), or GUI

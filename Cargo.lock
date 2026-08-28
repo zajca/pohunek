@@ -3271,6 +3271,7 @@ dependencies = [
  "pohunek-hostcheck",
  "pohunek-logging",
  "pohunek-netbird",
+ "pohunek-overlay",
  "pohunek-paths",
  "pohunek-prompt",
  "pohunek-protocol",

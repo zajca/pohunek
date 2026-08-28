@@ -1165,7 +1165,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ClientError::OverlayRegistry(overlay::RegistryError::HostUnknown(host))
+            ClientError::OverlayRegistry(overlay::RegistryError::InvalidQualifiedHost(host))
                 if host == selector
         ));
         tokio::time::timeout(Duration::from_millis(25), listener.accept())

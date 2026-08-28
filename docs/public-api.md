@@ -26,12 +26,11 @@ Protocol v3 is the coordinated overlay-routing boundary. It changes
 `overlay` fields plus optional `peer_id`. Every daemon and bundled client must
 be upgraded together; no v2 compatibility shim is provided.
 
-The former exact integer request envelope is deliberately rejected. Protocol
-v2 is a one-time coordinated pre-1.0 boundary: every CLI, GUI, web backend/SDK,
-custom client, and local or remote daemon that communicates with another peer
-must be upgraded together. There is no v1 envelope or notification-policy
-compatibility shim. After crossing this boundary, future peers negotiate the
-highest overlapping range instead of requiring equal maximum versions.
+The former exact integer request envelope is deliberately rejected. The
+historical protocol-v2 transition was the one-time move from integer-v1 to
+range negotiation; it provided no v1 envelope or notification-policy shim.
+Current protocol-v3 components likewise require a coordinated upgrade from v2
+because this build supports only `3..=3`.
 
 Clients should call `daemon.health` after opening a control connection to learn
 the daemon build version and protocol version, but `daemon.health` is not a
@@ -892,8 +891,8 @@ Canonical public codes currently emitted include:
 | `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `remote_discovery_failed` |
 | `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy` |
 
-Protocol v2 additionally emits these runtime codes for provider-neutral agent
-and observation behavior: `agent_kind_unsupported`,
+Protocol v3 emits these runtime codes for provider-neutral agent and
+observation behavior: `agent_kind_unsupported`,
 `agent_fork_unsupported`, `session_terminal_unavailable`,
 `session_has_no_managed_terminal`, `session_runtime_changed`,
 `session_output_limit_exceeded`, `session_wait_limit_exceeded`,
@@ -964,7 +963,7 @@ reserve stderr for diagnostics. Success exits zero with:
 ```json
 {
   "cli_version": "0.x.y",
-  "protocol": {"minimum": 2, "maximum": 2},
+  "protocol": {"minimum": 3, "maximum": 3},
   "ok": {}
 }
 ```
@@ -995,11 +994,11 @@ appear in that envelope, diagnostics, or structured logs.
 
 ## Hermes Operator Plugin CLI
 
-The Hermes operator plugin is a local CLI lifecycle, not a daemon public method:
-M3 does not change public protocol version `2` or add a Hermes-specific wire
-shape. It embeds the plugin assets and generated skill in the `pohunek` binary,
-then installs them only into an explicitly selected Hermes profile or custom
-absolute home.
+The Hermes operator plugin is a local CLI lifecycle, not a daemon public method.
+Historically, M3 did not bump the then-current public protocol v2 or add a
+Hermes-specific wire shape. Current builds use public protocol v3. The CLI
+embeds the plugin assets and generated skill, then installs them only into an
+explicitly selected Hermes profile or custom absolute home.
 
 ```bash
 pohunek integration install --agent hermes --hermes-profile default \
@@ -1067,7 +1066,7 @@ notification server is introduced.
 
 ## Attach Stream
 
-The attach byte stream is part of public protocol v2. It is not an implementation
+The attach byte stream is part of public protocol v3. It is not an implementation
 detail of the CLI.
 
 Sequence:
@@ -1168,7 +1167,8 @@ Connection APIs:
 
 - `Client::connect(host, socket_path)`: `""` and `"local"` use the Unix socket;
   any other host is resolved through the default configured overlay registry
-  and dialed over its exact per-overlay route. A socket-address literal is not a
+  and dialed over its exact per-overlay route. `<overlay>:<selector>` restricts
+  resolution to one configured provider. A socket-address literal is not a
   bypass and must resolve under current provider policy.
 - `Client::connect_with_registry(host, socket_path, registry)`: the same routing
   with a caller-supplied registry; ambiguous names fail closed.

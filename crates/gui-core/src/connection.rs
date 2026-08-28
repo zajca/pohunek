@@ -264,7 +264,7 @@ pub(crate) async fn connect_client(
         HostTransport::Remote { host, socket_path } => {
             Ok(Client::connect_with_options(host, socket_path, options).await?)
         }
-        HostTransport::Tcp { addr } => {
+        HostTransport::Tcp { addr, .. } => {
             Ok(
                 Client::connect_trusted_tcp_addr_with_options(config.id.as_str(), *addr, options)
                     .await?,
@@ -358,20 +358,25 @@ pub async fn discover_hosts(
     let mut hosts = vec![local.clone()];
     for record in records {
         if matches!(record.class, HostClass::ReachableDaemon { .. }) {
-            let addr = discovered_transport_addr(&record)?;
-            let identity = record
-                .peer_id
-                .as_deref()
-                .or(record.fqdn.as_deref())
-                .or(record.name.as_deref())
-                .unwrap_or_else(|| record.address.as_deref().expect("reachable route address"));
-            hosts.push(HostConfig::tcp(
-                format!("{}:{identity}", record.overlay),
-                addr,
-            ));
+            hosts.push(discovered_host_config(&record)?);
         }
     }
     Ok(hosts)
+}
+
+pub(crate) fn discovered_host_config(record: &HostRecord) -> Result<HostConfig, CoreError> {
+    let addr = discovered_transport_addr(record)?;
+    let identity = record
+        .peer_id
+        .as_deref()
+        .or(record.fqdn.as_deref())
+        .or(record.name.as_deref())
+        .unwrap_or_else(|| record.address.as_deref().expect("reachable route address"));
+    Ok(HostConfig::tcp_with_attach_host(
+        format!("{}:{identity}", record.overlay),
+        addr,
+        format!("{}:{}", record.overlay, addr.ip()),
+    ))
 }
 
 pub(crate) fn discovered_transport_addr(

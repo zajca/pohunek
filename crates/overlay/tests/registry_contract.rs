@@ -176,6 +176,32 @@ async fn registry_isolates_failure_but_rejects_name_collisions() {
     ));
 }
 
+#[tokio::test]
+async fn qualified_host_uses_only_named_overlay_and_its_port() {
+    let listener = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let address = "100.64.0.2".parse().expect("peer address");
+    let mut first = MemoryTransport::new("first", listener);
+    first.add_member(address);
+    first.add_peer("build", Some("first-build"), Some(address));
+    let mut second = MemoryTransport::new("second", listener);
+    second.add_member(address);
+    second.add_peer("build", Some("second-build"), Some(address));
+    let registry = OverlayRegistry::new(vec![configured(first, 17001), configured(second, 17002)])
+        .expect("registry");
+
+    let route = registry
+        .resolve_host("second:build")
+        .await
+        .expect("qualified host");
+    assert_eq!(route.overlay.as_str(), "second");
+    assert_eq!(route.peer_id.as_deref(), Some("second-build"));
+    assert_eq!(route.addr, SocketAddr::new(address, 17002));
+    assert!(matches!(
+        registry.resolve_host("missing:build").await,
+        Err(RegistryError::OverlayNotConfigured(id)) if id.as_str() == "missing"
+    ));
+}
+
 #[test]
 fn registry_rejects_duplicate_ids_and_zero_ports() {
     let listener = IpAddr::V4(Ipv4Addr::LOCALHOST);

@@ -109,6 +109,12 @@ pub enum RegistryError {
     /// A configured listener port was zero.
     #[error("overlay '{0}' has invalid port 0")]
     InvalidPort(OverlayId),
+    /// A provider-qualified host omitted its provider or selector.
+    #[error("invalid provider-qualified host '{0}': expected '<overlay>:<selector>'")]
+    InvalidQualifiedHost(String),
+    /// A provider-qualified host named an overlay that is not configured.
+    #[error("overlay '{0}' is not configured")]
+    OverlayNotConfigured(OverlayId),
     /// More than one healthy overlay resolved the same unqualified host.
     #[error("host '{host}' is ambiguous across overlays: {overlays:?}")]
     AmbiguousHost {
@@ -389,16 +395,21 @@ impl OverlayRegistry {
         &self.entries
     }
 
-    /// Resolve one unqualified host across all configured overlays.
+    /// Resolve one unqualified or provider-qualified host.
     ///
-    /// Healthy providers are authoritative. A unique success wins even when
-    /// another provider is unavailable; multiple successes are rejected as an
-    /// ambiguous cross-overlay collision.
+    /// A provider-qualified selector uses `<overlay>:<selector>` and is sent
+    /// only to that configured provider. Unqualified selectors are sent to all
+    /// providers; a unique healthy success wins and cross-overlay collisions
+    /// fail closed.
     ///
     /// # Errors
     ///
     /// Returns typed unknown, ambiguous, or aggregated provider failures.
     pub async fn resolve_host(&self, host: &str) -> Result<OverlayRoute, RegistryError> {
+        if host.contains(':') {
+            return self.resolve_qualified_host(host).await;
+        }
+
         let mut routes = Vec::new();
         let mut failures = Vec::new();
         let mut collision_overlays = Vec::new();
@@ -446,6 +457,41 @@ impl OverlayRegistry {
             _ => Err(RegistryError::HostUnavailable {
                 host: host.to_owned(),
                 failures,
+            }),
+        }
+    }
+
+    async fn resolve_qualified_host(&self, host: &str) -> Result<OverlayRoute, RegistryError> {
+        let (overlay, selector) = host
+            .split_once(':')
+            .filter(|(overlay, selector)| !overlay.is_empty() && !selector.is_empty())
+            .ok_or_else(|| RegistryError::InvalidQualifiedHost(host.to_owned()))?;
+        let overlay = OverlayId::new(overlay)
+            .map_err(|_invalid_id| RegistryError::InvalidQualifiedHost(host.to_owned()))?;
+        let entry = self
+            .entries()
+            .iter()
+            .find(|entry| entry.id() == &overlay)
+            .ok_or_else(|| RegistryError::OverlayNotConfigured(overlay.clone()))?;
+
+        match entry.transport.resolve_peer(selector).await {
+            Ok(peer) => Ok(OverlayRoute {
+                overlay,
+                peer_id: peer.peer_id,
+                display_name: peer.display_name,
+                fqdn: peer.fqdn,
+                addr: SocketAddr::new(peer.address, entry.port()),
+            }),
+            Err(OverlayError::HostUnknown { .. }) => {
+                Err(RegistryError::HostUnknown(host.to_owned()))
+            }
+            Err(error @ OverlayError::PeerCollision { .. }) => Err(RegistryError::AmbiguousHost {
+                host: host.to_owned(),
+                overlays: vec![error.overlay().clone()],
+            }),
+            Err(error) => Err(RegistryError::HostUnavailable {
+                host: host.to_owned(),
+                failures: vec![OverlayFailure { overlay, error }],
             }),
         }
     }

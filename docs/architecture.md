@@ -414,8 +414,9 @@ registry. Each entry has a stable overlay ID, a transport implementation, and
 its own non-zero daemon port. Daemon listeners run concurrently for every
 entry; discovery aggregates providers concurrently while isolating a failed
 provider from healthy results. An unqualified selector matching multiple
-providers fails closed. Control and raw attach reuse the same selected socket
-route.
+providers fails closed. A provider-qualified `<overlay>:<selector>` target is
+resolved only by that provider and receives its configured daemon port. Control
+and raw attach reuse the same selected socket route.
 
 Discovery preserves provider peer identity separately from display names and
 addresses. Stable client identity is overlay-qualified, so equal names,
