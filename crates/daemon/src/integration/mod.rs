@@ -92,6 +92,13 @@ const CLAUDE_NOTIFICATION_MATCHERS: &[&str] = &[
     "elicitation_response",
 ];
 
+/// Exact Unix mode written for Pohunek-managed hook executables.
+///
+/// Group or other write access would let another local principal alter code
+/// executed by the owner. Other modes are drift from the installer contract.
+#[cfg(unix)]
+const MANAGED_HOOK_MODE: u32 = 0o755;
+
 /// Env var overriding Claude's config dir (else `~/.claude`).
 const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 /// Env var overriding Codex's config dir (else `~/.codex`).
@@ -294,12 +301,14 @@ fn status_at(
     let mut warnings = Vec::new();
     let assets = [
         inspect_asset(
+            agent,
             ManagedAssetKind::StateHook,
             state_path,
             state_asset,
             &mut warnings,
         ),
         inspect_asset(
+            agent,
             ManagedAssetKind::NotificationHook,
             notify_path,
             notify_asset,
@@ -385,6 +394,7 @@ impl ManagedAssetKind {
 }
 
 fn inspect_asset(
+    agent: StatusAgent,
     kind: ManagedAssetKind,
     path: PathBuf,
     expected: &'static str,
@@ -452,28 +462,53 @@ fn inspect_asset(
             )),
         }
     }
-    let executable = asset_is_executable(&metadata);
-    if !executable {
-        warnings.push(format!("managed {description} is not executable"));
-    }
+    let permissions_current = asset_permissions_current(agent, kind, &metadata, warnings);
     AssetStatus {
         path,
         content: Some(content),
         present: true,
         footprint: true,
-        current: content_current && executable,
+        current: content_current && permissions_current,
     }
 }
 
 #[cfg(unix)]
-fn asset_is_executable(metadata: &fs::Metadata) -> bool {
+fn asset_permissions_current(
+    agent: StatusAgent,
+    kind: ManagedAssetKind,
+    metadata: &fs::Metadata,
+    warnings: &mut Vec<String>,
+) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
-    metadata.permissions().mode() & 0o111 != 0
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode == MANAGED_HOOK_MODE {
+        return true;
+    }
+
+    let description = kind.description();
+    let agent = agent.kind();
+    if mode & 0o022 != 0 {
+        warnings.push(format!(
+            "managed {description} permissions are unsafe (mode {mode:04o}; group or other users can write it); run `pohunek integration install --agent {}` to restore mode {MANAGED_HOOK_MODE:04o}",
+            agent.as_wire()
+        ));
+    } else {
+        warnings.push(format!(
+            "managed {description} permissions drifted (mode {mode:04o}; expected {MANAGED_HOOK_MODE:04o}); run `pohunek integration install --agent {}` to restore them",
+            agent.as_wire()
+        ));
+    }
+    false
 }
 
 #[cfg(not(unix))]
-fn asset_is_executable(_metadata: &fs::Metadata) -> bool {
+fn asset_permissions_current(
+    _agent: StatusAgent,
+    _kind: ManagedAssetKind,
+    _metadata: &fs::Metadata,
+    _warnings: &mut Vec<String>,
+) -> bool {
     true
 }
 
@@ -575,7 +610,13 @@ fn inspect_claude_registration(
             trust_event: None,
         },
     ]);
-    let status = inspect_hook_file(&settings_path, "Claude settings.json", &specs, warnings);
+    let status = inspect_hook_file(
+        StatusAgent::Claude,
+        &settings_path,
+        "Claude settings.json",
+        &specs,
+        warnings,
+    );
     (status.footprint, status.current)
 }
 
@@ -609,7 +650,13 @@ fn inspect_codex_registration(
             trust_event: Some(CODEX_STOP_TRUST_EVENT),
         },
     ];
-    let hooks = inspect_hook_file(&hooks_path, "Codex hooks.json", &specs, warnings);
+    let hooks = inspect_hook_file(
+        StatusAgent::Codex,
+        &hooks_path,
+        "Codex hooks.json",
+        &specs,
+        warnings,
+    );
     let config = inspect_codex_config(
         &config_dir.join("config.toml"),
         &hooks_path,
@@ -621,6 +668,7 @@ fn inspect_codex_registration(
 }
 
 fn inspect_hook_file(
+    agent: StatusAgent,
     path: &Path,
     label: &str,
     specs: &[HookSpec],
@@ -668,7 +716,8 @@ fn inspect_hook_file(
     let mut positions = Vec::with_capacity(specs.len());
     for spec in specs {
         let references = hook_command_positions(hooks, spec.event, &spec.command);
-        footprint |= hooks_contains_command(hooks, &spec.command);
+        let reference_count = hook_command_count(hooks, &spec.command);
+        footprint |= reference_count > 0;
         let exact = references
             .iter()
             .copied()
@@ -676,12 +725,22 @@ fn inspect_hook_file(
                 hook_registration_matches(hooks, spec.event, group_index, handler_index, spec)
             })
             .collect::<Vec<_>>();
-        let spec_current = references.len() == 1 && exact.len() == 1;
+        let spec_current = reference_count == 1 && references.len() == 1 && exact.len() == 1;
         if !spec_current {
-            warnings.push(format!(
-                "managed {} registration is missing or modified",
-                spec.label
-            ));
+            let agent = agent.kind();
+            if reference_count > references.len() {
+                warnings.push(format!(
+                    "managed {} registration also appears under an unexpected event; run `pohunek integration install --agent {}` to remove the duplicate",
+                    spec.label,
+                    agent.as_wire()
+                ));
+            } else {
+                warnings.push(format!(
+                    "managed {} registration is missing or modified; run `pohunek integration install --agent {}` to restore it",
+                    spec.label,
+                    agent.as_wire()
+                ));
+            }
         }
         current &= spec_current;
         positions.push(spec_current.then(|| exact[0]));
@@ -719,21 +778,15 @@ fn hook_command_positions(
         .collect()
 }
 
-fn hooks_contains_command(hooks: &Map<String, Value>, command: &str) -> bool {
-    hooks.values().any(|events| {
-        events.as_array().is_some_and(|groups| {
-            groups.iter().any(|group| {
-                group
-                    .get("hooks")
-                    .and_then(Value::as_array)
-                    .is_some_and(|handlers| {
-                        handlers.iter().any(|handler| {
-                            handler.get("command").and_then(Value::as_str) == Some(command)
-                        })
-                    })
-            })
-        })
-    })
+fn hook_command_count(hooks: &Map<String, Value>, command: &str) -> usize {
+    hooks
+        .values()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter(|handler| handler.get("command").and_then(Value::as_str) == Some(command))
+        .count()
 }
 
 fn hook_registration_matches(
@@ -1478,7 +1531,7 @@ fn make_executable(path: &Path) -> Result<(), ProtocolError> {
         let mut perms = fs::metadata(path)
             .map_err(|err| io_error("stat", path, &err))?
             .permissions();
-        perms.set_mode(0o755);
+        perms.set_mode(MANAGED_HOOK_MODE);
         fs::set_permissions(path, perms).map_err(|err| io_error("chmod", path, &err))?;
     };
     let _ = path;
@@ -1546,6 +1599,7 @@ mod tests {
         CLAUDE_NOTIFY_HOOK_ASSET, CODEX_HOOK_ASSET, CODEX_NOTIFY_HOOK_ASSET,
         CODEX_SESSION_START_TRUST_EVENT, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID,
         ENV_SOCKET_PATH, EXPECTED_INTEGRATION_VERSION, HOOK_TIMEOUT_SECS, SESSION_START_EVENT,
+        STATE_HOOK_INSTALL_NAME,
     };
 
     /// Large enough to expose unbounded hook stdin reads through pipe backpressure.
@@ -2621,6 +2675,35 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn status_rejects_unsafe_managed_hook_permissions_with_repair_hint() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let codex = temp_dir("status-unsafe-hook-permissions");
+        install_codex(&codex).expect("install Codex fixture");
+        let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
+        let mut permissions = fs::metadata(&hook_path)
+            .expect("managed hook metadata")
+            .permissions();
+        permissions.set_mode(0o777);
+        fs::set_permissions(&hook_path, permissions).expect("make managed hook unsafe");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        let warning = report
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("permissions are unsafe"))
+            .expect("unsafe permissions warning");
+        assert!(warning.contains("mode 0777"), "{warning}");
+        assert!(
+            warning.contains("pohunek integration install --agent codex"),
+            "{warning}"
+        );
+    }
+
     #[test]
     fn status_detects_broken_claude_registration() {
         let claude = temp_dir("status-claude-registration");
@@ -2641,6 +2724,35 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("Claude SessionStart registration")));
+    }
+
+    #[test]
+    fn status_rejects_managed_registration_under_an_extra_event() {
+        let codex = temp_dir("status-extra-registration-event");
+        install_codex(&codex).expect("install Codex fixture");
+        let hooks_path = codex.join("hooks.json");
+        let mut hooks = read_json(&hooks_path);
+        let duplicate = hooks["hooks"][SESSION_START_EVENT][0]["hooks"][0].clone();
+        hooks["hooks"]["PreToolUse"] = json!([{ "hooks": [duplicate] }]);
+        fs::write(
+            &hooks_path,
+            serde_json::to_vec_pretty(&hooks).expect("serialize hooks with duplicate"),
+        )
+        .expect("write hooks with duplicate");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        let warning = report
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("unexpected event"))
+            .expect("unexpected event warning");
+        assert!(warning.contains("Codex SessionStart"), "{warning}");
+        assert!(
+            warning.contains("pohunek integration install --agent codex"),
+            "{warning}"
+        );
     }
 
     #[test]

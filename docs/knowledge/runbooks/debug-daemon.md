@@ -61,9 +61,11 @@ For durable notification issues:
    Pohunek-managed hook command.
    First inspect both agents with `pohunek integration status --json`, or select
    one with `pohunek integration status --agent <codex-or-claude> --json`.
-   `current` verifies both executable assets, every provider registration, and
-   Codex feature/trust state. Follow each warning and use the printed reinstall
-   hint; status itself never repairs or rewrites provider configuration.
+   `current` verifies both executable assets with the installer-owned permission
+   mode, exactly one managed registration under each expected provider event,
+   and Codex feature/trust state. Unsafe permission drift and duplicate managed
+   registrations are `outdated`; follow the actionable reinstall warning or the
+   printed hint. Status itself never repairs or rewrites provider configuration.
 9. If a notification is missing its session link, inspect the hook environment
    setup. Hook adapters silently drop an invalid `POHUNEK_SESSION_ID` and still
    create the notification without linkage.

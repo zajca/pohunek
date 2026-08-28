@@ -18,17 +18,17 @@ use futures::{SinkExt, StreamExt};
 use protocol::{
     event, method, AgentActivity, AgentKind, AssistantMaterializeParams,
     AssistantMaterializeResult, AttachHeader, ErrorClass, Event, IntegrationInstallState,
-    IntegrationStatusParams, IntegrationStatusResult, NotificationCreateParams,
-    NotificationCreateResult, NotificationDeleteParams, NotificationDeleteResult, NotificationKind,
-    NotificationKindPolicy, NotificationListParams, NotificationListResult, NotificationPolicy,
-    NotificationPolicyParams, NotificationPolicyResult, NotificationRetentionParams,
-    NotificationRetentionResult, NotificationSeverity, NotificationSource, NotificationStatus,
-    NotificationUpdateParams, NotificationUpdateResult, ReportSequence, Request as ProtocolRequest,
-    Response, SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult,
-    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter,
-    SessionListParams, SessionNewParams, SessionRemoveResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionResizeParams, SessionResizeResult, SessionState,
-    SessionStopResult, StateSource, TerminalDimensions, PROTOCOL_VERSION,
+    IntegrationStatusResult, NotificationCreateParams, NotificationCreateResult,
+    NotificationDeleteParams, NotificationDeleteResult, NotificationKind, NotificationKindPolicy,
+    NotificationListParams, NotificationListResult, NotificationPolicy, NotificationPolicyParams,
+    NotificationPolicyResult, NotificationRetentionParams, NotificationRetentionResult,
+    NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
+    NotificationUpdateResult, ReportSequence, Request as ProtocolRequest, Response,
+    SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
+    SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
+    SessionNewParams, SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, StateSource,
+    TerminalDimensions, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -242,7 +242,7 @@ async fn spawn_server(
 }
 
 #[tokio::test]
-async fn integration_status_dispatches_at_daemon_boundary() {
+async fn integration_status_accepts_null_at_daemon_boundary() {
     let xdg = XdgGuard::set_all("integration-status-rpc").await;
     let claude = xdg.home().join(".claude");
     let codex = xdg.home().join(".codex");
@@ -257,7 +257,7 @@ async fn integration_status_dispatches_at_daemon_boundary() {
     let request = Request::make(
         "integration-status",
         method::INTEGRATION_STATUS,
-        serde_json::to_value(IntegrationStatusParams { agent: None }).expect("serialize params"),
+        serde_json::Value::Null,
     );
     let payload = ok_payload(exchange(&mut framed, &request).await);
 

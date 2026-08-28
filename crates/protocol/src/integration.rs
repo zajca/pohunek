@@ -74,7 +74,7 @@ pub struct IntegrationInstallResult {
 }
 
 /// Request parameters for `integration.status`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationStatusParams.ts"))]
 pub struct IntegrationStatusParams {
@@ -150,7 +150,12 @@ pub struct IntegrationInstallReport {
 
 #[cfg(test)]
 mod tests {
-    use super::IntegrationInstallState;
+    use super::{IntegrationInstallState, IntegrationStatusParams};
+
+    #[test]
+    fn integration_status_params_default_to_all_agents() {
+        assert_eq!(IntegrationStatusParams::default().agent, None);
+    }
 
     #[test]
     fn integration_install_states_use_exact_snake_case_wire_values() {
