@@ -72,6 +72,10 @@ pub(crate) struct LocalPeerState {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Peer {
+    /// Stable provider identity. Current status uses publicKey; legacy status
+    /// may use pubKey.
+    #[serde(rename = "publicKey", alias = "pubKey")]
+    pub public_key: Option<String>,
     /// The peer's fully qualified `NetBird` name (e.g. `host-b.netbird.cloud`).
     pub fqdn: Option<String>,
     /// The peer's `NetBird` IP as a string (wire key `netbirdIp` in both shapes).
@@ -88,6 +92,12 @@ pub struct Peer {
 }
 
 impl Peer {
+    /// Return the non-empty stable provider identity.
+    #[must_use]
+    pub fn peer_id(&self) -> Option<&str> {
+        self.public_key.as_deref().filter(|value| !value.is_empty())
+    }
+
     /// True when this peer's connection status equals `"Connected"`
     /// (case-insensitive). Absent status is treated as not connected.
     #[must_use]
@@ -357,6 +367,7 @@ mod tests {
         // First peer: Connected P2P.
         assert!(peers[0].is_connected());
         assert_eq!(peers[0].connection_type.as_deref(), Some("P2P"));
+        assert_eq!(peers[0].peer_id(), Some("pubkey-b"));
         assert_eq!(
             peers[0].ip(),
             Some("100.92.30.40".parse::<IpAddr>().unwrap())
@@ -381,6 +392,7 @@ mod tests {
         assert!(peers[0].is_connected());
         // Shape B uses connType / connectionStatus.
         assert_eq!(peers[0].connection_type.as_deref(), Some("P2P"));
+        assert_eq!(peers[0].peer_id(), Some("pubkey-b-legacy"));
         assert_eq!(
             peers[0].ip(),
             Some("100.64.0.20".parse::<IpAddr>().unwrap())

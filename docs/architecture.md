@@ -415,8 +415,10 @@ its own non-zero daemon port. Daemon listeners run concurrently for every
 entry; discovery aggregates providers concurrently while isolating a failed
 provider from healthy results. An unqualified selector matching multiple
 providers fails closed. A provider-qualified `<overlay>:<selector>` target is
-resolved only by that provider and receives its configured daemon port. Control
-and raw attach reuse the same selected socket route.
+resolved only by that provider and receives its configured daemon port. An
+explicit `@<port>` suffix preserves a port learned from discovery while the
+selector is still resolved against current provider state. Control and raw
+attach reuse the same selected socket route within one SDK client.
 
 Daemon construction requires a validated registry up front. The shared
 discovery cache has no registry-less state, including when the Unix control
@@ -430,8 +432,17 @@ remain candidates. The public `HostRecord` carries `overlay`, optional
 Provider discovery returns remote peers only; GUI, web, and CLI fan-out
 consumers add the explicit local Unix-socket target themselves.
 
+The GUI retains the overlay-qualified peer identity and discovered port, never
+the discovered IP as reconnect state. Every control reconnect resolves that
+stable identity through current provider state. External attach receives the
+same selector with its explicit discovered port; the resulting SDK client keeps
+the exact resolved endpoint only long enough to keep control and raw attach on
+one route.
+
 The production NetBird adapter remains tokenless and local. There is no signed
-manifest exchange.
+manifest exchange. NetBird `publicKey` or legacy `pubKey` is the stable peer
+identity; peers without one preserve `peer_id = null` and clients fall back to
+the peer FQDN rather than treating its mutable IP as identity.
 
 1. The daemon/CLI reads local NetBird state via `netbird status --json` (no
    management-API token) to enumerate peers, NetBird addresses, and names.

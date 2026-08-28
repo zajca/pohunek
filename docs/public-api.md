@@ -272,6 +272,7 @@ wire shapes are the exported `crates/protocol` structs.
 
 - `overlay`: required stable transport ID used to qualify peer identity.
 - `peer_id`: optional stable provider peer identity; absence is preserved.
+  NetBird uses `publicKey` or legacy `pubKey`, never the mutable peer IP.
 - `address`: optional dialable IP address without a port. `null` keeps an
   address-less or rejected-spoof candidate visible but non-dialable.
 - `port`: required effective daemon port for this overlay route.
@@ -1152,6 +1153,8 @@ Public exports:
   still have completed remotely.
 - `next_request_id(method)`: shared correlation-id generator used by SDK-backed
   clients.
+- `remote_host_with_port(host, port)`: formats a provider-resolved selector
+  with an explicit non-zero daemon port.
 - `ConfiguredTransport` and `OverlayRegistry`: validated provider registry with
   stable overlay IDs and one non-zero daemon port per provider.
 - `discover_hosts(registry)`: aggregated configured-overlay discovery with
@@ -1174,10 +1177,13 @@ Connection APIs:
 - `Client::connect(host, socket_path)`: `""` and `"local"` use the Unix socket;
   any other host is resolved through the default configured overlay registry
   and dialed over its exact per-overlay route. `<overlay>:<selector>` restricts
-  resolution to one configured provider. A bare IPv6 literal remains an
-  unqualified selector; only an explicit configured-overlay prefix qualifies
-  it. A socket-address literal is not a bypass and must resolve under current
-  provider policy.
+  resolution to one configured provider. The optional
+  `<overlay>:<selector>@<port>` form retains an explicit discovered daemon
+  port while still resolving the selector through current provider state. The
+  `@` character is reserved by this route grammar. A bare IPv6 literal
+  remains an unqualified selector; only an explicit configured-overlay prefix
+  qualifies it. A socket-address literal is not a bypass and must resolve under
+  current provider policy.
 - `Client::connect_with_registry(host, socket_path, registry)`: the same routing
   with a caller-supplied registry; ambiguous names fail closed.
 - `Client::connect_local(socket_path)`: direct Unix socket.

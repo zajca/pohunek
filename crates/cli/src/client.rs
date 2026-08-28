@@ -121,7 +121,7 @@ mod tests {
         BindAddrError, ConfiguredTransport, DiscoveredPeer, OverlayError, OverlayFuture, OverlayId,
         OverlayRegistry, OverlayTransport, ResolvedPeer,
     };
-    use pohunek_gui_core::{render_attach_command, AttachTemplateValues, HostConfig};
+    use pohunek_gui_core::{render_attach_command, AttachTemplateValues};
     use tokio::net::TcpListener;
 
     use super::*;
@@ -160,7 +160,7 @@ mod tests {
         }
 
         fn resolve_peer<'a>(&'a self, host: &'a str) -> OverlayFuture<'a, ResolvedPeer> {
-            let result = if host == self.address.to_string() {
+            let result = if host == self.address.to_string() || host == "stable-peer" {
                 Ok(ResolvedPeer {
                     peer_id: Some(format!("{}-peer", self.id)),
                     display_name: Some(format!("{} host", self.id)),
@@ -187,31 +187,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gui_attach_selector_reaches_cli_route_with_overlay_port() {
+    async fn gui_attach_route_preserves_discovered_port_over_cli_registry() {
         let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let first = TcpListener::bind(SocketAddr::new(address, 0))
+        let registry_listener = TcpListener::bind(SocketAddr::new(address, 0))
             .await
-            .expect("first listener");
-        let second = TcpListener::bind(SocketAddr::new(address, 0))
+            .expect("registry listener");
+        let discovered_listener = TcpListener::bind(SocketAddr::new(address, 0))
             .await
-            .expect("second listener");
-        let first_addr = first.local_addr().expect("first address");
-        let second_addr = second.local_addr().expect("second address");
-        let registry = OverlayRegistry::new(vec![
-            configured("first", address, first_addr.port()),
-            configured("second", address, second_addr.port()),
-        ])
-        .expect("registry");
-        let host = HostConfig::tcp_with_attach_host(
-            "second:peer",
-            second_addr,
-            format!("second:{address}"),
-        );
+            .expect("discovered listener");
+        let registry_addr = registry_listener.local_addr().expect("registry address");
+        let discovered_addr = discovered_listener
+            .local_addr()
+            .expect("discovered address");
+        let registry =
+            OverlayRegistry::new(vec![configured("policy", address, registry_addr.port())])
+                .expect("registry");
+        let route =
+            pohunek_client::remote_host_with_port("policy:stable-peer", discovered_addr.port())
+                .expect("discovered route");
         let command = render_attach_command(
             "{bin} attach --host {host} {id}",
             &AttachTemplateValues {
                 bin: "pohunek".to_owned(),
-                host: host.attach_host(),
+                host: route,
                 id: "s-42".to_owned(),
             },
         );
@@ -224,13 +222,14 @@ mod tests {
         let client = Client::connect_with_registry(selector, registry)
             .await
             .expect("CLI registry connection");
-        let (_stream, _) = tokio::time::timeout(Duration::from_secs(1), second.accept())
+        let (_stream, _) =
+            tokio::time::timeout(Duration::from_secs(1), discovered_listener.accept())
+                .await
+                .expect("discovered port accept deadline")
+                .expect("discovered port accept");
+        tokio::time::timeout(Duration::from_millis(25), registry_listener.accept())
             .await
-            .expect("second overlay accept deadline")
-            .expect("second overlay accept");
-        tokio::time::timeout(Duration::from_millis(25), first.accept())
-            .await
-            .expect_err("first overlay port must not be dialed");
+            .expect_err("CLI registry port must not replace the discovered port");
         drop(client);
     }
 

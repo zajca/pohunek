@@ -53,9 +53,12 @@ terminal_rows = 24
 Use an absolute `pohunek_bin` when a desktop launcher may have a different
 `PATH`. `attach_command` supports exactly `{bin}`, `{host}`, and `{id}`.
 For a discovered remote host, `{host}` is a provider-qualified
-`<overlay>:<address>` selector without a port. The spawned CLI revalidates that
-selector through the named provider and applies the provider's configured port;
-the GUI never passes its trusted `SocketAddr` as general CLI input.
+`<overlay>:<stable-peer-id-or-fqdn>@<discovered-port>` route. The spawned CLI
+re-resolves and validates that stable selector through current provider state,
+then uses the discovered port instead of its own registry environment. GUI
+reconnects use the same process and never retain the discovered IP as identity.
+The exact resolved socket endpoint lives only inside one SDK client so its raw
+attach remains on the same route as its control connection.
 `notification_command` defaults to `notify-send` and receives title and body as
 separate arguments.
 

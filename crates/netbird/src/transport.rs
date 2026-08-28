@@ -128,12 +128,14 @@ fn resolve_from_status(
     host: &str,
     id: &OverlayId,
 ) -> Result<ResolvedPeer, OverlayError> {
-    let address = crate::resolve_host(status, host).map_err(|error| map_error(error, id))?;
-    let peer = find_peer_by_ip(status, address);
+    let peer = crate::host::resolve_peer(status, host).map_err(|error| map_error(error, id))?;
+    let address = peer
+        .ip()
+        .expect("NetBird peer resolution only returns policy-valid addresses");
     Ok(ResolvedPeer {
-        peer_id: Some(address.to_string()),
-        display_name: peer.and_then(short_name),
-        fqdn: peer.and_then(|peer| peer.fqdn.clone()),
+        peer_id: peer.peer_id().map(str::to_owned),
+        display_name: short_name(peer),
+        fqdn: peer.fqdn.clone(),
         address,
     })
 }
@@ -145,18 +147,11 @@ fn discover_from_status(status: &NetbirdStatus) -> Vec<DiscoveredPeer> {
 fn map_peer(peer: &Peer) -> DiscoveredPeer {
     let parsed = peer.ip();
     DiscoveredPeer {
-        peer_id: parsed.map(|address| address.to_string()),
+        peer_id: peer.peer_id().map(str::to_owned),
         display_name: short_name(peer),
         fqdn: peer.fqdn.clone(),
         address: parsed.filter(|address| crate::is_netbird_ip(*address)),
     }
-}
-
-fn find_peer_by_ip(status: &NetbirdStatus, address: IpAddr) -> Option<&Peer> {
-    status
-        .peers()
-        .iter()
-        .find(|peer| peer.ip() == Some(address))
 }
 
 fn short_name(peer: &Peer) -> Option<String> {
@@ -185,20 +180,20 @@ mod tests {
                 "netbirdIp":"100.64.0.1",
                 "fqdn":"self.example",
                 "peers":[
-                    {"fqdn":"safe.example","netbirdIp":"100.64.0.2"},
+                    {"publicKey":"safe-key","fqdn":"safe.example","netbirdIp":"100.64.0.2"},
                     {"fqdn":"missing.example"},
-                    {"fqdn":"spoofed.example","netbirdIp":"127.0.0.1"}
+                    {"publicKey":"spoofed-key","fqdn":"spoofed.example","netbirdIp":"127.0.0.1"}
                 ]
             }"#,
         );
 
         let peers = discover_from_status(&status);
         assert_eq!(peers.len(), 3);
-        assert_eq!(peers[0].peer_id.as_deref(), Some("100.64.0.2"));
+        assert_eq!(peers[0].peer_id.as_deref(), Some("safe-key"));
         assert_eq!(peers[0].address, Some("100.64.0.2".parse().expect("safe")));
         assert_eq!(peers[1].peer_id, None);
         assert_eq!(peers[1].address, None);
-        assert_eq!(peers[2].peer_id.as_deref(), Some("127.0.0.1"));
+        assert_eq!(peers[2].peer_id.as_deref(), Some("spoofed-key"));
         assert_eq!(peers[2].address, None);
         assert!(peers
             .iter()
@@ -236,6 +231,31 @@ mod tests {
             OverlayError::HostUnknown { host, overlay }
                 if host == "missing" && overlay == id
         ));
+    }
+
+    #[test]
+    fn resolved_peer_keeps_public_key_across_ip_change() {
+        let id = OverlayId::new(NETBIRD_OVERLAY_ID).expect("id");
+        let first = status(
+            r#"{"peers":[{"publicKey":"stable-key","fqdn":"remote.example","netbirdIp":"100.64.0.2"}]}"#,
+        );
+        let second = status(
+            r#"{"peers":[{"publicKey":"stable-key","fqdn":"remote.example","netbirdIp":"100.64.0.3"}]}"#,
+        );
+
+        let first = resolve_from_status(&first, "stable-key", &id).expect("first route");
+        let second = resolve_from_status(&second, "stable-key", &id).expect("second route");
+
+        assert_eq!(first.peer_id.as_deref(), Some("stable-key"));
+        assert_eq!(second.peer_id.as_deref(), Some("stable-key"));
+        assert_eq!(
+            first.address,
+            "100.64.0.2".parse::<IpAddr>().expect("first IP")
+        );
+        assert_eq!(
+            second.address,
+            "100.64.0.3".parse::<IpAddr>().expect("second IP")
+        );
     }
 }
 

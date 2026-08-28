@@ -71,11 +71,15 @@ a wildcard requires explicit install-time confirmation. See
 [Hermes operator](hermes-operator.md#access-policy-and-targets).
 
 Unqualified names that resolve in more than one overlay fail closed. Clients
-keep the overlay-qualified peer identity for display and caching, and reuse the
-exact discovered socket route for control calls and the separate raw attach
-connection through the explicit trusted-route API. A socket-address literal
-cannot bypass current overlay membership and configured-port policy. A bare
-IPv6 literal such as `fd00::2` remains an unqualified selector; only an explicit
-configured-overlay prefix such as `netbird:fd00::2` qualifies it. A failure in
-one configured overlay does not hide healthy peers from another overlay;
-discovery reports an error only when every provider fails.
+keep the overlay-qualified stable peer identity and discovered port for display,
+caching, reconnects, and external attach. Each new connection re-resolves that
+identity through current provider state; only control and raw attach opened by
+one SDK client reuse its exact selected socket endpoint. The explicit
+`<overlay>:<selector>@<port>` form carries the discovered port without trusting
+a cached IP. A socket-address literal cannot bypass current overlay membership.
+NetBird uses `publicKey` or legacy `pubKey` as `peer_id`; when absent,
+`peer_id` stays null and clients fall back to FQDN. A bare IPv6 literal such as
+`fd00::2` remains an unqualified selector; only an explicit configured-overlay
+prefix such as `netbird:fd00::2` qualifies it. A failure in one configured
+overlay does not hide healthy peers from another overlay; discovery reports an
+error only when every provider fails.

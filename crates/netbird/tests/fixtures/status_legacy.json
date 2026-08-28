@@ -12,6 +12,7 @@
     {
       "fqdn": "host-b.netbird.cloud",
       "netbirdIp": "100.64.0.20",
+      "pubKey": "pubkey-b-legacy",
       "connectionStatus": "Connected",
       "connType": "P2P",
       "lastSeen": "2026-06-19T10:00:00Z",

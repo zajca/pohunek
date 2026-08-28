@@ -101,6 +101,15 @@ pub enum ClientError {
         detail: String,
     },
 
+    /// An explicit remote route did not contain a valid selector and port.
+    #[error("invalid remote route '{route}': {detail}")]
+    InvalidRemoteRoute {
+        /// Non-secret route supplied by the caller.
+        route: String,
+        /// Stable explanation of the rejected route shape.
+        detail: &'static str,
+    },
+
     /// A `NetBird` TCP connection to the host's daemon port could not be opened.
     #[error("could not open a NetBird connection to host '{host}': {source}")]
     HostUnreachable {
@@ -256,6 +265,15 @@ impl ClientError {
                 "invalid_discovery_options",
                 format!("invalid discovery options: {detail}"),
                 Some("fix the invalid discovery option before running discovery".to_owned()),
+            ),
+            ClientError::InvalidRemoteRoute { route, detail } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "invalid_remote_route",
+                format!("invalid remote route '{route}': {detail}"),
+                Some(
+                    "use '<overlay>:<selector>' or '<overlay>:<selector>@<non-zero-port>'"
+                        .to_owned(),
+                ),
             ),
             ClientError::HostUnreachable { host, source } => {
                 let mut err = ProtocolError::host_unreachable(host);
@@ -561,6 +579,22 @@ mod tests {
             structured.recover.as_deref(),
             Some("fix the invalid discovery option before running discovery")
         );
+    }
+
+    #[test]
+    fn invalid_remote_route_maps_to_non_retry_configuration_error() {
+        let structured = ClientError::InvalidRemoteRoute {
+            route: "netbird:stable-key@0".to_owned(),
+            detail: "the port must be a non-zero u16",
+        }
+        .to_protocol_error();
+
+        assert_eq!(structured.class, ErrorClass::Configuration);
+        assert_eq!(structured.code, "invalid_remote_route");
+        assert!(structured
+            .recover
+            .as_deref()
+            .is_some_and(|hint| hint.contains("<non-zero-port>")));
     }
 
     #[test]

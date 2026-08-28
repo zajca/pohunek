@@ -348,7 +348,9 @@ waiting for owner approval.
 Every command accepts `--host <name>` (default `local`), and nearly all of
 them `--json` for machine-readable output (the exceptions are `attach`,
 `daemon start`, and `prompt render`). Session targets are `<session-id>` or
-`<host>/<session-id>`.
+`<host>/<session-id>`. A discovered route may use
+`<overlay>:<stable-selector>@<port>`; the selector is re-resolved through
+current overlay state while the discovered daemon port is retained.
 
 | Command | What it does |
 |---|---|

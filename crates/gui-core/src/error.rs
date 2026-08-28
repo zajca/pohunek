@@ -33,6 +33,10 @@ pub enum CoreError {
     MissingSessionEventPayload,
     #[error("host discovery record does not contain a usable host name")]
     MissingDiscoveredHostName,
+    #[error("host discovery record does not contain a stable peer identity or FQDN")]
+    MissingDiscoveredStableIdentity,
+    #[error("host discovery record contains invalid daemon port 0")]
+    InvalidDiscoveredPort,
     #[error("host discovery address '{address}:{port}' is invalid: {source}")]
     InvalidDiscoveredAddress {
         address: String,

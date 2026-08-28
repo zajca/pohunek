@@ -365,23 +365,24 @@ pub async fn discover_hosts(
 }
 
 pub(crate) fn discovered_host_config(record: &HostRecord) -> Result<HostConfig, CoreError> {
-    let addr = discovered_transport_addr(record)?;
+    discovered_transport_addr(record)?;
     let identity = record
         .peer_id
         .as_deref()
-        .or(record.fqdn.as_deref())
-        .or(record.name.as_deref())
-        .unwrap_or_else(|| record.address.as_deref().expect("reachable route address"));
-    Ok(HostConfig::tcp_with_attach_host(
-        format!("{}:{identity}", record.overlay),
-        addr,
-        format!("{}:{}", record.overlay, addr.ip()),
-    ))
+        .filter(|identity| !identity.is_empty())
+        .or(record.fqdn.as_deref().filter(|fqdn| !fqdn.is_empty()))
+        .ok_or(CoreError::MissingDiscoveredStableIdentity)?;
+    let selector = format!("{}:{identity}", record.overlay);
+    let route = pohunek_client::remote_host_with_port(&selector, record.port)?;
+    Ok(HostConfig::remote(selector, route, ""))
 }
 
 pub(crate) fn discovered_transport_addr(
     record: &HostRecord,
 ) -> Result<std::net::SocketAddr, CoreError> {
+    if record.port == 0 {
+        return Err(CoreError::InvalidDiscoveredPort);
+    }
     let address = record
         .address
         .clone()

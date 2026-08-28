@@ -2,6 +2,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -33,6 +34,68 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// response serialization, and local mesh latency without racing the daemon's
 /// authoritative bounded-wait deadline.
 const DEDICATED_WAIT_TRANSPORT_HEADROOM: Duration = Duration::from_secs(1);
+const REMOTE_PORT_SEPARATOR: char = '@';
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RemoteTarget<'a> {
+    selector: &'a str,
+    port: Option<NonZeroU16>,
+}
+
+impl<'a> RemoteTarget<'a> {
+    fn parse(route: &'a str) -> Result<Self, ClientError> {
+        let Some((selector, raw_port)) = route.rsplit_once(REMOTE_PORT_SEPARATOR) else {
+            return Ok(Self {
+                selector: route,
+                port: None,
+            });
+        };
+        if selector.is_empty() || selector.contains(REMOTE_PORT_SEPARATOR) {
+            return Err(invalid_remote_route(
+                route,
+                "the selector must be non-empty and cannot contain '@'",
+            ));
+        }
+        let port = raw_port
+            .parse::<u16>()
+            .ok()
+            .and_then(NonZeroU16::new)
+            .ok_or_else(|| invalid_remote_route(route, "the port must be a non-zero u16"))?;
+        Ok(Self {
+            selector,
+            port: Some(port),
+        })
+    }
+}
+
+fn invalid_remote_route(route: &str, detail: &'static str) -> ClientError {
+    ClientError::InvalidRemoteRoute {
+        route: route.to_owned(),
+        detail,
+    }
+}
+
+/// Format a stable overlay selector with an explicit daemon port.
+///
+/// The returned value is accepted anywhere an SDK or CLI remote host is
+/// accepted. The selector is still resolved through current overlay state;
+/// only the discovered daemon port is retained.
+///
+/// # Errors
+///
+/// Returns [`ClientError::InvalidRemoteRoute`] when the selector is empty,
+/// contains the reserved `@` separator, or `port` is zero.
+pub fn remote_host_with_port(host: &str, port: u16) -> Result<String, ClientError> {
+    if host.is_empty() || host.contains(REMOTE_PORT_SEPARATOR) {
+        return Err(invalid_remote_route(
+            host,
+            "the selector must be non-empty and cannot contain '@'",
+        ));
+    }
+    NonZeroU16::new(port)
+        .ok_or_else(|| invalid_remote_route(host, "the port must be a non-zero u16"))?;
+    Ok(format!("{host}{REMOTE_PORT_SEPARATOR}{port}"))
+}
 
 /// A connected SDK client over either the local Unix socket or remote TCP.
 #[derive(Debug)]
@@ -949,8 +1012,16 @@ async fn resolve_remote_addr(
     connect_timeout: Duration,
     registry: OverlayRegistry,
 ) -> Result<SocketAddr, ClientError> {
-    match tokio::time::timeout(connect_timeout, registry.resolve_host(&host)).await {
-        Ok(result) => result.map(|route| route.addr).map_err(ClientError::from),
+    let target = RemoteTarget::parse(&host)?;
+    match tokio::time::timeout(connect_timeout, registry.resolve_host(target.selector)).await {
+        Ok(result) => result
+            .map(|route| {
+                SocketAddr::new(
+                    route.addr.ip(),
+                    target.port.map_or(route.addr.port(), NonZeroU16::get),
+                )
+            })
+            .map_err(ClientError::from),
         Err(_elapsed) => Err(ClientError::RemoteDiscoveryFailed {
             detail: format!("timed out resolving remote host '{host}' after {connect_timeout:?}"),
         }),
@@ -1035,7 +1106,7 @@ fn response_id_mismatch_error(
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::Arc;
+    use std::sync::{Arc, RwLock};
 
     use super::*;
     use overlay::{
@@ -1049,6 +1120,12 @@ mod tests {
     struct PolicyTransport {
         id: OverlayId,
         member: IpAddr,
+    }
+
+    #[derive(Debug)]
+    struct MutablePolicyTransport {
+        id: OverlayId,
+        member: Arc<RwLock<IpAddr>>,
     }
 
     impl OverlayTransport for PolicyTransport {
@@ -1097,8 +1174,58 @@ mod tests {
         }
     }
 
+    impl OverlayTransport for MutablePolicyTransport {
+        fn id(&self) -> &OverlayId {
+            &self.id
+        }
+
+        fn validate_bind_addr(&self, addr: IpAddr) -> Result<(), BindAddrError> {
+            if addr == *self.member.read().expect("member read lock") {
+                Ok(())
+            } else {
+                Err(BindAddrError::NotMember(addr))
+            }
+        }
+
+        fn listener_addr(&self) -> OverlayFuture<'_, IpAddr> {
+            let member = *self.member.read().expect("member read lock");
+            Box::pin(async move { Ok(member) })
+        }
+
+        fn resolve_peer<'a>(&'a self, host: &'a str) -> OverlayFuture<'a, ResolvedPeer> {
+            let result = if host == "stable-peer" {
+                Ok(ResolvedPeer {
+                    peer_id: Some("stable-peer".to_owned()),
+                    display_name: Some("member".to_owned()),
+                    fqdn: Some("member.test".to_owned()),
+                    address: *self.member.read().expect("member read lock"),
+                })
+            } else {
+                Err(OverlayError::HostUnknown {
+                    host: host.to_owned(),
+                    overlay: self.id.clone(),
+                })
+            };
+            Box::pin(async move { result })
+        }
+
+        fn discover_peers(&self) -> OverlayFuture<'_, Vec<DiscoveredPeer>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
     fn policy_registry(member: IpAddr, port: u16) -> OverlayRegistry {
         let transport = Arc::new(PolicyTransport {
+            id: OverlayId::new("policy").expect("policy overlay id"),
+            member,
+        });
+        let configured =
+            ConfiguredTransport::new(transport, port).expect("configured policy transport");
+        OverlayRegistry::new(vec![configured]).expect("policy registry")
+    }
+
+    fn mutable_policy_registry(member: Arc<RwLock<IpAddr>>, port: u16) -> OverlayRegistry {
+        let transport = Arc::new(MutablePolicyTransport {
             id: OverlayId::new("policy").expect("policy overlay id"),
             member,
         });
@@ -1148,6 +1275,22 @@ mod tests {
         assert!(!invalid.to_string().contains("private"));
     }
 
+    #[test]
+    fn explicit_remote_route_format_is_canonical_and_validated() {
+        assert_eq!(
+            remote_host_with_port("policy:stable-peer", 18722).expect("valid route"),
+            "policy:stable-peer@18722"
+        );
+        assert!(matches!(
+            remote_host_with_port("policy:stable-peer", 0),
+            Err(ClientError::InvalidRemoteRoute { .. })
+        ));
+        assert!(matches!(
+            RemoteTarget::parse("policy:stable-peer@not-a-port"),
+            Err(ClientError::InvalidRemoteRoute { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn registry_connect_rejects_socket_literal_before_dialing() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -1194,6 +1337,45 @@ mod tests {
 
         accepted.await.expect("policy accept task");
         drop(client);
+    }
+
+    #[tokio::test]
+    async fn fresh_clients_reresolve_stable_peer_and_avoid_reassigned_ip() {
+        let first_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let second_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        let first_listener = TcpListener::bind(SocketAddr::new(first_ip, 0))
+            .await
+            .expect("first listener");
+        let port = first_listener.local_addr().expect("first address").port();
+        let second_listener = TcpListener::bind(SocketAddr::new(second_ip, port))
+            .await
+            .expect("second listener");
+        let current_ip = Arc::new(RwLock::new(first_ip));
+        let registry = mutable_policy_registry(Arc::clone(&current_ip), port);
+        let route = remote_host_with_port("policy:stable-peer", port).expect("stable route");
+
+        let first_client =
+            Client::connect_with_registry(&route, "/unused/local.sock", registry.clone())
+                .await
+                .expect("first GUI-style connection");
+        let (_stream, _) = tokio::time::timeout(Duration::from_secs(1), first_listener.accept())
+            .await
+            .expect("first accept deadline")
+            .expect("first accept");
+        drop(first_client);
+
+        *current_ip.write().expect("member write lock") = second_ip;
+        let second_client = Client::connect_with_registry(&route, "/unused/local.sock", registry)
+            .await
+            .expect("reconnected GUI-style client");
+        let (_stream, _) = tokio::time::timeout(Duration::from_secs(1), second_listener.accept())
+            .await
+            .expect("second accept deadline")
+            .expect("second accept");
+        tokio::time::timeout(Duration::from_millis(25), first_listener.accept())
+            .await
+            .expect_err("reassigned old IP must not receive the reconnect");
+        drop(second_client);
     }
 
     #[tokio::test]
