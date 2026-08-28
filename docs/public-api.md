@@ -817,13 +817,20 @@ reports real installed and expected version fields. `installed_version` is
 unknown when any readable managed asset lacks a valid marker. The typed recovery
 is `reinstall` only when the installer can repair every finding; malformed,
 unreadable, oversized, or unresolved provider configuration instead reports
-`repair_configuration`. Symlinked or special managed assets also require manual
-repair, while an explicit reinstall replaces installer-owned assets atomically
-without following an existing symlink. Managed assets and provider configuration
-are opened without following symlinks, verified as regular files from the same
-descriptor, and read with separate named byte limits; provider inspection is
-nonblocking so FIFOs cannot stall the daemon worker. An oversized file is
-`outdated` with an actionable warning. The CLI routes Codex and Claude status to
+`repair_configuration`. Symlinked, special, foreign-owned, or group/world-writable
+managed assets also require manual repair, while an explicit reinstall replaces
+installer-owned assets atomically without following an existing symlink. Managed
+asset type, effective-UID ownership, mode, and content are inspected through one
+non-following descriptor. The relevant parent chain starts at the explicitly
+resolved agent config root and ends at the asset's direct parent; every path in
+that chain must be a real directory owned by the daemon's effective UID without
+group or world write access. System ancestors above the config root are outside
+this check, so ordinary safe home/XDG roots are not rejected merely because an
+ancestor such as `/tmp` is shared. Provider configuration is separately opened
+without following symlinks, verified as a regular file from the same descriptor,
+and read with its own named byte limit; provider inspection is nonblocking so
+FIFOs cannot stall the daemon worker. An oversized file is `outdated` with an
+actionable warning. The CLI routes Codex and Claude status to
 the effective global `--host`; mutating hook installation and every Hermes
 lifecycle action remain local. Human recovery hints and warning commands for a
 remote report explicitly name the daemon host where the operator must run the

@@ -3285,6 +3285,7 @@ dependencies = [
  "base64",
  "futures",
  "libc",
+ "nix 0.29.0",
  "pohunek-client",
  "pohunek-hostcheck",
  "pohunek-knowledge",

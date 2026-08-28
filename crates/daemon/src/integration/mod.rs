@@ -61,6 +61,9 @@ const INSPECTION_LIMIT_PROBE_BYTES: usize = 1;
 /// Unix permission and special-mode bits relevant to executable trust checks.
 #[cfg(unix)]
 const UNIX_MODE_MASK: u32 = 0o7777;
+/// Group/other write bits violate the owner-private executable path boundary.
+#[cfg(unix)]
+const GROUP_OR_OTHER_WRITE_MASK: u32 = 0o022;
 /// Per-hook timeout (seconds) recorded in the agent's hook config.
 const HOOK_TIMEOUT_SECS: u64 = 10;
 /// Action argument passed to the hook script for the `SessionStart` event.
@@ -297,12 +300,22 @@ fn status_at(
 
     let mut warnings = Vec::new();
     let mut recovery = IntegrationRecovery::None;
+    let parent_chain_current = managed_asset_parent_chain_current(
+        agent,
+        config_dir,
+        state_path
+            .parent()
+            .expect("managed asset path always has a parent"),
+        &mut warnings,
+        &mut recovery,
+    );
     let assets = [
         inspect_asset(
             agent,
             ManagedAssetKind::StateHook,
             state_path,
             state_asset,
+            parent_chain_current,
             &mut warnings,
             &mut recovery,
         ),
@@ -311,6 +324,7 @@ fn status_at(
             ManagedAssetKind::NotificationHook,
             notify_path,
             notify_asset,
+            parent_chain_current,
             &mut warnings,
             &mut recovery,
         ),
@@ -418,6 +432,153 @@ enum ManagedAssetKind {
     NotificationHook,
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnixMetadataSnapshot {
+    is_expected_type: bool,
+    owner_uid: u32,
+    mode: u32,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataTrustIssue {
+    UnexpectedType,
+    ForeignOwner { actual: u32, expected: u32 },
+    GroupOrOtherWritable { mode: u32 },
+}
+
+#[cfg(unix)]
+fn evaluate_owner_private_metadata(
+    metadata: UnixMetadataSnapshot,
+    effective_uid: u32,
+) -> Result<(), MetadataTrustIssue> {
+    if !metadata.is_expected_type {
+        return Err(MetadataTrustIssue::UnexpectedType);
+    }
+    if metadata.owner_uid != effective_uid {
+        return Err(MetadataTrustIssue::ForeignOwner {
+            actual: metadata.owner_uid,
+            expected: effective_uid,
+        });
+    }
+    if metadata.mode & GROUP_OR_OTHER_WRITE_MASK != 0 {
+        return Err(MetadataTrustIssue::GroupOrOtherWritable {
+            mode: metadata.mode,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn metadata_snapshot(metadata: &fs::Metadata, is_expected_type: bool) -> UnixMetadataSnapshot {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    UnixMetadataSnapshot {
+        is_expected_type,
+        owner_uid: metadata.uid(),
+        mode: metadata.permissions().mode() & UNIX_MODE_MASK,
+    }
+}
+
+#[cfg(unix)]
+fn managed_asset_parent_chain_current(
+    agent: StatusAgent,
+    config_dir: &Path,
+    asset_parent: &Path,
+    warnings: &mut Vec<String>,
+    recovery: &mut IntegrationRecovery,
+) -> bool {
+    let relative_parent = match asset_parent.strip_prefix(config_dir) {
+        Ok(relative_parent) => relative_parent,
+        Err(_error) => {
+            warnings.push("managed asset parent escapes the agent config root".to_owned());
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+            return false;
+        }
+    };
+    let effective_uid = nix::unistd::Uid::effective().as_raw();
+    let mut parent = config_dir.to_path_buf();
+    let mut current = inspect_managed_parent(agent, &parent, effective_uid, warnings);
+    for component in relative_parent.components() {
+        parent.push(component);
+        current = inspect_managed_parent(agent, &parent, effective_uid, warnings) && current;
+    }
+    if !current {
+        require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+    }
+    current
+}
+
+#[cfg(not(unix))]
+fn managed_asset_parent_chain_current(
+    _agent: StatusAgent,
+    _config_dir: &Path,
+    _asset_parent: &Path,
+    _warnings: &mut Vec<String>,
+    _recovery: &mut IntegrationRecovery,
+) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn inspect_managed_parent(
+    agent: StatusAgent,
+    path: &Path,
+    effective_uid: u32,
+    warnings: &mut Vec<String>,
+) -> bool {
+    let file = match open_inspection_directory(path) {
+        Ok(file) => file,
+        Err(_error) => {
+            warnings.push(format!(
+                "managed asset parent {} could not be opened safely",
+                path.display()
+            ));
+            return false;
+        }
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_error) => {
+            warnings.push(format!(
+                "managed asset parent {} metadata could not be read",
+                path.display()
+            ));
+            return false;
+        }
+    };
+    match evaluate_owner_private_metadata(
+        metadata_snapshot(&metadata, metadata.file_type().is_dir()),
+        effective_uid,
+    ) {
+        Ok(()) => true,
+        Err(MetadataTrustIssue::UnexpectedType) => {
+            warnings.push(format!(
+                "managed asset parent {} is not a real directory",
+                path.display()
+            ));
+            false
+        }
+        Err(MetadataTrustIssue::ForeignOwner { actual, expected }) => {
+            warnings.push(format!(
+                "managed asset parent {} is owned by uid {actual}, not daemon uid {expected}; repair the agent configuration before running `pohunek integration install --agent {}`",
+                path.display(),
+                agent.kind().as_wire()
+            ));
+            false
+        }
+        Err(MetadataTrustIssue::GroupOrOtherWritable { mode }) => {
+            warnings.push(format!(
+                "managed asset parent {} is unsafe (mode {mode:04o}; group or other users can replace managed hooks); repair the directory permissions before running `pohunek integration install --agent {}`",
+                path.display(),
+                agent.kind().as_wire()
+            ));
+            false
+        }
+    }
+}
+
 impl ManagedAssetKind {
     fn description(self) -> &'static str {
         match self {
@@ -432,12 +593,13 @@ fn inspect_asset(
     kind: ManagedAssetKind,
     path: PathBuf,
     expected: &'static str,
+    parent_chain_current: bool,
     warnings: &mut Vec<String>,
     recovery: &mut IntegrationRecovery,
 ) -> AssetStatus {
     let description = kind.description();
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
+    let mut file = match open_inspection_file(&path) {
+        Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             warnings.push(format!("managed {description} is missing"));
             require_recovery(recovery, IntegrationRecovery::Reinstall);
@@ -450,7 +612,7 @@ fn inspect_asset(
             };
         }
         Err(_error) => {
-            warnings.push(format!("managed {description} metadata could not be read"));
+            warnings.push(format!("managed {description} could not be opened safely"));
             require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
             return AssetStatus {
                 path,
@@ -461,18 +623,23 @@ fn inspect_asset(
             };
         }
     };
-    if !metadata.file_type().is_file() {
-        warnings.push(format!("managed {description} is not a regular file"));
-        require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
-        return AssetStatus {
-            path,
-            content: None,
-            present: true,
-            footprint: true,
-            current: false,
-        };
-    }
-    let content = match read_bounded_utf8(&path, MANAGED_ASSET_INSPECTION_LIMIT_BYTES) {
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_error) => {
+            warnings.push(format!("managed {description} metadata could not be read"));
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+            return AssetStatus {
+                path,
+                content: None,
+                present: true,
+                footprint: true,
+                current: false,
+            };
+        }
+    };
+    let metadata_current = asset_metadata_current(agent, kind, &metadata, warnings, recovery);
+    let content = match read_bounded_utf8_from_file(&mut file, MANAGED_ASSET_INSPECTION_LIMIT_BYTES)
+    {
         Ok(BoundedRead::Content(content)) => content,
         Ok(BoundedRead::Oversized) => {
             warnings.push(format!(
@@ -515,27 +682,49 @@ fn inspect_asset(
             )),
         }
     }
-    let permissions_current = asset_permissions_current(agent, kind, &metadata, warnings);
-    if !permissions_current {
-        require_recovery(recovery, IntegrationRecovery::Reinstall);
-    }
     AssetStatus {
         path,
         content: Some(content),
         present: true,
         footprint: true,
-        current: content_current && permissions_current,
+        current: content_current && metadata_current && parent_chain_current,
     }
 }
 
 #[cfg(unix)]
-fn asset_permissions_current(
+fn asset_metadata_current(
     agent: StatusAgent,
     kind: ManagedAssetKind,
     metadata: &fs::Metadata,
     warnings: &mut Vec<String>,
+    recovery: &mut IntegrationRecovery,
 ) -> bool {
     use std::os::unix::fs::PermissionsExt;
+
+    let effective_uid = nix::unistd::Uid::effective().as_raw();
+    match evaluate_owner_private_metadata(
+        metadata_snapshot(metadata, metadata.file_type().is_file()),
+        effective_uid,
+    ) {
+        Ok(()) | Err(MetadataTrustIssue::GroupOrOtherWritable { .. }) => {}
+        Err(MetadataTrustIssue::UnexpectedType) => {
+            warnings.push(format!(
+                "managed {} is not a regular file",
+                kind.description()
+            ));
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+            return false;
+        }
+        Err(MetadataTrustIssue::ForeignOwner { actual, expected }) => {
+            warnings.push(format!(
+                "managed {} is owned by uid {actual}, not daemon uid {expected}; repair ownership before running `pohunek integration install --agent {}`",
+                kind.description(),
+                agent.kind().as_wire()
+            ));
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+            return false;
+        }
+    }
 
     let mode = metadata.permissions().mode() & UNIX_MODE_MASK;
     if mode == MANAGED_HOOK_MODE {
@@ -549,21 +738,24 @@ fn asset_permissions_current(
             "managed {description} permissions are unsafe (mode {mode:04o}; group or other users can write it); run `pohunek integration install --agent {}` to restore mode {MANAGED_HOOK_MODE:04o}",
             agent.as_wire()
         ));
+        require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
     } else {
         warnings.push(format!(
             "managed {description} permissions drifted (mode {mode:04o}; expected {MANAGED_HOOK_MODE:04o}); run `pohunek integration install --agent {}` to restore them",
             agent.as_wire()
         ));
+        require_recovery(recovery, IntegrationRecovery::Reinstall);
     }
     false
 }
 
 #[cfg(not(unix))]
-fn asset_permissions_current(
+fn asset_metadata_current(
     _agent: StatusAgent,
     _kind: ManagedAssetKind,
     _metadata: &fs::Metadata,
     _warnings: &mut Vec<String>,
+    _recovery: &mut IntegrationRecovery,
 ) -> bool {
     true
 }
@@ -589,6 +781,11 @@ enum BoundedRead {
 }
 
 fn read_bounded_utf8(path: &Path, max_bytes: usize) -> io::Result<BoundedRead> {
+    let mut file = open_regular_inspection_file(path)?;
+    read_bounded_utf8_from_file(&mut file, max_bytes)
+}
+
+fn read_bounded_utf8_from_file(file: &mut fs::File, max_bytes: usize) -> io::Result<BoundedRead> {
     let read_limit = max_bytes.saturating_add(INSPECTION_LIMIT_PROBE_BYTES);
     let read_limit = u64::try_from(read_limit).map_err(|_error| {
         io::Error::new(
@@ -597,7 +794,6 @@ fn read_bounded_utf8(path: &Path, max_bytes: usize) -> io::Result<BoundedRead> {
         )
     })?;
     let mut bytes = Vec::new();
-    let file = open_regular_inspection_file(path)?;
     file.take(read_limit).read_to_end(&mut bytes)?;
     if bytes.len() > max_bytes {
         return Ok(BoundedRead::Oversized);
@@ -607,7 +803,7 @@ fn read_bounded_utf8(path: &Path, max_bytes: usize) -> io::Result<BoundedRead> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-fn open_regular_inspection_file(path: &Path) -> io::Result<fs::File> {
+fn open_inspection_file(path: &Path) -> io::Result<fs::File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -616,7 +812,11 @@ fn open_regular_inspection_file(path: &Path) -> io::Result<fs::File> {
 
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
     };
-    let file = options.open(path)?;
+    options.open(path)
+}
+
+fn open_regular_inspection_file(path: &Path) -> io::Result<fs::File> {
+    let file = open_inspection_file(path)?;
     if !file.metadata()?.file_type().is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -624,6 +824,17 @@ fn open_regular_inspection_file(path: &Path) -> io::Result<fs::File> {
         ));
     }
     Ok(file)
+}
+
+#[cfg(unix)]
+fn open_inspection_directory(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    options.open(path)
 }
 
 fn registration_paths(config_dir: &Path, agent: StatusAgent) -> Vec<PathBuf> {
@@ -2887,6 +3098,88 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn owner_private_metadata_rejects_foreign_uid_without_chown() {
+        let effective_uid = nix::unistd::Uid::effective().as_raw();
+        let foreign_uid = effective_uid.wrapping_add(1);
+        let metadata = super::UnixMetadataSnapshot {
+            is_expected_type: true,
+            owner_uid: foreign_uid,
+            mode: super::MANAGED_HOOK_MODE,
+        };
+
+        assert_eq!(
+            super::evaluate_owner_private_metadata(metadata, effective_uid),
+            Err(super::MetadataTrustIssue::ForeignOwner {
+                actual: foreign_uid,
+                expected: effective_uid,
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_trust_anchor_does_not_reject_safe_config_below_system_temp() {
+        let codex = temp_dir("status-safe-config-trust-anchor");
+        install_codex(&codex).expect("install Codex fixture");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Current);
+        assert_eq!(report.recovery, protocol::IntegrationRecovery::None);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_managed_asset_parents_require_manual_repair() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for (name, agent, mode) in [
+            ("codex config root", AgentKind::Codex, 0o775),
+            ("claude hooks directory", AgentKind::Claude, 0o757),
+        ] {
+            let config_dir = temp_dir(&format!("status-writable-parent-{name}"));
+            let parent = match agent {
+                AgentKind::Codex => {
+                    install_codex(&config_dir).expect("install Codex fixture");
+                    config_dir.clone()
+                }
+                AgentKind::Claude => {
+                    install_claude(&config_dir).expect("install Claude fixture");
+                    config_dir.join("hooks")
+                }
+                AgentKind::Shell | AgentKind::Hermes | AgentKind::Unknown(_) => {
+                    unreachable!("test uses managed agents")
+                }
+            };
+            fs::set_permissions(&parent, fs::Permissions::from_mode(mode))
+                .expect("make managed asset parent writable");
+
+            let report = explicit_status(&config_dir, agent);
+
+            assert_eq!(
+                report.state,
+                protocol::IntegrationInstallState::Outdated,
+                "{name}"
+            );
+            assert_eq!(
+                report.recovery,
+                protocol::IntegrationRecovery::RepairConfiguration,
+                "{name}"
+            );
+            assert!(
+                report.warnings.iter().any(|warning| {
+                    warning.contains("managed asset parent")
+                        && warning.contains(&format!("mode {mode:04o}"))
+                }),
+                "{name}: {:?}",
+                report.warnings
+            );
+        }
+    }
+
     #[test]
     fn status_detects_each_modified_or_missing_managed_asset() {
         for (name, relative_path, mutation) in [
@@ -3081,6 +3374,32 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn managed_asset_parent_symlink_requires_manual_repair() {
+        use std::os::unix::fs::symlink;
+
+        let claude = temp_dir("status-asset-parent-symlink");
+        install_claude(&claude).expect("install Claude fixture");
+        let hooks_path = claude.join("hooks");
+        let real_hooks_path = claude.join("hooks-real");
+        fs::rename(&hooks_path, &real_hooks_path).expect("move real hooks directory");
+        symlink(&real_hooks_path, &hooks_path).expect("link managed asset parent");
+
+        let report = explicit_status(&claude, AgentKind::Claude);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("managed asset parent")
+                && warning.contains("could not be opened safely")));
+    }
+
     #[test]
     fn managed_asset_metadata_error_requires_manual_repair() {
         let claude = temp_dir("status-asset-metadata-error");
@@ -3097,7 +3416,7 @@ mod tests {
         assert!(report
             .warnings
             .iter()
-            .any(|warning| warning.contains("metadata could not be read")));
+            .any(|warning| warning.contains("managed asset parent")));
     }
 
     #[cfg(unix)]
@@ -3117,6 +3436,10 @@ mod tests {
         let report = explicit_status(&codex, AgentKind::Codex);
 
         assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
         let warning = report
             .warnings
             .iter()

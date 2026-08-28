@@ -22,6 +22,14 @@ The assistant must:
 - Verify changes before claiming they work.
 - Keep remote confirmation behavior intact.
 - Treat hooks as executable code requiring explicit review.
+- Keep daemon-managed hook assets inside an explicit owner-private config-root
+  trust anchor. Status must inspect each asset through one no-follow descriptor
+  for type, effective-UID ownership, mode, and content, and must reject any
+  effective-UID-foreign, symlinked, special, or group/world-writable asset. From
+  the selected config root through the direct asset parent, every directory must
+  be real, effective-UID-owned, and not group/world writable. Ancestors above the
+  selected root are outside this chain so normal home/XDG paths are not rejected
+  solely because a shared system ancestor exists.
 - Avoid weakening owner-only profile checks, name guards, path containment, or
   remote safety gates.
 - Treat worker control sockets and journals as owner-private runtime authority.
