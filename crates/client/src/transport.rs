@@ -26,11 +26,11 @@ use crate::ClientError;
 pub const LOCAL_HOST: &str = "local";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Transport processing budget added after a validated daemon-side wait.
+/// Transport processing budget added after a validated daemon-side deadline.
 ///
 /// One second leaves room for request framing, waiter teardown, scheduling,
 /// response serialization, and local mesh latency without racing the daemon's
-/// authoritative bounded-wait deadline.
+/// authoritative overall delivery-and-wait deadline.
 const DEDICATED_WAIT_TRANSPORT_HEADROOM: Duration = Duration::from_secs(1);
 
 /// A connected SDK client over either the local Unix socket or remote TCP.
@@ -327,7 +327,7 @@ impl Client {
             .await
     }
 
-    /// Deliver input with an optional dedicated bounded delivery-wait connection.
+    /// Deliver input with an optional dedicated overall-deadline connection.
     pub async fn session_input(
         &mut self,
         params: SessionInputParams,
@@ -469,10 +469,11 @@ fn validate_input_wait_result(
     })?;
     if result.activity_source.is_none()
         || result.runtime.is_none()
+        || result.activity_epoch.as_deref().is_none_or(str::is_empty)
         || result.activity_revision.is_none()
     {
         return Err(ClientError::InputWaitContract {
-            detail: "the response omitted runtime-scoped activity evidence",
+            detail: "the response omitted epoch- and runtime-scoped activity evidence",
         });
     }
     let target_matches = if wait.until.is_empty() {
@@ -1257,6 +1258,7 @@ mod tests {
                 "runtime_id": "runtime-1",
                 "runtime_generation": "1"
             },
+            "activity_epoch": "d-epoch-1",
             "activity_revision": "2"
         });
         let (address, server) = spawn_dedicated_capture_server(result).await;
@@ -1302,6 +1304,44 @@ mod tests {
             .session_input(params)
             .await
             .expect_err("legacy success must fail closed");
+        assert!(matches!(error, ClientError::InputWaitContract { .. }));
+        assert_eq!(
+            error.to_protocol_error().code,
+            "session_input_wait_contract_mismatch"
+        );
+        let request = server.await.expect("capture server");
+        assert_eq!(request.method(), protocol::method::SESSION_INPUT);
+    }
+
+    #[tokio::test]
+    async fn input_wait_rejects_success_without_activity_epoch() {
+        let result = serde_json::json!({
+            "accepted": true,
+            "activity": "idle",
+            "activity_source": "report",
+            "runtime": {
+                "runtime_id": "runtime-1",
+                "runtime_generation": "1"
+            },
+            "activity_revision": "2"
+        });
+        let (address, server) = spawn_dedicated_capture_server(result).await;
+        let mut client = Client::connect_tcp_addr("fixture-remote", address)
+            .await
+            .expect("connect remote");
+        let params = SessionInputParams {
+            session_id: SessionId("s-target".to_owned()),
+            text: "hello".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: vec![protocol::AgentActivity::Idle],
+                timeout_ms: None,
+            }),
+        };
+
+        let error = client
+            .session_input(params)
+            .await
+            .expect_err("unscoped revision must fail closed");
         assert!(matches!(error, ClientError::InputWaitContract { .. }));
         assert_eq!(
             error.to_protocol_error().code,
@@ -1460,7 +1500,7 @@ mod tests {
     }
 
     #[test]
-    fn dedicated_timeout_covers_wire_wait_and_transport_headroom() {
+    fn dedicated_timeout_covers_overall_deadline_and_transport_headroom() {
         assert_eq!(
             dedicated_request_timeout(Duration::from_secs(5), 8_000),
             Duration::from_secs(9)

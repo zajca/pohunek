@@ -476,8 +476,9 @@ struct ActivityEvidence {
     activity: AgentActivity,
     source: StateSource,
     runtime: SessionRuntimeIdentity,
+    activity_epoch: String,
     revision: ActivityRevision,
-    observed_at: Instant,
+    observed_at: tokio::time::Instant,
 }
 
 impl ActivityEvidence {
@@ -487,6 +488,7 @@ impl ActivityEvidence {
             activity: self.activity,
             source: self.source,
             runtime: Some(self.runtime.clone()),
+            activity_epoch: Some(self.activity_epoch.clone()),
             revision: Some(self.revision),
         }
     }
@@ -496,6 +498,7 @@ fn record_activity_evidence(
     entry: &mut SessionEntry,
     activity: AgentActivity,
     source: StateSource,
+    activity_epoch: &str,
 ) -> Option<ActivityEvidence> {
     entry.activity_revision = entry
         .activity_revision
@@ -511,8 +514,9 @@ fn record_activity_evidence(
         activity,
         source,
         runtime,
+        activity_epoch: activity_epoch.to_owned(),
         revision: ActivityRevision::new(entry.activity_revision),
-        observed_at: Instant::now(),
+        observed_at: tokio::time::Instant::now(),
     };
     entry.activity_evidence.insert(activity, evidence.clone());
     Some(evidence)
@@ -1776,6 +1780,7 @@ impl SessionRegistry {
     /// Record the active nested agent currently owning a live session.
     pub async fn report_agent(&self, params: SessionReportAgentParams) -> SessionReportAgentResult {
         let not_recorded = SessionReportAgentResult { recorded: false };
+        let activity_epoch = self.daemon_instance_id().to_owned();
         let resolved = match self.inner.profiles.resolve_agent(&params.agent) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -1847,7 +1852,7 @@ impl SessionRegistry {
             let evidence = reported_activity.and_then(|activity| {
                 entry.info.activity = Some(activity);
                 entry.info.state_source = StateSource::Report;
-                record_activity_evidence(entry, activity, StateSource::Report)
+                record_activity_evidence(entry, activity, StateSource::Report, &activity_epoch)
             });
             let _ = entry.detector_config.send(active_detector_config);
             entry.info.updated_at = timestamp_now();

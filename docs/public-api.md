@@ -187,7 +187,7 @@ All params and result type names below refer to structs exported by
 | `session.attach` | `SessionAttachParams` | `SessionAttachResult` | Mints a one-shot attach stream id. |
 | `session.detach` | `SessionDetachParams` | `SessionDetachResult` | Cancels an active attach stream. After a worker stream failure, the first call returns its optional typed `error` and consumes that short-lived result; unknown or already-consumed streams return `detached: false` without `error`. |
 | `session.resize` | `SessionResizeParams` | `SessionResizeResult` | Resizes the PTY on the control connection. |
-| `session.input` | `SessionInputParams` | `SessionInputResult` | Injects text using agent-specific input framing. Hermes accepts at most `MAX_SESSION_INPUT_BYTES` UTF-8 bytes, permits LF and tab but rejects other C0/C1 controls without rewriting them, and returns `session_input_blocked` while approval-visible activity is blocked. Unsafe or oversized Hermes text returns `session_input_rejected`. With `wait`, the daemon validates the complete contract before delivery, deduplicates targets in first-occurrence order, acquires a waiter permit, captures the runtime that accepted the write, and accepts only matching activity evidence observed after submit framing completes. The result includes `activity`, `activity_source`, `runtime`, and decimal-string `activity_revision`; Rust and TypeScript SDK wait helpers require all four and return `session_input_wait_contract_mismatch` when a same-version daemon ignores `wait` or omits evidence. Exact event evidence and retained per-activity revisions preserve rapid transitions across a newer snapshot or broadcast lag. Runtime exit returns `session_not_running`; replacement returns `session_runtime_changed`; shutdown cancels the wait. The wait is bounded by `timeout_ms: 1..8000` (default 8000), always uses a dedicated connection with transport headroom, and returns `session_input_timeout` on expiry. |
+| `session.input` | `SessionInputParams` | `SessionInputResult` | Injects text using agent-specific input framing. Hermes accepts at most `MAX_SESSION_INPUT_BYTES` UTF-8 bytes, permits LF and tab but rejects other C0/C1 controls without rewriting them, and returns `session_input_blocked` while approval-visible activity is blocked. Unsafe or oversized Hermes text returns `session_input_rejected`. With `wait`, the daemon validates the complete contract before delivery, deduplicates targets in first-occurrence order, acquires a waiter permit, and starts one overall `timeout_ms: 1..8000` deadline (default 8000) before delivery. It writes the body, owns the profile submit delay, captures the runtime and activity revision immediately before a separate submit write, and accepts matching evidence above that lower bound through the fixed deadline, including evidence observed between PTY submit flush and worker ACK. Evidence after the deadline is rejected even during timeout recheck. The result includes `activity`, `activity_source`, `runtime`, `activity_epoch`, and decimal-string `activity_revision`; Rust and TypeScript SDK wait helpers require all five and return `session_input_wait_contract_mismatch` when a same-version daemon ignores `wait` or omits evidence. Clients deduplicate by `(activity_epoch, runtime, activity_revision)` because daemon reconnect preserves runtime identity but resets the epoch-scoped revision. Retained per-activity revisions preserve rapid transitions across a newer snapshot or broadcast lag. Runtime exit returns `session_not_running`; replacement returns `session_runtime_changed`; shutdown cancels delivery or waiting. The dedicated connection adds fixed transport response headroom beyond the same overall deadline and returns `session_input_timeout` on expiry. |
 | `session.screen` | `SessionScreenParams` | `SessionScreenResult` | Reads one bounded, rendered, runtime-bound terminal snapshot without acquiring attach ownership or resizing the terminal. |
 | `session.output` | `SessionOutputParams` | `SessionOutputResult` | Reads a newest retained tail or continues from an exact runtime-scoped output cursor. A request with `wait_ms` uses a dedicated connection with bounded-wait headroom. |
 | `session.wait` | `SessionWaitParams` | `SessionWaitResult` | Performs one bounded long poll for state, activity, metadata, terminal, output, or runtime change. It always uses a dedicated connection. |
@@ -928,7 +928,7 @@ The daemon then writes these events:
 | `session_runtime_conflict` | `{session: SessionInfo}` | Runtime discovery found duplicate, mismatched, or otherwise ambiguous live identity. The daemon quarantines the conflict and does not kill a worker automatically. |
 | `session_runtime_discovered` | `{entry: RuntimeInventoryEntry}` | Startup reconciliation classified a discovered durable worker that is not a plainly managed runtime (orphaned, conflicting, incompatible, or identity-mismatched). Emitted once per non-managed discovery so operators can inspect quarantined runtimes. |
 | `session_native_recovered` | `{session: SessionInfo, previous_runtime_id?: string, runtime_id?: string}` | Explicit provider-native recovery created a new worker and runtime generation for the same logical session. `previous_runtime_id` can be absent for a one-time migrated legacy session; production worker recovery includes the new `runtime_id`. |
-| `agent_state` | `{session_id: SessionId, activity: AgentActivity, source: StateSource, runtime?: SessionRuntimeIdentity, revision?: ActivityRevision}` | Agent activity changed. `source` may be `report` when a hook report supplied explicit active-agent state. Current daemons emit `runtime` and decimal-string `revision`, making the transition exact evidence rather than a hint to re-read only the latest snapshot; the fields remain additive for general v2 subscribers, while input-wait success requires them through `SessionInputResult`. |
+| `agent_state` | `{session_id: SessionId, activity: AgentActivity, source: StateSource, runtime?: SessionRuntimeIdentity, activity_epoch?: string, revision?: ActivityRevision}` | Agent activity changed. `source` may be `report` when a hook report supplied explicit active-agent state. Current daemons emit `runtime`, `activity_epoch`, and decimal-string `revision`, making `(activity_epoch, runtime, revision)` exact reconnect-safe evidence rather than a hint to re-read only the latest snapshot; the fields remain additive for general v2 subscribers, while input-wait success requires them through `SessionInputResult`. |
 | `attach_opened` | `{session_id: SessionId, stream_id: string}` | A pending attach token was redeemed and a raw stream opened. |
 | `attach_closed` | `{session_id: SessionId, stream_id: string}` | A raw attach stream ended or was detached. |
 | `notification_created` | `{record: NotificationRecord}` | A durable notification record was created. |
@@ -1167,8 +1167,9 @@ Request APIs:
   an immediate read and automatically opens a dedicated connection when
   `wait_ms` is present.
 - `Client::session_input(SessionInputParams)`: uses a dedicated connection when
-  `wait` is present and rejects successful responses that omit runtime-scoped
-  activity evidence.
+  `wait` is present, budgets the wire timeout as the daemon's overall
+  delivery-and-wait deadline plus fixed response headroom, and rejects successful
+  responses that omit epoch- and runtime-scoped activity evidence.
 - `Client::session_wait(SessionWaitParams)`: automatically opens a dedicated
   connection for the bounded long poll.
 - `Client::session_resume`, `session_resize`, and `session_set_metadata`: typed
@@ -1284,8 +1285,9 @@ Request APIs:
 - `client.call(method, params)`: typed call keyed by the generated `Methods`
   map. A configured origin is added to the wire request.
 - `client.sessionInput(params)`: uses a dedicated connection when `wait` is
-  present and rejects successful responses that omit runtime-scoped activity
-  evidence.
+  present, budgets the wire timeout as the daemon's overall delivery-and-wait
+  deadline plus fixed response headroom, and rejects successful responses that
+  omit epoch- and runtime-scoped activity evidence.
 - `client.handshake()`: calls `daemon.health` and enforces strict protocol
   version equality.
 - `client.request(request)`: validates the optional atomic wire origin, applies

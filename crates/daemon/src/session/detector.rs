@@ -95,6 +95,7 @@ impl SessionRegistry {
     }
 
     pub(super) async fn record_activity(&self, id: &SessionId, transition: ActivityTransition) {
+        let activity_epoch = self.daemon_instance_id().to_owned();
         let updated = {
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(id) else {
@@ -117,7 +118,12 @@ impl SessionRegistry {
             entry.info.activity = Some(transition.activity);
             entry.info.state_source = transition.source;
             entry.info.updated_at = timestamp_now();
-            let evidence = record_activity_evidence(entry, transition.activity, transition.source);
+            let evidence = record_activity_evidence(
+                entry,
+                transition.activity,
+                transition.source,
+                &activity_epoch,
+            );
             let rescan = (transition.activity == AgentActivity::Working)
                 .then(|| std::sync::Arc::clone(&entry.procwatch_rescan));
             (rescan, evidence)

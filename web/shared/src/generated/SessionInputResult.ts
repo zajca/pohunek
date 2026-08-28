@@ -26,7 +26,11 @@ export type SessionInputResult = {
    */
   runtime?: SessionRuntimeIdentity;
   /**
-   * Exact post-submission activity revision that completed the wait.
+   * Daemon epoch that scopes [`Self::activity_revision`].
+   */
+  activity_epoch?: string;
+  /**
+   * Exact post-submission activity revision within [`Self::activity_epoch`].
    */
   activity_revision?: ActivityRevision;
 };

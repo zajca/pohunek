@@ -1387,6 +1387,7 @@ fn session_input_result_json_shape_roundtrips() {
         activity: None,
         activity_source: None,
         runtime: None,
+        activity_epoch: None,
         activity_revision: None,
     };
     let value = serde_json::to_value(&omitted).expect("serialize omitted input result");
@@ -1402,6 +1403,7 @@ fn session_input_result_json_shape_roundtrips() {
             SessionRuntimeIdentity::new("runtime-42", RuntimeGeneration::new(3))
                 .expect("valid runtime identity"),
         ),
+        activity_epoch: Some("d-epoch-1".to_owned()),
         activity_revision: Some(ActivityRevision::new(7)),
     };
     let value = serde_json::to_value(&populated).expect("serialize populated input result");
@@ -1415,6 +1417,7 @@ fn session_input_result_json_shape_roundtrips() {
                 "runtime_id": "runtime-42",
                 "runtime_generation": "3"
             },
+            "activity_epoch": "d-epoch-1",
             "activity_revision": "7"
         })
     );
@@ -2196,6 +2199,7 @@ fn agent_state_event_carries_activity_in_flattened_payload() {
                 "runtime_id": "runtime-42",
                 "runtime_generation": "3"
             },
+            "activity_epoch": "d-epoch-1",
             "revision": "7"
         }),
     )
@@ -2218,6 +2222,7 @@ fn agent_state_event_carries_activity_in_flattened_payload() {
                 "runtime_id": "runtime-42",
                 "runtime_generation": "3"
             },
+            "activity_epoch": "d-epoch-1",
             "revision": "7"
         })
     );

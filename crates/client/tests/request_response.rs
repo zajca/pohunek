@@ -412,6 +412,7 @@ async fn input_wait_without_timeout_uses_dedicated_connection_and_headroom() {
                     "runtime_id": "runtime-1",
                     "runtime_generation": "1"
                 },
+                "activity_epoch": "d-epoch-1",
                 "activity_revision": "2",
             }),
         )

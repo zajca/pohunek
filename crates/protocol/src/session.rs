@@ -456,7 +456,7 @@ pub struct SessionInputParams {
     pub session_id: SessionId,
     /// Text to inject. The daemon applies agent-specific submit framing.
     pub text: String,
-    /// Optional bounded wait after delivery; absent keeps fire-and-forget.
+    /// Optional bounded delivery-and-activity wait; absent keeps fire-and-forget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub wait: Option<SessionInputWait>,
@@ -471,9 +471,9 @@ pub struct SessionInputWait {
     /// An empty list defaults to `idle` and `blocked`.
     #[serde(default)]
     pub until: Vec<AgentActivity>,
-    /// Bounded wait duration in milliseconds from `1` to
-    /// [`MAX_SESSION_WAIT_MS`]. When omitted, the daemon applies that ceiling;
-    /// zero is rejected before any delivery.
+    /// Overall delivery-and-wait deadline in milliseconds from `1` to
+    /// [`MAX_SESSION_WAIT_MS`], measured before delivery begins. When omitted,
+    /// the daemon applies that ceiling; zero is rejected before any delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub timeout_ms: Option<u32>,
@@ -498,7 +498,11 @@ pub struct SessionInputResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub runtime: Option<SessionRuntimeIdentity>,
-    /// Exact post-submission activity revision that completed the wait.
+    /// Daemon epoch that scopes [`Self::activity_revision`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub activity_epoch: Option<String>,
+    /// Exact post-submission activity revision within [`Self::activity_epoch`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub activity_revision: Option<ActivityRevision>,
@@ -2173,7 +2177,11 @@ pub struct AgentStateEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub runtime: Option<SessionRuntimeIdentity>,
-    /// Exact monotonic revision assigned to this activity transition.
+    /// Daemon epoch that scopes [`Self::revision`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub activity_epoch: Option<String>,
+    /// Exact monotonic revision within [`Self::activity_epoch`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub revision: Option<ActivityRevision>,
@@ -2596,6 +2604,7 @@ mod tests {
                 SessionRuntimeIdentity::new("runtime-1", RuntimeGeneration::new(2))
                     .expect("valid runtime identity"),
             ),
+            activity_epoch: Some("d-epoch-1".to_owned()),
             revision: Some(ActivityRevision::new(3)),
         })
         .expect("serialize typed agent-state event");
@@ -2607,6 +2616,7 @@ mod tests {
                 "runtime_id": "runtime-1",
                 "runtime_generation": "2"
             },
+            "activity_epoch": "d-epoch-1",
             "revision": "3",
         });
 
@@ -2626,6 +2636,7 @@ mod tests {
         .expect("parse pre-evidence agent-state event");
 
         assert_eq!(event.runtime, None);
+        assert_eq!(event.activity_epoch, None);
         assert_eq!(event.revision, None);
     }
 

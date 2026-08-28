@@ -40,12 +40,17 @@ stderr.
 waiting for a matching activity observed only after submission. The daemon first
 validates the whole wait contract, so zero or over-limit timeouts cannot deliver
 text; duplicate `--until` values are deduplicated in first-occurrence order;
-omitted targets default to `idle` and `blocked`; the timeout range is `1..8000` ms (default
-8000). Waiting uses a dedicated SDK/CLI transport with bounded-wait headroom,
-acquires one observation waiter slot, and returns exact post-submit evidence as
-`activity`, `activity_source`, `runtime`, and decimal-string
-`activity_revision`. Rapid matching transitions remain valid even when the
-latest activity changes again or the event receiver lags. The wait returns
+omitted targets default to `idle` and `blocked`; the timeout range is `1..8000`
+ms (default 8000). The timeout is one overall deadline measured before delivery,
+so submit delay consumes it and the SDK transport needs only its fixed response
+headroom. The daemon captures a revision boundary immediately before the final
+submit write and excludes both pre-submit and post-deadline evidence. Waiting
+acquires one observation waiter slot and returns exact post-submit evidence as
+`activity`, `activity_source`, `runtime`, `activity_epoch`, and decimal-string
+`activity_revision`. Clients deduplicate by `(activity_epoch, runtime,
+activity_revision)` because a daemon reconnect changes the epoch while retaining
+the worker runtime. Rapid matching transitions remain valid even when the latest
+activity changes again, arrives before submit ACK, or the event receiver lags. The wait returns
 `session_not_running` if that runtime exits, `session_runtime_changed` if it is
 replaced, and `session_input_timeout` when no target arrives. Rust and TypeScript
 SDK helpers fail closed with `session_input_wait_contract_mismatch` when a daemon

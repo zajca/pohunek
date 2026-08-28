@@ -355,6 +355,7 @@ describe("Client request/response", () => {
       activity: "idle",
       activity_source: "report",
       runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+      activity_epoch: "d-epoch-1",
       activity_revision: "2",
     } as const;
     const daemon = await startUnixDaemon([
@@ -398,12 +399,13 @@ describe("Client request/response", () => {
     }
   });
 
-  test("input wait without timeout uses a dedicated connection with headroom", async () => {
+  test("input wait overall deadline uses a dedicated connection with headroom", async () => {
     const input = {
       accepted: true,
       activity: "idle",
       activity_source: "screen",
       runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+      activity_epoch: "d-epoch-1",
       activity_revision: "2",
     } as const;
     const daemon = await startUnixDaemon([
@@ -477,8 +479,16 @@ describe("Client request/response", () => {
       {
         accepted: true,
         activity: "idle",
+        activity_source: "report",
+        runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+        activity_revision: "2",
+      },
+      {
+        accepted: true,
+        activity: "idle",
         activity_source: "unknown",
         runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+        activity_epoch: "d-epoch-1",
         activity_revision: "2",
       },
       {
@@ -486,6 +496,7 @@ describe("Client request/response", () => {
         activity: "idle",
         activity_source: "report",
         runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+        activity_epoch: "d-epoch-1",
         activity_revision: "18446744073709551616",
       },
     ];

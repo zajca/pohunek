@@ -1,5 +1,6 @@
 {
   "activity": "blocked",
+  "activity_epoch": "d-fixture-1",
   "event": "agent_state",
   "revision": "7",
   "runtime": {

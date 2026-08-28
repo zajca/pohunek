@@ -27,7 +27,11 @@ export type AgentStateEvent = {
    */
   runtime?: SessionRuntimeIdentity;
   /**
-   * Exact monotonic revision assigned to this activity transition.
+   * Daemon epoch that scopes [`Self::revision`].
+   */
+  activity_epoch?: string;
+  /**
+   * Exact monotonic revision within [`Self::activity_epoch`].
    */
   revision?: ActivityRevision;
 };

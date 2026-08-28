@@ -393,6 +393,7 @@ fn base_fixtures(values: &FixtureValues) -> Result<Vec<NamedFixture>, XtaskError
                         SessionRuntimeIdentity::new("runtime-fixture-1", RuntimeGeneration::new(3))
                             .expect("fixture runtime identity is valid"),
                     ),
+                    activity_epoch: Some("d-fixture-1".to_owned()),
                     revision: Some(ActivityRevision::new(7)),
                 })?,
             )

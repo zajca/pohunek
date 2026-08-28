@@ -16,7 +16,7 @@ export type SessionInputParams = {
    */
   text: string;
   /**
-   * Optional bounded wait after delivery; absent keeps fire-and-forget.
+   * Optional bounded delivery-and-activity wait; absent keeps fire-and-forget.
    */
   wait?: SessionInputWait;
 };

@@ -191,6 +191,7 @@ const DEFAULT_NOTIFICATION_SOURCE = {
 
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const encoder = new TextEncoder();
+let nextActivityEpoch = 1;
 
 class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBackend {
   public readonly scenario: FixtureScenario;
@@ -212,6 +213,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
   private readonly sessionResizes = new Map<string, ScenarioResize[]>();
   private readonly observations = new Map<string, FixtureObservation>();
   private readonly activityRevisions = new Map<string, bigint>();
+  private readonly activityEpoch: string;
   private endpointsValue: FixtureDaemonEndpoint[] = [];
   private discoveredHosts: HostRecord[];
   private nextSessionId = 1;
@@ -223,6 +225,8 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     assertListenOptions(options.listen);
     this.listenOptions = options.listen;
     this.daemonVersion = options.daemonVersion ?? DEFAULT_DAEMON_VERSION;
+    this.activityEpoch = `d-testkit-${nextActivityEpoch}`;
+    nextActivityEpoch += 1;
     this.protocolVersion = options.protocolVersion ?? PROTOCOL_VERSION;
     this.hostCapabilities = cloneValue(options.host?.capabilities ?? defaultHostCapabilities(this.daemonVersion));
     this.discoveredHosts = cloneValue([...(options.host?.discoveredHosts ?? [])]);
@@ -317,6 +321,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
         runtime_id: observation.runtime_id,
         runtime_generation: observation.runtime_generation.toString(),
       },
+      activity_epoch: this.activityEpoch,
       revision: revision.toString(),
     });
   }

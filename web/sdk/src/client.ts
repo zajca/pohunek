@@ -27,7 +27,7 @@ import { WsTransport } from "./transport-ws";
 
 // A 128-bit prefix keeps independently started SDK clients collision-resistant.
 const RUN_TOKEN_RANDOM_BYTES = 16;
-// Dedicated long polls need transport cleanup headroom beyond the wire timeout.
+// Dedicated calls need response headroom beyond the daemon's overall wire deadline.
 const DEDICATED_REQUEST_HEADROOM_MS = 1_000;
 const MAX_U64 = 18_446_744_073_709_551_615n;
 const STATE_SOURCES = new Set<StateSource>([
@@ -327,6 +327,9 @@ function validateInputWaitResult(
   }
   if (!isRuntimeIdentity(result["runtime"])) {
     throw ClientError.inputWaitContract("the response omitted a valid runtime identity");
+  }
+  if (typeof result["activity_epoch"] !== "string" || result["activity_epoch"].length === 0) {
+    throw ClientError.inputWaitContract("the response omitted a valid activity epoch");
   }
   if (!isCanonicalDecimal(result["activity_revision"])) {
     throw ClientError.inputWaitContract("the response omitted a valid activity revision");

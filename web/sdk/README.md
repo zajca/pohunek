@@ -116,8 +116,12 @@ session.
 
 `client.sessionInput({ ..., wait })` opens a dedicated bounded connection and
 accepts success only when the daemon returns the requested activity, its source,
-the exact runtime identity, and a canonical decimal activity revision. Missing
-or contradictory evidence fails closed as
+the exact runtime identity, a nonempty daemon activity epoch, and a canonical
+decimal activity revision. The wait timeout is the daemon's overall
+delivery-and-activity deadline measured before delivery; the transport adds only
+fixed response headroom. Deduplicate evidence by `(activity_epoch, runtime,
+activity_revision)`, since daemon reconnect preserves the runtime but starts a
+new epoch-scoped revision sequence. Missing or contradictory evidence fails closed as
 `session_input_wait_contract_mismatch`; it is never treated as delivery
 confirmation from a daemon that ignored `wait`.
 

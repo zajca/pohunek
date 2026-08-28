@@ -2650,6 +2650,7 @@ mod tests {
                 activity: None,
                 activity_source: None,
                 runtime: None,
+                activity_epoch: None,
                 activity_revision: None,
             },
         );
@@ -2672,6 +2673,7 @@ mod tests {
                     )
                     .expect("valid runtime identity"),
                 ),
+                activity_epoch: Some("d-epoch-1".to_owned()),
                 activity_revision: Some(protocol::ActivityRevision::new(2)),
             },
         );
@@ -2776,6 +2778,7 @@ mod tests {
             activity: None,
             activity_source: None,
             runtime: None,
+            activity_epoch: None,
             activity_revision: None,
         };
         let doc = crate::commands::render_json(&result).expect("json doc");
