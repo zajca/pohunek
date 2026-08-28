@@ -1116,6 +1116,34 @@ async fn foreground_leader_selects_agent_and_shell_return_clears_claim() {
 }
 
 #[tokio::test]
+async fn root_foreground_group_selects_member_until_member_exits() {
+    let (registry, inspector, created) = mock_procwatch_registry("foreground-root-member").await;
+    let mut member = codex_fact(320, created.pid);
+    member.pgid = created.pid;
+    inspector.set_descendants(created.pid, vec![member]);
+    inspector.set_foreground_group(created.pid, Some(created.pid));
+
+    for _ in 0..DIRECT_AGENT_RESCAN_COUNT {
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let selected = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(selected.active_agent.as_deref(), Some("codex"));
+        assert_eq!(selected.active_agent_pid, Some(320));
+    }
+
+    inspector.set_descendants(created.pid, Vec::new());
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let cleared = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(cleared.active_agent, None);
+    assert_eq!(cleared.active_agent_pid, None);
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
 async fn foreign_foreground_process_does_not_hijack_reconciliation() {
     let (registry, inspector, created) = mock_procwatch_registry("foreground-foreign").await;
     let mut foreign = codex_fact(FOREIGN_AGENT_PID, created.pid);

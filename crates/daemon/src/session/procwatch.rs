@@ -460,17 +460,14 @@ impl SessionRegistry {
         };
 
         if foreground_group == root_pid {
-            let Some(active) = entry.active_agent.clone() else {
-                return ForegroundDecision::Preserve;
-            };
-            let active_is_launch_root = active.pid == Some(root_pid)
-                && entry.info.agent_base != AgentKind::Shell
-                && entry.info.active_agent_base.as_ref() == Some(&entry.info.agent_base);
+            let active_is_launch_root = entry.active_agent.as_ref().is_some_and(|active| {
+                active.pid == Some(root_pid)
+                    && entry.info.agent_base != AgentKind::Shell
+                    && entry.info.active_agent_base.as_ref() == Some(&entry.info.agent_base)
+            });
             if active_is_launch_root {
                 return ForegroundDecision::Preserve;
             }
-            let _ = clear_active_agent(entry, self.procwatch_tombstone_for(&active, now));
-            return ForegroundDecision::Updated;
         }
 
         if let Some(observed) = choose_foreground_observed(entry, foreground_group) {
@@ -493,6 +490,14 @@ impl SessionRegistry {
                 activity_reported: false,
             };
             let _ = apply_observed_transition(entry, &observed, report, agent);
+            return ForegroundDecision::Updated;
+        }
+
+        if foreground_group == root_pid {
+            let Some(active) = entry.active_agent.clone() else {
+                return ForegroundDecision::Preserve;
+            };
+            let _ = clear_active_agent(entry, self.procwatch_tombstone_for(&active, now));
             return ForegroundDecision::Updated;
         }
 

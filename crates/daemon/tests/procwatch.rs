@@ -205,6 +205,16 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
             .expect("create shell session")
     };
     let child_pid = wait_for_pid_file(&pid_file).await;
+    let inspector = LinuxInspector::new();
+    let child = inspector
+        .process(child_pid)
+        .expect("inspect fake agent")
+        .expect("fake agent remains live");
+    let foreground_group = inspector
+        .foreground_process_group(created.pid)
+        .expect("inspect root foreground group");
+    assert_eq!(child.pgid, created.pid);
+    assert_eq!(foreground_group, Some(created.pid));
 
     let observed =
         wait_for_active_pid(&registry, &created.id, Some(child_pid), OBSERVE_TIMEOUT).await;
