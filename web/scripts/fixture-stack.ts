@@ -4,6 +4,7 @@ import { join } from "node:path";
 import {
   DEFAULT_DISCOVER_INTERVAL_SECONDS,
   DEFAULT_STATIC_ASSETS_DIR,
+  externalPeerSelector,
   startBackend,
   type BackendHandle,
   type BackendLogger,
@@ -14,7 +15,7 @@ import { startFixtureDaemon, type FixtureDaemonHandle, type FixtureProject } fro
 export const FIXTURE_LOOPBACK_HOST = "127.0.0.1";
 export const FIXTURE_LOCAL_HOST = "local";
 const FIXTURE_PEER_NAME = "fixture-peer";
-export const FIXTURE_PEER_HOST = `netbird:${FIXTURE_PEER_NAME}`;
+export const FIXTURE_PEER_HOST = `netbird:${externalPeerSelector(FIXTURE_PEER_NAME)}`;
 export const FIXTURE_LOCAL_SESSION_ID = "s-local-seed";
 export const FIXTURE_PEER_SESSION_ID = "s-peer-seed";
 export const FIXTURE_NOTIFICATION_ID = "n-local-seed";

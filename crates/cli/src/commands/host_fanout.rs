@@ -191,17 +191,19 @@ pub(crate) fn reachable_target(record: &HostRecord) -> Option<HostTarget> {
                 .as_deref()?
                 .parse::<std::net::IpAddr>()
                 .ok()?;
-            let identity = if let Some(peer_id) = record
+            let identity = record
                 .peer_id
                 .as_deref()
                 .filter(|identity| !identity.is_empty())
-            {
-                pohunek_client::ExternalIdentity::peer_id(peer_id).ok()?
-            } else if let Some(fqdn) = record.fqdn.as_deref().filter(|fqdn| !fqdn.is_empty()) {
-                pohunek_client::ExternalIdentity::fqdn(fqdn).ok()?
-            } else {
-                return None;
-            };
+                .map(pohunek_client::ExternalIdentity::peer_id)
+                .or_else(|| {
+                    record
+                        .fqdn
+                        .as_deref()
+                        .filter(|fqdn| !fqdn.is_empty())
+                        .map(pohunek_client::ExternalIdentity::fqdn)
+                })?
+                .ok()?;
             let host_id = format!("{}:{}", record.overlay, identity.selector());
             let transport_target =
                 pohunek_client::remote_host_with_port(&host_id, record.port).ok()?;

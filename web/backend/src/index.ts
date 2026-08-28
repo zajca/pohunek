@@ -14,6 +14,7 @@ export {
   loadBackendConfig,
 } from "./config";
 export type { BackendConfig } from "./config";
+export { externalFqdnSelector, externalPeerSelector } from "./identity";
 export { BackendStartupError, startHostsPipeline } from "./hosts";
 export type {
   BackendHostEntry,
