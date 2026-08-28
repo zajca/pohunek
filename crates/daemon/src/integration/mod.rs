@@ -12,8 +12,8 @@
 //! installer are stripped before managed hooks are (re-)added.
 
 use std::fmt::Write as _;
-use std::fs;
-use std::io::{self, Read as _};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use protocol::{
@@ -58,6 +58,9 @@ const MANAGED_ASSET_INSPECTION_LIMIT_BYTES: usize = 64 * 1024;
 const PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 /// One byte beyond a limit distinguishes an exact-boundary file from overflow.
 const INSPECTION_LIMIT_PROBE_BYTES: usize = 1;
+/// Unix permission and special-mode bits relevant to executable trust checks.
+#[cfg(unix)]
+const UNIX_MODE_MASK: u32 = 0o7777;
 /// Per-hook timeout (seconds) recorded in the agent's hook config.
 const HOOK_TIMEOUT_SECS: u64 = 10;
 /// Action argument passed to the hook script for the `SessionStart` event.
@@ -460,7 +463,7 @@ fn inspect_asset(
     };
     if !metadata.file_type().is_file() {
         warnings.push(format!("managed {description} is not a regular file"));
-        require_recovery(recovery, IntegrationRecovery::Reinstall);
+        require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
         return AssetStatus {
             path,
             content: None,
@@ -534,7 +537,7 @@ fn asset_permissions_current(
 ) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
-    let mode = metadata.permissions().mode() & 0o777;
+    let mode = metadata.permissions().mode() & UNIX_MODE_MASK;
     if mode == MANAGED_HOOK_MODE {
         return true;
     }
@@ -594,15 +597,33 @@ fn read_bounded_utf8(path: &Path, max_bytes: usize) -> io::Result<BoundedRead> {
         )
     })?;
     let mut bytes = Vec::new();
-    fs::File::open(path)?
-        .take(read_limit)
-        .read_to_end(&mut bytes)?;
+    let file = open_regular_inspection_file(path)?;
+    file.take(read_limit).read_to_end(&mut bytes)?;
     if bytes.len() > max_bytes {
         return Ok(BoundedRead::Oversized);
     }
     String::from_utf8(bytes)
         .map(BoundedRead::Content)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn open_regular_inspection_file(path: &Path) -> io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+    };
+    let file = options.open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "inspection target is not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 fn registration_paths(config_dir: &Path, agent: StatusAgent) -> Vec<PathBuf> {
@@ -633,6 +654,14 @@ struct HookFileStatus {
     footprint: bool,
     current: bool,
     positions: Vec<Option<(usize, usize)>>,
+}
+
+fn noncurrent_hook_file(footprint: bool, spec_count: usize) -> HookFileStatus {
+    HookFileStatus {
+        footprint,
+        current: false,
+        positions: vec![None; spec_count],
+    }
 }
 
 enum ReadState {
@@ -759,19 +788,9 @@ fn inspect_hook_file(
     recovery: &mut IntegrationRecovery,
 ) -> HookFileStatus {
     let content = match read_status_file(path, label, warnings, recovery) {
-        ReadState::Missing => {
-            return HookFileStatus {
-                footprint: false,
-                current: false,
-                positions: vec![None; specs.len()],
-            };
-        }
+        ReadState::Missing => return noncurrent_hook_file(false, specs.len()),
         ReadState::Unreadable | ReadState::Oversized => {
-            return HookFileStatus {
-                footprint: true,
-                current: false,
-                positions: vec![None; specs.len()],
-            };
+            return noncurrent_hook_file(true, specs.len());
         }
         ReadState::Content(content) => content,
     };
@@ -780,22 +799,31 @@ fn inspect_hook_file(
         Err(_error) => {
             warnings.push(format!("{label} is malformed"));
             require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
-            return HookFileStatus {
-                footprint: true,
-                current: false,
-                positions: vec![None; specs.len()],
-            };
+            return noncurrent_hook_file(true, specs.len());
         }
     };
-    let Some(hooks) = document.get("hooks").and_then(Value::as_object) else {
-        warnings.push(format!("{label} has no valid hooks object"));
-        require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
-        return HookFileStatus {
-            footprint: document.get("hooks").is_some(),
-            current: false,
-            positions: vec![None; specs.len()],
-        };
+    let hooks = match document.get("hooks") {
+        Some(Value::Object(hooks)) => hooks,
+        None => {
+            warnings.push(format!("{label} has no hooks object"));
+            require_recovery(recovery, IntegrationRecovery::Reinstall);
+            return noncurrent_hook_file(false, specs.len());
+        }
+        Some(_invalid) => {
+            warnings.push(format!("{label} has an invalid hooks structure"));
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+            return noncurrent_hook_file(true, specs.len());
+        }
     };
+    if let Some(event) = specs
+        .iter()
+        .map(|spec| spec.event)
+        .find(|event| hooks.get(*event).is_some_and(|entries| !entries.is_array()))
+    {
+        warnings.push(format!("{label} has invalid {event} hook entries"));
+        require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+        return noncurrent_hook_file(true, specs.len());
+    }
 
     let mut footprint = false;
     let mut current = true;
@@ -928,6 +956,13 @@ fn inspect_codex_config(
             return (true, false);
         }
     };
+    if !codex_config_structure_valid(&document) {
+        warnings.push(
+            "Codex config.toml has invalid features, hooks, or hooks.state structure".to_owned(),
+        );
+        require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+        return (true, false);
+    }
     let hooks_enabled = document
         .get("features")
         .and_then(toml::Value::as_table)
@@ -988,6 +1023,17 @@ fn inspect_codex_config(
         trust_current &= valid;
     }
     (footprint, hooks_enabled && trust_current)
+}
+
+fn codex_config_structure_valid(document: &toml::Value) -> bool {
+    let features_valid = document.get("features").is_none_or(toml::Value::is_table);
+    let Some(hooks) = document.get("hooks") else {
+        return features_valid;
+    };
+    let Some(hooks) = hooks.as_table() else {
+        return false;
+    };
+    features_valid && hooks.get("state").is_none_or(toml::Value::is_table)
 }
 
 fn read_status_file(
@@ -1085,11 +1131,7 @@ pub fn install_claude(claude_dir: &Path) -> Result<InstallPaths, ProtocolError> 
     let hooks_dir = claude_dir.join("hooks");
     create_dir_all(&hooks_dir)?;
     let hook_path = hooks_dir.join(STATE_HOOK_INSTALL_NAME);
-    write_file(&hook_path, CLAUDE_HOOK_ASSET)?;
-    make_executable(&hook_path)?;
     let notify_hook_path = hooks_dir.join(NOTIFY_HOOK_INSTALL_NAME);
-    write_file(&notify_hook_path, CLAUDE_NOTIFY_HOOK_ASSET)?;
-    make_executable(&notify_hook_path)?;
 
     let settings_path = claude_dir.join("settings.json");
     let mut settings = read_json_object_or_empty(&settings_path)?;
@@ -1127,6 +1169,8 @@ pub fn install_claude(claude_dir: &Path) -> Result<InstallPaths, ProtocolError> 
         &hook_command(&notify_hook_path, STOP_FAILURE_ACTION),
         Some("*"),
     )?;
+    write_managed_asset(&hook_path, CLAUDE_HOOK_ASSET)?;
+    write_managed_asset(&notify_hook_path, CLAUDE_NOTIFY_HOOK_ASSET)?;
     write_json_pretty(&settings_path, &settings)?;
 
     Ok(InstallPaths {
@@ -1151,11 +1195,7 @@ pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
     }
 
     let hook_path = codex_dir.join(STATE_HOOK_INSTALL_NAME);
-    write_file(&hook_path, CODEX_HOOK_ASSET)?;
-    make_executable(&hook_path)?;
     let notify_hook_path = codex_dir.join(NOTIFY_HOOK_INSTALL_NAME);
-    write_file(&notify_hook_path, CODEX_NOTIFY_HOOK_ASSET)?;
-    make_executable(&notify_hook_path)?;
 
     let hooks_path = codex_dir.join("hooks.json");
     let mut hooks_file = read_json_object_or_empty(&hooks_path)?;
@@ -1203,8 +1243,6 @@ pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
             handler_index,
         ));
     }
-    write_json_pretty(&hooks_path, &hooks_file)?;
-
     let config_path = codex_dir.join("config.toml");
     let existing = match fs::read_to_string(&config_path) {
         Ok(content) => content,
@@ -1219,6 +1257,9 @@ pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
         trust_states.push((trust_key, trusted_hash));
     }
     let updated = update_codex_config_toml(&existing, &trust_states, &config_path)?;
+    write_managed_asset(&hook_path, CODEX_HOOK_ASSET)?;
+    write_managed_asset(&notify_hook_path, CODEX_NOTIFY_HOOK_ASSET)?;
+    write_json_pretty(&hooks_path, &hooks_file)?;
     if updated != existing {
         write_file(&config_path, &updated)?;
     }
@@ -1622,6 +1663,45 @@ fn write_json_pretty(path: &Path, value: &Value) -> Result<(), ProtocolError> {
 
 fn write_file(path: &Path, body: &str) -> Result<(), ProtocolError> {
     fs::write(path, body).map_err(|err| io_error("write", path, &err))
+}
+
+/// Atomically replace one installer-owned executable without following its path.
+fn write_managed_asset(path: &Path, body: &str) -> Result<(), ProtocolError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| settings_invalid(path, "managed asset path has no parent directory"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| settings_invalid(path, "managed asset name is not valid UTF-8"))?;
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", ulid::Ulid::new()));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            options
+                .mode(MANAGED_HOOK_MODE)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        };
+        let mut file = options
+            .open(&temp_path)
+            .map_err(|error| io_error("create temporary managed asset", &temp_path, &error))?;
+        file.write_all(body.as_bytes())
+            .map_err(|error| io_error("write temporary managed asset", &temp_path, &error))?;
+        file.sync_all()
+            .map_err(|error| io_error("sync temporary managed asset", &temp_path, &error))?;
+        drop(file);
+        make_executable(&temp_path)?;
+        fs::rename(&temp_path, path)
+            .map_err(|error| io_error("replace managed asset", path, &error))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 fn create_dir_all(path: &Path) -> Result<(), ProtocolError> {
@@ -2891,6 +2971,88 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn status_rejects_provider_config_fifo_without_blocking() {
+        let codex = temp_dir("status-config-fifo");
+        install_codex(&codex).expect("install Codex fixture");
+        let config_path = codex.join("config.toml");
+        fs::remove_file(&config_path).expect("remove regular Codex config");
+        let output = Command::new("mkfifo")
+            .arg(&config_path)
+            .output()
+            .expect("run mkfifo");
+        assert!(
+            output.status.success(),
+            "mkfifo failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let report = super::status_at(
+                super::StatusAgent::Codex,
+                &codex,
+                CODEX_HOOK_ASSET,
+                CODEX_NOTIFY_HOOK_ASSET,
+            );
+            sender.send(report).expect("send FIFO status report");
+        });
+        let report = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("provider FIFO inspection must not block");
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Codex config.toml could not be read")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_asset_symlink_requires_repair_and_reinstall_preserves_target() {
+        use std::os::unix::fs::symlink;
+
+        let codex = temp_dir("status-asset-symlink");
+        install_codex(&codex).expect("install Codex fixture");
+        let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
+        let sentinel_path = codex.join("sentinel-target");
+        let sentinel = b"sentinel-private-payload";
+        fs::write(&sentinel_path, sentinel).expect("write sentinel target");
+        fs::remove_file(&hook_path).expect("remove managed hook");
+        symlink(&sentinel_path, &hook_path).expect("link managed hook to sentinel");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        install_codex(&codex).expect("safely replace managed symlink");
+        assert_eq!(
+            fs::read(&sentinel_path).expect("read sentinel target"),
+            sentinel,
+            "managed asset replacement must not follow the symlink"
+        );
+        assert!(
+            fs::symlink_metadata(&hook_path)
+                .expect("replacement metadata")
+                .file_type()
+                .is_file(),
+            "managed asset must become a regular file"
+        );
+        assert_eq!(
+            fs::read_to_string(&hook_path).expect("read replacement hook"),
+            CODEX_HOOK_ASSET
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn status_rejects_unsafe_managed_hook_permissions_with_repair_hint() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2916,6 +3078,27 @@ mod tests {
             warning.contains("pohunek integration install --agent codex"),
             "{warning}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_detects_special_managed_hook_mode_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let codex = temp_dir("status-special-hook-mode");
+        install_codex(&codex).expect("install Codex fixture");
+        let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
+        fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o4755))
+            .expect("set managed hook setuid bit");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("mode 4755")));
     }
 
     #[test]
@@ -2966,6 +3149,79 @@ mod tests {
         assert!(
             warning.contains("pohunek integration install --agent codex"),
             "{warning}"
+        );
+    }
+
+    #[test]
+    fn invalid_hook_event_structure_requires_manual_repair_before_install() {
+        let codex = temp_dir("status-invalid-hook-event");
+        install_codex(&codex).expect("install Codex fixture");
+        let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
+        let sentinel = "# managed asset sentinel\n";
+        fs::write(&hook_path, sentinel).expect("write managed asset sentinel");
+        let hooks_path = codex.join("hooks.json");
+        let mut hooks = read_json(&hooks_path);
+        hooks["hooks"][SESSION_START_EVENT] = json!({ "invalid": true });
+        fs::write(
+            &hooks_path,
+            serde_json::to_vec_pretty(&hooks).expect("serialize invalid hooks structure"),
+        )
+        .expect("write invalid hooks structure");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        let error = install_codex(&codex).expect_err("invalid event structure must fail install");
+        assert_eq!(error.code, "integration_settings_invalid");
+        assert_eq!(
+            fs::read_to_string(&hook_path).expect("read managed asset sentinel"),
+            sentinel,
+            "config validation must precede managed asset replacement"
+        );
+    }
+
+    #[test]
+    fn missing_hooks_object_is_reinstallable() {
+        let codex = temp_dir("status-missing-hooks-object");
+        install_codex(&codex).expect("install Codex fixture");
+        fs::write(codex.join("hooks.json"), "{}\n").expect("remove hooks object");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
+        install_codex(&codex).expect("reinstall missing hooks object");
+        assert_eq!(
+            explicit_status(&codex, AgentKind::Codex).state,
+            protocol::IntegrationInstallState::Current
+        );
+    }
+
+    #[test]
+    fn invalid_codex_config_structure_requires_manual_repair_before_install() {
+        let codex = temp_dir("status-invalid-config-structure");
+        install_codex(&codex).expect("install Codex fixture");
+        let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
+        let sentinel = "# managed asset sentinel\n";
+        fs::write(&hook_path, sentinel).expect("write managed asset sentinel");
+        fs::write(codex.join("config.toml"), "features = true\n")
+            .expect("write invalid Codex config structure");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        let error = install_codex(&codex).expect_err("invalid config structure must fail install");
+        assert_eq!(error.code, "integration_settings_invalid");
+        assert_eq!(
+            fs::read_to_string(&hook_path).expect("read managed asset sentinel"),
+            sentinel,
+            "config validation must precede managed asset replacement"
         );
     }
 

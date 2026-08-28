@@ -244,8 +244,9 @@ pub(crate) async fn run_install(
 ///
 /// # Errors
 ///
-/// Returns [`CliError`] if the local daemon is unreachable or rejects the call.
+/// Returns [`CliError`] if the effective host daemon is unreachable or rejects the call.
 pub(crate) async fn run_status(
+    host: &str,
     paths: &Paths,
     agent: Option<HookAgentArg>,
     json: bool,
@@ -253,7 +254,7 @@ pub(crate) async fn run_status(
     let params = IntegrationStatusParams {
         agent: agent.map(Into::into),
     };
-    let mut client = Client::connect(LOCAL_HOST, paths).await?;
+    let mut client = Client::connect(host, paths).await?;
     let result: IntegrationStatusResult = client.call::<method::IntegrationStatus>(params).await?;
 
     if json {

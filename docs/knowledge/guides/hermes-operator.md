@@ -92,11 +92,12 @@ pohunek integration uninstall --agent hermes \
 with Codex or Claude returns a typed unsupported-action error; their separate
 daemon-backed status reports the complete managed install contract, while
 install remains available. Bare status selects both daemon-managed agents;
-explicit Hermes status keeps its local target and executable flags:
+Codex and Claude status honors the effective global `--host`, while explicit
+Hermes status keeps its local target and executable flags:
 
 ```sh
 pohunek integration status --json
-pohunek integration status --agent codex --json
+pohunek --host buildbox integration status --agent codex --json
 pohunek integration status --agent claude --json
 pohunek integration status --agent hermes --hermes-profile work \
   --hermes-bin /absolute/path/to/hermes --json

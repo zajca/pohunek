@@ -319,9 +319,9 @@ NetBird, never through SSH. `*` needs `--confirm-wildcard`. Use
 `integration update` for a version/policy refresh and `integration uninstall`
 to remove only managed assets; add `--confirm-modified` when the ownership
 check reports changed assets. `status`, `doctor`, `update`, and `uninstall` are
-Hermes-only; Codex and Claude retain their existing `integration install`
-behavior and receive a typed unsupported-action error for these lifecycle
-actions.
+local for Hermes. Codex and Claude expose daemon-backed `integration status`
+on the effective `--host`; `doctor`, `update`, and `uninstall` remain
+Hermes-only and return a typed unsupported-action error for those agents.
 
 The plugin is a delegated-tool guardrail, not a sandbox against a same-user
 Hermes process with shell or file-write access. It repeats the daemon's exact
@@ -368,7 +368,8 @@ them `--json` for machine-readable output (the exceptions are `attach`,
 | `pohunek notifications read / ack / archive / delete` | Drive one record's lifecycle (`host/id` targets a specific host). |
 | `pohunek notifications policy / retention` | Per-kind/provider policy (including `hermes`), retention pruning (`--dry-run` / `--apply`). |
 | `pohunek integration install` | Install Codex/Claude hooks, or a selected Hermes profile's managed plugin with explicit access mode and host allowlist. |
-| `pohunek integration status / doctor / update / uninstall --agent hermes` | Inspect, diagnose, atomically refresh, or safely remove one explicitly selected Hermes plugin target. |
+| `pohunek integration status` | Inspect daemon-managed Codex/Claude hooks on the effective `--host`, or one explicitly selected local Hermes target. |
+| `pohunek integration doctor / update / uninstall --agent hermes` | Diagnose, atomically refresh, or safely remove one explicitly selected local Hermes plugin target. |
 | `pohunek setup [scripts\|config\|sway]` | Install launcher scripts, default config + prompt templates, sway keybindings. |
 | `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + live snapshot. |
 | `pohunek prompt render / link` | Render provider prompt templates and work-item link metadata (used by launchers). |

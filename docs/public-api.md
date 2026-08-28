@@ -817,9 +817,15 @@ reports real installed and expected version fields. `installed_version` is
 unknown when any readable managed asset lacks a valid marker. The typed recovery
 is `reinstall` only when the installer can repair every finding; malformed,
 unreadable, oversized, or unresolved provider configuration instead reports
-`repair_configuration`. Managed assets and provider configuration are read with
-separate named byte limits, and an oversized file is `outdated` with an
-actionable warning. All enum values use snake_case on the wire.
+`repair_configuration`. Symlinked or special managed assets also require manual
+repair, while an explicit reinstall replaces installer-owned assets atomically
+without following an existing symlink. Managed assets and provider configuration
+are opened without following symlinks, verified as regular files from the same
+descriptor, and read with separate named byte limits; provider inspection is
+nonblocking so FIFOs cannot stall the daemon worker. An oversized file is
+`outdated` with an actionable warning. The CLI routes Codex and Claude status to
+the effective global `--host`; mutating hook installation and every Hermes
+lifecycle action remain local. All enum values use snake_case on the wire.
 
 Codex notification support requires modern lifecycle hooks for
 `PermissionRequest` and `Stop`. The installer writes managed command hooks to

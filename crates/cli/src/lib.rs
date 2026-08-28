@@ -1742,7 +1742,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                         return Err(commands::integration::hermes_options_require_hermes());
                     }
                     let paths = Paths::resolve()?;
-                    commands::integration::run_status(&paths, agent, json).await?;
+                    let host = effective_host(&global_host, None);
+                    commands::integration::run_status(&host, &paths, agent, json).await?;
                     return Ok(ExitCode::SUCCESS);
                 }
                 IntegrationAction::Doctor {
@@ -2963,6 +2964,31 @@ mod tests {
     fn effective_host_uses_global_when_no_target() {
         assert_eq!(effective_host(LOCAL_HOST, None), "local");
         assert_eq!(effective_host("host-b", None), "host-b");
+    }
+
+    #[test]
+    fn integration_status_preserves_global_host_for_dispatch() {
+        let cli = Cli::try_parse_from([
+            "pohunek",
+            "--host",
+            "host-b",
+            "integration",
+            "status",
+            "--agent",
+            "codex",
+        ])
+        .expect("parse remote integration status");
+
+        assert_eq!(effective_host(&cli.host, None), "host-b");
+        assert!(matches!(
+            cli.command,
+            Commands::Integration {
+                action: IntegrationAction::Status {
+                    agent: Some(commands::integration::HookAgentArg::Codex),
+                    ..
+                }
+            }
+        ));
     }
 
     #[test]
