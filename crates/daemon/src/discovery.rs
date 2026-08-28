@@ -43,9 +43,12 @@ impl DiscoveryCache {
         &self,
         force: bool,
     ) -> Result<Vec<HostRecord>, pohunek_client::ClientError> {
-        let registry = self.registry.as_ref().ok_or_else(|| {
-            pohunek_client::ClientError::OverlayRegistry(overlay::RegistryError::Empty)
-        })?;
+        let registry =
+            self.registry
+                .as_ref()
+                .ok_or(pohunek_client::ClientError::OverlayRegistry(
+                    overlay::RegistryError::Empty,
+                ))?;
         let mut guard = self.cache.lock().await;
         if !force {
             if let Some(entry) = guard.as_ref() {

@@ -1,4 +1,4 @@
-//! NetBird implementation of the generic overlay contract.
+//! `NetBird` implementation of the generic overlay contract.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -10,17 +10,17 @@ use overlay::{
 
 use crate::{NetbirdError, NetbirdStatus, Peer};
 
-/// Stable identifier used by every NetBird route and wire record.
+/// Stable identifier used by every `NetBird` route and wire record.
 pub const NETBIRD_OVERLAY_ID: &str = "netbird";
 
-/// NetBird provider adapter.
+/// `NetBird` provider adapter.
 #[derive(Debug)]
 pub struct NetbirdTransport {
     id: OverlayId,
 }
 
 impl NetbirdTransport {
-    /// Create the NetBird provider adapter.
+    /// Create the `NetBird` provider adapter.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -66,7 +66,7 @@ impl OverlayTransport for NetbirdTransport {
     }
 }
 
-/// Build the production registry from fail-fast NetBird configuration.
+/// Build the production registry from fail-fast `NetBird` configuration.
 ///
 /// # Errors
 ///

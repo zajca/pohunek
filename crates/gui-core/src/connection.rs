@@ -381,9 +381,10 @@ pub(crate) fn discovered_transport_addr(
     address
         .parse::<std::net::IpAddr>()
         .map(|address| std::net::SocketAddr::new(address, record.port))
-        .map_err(|_| CoreError::InvalidDiscoveredAddress {
+        .map_err(|source| CoreError::InvalidDiscoveredAddress {
             address,
             port: record.port,
+            source,
         })
 }
 

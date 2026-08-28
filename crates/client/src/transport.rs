@@ -1325,11 +1325,9 @@ mod tests {
             .expect("attach exact endpoint");
         let line = server.await.expect("selected endpoint server");
         assert_eq!(line, "{\"attach\":\"stream-same-route\"}\n");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(25), decoy.accept())
-                .await
-                .is_err()
-        );
+        tokio::time::timeout(Duration::from_millis(25), decoy.accept())
+            .await
+            .expect_err("the decoy endpoint must remain unused");
         drop(raw);
     }
 

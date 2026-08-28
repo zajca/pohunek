@@ -1,4 +1,4 @@
-//! `pohunek setup` — materialize the sway/rofi launcher integration locally.
+//! `pohunek setup` — materialize shell and sway/rofi integration locally.
 //!
 //! All operations are local filesystem writes (no daemon involvement), mirroring
 //! the `doctor` command's shape (sync, takes `&Paths`, renders human or `--json`).
@@ -10,6 +10,8 @@
 //! - `setup config` writes a default `launcher.conf` plus prompt templates, never
 //!   overwriting an existing file unless `--force` is given.
 //! - `setup sway` writes (or prints) a sway drop-in binding a key to the launcher.
+//! - `setup completions` delegates to the completion module and writes one
+//!   shell's generated script into its conventional per-user directory.
 //! - `setup` (no subcommand) runs all three and prints next steps.
 
 use std::fmt::Write as _;

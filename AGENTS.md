@@ -211,6 +211,18 @@ feature — `--all-features` only covers the everything-on case.
   `docs/knowledge/assistant/source-map.md` — update the matching knowledge
   file(s) in the *same* change and re-run `cargo xtask docs check`. A stale
   bundle is treated like stale code, not a follow-up.
+- **Keep shell completion synchronized with the CLI.** The clap command tree is
+  the source of truth for generated Bash, Zsh, and Fish completion; never
+  hand-maintain generated shell scripts. Every command, subcommand, flag, or
+  argument change must also review `crates/cli/src/completion.rs`, update any
+  affected dynamic value completers (especially `--host` and session `target`
+  arguments), and extend completion/parser tests. Preserve the completion
+  safety contract: static generation performs no daemon or NetBird I/O, while
+  dynamic lookups are opt-in, deadline-bounded, do not autostart the daemon, and
+  fail silently. In the same change, update the CLI tables/examples in
+  `README.md`, matching `docs/knowledge/` guidance and source map entries, and
+  release/install coverage when those surfaces change. Run at least
+  `cargo test -p pohunek-cli` and `cargo xtask docs check` before the full gates.
 - Comments and all repository text are in **English**.
 
 ## Workflow

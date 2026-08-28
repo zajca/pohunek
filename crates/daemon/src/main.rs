@@ -474,7 +474,8 @@ fn next_retry_interval(current: Duration) -> Duration {
 /// Serve the remote transport when its port configuration is valid.
 async fn serve_remote(state: DaemonState, registry: &OverlayRegistry, shutdown: CancellationToken) {
     let mut tasks = Vec::with_capacity(registry.entries().len());
-    for configured in registry.entries().iter().cloned() {
+    for configured in registry.entries() {
+        let configured = configured.clone();
         let state = state.clone();
         let shutdown = shutdown.clone();
         tasks.push(tokio::spawn(async move {

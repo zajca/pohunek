@@ -1,7 +1,8 @@
 //! `pohunek` — the CLI control plane.
 //!
 //! Commands: `doctor`, `daemon start`, `health`/`status`, `session`, `attach`,
-//! `integration`, and `host` (discover/list/inspect). The grammar is host-aware
+//! `completions`, `integration`, and `host` (discover/list/inspect). The grammar
+//! is host-aware
 //! (a `--host` flag and `<host>/<session-id>` targets); the *effective host*
 //! selects the transport, so local and remote (over `NetBird`) execute through one
 //! surface. Local behavior is unchanged from the local-only phase.
@@ -10,6 +11,7 @@
 
 mod client;
 mod commands;
+mod completion;
 mod error;
 mod hermes_integration;
 mod paths;
@@ -51,6 +53,16 @@ enum Commands {
     Attach {
         /// Session target: `session-id` or `<host>/<session-id>`.
         target: Target,
+    },
+
+    /// Generate shell completion for Bash, Zsh, or Fish.
+    Completions {
+        /// Shell whose completion script should be generated.
+        #[arg(value_enum)]
+        shell: completion::CompletionShell,
+        /// Include bounded runtime host and session-target completion.
+        #[arg(long)]
+        dynamic: bool,
     },
 
     /// Check environment health (binaries, socket/state dir writability).
@@ -109,11 +121,12 @@ enum Commands {
         action: MigrationAction,
     },
 
-    /// Set up the sway/rofi launcher integration on this machine.
+    /// Set up shell completion and the sway/rofi launcher on this machine.
     ///
-    /// With no subcommand, runs the full setup (scripts + config + sway
-    /// drop-in). Subcommands apply one part at a time. All operations are
-    /// local filesystem writes; `--host` is ignored.
+    /// With no subcommand, runs the launcher setup (scripts + config + sway
+    /// drop-in). Subcommands apply one part at a time and can also install
+    /// completion for a selected shell. All operations are local filesystem
+    /// writes; `--host` is ignored.
     Setup {
         #[command(subcommand)]
         action: Option<SetupAction>,
@@ -887,6 +900,19 @@ enum MigrationAction {
 
 #[derive(Debug, Subcommand)]
 enum SetupAction {
+    /// Install shell completion in the conventional per-user directory.
+    Completions {
+        /// Shell whose completion script should be installed.
+        #[arg(value_enum)]
+        shell: completion::CompletionShell,
+        /// Include bounded runtime host and session-target completion.
+        #[arg(long)]
+        dynamic: bool,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Materialize the launcher scripts into the data dir's `bin/`.
     Scripts {
         /// Emit machine-readable JSON instead of human text.
@@ -1208,7 +1234,9 @@ impl Commands {
             }
             Commands::Subscribe { json } => *json,
             Commands::Prompt { action } => action.wants_json(),
-            Commands::Attach { .. } | Commands::Daemon { .. } => false,
+            Commands::Attach { .. } | Commands::Completions { .. } | Commands::Daemon { .. } => {
+                false
+            }
         }
     }
 
@@ -1216,6 +1244,7 @@ impl Commands {
         match self {
             Commands::Notifications { action } => action.uses_all_hosts(),
             Commands::Attach { .. }
+            | Commands::Completions { .. }
             | Commands::Doctor { .. }
             | Commands::Daemon { .. }
             | Commands::Health { .. }
@@ -1251,7 +1280,8 @@ impl ProjectAction {
 impl SetupAction {
     fn wants_json(&self) -> bool {
         match self {
-            SetupAction::Scripts { json }
+            SetupAction::Completions { json, .. }
+            | SetupAction::Scripts { json }
             | SetupAction::Config { json, .. }
             | SetupAction::Sway { json, .. } => *json,
         }
@@ -1388,6 +1418,8 @@ impl PromptAction {
 }
 
 pub async fn run_cli() -> ExitCode {
+    completion::complete_env();
+
     // Parse manually (not `Cli::parse`) so a clap usage error can be rendered as a
     // structured `--json` document instead of clap's human text + hard process
     // exit. We keep the raw argv to recover the `--json` intent: parsing fails
@@ -1430,6 +1462,10 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let host = effective_host(&global_host, Some(&target));
             // Box the large attach future to keep this dispatch arm small.
             Box::pin(commands::attach::run_attach(&host, &paths, &target)).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Completions { shell, dynamic } => {
+            completion::run(shell, dynamic)?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Doctor { json } => {
@@ -1791,6 +1827,13 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             let paths = Paths::resolve()?;
             match action {
                 None => commands::setup::run_all(&paths, json)?,
+                Some(SetupAction::Completions {
+                    shell,
+                    dynamic,
+                    json,
+                }) => {
+                    completion::install(&paths, shell, dynamic, json)?;
+                }
                 Some(SetupAction::Scripts { json }) => {
                     commands::setup::run_scripts(&paths, json)?;
                 }
@@ -2831,6 +2874,49 @@ mod tests {
             Commands::Attach { target } => {
                 assert_eq!(target.session_id, "s-42");
                 assert_eq!(target.host.as_deref(), Some("local"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_static_completion_command() {
+        let cli = Cli::try_parse_from(["pohunek", "completions", "zsh"]).expect("parse");
+
+        match cli.command {
+            Commands::Completions { shell, dynamic } => {
+                assert_eq!(shell, completion::CompletionShell::Zsh);
+                assert!(!dynamic);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_dynamic_setup_completion_command() {
+        let cli = Cli::try_parse_from([
+            "pohunek",
+            "setup",
+            "completions",
+            "fish",
+            "--dynamic",
+            "--json",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Commands::Setup {
+                action:
+                    Some(SetupAction::Completions {
+                        shell,
+                        dynamic,
+                        json,
+                    }),
+                ..
+            } => {
+                assert_eq!(shell, completion::CompletionShell::Fish);
+                assert!(dynamic);
+                assert!(json);
             }
             other => panic!("unexpected command: {other:?}"),
         }

@@ -3,9 +3,7 @@
 /**
  * One enumerated host with its overlay identity and classification.
  *
- * Field order and names are part of the wire contract the rofi switcher parses
- * (`name`, `address`, `port`, `overlay`, `peer_id`, and the flattened
- * `classification`).
+ * Field order and names are part of the wire contract the rofi switcher parses.
  */
 export type HostRecord =
   & {

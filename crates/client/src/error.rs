@@ -394,15 +394,6 @@ fn registry_error_to_protocol(error: &overlay::RegistryError) -> ProtocolError {
             ),
             Some("repair a configured overlay or use a concrete discovered route".to_owned()),
         ),
-        overlay::RegistryError::Empty
-        | overlay::RegistryError::InvalidId { .. }
-        | overlay::RegistryError::DuplicateId(_)
-        | overlay::RegistryError::InvalidPort(_) => ProtocolError::new(
-            ErrorClass::Configuration,
-            "overlay_registry_invalid",
-            error.to_string(),
-            Some("fix the configured overlay registry before retrying".to_owned()),
-        ),
         _ => ProtocolError::new(
             ErrorClass::Configuration,
             "overlay_registry_invalid",

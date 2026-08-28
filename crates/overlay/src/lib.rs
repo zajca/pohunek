@@ -77,8 +77,9 @@ impl OverlayError {
             Self::HostUnknown { overlay, .. }
             | Self::PeerCollision { overlay, .. }
             | Self::StateUnavailable { overlay, .. }
-            | Self::InvalidConfig { overlay, .. } => overlay,
-            Self::CliMissing(overlay) | Self::ListenerAddressMissing(overlay) => overlay,
+            | Self::InvalidConfig { overlay, .. }
+            | Self::CliMissing(overlay)
+            | Self::ListenerAddressMissing(overlay) => overlay,
         }
     }
 }
@@ -165,8 +166,8 @@ impl OverlayId {
 }
 
 impl fmt::Display for OverlayId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -340,9 +341,8 @@ impl ConfiguredTransport {
 }
 
 impl fmt::Debug for ConfiguredTransport {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ConfiguredTransport")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfiguredTransport")
             .field("overlay", self.id())
             .field("port", &self.port())
             .finish_non_exhaustive()
