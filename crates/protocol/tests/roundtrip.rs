@@ -20,16 +20,16 @@ use protocol::{
     ProviderKind, ReportSequence, Request, Response, RuntimeGeneration, SessionAttachParams,
     SessionAttachResult, SessionCapabilities, SessionDetachParams, SessionDetachResult,
     SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams, SessionOutputGap,
-    SessionOutputParams, SessionOutputResult, SessionReleaseAgentParams, SessionReleaseAgentResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionRuntimeIdentity,
-    SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
-    SessionState, SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult,
-    SessionWarning, SessionWarningKind, StateSource, TerminalCursor, TerminalDimensions,
-    TerminalWatermark, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES, MAX_RUNTIME_ID_BYTES,
-    MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
-    MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_WAIT_MS,
+    SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
+    SessionOutputGap, SessionOutputParams, SessionOutputResult, SessionReleaseAgentParams,
+    SessionReleaseAgentResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
+    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
+    StateSource, TerminalCursor, TerminalDimensions, TerminalWatermark, MAX_CONTROL_LINE_BYTES,
+    MAX_REQUEST_ID_BYTES, MAX_RUNTIME_ID_BYTES, MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES,
+    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_WAIT_MS,
     OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, PROTOCOL_VERSION,
     SESSION_OUTPUT_METADATA_HEADROOM_BYTES, SUPPORTED_PROTOCOL_VERSIONS,
 };
@@ -456,6 +456,36 @@ fn notification_create_params_json_shape_roundtrips() {
 
     let back = line_roundtrip(&params);
     assert_eq!(back, params);
+
+    let waiting = SessionInputParams {
+        session_id: SessionId("s-42".to_owned()),
+        text: "write tests first".to_owned(),
+        wait: Some(SessionInputWait {
+            until: vec![AgentActivity::Idle, AgentActivity::Blocked],
+            timeout_ms: Some(MAX_SESSION_WAIT_MS),
+        }),
+    };
+    let value = serde_json::to_value(&waiting).expect("serialize waiting input params");
+    assert_eq!(
+        value,
+        json!({
+            "session_id": "s-42",
+            "text": "write tests first",
+            "wait": {
+                "until": ["idle", "blocked"],
+                "timeout_ms": 8000
+            }
+        })
+    );
+    assert_eq!(line_roundtrip(&waiting), waiting);
+
+    let overflow = json!({
+        "session_id": "s-42",
+        "text": "write tests first",
+        "wait": { "until": ["idle"], "timeout_ms": 4_294_967_296_u64 }
+    });
+    serde_json::from_value::<SessionInputParams>(overflow)
+        .expect_err("input wait timeout must stay bounded to an unsigned 32-bit integer");
 }
 
 #[test]
@@ -3086,6 +3116,8 @@ fn m1_observation_errors_are_stable_and_payload_free() {
         ProtocolError::agent_runtime_unsupported(),
         ProtocolError::session_input_rejected(),
         ProtocolError::session_input_blocked(),
+        ProtocolError::session_agent_blocked(),
+        ProtocolError::session_input_timeout(),
         ProtocolError::session_terminal_unavailable(),
         ProtocolError::session_has_no_managed_terminal(),
         ProtocolError::session_runtime_changed(),

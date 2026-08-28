@@ -3483,7 +3483,7 @@ fn hermes_programmatic_input_fails_closed_while_blocked() {
 #[tokio::test]
 async fn session_input_wait_rejects_invalid_contract_before_delivery() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        shell_command: observable_input_shell(),
         stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     });
@@ -3511,12 +3511,264 @@ async fn session_input_wait_rejects_invalid_contract_before_delivery() {
         }
     }
 
+    tokio::time::sleep(Duration::from_millis(50)).await;
     let output = read_session_output_after_rejection(&registry, &created.id).await;
     assert!(
         !output.contains("must not be delivered"),
         "invalid wait must not deliver input; output={output:?}"
     );
 
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_times_out_with_typed_error() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+
+    let error = registry
+        .input(protocol::SessionInputParams {
+            session_id: created.id.clone(),
+            text: "submitted but never settled".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: vec![AgentActivity::Blocked],
+                timeout_ms: Some(25),
+            }),
+        })
+        .await
+        .expect_err("missing target activity must time out");
+
+    assert_eq!(error.code, "session_input_timeout");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_rejects_blocked_session_before_delivery() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: observable_input_shell(),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Blocked, 1)
+            .await
+            .recorded
+    );
+
+    let error = registry
+        .input(protocol::SessionInputParams {
+            session_id: created.id.clone(),
+            text: "blocked-input-marker".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: vec![AgentActivity::Idle],
+                timeout_ms: Some(250),
+            }),
+        })
+        .await
+        .expect_err("blocked wait input must be rejected");
+
+    assert_eq!(error.code, "session_agent_blocked");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    assert!(
+        !output.contains("blocked-input-marker"),
+        "output={output:?}"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_ignores_activity_reported_during_submit_delay() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        claude_submit_delay: Duration::from_millis(100),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let mut create = params();
+    create.agent = "claude".to_owned();
+    let created = registry
+        .create(create)
+        .await
+        .expect("create Claude session");
+    let reports = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                report_input_activity(&registry, &session_id, AgentActivity::Idle, 1)
+                    .await
+                    .recorded
+            );
+            tokio::time::sleep(Duration::from_millis(130)).await;
+            report_input_activity(&registry, &session_id, AgentActivity::Blocked, 2).await
+        }
+    });
+
+    let result = registry
+        .input(protocol::SessionInputParams {
+            session_id: created.id.clone(),
+            text: "submit after the delay".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: Vec::new(),
+                timeout_ms: Some(500),
+            }),
+        })
+        .await
+        .expect("post-submit blocked activity settles the default wait");
+
+    assert_eq!(result.activity, Some(AgentActivity::Blocked));
+    assert_eq!(result.activity_source, Some(StateSource::Report));
+    assert!(reports.await.expect("report task joins").recorded);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_resnapshots_after_broadcast_lag() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let mut events = registry.subscribe();
+    let submitted_revision = registry
+        .input_activity_snapshot(&created.id)
+        .await
+        .expect("snapshot activity")
+        .revision;
+    for sequence in 1..=130 {
+        assert!(
+            report_input_activity(&registry, &created.id, AgentActivity::Working, sequence,)
+                .await
+                .recorded
+        );
+    }
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Idle, 131)
+            .await
+            .recorded
+    );
+
+    let result = registry
+        .await_input_settled(
+            &created.id,
+            protocol::SessionInputWait {
+                until: vec![AgentActivity::Idle],
+                timeout_ms: Some(100),
+            },
+            submitted_revision,
+            &mut events,
+        )
+        .await
+        .expect("lagged receiver must settle from a fresh snapshot");
+
+    assert_eq!(result.activity, Some(AgentActivity::Idle));
+    assert_eq!(result.activity_source, Some(StateSource::Report));
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_is_cancelled_by_daemon_shutdown() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let wait = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id,
+                    text: "wait for shutdown".to_owned(),
+                    wait: Some(protocol::SessionInputWait {
+                        until: vec![AgentActivity::Blocked],
+                        timeout_ms: Some(1_000),
+                    }),
+                })
+                .await
+        }
+    });
+    wait_for_session_waiters(&registry, &created.id, 1).await;
+
+    registry.shutdown_event_log().await;
+    let error = wait
+        .await
+        .expect("input wait task joins")
+        .expect_err("shutdown must cancel input wait");
+
+    assert_eq!(error.code, "daemon_shutting_down");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_obeys_per_session_waiter_limit() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        observation_global_waiters: 2,
+        observation_session_waiters: 1,
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let first = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id,
+                    text: "first waiter".to_owned(),
+                    wait: Some(protocol::SessionInputWait {
+                        until: vec![AgentActivity::Blocked],
+                        timeout_ms: Some(1_000),
+                    }),
+                })
+                .await
+        }
+    });
+    wait_for_session_waiters(&registry, &created.id, 1).await;
+
+    let error = registry
+        .input(protocol::SessionInputParams {
+            session_id: created.id.clone(),
+            text: "second waiter".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: vec![AgentActivity::Blocked],
+                timeout_ms: Some(1_000),
+            }),
+        })
+        .await
+        .expect_err("second waiter for one session must be rejected");
+
+    assert_eq!(error.code, "session_waiter_limit_reached");
+    first.abort();
+    let _ = first.await;
+    wait_for_session_waiters(&registry, &created.id, 0).await;
     let _ = registry.stop(&created.id).await;
 }
 
@@ -3587,6 +3839,58 @@ async fn read_session_output_after_rejection(registry: &SessionRegistry, id: &Se
         .await
         .expect("inspect terminal after rejected input");
     output.visible_lines.join("\n")
+}
+
+fn observable_input_shell() -> ShellCommand {
+    ShellCommand::new(
+        "/bin/sh",
+        [
+            "-c",
+            "IFS= read -r line; printf 'received:%s\\n' \"$line\"; sleep 30",
+        ],
+    )
+}
+
+async fn report_input_activity(
+    registry: &SessionRegistry,
+    session_id: &SessionId,
+    activity: AgentActivity,
+    sequence: u64,
+) -> protocol::SessionReportAgentResult {
+    registry
+        .report_agent(protocol::SessionReportAgentParams {
+            session_id: session_id.clone(),
+            source: "test:pohunek-input-wait".to_owned(),
+            agent: "codex".to_owned(),
+            activity: Some(activity),
+            seq: Some(protocol::ReportSequence::new(sequence)),
+            pid: None,
+            agent_session_id: None,
+            agent_session_path: None,
+        })
+        .await
+}
+
+async fn wait_for_session_waiters(
+    registry: &SessionRegistry,
+    session_id: &SessionId,
+    expected: usize,
+) {
+    for _ in 0..100 {
+        let count = registry
+            .inner
+            .observation_session_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .copied()
+            .unwrap_or_default();
+        if count == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("timed out waiting for {expected} session input waiters");
 }
 
 #[test]

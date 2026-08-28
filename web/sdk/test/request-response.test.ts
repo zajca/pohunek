@@ -350,8 +350,14 @@ describe("Client request/response", () => {
       terminal_watermark: "2",
       output_offset: "0",
     } as const;
+    const input = {
+      accepted: true,
+      activity: "idle",
+      activity_source: "report",
+    } as const;
     const daemon = await startUnixDaemon([
       { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), screen) },
+      { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), input) },
       { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), output) },
       { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), wait) },
     ]);
@@ -360,6 +366,11 @@ describe("Client request/response", () => {
         origin: { sessionId: "s-origin", daemonId: "daemon-origin" },
       });
       await client.sessionScreen({ session_id: "s-target" });
+      await client.sessionInput({
+        session_id: "s-target",
+        text: "hello",
+        wait: { until: ["idle"] },
+      });
       await client.sessionOutput({
         session_id: "s-target",
         runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
@@ -373,12 +384,62 @@ describe("Client request/response", () => {
         timeout_ms: 25,
       });
 
-      for (const method of ["session.screen", "session.output", "session.wait"]) {
+      for (const method of ["session.screen", "session.input", "session.output", "session.wait"]) {
         const sent = parseRequestLine(await daemon.nextRequest());
         expect(sent["method"]).toBe(method);
         expect(sent["origin_session_id"]).toBe("s-origin");
         expect(sent["origin_daemon_id"]).toBe("daemon-origin");
       }
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("input wait without timeout uses a dedicated connection with headroom", async () => {
+    const input = {
+      accepted: true,
+      activity: "idle",
+      activity_source: "screen",
+    } as const;
+    const daemon = await startUnixDaemon([
+      {
+        kind: "delay",
+        ms: 60,
+        line: (line) => okResponseLine(requestIdFromLine(line), input),
+      },
+      {
+        kind: "reply",
+        line: (line) => okResponseLine(requestIdFromLine(line), {
+          status: "ok",
+          daemon_version: "test",
+          protocol_version: PROTOCOL_VERSION,
+        }),
+      },
+    ]);
+    try {
+      const client = await connectClient(daemon, undefined, { requestTimeoutMs: 20 });
+
+      expect(await client.sessionInput({
+        session_id: "s-target",
+        text: "hello",
+        wait: { until: ["idle"] },
+      })).toEqual(input);
+      expect(await client.call("daemon.health", null)).toEqual({
+        status: "ok",
+        daemon_version: "test",
+        protocol_version: PROTOCOL_VERSION,
+      });
+
+      const waiting = parseRequestLine(await daemon.nextRequest());
+      expect(waiting["method"]).toBe("session.input");
+      expect(waiting["params"]).toEqual({
+        session_id: "s-target",
+        text: "hello",
+        wait: { until: ["idle"] },
+      });
+      const followUp = parseRequestLine(await daemon.nextRequest());
+      expect(followUp["method"]).toBe("daemon.health");
       await client.close();
     } finally {
       await daemon.close();

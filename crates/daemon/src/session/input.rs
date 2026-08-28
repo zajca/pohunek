@@ -19,6 +19,13 @@ pub(super) const SUBMIT: &[u8] = b"\r";
 /// Activities that settle a wait when the caller supplies no explicit targets.
 const DEFAULT_INPUT_WAIT_UNTIL: [AgentActivity; 2] = [AgentActivity::Idle, AgentActivity::Blocked];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct InputActivitySnapshot {
+    pub(super) activity: Option<AgentActivity>,
+    pub(super) source: protocol::StateSource,
+    pub(super) revision: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct InputWritePlan {
     pub(super) immediate: Vec<u8>,
@@ -54,12 +61,18 @@ impl SessionRegistry {
         Self::validate_input_wait(&wait)?;
         let mut events = self.subscribe();
         let _waiter_permit = self.acquire_waiter(&params.session_id)?;
-        if self.current_activity(&params.session_id).await? == Some(AgentActivity::Blocked) {
+        if self
+            .input_activity_snapshot(&params.session_id)
+            .await?
+            .activity
+            == Some(AgentActivity::Blocked)
+        {
             return Err(ProtocolError::session_agent_blocked());
         }
         self.write_input_to_session(&params.session_id, &params.text)
             .await?;
-        self.await_input_settled(&params.session_id, wait, &mut events)
+        let submitted = self.input_activity_snapshot(&params.session_id).await?;
+        self.await_input_settled(&params.session_id, wait, submitted.revision, &mut events)
             .await
     }
 
@@ -111,17 +124,26 @@ impl SessionRegistry {
         Ok(())
     }
 
-    async fn current_activity(
+    pub(super) async fn input_activity_snapshot(
         &self,
         session_id: &SessionId,
-    ) -> Result<Option<AgentActivity>, ProtocolError> {
-        Ok(self.inspect(session_id).await?.activity)
+    ) -> Result<InputActivitySnapshot, ProtocolError> {
+        let sessions = self.inner.sessions.lock().await;
+        let entry = sessions
+            .get(session_id)
+            .ok_or_else(|| session_not_found(&session_id.0))?;
+        Ok(InputActivitySnapshot {
+            activity: entry.info.activity,
+            source: entry.info.state_source,
+            revision: entry.activity_revision,
+        })
     }
 
-    async fn await_input_settled(
+    pub(super) async fn await_input_settled(
         &self,
         session_id: &SessionId,
         wait: SessionInputWait,
+        submitted_revision: u64,
         events: &mut broadcast::Receiver<protocol::Event>,
     ) -> Result<SessionInputResult, ProtocolError> {
         let targets: &[AgentActivity] = if wait.until.is_empty() {
@@ -129,28 +151,35 @@ impl SessionRegistry {
         } else {
             &wait.until
         };
-        let deadline_ms = wait
-            .timeout_ms
-            .map_or_else(|| u64::from(protocol::MAX_SESSION_WAIT_MS), u64::from);
-        let deadline = Duration::from_millis(deadline_ms);
-        let started = tokio::time::Instant::now();
+        let deadline_ms = wait.timeout_ms.unwrap_or(protocol::MAX_SESSION_WAIT_MS);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(deadline_ms));
 
         loop {
-            let remaining = deadline.saturating_sub(started.elapsed());
-            let received = tokio::time::timeout(remaining, events.recv()).await;
-            match received {
-                Err(_) => return Err(ProtocolError::session_input_timeout()),
-                Ok(Err(broadcast::error::RecvError::Closed)) => {
-                    return Err(ProtocolError::new(
-                        ErrorClass::Daemon,
-                        "daemon_shutting_down",
-                        "daemon event channel closed during bounded input wait",
-                        None,
+            tokio::select! {
+                biased;
+                () = self.inner.event_log_shutdown.cancelled() => {
+                    return Err(input_wait_shutdown_error(
+                        "daemon shutdown cancelled the bounded input wait",
                     ));
                 }
-                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
-                Ok(Ok(event)) if event.event() != protocol::event::AGENT_STATE => {}
-                Ok(Ok(event)) => {
+                () = tokio::time::sleep_until(deadline) => {
+                    if let Some(result) = self
+                        .evaluate_input_wait(session_id, targets, submitted_revision)
+                        .await?
+                    {
+                        return Ok(result);
+                    }
+                    return Err(ProtocolError::session_input_timeout());
+                }
+                received = events.recv() => match received {
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Err(input_wait_shutdown_error(
+                            "daemon event channel closed during bounded input wait",
+                        ));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Ok(event) if event.event() != protocol::event::AGENT_STATE => continue,
+                    Ok(event) => {
                     let state: AgentStateEvent = serde_json::from_value(event.payload().clone())
                         .map_err(|_error| {
                             ProtocolError::new(
@@ -160,17 +189,39 @@ impl SessionRegistry {
                                 None,
                             )
                         })?;
-                    if state.session_id != *session_id || !targets.contains(&state.activity) {
+                    if state.session_id != *session_id {
                         continue;
                     }
-                    return Ok(SessionInputResult {
-                        accepted: true,
-                        activity: Some(state.activity),
-                        activity_source: Some(state.source),
-                    });
-                }
+                    }
+                },
+            }
+            if let Some(result) = self
+                .evaluate_input_wait(session_id, targets, submitted_revision)
+                .await?
+            {
+                return Ok(result);
             }
         }
+    }
+
+    async fn evaluate_input_wait(
+        &self,
+        session_id: &SessionId,
+        targets: &[AgentActivity],
+        submitted_revision: u64,
+    ) -> Result<Option<SessionInputResult>, ProtocolError> {
+        let snapshot = self.input_activity_snapshot(session_id).await?;
+        let Some(activity) = snapshot.activity else {
+            return Ok(None);
+        };
+        if snapshot.revision <= submitted_revision || !targets.contains(&activity) {
+            return Ok(None);
+        }
+        Ok(Some(SessionInputResult {
+            accepted: true,
+            activity: Some(activity),
+            activity_source: Some(snapshot.source),
+        }))
     }
 
     fn validate_input_wait(wait: &SessionInputWait) -> Result<(), ProtocolError> {
@@ -189,6 +240,10 @@ impl SessionRegistry {
 
         Ok(())
     }
+}
+
+fn input_wait_shutdown_error(message: &str) -> ProtocolError {
+    ProtocolError::new(ErrorClass::Daemon, "daemon_shutting_down", message, None)
 }
 
 pub(super) fn plan_initial_input_delivery(

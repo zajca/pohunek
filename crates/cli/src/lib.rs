@@ -1069,7 +1069,7 @@ enum SessionAction {
         #[arg(long = "until", value_parser = commands::session::parse_activity_filter)]
         wait_until: Vec<protocol::AgentActivity>,
         /// Bounded input-wait duration in milliseconds.
-        #[arg(long = "timeout", value_parser = commands::session::parse_wait_timeout_ms)]
+        #[arg(long = "timeout", value_parser = commands::session::parse_input_timeout_ms)]
         timeout_ms: Option<u32>,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
@@ -2778,6 +2778,24 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_input_timeout_errors_name_the_input_flag() {
+        let error = Cli::try_parse_from([
+            "pohunek",
+            "session",
+            "input",
+            "s-42",
+            "hello",
+            "--timeout",
+            "0",
+        ])
+        .expect_err("zero input timeout must fail");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("--timeout must be between 1 and 8000"));
+        assert!(!rendered.contains("--timeout-ms"));
     }
 
     #[test]

@@ -39,11 +39,12 @@ stderr.
 `pohunek session input --until idle --timeout 1000` can confirm delivery by
 waiting for a matching activity observed only after submission. The daemon first
 validates the whole wait contract, so zero or over-limit timeouts cannot deliver
-text; duplicate `--until` values are sorted and deduplicated; omitted targets
-default to `idle` and `blocked`; the timeout range is `1..8000` ms (default
+text; duplicate `--until` values are deduplicated in first-occurrence order;
+omitted targets default to `idle` and `blocked`; the timeout range is `1..8000` ms (default
 8000). Waiting uses a dedicated SDK/CLI transport with bounded-wait headroom,
 acquires one observation waiter slot, and returns `session_input_timeout`
-rather than accepting pre-delivery state.
+rather than accepting activity evidence observed before submit framing
+completes.
 
 `pohunek session diff <target> [--base <ref>] [--json]` prints a unified diff
 of a session's worktree against a base ref: raw diff text on stdout by

@@ -107,8 +107,9 @@ const client = await connectLocal(socketPath, {
 ```
 
 The origin is an atomic pair of bounded safe identifiers. The SDK copies it to
-ordinary calls, subscriptions, waiting `session.output`, and `session.wait`,
-including their dedicated connections. A partial, unsafe, oversized, or
+ordinary calls, subscriptions, waiting `session.input`, waiting
+`session.output`, and `session.wait`, including their dedicated connections. A
+partial, unsafe, oversized, or
 conflicting pair is rejected before a control line is written. Omit `origin`
 for ordinary browser or host-side clients that are not running inside a managed
 session.

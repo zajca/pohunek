@@ -443,6 +443,8 @@ struct SessionRegistryInner {
 #[derive(Debug, Clone)]
 struct SessionEntry {
     info: SessionInfo,
+    /// Monotonic in-memory cursor advanced for every emitted activity report.
+    activity_revision: u64,
     runtime: RuntimeHandle,
     desired_state: DesiredState,
     detector_cancel: CancellationToken,
@@ -1795,6 +1797,10 @@ impl SessionRegistry {
             if let Some(activity) = reported_activity {
                 entry.info.activity = Some(activity);
                 entry.info.state_source = StateSource::Report;
+                entry.activity_revision = entry
+                    .activity_revision
+                    .checked_add(1)
+                    .expect("session activity revision overflowed");
             }
             let _ = entry.detector_config.send(active_detector_config);
             entry.info.updated_at = timestamp_now();

@@ -332,8 +332,8 @@ impl Client {
         &mut self,
         params: SessionInputParams,
     ) -> Result<SessionInputResult, ClientError> {
-        let timeout_ms = params.wait.as_ref().and_then(|wait| wait.timeout_ms);
-        if let Some(timeout_ms) = timeout_ms {
+        if let Some(wait) = &params.wait {
+            let timeout_ms = wait.timeout_ms.unwrap_or(protocol::MAX_SESSION_WAIT_MS);
             self.call_dedicated::<protocol::method::SessionInput>(params, timeout_ms)
                 .await
         } else {
@@ -1205,6 +1205,36 @@ mod tests {
             .expect("session wait succeeds");
         let request = server.await.expect("capture server");
         assert_eq!(request.method(), protocol::method::SESSION_WAIT);
+        assert_test_request_origin(&request);
+    }
+
+    #[tokio::test]
+    async fn dedicated_input_wait_carries_the_connection_origin() {
+        let result = serde_json::json!({
+            "accepted": true,
+            "activity": "idle",
+            "activity_source": "report"
+        });
+        let (address, server) = spawn_dedicated_capture_server(result).await;
+        let mut client = Client::connect_tcp_addr("fixture-remote", address)
+            .await
+            .expect("connect remote");
+        client.origin = Some(test_request_origin());
+        let params = SessionInputParams {
+            session_id: SessionId("s-target".to_owned()),
+            text: "hello".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: vec![protocol::AgentActivity::Idle],
+                timeout_ms: None,
+            }),
+        };
+
+        client
+            .session_input(params)
+            .await
+            .expect("session input wait succeeds");
+        let request = server.await.expect("capture server");
+        assert_eq!(request.method(), protocol::method::SESSION_INPUT);
         assert_test_request_origin(&request);
     }
 

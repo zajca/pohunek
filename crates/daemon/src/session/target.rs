@@ -642,6 +642,7 @@ impl SessionRegistry {
 
         let entry = SessionEntry {
             info: info.clone(),
+            activity_revision: 0,
             runtime: started.handle.clone(),
             desired_state: DesiredState::Running,
             detector_cancel: detector_cancel.clone(),

@@ -187,7 +187,7 @@ All params and result type names below refer to structs exported by
 | `session.attach` | `SessionAttachParams` | `SessionAttachResult` | Mints a one-shot attach stream id. |
 | `session.detach` | `SessionDetachParams` | `SessionDetachResult` | Cancels an active attach stream. After a worker stream failure, the first call returns its optional typed `error` and consumes that short-lived result; unknown or already-consumed streams return `detached: false` without `error`. |
 | `session.resize` | `SessionResizeParams` | `SessionResizeResult` | Resizes the PTY on the control connection. |
-| `session.input` | `SessionInputParams` | `SessionInputResult` | Injects text using agent-specific input framing. Hermes accepts at most `MAX_SESSION_INPUT_BYTES` UTF-8 bytes, permits LF and tab but rejects other C0/C1 controls without rewriting them, and returns `session_input_blocked` while approval-visible activity is blocked. Unsafe or oversized Hermes text returns `session_input_rejected`. With `wait`, the daemon validates the complete contract before delivery, deduplicates targets deterministically, acquires a waiter permit, requires a new matching `agent_state` event after delivery, and bounds the wait by `timeout_ms: 1..8000` (default 8000). A waiting request uses a dedicated connection; timeout is `session_input_timeout`. |
+| `session.input` | `SessionInputParams` | `SessionInputResult` | Injects text using agent-specific input framing. Hermes accepts at most `MAX_SESSION_INPUT_BYTES` UTF-8 bytes, permits LF and tab but rejects other C0/C1 controls without rewriting them, and returns `session_input_blocked` while approval-visible activity is blocked. Unsafe or oversized Hermes text returns `session_input_rejected`. With `wait`, the daemon validates the complete contract before delivery, deduplicates targets in first-occurrence order, acquires a waiter permit, and accepts only a matching activity revision newer than the snapshot taken after submit framing completes. Lagged event receivers re-snapshot current activity, and shutdown cancels the wait. The wait is bounded by `timeout_ms: 1..8000` (default 8000), always uses a dedicated connection with transport headroom, and returns `session_input_timeout` on expiry. |
 | `session.screen` | `SessionScreenParams` | `SessionScreenResult` | Reads one bounded, rendered, runtime-bound terminal snapshot without acquiring attach ownership or resizing the terminal. |
 | `session.output` | `SessionOutputParams` | `SessionOutputResult` | Reads a newest retained tail or continues from an exact runtime-scoped output cursor. A request with `wait_ms` uses a dedicated connection with bounded-wait headroom. |
 | `session.wait` | `SessionWaitParams` | `SessionWaitResult` | Performs one bounded long poll for state, activity, metadata, terminal, output, or runtime change. It always uses a dedicated connection. |
@@ -880,9 +880,10 @@ and observation behavior: `agent_kind_unsupported`,
 `agent_fork_unsupported`, `session_terminal_unavailable`,
 `session_has_no_managed_terminal`, `session_runtime_changed`,
 `session_output_limit_exceeded`, `session_wait_limit_exceeded`,
-`session_waiter_limit_reached`, `worker_feature_unavailable`, and
+`session_waiter_limit_reached`, `worker_feature_unavailable`,
 `plugin_self_target_denied`, `agent_runtime_unsupported`,
-`session_input_rejected`, and `session_input_blocked`. Daemon startup may additionally return
+`session_input_rejected`, `session_input_blocked`, `session_agent_blocked`,
+`session_input_invalid_wait`, and `session_input_timeout`. Daemon startup may additionally return
 `observation_limits_invalid`. Observation request errors intentionally carry no terminal
 payload or current-runtime payload; refresh `session.inspect` or restart
 observation from a fresh screen/tail when recovery requires new coordinates.

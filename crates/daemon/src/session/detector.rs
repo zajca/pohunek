@@ -117,6 +117,10 @@ impl SessionRegistry {
             entry.info.activity = Some(transition.activity);
             entry.info.state_source = transition.source;
             entry.info.updated_at = timestamp_now();
+            entry.activity_revision = entry
+                .activity_revision
+                .checked_add(1)
+                .expect("session activity revision overflowed");
             let rescan = (transition.activity == AgentActivity::Working)
                 .then(|| std::sync::Arc::clone(&entry.procwatch_rescan));
             (transition, rescan)

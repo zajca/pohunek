@@ -21,7 +21,7 @@ use crate::procwatch::ProcessInspector;
 use crate::session::target::open_detector_output;
 use crate::store::{ResumeBinding, SessionWriteOutcome};
 
-// Rust guideline compliant 2026-07-29
+// Rust guideline compliant 2026-08-28
 
 #[derive(Debug, Clone)]
 struct DiscoveredWorker {
@@ -744,6 +744,7 @@ impl SessionRegistry {
         let info = record.info.clone();
         let entry = SessionEntry {
             info: info.clone(),
+            activity_revision: 0,
             runtime: RuntimeHandle::Worker(worker.clone()),
             desired_state: DesiredState::Running,
             detector_cancel: detector_cancel.clone(),
@@ -850,6 +851,7 @@ impl SessionRegistry {
         let info = record.info.clone();
         let entry = SessionEntry {
             info: info.clone(),
+            activity_revision: 0,
             runtime: RuntimeHandle::Unavailable(state),
             desired_state: record.desired_state,
             detector_cancel: CancellationToken::new(),

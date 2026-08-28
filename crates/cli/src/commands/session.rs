@@ -61,12 +61,21 @@ pub(crate) fn parse_output_bytes(value: &str) -> Result<u32, String> {
 
 /// Parse a required bounded wait timeout against the shared protocol ceiling.
 pub(crate) fn parse_wait_timeout_ms(value: &str) -> Result<u32, String> {
+    parse_bounded_wait_timeout_ms(value, "--timeout-ms")
+}
+
+/// Parse an input-wait timeout against the shared protocol ceiling.
+pub(crate) fn parse_input_timeout_ms(value: &str) -> Result<u32, String> {
+    parse_bounded_wait_timeout_ms(value, "--timeout")
+}
+
+fn parse_bounded_wait_timeout_ms(value: &str, flag: &str) -> Result<u32, String> {
     let parsed = value
         .parse::<u32>()
-        .map_err(|_error| "--timeout-ms must be an unsigned 32-bit integer".to_owned())?;
+        .map_err(|_error| format!("{flag} must be an unsigned 32-bit integer"))?;
     if parsed == 0 || parsed > protocol::MAX_SESSION_WAIT_MS {
         return Err(format!(
-            "--timeout-ms must be between 1 and {}",
+            "{flag} must be between 1 and {}",
             protocol::MAX_SESSION_WAIT_MS
         ));
     }
@@ -1433,10 +1442,18 @@ fn render_remove_human(session_id: &str, result: &SessionRemoveResult) -> String
 }
 
 fn render_input_human(session_id: &str, result: &SessionInputResult) -> String {
-    if result.accepted {
-        format!("session {session_id}: input accepted\n")
+    let disposition = if result.accepted {
+        "accepted"
     } else {
-        format!("session {session_id}: input rejected\n")
+        "rejected"
+    };
+    match (result.activity, result.activity_source) {
+        (Some(activity), Some(source)) => format!(
+            "session {session_id}: input {disposition} activity={} source={}\n",
+            activity_label(activity),
+            state_source_label(source)
+        ),
+        _ => format!("session {session_id}: input {disposition}\n"),
     }
 }
 
@@ -2636,6 +2653,23 @@ mod tests {
         );
 
         assert_eq!(output, "session s-42: input accepted\n");
+    }
+
+    #[test]
+    fn renders_settled_input_activity_and_source() {
+        let output = render_input_human(
+            "s-42",
+            &protocol::SessionInputResult {
+                accepted: true,
+                activity: Some(AgentActivity::Blocked),
+                activity_source: Some(StateSource::Report),
+            },
+        );
+
+        assert_eq!(
+            output,
+            "session s-42: input accepted activity=blocked source=report\n"
+        );
     }
 
     #[test]

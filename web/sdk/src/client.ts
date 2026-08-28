@@ -1,4 +1,5 @@
 import {
+  MAX_SESSION_WAIT_MS,
   PROTOCOL_VERSION,
   SUPPORTED_PROTOCOL_VERSIONS,
   type Methods,
@@ -7,6 +8,8 @@ import {
   type ProtocolVersionRange,
   type SessionOutputParams,
   type SessionOutputResult,
+  type SessionInputParams,
+  type SessionInputResult,
   type SessionScreenParams,
   type SessionScreenResult,
   type SessionWaitParams,
@@ -92,6 +95,17 @@ export class Client {
       return this.callDedicated("session.output", params, params.wait_ms);
     }
     return this.call("session.output", params);
+  }
+
+  public async sessionInput(params: SessionInputParams): Promise<SessionInputResult> {
+    if (params.wait !== undefined) {
+      return this.callDedicated(
+        "session.input",
+        params,
+        params.wait.timeout_ms ?? MAX_SESSION_WAIT_MS,
+      );
+    }
+    return this.call("session.input", params);
   }
 
   public async sessionWait(params: SessionWaitParams): Promise<SessionWaitResult> {
@@ -222,7 +236,7 @@ export class Client {
     this.selectedVersion = received;
   }
 
-  private async callDedicated<K extends "session.output" | "session.wait">(
+  private async callDedicated<K extends "session.input" | "session.output" | "session.wait">(
     method: K,
     params: Methods[K]["params"],
     wireTimeoutMs: number,
