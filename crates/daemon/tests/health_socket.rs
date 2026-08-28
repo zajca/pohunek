@@ -142,6 +142,10 @@ struct XdgGuard {
 
 impl XdgGuard {
     async fn set_all(tag: &str) -> Self {
+        Self::set_all_after(tag, || {}).await
+    }
+
+    async fn set_all_after(tag: &str, before_isolation: impl FnOnce()) -> Self {
         let guard = XDG_LOCK.lock().await;
         let vars = [
             "XDG_RUNTIME_DIR",
@@ -150,11 +154,14 @@ impl XdgGuard {
             "XDG_CONFIG_HOME",
             "XDG_CACHE_HOME",
             "HOME",
+            "CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
         ];
         let saved = vars
             .iter()
             .map(|&key| (key, std::env::var(key).ok()))
             .collect::<Vec<_>>();
+        before_isolation();
         let root = temp_dir(tag);
         std::env::set_var("XDG_RUNTIME_DIR", root.join("runtime"));
         std::env::set_var("XDG_STATE_HOME", root.join("state"));
@@ -162,6 +169,8 @@ impl XdgGuard {
         std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
         std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
         std::env::set_var("HOME", root.join("home"));
+        std::env::set_var("CLAUDE_CONFIG_DIR", root.join("home/.claude"));
+        std::env::set_var("CODEX_HOME", root.join("home/.codex"));
         Self {
             _guard: guard,
             saved,
@@ -246,9 +255,30 @@ async fn spawn_server(
 
 #[tokio::test]
 async fn integration_status_accepts_null_at_daemon_boundary() {
-    let xdg = XdgGuard::set_all("integration-status-rpc").await;
+    let ambient = temp_dir("integration-status-ambient-provider-overrides");
+    let ambient_claude = ambient.join("claude");
+    let ambient_codex = ambient.join("codex");
+    std::fs::create_dir_all(&ambient_claude).expect("create ambient Claude override");
+    std::fs::create_dir_all(&ambient_codex).expect("create ambient Codex override");
+    std::fs::write(ambient_claude.join("sentinel"), "ambient Claude\n")
+        .expect("write ambient Claude sentinel");
+    std::fs::write(ambient_codex.join("sentinel"), "ambient Codex\n")
+        .expect("write ambient Codex sentinel");
+    let ambient_before = tree_snapshot(&ambient);
+    let claude_override = ambient_claude.clone();
+    let codex_override = ambient_codex.clone();
+    let xdg = XdgGuard::set_all_after("integration-status-rpc", move || {
+        std::env::set_var("CLAUDE_CONFIG_DIR", claude_override);
+        std::env::set_var("CODEX_HOME", codex_override);
+    })
+    .await;
     let claude = xdg.home().join(".claude");
     let codex = xdg.home().join(".codex");
+    assert_eq!(
+        std::env::var_os("CLAUDE_CONFIG_DIR"),
+        Some(claude.clone().into())
+    );
+    assert_eq!(std::env::var_os("CODEX_HOME"), Some(codex.clone().into()));
     std::fs::create_dir_all(&claude).expect("create isolated Claude config");
     std::fs::create_dir_all(&codex).expect("create isolated Codex config");
     pohunek_daemon::integration::install_claude(&claude).expect("install Claude fixture");
@@ -278,7 +308,32 @@ async fn integration_status_accepts_null_at_daemon_boundary() {
         before,
         "integration.status must not mutate provider configuration"
     );
+    assert_eq!(
+        tree_snapshot(&ambient),
+        ambient_before,
+        "isolated status must not inspect or mutate ambient provider overrides"
+    );
 
+    framed.get_mut().shutdown().await.expect("close client");
+    shutdown.send(()).expect("send integration status shutdown");
+    server.await.expect("integration status server task");
+}
+
+#[tokio::test]
+async fn integration_status_rejects_unknown_params_at_daemon_boundary() {
+    let socket = temp_socket("integration-status-unknown-params");
+    let (shutdown, server) = spawn_server(&socket, "test").await;
+    let mut framed = connect(&socket).await;
+    let request = Request::make(
+        "integration-status-unknown-params",
+        method::INTEGRATION_STATUS,
+        serde_json::json!({ "agent": "codex", "unexpected": true }),
+    );
+
+    let response = exchange(&mut framed, &request).await;
+
+    assert_eq!(response.id(), "integration-status-unknown-params");
+    assert_eq!(err_payload(response).code, "bad_request");
     framed.get_mut().shutdown().await.expect("close client");
     shutdown.send(()).expect("send integration status shutdown");
     server.await.expect("integration status server task");

@@ -74,7 +74,10 @@ pub struct IntegrationInstallResult {
 }
 
 /// Request parameters for `integration.status`.
+///
+/// Unknown fields are rejected so misspelled filters cannot broaden a report.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationStatusParams.ts"))]
 pub struct IntegrationStatusParams {
@@ -171,6 +174,17 @@ mod tests {
     #[test]
     fn integration_status_params_default_to_all_agents() {
         assert_eq!(IntegrationStatusParams::default().agent, None);
+    }
+
+    #[test]
+    fn integration_status_params_reject_unknown_fields() {
+        let error = serde_json::from_value::<IntegrationStatusParams>(serde_json::json!({
+            "agent": "codex",
+            "unexpected": true,
+        }))
+        .expect_err("unknown integration status fields must fail");
+
+        assert!(error.to_string().contains("unknown field `unexpected`"));
     }
 
     #[test]

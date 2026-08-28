@@ -451,7 +451,7 @@ fn inspect_asset(
         }
         Err(_error) => {
             warnings.push(format!("managed {description} metadata could not be read"));
-            require_recovery(recovery, IntegrationRecovery::Reinstall);
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
             return AssetStatus {
                 path,
                 content: None,
@@ -802,7 +802,12 @@ fn inspect_hook_file(
             return noncurrent_hook_file(true, specs.len());
         }
     };
-    let hooks = match document.get("hooks") {
+    let Some(root) = document.as_object() else {
+        warnings.push(format!("{label} top level is not an object"));
+        require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+        return noncurrent_hook_file(true, specs.len());
+    };
+    let hooks = match root.get("hooks") {
         Some(Value::Object(hooks)) => hooks,
         None => {
             warnings.push(format!("{label} has no hooks object"));
@@ -948,7 +953,7 @@ fn inspect_codex_config(
         ReadState::Unreadable | ReadState::Oversized => return (true, false),
         ReadState::Content(content) => content,
     };
-    let document: toml::Value = match content.parse() {
+    let document: DocumentMut = match content.parse() {
         Ok(document) => document,
         Err(_error) => {
             warnings.push("Codex config.toml is malformed".to_owned());
@@ -956,7 +961,7 @@ fn inspect_codex_config(
             return (true, false);
         }
     };
-    if !codex_config_structure_valid(&document) {
+    if !codex_config_structure_valid(&document, hooks_path, specs) {
         warnings.push(
             "Codex config.toml has invalid features, hooks, or hooks.state structure".to_owned(),
         );
@@ -964,10 +969,11 @@ fn inspect_codex_config(
         return (true, false);
     }
     let hooks_enabled = document
+        .as_table()
         .get("features")
-        .and_then(toml::Value::as_table)
+        .and_then(Item::as_table)
         .and_then(|features| features.get("hooks"))
-        .and_then(toml::Value::as_bool)
+        .and_then(Item::as_bool)
         == Some(true);
     if !hooks_enabled {
         warnings.push("Codex hooks feature is not enabled".to_owned());
@@ -975,19 +981,16 @@ fn inspect_codex_config(
     }
 
     let trust_state = document
+        .as_table()
         .get("hooks")
-        .and_then(toml::Value::as_table)
+        .and_then(Item::as_table)
         .and_then(|hooks| hooks.get("state"))
-        .and_then(toml::Value::as_table);
+        .and_then(Item::as_table);
     let trust_prefix = format!("{}:", hooks_path.display());
     let mut footprint = trust_state.is_some_and(|state| {
-        state.keys().any(|key| {
-            key.starts_with(&trust_prefix)
-                && specs
-                    .iter()
-                    .filter_map(|spec| spec.trust_event)
-                    .any(|event| key[trust_prefix.len()..].starts_with(&format!("{event}:")))
-        })
+        state
+            .iter()
+            .any(|(key, _item)| is_managed_trust_key(key, &trust_prefix, specs))
     });
     let mut trust_current = true;
     for (spec, position) in specs.iter().zip(positions) {
@@ -1007,9 +1010,9 @@ fn inspect_codex_config(
             .ok();
             trust_state
                 .and_then(|state| state.get(&trust_key))
-                .and_then(toml::Value::as_table)
+                .and_then(Item::as_table)
                 .and_then(|entry| entry.get("trusted_hash"))
-                .and_then(toml::Value::as_str)
+                .and_then(Item::as_str)
                 .zip(expected.as_deref())
                 .is_some_and(|(actual, expected)| actual == expected)
         });
@@ -1025,15 +1028,44 @@ fn inspect_codex_config(
     (footprint, hooks_enabled && trust_current)
 }
 
-fn codex_config_structure_valid(document: &toml::Value) -> bool {
-    let features_valid = document.get("features").is_none_or(toml::Value::is_table);
-    let Some(hooks) = document.get("hooks") else {
-        return features_valid;
+fn codex_config_structure_valid(
+    document: &DocumentMut,
+    hooks_path: &Path,
+    specs: &[HookSpec],
+) -> bool {
+    let root = document.as_table();
+    if root.get("features").is_some_and(|item| !item.is_table()) {
+        return false;
+    }
+    let Some(hooks) = root.get("hooks") else {
+        return true;
     };
     let Some(hooks) = hooks.as_table() else {
         return false;
     };
-    features_valid && hooks.get("state").is_none_or(toml::Value::is_table)
+    let Some(state) = hooks.get("state") else {
+        return true;
+    };
+    let Some(state) = state.as_table() else {
+        return false;
+    };
+    let trust_prefix = format!("{}:", hooks_path.display());
+    state
+        .iter()
+        .all(|(key, item)| !is_managed_trust_key(key, &trust_prefix, specs) || item.is_table())
+}
+
+fn is_managed_trust_key(key: &str, trust_prefix: &str, specs: &[HookSpec]) -> bool {
+    key.strip_prefix(trust_prefix).is_some_and(|suffix| {
+        specs
+            .iter()
+            .filter_map(|spec| spec.trust_event)
+            .any(|event| {
+                suffix
+                    .strip_prefix(event)
+                    .is_some_and(|rest| rest.starts_with(':'))
+            })
+    })
 }
 
 fn read_status_file(
@@ -1544,13 +1576,11 @@ fn remove_owned_command_hooks(hooks: &mut Map<String, Value>, owned_commands: &[
     }
 }
 
-/// Whether a hook entry is one of this installer's exact command hooks.
+/// Whether a hook entry carries one of this installer's exact command identities.
 fn is_owned_command(hook: &Value, owned_commands: &[String]) -> bool {
-    hook.get("type").and_then(Value::as_str) == Some("command")
-        && hook
-            .get("command")
-            .and_then(Value::as_str)
-            .is_some_and(|command| owned_commands.iter().any(|owned| owned == command))
+    hook.get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| owned_commands.iter().any(|owned| owned == command))
 }
 
 /// Update Codex `config.toml` through a TOML parser, preserving unrelated data.
@@ -3051,6 +3081,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn managed_asset_metadata_error_requires_manual_repair() {
+        let claude = temp_dir("status-asset-metadata-error");
+        fs::write(claude.join("hooks"), "not a directory\n")
+            .expect("replace managed asset parent with a file");
+
+        let report = explicit_status(&claude, AgentKind::Claude);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("metadata could not be read")));
+    }
+
     #[cfg(unix)]
     #[test]
     fn status_rejects_unsafe_managed_hook_permissions_with_repair_hint() {
@@ -3184,20 +3233,113 @@ mod tests {
     }
 
     #[test]
-    fn missing_hooks_object_is_reinstallable() {
-        let codex = temp_dir("status-missing-hooks-object");
-        install_codex(&codex).expect("install Codex fixture");
-        fs::write(codex.join("hooks.json"), "{}\n").expect("remove hooks object");
+    fn non_object_registration_root_requires_manual_repair_for_each_provider() {
+        for agent in [AgentKind::Claude, AgentKind::Codex] {
+            let config_dir = temp_dir(&format!("status-non-object-root-{}", agent.as_wire()));
+            let registration_path = match &agent {
+                AgentKind::Claude => {
+                    install_claude(&config_dir).expect("install Claude fixture");
+                    config_dir.join("settings.json")
+                }
+                AgentKind::Codex => {
+                    install_codex(&config_dir).expect("install Codex fixture");
+                    config_dir.join("hooks.json")
+                }
+                _ => panic!("test uses only managed hook agents"),
+            };
+            fs::write(&registration_path, "[]\n").expect("write non-object registration root");
 
-        let report = explicit_status(&codex, AgentKind::Codex);
+            let report = explicit_status(&config_dir, agent.clone());
 
-        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
-        assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
-        install_codex(&codex).expect("reinstall missing hooks object");
-        assert_eq!(
-            explicit_status(&codex, AgentKind::Codex).state,
-            protocol::IntegrationInstallState::Current
-        );
+            assert_eq!(
+                report.recovery,
+                protocol::IntegrationRecovery::RepairConfiguration,
+                "{}",
+                agent.as_wire()
+            );
+            let error = match &agent {
+                AgentKind::Claude => install_claude(&config_dir),
+                AgentKind::Codex => install_codex(&config_dir),
+                _ => unreachable!("test uses only managed hook agents"),
+            }
+            .expect_err("non-object registration root must fail install");
+            assert_eq!(error.code, "integration_settings_invalid");
+        }
+    }
+
+    #[test]
+    fn missing_hooks_object_is_reinstallable_for_each_provider() {
+        for agent in [AgentKind::Claude, AgentKind::Codex] {
+            let config_dir = temp_dir(&format!("status-missing-hooks-{}", agent.as_wire()));
+            let registration_path = match &agent {
+                AgentKind::Claude => {
+                    install_claude(&config_dir).expect("install Claude fixture");
+                    config_dir.join("settings.json")
+                }
+                AgentKind::Codex => {
+                    install_codex(&config_dir).expect("install Codex fixture");
+                    config_dir.join("hooks.json")
+                }
+                _ => panic!("test uses only managed hook agents"),
+            };
+            fs::write(registration_path, "{}\n").expect("remove hooks object");
+
+            let report = explicit_status(&config_dir, agent.clone());
+
+            assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+            assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
+            match &agent {
+                AgentKind::Claude => install_claude(&config_dir),
+                AgentKind::Codex => install_codex(&config_dir),
+                _ => unreachable!("test uses only managed hook agents"),
+            }
+            .expect("reinstall missing hooks object");
+            assert_eq!(
+                explicit_status(&config_dir, agent).state,
+                protocol::IntegrationInstallState::Current
+            );
+        }
+    }
+
+    #[test]
+    fn reinstall_replaces_owned_command_with_missing_type_for_each_provider() {
+        for agent in [AgentKind::Claude, AgentKind::Codex] {
+            let config_dir = temp_dir(&format!("status-owned-command-{}", agent.as_wire()));
+            let registration_path = match &agent {
+                AgentKind::Claude => {
+                    install_claude(&config_dir).expect("install Claude fixture");
+                    config_dir.join("settings.json")
+                }
+                AgentKind::Codex => {
+                    install_codex(&config_dir).expect("install Codex fixture");
+                    config_dir.join("hooks.json")
+                }
+                _ => panic!("test uses only managed hook agents"),
+            };
+            let mut registration = read_json(&registration_path);
+            registration["hooks"][SESSION_START_EVENT][0]["hooks"][0]
+                .as_object_mut()
+                .expect("managed handler object")
+                .remove("type");
+            fs::write(
+                &registration_path,
+                serde_json::to_vec_pretty(&registration).expect("serialize drifted registration"),
+            )
+            .expect("write drifted registration");
+
+            let report = explicit_status(&config_dir, agent.clone());
+
+            assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
+            match &agent {
+                AgentKind::Claude => install_claude(&config_dir),
+                AgentKind::Codex => install_codex(&config_dir),
+                _ => unreachable!("test uses only managed hook agents"),
+            }
+            .expect("reinstall exact owned command identity");
+            let repaired = explicit_status(&config_dir, agent);
+            assert_eq!(repaired.state, protocol::IntegrationInstallState::Current);
+            assert!(repaired.warnings.is_empty(), "{:?}", repaired.warnings);
+        }
     }
 
     #[test]
@@ -3217,6 +3359,43 @@ mod tests {
             protocol::IntegrationRecovery::RepairConfiguration
         );
         let error = install_codex(&codex).expect_err("invalid config structure must fail install");
+        assert_eq!(error.code, "integration_settings_invalid");
+        assert_eq!(
+            fs::read_to_string(&hook_path).expect("read managed asset sentinel"),
+            sentinel,
+            "config validation must precede managed asset replacement"
+        );
+    }
+
+    #[test]
+    fn scalar_managed_trust_key_requires_manual_repair_before_install() {
+        let codex = temp_dir("status-scalar-trust-key");
+        install_codex(&codex).expect("install Codex fixture");
+        let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
+        let sentinel = "# managed asset sentinel\n";
+        fs::write(&hook_path, sentinel).expect("write managed asset sentinel");
+        let trust_key = codex_hook_trust_key(
+            &codex.join("hooks.json"),
+            CODEX_SESSION_START_TRUST_EVENT,
+            0,
+            0,
+        );
+        fs::write(
+            codex.join("config.toml"),
+            format!(
+                "[features]\nhooks = true\n\n[hooks.state]\n{} = \"invalid\"\n",
+                toml_basic_string(&trust_key)
+            ),
+        )
+        .expect("write scalar managed trust key");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        let error = install_codex(&codex).expect_err("scalar trust key must fail install");
         assert_eq!(error.code, "integration_settings_invalid");
         assert_eq!(
             fs::read_to_string(&hook_path).expect("read managed asset sentinel"),
@@ -3649,8 +3828,13 @@ mod tests {
         )
         .unwrap();
 
+        let report = explicit_status(&codex_dir, AgentKind::Codex);
         let err = install_codex(&codex_dir).expect_err("inline features table is refused");
 
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
         assert_eq!(err.code, "integration_settings_invalid");
         assert!(
             err.msg.contains("features") && err.msg.contains("not a TOML table"),

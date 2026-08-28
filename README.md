@@ -321,7 +321,9 @@ to remove only managed assets; add `--confirm-modified` when the ownership
 check reports changed assets. `status`, `doctor`, `update`, and `uninstall` are
 local for Hermes. Codex and Claude expose daemon-backed `integration status`
 on the effective `--host`; `doctor`, `update`, and `uninstall` remain
-Hermes-only and return a typed unsupported-action error for those agents.
+Hermes-only and return a typed unsupported-action error for those agents. A
+remote status recovery hint names the daemon host where the local-only installer
+must run; `--host` never turns `integration install` into a remote mutation.
 
 The plugin is a delegated-tool guardrail, not a sandbox against a same-user
 Hermes process with shell or file-write access. It repeats the daemon's exact

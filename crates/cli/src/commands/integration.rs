@@ -260,7 +260,7 @@ pub(crate) async fn run_status(
     if json {
         print!("{}", crate::commands::render_json(&result)?);
     } else {
-        print!("{}", render_status_human(&result));
+        print!("{}", render_status_human(host, &result));
     }
     Ok(())
 }
@@ -574,7 +574,7 @@ fn render_install_human(result: &IntegrationInstallResult) -> String {
     output
 }
 
-fn render_status_human(result: &IntegrationStatusResult) -> String {
+fn render_status_human(host: &str, result: &IntegrationStatusResult) -> String {
     if result.agents.is_empty() {
         return "no agents selected\n".to_owned();
     }
@@ -599,26 +599,52 @@ fn render_status_human(result: &IntegrationStatusResult) -> String {
             let _ = writeln!(output, "  registration: {path}");
         }
         for warning in &report.warnings {
+            let warning = qualify_status_warning(host, warning);
             let _ = writeln!(output, "  warning: {warning}");
         }
         match report.recovery {
             protocol::IntegrationRecovery::None => {}
             protocol::IntegrationRecovery::Reinstall => {
                 let agent = agent_label(&report.agent);
-                let _ = writeln!(
-                    output,
-                    "  hint: run `pohunek integration install --agent {agent}` to repair"
-                );
+                if host.is_empty() || host == LOCAL_HOST {
+                    let _ = writeln!(
+                        output,
+                        "  hint: run `pohunek integration install --agent {agent}` to repair"
+                    );
+                } else {
+                    let _ = writeln!(
+                        output,
+                        "  hint: on daemon host `{host}`, run `pohunek integration install --agent {agent}` directly to repair"
+                    );
+                }
             }
             protocol::IntegrationRecovery::RepairConfiguration => {
-                let _ = writeln!(
-                    output,
-                    "  hint: inspect and repair the reported provider configuration before reinstalling"
-                );
+                if host.is_empty() || host == LOCAL_HOST {
+                    let _ = writeln!(
+                        output,
+                        "  hint: inspect and repair the reported provider configuration before reinstalling"
+                    );
+                } else {
+                    let _ = writeln!(
+                        output,
+                        "  hint: inspect and repair the reported provider configuration directly on daemon host `{host}` before reinstalling there"
+                    );
+                }
             }
         }
     }
     output
+}
+
+fn qualify_status_warning(host: &str, warning: &str) -> String {
+    if host.is_empty() || host == LOCAL_HOST {
+        return warning.to_owned();
+    }
+    warning.replacen(
+        "run `pohunek integration install",
+        &format!("on daemon host `{host}`, run `pohunek integration install"),
+        1,
+    )
 }
 
 fn state_label(state: IntegrationInstallState) -> &'static str {
@@ -737,6 +763,7 @@ fn render_hermes_human(result: &HermesResult) -> String {
 #[cfg(test)]
 mod status_tests {
     use super::{installed_version_label, render_status_human};
+    use crate::target::LOCAL_HOST;
     use protocol::{
         AgentKind, IntegrationAgentStatus, IntegrationInstallState, IntegrationRecovery,
         IntegrationStatusResult,
@@ -785,7 +812,7 @@ mod status_tests {
             ],
         };
 
-        let output = render_status_human(&result);
+        let output = render_status_human(LOCAL_HOST, &result);
 
         let rows: Vec<&str> = output
             .lines()
@@ -823,12 +850,42 @@ mod status_tests {
             }],
         };
 
-        let output = render_status_human(&result);
+        let output = render_status_human(LOCAL_HOST, &result);
 
         assert!(output.contains(
             "  hint: inspect and repair the reported provider configuration before reinstalling"
         ));
         assert!(!output.contains("pohunek integration install"));
+    }
+
+    #[test]
+    fn remote_status_qualifies_install_commands_with_the_daemon_host() {
+        let result = IntegrationStatusResult {
+            agents: vec![IntegrationAgentStatus {
+                agent: AgentKind::Codex,
+                available: true,
+                expected_asset_paths: Vec::new(),
+                present_asset_paths: Vec::new(),
+                registration_paths: Vec::new(),
+                installed_version: Some(3),
+                expected_version: 4,
+                state: IntegrationInstallState::Outdated,
+                recovery: IntegrationRecovery::Reinstall,
+                warnings: vec![
+                    "managed state hook permissions drifted; run `pohunek integration install --agent codex` to restore them".to_owned(),
+                ],
+            }],
+        };
+
+        let output = render_status_human("buildbox", &result);
+
+        assert!(output.contains(
+            "warning: managed state hook permissions drifted; on daemon host `buildbox`, run `pohunek integration install --agent codex` to restore them"
+        ));
+        assert!(output.contains(
+            "hint: on daemon host `buildbox`, run `pohunek integration install --agent codex` directly to repair"
+        ));
+        assert!(!output.contains("pohunek --host buildbox integration install"));
     }
 
     #[test]

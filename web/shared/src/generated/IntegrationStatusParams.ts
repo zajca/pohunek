@@ -4,6 +4,8 @@ import type { AgentKind } from "./AgentKind";
 
 /**
  * Request parameters for `integration.status`.
+ *
+ * Unknown fields are rejected so misspelled filters cannot broaden a report.
  */
 export type IntegrationStatusParams = {
   /**

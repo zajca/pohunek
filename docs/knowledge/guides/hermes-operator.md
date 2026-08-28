@@ -93,7 +93,9 @@ with Codex or Claude returns a typed unsupported-action error; their separate
 daemon-backed status reports the complete managed install contract, while
 install remains available. Bare status selects both daemon-managed agents;
 Codex and Claude status honors the effective global `--host`, while explicit
-Hermes status keeps its local target and executable flags:
+Hermes status keeps its local target and executable flags. For remote
+Codex/Claude reports, run any suggested `integration install` directly on the
+named daemon host; adding `--host` does not make installation remote:
 
 ```sh
 pohunek integration status --json
