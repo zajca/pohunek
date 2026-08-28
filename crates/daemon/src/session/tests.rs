@@ -3674,6 +3674,104 @@ async fn session_input_wait_deadline_includes_submit_delay() {
 }
 
 #[tokio::test]
+async fn session_input_wait_deadline_bounds_body_write_ack() {
+    let agents_dir = temp_agents_dir_with(
+        "input-wait-body-ack-deadline",
+        "input-wait-body-ack-claude",
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'read line; echo got:$line; sleep 30']\n",
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        claude_submit_delay: Duration::ZERO,
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let mut create = params();
+    create.agent = "input-wait-body-ack-claude".to_owned();
+    let created = registry
+        .create(create)
+        .await
+        .expect("create Claude session");
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+
+    let error = tokio::time::timeout(
+        Duration::from_millis(150),
+        registry.write_waited_input_with_ack_delays(
+            &created.id,
+            "body-ack-timeout",
+            deadline,
+            Duration::from_millis(250),
+            Duration::ZERO,
+        ),
+    )
+    .await
+    .expect("body write must respect the overall deadline")
+    .expect_err("delayed body ACK must time out");
+
+    assert_eq!(error.code, "session_input_timeout");
+    tokio::time::sleep(Duration::from_millis(275)).await;
+    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    assert!(
+        !output.contains("got:body-ack-timeout"),
+        "output={output:?}"
+    );
+    registry
+        .inspect(&created.id)
+        .await
+        .expect("late body ACK is consumed without desynchronizing control");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_deadline_bounds_submit_write_ack() {
+    let agents_dir = temp_agents_dir_with(
+        "input-wait-submit-ack-deadline",
+        "input-wait-submit-ack-deadline-claude",
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'read line; echo got:$line; sleep 30']\n",
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        claude_submit_delay: Duration::ZERO,
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let mut create = params();
+    create.agent = "input-wait-submit-ack-deadline-claude".to_owned();
+    let created = registry
+        .create(create)
+        .await
+        .expect("create Claude session");
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+
+    let error = tokio::time::timeout(
+        Duration::from_millis(150),
+        registry.write_waited_input_with_ack_delays(
+            &created.id,
+            "submit-ack-timeout",
+            deadline,
+            Duration::ZERO,
+            Duration::from_millis(250),
+        ),
+    )
+    .await
+    .expect("submit write must respect the overall deadline")
+    .expect_err("delayed submit ACK must time out");
+
+    assert_eq!(error.code, "session_input_timeout");
+    tokio::time::sleep(Duration::from_millis(275)).await;
+    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    assert!(
+        output.contains("got:submit-ack-timeout"),
+        "output={output:?}"
+    );
+    registry
+        .inspect(&created.id)
+        .await
+        .expect("late submit ACK is consumed without desynchronizing control");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
 async fn session_input_wait_accepts_activity_between_submit_flush_and_ack() {
     let agents_dir = temp_agents_dir_with(
         "input-wait-submit-ack",
@@ -3710,10 +3808,11 @@ async fn session_input_wait_accepts_activity_between_submit_flush_and_ack() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
 
     let submission = registry
-        .write_waited_input_with_ack_delay(
+        .write_waited_input_with_ack_delays(
             &created.id,
             "submit-boundary",
             deadline,
+            Duration::ZERO,
             Duration::from_millis(500),
         )
         .await

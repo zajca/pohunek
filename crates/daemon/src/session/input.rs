@@ -9,7 +9,7 @@ use super::{
     worker_error_to_protocol, ActivityEvidence, AgentActivity, AgentKind, Duration, ErrorClass,
     InputRules, LaunchCommand, LaunchCommandPlan, ProtocolError, ResolvedAgent, RuntimeHandle,
     SessionEntry, SessionId, SessionInputParams, SessionInputResult, SessionInputWait,
-    SessionRegistry, SessionRegistryConfig, SessionState,
+    SessionRegistry, SessionRegistryConfig, SessionState, Worker,
 };
 
 pub(super) const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
@@ -143,15 +143,22 @@ impl SessionRegistry {
         text: &str,
         deadline: tokio::time::Instant,
     ) -> Result<InputSubmission, ProtocolError> {
-        self.write_waited_input_with_ack_delay(session_id, text, deadline, Duration::ZERO)
-            .await
+        self.write_waited_input_with_ack_delays(
+            session_id,
+            text,
+            deadline,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await
     }
 
-    pub(super) async fn write_waited_input_with_ack_delay(
+    pub(super) async fn write_waited_input_with_ack_delays(
         &self,
         session_id: &SessionId,
         text: &str,
         deadline: tokio::time::Instant,
+        body_ack_delay: Duration,
         submit_ack_delay: Duration,
     ) -> Result<InputSubmission, ProtocolError> {
         self.ensure_not_external(session_id).await?;
@@ -172,13 +179,15 @@ impl SessionRegistry {
         };
         let writes = build_input_writes(text, rules)?;
         if !writes.body.is_empty() {
-            worker
-                .write(vec![WorkerInputFragment {
+            self.write_worker_before_deadline(
+                worker.clone(),
+                vec![WorkerInputFragment {
                     bytes: SecretBytes::new(writes.body),
-                    delay_after_ms: 0,
-                }])
-                .await
-                .map_err(worker_error_to_protocol)?;
+                    delay_after_ms: duration_millis(body_ack_delay),
+                }],
+                deadline,
+            )
+            .await?;
         }
         self.wait_before_submit(writes.submit_delay, deadline)
             .await?;
@@ -188,13 +197,15 @@ impl SessionRegistry {
         if tokio::time::Instant::now() >= deadline {
             return Err(ProtocolError::session_input_timeout());
         }
-        worker
-            .write(vec![WorkerInputFragment {
+        self.write_worker_before_deadline(
+            worker,
+            vec![WorkerInputFragment {
                 bytes: SecretBytes::new(SUBMIT.to_vec()),
                 delay_after_ms: duration_millis(submit_ack_delay),
-            }])
-            .await
-            .map_err(worker_error_to_protocol)?;
+            }],
+            deadline,
+        )
+        .await?;
         self.input_activity_snapshot(session_id, Some(&runtime))
             .await?;
 
@@ -204,6 +215,33 @@ impl SessionRegistry {
             after_revision: boundary.revision,
             deadline,
         })
+    }
+
+    async fn write_worker_before_deadline(
+        &self,
+        worker: Worker,
+        fragments: Vec<WorkerInputFragment>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ProtocolError> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ProtocolError::session_input_timeout());
+        }
+        let mut write = tokio::spawn(async move { worker.write(fragments).await });
+        tokio::select! {
+            biased;
+            () = self.inner.event_log_shutdown.cancelled() => Err(input_wait_shutdown_error(
+                "daemon shutdown cancelled input during worker delivery",
+            )),
+            () = tokio::time::sleep_until(deadline) => {
+                Err(ProtocolError::session_input_timeout())
+            }
+            result = &mut write => {
+                result
+                    .map_err(|error| worker_input_task_error(&error))?
+                    .map(|_| ())
+                    .map_err(worker_error_to_protocol)
+            }
+        }
     }
 
     async fn wait_before_submit(
@@ -417,6 +455,15 @@ fn input_wait_result(evidence: ActivityEvidence) -> SessionInputResult {
 
 fn input_wait_shutdown_error(message: &str) -> ProtocolError {
     ProtocolError::new(ErrorClass::Daemon, "daemon_shutting_down", message, None)
+}
+
+fn worker_input_task_error(_error: &tokio::task::JoinError) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Runtime,
+        "worker_operation_failed",
+        "worker input task failed",
+        None,
+    )
 }
 
 pub(super) fn plan_initial_input_delivery(

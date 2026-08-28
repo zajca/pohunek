@@ -368,11 +368,14 @@ state manifest, and resume command.
 
 An optional bounded input wait uses one overall deadline measured before
 delivery, so profile submit delay consumes the same budget advertised to Rust
-and TypeScript transports. For waited input, the daemon writes the body first,
-owns the submit delay, captures a runtime-scoped activity revision immediately
-before the separate submit write, and accepts revisions above that lower bound
-even when they arrive before the worker acknowledges the submit. A fixed upper
-deadline rejects evidence observed later, including the timeout recheck.
+and TypeScript transports. For waited input, the daemon deadline-bounds the body
+write acknowledgement, owns the submit delay, captures a runtime-scoped activity
+revision immediately before the separate deadline-bounded submit write, and
+accepts revisions above that lower bound even when they arrive before the worker
+acknowledges the submit. Timed-out worker exchanges remain cancellation-shielded
+until their late acknowledgement is consumed, preventing the shared control
+stream from becoming desynchronized. A fixed upper deadline rejects evidence
+observed later, including the timeout recheck.
 Each event carries its runtime identity, daemon `activity_epoch`, and exact
 decimal-string activity revision. The registry retains the latest evidence for
 each activity so broadcast lag cannot erase a rapid target transition. The
