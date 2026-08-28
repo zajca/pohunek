@@ -1584,6 +1584,7 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
     use std::thread;
     use std::time::Duration;
@@ -1629,13 +1630,17 @@ mod tests {
     /// Claude lifecycle event used for active-agent release.
     const CLAUDE_SESSION_END_EVENT: &str = "SessionEnd";
 
+    /// Per-process sequence that keeps parallel temp paths collision-free.
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
     fn temp_dir(tag: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time after epoch")
             .as_nanos();
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "pohunek-integration-{tag}-{}-{nanos}",
+            "pohunek-integration-{tag}-{}-{nanos}-{sequence}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).expect("create temp dir");
