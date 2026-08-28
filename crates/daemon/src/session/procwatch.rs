@@ -471,12 +471,7 @@ impl SessionRegistry {
         }
 
         if let Some(observed) = choose_foreground_observed(entry, foreground_group) {
-            let active_matches = entry.active_agent.as_ref().is_some_and(|active| {
-                active.pid == Some(observed.pid)
-                    && active.start_identity == Some(observed.start_identity)
-                    && entry.info.active_agent_base.as_ref() == Some(&observed.agent_base)
-            });
-            if active_matches {
+            if bind_matching_observed_identity(entry, &observed) {
                 return ForegroundDecision::Preserve;
             }
             let agent = agent_kind_label(&observed.agent_base).to_owned();
@@ -562,6 +557,12 @@ fn apply_observed_refresh(
             if identity_changed || base_changed {
                 existing.first_seen = observation.first_seen;
             }
+            if identity_changed {
+                let identity = (observation.pid, observation.start_identity);
+                if let Some(watch) = exit_watches.remove(&identity) {
+                    to_spawn.push((identity, watch, entry.procwatch_cancel.clone()));
+                }
+            }
             continue;
         }
 
@@ -610,6 +611,39 @@ fn choose_foreground_observed(
                 .min_by_key(|observed| (observed.first_seen, observed.pid))
                 .cloned()
         })
+}
+
+fn bind_matching_observed_identity(entry: &mut SessionEntry, observed: &ObservedAgent) -> bool {
+    let Some(active) = entry.active_agent.as_ref() else {
+        return false;
+    };
+    if active.pid != Some(observed.pid)
+        || entry.info.active_agent_base.as_ref() != Some(&observed.agent_base)
+    {
+        return false;
+    }
+    if let Some(start_identity) = active.start_identity {
+        return start_identity == observed.start_identity;
+    }
+
+    let claim = (
+        active.source.clone(),
+        active.agent.clone(),
+        active.seq,
+        active.pid,
+    );
+    entry
+        .active_agent
+        .as_mut()
+        .expect("active report was checked above")
+        .start_identity = Some(observed.start_identity);
+    if let Some(last) = entry.last_agent_report.as_mut() {
+        let last_claim = (last.source.clone(), last.agent.clone(), last.seq, last.pid);
+        if last.start_identity.is_none() && last_claim == claim {
+            last.start_identity = Some(observed.start_identity);
+        }
+    }
+    true
 }
 
 fn apply_observed_transition(

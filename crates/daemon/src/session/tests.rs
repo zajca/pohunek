@@ -887,7 +887,7 @@ struct MockInspectorState {
     foreground_error: Option<std::io::ErrorKind>,
     foreground_block: Option<Arc<ForegroundBlock>>,
     cwd: HashMap<Pid, PathBuf>,
-    exits: HashMap<Pid, tokio::sync::watch::Sender<bool>>,
+    exits: HashMap<Pid, Vec<tokio::sync::watch::Sender<bool>>>,
     ownership_markers: HashMap<Pid, OwnershipMarkers>,
 }
 
@@ -905,10 +905,6 @@ impl MockInspector {
                 .cwd
                 .entry(fact.pid)
                 .or_insert_with(|| PathBuf::from("/tmp"));
-            inner
-                .exits
-                .entry(fact.pid)
-                .or_insert_with(|| tokio::sync::watch::channel(false).0);
         }
         inner.descendants.insert(root, facts);
     }
@@ -944,15 +940,32 @@ impl MockInspector {
     }
 
     fn fire_exit(&self, pid: Pid) {
-        let sender = {
-            let mut inner = self.inner.lock().expect("mock inspector lock");
-            inner
-                .exits
-                .entry(pid)
-                .or_insert_with(|| tokio::sync::watch::channel(false).0)
-                .clone()
-        };
+        let mut inner = self.inner.lock().expect("mock inspector lock");
+        for sender in inner.exits.entry(pid).or_default() {
+            sender.send_replace(true);
+        }
+    }
+
+    fn fire_exit_watch(&self, pid: Pid, generation: usize) {
+        let sender = self
+            .inner
+            .lock()
+            .expect("mock inspector lock")
+            .exits
+            .get(&pid)
+            .and_then(|watches| watches.get(generation))
+            .cloned()
+            .expect("exit watch generation");
         sender.send_replace(true);
+    }
+
+    fn exit_watch_count(&self, pid: Pid) -> usize {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .exits
+            .get(&pid)
+            .map_or(0, Vec::len)
     }
 
     fn set_cwd(&self, pid: Pid, cwd: PathBuf) {
@@ -1031,14 +1044,14 @@ impl ProcessInspector for MockInspector {
     }
 
     fn exit_watch(&self, pid: Pid) -> std::io::Result<ExitWatch> {
-        let receiver = {
-            let mut inner = self.inner.lock().expect("mock inspector lock");
-            inner
-                .exits
-                .entry(pid)
-                .or_insert_with(|| tokio::sync::watch::channel(false).0)
-                .subscribe()
-        };
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .exits
+            .entry(pid)
+            .or_default()
+            .push(sender);
         Ok(ExitWatch::from_test_signal(receiver))
     }
 
@@ -1278,6 +1291,74 @@ async fn foreground_replacement_replaces_hook_identity_and_detector() {
         replacement_detector.borrow().detection,
         DetectorConfig::for_agent(&AgentKind::Claude).detection
     );
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn first_foreground_scan_binds_hook_identity_without_replacing_metadata() {
+    let (registry, inspector, created) = mock_procwatch_registry("foreground-hook-bind").await;
+    let observed = codex_fact(510, created.pid);
+    inspector.set_descendants(created.pid, vec![observed.clone()]);
+    inspector.set_cwd(observed.pid, temp_dir("foreground-hook-bind"));
+    inspector.set_foreground_group(created.pid, Some(observed.pid));
+
+    let report = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: CODEX_HOOK_SOURCE.to_owned(),
+            agent: CODEX_HOOK_AGENT.to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
+            pid: Some(observed.pid),
+            agent_session_id: Some("hook-native-id".to_owned()),
+            agent_session_path: Some("/tmp/hook-native.jsonl".to_owned()),
+        })
+        .await;
+    assert!(report.recorded);
+    assert_eq!(
+        registry.inner.sessions.lock().await[&created.id]
+            .active_agent
+            .as_ref()
+            .and_then(|active| active.start_identity),
+        None
+    );
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+
+    let inspected = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(inspected.active_agent.as_deref(), Some(CODEX_HOOK_AGENT));
+    assert_eq!(inspected.active_agent_pid, Some(observed.pid));
+    assert_eq!(
+        inspected.active_agent_session_id.as_deref(),
+        Some("hook-native-id")
+    );
+    assert_eq!(
+        inspected.active_agent_session_path.as_deref(),
+        Some("/tmp/hook-native.jsonl")
+    );
+    assert_eq!(inspected.activity, Some(AgentActivity::Working));
+    assert_eq!(inspected.state_source, StateSource::Report);
+    {
+        let sessions = registry.inner.sessions.lock().await;
+        let entry = &sessions[&created.id];
+        assert_eq!(
+            entry
+                .active_agent
+                .as_ref()
+                .and_then(|active| active.start_identity),
+            Some(observed.start_identity)
+        );
+        assert_eq!(
+            entry
+                .last_agent_report
+                .as_ref()
+                .and_then(|active| active.start_identity),
+            Some(observed.start_identity)
+        );
+    };
 
     let _ = registry.stop(&created.id).await;
 }
@@ -4847,6 +4928,7 @@ async fn procwatch_refreshes_agent_base_when_pid_is_reused() {
     registry
         .rescan_procwatch_at(&created.id, created.pid, second_scan)
         .await;
+    assert_eq!(inspector.exit_watch_count(PID_REUSE_AGENT_PID), 2);
 
     {
         let sessions = registry.inner.sessions.lock().await;
@@ -4872,6 +4954,11 @@ async fn procwatch_refreshes_agent_base_when_pid_is_reused() {
     let after_old_exit = registry.inspect(&created.id).await.expect("inspect");
     assert_eq!(after_old_exit.active_agent.as_deref(), Some("claude"));
     assert_eq!(after_old_exit.active_agent_pid, Some(PID_REUSE_AGENT_PID));
+
+    inspector.set_descendants(created.pid, Vec::new());
+    inspector.fire_exit_watch(PID_REUSE_AGENT_PID, 1);
+    let after_new_exit = wait_for_active_agent_pid(&registry, &created.id, None).await;
+    assert_eq!(after_new_exit.active_agent, None);
 
     let _ = registry.stop(&created.id).await;
 }
