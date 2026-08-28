@@ -2,6 +2,7 @@
 
 import type { AgentKind } from "./AgentKind";
 import type { IntegrationInstallState } from "./IntegrationInstallState";
+import type { IntegrationRecovery } from "./IntegrationRecovery";
 
 /**
  * Read-only installation state for one managed hook integration.
@@ -39,6 +40,10 @@ export type IntegrationAgentStatus = {
    * Aggregate install health derived from the files above.
    */
   state: IntegrationInstallState;
+  /**
+   * Safe next action derived from the complete set of findings.
+   */
+  recovery: IntegrationRecovery;
   /**
    * Non-fatal, non-secret reasons the complete install contract is unhealthy.
    */

@@ -115,9 +115,25 @@ pub struct IntegrationAgentStatus {
     pub expected_version: u32,
     /// Aggregate install health derived from the files above.
     pub state: IntegrationInstallState,
+    /// Safe next action derived from the complete set of findings.
+    pub recovery: IntegrationRecovery,
     /// Non-fatal, non-secret reasons the complete install contract is unhealthy.
     #[serde(default)]
     pub warnings: Vec<String>,
+}
+
+/// Safe recovery action for one managed hook integration report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationRecovery.ts"))]
+pub enum IntegrationRecovery {
+    /// The complete managed integration contract is current.
+    None,
+    /// Re-running the installer can repair every reported finding.
+    Reinstall,
+    /// Provider configuration must be repaired before reinstalling safely.
+    RepairConfiguration,
 }
 
 /// Derived installation health for one managed hook integration.
@@ -150,7 +166,7 @@ pub struct IntegrationInstallReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{IntegrationInstallState, IntegrationStatusParams};
+    use super::{IntegrationInstallState, IntegrationRecovery, IntegrationStatusParams};
 
     #[test]
     fn integration_status_params_default_to_all_agents() {
@@ -166,6 +182,23 @@ mod tests {
         ] {
             assert_eq!(
                 serde_json::to_string(&state).expect("serialize integration state"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn integration_recovery_uses_exact_snake_case_wire_values() {
+        for (recovery, expected) in [
+            (IntegrationRecovery::None, "\"none\""),
+            (IntegrationRecovery::Reinstall, "\"reinstall\""),
+            (
+                IntegrationRecovery::RepairConfiguration,
+                "\"repair_configuration\"",
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&recovery).expect("serialize integration recovery"),
                 expected
             );
         }

@@ -13,13 +13,13 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
 use protocol::{
     AgentKind, ErrorClass, IntegrationAgentStatus, IntegrationInstallReport,
-    IntegrationInstallResult, IntegrationInstallState, IntegrationStatusParams,
-    IntegrationStatusResult, ProtocolError, EXPECTED_INTEGRATION_VERSION,
+    IntegrationInstallResult, IntegrationInstallState, IntegrationRecovery,
+    IntegrationStatusParams, IntegrationStatusResult, ProtocolError, EXPECTED_INTEGRATION_VERSION,
 };
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -49,6 +49,15 @@ const CLAUDE_NOTIFY_HOOK_ASSET: &str = include_str!("assets/claude/pohunek-agent
 const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/pohunek-agent-state.sh");
 /// The Codex notification hook script, embedded at compile time.
 const CODEX_NOTIFY_HOOK_ASSET: &str = include_str!("assets/codex/pohunek-agent-notify.sh");
+/// Managed hook assets are currently below 8 KiB; 64 KiB leaves ample growth
+/// while bounding status memory and I/O for installer-owned executable files.
+const MANAGED_ASSET_INSPECTION_LIMIT_BYTES: usize = 64 * 1024;
+/// Provider configuration can legitimately contain unrelated user settings, so
+/// status allows 2 MiB before requiring manual inspection rather than parsing
+/// an attacker-controlled or accidentally expanded file in full.
+const PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+/// One byte beyond a limit distinguishes an exact-boundary file from overflow.
+const INSPECTION_LIMIT_PROBE_BYTES: usize = 1;
 /// Per-hook timeout (seconds) recorded in the agent's hook config.
 const HOOK_TIMEOUT_SECS: u64 = 10;
 /// Action argument passed to the hook script for the `SessionStart` event.
@@ -202,6 +211,7 @@ fn reported_agent_status(agent: StatusAgent) -> IntegrationAgentStatus {
             installed_version: None,
             expected_version: EXPECTED_INTEGRATION_VERSION,
             state: IntegrationInstallState::Outdated,
+            recovery: IntegrationRecovery::RepairConfiguration,
             warnings: vec![format!(
                 "agent config directory could not be resolved ({})",
                 error.code
@@ -267,20 +277,7 @@ fn status_at(
         .map(|path| path_text(path))
         .collect();
 
-    let available = match fs::metadata(config_dir) {
-        Ok(metadata) if metadata.is_dir() => true,
-        Ok(_metadata) => false,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-        Err(_error) => false,
-    };
-    if !available {
-        let warning = match fs::metadata(config_dir) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                "agent config directory could not be inspected"
-            }
-            Ok(_metadata) => "agent config path is not a directory",
-            _ => "agent config directory does not exist",
-        };
+    if let Some((state, warning)) = config_dir_issue(config_dir) {
         return IntegrationAgentStatus {
             agent: agent.kind(),
             available: false,
@@ -289,16 +286,14 @@ fn status_at(
             registration_paths: registration_path_strings,
             installed_version: None,
             expected_version: EXPECTED_INTEGRATION_VERSION,
-            state: if warning == "agent config directory does not exist" {
-                IntegrationInstallState::NotInstalled
-            } else {
-                IntegrationInstallState::Outdated
-            },
+            state,
+            recovery: IntegrationRecovery::RepairConfiguration,
             warnings: vec![warning.to_owned()],
         };
     }
 
     let mut warnings = Vec::new();
+    let mut recovery = IntegrationRecovery::None;
     let assets = [
         inspect_asset(
             agent,
@@ -306,6 +301,7 @@ fn status_at(
             state_path,
             state_asset,
             &mut warnings,
+            &mut recovery,
         ),
         inspect_asset(
             agent,
@@ -313,15 +309,24 @@ fn status_at(
             notify_path,
             notify_asset,
             &mut warnings,
+            &mut recovery,
         ),
     ];
     let (registration_footprint, registrations_current) = match agent {
-        StatusAgent::Claude => {
-            inspect_claude_registration(config_dir, &assets[0].path, &assets[1].path, &mut warnings)
-        }
-        StatusAgent::Codex => {
-            inspect_codex_registration(config_dir, &assets[0].path, &assets[1].path, &mut warnings)
-        }
+        StatusAgent::Claude => inspect_claude_registration(
+            config_dir,
+            &assets[0].path,
+            &assets[1].path,
+            &mut warnings,
+            &mut recovery,
+        ),
+        StatusAgent::Codex => inspect_codex_registration(
+            config_dir,
+            &assets[0].path,
+            &assets[1].path,
+            &mut warnings,
+            &mut recovery,
+        ),
     };
     let present_asset_paths = assets
         .iter()
@@ -340,14 +345,40 @@ fn status_at(
 
     IntegrationAgentStatus {
         agent: agent.kind(),
-        available,
+        available: true,
         expected_asset_paths,
         present_asset_paths,
         registration_paths: registration_path_strings,
         installed_version,
         expected_version: EXPECTED_INTEGRATION_VERSION,
         state,
+        recovery,
         warnings,
+    }
+}
+
+fn config_dir_issue(config_dir: &Path) -> Option<(IntegrationInstallState, &'static str)> {
+    match fs::metadata(config_dir) {
+        Ok(metadata) if metadata.is_dir() => None,
+        Ok(_metadata) => Some((
+            IntegrationInstallState::Outdated,
+            "agent config path is not a directory",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Some((
+            IntegrationInstallState::NotInstalled,
+            "agent config directory does not exist",
+        )),
+        Err(_error) => Some((
+            IntegrationInstallState::Outdated,
+            "agent config directory could not be inspected",
+        )),
+    }
+}
+
+fn require_recovery(current: &mut IntegrationRecovery, required: IntegrationRecovery) {
+    if required == IntegrationRecovery::RepairConfiguration || *current == IntegrationRecovery::None
+    {
+        *current = required;
     }
 }
 
@@ -399,12 +430,14 @@ fn inspect_asset(
     path: PathBuf,
     expected: &'static str,
     warnings: &mut Vec<String>,
+    recovery: &mut IntegrationRecovery,
 ) -> AssetStatus {
     let description = kind.description();
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             warnings.push(format!("managed {description} is missing"));
+            require_recovery(recovery, IntegrationRecovery::Reinstall);
             return AssetStatus {
                 path,
                 content: None,
@@ -415,6 +448,7 @@ fn inspect_asset(
         }
         Err(_error) => {
             warnings.push(format!("managed {description} metadata could not be read"));
+            require_recovery(recovery, IntegrationRecovery::Reinstall);
             return AssetStatus {
                 path,
                 content: None,
@@ -426,6 +460,7 @@ fn inspect_asset(
     };
     if !metadata.file_type().is_file() {
         warnings.push(format!("managed {description} is not a regular file"));
+        require_recovery(recovery, IntegrationRecovery::Reinstall);
         return AssetStatus {
             path,
             content: None,
@@ -434,10 +469,24 @@ fn inspect_asset(
             current: false,
         };
     }
-    let content = match fs::read_to_string(&path) {
-        Ok(content) => content,
+    let content = match read_bounded_utf8(&path, MANAGED_ASSET_INSPECTION_LIMIT_BYTES) {
+        Ok(BoundedRead::Content(content)) => content,
+        Ok(BoundedRead::Oversized) => {
+            warnings.push(format!(
+                "managed {description} exceeds the {MANAGED_ASSET_INSPECTION_LIMIT_BYTES}-byte inspection limit; reinstall the integration to replace it"
+            ));
+            require_recovery(recovery, IntegrationRecovery::Reinstall);
+            return AssetStatus {
+                path,
+                content: None,
+                present: true,
+                footprint: true,
+                current: false,
+            };
+        }
         Err(_error) => {
             warnings.push(format!("managed {description} could not be read"));
+            require_recovery(recovery, IntegrationRecovery::Reinstall);
             return AssetStatus {
                 path,
                 content: None,
@@ -450,6 +499,7 @@ fn inspect_asset(
     let version = parse_integration_version(&content);
     let content_current = content == expected;
     if !content_current {
+        require_recovery(recovery, IntegrationRecovery::Reinstall);
         match version {
             Some(version) if version != EXPECTED_INTEGRATION_VERSION => warnings.push(format!(
                 "managed {description} version {version} does not match expected {EXPECTED_INTEGRATION_VERSION}"
@@ -463,6 +513,9 @@ fn inspect_asset(
         }
     }
     let permissions_current = asset_permissions_current(agent, kind, &metadata, warnings);
+    if !permissions_current {
+        require_recovery(recovery, IntegrationRecovery::Reinstall);
+    }
     AssetStatus {
         path,
         content: Some(content),
@@ -513,11 +566,10 @@ fn asset_permissions_current(
 }
 
 fn installed_version(assets: &[AssetStatus], warnings: &mut Vec<String>) -> Option<u32> {
-    let mut versions = assets
-        .iter()
-        .filter_map(|asset| asset.content.as_deref())
-        .filter_map(parse_integration_version)
-        .collect::<Vec<_>>();
+    let mut versions = Vec::new();
+    for content in assets.iter().filter_map(|asset| asset.content.as_deref()) {
+        versions.push(parse_integration_version(content)?);
+    }
     versions.sort_unstable();
     versions.dedup();
     if versions.len() > 1 {
@@ -526,6 +578,31 @@ fn installed_version(assets: &[AssetStatus], warnings: &mut Vec<String>) -> Opti
     } else {
         versions.first().copied()
     }
+}
+
+enum BoundedRead {
+    Content(String),
+    Oversized,
+}
+
+fn read_bounded_utf8(path: &Path, max_bytes: usize) -> io::Result<BoundedRead> {
+    let read_limit = max_bytes.saturating_add(INSPECTION_LIMIT_PROBE_BYTES);
+    let read_limit = u64::try_from(read_limit).map_err(|_error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "inspection limit does not fit in u64",
+        )
+    })?;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(read_limit)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Ok(BoundedRead::Oversized);
+    }
+    String::from_utf8(bytes)
+        .map(BoundedRead::Content)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn registration_paths(config_dir: &Path, agent: StatusAgent) -> Vec<PathBuf> {
@@ -561,6 +638,7 @@ struct HookFileStatus {
 enum ReadState {
     Missing,
     Unreadable,
+    Oversized,
     Content(String),
 }
 
@@ -569,6 +647,7 @@ fn inspect_claude_registration(
     state_path: &Path,
     notify_path: &Path,
     warnings: &mut Vec<String>,
+    recovery: &mut IntegrationRecovery,
 ) -> (bool, bool) {
     let settings_path = config_dir.join("settings.json");
     let mut specs = vec![
@@ -616,6 +695,7 @@ fn inspect_claude_registration(
         "Claude settings.json",
         &specs,
         warnings,
+        recovery,
     );
     (status.footprint, status.current)
 }
@@ -625,6 +705,7 @@ fn inspect_codex_registration(
     state_path: &Path,
     notify_path: &Path,
     warnings: &mut Vec<String>,
+    recovery: &mut IntegrationRecovery,
 ) -> (bool, bool) {
     let hooks_path = config_dir.join("hooks.json");
     let specs = vec![
@@ -656,6 +737,7 @@ fn inspect_codex_registration(
         "Codex hooks.json",
         &specs,
         warnings,
+        recovery,
     );
     let config = inspect_codex_config(
         &config_dir.join("config.toml"),
@@ -663,6 +745,7 @@ fn inspect_codex_registration(
         &specs,
         &hooks.positions,
         warnings,
+        recovery,
     );
     (hooks.footprint || config.0, hooks.current && config.1)
 }
@@ -673,8 +756,9 @@ fn inspect_hook_file(
     label: &str,
     specs: &[HookSpec],
     warnings: &mut Vec<String>,
+    recovery: &mut IntegrationRecovery,
 ) -> HookFileStatus {
-    let content = match read_status_file(path, label, warnings) {
+    let content = match read_status_file(path, label, warnings, recovery) {
         ReadState::Missing => {
             return HookFileStatus {
                 footprint: false,
@@ -682,7 +766,7 @@ fn inspect_hook_file(
                 positions: vec![None; specs.len()],
             };
         }
-        ReadState::Unreadable => {
+        ReadState::Unreadable | ReadState::Oversized => {
             return HookFileStatus {
                 footprint: true,
                 current: false,
@@ -695,6 +779,7 @@ fn inspect_hook_file(
         Ok(document) => document,
         Err(_error) => {
             warnings.push(format!("{label} is malformed"));
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
             return HookFileStatus {
                 footprint: true,
                 current: false,
@@ -704,6 +789,7 @@ fn inspect_hook_file(
     };
     let Some(hooks) = document.get("hooks").and_then(Value::as_object) else {
         warnings.push(format!("{label} has no valid hooks object"));
+        require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
         return HookFileStatus {
             footprint: document.get("hooks").is_some(),
             current: false,
@@ -727,6 +813,7 @@ fn inspect_hook_file(
             .collect::<Vec<_>>();
         let spec_current = reference_count == 1 && references.len() == 1 && exact.len() == 1;
         if !spec_current {
+            require_recovery(recovery, IntegrationRecovery::Reinstall);
             let agent = agent.kind();
             if reference_count > references.len() {
                 warnings.push(format!(
@@ -826,16 +913,18 @@ fn inspect_codex_config(
     specs: &[HookSpec],
     positions: &[Option<(usize, usize)>],
     warnings: &mut Vec<String>,
+    recovery: &mut IntegrationRecovery,
 ) -> (bool, bool) {
-    let content = match read_status_file(path, "Codex config.toml", warnings) {
+    let content = match read_status_file(path, "Codex config.toml", warnings, recovery) {
         ReadState::Missing => return (false, false),
-        ReadState::Unreadable => return (true, false),
+        ReadState::Unreadable | ReadState::Oversized => return (true, false),
         ReadState::Content(content) => content,
     };
     let document: toml::Value = match content.parse() {
         Ok(document) => document,
         Err(_error) => {
             warnings.push("Codex config.toml is malformed".to_owned());
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
             return (true, false);
         }
     };
@@ -847,6 +936,7 @@ fn inspect_codex_config(
         == Some(true);
     if !hooks_enabled {
         warnings.push("Codex hooks feature is not enabled".to_owned());
+        require_recovery(recovery, IntegrationRecovery::Reinstall);
     }
 
     let trust_state = document
@@ -893,21 +983,36 @@ fn inspect_codex_config(
                 "managed {} trust record is missing or modified",
                 spec.label
             ));
+            require_recovery(recovery, IntegrationRecovery::Reinstall);
         }
         trust_current &= valid;
     }
     (footprint, hooks_enabled && trust_current)
 }
 
-fn read_status_file(path: &Path, label: &str, warnings: &mut Vec<String>) -> ReadState {
-    match fs::read_to_string(path) {
-        Ok(content) => ReadState::Content(content),
+fn read_status_file(
+    path: &Path,
+    label: &str,
+    warnings: &mut Vec<String>,
+    recovery: &mut IntegrationRecovery,
+) -> ReadState {
+    match read_bounded_utf8(path, PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES) {
+        Ok(BoundedRead::Content(content)) => ReadState::Content(content),
+        Ok(BoundedRead::Oversized) => {
+            warnings.push(format!(
+                "{label} exceeds the {PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES}-byte inspection limit; reduce or replace the file before rerunning status"
+            ));
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+            ReadState::Oversized
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             warnings.push(format!("{label} is missing"));
+            require_recovery(recovery, IntegrationRecovery::Reinstall);
             ReadState::Missing
         }
         Err(_error) => {
             warnings.push(format!("{label} could not be read"));
+            require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
             ReadState::Unreadable
         }
     }
@@ -1585,7 +1690,6 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Mutex;
     use std::thread;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1599,7 +1703,8 @@ mod tests {
         install_codex, shell_single_quote, toml_basic_string, CLAUDE_HOOK_ASSET,
         CLAUDE_NOTIFY_HOOK_ASSET, CODEX_HOOK_ASSET, CODEX_NOTIFY_HOOK_ASSET,
         CODEX_SESSION_START_TRUST_EVENT, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID,
-        ENV_SOCKET_PATH, EXPECTED_INTEGRATION_VERSION, HOOK_TIMEOUT_SECS, SESSION_START_EVENT,
+        ENV_SOCKET_PATH, EXPECTED_INTEGRATION_VERSION, HOOK_TIMEOUT_SECS,
+        INTEGRATION_VERSION_PREFIX, NOTIFY_HOOK_INSTALL_NAME, SESSION_START_EVENT,
         STATE_HOOK_INSTALL_NAME,
     };
 
@@ -2586,6 +2691,10 @@ mod tests {
                 report.state,
                 protocol::IntegrationInstallState::NotInstalled
             );
+            assert_eq!(
+                report.recovery,
+                protocol::IntegrationRecovery::RepairConfiguration
+            );
             assert_eq!(report.warnings.len(), 1);
         }
         assert!(!claude.exists());
@@ -2609,6 +2718,38 @@ mod tests {
     }
 
     #[test]
+    fn bounded_status_read_accepts_limit_and_rejects_next_byte() {
+        let root = temp_dir("status-bounded-read");
+        fs::create_dir_all(&root).expect("create bounded read root");
+        let path = root.join("settings.json");
+        fs::write(
+            &path,
+            vec![b' '; super::PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES],
+        )
+        .expect("write exact-limit file");
+
+        match super::read_bounded_utf8(&path, super::PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES)
+            .expect("read exact-limit file")
+        {
+            super::BoundedRead::Content(content) => {
+                assert_eq!(content.len(), super::PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES);
+            }
+            super::BoundedRead::Oversized => panic!("exact-limit file must be accepted"),
+        }
+
+        fs::write(
+            &path,
+            vec![b' '; super::PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES + 1],
+        )
+        .expect("write over-limit file");
+        assert!(matches!(
+            super::read_bounded_utf8(&path, super::PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES)
+                .expect("classify over-limit file"),
+            super::BoundedRead::Oversized
+        ));
+    }
+
+    #[test]
     fn status_reports_complete_installs_current_without_mutation() {
         let root = temp_dir("status-current");
         let claude = root.join("claude");
@@ -2628,6 +2769,7 @@ mod tests {
         assert_eq!(result.agents.len(), 2);
         for report in result.agents {
             assert_eq!(report.state, protocol::IntegrationInstallState::Current);
+            assert_eq!(report.recovery, protocol::IntegrationRecovery::None);
             assert_eq!(report.installed_version, Some(EXPECTED_INTEGRATION_VERSION));
             assert_eq!(report.expected_asset_paths.len(), 2);
             assert_eq!(report.present_asset_paths.len(), 2);
@@ -2666,6 +2808,11 @@ mod tests {
                 protocol::IntegrationInstallState::Outdated,
                 "{name}"
             );
+            assert_eq!(
+                report.recovery,
+                protocol::IntegrationRecovery::Reinstall,
+                "{name}"
+            );
             assert!(
                 report.warnings.iter().any(|warning| warning.contains(
                     if relative_path.contains("notify") {
@@ -2678,6 +2825,68 @@ mod tests {
                 report.warnings
             );
         }
+    }
+
+    #[test]
+    fn installed_version_is_unknown_when_one_readable_asset_has_no_valid_marker() {
+        let codex = temp_dir("status-invalid-version-marker");
+        install_codex(&codex).expect("install Codex fixture");
+        let notify_path = codex.join(NOTIFY_HOOK_INSTALL_NAME);
+        let invalid_asset = CODEX_NOTIFY_HOOK_ASSET.replacen(
+            &format!("{INTEGRATION_VERSION_PREFIX}{EXPECTED_INTEGRATION_VERSION}"),
+            "# POHUNEK_INTEGRATION_VERSION=invalid",
+            1,
+        );
+        fs::write(notify_path, invalid_asset).expect("write invalid marker fixture");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.installed_version, None);
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
+    }
+
+    #[test]
+    fn status_classifies_oversized_asset_as_reinstallable_outdated() {
+        let codex = temp_dir("status-oversized-asset");
+        install_codex(&codex).expect("install Codex fixture");
+        fs::write(
+            codex.join(STATE_HOOK_INSTALL_NAME),
+            vec![b'#'; super::MANAGED_ASSET_INSPECTION_LIMIT_BYTES + 1],
+        )
+        .expect("write oversized asset");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("exceeds the 65536-byte inspection limit")));
+    }
+
+    #[test]
+    fn status_classifies_oversized_provider_config_as_manual_repair() {
+        let codex = temp_dir("status-oversized-config");
+        install_codex(&codex).expect("install Codex fixture");
+        fs::write(
+            codex.join("config.toml"),
+            vec![b' '; super::PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES + 1],
+        )
+        .expect("write oversized config");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("exceeds the 2097152-byte inspection limit")));
     }
 
     #[cfg(unix)]
@@ -2762,7 +2971,7 @@ mod tests {
 
     #[test]
     fn status_detects_broken_codex_registration_trust_and_read_errors() {
-        for failure in ["registration", "trust", "read"] {
+        for failure in ["registration", "trust", "read", "malformed-config"] {
             let codex = temp_dir(&format!("status-codex-{failure}"));
             install_codex(&codex).expect("install Codex fixture");
             match failure {
@@ -2790,6 +2999,10 @@ mod tests {
                     fs::remove_file(&hooks_path).expect("remove hooks file");
                     fs::create_dir(&hooks_path).expect("replace hooks file with directory");
                 }
+                "malformed-config" => {
+                    fs::write(codex.join("config.toml"), "[invalid")
+                        .expect("write malformed config");
+                }
                 other => panic!("unknown fixture failure: {other}"),
             }
 
@@ -2801,6 +3014,12 @@ mod tests {
                 "{failure}"
             );
             assert!(!report.warnings.is_empty(), "{failure}");
+            let expected_recovery = if matches!(failure, "read" | "malformed-config") {
+                protocol::IntegrationRecovery::RepairConfiguration
+            } else {
+                protocol::IntegrationRecovery::Reinstall
+            };
+            assert_eq!(report.recovery, expected_recovery, "{failure}");
         }
     }
 
@@ -2821,6 +3040,10 @@ mod tests {
             protocol::IntegrationInstallState::Outdated
         );
         assert!(result.agents[0].warnings[0].contains("missing_env"));
+        assert_eq!(
+            result.agents[0].recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
         assert_eq!(result.agents[1].agent, AgentKind::Codex);
         assert_eq!(
             result.agents[1].state,
@@ -2841,6 +3064,10 @@ mod tests {
         .expect("Claude report");
 
         assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
         assert!(report.warnings[0].contains("missing_env"));
     }
 
@@ -2853,8 +3080,43 @@ mod tests {
         }
     }
 
-    /// Serializes the process-global config-dir overrides used by status tests.
-    static STATUS_CONFIG_LOCK: Mutex<()> = Mutex::new(());
+    #[test]
+    fn status_env_restores_home_and_provider_specific_overrides_under_shared_lock() {
+        let _lock = crate::test_support::XDG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original_claude = std::env::var_os(super::CLAUDE_CONFIG_DIR_ENV);
+        let original_codex = std::env::var_os(super::CODEX_HOME_ENV);
+        let original_home = std::env::var_os("HOME");
+        let root = temp_dir("status-env-isolation");
+        let claude = root.join("claude");
+        let codex = root.join("codex");
+        let home = root.join("home");
+
+        let () = {
+            let _guard = ConfigDirGuard {
+                claude_dir: original_claude.clone(),
+                codex_dir: original_codex.clone(),
+                home: original_home.clone(),
+            };
+            set_optional_env(super::CLAUDE_CONFIG_DIR_ENV, Some(&claude));
+            set_optional_env(super::CODEX_HOME_ENV, Some(&codex));
+            set_optional_env("HOME", Some(&home));
+            assert_eq!(
+                std::env::var_os(super::CLAUDE_CONFIG_DIR_ENV),
+                Some(claude.into())
+            );
+            assert_eq!(std::env::var_os(super::CODEX_HOME_ENV), Some(codex.into()));
+            assert_eq!(std::env::var_os("HOME"), Some(home.into()));
+        };
+
+        assert_eq!(
+            std::env::var_os(super::CLAUDE_CONFIG_DIR_ENV),
+            original_claude
+        );
+        assert_eq!(std::env::var_os(super::CODEX_HOME_ENV), original_codex);
+        assert_eq!(std::env::var_os("HOME"), original_home);
+    }
 
     /// Restores the pre-test environment when the scoped assertion finishes.
     struct ConfigDirGuard {
@@ -2903,7 +3165,7 @@ mod tests {
         home: Option<&Path>,
         operation: impl FnOnce() -> T,
     ) -> T {
-        let _lock = STATUS_CONFIG_LOCK
+        let _lock = crate::test_support::XDG_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _guard = ConfigDirGuard {

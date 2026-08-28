@@ -600,12 +600,21 @@ fn render_status_human(result: &IntegrationStatusResult) -> String {
         for warning in &report.warnings {
             let _ = writeln!(output, "  warning: {warning}");
         }
-        if report.state != IntegrationInstallState::Current {
-            let agent = agent_label(&report.agent);
-            let _ = writeln!(
-                output,
-                "  hint: run `pohunek integration install --agent {agent}` to repair"
-            );
+        match report.recovery {
+            protocol::IntegrationRecovery::None => {}
+            protocol::IntegrationRecovery::Reinstall => {
+                let agent = agent_label(&report.agent);
+                let _ = writeln!(
+                    output,
+                    "  hint: run `pohunek integration install --agent {agent}` to repair"
+                );
+            }
+            protocol::IntegrationRecovery::RepairConfiguration => {
+                let _ = writeln!(
+                    output,
+                    "  hint: inspect and repair the reported provider configuration before reinstalling"
+                );
+            }
         }
     }
     output
@@ -728,7 +737,8 @@ fn render_hermes_human(result: &HermesResult) -> String {
 mod status_tests {
     use super::{installed_version_label, render_status_human};
     use protocol::{
-        AgentKind, IntegrationAgentStatus, IntegrationInstallState, IntegrationStatusResult,
+        AgentKind, IntegrationAgentStatus, IntegrationInstallState, IntegrationRecovery,
+        IntegrationStatusResult,
     };
 
     #[test]
@@ -750,6 +760,7 @@ mod status_tests {
                     installed_version: Some(4),
                     expected_version: 4,
                     state: IntegrationInstallState::Current,
+                    recovery: IntegrationRecovery::None,
                     warnings: Vec::new(),
                 },
                 IntegrationAgentStatus {
@@ -767,6 +778,7 @@ mod status_tests {
                     installed_version: None,
                     expected_version: 4,
                     state: IntegrationInstallState::Outdated,
+                    recovery: IntegrationRecovery::Reinstall,
                     warnings: vec!["managed notification hook is missing".to_owned()],
                 },
             ],
@@ -791,6 +803,31 @@ mod status_tests {
         assert!(
             output.contains("  hint: run `pohunek integration install --agent codex` to repair")
         );
+    }
+
+    #[test]
+    fn configuration_recovery_never_recommends_reinstall() {
+        let result = IntegrationStatusResult {
+            agents: vec![IntegrationAgentStatus {
+                agent: AgentKind::Codex,
+                available: true,
+                expected_asset_paths: Vec::new(),
+                present_asset_paths: Vec::new(),
+                registration_paths: vec!["/home/u/.codex/config.toml".to_owned()],
+                installed_version: None,
+                expected_version: 4,
+                state: IntegrationInstallState::Outdated,
+                recovery: IntegrationRecovery::RepairConfiguration,
+                warnings: vec!["Codex config.toml is malformed".to_owned()],
+            }],
+        };
+
+        let output = render_status_human(&result);
+
+        assert!(output.contains(
+            "  hint: inspect and repair the reported provider configuration before reinstalling"
+        ));
+        assert!(!output.contains("pohunek integration install"));
     }
 
     #[test]

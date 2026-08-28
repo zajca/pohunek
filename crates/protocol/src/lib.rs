@@ -58,10 +58,10 @@ pub use error::{ErrorClass, ProtocolError};
 #[doc(inline)]
 pub use integration::{
     IntegrationAgentStatus, IntegrationInstallParams, IntegrationInstallReport,
-    IntegrationInstallResult, IntegrationInstallState, IntegrationStatusParams,
-    IntegrationStatusResult, ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID,
-    ENV_SOCKET_PATH, ENV_WORKER_ID, ENV_WORKER_PROTOCOL_VERSION, ENV_WORKER_SOCKET_PATH,
-    EXPECTED_INTEGRATION_VERSION,
+    IntegrationInstallResult, IntegrationInstallState, IntegrationRecovery,
+    IntegrationStatusParams, IntegrationStatusResult, ENV_DAEMON_ID, ENV_FLAG,
+    ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH, ENV_WORKER_ID,
+    ENV_WORKER_PROTOCOL_VERSION, ENV_WORKER_SOCKET_PATH, EXPECTED_INTEGRATION_VERSION,
 };
 #[doc(inline)]
 pub use limits::{

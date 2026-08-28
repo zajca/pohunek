@@ -64,8 +64,11 @@ For durable notification issues:
    `current` verifies both executable assets with the installer-owned permission
    mode, exactly one managed registration under each expected provider event,
    and Codex feature/trust state. Unsafe permission drift and duplicate managed
-   registrations are `outdated`; follow the actionable reinstall warning or the
-   printed hint. Status itself never repairs or rewrites provider configuration.
+   registrations are `outdated`. Follow the typed recovery action: `reinstall`
+   means the installer can repair every finding, while `repair_configuration`
+   means provider files must be inspected and fixed first. Oversized files are
+   rejected by bounded inspection and reported with the applicable recovery.
+   Status itself never repairs or rewrites provider configuration.
 9. If a notification is missing its session link, inspect the hook environment
    setup. Hook adapters silently drop an invalid `POHUNEK_SESSION_ID` and still
    create the notification without linkage.
