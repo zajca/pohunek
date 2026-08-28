@@ -36,20 +36,24 @@ Hermes is visibly blocked on owner approval. In JSON mode, stdout contains
 exactly one versioned document with either `ok` or `err`; diagnostics remain on
 stderr.
 
-`pohunek session input --until idle --timeout 1000` can confirm delivery by
-waiting for a matching activity observed only after submission. The daemon first
-validates the whole wait contract, so zero or over-limit timeouts cannot deliver
-text; duplicate `--until` values are deduplicated in first-occurrence order;
-omitted targets default to `idle` and `blocked`; the timeout range is `1..8000`
-ms (default 8000). The timeout is one overall deadline measured before the
-per-session input gate, so gate contention, submit delay, atomic worker-plan
-acknowledgement, and activity waiting all consume it. The daemon does not stage
-waited text: after the delay it captures the causal revision boundary, rechecks
-blocked activity, and only then sends body plus submit as one worker plan. This
-trades a slightly earlier boundary for safety against stale staged text. A
-timed-out worker exchange continues consuming its late acknowledgement to keep
-the shared control stream synchronized; after the atomic plan is sent, delivery
-outcome is unknown and callers must not retry blindly. Waiting
+`pohunek session input --until idle --timeout 1000` can confirm delivery for an
+agent profile whose submit framing has no delay. The daemon first validates the
+whole wait contract, so zero or over-limit timeouts cannot deliver text;
+duplicate `--until` values are deduplicated in first-occurrence order; omitted
+targets default to `idle` and `blocked`; the timeout range is `1..8000` ms
+(default 8000). The timeout is one overall deadline measured before the
+per-session input gate, so gate contention, the two-fragment worker-plan
+acknowledgement, and activity waiting all consume it. Every input plan preserves
+the body fragment and separate submit fragment; fire-and-forget keeps the
+provider delay on the body fragment. A waited request rejects blocked activity
+as `session_agent_blocked` regardless of provider policy. Because the daemon
+cannot revalidate activity during a worker-owned delay or safely retract text
+already consumed by an arbitrary TUI, waited input rejects delayed framing with
+`session_input_wait_unsupported` before any bytes are written. Zero-delay waited
+input captures its causal boundary immediately before the atomic two-fragment
+plan. A timed-out worker exchange continues consuming its late acknowledgement
+to keep the shared control stream synchronized; after the plan is sent, delivery
+outcome may be unknown, so callers inspect the session and do not retry blindly. Waiting
 acquires one observation waiter slot and returns exact post-submit evidence as
 `activity`, `activity_source`, `runtime`, `activity_epoch`, and decimal-string
 `activity_revision`. Clients deduplicate by `(activity_epoch, runtime,
@@ -57,8 +61,9 @@ activity_revision)` because a daemon reconnect changes the epoch while retaining
 the worker runtime. Rapid matching transitions remain valid even when the latest
 activity changes again, arrives before submit ACK, or the event receiver lags. The wait returns
 `session_not_running` if that runtime exits, `session_runtime_changed` if it is
-replaced, and `session_input_timeout` when delivery acknowledgement or a target
-does not arrive before the deadline. Rust and TypeScript
+replaced, `session_input_wait_unsupported` for delayed provider framing, and
+`session_input_timeout` when delivery acknowledgement or a target does not
+arrive before the deadline. Rust and TypeScript
 SDK helpers validate the timeout locally and fail closed with
 `session_input_wait_contract_mismatch` when a daemon ignores `wait` or omits
 runtime-scoped evidence. Its recovery guidance says to inspect the session rather

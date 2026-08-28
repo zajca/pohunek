@@ -4,13 +4,17 @@ import type { AgentActivity } from "./AgentActivity";
 
 /**
  * Optional delivery-wait contract attached to a `session.input` request.
+ *
+ * Agents that require delayed submit framing reject this contract before any
+ * input bytes are written because activity cannot be revalidated inside the
+ * worker-owned delay.
  */
 export type SessionInputWait = {
   /**
    * Agent activities that complete the wait once observed after submission.
-   * An empty list defaults to `idle` and `blocked`.
+   * An absent or empty list defaults to `idle` and `blocked`.
    */
-  until: Array<AgentActivity>;
+  until?: Array<AgentActivity>;
   /**
    * Overall gate, delivery, and activity-wait deadline in milliseconds from
    * `1` to [`MAX_SESSION_WAIT_MS`], measured before delivery begins. When

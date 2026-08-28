@@ -463,14 +463,19 @@ pub struct SessionInputParams {
 }
 
 /// Optional delivery-wait contract attached to a `session.input` request.
+///
+/// Agents that require delayed submit framing reject this contract before any
+/// input bytes are written because activity cannot be revalidated inside the
+/// worker-owned delay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionInputWait.ts"))]
 pub struct SessionInputWait {
     /// Agent activities that complete the wait once observed after submission.
-    /// An empty list defaults to `idle` and `blocked`.
-    #[serde(default)]
-    pub until: Vec<AgentActivity>,
+    /// An absent or empty list defaults to `idle` and `blocked`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub until: Option<Vec<AgentActivity>>,
     /// Overall gate, delivery, and activity-wait deadline in milliseconds from
     /// `1` to [`MAX_SESSION_WAIT_MS`], measured before delivery begins. When
     /// omitted, the daemon applies that ceiling; zero is rejected before any

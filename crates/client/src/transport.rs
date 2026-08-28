@@ -330,9 +330,11 @@ impl Client {
     /// Deliver input with an optional dedicated overall-deadline connection.
     pub async fn session_input(
         &mut self,
-        params: SessionInputParams,
+        mut params: SessionInputParams,
     ) -> Result<SessionInputResult, ClientError> {
-        if let Some(wait) = params.wait.clone() {
+        if let Some(wait) = params.wait.as_mut() {
+            wait.until.get_or_insert_with(Vec::new);
+            let wait = wait.clone();
             let timeout_ms = validated_input_wait_timeout(&wait)?;
             let result = self
                 .call_dedicated::<protocol::method::SessionInput>(params, timeout_ms)
@@ -490,13 +492,14 @@ fn validate_input_wait_result(
             detail: "the response omitted epoch- and runtime-scoped activity evidence",
         });
     }
-    let target_matches = if wait.until.is_empty() {
+    let until = wait.until.as_deref().unwrap_or_default();
+    let target_matches = if until.is_empty() {
         matches!(
             activity,
             protocol::AgentActivity::Idle | protocol::AgentActivity::Blocked
         )
     } else {
-        wait.until.contains(&activity)
+        until.contains(&activity)
     };
     if !target_matches {
         return Err(ClientError::InputWaitContract {
@@ -1284,7 +1287,7 @@ mod tests {
             session_id: SessionId("s-target".to_owned()),
             text: "hello".to_owned(),
             wait: Some(protocol::SessionInputWait {
-                until: vec![protocol::AgentActivity::Idle],
+                until: Some(vec![protocol::AgentActivity::Idle]),
                 timeout_ms: None,
             }),
         };
@@ -1299,6 +1302,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn input_wait_normalizes_absent_targets_before_wire() {
+        let result = serde_json::json!({
+            "accepted": true,
+            "activity": "idle",
+            "activity_source": "report",
+            "runtime": {
+                "runtime_id": "runtime-1",
+                "runtime_generation": "1"
+            },
+            "activity_epoch": "d-epoch-1",
+            "activity_revision": "2"
+        });
+        let (address, server) = spawn_dedicated_capture_server(result).await;
+        let mut client = Client::connect_tcp_addr("fixture-remote", address)
+            .await
+            .expect("connect remote");
+
+        client
+            .session_input(SessionInputParams {
+                session_id: SessionId("s-target".to_owned()),
+                text: "hello".to_owned(),
+                wait: Some(protocol::SessionInputWait {
+                    until: None,
+                    timeout_ms: None,
+                }),
+            })
+            .await
+            .expect("session input wait succeeds");
+
+        let request = server.await.expect("capture server");
+        assert_eq!(request.params()["wait"]["until"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
     async fn input_wait_rejects_legacy_success_without_runtime_evidence() {
         let result = serde_json::json!({"accepted": true});
         let (address, server) = spawn_dedicated_capture_server(result).await;
@@ -1309,7 +1346,7 @@ mod tests {
             session_id: SessionId("s-target".to_owned()),
             text: "hello".to_owned(),
             wait: Some(protocol::SessionInputWait {
-                until: vec![protocol::AgentActivity::Idle],
+                until: Some(vec![protocol::AgentActivity::Idle]),
                 timeout_ms: None,
             }),
         };
@@ -1356,7 +1393,7 @@ mod tests {
                     session_id: SessionId("s-target".to_owned()),
                     text: "hello".to_owned(),
                     wait: Some(protocol::SessionInputWait {
-                        until: vec![protocol::AgentActivity::Idle],
+                        until: Some(vec![protocol::AgentActivity::Idle]),
                         timeout_ms: Some(timeout_ms),
                     }),
                 })
@@ -1370,6 +1407,18 @@ mod tests {
                 "invalid wait opened a dedicated connection"
             );
         }
+    }
+
+    #[test]
+    fn input_wait_timeout_preserves_unknown_delivery_recovery() {
+        let error = ClientError::Protocol(ProtocolError::session_input_timeout());
+        let recovery = error
+            .to_protocol_error()
+            .recover
+            .expect("timeout recovery hint");
+
+        assert!(recovery.contains("inspect the current session"));
+        assert!(recovery.contains("do not retry blindly"));
     }
 
     #[tokio::test]
@@ -1392,7 +1441,7 @@ mod tests {
             session_id: SessionId("s-target".to_owned()),
             text: "hello".to_owned(),
             wait: Some(protocol::SessionInputWait {
-                until: vec![protocol::AgentActivity::Idle],
+                until: Some(vec![protocol::AgentActivity::Idle]),
                 timeout_ms: None,
             }),
         };

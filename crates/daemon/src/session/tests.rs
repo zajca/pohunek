@@ -3389,6 +3389,13 @@ fn delayed_submit_input_frame_splits_text_and_submit() {
 
     assert_eq!(writes.body, b"hello Claude".to_vec());
     assert_eq!(writes.submit_delay, Duration::from_millis(150));
+
+    let fragments = super::input::worker_input_fragments(writes, Duration::from_millis(25));
+    assert_eq!(fragments.len(), 2);
+    assert_eq!(fragments[0].bytes.expose(), b"hello Claude");
+    assert_eq!(fragments[0].delay_after_ms, 150);
+    assert_eq!(fragments[1].bytes.expose(), super::input::SUBMIT);
+    assert_eq!(fragments[1].delay_after_ms, 25);
 }
 
 #[test]
@@ -3486,7 +3493,7 @@ async fn session_input_wait_rejects_invalid_contract_before_delivery() {
                 session_id: created.id.clone(),
                 text: "must not be delivered".to_owned(),
                 wait: Some(protocol::SessionInputWait {
-                    until: vec![AgentActivity::Idle],
+                    until: Some(vec![AgentActivity::Idle]),
                     timeout_ms,
                 }),
             })
@@ -3532,7 +3539,7 @@ async fn session_input_wait_preserves_external_read_only_error() {
             session_id: external_id,
             text: "must-not-write".to_owned(),
             wait: Some(protocol::SessionInputWait {
-                until: vec![AgentActivity::Idle],
+                until: Some(vec![AgentActivity::Idle]),
                 timeout_ms: Some(100),
             }),
         })
@@ -3560,7 +3567,7 @@ async fn session_input_wait_times_out_with_typed_error() {
             session_id: created.id.clone(),
             text: "submitted but never settled".to_owned(),
             wait: Some(protocol::SessionInputWait {
-                until: vec![AgentActivity::Blocked],
+                until: Some(vec![AgentActivity::Blocked]),
                 timeout_ms: Some(25),
             }),
         })
@@ -3593,7 +3600,7 @@ async fn session_input_wait_rejects_blocked_session_before_delivery() {
             session_id: created.id.clone(),
             text: "blocked-input-marker".to_owned(),
             wait: Some(protocol::SessionInputWait {
-                until: vec![AgentActivity::Idle],
+                until: Some(vec![AgentActivity::Idle]),
                 timeout_ms: Some(250),
             }),
         })
@@ -3611,109 +3618,129 @@ async fn session_input_wait_rejects_blocked_session_before_delivery() {
 }
 
 #[tokio::test]
-async fn session_input_wait_ignores_activity_reported_during_submit_delay() {
+async fn session_input_wait_rejects_delayed_provider_framing_before_delivery() {
     let agents_dir = temp_agents_dir_with(
-        "input-wait-submit-delay",
-        "input-wait-claude",
-        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
+        "input-wait-delayed-provider",
+        "input-wait-codex",
+        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
     );
+    std::fs::write(
+        agents_dir.join("input-wait-claude.toml"),
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
+    )
+    .expect("write Claude profile");
     let registry = SessionRegistry::new(SessionRegistryConfig {
         agents_dir: Some(agents_dir),
-        claude_submit_delay: Duration::from_millis(100),
         stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     });
-    let mut create = params();
-    create.agent = "input-wait-claude".to_owned();
-    let created = registry
-        .create(create)
-        .await
-        .expect("create Claude session");
-    let reports = tokio::spawn({
-        let registry = registry.clone();
-        let session_id = created.id.clone();
-        async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            assert!(
-                report_input_activity(&registry, &session_id, AgentActivity::Idle, 1)
-                    .await
-                    .recorded
-            );
-            tokio::time::sleep(Duration::from_millis(130)).await;
-            report_input_activity(&registry, &session_id, AgentActivity::Blocked, 2).await
-        }
-    });
 
-    let result = registry
-        .input(protocol::SessionInputParams {
-            session_id: created.id.clone(),
-            text: "submit after the delay".to_owned(),
-            wait: Some(protocol::SessionInputWait {
-                until: Vec::new(),
-                timeout_ms: Some(500),
-            }),
-        })
-        .await
-        .expect("post-submit blocked activity settles the default wait");
+    for agent in ["input-wait-codex", "input-wait-claude"] {
+        let mut create = params();
+        create.agent = agent.to_owned();
+        let created = registry.create(create).await.expect("create agent session");
+        let marker = format!("unsafe-wait-{agent}");
 
-    assert_eq!(result.activity, Some(AgentActivity::Blocked));
-    assert_eq!(result.activity_source, Some(StateSource::Report));
-    assert!(reports.await.expect("report task joins").recorded);
-    let _ = registry.stop(&created.id).await;
+        let error = registry
+            .input(protocol::SessionInputParams {
+                session_id: created.id.clone(),
+                text: marker.clone(),
+                wait: Some(protocol::SessionInputWait {
+                    until: Some(Vec::new()),
+                    timeout_ms: Some(500),
+                }),
+            })
+            .await
+            .expect_err("delayed provider wait must fail before delivery");
+
+        assert_eq!(error.code, "session_input_wait_unsupported");
+        registry
+            .input(protocol::SessionInputParams {
+                session_id: created.id.clone(),
+                text: "next-input".to_owned(),
+                wait: None,
+            })
+            .await
+            .expect("fire-and-forget keeps provider framing");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let output = read_session_output_after_rejection(&registry, &created.id).await;
+        assert!(!output.contains(&marker), "output={output:?}");
+        assert!(output.contains("got:next-input"), "output={output:?}");
+        let _ = registry.stop(&created.id).await;
+    }
 }
 
 #[tokio::test]
-async fn session_input_wait_deadline_includes_submit_delay() {
+async fn session_input_wait_rejects_blocked_transition_during_gate_for_all_adapters() {
     let agents_dir = temp_agents_dir_with(
-        "input-wait-overall-deadline",
-        "input-wait-deadline-claude",
-        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
+        "input-wait-blocked-gate",
+        "input-wait-gate-codex",
+        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
     );
+    std::fs::write(
+        agents_dir.join("input-wait-gate-claude.toml"),
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
+    )
+    .expect("write Claude profile");
     let registry = SessionRegistry::new(SessionRegistryConfig {
         agents_dir: Some(agents_dir),
-        claude_submit_delay: Duration::from_millis(250),
+        shell_command: observable_input_shell(),
         stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     });
-    let mut create = params();
-    create.agent = "input-wait-deadline-claude".to_owned();
-    let created = registry
-        .create(create)
-        .await
-        .expect("create Claude session");
 
-    let error = tokio::time::timeout(
-        Duration::from_millis(150),
-        registry.input(protocol::SessionInputParams {
-            session_id: created.id.clone(),
-            text: "deadline-before-submit".to_owned(),
-            wait: Some(protocol::SessionInputWait {
-                until: vec![AgentActivity::Idle],
-                timeout_ms: Some(50),
-            }),
-        }),
-    )
-    .await
-    .expect("overall deadline must not wait through the submit delay")
-    .expect_err("submit delay must consume the overall deadline");
+    for agent in ["shell", "input-wait-gate-codex", "input-wait-gate-claude"] {
+        let mut create = params();
+        create.agent = agent.to_owned();
+        let created = registry.create(create).await.expect("create agent session");
+        let input_gate = {
+            let sessions = registry.inner.sessions.lock().await;
+            std::sync::Arc::clone(&sessions.get(&created.id).expect("session entry").input_gate)
+        };
+        let gate_guard = input_gate.lock_owned().await;
+        let marker = format!("blocked-gate-{agent}");
+        let request = tokio::spawn({
+            let registry = registry.clone();
+            let session_id = created.id.clone();
+            let marker = marker.clone();
+            async move {
+                registry
+                    .input(protocol::SessionInputParams {
+                        session_id,
+                        text: marker,
+                        wait: Some(protocol::SessionInputWait {
+                            until: Some(vec![AgentActivity::Idle]),
+                            timeout_ms: Some(500),
+                        }),
+                    })
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        registry
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get_mut(&created.id)
+            .expect("session entry")
+            .info
+            .activity = Some(AgentActivity::Blocked);
+        drop(gate_guard);
 
-    assert_eq!(error.code, "session_input_timeout");
-    registry
-        .input(protocol::SessionInputParams {
-            session_id: created.id.clone(),
-            text: "next-input".to_owned(),
-            wait: None,
-        })
-        .await
-        .expect("next input succeeds without submitting timed-out text");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let output = read_session_output_after_rejection(&registry, &created.id).await;
-    assert!(
-        !output.contains("got:deadline-before-submit"),
-        "output={output:?}"
-    );
-    assert!(output.contains("got:next-input"), "output={output:?}");
-    let _ = registry.stop(&created.id).await;
+        let error = request
+            .await
+            .expect("wait request task joins")
+            .expect_err("blocked causal boundary must reject input");
+        assert_eq!(error.code, "session_agent_blocked", "agent={agent}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let output = read_session_output_after_rejection(&registry, &created.id).await;
+        assert!(
+            !output.contains(&marker),
+            "agent={agent}; output={output:?}"
+        );
+        let _ = registry.stop(&created.id).await;
+    }
 }
 
 #[tokio::test]
@@ -3772,86 +3799,6 @@ async fn session_input_wait_timeout_after_atomic_plan_does_not_stage_body() {
 }
 
 #[tokio::test]
-async fn session_input_wait_rechecks_blocked_activity_after_submit_delay() {
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: ShellCommand::new(
-            "/bin/sh",
-            ["-c", "while IFS= read -r line; do echo got:$line; done"],
-        ),
-        stop_grace: Duration::from_millis(50),
-        ..SessionRegistryConfig::default()
-    });
-    let created = registry
-        .create(params())
-        .await
-        .expect("create shell session");
-    registry
-        .inner
-        .sessions
-        .lock()
-        .await
-        .get_mut(&created.id)
-        .expect("session entry")
-        .input_rules = InputRules::hermes(false, Duration::from_millis(150));
-    let report = tokio::spawn({
-        let registry = registry.clone();
-        let session_id = created.id.clone();
-        async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            registry
-                .inner
-                .sessions
-                .lock()
-                .await
-                .get_mut(&session_id)
-                .expect("session entry")
-                .info
-                .activity = Some(AgentActivity::Blocked);
-        }
-    });
-
-    let error = registry
-        .input(protocol::SessionInputParams {
-            session_id: created.id.clone(),
-            text: "blocked-during-delay".to_owned(),
-            wait: Some(protocol::SessionInputWait {
-                until: vec![AgentActivity::Idle],
-                timeout_ms: Some(500),
-            }),
-        })
-        .await
-        .expect_err("blocked boundary must reject input before the atomic plan");
-
-    assert_eq!(error.code, "session_input_blocked");
-    report.await.expect("blocked mutation task joins");
-    registry
-        .inner
-        .sessions
-        .lock()
-        .await
-        .get_mut(&created.id)
-        .expect("session entry")
-        .info
-        .activity = Some(AgentActivity::Working);
-    registry
-        .input(protocol::SessionInputParams {
-            session_id: created.id.clone(),
-            text: "next-input".to_owned(),
-            wait: None,
-        })
-        .await
-        .expect("next input succeeds after blocked state clears");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let output = read_session_output_after_rejection(&registry, &created.id).await;
-    assert!(
-        !output.contains("got:blocked-during-delay"),
-        "output={output:?}"
-    );
-    assert!(output.contains("got:next-input"), "output={output:?}");
-    let _ = registry.stop(&created.id).await;
-}
-
-#[tokio::test]
 async fn session_input_serializes_waited_transactions() {
     let agents_dir = temp_agents_dir_with(
         "input-wait-serialized",
@@ -3860,7 +3807,7 @@ async fn session_input_serializes_waited_transactions() {
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
         agents_dir: Some(agents_dir),
-        claude_submit_delay: Duration::from_millis(100),
+        claude_submit_delay: Duration::ZERO,
         stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     });
@@ -3880,7 +3827,7 @@ async fn session_input_serializes_waited_transactions() {
                     &session_id,
                     "first-waited",
                     deadline,
-                    Duration::ZERO,
+                    Duration::from_millis(100),
                 )
                 .await
         }
@@ -3926,7 +3873,7 @@ async fn session_input_serializes_waited_and_fire_and_forget_transactions() {
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
         agents_dir: Some(agents_dir),
-        claude_submit_delay: Duration::from_millis(100),
+        claude_submit_delay: Duration::ZERO,
         stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     });
@@ -3945,7 +3892,7 @@ async fn session_input_serializes_waited_and_fire_and_forget_transactions() {
                     &session_id,
                     "first-waited",
                     tokio::time::Instant::now() + Duration::from_secs(1),
-                    Duration::ZERO,
+                    Duration::from_millis(100),
                 )
                 .await
         }
@@ -3990,7 +3937,7 @@ async fn session_input_wait_accepts_activity_between_submit_flush_and_ack() {
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
         agents_dir: Some(agents_dir),
-        claude_submit_delay: Duration::from_millis(100),
+        claude_submit_delay: Duration::ZERO,
         stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     });
@@ -4030,7 +3977,7 @@ async fn session_input_wait_accepts_activity_between_submit_flush_and_ack() {
         .await_input_settled(
             &created.id,
             protocol::SessionInputWait {
-                until: Vec::new(),
+                until: Some(Vec::new()),
                 timeout_ms: Some(1_000),
             },
             submission,
@@ -4039,7 +3986,7 @@ async fn session_input_wait_accepts_activity_between_submit_flush_and_ack() {
         .await
         .expect("activity after submit flush but before ACK settles the wait");
 
-    assert_eq!(result.activity, Some(AgentActivity::Blocked));
+    assert_eq!(result.activity, Some(AgentActivity::Idle));
     assert_eq!(result.activity_source, Some(StateSource::Report));
     assert!(reports.await.expect("report task joins").recorded);
     let _ = registry.stop(&created.id).await;
@@ -4085,7 +4032,7 @@ async fn session_input_wait_timeout_recheck_rejects_evidence_after_deadline() {
         .await_input_settled(
             &created.id,
             protocol::SessionInputWait {
-                until: vec![AgentActivity::Idle],
+                until: Some(vec![AgentActivity::Idle]),
                 timeout_ms: Some(10),
             },
             submission,
@@ -4257,7 +4204,7 @@ async fn session_input_wait_resnapshots_after_broadcast_lag() {
         .await_input_settled(
             &created.id,
             protocol::SessionInputWait {
-                until: vec![AgentActivity::Idle],
+                until: Some(vec![AgentActivity::Idle]),
                 timeout_ms: Some(100),
             },
             submission,
@@ -4317,7 +4264,7 @@ async fn session_input_wait_uses_rapid_target_event_after_latest_state_changes()
         .await_input_settled(
             &created.id,
             protocol::SessionInputWait {
-                until: vec![AgentActivity::Idle],
+                until: Some(vec![AgentActivity::Idle]),
                 timeout_ms: Some(100),
             },
             submission,
@@ -4369,7 +4316,7 @@ async fn session_input_wait_rejects_replaced_runtime() {
         .await_input_settled(
             &created.id,
             protocol::SessionInputWait {
-                until: vec![AgentActivity::Idle],
+                until: Some(vec![AgentActivity::Idle]),
                 timeout_ms: Some(100),
             },
             submission,
@@ -4410,7 +4357,7 @@ async fn session_input_wait_rejects_runtime_exit() {
         .await_input_settled(
             &created.id,
             protocol::SessionInputWait {
-                until: vec![AgentActivity::Idle],
+                until: Some(vec![AgentActivity::Idle]),
                 timeout_ms: Some(100),
             },
             submission,
@@ -4467,7 +4414,7 @@ async fn duplicate_agent_report_sequence_is_idempotent_for_input_waits() {
         .await_input_settled(
             &created.id,
             protocol::SessionInputWait {
-                until: vec![AgentActivity::Blocked],
+                until: Some(vec![AgentActivity::Blocked]),
                 timeout_ms: Some(25),
             },
             submission,
@@ -4499,7 +4446,7 @@ async fn session_input_wait_is_cancelled_by_daemon_shutdown() {
                     session_id,
                     text: "wait for shutdown".to_owned(),
                     wait: Some(protocol::SessionInputWait {
-                        until: vec![AgentActivity::Blocked],
+                        until: Some(vec![AgentActivity::Blocked]),
                         timeout_ms: Some(1_000),
                     }),
                 })
@@ -4540,7 +4487,7 @@ async fn session_input_wait_obeys_per_session_waiter_limit() {
                     session_id,
                     text: "first waiter".to_owned(),
                     wait: Some(protocol::SessionInputWait {
-                        until: vec![AgentActivity::Blocked],
+                        until: Some(vec![AgentActivity::Blocked]),
                         timeout_ms: Some(1_000),
                     }),
                 })
@@ -4554,7 +4501,7 @@ async fn session_input_wait_obeys_per_session_waiter_limit() {
             session_id: created.id.clone(),
             text: "second waiter".to_owned(),
             wait: Some(protocol::SessionInputWait {
-                until: vec![AgentActivity::Blocked],
+                until: Some(vec![AgentActivity::Blocked]),
                 timeout_ms: Some(1_000),
             }),
         })
@@ -4606,11 +4553,11 @@ async fn session_input_wait_deduplicates_targets_and_requires_new_event() {
             session_id: created.id.clone(),
             text: "\n".to_owned(),
             wait: Some(protocol::SessionInputWait {
-                until: vec![
+                until: Some(vec![
                     AgentActivity::Idle,
                     AgentActivity::Blocked,
                     AgentActivity::Idle,
-                ],
+                ]),
                 timeout_ms: Some(1_000),
             }),
         })

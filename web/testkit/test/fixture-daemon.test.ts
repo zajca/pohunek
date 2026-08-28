@@ -112,7 +112,7 @@ describe("@pohunek/testkit fixture daemon", () => {
     try {
       const client = await connectLocal(requireUnixSocket(daemon));
       const created = await client.call("session.new", {
-        agent: "codex",
+        agent: "shell",
         cols: TEST_COLS,
         rows: TEST_ROWS,
       });
@@ -132,6 +132,32 @@ describe("@pohunek/testkit fixture daemon", () => {
       expect(result.runtime?.runtime_id).toBe(`runtime-${created.id}`);
       expect(result.activity_epoch?.startsWith("d-testkit-")).toBe(true);
       expect(result.activity_revision).toBe("1");
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("session input wait accepts absent targets as the default target set", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-default-targets") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const created = await client.call("session.new", {
+        agent: "shell",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      });
+      setTimeout(() => {
+        daemon.scenario.setAgentState(created.id, "idle", "report");
+      }, 20);
+
+      const result = await client.call("session.input", {
+        session_id: created.id,
+        text: "hello",
+        wait: { timeout_ms: 200 },
+      });
+
+      expect(result.activity).toBe("idle");
       await client.close();
     } finally {
       await daemon.close();
@@ -164,8 +190,8 @@ describe("@pohunek/testkit fixture daemon", () => {
     }
   });
 
-  test("session input wait returns a typed timeout without matching activity", async () => {
-    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-timeout") } });
+  test("session input wait rejects delayed provider framing before delivery", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-delayed") } });
     try {
       const client = await connectLocal(requireUnixSocket(daemon));
       const created = await client.call("session.new", {
@@ -177,8 +203,34 @@ describe("@pohunek/testkit fixture daemon", () => {
       await expectProtocolError(client.call("session.input", {
         session_id: created.id,
         text: "hello",
+        wait: {},
+      }), "session_input_wait_unsupported");
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("session input wait returns a typed timeout without matching activity", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-timeout") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const created = await client.call("session.new", {
+        agent: "shell",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      });
+
+      const error = await client.call("session.input", {
+        session_id: created.id,
+        text: "hello",
         wait: { until: ["idle"], timeout_ms: 10 },
-      }), "session_input_timeout");
+      }).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(ClientError);
+      const structured = (error as ClientError).toProtocolError();
+      expect(structured.code).toBe("session_input_timeout");
+      expect(structured.recover).toContain("inspect the current session");
+      expect(structured.recover).toContain("do not retry blindly");
       await client.close();
     } finally {
       await daemon.close();

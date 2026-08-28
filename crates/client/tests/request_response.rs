@@ -450,7 +450,7 @@ async fn input_wait_without_timeout_uses_dedicated_connection_and_headroom() {
             session_id: protocol::SessionId("s-1".to_owned()),
             text: "hello".to_owned(),
             wait: Some(protocol::SessionInputWait {
-                until: vec![protocol::AgentActivity::Idle],
+                until: Some(vec![protocol::AgentActivity::Idle]),
                 timeout_ms: None,
             }),
         })

@@ -452,6 +452,66 @@ describe("Client request/response", () => {
     }
   });
 
+  test("input wait normalizes absent targets before wire validation", async () => {
+    const input = {
+      accepted: true,
+      activity: "idle",
+      activity_source: "report",
+      runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+      activity_epoch: "d-epoch-1",
+      activity_revision: "2",
+    } as const;
+    const daemon = await startUnixDaemon([{
+      kind: "reply",
+      line: (line) => okResponseLine(requestIdFromLine(line), input),
+    }]);
+    try {
+      const client = await connectClient(daemon);
+
+      expect(await client.sessionInput({
+        session_id: "s-target",
+        text: "hello",
+        wait: {},
+      })).toEqual(input);
+
+      const request = parseRequestLine(await daemon.nextRequest());
+      expect(request["params"]).toEqual({
+        session_id: "s-target",
+        text: "hello",
+        wait: { until: [] },
+      });
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("session input timeout preserves unknown-delivery recovery", async () => {
+    const source: ProtocolError = {
+      class: "runtime",
+      code: "session_input_timeout",
+      msg: "the overall input deadline elapsed before delivery and requested activity were confirmed",
+      recover: "delivery outcome may be unknown; inspect the current session before deciding whether to resend, and do not retry blindly",
+    };
+    const daemon = await startUnixDaemon([{
+      kind: "reply",
+      line: (line) => errResponseLine(requestIdFromLine(line), source),
+    }]);
+    try {
+      const client = await connectClient(daemon);
+      const error = await expectClientError(client.sessionInput({
+        session_id: "s-target",
+        text: "hello",
+        wait: {},
+      }));
+
+      expect(error.toProtocolError().recover).toBe(source.recover);
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
   test("input wait rejects a legacy success without runtime evidence", async () => {
     const daemon = await startUnixDaemon([
       {

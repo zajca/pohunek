@@ -860,11 +860,12 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       this.pty.writeToSession(session.id, encoder.encode(params.text));
       return okResponse(request.id, { accepted: true } satisfies SessionInputResult);
     }
+    const until = isRecord(params.wait) ? params.wait.until : undefined;
     if (
       !isRecord(params.wait)
       || !hasOnlyKeys(params.wait, ["until", "timeout_ms"])
-      || !Array.isArray(params.wait.until)
-      || params.wait.until.some((activity) => !isAgentActivity(activity))
+      || (until !== undefined && !Array.isArray(until))
+      || (Array.isArray(until) && until.some((activity) => !isAgentActivity(activity)))
       || (params.wait.timeout_ms !== undefined && !isPositiveInteger(params.wait.timeout_ms))
     ) {
       if (isRecord(params.wait) && params.wait.timeout_ms === 0) {
@@ -872,12 +873,16 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       }
       return errResponse(request.id, invalidParams(request.method));
     }
+    const normalizedUntil = until ?? [];
     const timeoutMs = params.wait.timeout_ms ?? MAX_SESSION_WAIT_MS;
     if (timeoutMs > MAX_SESSION_WAIT_MS) {
       return errResponse(request.id, sessionWaitLimitExceeded());
     }
+    if (session.agent_base !== "shell") {
+      return errResponse(request.id, sessionInputWaitUnsupported());
+    }
     const targets = new Set<AgentActivity>(
-      params.wait.until.length === 0 ? ["idle", "blocked"] : params.wait.until,
+      normalizedUntil.length === 0 ? ["idle", "blocked"] : normalizedUntil,
     );
     const afterRevision = this.activityRevisions.get(session.id) ?? 0n;
     const observation = this.observation(session.id);
@@ -2169,6 +2174,16 @@ function sessionInputTimeout(): ProtocolError {
     "runtime",
     "session_input_timeout",
     "the overall input deadline elapsed before delivery and requested activity were confirmed",
+    "delivery outcome may be unknown; inspect the current session before deciding whether to resend, and do not retry blindly",
+  );
+}
+
+function sessionInputWaitUnsupported(): ProtocolError {
+  return protocolError(
+    "runtime",
+    "session_input_wait_unsupported",
+    "bounded input confirmation is unavailable for agents that require delayed submit framing",
+    "use fire-and-forget input only when safe, or select a zero-delay agent profile",
   );
 }
 

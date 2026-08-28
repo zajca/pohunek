@@ -461,7 +461,7 @@ fn notification_create_params_json_shape_roundtrips() {
         session_id: SessionId("s-42".to_owned()),
         text: "write tests first".to_owned(),
         wait: Some(SessionInputWait {
-            until: vec![AgentActivity::Idle, AgentActivity::Blocked],
+            until: Some(vec![AgentActivity::Idle, AgentActivity::Blocked]),
             timeout_ms: Some(MAX_SESSION_WAIT_MS),
         }),
     };
@@ -478,6 +478,18 @@ fn notification_create_params_json_shape_roundtrips() {
         })
     );
     assert_eq!(line_roundtrip(&waiting), waiting);
+
+    let absent_until: SessionInputParams = serde_json::from_value(json!({
+        "session_id": "s-42",
+        "text": "write tests first",
+        "wait": { "timeout_ms": 1000 }
+    }))
+    .expect("absent wait targets use the serde default");
+    assert_eq!(
+        absent_until.wait.expect("wait contract").until,
+        None,
+        "the SDK layer normalizes absent targets before sending"
+    );
 
     let overflow = json!({
         "session_id": "s-42",
@@ -3144,7 +3156,6 @@ fn m1_observation_errors_are_stable_and_payload_free() {
         ProtocolError::session_input_rejected(),
         ProtocolError::session_input_blocked(),
         ProtocolError::session_agent_blocked(),
-        ProtocolError::session_input_timeout(),
         ProtocolError::session_terminal_unavailable(),
         ProtocolError::session_has_no_managed_terminal(),
         ProtocolError::session_runtime_changed(),
@@ -3159,6 +3170,18 @@ fn m1_observation_errors_are_stable_and_payload_free() {
         assert!(!error.msg.contains("base64"));
         assert_eq!(line_roundtrip(&error), error);
     }
+
+    let timeout = ProtocolError::session_input_timeout();
+    assert_eq!(timeout.class, ErrorClass::Runtime);
+    let timeout_recovery = timeout.recover.as_deref().expect("timeout recovery hint");
+    assert!(timeout_recovery.contains("inspect the current session"));
+    assert!(timeout_recovery.contains("do not retry blindly"));
+    assert_eq!(line_roundtrip(&timeout), timeout);
+
+    let unsupported = ProtocolError::session_input_wait_unsupported();
+    assert_eq!(unsupported.class, ErrorClass::Runtime);
+    assert!(unsupported.recover.is_some());
+    assert_eq!(line_roundtrip(&unsupported), unsupported);
 
     let response = Response::err(
         PROTOCOL_VERSION,

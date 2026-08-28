@@ -66,7 +66,7 @@ impl SessionRegistry {
 
         let mut wait = wait;
         let mut seen = Vec::new();
-        wait.until.retain(|activity| {
+        wait.until.get_or_insert_with(Vec::new).retain(|activity| {
             if seen.contains(activity) {
                 false
             } else {
@@ -118,16 +118,7 @@ impl SessionRegistry {
         match runtime {
             RuntimeHandle::Worker(worker) => {
                 worker
-                    .write(vec![
-                        WorkerInputFragment {
-                            bytes: SecretBytes::new(writes.body),
-                            delay_after_ms: duration_millis(writes.submit_delay),
-                        },
-                        WorkerInputFragment {
-                            bytes: SecretBytes::new(SUBMIT.to_vec()),
-                            delay_after_ms: 0,
-                        },
-                    ])
+                    .write(worker_input_fragments(writes, Duration::ZERO))
                     .await
                     .map_err(worker_error_to_protocol)?;
             }
@@ -166,7 +157,7 @@ impl SessionRegistry {
                 .get(session_id)
                 .ok_or_else(|| session_not_found(&session_id.0))?;
             let runtime = input_runtime_identity(entry, session_id)?;
-            entry.input_rules.validate_activity(entry.info.activity)?;
+            reject_blocked_wait(entry.info.activity)?;
             let worker = match &entry.runtime {
                 RuntimeHandle::Worker(worker) => worker.clone(),
                 RuntimeHandle::Unavailable(state) => {
@@ -176,21 +167,14 @@ impl SessionRegistry {
             (worker, entry.input_rules, runtime)
         };
         let writes = build_input_writes(text, rules)?;
-        if writes.submit_delay >= deadline.saturating_duration_since(tokio::time::Instant::now()) {
-            return Err(ProtocolError::session_input_timeout());
-        }
-        self.wait_before_submit(writes.submit_delay, deadline)
-            .await?;
+        validate_wait_framing(writes.submit_delay)?;
         let boundary = self
             .input_activity_snapshot(session_id, Some(&runtime))
             .await?;
-        rules.validate_activity(boundary.activity)?;
+        reject_blocked_wait(boundary.activity)?;
         self.write_worker_before_deadline(
             worker,
-            vec![WorkerInputFragment {
-                bytes: SecretBytes::new(submitted_input(writes.body)),
-                delay_after_ms: duration_millis(plan_ack_delay),
-            }],
+            worker_input_fragments(writes, plan_ack_delay),
             deadline,
         )
         .await?;
@@ -261,26 +245,6 @@ impl SessionRegistry {
         }
     }
 
-    async fn wait_before_submit(
-        &self,
-        delay: Duration,
-        deadline: tokio::time::Instant,
-    ) -> Result<(), ProtocolError> {
-        if delay.is_zero() {
-            return Ok(());
-        }
-        tokio::select! {
-            biased;
-            () = self.inner.event_log_shutdown.cancelled() => Err(input_wait_shutdown_error(
-                "daemon shutdown cancelled input before submit",
-            )),
-            () = tokio::time::sleep_until(deadline) => {
-                Err(ProtocolError::session_input_timeout())
-            }
-            () = tokio::time::sleep(delay) => Ok(()),
-        }
-    }
-
     pub(super) async fn input_activity_snapshot(
         &self,
         session_id: &SessionId,
@@ -308,10 +272,11 @@ impl SessionRegistry {
         submission: InputSubmission,
         events: &mut broadcast::Receiver<protocol::Event>,
     ) -> Result<SessionInputResult, ProtocolError> {
-        let targets: &[AgentActivity] = if wait.until.is_empty() {
+        let until = wait.until.as_deref().unwrap_or_default();
+        let targets: &[AgentActivity] = if until.is_empty() {
             &DEFAULT_INPUT_WAIT_UNTIL
         } else {
-            &wait.until
+            until
         };
         loop {
             tokio::select! {
@@ -542,7 +507,34 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn submitted_input(mut body: Vec<u8>) -> Vec<u8> {
-    body.extend_from_slice(SUBMIT);
-    body
+fn reject_blocked_wait(activity: Option<AgentActivity>) -> Result<(), ProtocolError> {
+    if activity == Some(AgentActivity::Blocked) {
+        Err(ProtocolError::session_agent_blocked())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_wait_framing(submit_delay: Duration) -> Result<(), ProtocolError> {
+    if submit_delay.is_zero() {
+        Ok(())
+    } else {
+        Err(ProtocolError::session_input_wait_unsupported())
+    }
+}
+
+pub(super) fn worker_input_fragments(
+    writes: InputWritePlan,
+    acknowledgement_delay: Duration,
+) -> Vec<WorkerInputFragment> {
+    vec![
+        WorkerInputFragment {
+            bytes: SecretBytes::new(writes.body),
+            delay_after_ms: duration_millis(writes.submit_delay),
+        },
+        WorkerInputFragment {
+            bytes: SecretBytes::new(SUBMIT.to_vec()),
+            delay_after_ms: duration_millis(acknowledgement_delay),
+        },
+    ]
 }

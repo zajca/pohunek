@@ -111,13 +111,17 @@ export class Client {
 
   public async sessionInput(params: SessionInputParams): Promise<SessionInputResult> {
     if (params.wait !== undefined) {
-      const timeoutMs = validatedInputWaitTimeout(params.wait);
+      const wait = {
+        ...params.wait,
+        until: params.wait.until ?? [],
+      };
+      const timeoutMs = validatedInputWaitTimeout(wait);
       const result = await this.callDedicated(
         "session.input",
-        params,
+        { ...params, wait },
         timeoutMs,
       );
-      return validateInputWaitResult(params.wait.until, result);
+      return validateInputWaitResult(wait.until, result);
     }
     return this.call("session.input", params);
   }
@@ -327,7 +331,7 @@ function validatedInputWaitTimeout(wait: SessionInputWait): number {
 }
 
 function validateInputWaitResult(
-  until: SessionInputWait["until"],
+  until: NonNullable<SessionInputWait["until"]>,
   value: unknown,
 ): SessionInputResult {
   if (typeof value !== "object" || value === null) {

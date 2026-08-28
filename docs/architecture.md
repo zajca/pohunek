@@ -366,19 +366,28 @@ Kandev's hard-won handling:
 These per-agent input rules live in the agent adapter next to its launch command,
 state manifest, and resume command.
 
+Every worker input plan preserves provider framing as two fragments: the body
+fragment owns the provider submit delay and a separate fragment carries the
+submit byte. The per-session input gate serializes that complete plan against
+both waited and fire-and-forget calls. Fire-and-forget retains each provider's
+blocked-input policy and delayed submit behavior.
+
 An optional bounded input wait uses one overall deadline measured before
-delivery. Waiting for the per-session input gate and the profile submit delay
-consume the same budget advertised to Rust and TypeScript transports. The daemon
-does not stage waited text in the PTY: it waits first, then captures a
-runtime-scoped activity revision, revalidates blocked activity, and sends body
-plus submit as one worker input plan. This moves the causal boundary slightly
-earlier than a pre-staged Enter, but prevents timeout, blocked approval, or a
-concurrent input from leaving unsubmitted text for a later request. The input
-gate serializes the complete framing transaction against both waited and
-fire-and-forget calls. Timed-out worker exchanges remain cancellation-shielded
+delivery. Waiting for the per-session input gate consumes the same budget
+advertised to Rust and TypeScript transports. A waited request rejects blocked
+activity with `session_agent_blocked` both before the gate and at the causal
+boundary, independently of the provider's fire-and-forget policy. The daemon
+cannot revalidate activity inside a worker-owned delay or safely retract body
+text already consumed by an arbitrary TUI. It therefore rejects nonzero-delay
+wait framing with `session_input_wait_unsupported` before writing any bytes.
+For zero-delay framing, the daemon captures the runtime-scoped activity boundary
+immediately before sending the two-fragment worker plan. This fail-closed tradeoff
+preserves provider paste-burst behavior without risking an Enter against a newly
+visible approval UI. Timed-out worker exchanges remain cancellation-shielded
 until their late acknowledgement is consumed; once the atomic plan was sent,
-delivery outcome is unknown and clients must not retry blindly. A fixed upper
-deadline rejects evidence observed later, including the timeout recheck.
+delivery outcome may be unknown, so clients inspect the session and never retry
+blindly. A fixed upper deadline rejects evidence observed later, including the
+timeout recheck.
 Each event carries its runtime identity, daemon `activity_epoch`, and exact
 decimal-string activity revision. The registry retains the latest evidence for
 the full maximum wait window, subject to a hard per-session memory bound, so a

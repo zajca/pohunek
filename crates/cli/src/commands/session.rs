@@ -1103,7 +1103,7 @@ fn input_params(
         session_id: SessionId(target.session_id.clone()),
         text: text.to_owned(),
         wait: (!wait_until.is_empty() || timeout_ms.is_some()).then(|| SessionInputWait {
-            until: wait_until.to_vec(),
+            until: Some(wait_until.to_vec()),
             timeout_ms,
         }),
     }
