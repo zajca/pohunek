@@ -37,7 +37,15 @@ The assistant must:
   below a trusted config root is safe absence; installation creates it as
   `0700`, never chmods an existing real user directory, and rejects unsafe path
   shapes. Codex trust identity covers a canonical single-handler managed group,
-  so sibling handlers cannot inherit the managed trust record.
+  so sibling handlers cannot inherit the managed trust record. Its managed
+  trust-key set is exact; stale managed keys and tables are removed on reinstall.
+- Require `CLAUDE_CONFIG_DIR` and `CODEX_HOME` to resolve to absolute UTF-8 paths
+  before registration commands are constructed. Before any integration install
+  mutation, open and validate all existing config and hook parents within the
+  explicit trust anchor. Perform temporary-file creation, mode setting, and
+  replacement relative to those open directory descriptors so concurrent name
+  swaps cannot redirect writes. Preserve safe existing provider-file modes and
+  create new registration files as owner-readable and owner-writable only.
 - Avoid weakening owner-only profile checks, name guards, path containment, or
   remote safety gates.
 - Treat worker control sockets and journals as owner-private runtime authority.

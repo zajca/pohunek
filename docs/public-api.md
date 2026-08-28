@@ -805,7 +805,9 @@ one. Every managed script is checked independently against its embedded asset
 and executable mode. Claude must also contain every exact managed registration
 in `settings.json`. Codex must contain every exact registration in `hooks.json`,
 have the hooks feature enabled, and retain the position-derived trust hash for
-each managed hook in `config.toml`.
+each managed hook in `config.toml`. The managed Codex trust-key set must be
+exact: stale managed keys or tables make the integration outdated, and
+reinstallation removes them before writing only the currently expected keys.
 
 `not_installed` means no Pohunek-managed asset or registration was detected;
 `current` means the complete contract above matches; `outdated` covers every
@@ -838,18 +840,32 @@ wrong type, foreign owner, or group/world-writable child requires
 directory as mode `0700`, but never changes permissions on an existing real user
 directory. Codex trust records describe a canonical single-handler managed
 group, so adding a sibling handler makes status non-current until reinstall
-separates the managed handler while preserving the user sibling. An oversized
-file is `outdated` with an actionable warning. The CLI routes Codex and Claude status to
-the effective global `--host`; mutating hook installation and every Hermes
-lifecycle action remain local. Human recovery hints and warning commands for a
-remote report explicitly name the daemon host where the operator must run the
-local installer; passing that host back to `integration install` is not a remote
-mutation. A JSON registration root that is not an object, an inline TOML table
-where the installer requires a regular table, a scalar installer-owned trust
-key, and managed-asset metadata errors other than absence require
-`repair_configuration`. A missing `hooks` object remains reinstallable, and a
-handler with an exact installer-owned command identity is safely replaced even
-when its `type` field drifted. All enum values use snake_case on the wire.
+separates the managed handler while preserving the user sibling. Agent config
+roots selected through `CLAUDE_CONFIG_DIR` or `CODEX_HOME` must be absolute and
+UTF-8 representable after tilde expansion. Invalid roots fail with
+`agent_config_dir_invalid` before registration commands are constructed, so a
+daemon working directory cannot change where a provider process resolves them.
+Before any mutation, installation opens and validates every existing config and
+hook parent as a no-follow, effective-UID-owned real directory without group or
+world write access. An unsafe parent fails with
+`configuration/integration_path_untrusted`. Provider files are prepared in
+memory, then replaced through the already-opened directory descriptor using an
+exclusive temporary file, `fchmod`, and `renameat`; parent or pathname swaps
+cannot redirect the write. Existing safe provider-file modes are preserved,
+while new registration files use mode `0600` and managed executable assets use
+mode `0755`. An oversized file is `outdated` with an actionable warning. The CLI
+routes Codex and Claude status to the effective global `--host`; mutating hook
+installation and every Hermes lifecycle action remain local. Human recovery
+hints and warning commands for a remote report explicitly name the daemon host
+where the operator must run the local installer; passing that host back to
+`integration install` is not a remote mutation. A JSON registration root that
+is not an object, an inline TOML table where the installer requires a regular
+table, a scalar value at a currently expected installer-owned trust key, and
+managed-asset metadata errors other than absence require
+`repair_configuration`. A scalar under a stale managed trust key is safely
+removed like a stale table. A missing `hooks` object remains reinstallable, and
+a handler with an exact installer-owned command identity is safely replaced
+even when its `type` field drifted. All enum values use snake_case on the wire.
 
 Codex notification support requires modern lifecycle hooks for
 `PermissionRequest` and `Stop`. The installer writes managed command hooks to
@@ -922,7 +938,7 @@ Canonical public codes currently emitted include:
 
 | Class | Codes |
 |---|---|
-| `configuration` | `paths_unavailable`, `netbird_invalid_config`, `invalid_discovery_options` |
+| `configuration` | `paths_unavailable`, `netbird_invalid_config`, `invalid_discovery_options`, `agent_config_dir_invalid`, `integration_path_untrusted` |
 | `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback` |
 | `transport` | `framing`, `host_unreachable`, `request_timeout` |
 | `discovery` | `netbird_cli_missing`, `netbird_state_unavailable`, `host_unknown`, `remote_discovery_failed` |

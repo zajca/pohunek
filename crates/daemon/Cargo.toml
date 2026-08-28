@@ -38,6 +38,7 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true }
+rustix = { version = "1", features = ["fs"] }
 time = { workspace = true }
 zbus = { workspace = true }
 ulid = { workspace = true }

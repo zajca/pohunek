@@ -80,16 +80,28 @@ For durable notification issues:
    no-follow and require effective-UID ownership plus no group/world write bits;
    their metadata and bounded content come from the same descriptor. Codex
    managed trust uses a canonical single-handler group, so a sibling handler is
-   drift even when the managed command itself is unchanged. Follow the typed
+   drift even when the managed command itself is unchanged. The managed trust
+   key set must also be exact; stale managed keys or tables are reinstallable
+   drift and are removed during reinstall. `CLAUDE_CONFIG_DIR` and `CODEX_HOME`
+   must resolve to absolute UTF-8 paths, which keeps generated registrations
+   independent of the daemon and provider working directories. Follow the typed
    recovery action: `reinstall` means the installer
    can repair every finding, while `repair_configuration` means provider files,
    symlinked, special, foreign-owned, or group/world-writable managed assets or
    parents, invalid registration roots, incompatible TOML table shapes, and
-   installer-owned scalar trust entries must be inspected and fixed first. A
-   missing `hooks` object and an exact owned command with drifted handler metadata
-   remain safely reinstallable. Oversized and non-regular files are rejected by
-   bounded, nonblocking inspection and reported with the applicable recovery.
-   Status itself never repairs or rewrites provider configuration.
+   scalar values at currently expected installer-owned trust keys must be
+   inspected and fixed first. Scalars under stale managed keys are removed like
+   stale tables. A missing `hooks` object and an exact owned command with drifted
+   handler metadata remain safely reinstallable. Oversized and non-regular files
+   are rejected by bounded, nonblocking inspection and reported with the
+   applicable recovery.
+   Status itself never repairs or rewrites provider configuration. Installation
+   validates all existing config and hook parents before any mutation and fails
+   unsafe parents with `configuration/integration_path_untrusted`. It performs
+   replacements through already-opened directory descriptors with exclusive
+   temporary files, explicit modes, and descriptor-relative rename, so a
+   concurrent parent-name swap cannot redirect a managed write. Existing safe
+   provider-file modes are preserved; new registration files use `0600`.
 9. If a notification is missing its session link, inspect the hook environment
    setup. Hook adapters silently drop an invalid `POHUNEK_SESSION_ID` and still
    create the notification without linkage.
