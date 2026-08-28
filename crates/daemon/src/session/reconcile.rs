@@ -21,7 +21,7 @@ use crate::procwatch::ProcessInspector;
 use crate::session::target::open_detector_output;
 use crate::store::{ResumeBinding, SessionWriteOutcome};
 
-// Rust guideline compliant 2026-07-29
+// Rust guideline compliant 2026-08-28
 
 #[derive(Debug, Clone)]
 struct DiscoveredWorker {
@@ -1197,6 +1197,7 @@ fn active_report_from_info(info: &protocol::SessionInfo) -> Option<ActiveAgentRe
         agent: info.active_agent.clone()?,
         seq: None,
         pid: info.active_agent_pid,
+        start_identity: None,
         reported_at: std::time::Instant::now(),
         activity_reported: false,
     })
@@ -1211,6 +1212,7 @@ fn release_tombstone(
         agent: release.provider.clone(),
         seq: Some(release.sequence),
         pid: Some(release.process.pid),
+        start_identity: Some(release.process.start_identity),
         reported_at: std::time::Instant::now(),
         activity_reported: false,
     }
@@ -1281,6 +1283,7 @@ fn apply_worker_identities(
             agent: identity.provider.clone(),
             seq: Some(identity.sequence),
             pid: Some(identity.process.pid),
+            start_identity: Some(identity.process.start_identity),
             reported_at: std::time::Instant::now(),
             activity_reported: false,
         }),

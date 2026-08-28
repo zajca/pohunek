@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -885,9 +885,16 @@ struct MockInspectorState {
     descendants_error: Option<std::io::ErrorKind>,
     foreground_groups: HashMap<Pid, Option<Pid>>,
     foreground_error: Option<std::io::ErrorKind>,
+    foreground_block: Option<Arc<ForegroundBlock>>,
     cwd: HashMap<Pid, PathBuf>,
     exits: HashMap<Pid, tokio::sync::watch::Sender<bool>>,
     ownership_markers: HashMap<Pid, OwnershipMarkers>,
+}
+
+#[derive(Debug, Default)]
+struct ForegroundBlock {
+    entered: AtomicBool,
+    released: AtomicBool,
 }
 
 impl MockInspector {
@@ -918,6 +925,22 @@ impl MockInspector {
             .lock()
             .expect("mock inspector lock")
             .foreground_error = Some(kind);
+    }
+
+    fn clear_foreground_error(&self) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .foreground_error = None;
+    }
+
+    fn block_foreground(&self) -> Arc<ForegroundBlock> {
+        let block = Arc::new(ForegroundBlock::default());
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .foreground_block = Some(Arc::clone(&block));
+        block
     }
 
     fn fire_exit(&self, pid: Pid) {
@@ -1031,11 +1054,24 @@ impl ProcessInspector for MockInspector {
     }
 
     fn foreground_process_group(&self, root_pid: Pid) -> std::io::Result<Option<Pid>> {
-        let inner = self.inner.lock().expect("mock inspector lock");
-        if let Some(kind) = inner.foreground_error {
+        let (kind, foreground, block) = {
+            let inner = self.inner.lock().expect("mock inspector lock");
+            (
+                inner.foreground_error,
+                inner.foreground_groups.get(&root_pid).copied().flatten(),
+                inner.foreground_block.clone(),
+            )
+        };
+        if let Some(block) = block {
+            block.entered.store(true, Ordering::Release);
+            while !block.released.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        }
+        if let Some(kind) = kind {
             return Err(std::io::Error::new(kind, "mock foreground failure"));
         }
-        Ok(inner.foreground_groups.get(&root_pid).copied().flatten())
+        Ok(foreground)
     }
 }
 
@@ -1066,19 +1102,35 @@ async fn foreground_leader_selects_agent_and_shell_return_clears_claim() {
     assert_eq!(rebound.active_agent_pid, Some(310));
 
     inspector.set_foreground_group(created.pid, Some(created.pid));
-    registry
-        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
-        .await;
-    let cleared = registry.inspect(&created.id).await.expect("inspect");
-    assert_eq!(cleared.active_agent, None);
-    assert_eq!(cleared.active_agent_base, None);
-    assert_eq!(cleared.active_agent_pid, None);
+    for _ in 0..DIRECT_AGENT_RESCAN_COUNT {
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let cleared = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(cleared.active_agent, None);
+        assert_eq!(cleared.active_agent_base, None);
+        assert_eq!(cleared.active_agent_pid, None);
+    }
+
+    let _ = registry.stop(&created.id).await;
 }
 
 #[tokio::test]
 async fn foreign_foreground_process_does_not_hijack_reconciliation() {
     let (registry, inspector, created) = mock_procwatch_registry("foreground-foreign").await;
-    inspector.set_descendants(created.pid, Vec::new());
+    let mut foreign = codex_fact(FOREIGN_AGENT_PID, created.pid);
+    foreign.pgid = FOREIGN_AGENT_PID;
+    inspector.set_descendants(
+        created.pid,
+        vec![foreign, codex_fact(FOREIGN_AGENT_PID + 1, created.pid)],
+    );
+    inspector.set_ownership_markers(
+        FOREIGN_AGENT_PID,
+        OwnershipMarkers {
+            daemon_id: Some("foreign-daemon".to_owned()),
+            session_id: Some("foreign-session".to_owned()),
+        },
+    );
     let root_cwd = temp_dir("foreign-foreground-root");
     inspector.set_cwd(created.pid, root_cwd.clone());
     inspector.set_foreground_group(created.pid, Some(FOREIGN_AGENT_PID));
@@ -1096,8 +1148,8 @@ async fn foreign_foreground_process_does_not_hijack_reconciliation() {
 async fn foreground_member_matches_pgid_without_crossing_groups() {
     let (registry, inspector, created) = mock_procwatch_registry("foreground-member").await;
 
-    // The wrapper is the recognized leader but not an identified agent. Its PGID
-    // identifies the group; a same-kind process in another group must never win.
+    // The unrecognized wrapper owns the foreground group. Only a recognized
+    // member of that exact PGID is eligible; another group must never win.
     let mut wrapper = ProcessFact {
         comm: "wrapper".to_owned(),
         cmdline: vec!["/usr/bin/wrapper".to_owned()],
@@ -1110,14 +1162,46 @@ async fn foreground_member_matches_pgid_without_crossing_groups() {
     inspector.set_descendants(created.pid, vec![wrapper, member, unrelated]);
     inspector.set_foreground_group(created.pid, Some(399));
 
+    for _ in 0..DIRECT_AGENT_RESCAN_COUNT {
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let selected = registry.inspect(&created.id).await.expect("inspect");
+
+        assert_eq!(selected.active_agent.as_deref(), Some("claude"));
+        assert_eq!(selected.active_agent_base, Some(AgentKind::Claude));
+        assert_eq!(selected.active_agent_pid, Some(410));
+    }
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn foreground_recognized_leader_wins_over_older_same_kind_other_group() {
+    let (registry, inspector, created) = mock_procwatch_registry("foreground-exact-leader").await;
+    inspector.set_descendants(created.pid, vec![codex_fact(430, created.pid)]);
     registry
         .rescan_procwatch_at(&created.id, created.pid, Instant::now())
         .await;
-    let selected = registry.inspect(&created.id).await.expect("inspect");
 
-    assert_eq!(selected.active_agent.as_deref(), Some("claude"));
-    assert_eq!(selected.active_agent_base, Some(AgentKind::Claude));
-    assert_eq!(selected.active_agent_pid, Some(410));
+    let mut leader = codex_fact(440, created.pid);
+    leader.pgid = 440;
+    let mut member = claude_fact(441, 440);
+    member.pgid = 440;
+    inspector.set_descendants(
+        created.pid,
+        vec![codex_fact(430, created.pid), member, leader],
+    );
+    inspector.set_foreground_group(created.pid, Some(440));
+
+    for _ in 0..DIRECT_AGENT_RESCAN_COUNT {
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let selected = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(selected.active_agent.as_deref(), Some("codex"));
+        assert_eq!(selected.active_agent_pid, Some(440));
+    }
 
     let _ = registry.stop(&created.id).await;
 }
@@ -1160,6 +1244,8 @@ async fn foreground_replacement_replaces_hook_identity_and_detector() {
     assert_eq!(replaced.active_agent_pid, Some(500));
     assert_eq!(replaced.active_agent_session_id, None);
     assert_eq!(replaced.active_agent_session_path, None);
+    assert_eq!(replaced.activity, None);
+    assert_eq!(replaced.state_source, StateSource::Process);
     assert_eq!(
         replacement_detector.borrow().detection,
         DetectorConfig::for_agent(&AgentKind::Claude).detection
@@ -1186,7 +1272,7 @@ async fn transient_foreground_error_preserves_last_known_claim() {
     );
 
     inspector.fail_foreground_with(std::io::ErrorKind::PermissionDenied);
-    inspector.set_descendants(created.pid, vec![codex_fact(600, created.pid)]);
+    inspector.set_descendants(created.pid, vec![codex_fact(610, created.pid)]);
     registry
         .rescan_procwatch_at(&created.id, created.pid, Instant::now())
         .await;
@@ -1202,8 +1288,16 @@ async fn transient_foreground_error_preserves_last_known_claim() {
         Some(600)
     );
 
-    inspector.set_descendants(created.pid, vec![codex_fact(600, created.pid)]);
-    inspector.set_foreground_group(created.pid, Some(600));
+    inspector.clear_foreground_error();
+    inspector.set_foreground_group(created.pid, Some(610));
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let recovered = registry
+        .inspect(&created.id)
+        .await
+        .expect("recovered inspect");
+    assert_eq!(recovered.active_agent_pid, Some(610));
 
     let _ = registry.stop(&created.id).await;
 }
@@ -4505,6 +4599,8 @@ const PID_REUSE_AGENT_PID: Pid = 225;
 const FOREIGN_AGENT_PID: Pid = 240;
 /// Delay separating pid-reuse observations so `first_seen` changes if reset.
 const PID_REUSE_RESCAN_DELAY: Duration = Duration::from_millis(5);
+/// Bound proving a blocked foreground probe does not hold the session mutex.
+const FOREGROUND_LOCK_TEST_TIMEOUT: Duration = Duration::from_secs(1);
 
 async fn mock_procwatch_registry(tag: &str) -> (SessionRegistry, Arc<MockInspector>, SessionInfo) {
     let inspector = Arc::new(MockInspector::default());
@@ -4605,6 +4701,7 @@ async fn direct_agent_root_pid_hook_claim_survives_procwatch_reconciles() {
     let (registry, inspector, created) = mock_direct_codex_registry("direct-root").await;
     inspector.set_descendants(created.pid, Vec::new());
     inspector.set_cwd(created.pid, temp_dir("direct-root-cwd"));
+    inspector.set_foreground_group(created.pid, Some(created.pid));
 
     let report = registry
         .report_agent(SessionReportAgentParams {
@@ -4642,6 +4739,7 @@ async fn direct_agent_without_hook_does_not_auto_report_root() {
     let (registry, inspector, created) = mock_direct_codex_registry("direct-no-hook").await;
     inspector.set_descendants(created.pid, Vec::new());
     inspector.set_cwd(created.pid, temp_dir("direct-no-hook-cwd"));
+    inspector.set_foreground_group(created.pid, Some(created.pid));
 
     for _ in 0..DIRECT_AGENT_RESCAN_COUNT {
         registry
@@ -4653,6 +4751,39 @@ async fn direct_agent_without_hook_does_not_auto_report_root() {
         assert_eq!(inspected.active_agent_pid, None);
     }
 
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreground_probe_does_not_hold_global_session_lock() {
+    let (registry, inspector, created) = mock_procwatch_registry("foreground-lock").await;
+    inspector.set_descendants(created.pid, Vec::new());
+    inspector.set_foreground_group(created.pid, Some(created.pid));
+    let block = inspector.block_foreground();
+    let scan_registry = registry.clone();
+    let scan_id = created.id.clone();
+    let root_pid = created.pid;
+    let scan = tokio::spawn(async move {
+        scan_registry
+            .rescan_procwatch_at(&scan_id, root_pid, Instant::now())
+            .await;
+    });
+
+    tokio::time::timeout(FOREGROUND_LOCK_TEST_TIMEOUT, async {
+        while !block.entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("foreground probe should start");
+
+    tokio::time::timeout(FOREGROUND_LOCK_TEST_TIMEOUT, registry.inspect(&created.id))
+        .await
+        .expect("inspect must not wait for foreground probe")
+        .expect("inspect session");
+
+    block.released.store(true, Ordering::Release);
+    scan.await.expect("foreground rescan task");
     let _ = registry.stop(&created.id).await;
 }
 
@@ -4680,10 +4811,10 @@ async fn procwatch_refreshes_agent_base_when_pid_is_reused() {
         observed.first_seen
     };
 
-    inspector.set_descendants(
-        created.pid,
-        vec![claude_fact(PID_REUSE_AGENT_PID, created.pid)],
-    );
+    let mut replacement = claude_fact(PID_REUSE_AGENT_PID, created.pid);
+    replacement.start_identity = u64::from(PID_REUSE_AGENT_PID) + 1;
+    replacement.pgid = PID_REUSE_AGENT_PID + 10;
+    inspector.set_descendants(created.pid, vec![replacement]);
     let second_scan = first_seen + PID_REUSE_RESCAN_DELAY;
     registry
         .rescan_procwatch_at(&created.id, created.pid, second_scan)
@@ -4699,8 +4830,21 @@ async fn procwatch_refreshes_agent_base_when_pid_is_reused() {
             .find(|observed| observed.pid == PID_REUSE_AGENT_PID)
             .expect("observed reused pid");
         assert_eq!(observed.agent_base, AgentKind::Claude);
+        assert_eq!(observed.start_identity, u64::from(PID_REUSE_AGENT_PID) + 1);
+        assert_eq!(observed.pgid, PID_REUSE_AGENT_PID + 10);
         assert_eq!(observed.first_seen, second_scan);
     };
+
+    registry
+        .on_observed_agent_exit(
+            &created.id,
+            (PID_REUSE_AGENT_PID, u64::from(PID_REUSE_AGENT_PID)),
+        )
+        .await;
+    let after_old_exit = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(after_old_exit.active_agent.as_deref(), Some("claude"));
+    assert_eq!(after_old_exit.active_agent_pid, Some(PID_REUSE_AGENT_PID));
+
     let _ = registry.stop(&created.id).await;
 }
 

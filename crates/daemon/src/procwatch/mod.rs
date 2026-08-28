@@ -4,7 +4,7 @@
 //! against OS process facts. Linux is implemented first; other platforms can add
 //! backends behind the same trait without changing reconciliation code.
 
-// Rust guideline compliant 2026-08-25
+// Rust guideline compliant 2026-08-28
 
 use std::fmt::Debug;
 use std::io;
@@ -182,10 +182,11 @@ pub trait ProcessInspector: Debug + Send + Sync + 'static {
     /// Returns OS I/O errors that are not normal process-exit races.
     fn ownership_markers(&self, pid: Pid) -> io::Result<OwnershipMarkers>;
 
-    /// Returns the foreground process group of `pid`'s controlling terminal.
+    /// Returns the foreground process group reported for `pid` by the OS.
     ///
-    /// A process with no controlling terminal yields `None`. Implementations
-    /// treat process-exit races as `None`, mirroring the other inspection APIs.
+    /// A process with no controlling terminal, a foreign owner, or a process-exit
+    /// race yields `None`, mirroring the other inspection APIs. Linux reads the
+    /// signed `tpgid` field from `/proc/<pid>/stat`; negative values yield `None`.
     ///
     /// # Errors
     ///
