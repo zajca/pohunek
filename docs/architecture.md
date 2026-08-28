@@ -341,6 +341,10 @@ the active agent's manifest so Codex/Claude UI patterns are interpreted
 correctly inside the shell session. Releasing the active report clears the
 active fields and restores the shell/default detector manifest. See the resume
 model below.
+Each detector task is scoped to the exact worker id, runtime id, and runtime
+generation that created its output stream. Cancellation is advisory; a final
+transition from a superseded detector is discarded instead of being stamped
+with a replacement runtime's identity.
 
 ### Agent input injection (TUI quirks)
 
@@ -380,11 +384,14 @@ boundary, independently of the provider's fire-and-forget policy. The daemon
 cannot revalidate activity inside a worker-owned delay or safely retract body
 text already consumed by an arbitrary TUI. It therefore rejects nonzero-delay
 wait framing with `session_input_wait_unsupported` before writing any bytes.
-For zero-delay framing, the daemon captures the runtime-scoped activity boundary
-immediately before sending the two-fragment worker plan. This fail-closed tradeoff
+For zero-delay framing, the daemon first obtains the exclusive worker write
+reservation, then captures the runtime-scoped activity boundary immediately
+before starting the prepared two-fragment worker plan. A timeout or shutdown
+while acquiring that reservation cancels the unsent plan and writes no bytes.
+Once send starts, the worker exchange remains cancellation-shielded and retains
+the per-session input gate until its late acknowledgement is consumed. This fail-closed tradeoff
 preserves provider paste-burst behavior without risking an Enter against a newly
-visible approval UI. Timed-out worker exchanges remain cancellation-shielded
-until their late acknowledgement is consumed; once the atomic plan was sent,
+visible approval UI. Once the atomic plan was sent,
 delivery outcome may be unknown, so clients inspect the session and never retry
 blindly. A fixed upper deadline rejects evidence observed later, including the
 timeout recheck.

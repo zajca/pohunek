@@ -664,9 +664,18 @@ pub(crate) async fn run_input(
     json: bool,
 ) -> Result<(), CliError> {
     let mut client = Client::connect(host, paths).await?;
-    let input = client
-        .session_input(input_params(target, text, wait_until, timeout_ms))
-        .await?;
+    let params = input_params(target, text, wait_until, timeout_ms);
+    let input = if params.wait.is_some() {
+        tokio::select! {
+            result = client.session_input(params) => result?,
+            signal = process_cancellation() => {
+                signal?;
+                return Err(CliError::InputWaitInterrupted);
+            }
+        }
+    } else {
+        client.session_input(params).await?
+    };
 
     if json {
         print!("{}", crate::commands::render_json(&input)?);

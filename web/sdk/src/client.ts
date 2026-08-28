@@ -88,6 +88,16 @@ export class Client {
     method: K,
     params: Methods[K]["params"],
   ): Promise<Methods[K]["output"]> {
+    if (method === "session.input" && isWaitingSessionInput(params)) {
+      return this.sessionInput(params);
+    }
+    return this.callDirect(method, params);
+  }
+
+  private async callDirect<K extends keyof Methods>(
+    method: K,
+    params: Methods[K]["params"],
+  ): Promise<Methods[K]["output"]> {
     const request: Request = {
       v: SUPPORTED_PROTOCOL_VERSIONS,
       id: nextRequestId(String(method)),
@@ -113,7 +123,7 @@ export class Client {
     if (params.wait !== undefined) {
       const wait = {
         ...params.wait,
-        until: params.wait.until ?? [],
+        until: [...(params.wait.until ?? [])],
       };
       const timeoutMs = validatedInputWaitTimeout(wait);
       const result = await this.callDedicated(
@@ -123,7 +133,7 @@ export class Client {
       );
       return validateInputWaitResult(wait.until, result);
     }
-    return this.call("session.input", params);
+    return this.callDirect("session.input", params);
   }
 
   public async sessionWait(params: SessionWaitParams): Promise<SessionWaitResult> {
@@ -269,7 +279,7 @@ export class Client {
       this.remoteHost,
     );
     try {
-      return await client.call(method, params);
+      return await client.callDirect(method, params);
     } finally {
       await client.close();
     }
@@ -309,6 +319,13 @@ export class Client {
       throw ClientError.json(error);
     }
   }
+}
+
+function isWaitingSessionInput(value: unknown): value is SessionInputParams & { wait: SessionInputWait } {
+  return typeof value === "object"
+    && value !== null
+    && "wait" in value
+    && (value as { wait?: unknown }).wait !== undefined;
 }
 
 function validatedInputWaitTimeout(wait: SessionInputWait): number {

@@ -15,9 +15,9 @@ use pohunek_worker_protocol::{
 };
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{oneshot, Mutex, OwnedMutexGuard};
 
-// Rust guideline compliant 2026-08-04
+// Rust guideline compliant 2026-08-28
 
 /// Prefix for daemon-generated, producer-scoped control input identifiers.
 const INPUT_WRITE_ID_PREFIX: &str = "input";
@@ -109,6 +109,13 @@ pub struct Worker {
     socket_path: PathBuf,
     request_sequence: Arc<AtomicU64>,
     dimension_order: Arc<Mutex<()>>,
+}
+
+/// Prepared exclusive input write that has not started transport delivery.
+#[derive(Debug)]
+pub(crate) struct WriteReservation {
+    inner: OwnedMutexGuard<Inner>,
+    request: ControlRequest,
 }
 
 #[derive(Debug)]
@@ -493,7 +500,22 @@ impl Worker {
     ///
     /// Returns [`WorkerError`] for unavailable runtime or worker rejection.
     pub async fn write(&self, fragments: Vec<InputFragment>) -> Result<u64, WorkerError> {
-        let mut inner = self.inner.lock().await;
+        self.reserve_write(fragments).await?.commit(None).await
+    }
+
+    /// Reserves the worker control connection and prepares one input plan.
+    ///
+    /// The returned reservation owns the exclusive control mutex. Dropping it
+    /// before [`WriteReservation::commit`] writes no control bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError`] for unavailable runtime or invalid plan framing.
+    pub(crate) async fn reserve_write(
+        &self,
+        fragments: Vec<InputFragment>,
+    ) -> Result<WriteReservation, WorkerError> {
+        let mut inner = Arc::clone(&self.inner).lock_owned().await;
         let scope = scope(&inner)?;
         let sequence = inner.next_write_sequence;
         inner.next_write_sequence = sequence.checked_add(1).ok_or_else(|| {
@@ -502,16 +524,13 @@ impl Worker {
         let write_id = input_write_id(&inner.lease_id, sequence)?;
         let plan = InputPlan::new(write_id, fragments)
             .map_err(|error| WorkerError::Protocol(error.to_string()))?;
-        let response = request_locked(
-            &mut inner,
-            self.next_request_id("write")?,
-            RequestKind::WritePlan { scope, plan },
-        )
-        .await?;
-        match response {
-            ResponseKind::WriteCompleted { acknowledgement } => Ok(acknowledgement.bytes_written),
-            other => response_error(other),
-        }
+        Ok(WriteReservation {
+            inner,
+            request: ControlRequest {
+                request_id: self.next_request_id("write")?,
+                kind: RequestKind::WritePlan { scope, plan },
+            },
+        })
     }
 
     /// Applies an ordered PTY resize.
@@ -735,6 +754,32 @@ impl Worker {
         let sequence = self.request_sequence.fetch_add(1, Ordering::Relaxed);
         StreamId::new(format!("{operation}-{sequence}"))
             .map_err(|error| WorkerError::Protocol(error.to_string()))
+    }
+}
+
+impl WriteReservation {
+    /// Starts the prepared write and consumes its worker acknowledgement.
+    ///
+    /// `send_started` is completed immediately before the first control writer
+    /// await. Callers may cancel safely until that signal; after it, they must
+    /// keep this future alive until the acknowledgement is consumed.
+    pub(crate) async fn commit(
+        mut self,
+        send_started: Option<oneshot::Sender<()>>,
+    ) -> Result<u64, WorkerError> {
+        let inner = &mut *self.inner;
+        let response = exchange_marked(
+            &mut inner.reader,
+            &mut inner.writer,
+            self.request,
+            send_started,
+        )
+        .await?
+        .kind;
+        match response {
+            ResponseKind::WriteCompleted { acknowledgement } => Ok(acknowledgement.bytes_written),
+            other => response_error(other),
+        }
     }
 }
 
@@ -1047,7 +1092,19 @@ async fn exchange(
     writer: &mut ControlWriter<OwnedWriteHalf>,
     request: ControlRequest,
 ) -> Result<ControlResponse, WorkerError> {
+    exchange_marked(reader, writer, request, None).await
+}
+
+async fn exchange_marked(
+    reader: &mut ControlReader<OwnedReadHalf>,
+    writer: &mut ControlWriter<OwnedWriteHalf>,
+    request: ControlRequest,
+    send_started: Option<oneshot::Sender<()>>,
+) -> Result<ControlResponse, WorkerError> {
     let expected = request.request_id.clone();
+    if let Some(send_started) = send_started {
+        let _result = send_started.send(());
+    }
     writer
         .write(&ControlMessage::Request(request))
         .await

@@ -36,7 +36,8 @@ Hermes is visibly blocked on owner approval. In JSON mode, stdout contains
 exactly one versioned document with either `ok` or `err`; diagnostics remain on
 stderr.
 
-`pohunek session input --until idle --timeout 1000` can confirm delivery for an
+`pohunek session input s-01J00000000000000000000000 'Continue.' --until idle --timeout 1000`
+can confirm delivery for an
 agent profile whose submit framing has no delay. The daemon first validates the
 whole wait contract, so zero or over-limit timeouts cannot deliver text;
 duplicate `--until` values are deduplicated in first-occurrence order; omitted
@@ -50,9 +51,12 @@ as `session_agent_blocked` regardless of provider policy. Because the daemon
 cannot revalidate activity during a worker-owned delay or safely retract text
 already consumed by an arbitrary TUI, waited input rejects delayed framing with
 `session_input_wait_unsupported` before any bytes are written. Zero-delay waited
-input captures its causal boundary immediately before the atomic two-fragment
-plan. A timed-out worker exchange continues consuming its late acknowledgement
-to keep the shared control stream synchronized; after the plan is sent, delivery
+input reserves the exclusive worker write first, then captures its causal
+boundary immediately before the prepared atomic two-fragment plan starts. A
+timeout or shutdown while reserving the worker cancels the unsent plan without
+PTY bytes. After send starts, the exchange continues consuming its late
+acknowledgement and holds the per-session gate to keep the shared control stream
+synchronized; after the plan is sent, delivery
 outcome may be unknown, so callers inspect the session and do not retry blindly. Waiting
 acquires one observation waiter slot and returns exact post-submit evidence as
 `activity`, `activity_source`, `runtime`, `activity_epoch`, and decimal-string
@@ -68,6 +72,10 @@ SDK helpers validate the timeout locally and fail closed with
 `session_input_wait_contract_mismatch` when a daemon ignores `wait` or omits
 runtime-scoped evidence. Its recovery guidance says to inspect the session rather
 than blindly resending input because delivery may already have happened.
+Generic typed Rust and TypeScript `Client.call` paths route waited input through
+the same helper, so they cannot bypass this validation. SIGINT or SIGTERM during
+a waited CLI input returns JSON code `session_input_interrupted` without a retry
+hint because delivery outcome is unknown.
 
 `pohunek session diff <target> [--base <ref>] [--json]` prints a unified diff
 of a session's worktree against a base ref: raw diff text on stdout by

@@ -166,6 +166,12 @@ interface FixtureActivityEvidence {
   readonly revision: bigint;
 }
 
+type FixtureInputWaitEvent =
+  | { readonly kind: "activity"; readonly evidence: FixtureActivityEvidence }
+  | { readonly kind: "removed" }
+  | { readonly kind: "runtime_changed" }
+  | { readonly kind: "stopped" };
+
 const U64_MAX = 18_446_744_073_709_551_615n;
 const U64_DECIMAL_DIGITS = U64_MAX.toString().length;
 
@@ -218,11 +224,12 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
   private readonly projectWorktrees = new Map<string, ProjectWorktree[]>();
   private readonly sessionInitialAttachDimensions = new Map<string, TerminalDimensions[]>();
   private readonly sessionResizes = new Map<string, ScenarioResize[]>();
+  private readonly sessionInputs = new Map<string, Uint8Array[]>();
   private readonly observations = new Map<string, FixtureObservation>();
   private readonly activityRevisions = new Map<string, bigint>();
   private readonly activityWaiters = new Map<
     string,
-    Set<(evidence: FixtureActivityEvidence) => void>
+    Set<(event: FixtureInputWaitEvent) => void>
   >();
   private readonly activityEpoch: string;
   private endpointsValue: FixtureDaemonEndpoint[] = [];
@@ -345,12 +352,13 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       revision,
     };
     for (const waiter of [...(this.activityWaiters.get(sessionId) ?? [])]) {
-      waiter(evidence);
+      waiter({ kind: "activity", evidence });
     }
   }
 
   public removeSession(sessionId: string): void {
     const session = this.requireSession(sessionId);
+    this.notifyInputWaiters(sessionId, { kind: "removed" });
     this.sessions.delete(sessionId);
     this.activityRevisions.delete(sessionId);
     this.pty.closeSession(sessionId);
@@ -378,6 +386,42 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
 
   public resizes(sessionId: string): ReadonlyArray<ScenarioResize> {
     return (this.sessionResizes.get(sessionId) ?? []).map((resize) => ({ ...resize }));
+  }
+
+  public inputs(sessionId: string): ReadonlyArray<Uint8Array> {
+    return (this.sessionInputs.get(sessionId) ?? []).map(copyBytes);
+  }
+
+  public replaceRuntime(sessionId: string, runtimeId?: string): void {
+    const session = this.requireSession(sessionId);
+    const current = this.observation(sessionId);
+    const nextGeneration = incrementU64(current.runtime_generation, "fixture runtime generation");
+    const nextRuntimeId = runtimeId ?? `${current.runtime_id}-replacement`;
+    const nextWorkerId = `${current.worker_id}-replacement`;
+    if (!isBoundedRuntimeId(nextRuntimeId)) {
+      throw new Error("fixture replacement runtime id must be a bounded control-free identifier");
+    }
+    session.runtime = {
+      state: "live",
+      runtime_generation: nextGeneration.toString(),
+      worker_id: nextWorkerId,
+      runtime_id: nextRuntimeId,
+      started_at: timestamp(),
+      last_connected_at: timestamp(),
+    };
+    delete session.activity;
+    session.state_source = "process";
+    session.updated_at = timestamp();
+    this.observations.set(sessionId, {
+      runtime_id: nextRuntimeId,
+      runtime_generation: nextGeneration,
+      worker_id: nextWorkerId,
+      history_start_offset: 0n,
+      output: new Uint8Array(),
+      watermark: 0n,
+    });
+    this.notifyInputWaiters(sessionId, { kind: "runtime_changed" });
+    this.emitSessionEvent(EVENT_SESSION_UPDATED, session);
   }
 
   public initialAttachDimensions(sessionId: string): ReadonlyArray<TerminalDimensions> {
@@ -724,6 +768,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     session.state = "stopped";
     session.updated_at = timestamp();
     session.exit_code = 0;
+    this.notifyInputWaiters(session.id, { kind: "stopped" });
     this.pty.closeSession(session.id);
     this.emitSessionEvent(EVENT_SESSION_STOPPED, session);
     return okResponse(request.id, { stopped: true } satisfies SessionStopResult);
@@ -837,6 +882,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     if (session === undefined) return okResponse(request.id, { removed: false, stopped: false });
     if (session.external === true) return errResponse(request.id, badRequest("external sessions cannot be removed"));
     const stopped = session.state === "running" || session.state === "starting";
+    this.notifyInputWaiters(session.id, { kind: "removed" });
     this.sessions.delete(session.id);
     this.pty.closeSession(session.id);
     this.emitEvent({ v: PROTOCOL_VERSION, event: EVENT_SESSION_REMOVED, session: cloneValue(session) });
@@ -855,9 +901,10 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     }
     const session = this.sessions.get(params.session_id);
     if (session === undefined) return errResponse(request.id, sessionNotFound(params.session_id));
+    if (session.external === true) return errResponse(request.id, sessionExternalReadOnly());
     if (session.state !== "running") return errResponse(request.id, sessionNotRunning(params.session_id));
     if (params.wait === undefined) {
-      this.pty.writeToSession(session.id, encoder.encode(params.text));
+      this.deliverSessionInput(session.id, encoder.encode(params.text));
       return okResponse(request.id, { accepted: true } satisfies SessionInputResult);
     }
     const until = isRecord(params.wait) ? params.wait.until : undefined;
@@ -881,18 +928,31 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     if (session.agent_base !== "shell") {
       return errResponse(request.id, sessionInputWaitUnsupported());
     }
+    if (session.activity === "blocked") {
+      return errResponse(request.id, sessionAgentBlocked());
+    }
     const targets = new Set<AgentActivity>(
       normalizedUntil.length === 0 ? ["idle", "blocked"] : normalizedUntil,
     );
-    const afterRevision = this.activityRevisions.get(session.id) ?? 0n;
     const observation = this.observation(session.id);
-    this.pty.writeToSession(session.id, encoder.encode(params.text));
     const deadline = Date.now() + timeoutMs;
+    const afterRevision = this.activityRevisions.get(session.id) ?? 0n;
+    this.deliverSessionInput(session.id, encoder.encode(params.text));
     while (Date.now() < deadline) {
-      const evidence = await this.waitForActivity(session.id, deadline - Date.now());
-      if (evidence === undefined) {
+      const event = await this.waitForActivity(session.id, deadline - Date.now());
+      if (event === undefined) {
         break;
       }
+      if (event.kind === "removed") {
+        return errResponse(request.id, sessionNotFound(session.id));
+      }
+      if (event.kind === "stopped") {
+        return errResponse(request.id, sessionNotRunning(session.id));
+      }
+      if (event.kind === "runtime_changed") {
+        return errResponse(request.id, sessionRuntimeChanged());
+      }
+      const evidence = event.evidence;
       if (
         evidence.revision > afterRevision
         && targets.has(evidence.activity)
@@ -914,25 +974,25 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
   private waitForActivity(
     sessionId: string,
     timeoutMs: number,
-  ): Promise<FixtureActivityEvidence | undefined> {
+  ): Promise<FixtureInputWaitEvent | undefined> {
     return new Promise((resolve) => {
       const waiters = this.activityWaiters.get(sessionId) ?? new Set();
       this.activityWaiters.set(sessionId, waiters);
-      const finish = (evidence: FixtureActivityEvidence | undefined): void => {
+      const finish = (event: FixtureInputWaitEvent | undefined): void => {
         clearTimeout(timer);
-        waiters.delete(onActivity);
+        waiters.delete(onEvent);
         if (waiters.size === 0) {
           this.activityWaiters.delete(sessionId);
         }
-        resolve(evidence);
+        resolve(event);
       };
-      const onActivity = (evidence: FixtureActivityEvidence): void => {
-        finish(evidence);
+      const onEvent = (event: FixtureInputWaitEvent): void => {
+        finish(event);
       };
       const timer = setTimeout(() => {
         finish(undefined);
       }, timeoutMs);
-      waiters.add(onActivity);
+      waiters.add(onEvent);
     });
   }
 
@@ -1485,6 +1545,19 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     }
     for (const subscriber of this.subscribers) {
       writeLine(subscriber, line);
+    }
+  }
+
+  private deliverSessionInput(sessionId: string, bytes: Uint8Array): void {
+    const inputs = this.sessionInputs.get(sessionId) ?? [];
+    inputs.push(copyBytes(bytes));
+    this.sessionInputs.set(sessionId, inputs);
+    this.pty.writeToSession(sessionId, bytes);
+  }
+
+  private notifyInputWaiters(sessionId: string, event: FixtureInputWaitEvent): void {
+    for (const waiter of [...(this.activityWaiters.get(sessionId) ?? [])]) {
+      waiter(event);
     }
   }
 
@@ -2148,8 +2221,8 @@ function sessionRuntimeChanged(): ProtocolError {
   return protocolError(
     "runtime",
     "session_runtime_changed",
-    "session runtime changed while reading retained output",
-    "read the current screen and restart output reads from its runtime identity",
+    "session runtime changed during the bounded operation",
+    "inspect the session and restart from its current runtime identity",
   );
 }
 
@@ -2280,6 +2353,22 @@ function sessionNotFound(sessionId: string): ProtocolError {
 
 function sessionNotRunning(sessionId: string): ProtocolError {
   return protocolError("runtime", "session_not_running", `session is not running: ${sessionId}`);
+}
+
+function sessionAgentBlocked(): ProtocolError {
+  return protocolError(
+    "runtime",
+    "session_agent_blocked",
+    "the agent is blocked on operator input",
+  );
+}
+
+function sessionExternalReadOnly(): ProtocolError {
+  return protocolError(
+    "runtime",
+    "session_external_read_only",
+    "external sessions are read-only",
+  );
 }
 
 function agentKindUnsupported(agent: string): ProtocolError {

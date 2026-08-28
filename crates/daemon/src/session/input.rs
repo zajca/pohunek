@@ -4,12 +4,14 @@ use pohunek_worker_protocol::{InputFragment as WorkerInputFragment, SecretBytes}
 
 use protocol::{ActivityRevision, AgentStateEvent, SessionRuntimeIdentity};
 
+use crate::runtime::WriteReservation;
+
 use super::{
     adapter_for, broadcast, session_not_found, session_not_running, unavailable_runtime_error,
-    worker_error_to_protocol, ActivityEvidence, AgentActivity, AgentKind, Duration, ErrorClass,
-    InputRules, LaunchCommand, LaunchCommandPlan, ProtocolError, ResolvedAgent, RuntimeHandle,
-    SessionEntry, SessionId, SessionInputParams, SessionInputResult, SessionInputWait,
-    SessionRegistry, SessionRegistryConfig, SessionState, Worker,
+    warn, worker_error_to_protocol, ActivityEvidence, AgentActivity, AgentKind, Duration,
+    ErrorClass, InputRules, LaunchCommand, LaunchCommandPlan, ProtocolError, ResolvedAgent,
+    RuntimeHandle, SessionEntry, SessionId, SessionInputParams, SessionInputResult,
+    SessionInputWait, SessionRegistry, SessionRegistryConfig, SessionState, Worker,
 };
 
 pub(super) const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
@@ -148,7 +150,7 @@ impl SessionRegistry {
         plan_ack_delay: Duration,
     ) -> Result<InputSubmission, ProtocolError> {
         let input_gate = self.input_gate(session_id).await?;
-        let _input_guard = self
+        let input_guard = self
             .lock_input_before_deadline(input_gate, deadline)
             .await?;
         let (worker, rules, runtime) = {
@@ -168,16 +170,22 @@ impl SessionRegistry {
         };
         let writes = build_input_writes(text, rules)?;
         validate_wait_framing(writes.submit_delay)?;
-        let boundary = self
-            .input_activity_snapshot(session_id, Some(&runtime))
+        let reservation = self
+            .reserve_worker_before_deadline(
+                &worker,
+                worker_input_fragments(writes, plan_ack_delay),
+                deadline,
+            )
             .await?;
-        reject_blocked_wait(boundary.activity)?;
-        self.write_worker_before_deadline(
-            worker,
-            worker_input_fragments(writes, plan_ack_delay),
-            deadline,
-        )
-        .await?;
+        let boundary = self
+            .commit_worker_before_deadline(
+                reservation,
+                input_guard,
+                session_id.clone(),
+                runtime.clone(),
+                deadline,
+            )
+            .await?;
         self.input_activity_snapshot(session_id, Some(&runtime))
             .await?;
 
@@ -218,29 +226,85 @@ impl SessionRegistry {
         }
     }
 
-    async fn write_worker_before_deadline(
+    async fn reserve_worker_before_deadline(
         &self,
-        worker: Worker,
+        worker: &Worker,
         fragments: Vec<WorkerInputFragment>,
         deadline: tokio::time::Instant,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<WriteReservation, ProtocolError> {
         if tokio::time::Instant::now() >= deadline {
             return Err(ProtocolError::session_input_timeout());
         }
-        let mut write = tokio::spawn(async move { worker.write(fragments).await });
         tokio::select! {
             biased;
             () = self.inner.event_log_shutdown.cancelled() => Err(input_wait_shutdown_error(
-                "daemon shutdown cancelled input during worker delivery",
+                "daemon shutdown cancelled input before worker delivery",
             )),
             () = tokio::time::sleep_until(deadline) => {
                 Err(ProtocolError::session_input_timeout())
             }
-            result = &mut write => {
-                result
-                    .map_err(|error| worker_input_task_error(&error))?
-                    .map(|_| ())
-                    .map_err(worker_error_to_protocol)
+            result = worker.reserve_write(fragments) => result.map_err(worker_error_to_protocol),
+        }
+    }
+
+    async fn commit_worker_before_deadline(
+        &self,
+        reservation: WriteReservation,
+        input_guard: tokio::sync::OwnedMutexGuard<()>,
+        session_id: SessionId,
+        runtime: SessionRuntimeIdentity,
+        deadline: tokio::time::Instant,
+    ) -> Result<InputActivitySnapshot, ProtocolError> {
+        let (send_started_tx, send_started_rx) = tokio::sync::oneshot::channel();
+        let registry = self.clone();
+        let mut write = tokio::spawn(async move {
+            let _input_guard = input_guard;
+            let boundary = registry
+                .input_activity_snapshot(&session_id, Some(&runtime))
+                .await?;
+            reject_blocked_wait(boundary.activity)?;
+            reservation
+                .commit(Some(send_started_tx))
+                .await
+                .map_err(worker_error_to_protocol)?;
+            Ok(boundary)
+        });
+        tokio::pin!(send_started_rx);
+
+        tokio::select! {
+            biased;
+            started = &mut send_started_rx => {
+                if started.is_err() {
+                    return worker_write_task_result(write.await);
+                }
+            }
+            result = &mut write => return worker_write_task_result(result),
+            () = self.inner.event_log_shutdown.cancelled() => {
+                write.abort();
+                let _result = write.await;
+                return Err(input_wait_shutdown_error(
+                    "daemon shutdown cancelled input before worker delivery",
+                ));
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                write.abort();
+                let _result = write.await;
+                return Err(ProtocolError::session_input_timeout());
+            }
+        }
+
+        tokio::select! {
+            biased;
+            result = &mut write => worker_write_task_result(result),
+            () = self.inner.event_log_shutdown.cancelled() => {
+                shield_worker_ack(write);
+                Err(input_wait_shutdown_error(
+                    "daemon shutdown cancelled input after worker delivery began",
+                ))
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                shield_worker_ack(write);
+                Err(ProtocolError::session_input_timeout())
             }
         }
     }
@@ -446,6 +510,28 @@ fn worker_input_task_error(_error: &tokio::task::JoinError) -> ProtocolError {
         "worker input task failed",
         None,
     )
+}
+
+fn worker_write_task_result(
+    result: Result<Result<InputActivitySnapshot, ProtocolError>, tokio::task::JoinError>,
+) -> Result<InputActivitySnapshot, ProtocolError> {
+    result.map_err(|error| worker_input_task_error(&error))?
+}
+
+fn shield_worker_ack(write: tokio::task::JoinHandle<Result<InputActivitySnapshot, ProtocolError>>) {
+    tokio::spawn(async move {
+        match write.await {
+            Ok(Ok(_boundary)) => {}
+            Ok(Err(error)) => warn!(
+                error = %error,
+                "worker input failed after the public deadline while consuming its acknowledgement"
+            ),
+            Err(error) => warn!(
+                error = %error,
+                "worker input task failed after the public deadline"
+            ),
+        }
+    });
 }
 
 pub(super) fn plan_initial_input_delivery(

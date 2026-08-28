@@ -587,6 +587,12 @@ struct RuntimeWatchIdentity {
     generation: protocol::RuntimeGeneration,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetectorScope {
+    id: SessionId,
+    runtime: RuntimeWatchIdentity,
+}
+
 impl RuntimeWatchIdentity {
     fn from_info(info: &SessionInfo) -> Option<Self> {
         let runtime = info.runtime.as_ref()?;
@@ -2041,7 +2047,17 @@ impl SessionRegistry {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) async fn record_cwd_hint(&self, id: &SessionId, path: String) {
+        self.record_cwd_hint_scoped(id, path, None).await;
+    }
+
+    async fn record_cwd_hint_scoped(
+        &self,
+        id: &SessionId,
+        path: String,
+        expected: Option<&RuntimeWatchIdentity>,
+    ) {
         let cwd = PathBuf::from(path);
         if !cwd.is_absolute() {
             debug!(
@@ -2052,7 +2068,10 @@ impl SessionRegistry {
             return;
         }
         match cwd.try_exists() {
-            Ok(true) => self.apply_cwd_change(id, cwd, CwdSource::Osc7).await,
+            Ok(true) => {
+                self.apply_cwd_change(id, cwd, CwdSource::Osc7, expected)
+                    .await;
+            }
             Ok(false) => {
                 debug!(
                     session_id = %id.0,
@@ -2071,7 +2090,13 @@ impl SessionRegistry {
         }
     }
 
-    async fn apply_cwd_change(&self, id: &SessionId, cwd: PathBuf, source: CwdSource) {
+    async fn apply_cwd_change(
+        &self,
+        id: &SessionId,
+        cwd: PathBuf,
+        source: CwdSource,
+        expected: Option<&RuntimeWatchIdentity>,
+    ) {
         if !self.cwd_update_needed(id, &cwd).await {
             return;
         }
@@ -2083,6 +2108,10 @@ impl SessionRegistry {
                 debug!(session_id = %id.0, "cwd update arrived for unknown session");
                 return;
             };
+            if expected.is_some_and(|expected| !expected.matches(entry)) {
+                debug!(session_id = %id.0, "cwd update arrived for a superseded runtime");
+                return;
+            }
             if entry.stopping || is_terminal(entry.info.state) || entry.info.cwd == cwd {
                 return;
             }

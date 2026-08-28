@@ -476,10 +476,9 @@ pub struct SessionInputWait {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub until: Option<Vec<AgentActivity>>,
-    /// Overall gate, delivery, and activity-wait deadline in milliseconds from
-    /// `1` to [`MAX_SESSION_WAIT_MS`], measured before delivery begins. When
-    /// omitted, the daemon applies that ceiling; zero is rejected before any
-    /// delivery.
+    /// Overall gate, worker-reservation, delivery, and activity-wait deadline in
+    /// milliseconds from `1` to [`MAX_SESSION_WAIT_MS`]. A pre-send timeout
+    /// writes no input; a post-send timeout may have an unknown delivery outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub timeout_ms: Option<u32>,

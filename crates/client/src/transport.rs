@@ -271,6 +271,19 @@ impl Client {
     where
         M: Method,
     {
+        if M::NAME == protocol::method::SESSION_INPUT {
+            let params =
+                serde_json::from_value::<SessionInputParams>(serde_json::to_value(params)?)?;
+            let result = self.session_input(params).await?;
+            return Ok(serde_json::from_value(serde_json::to_value(result)?)?);
+        }
+        self.call_direct::<M>(params).await
+    }
+
+    async fn call_direct<M>(&mut self, params: M::Params) -> Result<M::Output, ClientError>
+    where
+        M: Method,
+    {
         let request = Request::new(
             next_request_id(M::NAME),
             M::NAME,
@@ -342,7 +355,8 @@ impl Client {
             validate_input_wait_result(&wait, &result)?;
             Ok(result)
         } else {
-            self.call::<protocol::method::SessionInput>(params).await
+            self.call_direct::<protocol::method::SessionInput>(params)
+                .await
         }
     }
 
@@ -392,7 +406,7 @@ impl Client {
             dedicated_request_timeout(self.options.request_timeout, wire_timeout_ms);
         let options = self.options.with_request_timeout(request_timeout);
         let mut client = self.connect_dedicated(options).await?;
-        client.call::<M>(params).await
+        client.call_direct::<M>(params).await
     }
 
     async fn connect_dedicated(&self, options: ClientOptions) -> Result<Self, ClientError> {
@@ -1368,6 +1382,35 @@ mod tests {
         assert!(recovery.contains("do not retry blindly"));
         let request = server.await.expect("capture server");
         assert_eq!(request.method(), protocol::method::SESSION_INPUT);
+    }
+
+    #[tokio::test]
+    async fn generic_typed_call_routes_input_wait_through_contract_validation() {
+        let (address, server) =
+            spawn_dedicated_capture_server(serde_json::json!({"accepted": true})).await;
+        let mut client = Client::connect_tcp_addr("fixture-remote", address)
+            .await
+            .expect("connect remote");
+
+        let error = client
+            .call::<protocol::method::SessionInput>(SessionInputParams {
+                session_id: SessionId("s-target".to_owned()),
+                text: "hello".to_owned(),
+                wait: Some(protocol::SessionInputWait {
+                    until: None,
+                    timeout_ms: Some(100),
+                }),
+            })
+            .await
+            .expect_err("generic typed wait must reject a legacy success");
+
+        assert_eq!(
+            error.to_protocol_error().code,
+            "session_input_wait_contract_mismatch"
+        );
+        let request = server.await.expect("capture server");
+        assert_eq!(request.method(), protocol::method::SESSION_INPUT);
+        assert_eq!(request.params()["wait"]["until"], serde_json::json!([]));
     }
 
     #[tokio::test]

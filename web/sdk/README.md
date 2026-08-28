@@ -121,7 +121,10 @@ decimal activity revision. The wait timeout is the daemon's overall
 delivery-and-activity deadline measured before delivery; the transport adds only
 fixed response headroom. The SDK rejects a timeout outside `1..=8000` before
 opening the dedicated connection and normalizes an omitted `wait.until` to `[]`
-before validation and wire serialization. Delayed provider framing returns
+before validation and wire serialization. The target array is copied before the
+first transport await, so caller mutation cannot change the in-flight contract.
+Both `sessionInput(...)` and generic typed `call("session.input", ...)` route
+waited input through this path. Delayed provider framing returns
 `session_input_wait_unsupported` before delivery because the daemon cannot
 safely revalidate approval state inside a worker-owned delay. Deduplicate evidence by `(activity_epoch, runtime,
 activity_revision)`, since daemon reconnect preserves the runtime but starts a

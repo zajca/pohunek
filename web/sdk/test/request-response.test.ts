@@ -537,6 +537,68 @@ describe("Client request/response", () => {
     }
   });
 
+  test("generic typed call routes input waits through fail-closed validation", async () => {
+    const daemon = await startUnixDaemon([{
+      kind: "reply",
+      line: (line) => okResponseLine(requestIdFromLine(line), { accepted: true }),
+    }]);
+    try {
+      const client = await connectClient(daemon);
+      const error = await expectClientError(client.call("session.input", {
+        session_id: "s-target",
+        text: "hello",
+        wait: {},
+      }));
+
+      expect(error.toProtocolError().code).toBe("session_input_wait_contract_mismatch");
+      const request = parseRequestLine(await daemon.nextRequest());
+      expect(request["params"]).toEqual({
+        session_id: "s-target",
+        text: "hello",
+        wait: { until: [] },
+      });
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("input wait snapshots target arrays before opening dedicated transport", async () => {
+    const input = {
+      accepted: true,
+      activity: "idle",
+      activity_source: "report",
+      runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+      activity_epoch: "d-epoch-1",
+      activity_revision: "2",
+    } as const;
+    const daemon = await startUnixDaemon([{
+      kind: "reply",
+      line: (line) => okResponseLine(requestIdFromLine(line), input),
+    }]);
+    try {
+      const client = await connectClient(daemon);
+      const until: Array<"idle" | "blocked"> = ["idle"];
+      const waiting = client.sessionInput({
+        session_id: "s-target",
+        text: "hello",
+        wait: { until },
+      });
+      until[0] = "blocked";
+
+      expect(await waiting).toEqual(input);
+      const request = parseRequestLine(await daemon.nextRequest());
+      expect(request["params"]).toEqual({
+        session_id: "s-target",
+        text: "hello",
+        wait: { until: ["idle"] },
+      });
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
   test("input wait rejects invalid timeouts before transport", async () => {
     const daemon = await startUnixDaemon([{ kind: "silent" }]);
     try {

@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 
 use super::{
     event, event_payload, identity_claim_expiry_is_valid, runtime_error, timestamp_now, watch,
-    ActiveAgentReport, CancellationToken, DesiredState, DetectorConfig, Mutex, Notify,
-    ObservedAgent, ProtocolError, ResumeSnapshot, RuntimeHandle, RuntimeState,
+    ActiveAgentReport, CancellationToken, DesiredState, DetectorConfig, DetectorScope, Mutex,
+    Notify, ObservedAgent, ProtocolError, ResumeSnapshot, RuntimeHandle, RuntimeState,
     RuntimeWatchIdentity, SessionEntry, SessionId, SessionRecord, SessionRef, SessionRefKind,
     SessionRegistry, SessionRuntime, SessionState, StateSource, Worker, WorkerError,
     WORKER_CONNECT_RETRY,
@@ -770,8 +770,13 @@ impl SessionRegistry {
             return;
         }
         self.inner.sessions.lock().await.insert(id.clone(), entry);
+        let expected = RuntimeWatchIdentity::from_info(&info)
+            .expect("reconciled live runtime has a complete watcher identity");
         self.spawn_detector(
-            id.clone(),
+            DetectorScope {
+                id: id.clone(),
+                runtime: expected.clone(),
+            },
             detector_output,
             (info.rows, info.cols),
             detector_cancel,
@@ -779,8 +784,6 @@ impl SessionRegistry {
             detector_config_rx,
         );
         self.spawn_procwatch(id.clone(), child.pid, procwatch_cancel, procwatch_rescan);
-        let expected = RuntimeWatchIdentity::from_info(&info)
-            .expect("reconciled live runtime has a complete watcher identity");
         self.spawn_worker_exit_watcher(id, worker, expected, runtime_watch_cancel);
         if let Some(previous_runtime_id) = native_recovery {
             self.emit_native_recovered(&info, previous_runtime_id);

@@ -237,6 +237,68 @@ describe("@pohunek/testkit fixture daemon", () => {
     }
   });
 
+  test("session input wait rejects blocked activity before writing PTY bytes", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-blocked") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const created = await client.call("session.new", {
+        agent: "shell",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      });
+      daemon.scenario.setAgentState(created.id, "blocked", "report");
+
+      await expectProtocolError(client.call("session.input", {
+        session_id: created.id,
+        text: "must-not-write",
+        wait: { until: ["idle"], timeout_ms: 200 },
+      }), "session_agent_blocked");
+      expect(daemon.scenario.inputs(created.id)).toEqual([]);
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("session input wait wakes on stop, remove, and runtime replacement", async () => {
+    for (const lifecycle of ["stop", "remove", "replace"] as const) {
+      const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath(`input-${lifecycle}`) } });
+      try {
+        const client = await connectLocal(requireUnixSocket(daemon));
+        const control = await connectLocal(requireUnixSocket(daemon));
+        const created = await client.call("session.new", {
+          agent: "shell",
+          cols: TEST_COLS,
+          rows: TEST_ROWS,
+        });
+        const waiting = client.call("session.input", {
+          session_id: created.id,
+          text: `wait-${lifecycle}`,
+          wait: { until: ["idle"], timeout_ms: 500 },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        if (lifecycle === "stop") {
+          await control.call("session.stop", created.id);
+        } else if (lifecycle === "remove") {
+          daemon.scenario.removeSession(created.id);
+        } else {
+          daemon.scenario.replaceRuntime(created.id);
+        }
+
+        const expected = lifecycle === "stop"
+          ? "session_not_running"
+          : lifecycle === "remove"
+            ? "session_not_found"
+            : "session_runtime_changed";
+        await expectProtocolError(waiting, expected);
+        await control.close();
+        await client.close();
+      } finally {
+        await daemon.close();
+      }
+    }
+  });
+
   test("models Hermes capability boundaries and rejects unknown launch agents", async () => {
     const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("hermes-capabilities") } });
     try {

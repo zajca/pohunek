@@ -3367,6 +3367,42 @@ async fn inspect_missing_session_returns_not_found() {
     assert_eq!(missing.code, "session_not_found");
 }
 
+#[tokio::test]
+async fn superseded_detector_output_cannot_stamp_replacement_runtime() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let expected = RuntimeWatchIdentity::from_info(&created).expect("live detector identity");
+    let original_runtime = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("session entry");
+        let original = entry.info.runtime.clone();
+        let runtime = entry.info.runtime.as_mut().expect("runtime projection");
+        runtime.runtime_id = Some("runtime-replacement".to_owned());
+        runtime.runtime_generation = RuntimeGeneration::new(runtime.runtime_generation.get() + 1);
+        original
+    };
+
+    registry
+        .record_detector_activity(&created.id, &expected, transition(AgentActivity::Idle))
+        .await;
+
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&created.id).expect("session entry");
+    assert_eq!(entry.info.activity, None);
+    assert_eq!(entry.activity_revision, 0);
+    assert!(entry.activity_evidence.is_empty());
+    entry.info.runtime = original_runtime;
+    drop(sessions);
+    let _ = registry.stop(&created.id).await;
+}
+
 #[test]
 fn bracketed_paste_input_frame_keeps_submit_separate() {
     let writes = super::build_input_writes(
@@ -3744,6 +3780,197 @@ async fn session_input_wait_rejects_blocked_transition_during_gate_for_all_adapt
 }
 
 #[tokio::test]
+async fn session_input_wait_boundary_excludes_activity_before_worker_write_reservation() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Working, 1)
+            .await
+            .recorded
+    );
+    let worker = {
+        let sessions = registry.inner.sessions.lock().await;
+        match &sessions.get(&created.id).expect("session entry").runtime {
+            RuntimeHandle::Worker(worker) => worker.clone(),
+            RuntimeHandle::Unavailable(state) => panic!("unexpected runtime state: {state:?}"),
+        }
+    };
+    let reservation = worker
+        .reserve_write(super::input::worker_input_fragments(
+            super::build_input_writes(
+                "never-sent-reservation",
+                InputRules::unrestricted(false, Duration::ZERO),
+            )
+            .expect("valid blocker plan"),
+            Duration::ZERO,
+        ))
+        .await
+        .expect("reserve worker write");
+    let request = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id,
+                    text: "reservation-boundary".to_owned(),
+                    wait: Some(protocol::SessionInputWait {
+                        until: Some(vec![AgentActivity::Idle]),
+                        timeout_ms: Some(150),
+                    }),
+                })
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Idle, 2)
+            .await
+            .recorded
+    );
+    drop(reservation);
+
+    let error = request
+        .await
+        .expect("waited input task joins")
+        .expect_err("pre-reservation activity must not confirm delivered input");
+    assert_eq!(error.code, "session_input_timeout");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_timeout_while_worker_reserved_never_sends_late_input() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: observable_input_shell(),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let worker = {
+        let sessions = registry.inner.sessions.lock().await;
+        match &sessions.get(&created.id).expect("session entry").runtime {
+            RuntimeHandle::Worker(worker) => worker.clone(),
+            RuntimeHandle::Unavailable(state) => panic!("unexpected runtime state: {state:?}"),
+        }
+    };
+    let reservation = worker
+        .reserve_write(super::input::worker_input_fragments(
+            super::build_input_writes(
+                "never-sent-reservation",
+                InputRules::unrestricted(false, Duration::ZERO),
+            )
+            .expect("valid blocker plan"),
+            Duration::ZERO,
+        ))
+        .await
+        .expect("reserve worker write");
+
+    let error = registry
+        .input(protocol::SessionInputParams {
+            session_id: created.id.clone(),
+            text: "must-not-arrive-late".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: Some(vec![AgentActivity::Idle]),
+                timeout_ms: Some(25),
+            }),
+        })
+        .await
+        .expect_err("blocked reservation must consume the overall deadline");
+    assert_eq!(error.code, "session_input_timeout");
+    drop(reservation);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    registry
+        .input(protocol::SessionInputParams {
+            session_id: created.id.clone(),
+            text: "next-input".to_owned(),
+            wait: None,
+        })
+        .await
+        .expect("next input succeeds after timed out reservation");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    assert!(
+        !output.contains("must-not-arrive-late"),
+        "output={output:?}"
+    );
+    assert!(output.contains("received:next-input"), "output={output:?}");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_shutdown_while_worker_reserved_never_sends_late_input() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: observable_input_shell(),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let worker = {
+        let sessions = registry.inner.sessions.lock().await;
+        match &sessions.get(&created.id).expect("session entry").runtime {
+            RuntimeHandle::Worker(worker) => worker.clone(),
+            RuntimeHandle::Unavailable(state) => panic!("unexpected runtime state: {state:?}"),
+        }
+    };
+    let reservation = worker
+        .reserve_write(super::input::worker_input_fragments(
+            super::build_input_writes(
+                "never-sent-reservation",
+                InputRules::unrestricted(false, Duration::ZERO),
+            )
+            .expect("valid blocker plan"),
+            Duration::ZERO,
+        ))
+        .await
+        .expect("reserve worker write");
+    let request = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id,
+                    text: "must-not-arrive-after-shutdown".to_owned(),
+                    wait: Some(protocol::SessionInputWait {
+                        until: Some(vec![AgentActivity::Idle]),
+                        timeout_ms: Some(1_000),
+                    }),
+                })
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    registry.shutdown_event_log().await;
+
+    let error = request
+        .await
+        .expect("waited input task joins")
+        .expect_err("shutdown must cancel the unsent reservation");
+    assert_eq!(error.code, "daemon_shutting_down");
+    drop(reservation);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    assert!(
+        !output.contains("must-not-arrive-after-shutdown"),
+        "output={output:?}"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
 async fn session_input_wait_timeout_after_atomic_plan_does_not_stage_body() {
     let agents_dir = temp_agents_dir_with(
         "input-wait-plan-ack-deadline",
@@ -3778,14 +4005,28 @@ async fn session_input_wait_timeout_after_atomic_plan_does_not_stage_body() {
     .expect_err("delayed plan ACK must time out");
 
     assert_eq!(error.code, "session_input_timeout");
-    tokio::time::sleep(Duration::from_millis(275)).await;
-    registry
-        .input(protocol::SessionInputParams {
-            session_id: created.id.clone(),
-            text: "next-input".to_owned(),
-            wait: None,
-        })
+    let mut next_input = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id,
+                    text: "next-input".to_owned(),
+                    wait: None,
+                })
+                .await
+        }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut next_input)
+            .await
+            .is_err(),
+        "input gate must remain held until the late worker ACK is consumed"
+    );
+    next_input
         .await
+        .expect("next input task joins")
         .expect("next input succeeds after the late plan ACK is consumed");
     tokio::time::sleep(Duration::from_millis(50)).await;
     let output = read_session_output_after_rejection(&registry, &created.id).await;

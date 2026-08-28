@@ -123,7 +123,10 @@ impl SessionRegistry {
             self.emit(event::SESSION_UPDATED, &info);
         }
         match self.inner.inspector.cwd(focus_pid) {
-            Ok(cwd) => self.apply_cwd_change(id, cwd, CwdSource::Procwatch).await,
+            Ok(cwd) => {
+                self.apply_cwd_change(id, cwd, CwdSource::Procwatch, None)
+                    .await;
+            }
             Err(err) => {
                 debug!(
                     session_id = %id.0,

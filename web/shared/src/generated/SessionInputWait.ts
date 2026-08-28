@@ -16,10 +16,9 @@ export type SessionInputWait = {
    */
   until?: Array<AgentActivity>;
   /**
-   * Overall gate, delivery, and activity-wait deadline in milliseconds from
-   * `1` to [`MAX_SESSION_WAIT_MS`], measured before delivery begins. When
-   * omitted, the daemon applies that ceiling; zero is rejected before any
-   * delivery.
+   * Overall gate, worker-reservation, delivery, and activity-wait deadline in
+   * milliseconds from `1` to [`MAX_SESSION_WAIT_MS`]. A pre-send timeout
+   * writes no input; a post-send timeout may have an unknown delivery outcome.
    */
   timeout_ms?: number;
 };
