@@ -76,7 +76,7 @@ pub struct ControlServer {
 }
 
 impl ControlServer {
-    /// Bind the control socket at `socket_path`.
+    /// Bind the control socket at `socket_path` with a validated overlay registry.
     ///
     /// The parent directory is created (mode `0700`) if missing. If a socket
     /// file already exists, it is probed: a live daemon there is a hard error
@@ -87,10 +87,14 @@ impl ControlServer {
     /// # Errors
     ///
     /// Returns [`DaemonError`] on directory, permission, probe, or bind failure.
-    pub async fn bind(socket_path: &Path, health: HealthInfo) -> Result<Self, DaemonError> {
+    pub async fn bind(
+        socket_path: &Path,
+        health: HealthInfo,
+        registry: pohunek_client::OverlayRegistry,
+    ) -> Result<Self, DaemonError> {
         Self::bind_with_state(
             socket_path,
-            DaemonState::new(health, SessionRegistry::default()),
+            DaemonState::new(health, SessionRegistry::default(), registry),
         )
         .await
     }

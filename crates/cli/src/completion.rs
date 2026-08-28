@@ -6,10 +6,12 @@
 //! deliberately silent: pressing Tab must never turn a missing daemon, stale
 //! mesh state, or invalid local environment into shell noise.
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::future::Future;
 use std::io::{self, Write};
+use std::iter;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU16;
 use std::os::unix::fs::OpenOptionsExt;
@@ -421,10 +423,7 @@ async fn query_sessions(host: &str) -> Option<Vec<SessionInfo>> {
         let records = crate::commands::host::fetch_records(&paths.cache_dir, false)
             .await
             .ok()?;
-        let record = records
-            .iter()
-            .find(|record| record.name.as_deref() == Some(host))?;
-        let route = completion_route(record)?;
+        let route = completion_host_route(&records, host)?;
         Client::connect_trusted_tcp_addr_with_options(host, route, options)
             .await
             .ok()?
@@ -445,17 +444,61 @@ fn completion_route(record: &HostRecord) -> Option<SocketAddr> {
 }
 
 fn host_names(records: &[HostRecord]) -> Vec<String> {
-    let mut hosts = vec![LOCAL_HOST.to_owned()];
-    hosts.extend(records.iter().filter_map(|record| {
-        matches!(record.class, HostClass::ReachableDaemon { .. })
-            .then(|| record.name.as_deref())
-            .flatten()
-            .filter(|name| valid_host(name))
-            .map(str::to_owned)
-    }));
+    let mut hosts = completion_hosts(records)
+        .into_iter()
+        .map(|host| host.target)
+        .chain(iter::once(LOCAL_HOST.to_owned()))
+        .collect::<Vec<_>>();
     hosts.sort();
     hosts.dedup();
     hosts
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompletionHost {
+    target: String,
+    route: SocketAddr,
+}
+
+fn completion_hosts(records: &[HostRecord]) -> Vec<CompletionHost> {
+    let mut names = BTreeMap::<&str, usize>::new();
+    let mut qualified = Vec::new();
+    for record in records {
+        let Some(route) = completion_route(record) else {
+            continue;
+        };
+        let target = format!("{}:{}", record.overlay, route.ip());
+        if !valid_host(&target) {
+            continue;
+        }
+        let name = record.name.as_deref().filter(|name| valid_host(name));
+        if let Some(name) = name {
+            *names.entry(name).or_default() += 1;
+        }
+        qualified.push((CompletionHost { target, route }, name));
+    }
+
+    qualified
+        .into_iter()
+        .flat_map(|(host, name)| {
+            let short =
+                name.filter(|name| names.get(name) == Some(&1))
+                    .map(|name| CompletionHost {
+                        target: name.to_owned(),
+                        route: host.route,
+                    });
+            iter::once(host).chain(short)
+        })
+        .collect()
+}
+
+fn completion_host_route(records: &[HostRecord], target: &str) -> Option<SocketAddr> {
+    let mut routes = completion_hosts(records)
+        .into_iter()
+        .filter(|host| host.target == target)
+        .map(|host| host.route);
+    let route = routes.next()?;
+    routes.next().is_none().then_some(route)
 }
 
 fn session_candidates(
@@ -668,7 +711,40 @@ mod tests {
                 },
             ),
         ];
-        assert_eq!(host_names(&records), vec!["host-b", "local"]);
+        assert_eq!(
+            host_names(&records),
+            vec!["host-b", "local", "netbird:100.64.0.2"]
+        );
+    }
+
+    #[test]
+    fn completion_collisions_offer_only_qualified_targets_and_never_pick_first() {
+        let reachable = HostClass::ReachableDaemon {
+            daemon_version: "1.0.0".to_owned(),
+        };
+        let mut first = host_record("build", reachable.clone());
+        first.overlay = "first".to_owned();
+        first.address = Some("100.64.0.2".to_owned());
+        first.port = 17_001;
+        let mut second = host_record("build", reachable);
+        second.overlay = "second".to_owned();
+        second.address = Some("100.64.0.3".to_owned());
+        second.port = 17_002;
+        let records = vec![first, second];
+
+        assert_eq!(
+            host_names(&records),
+            vec!["first:100.64.0.2", "local", "second:100.64.0.3"]
+        );
+        assert_eq!(completion_host_route(&records, "build"), None);
+        assert_eq!(
+            completion_host_route(&records, "first:100.64.0.2"),
+            Some("100.64.0.2:17001".parse().expect("first route"))
+        );
+        assert_eq!(
+            completion_host_route(&records, "second:100.64.0.3"),
+            Some("100.64.0.3:17002".parse().expect("second route"))
+        );
     }
 
     #[test]

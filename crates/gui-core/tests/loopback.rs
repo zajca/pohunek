@@ -2051,7 +2051,11 @@ impl LoopbackDaemon {
             config.shell_command = shell_command;
         }
         let sessions = worker_backed_registry(config);
-        let mut state = DaemonState::new(HealthInfo::new(version), sessions);
+        let mut state = DaemonState::new(
+            HealthInfo::new(version),
+            sessions,
+            pohunek_client::default_overlay_registry().expect("configured registry"),
+        );
         if notifications_enabled {
             let notifications =
                 NotificationService::open(&temp_dir(&format!("{tag}-notifications")))

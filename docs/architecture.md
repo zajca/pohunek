@@ -418,6 +418,10 @@ providers fails closed. A provider-qualified `<overlay>:<selector>` target is
 resolved only by that provider and receives its configured daemon port. Control
 and raw attach reuse the same selected socket route.
 
+Daemon construction requires a validated registry up front. The shared
+discovery cache has no registry-less state, including when the Unix control
+server is created through its public constructor.
+
 Discovery preserves provider peer identity separately from display names and
 addresses. Stable client identity is overlay-qualified, so equal names,
 addresses, or provider IDs cannot collide across overlays. Address-less peers

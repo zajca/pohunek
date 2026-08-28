@@ -12,10 +12,10 @@ use protocol::HostRecord;
 use tokio::sync::Mutex;
 
 /// A short-lived, process-local cache of discovery records.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct DiscoveryCache {
     cache: Arc<Mutex<Option<CacheEntry>>>,
-    registry: Option<OverlayRegistry>,
+    registry: OverlayRegistry,
 }
 
 /// One completed discovery snapshot.
@@ -31,7 +31,7 @@ impl DiscoveryCache {
     pub fn new(registry: OverlayRegistry) -> Self {
         Self {
             cache: Arc::new(Mutex::new(None)),
-            registry: Some(registry),
+            registry,
         }
     }
 
@@ -51,13 +51,7 @@ impl DiscoveryCache {
                 }
             }
         }
-        let registry =
-            self.registry
-                .as_ref()
-                .ok_or(pohunek_client::ClientError::OverlayRegistry(
-                    overlay::RegistryError::Empty,
-                ))?;
-        let records = discover_hosts(registry).await?;
+        let records = discover_hosts(&self.registry).await?;
         *guard = Some(CacheEntry {
             fetched: Instant::now(),
             records: records.clone(),
@@ -82,7 +76,7 @@ mod tests {
             peer_id: Some("100.92.30.40".to_owned()),
             class: HostClass::Unreachable,
         }];
-        let cache = DiscoveryCache::default();
+        let cache = DiscoveryCache::new(crate::test_support::overlay_registry());
         *cache.cache.lock().await = Some(CacheEntry {
             fetched: Instant::now(),
             records: records.clone(),
@@ -91,34 +85,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_miss_without_registry_fails_closed() {
-        let error = DiscoveryCache::default()
-            .records(false)
-            .await
-            .expect_err("cache miss requires a configured registry");
-
-        assert!(matches!(
-            error,
-            pohunek_client::ClientError::OverlayRegistry(overlay::RegistryError::Empty)
-        ));
-    }
-
-    #[tokio::test]
-    async fn forced_refresh_without_registry_does_not_serve_fresh_cache() {
-        let cache = DiscoveryCache::default();
-        *cache.cache.lock().await = Some(CacheEntry {
-            fetched: Instant::now(),
-            records: Vec::new(),
-        });
-
-        let error = cache
-            .records(true)
-            .await
-            .expect_err("forced refresh requires a configured registry");
-
-        assert!(matches!(
-            error,
-            pohunek_client::ClientError::OverlayRegistry(overlay::RegistryError::Empty)
-        ));
+    async fn cache_miss_uses_required_registry() {
+        let cache = DiscoveryCache::new(crate::test_support::overlay_registry());
+        assert_eq!(cache.records(false).await.expect("discovery"), Vec::new());
     }
 }

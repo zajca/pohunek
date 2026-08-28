@@ -1163,13 +1163,21 @@ Public exports:
   explicitly.
 - Raw and attach helpers: `connect_raw*` and `attach_raw*`.
 
+Public daemon construction is registry-explicit. `DaemonState::new` and
+`ControlServer::bind` require a validated `OverlayRegistry`, and the shared
+discovery cache cannot be constructed without one. This keeps `host.discover`
+usable through the public server constructor instead of creating a latent
+registry-less state.
+
 Connection APIs:
 
 - `Client::connect(host, socket_path)`: `""` and `"local"` use the Unix socket;
   any other host is resolved through the default configured overlay registry
   and dialed over its exact per-overlay route. `<overlay>:<selector>` restricts
-  resolution to one configured provider. A socket-address literal is not a
-  bypass and must resolve under current provider policy.
+  resolution to one configured provider. A bare IPv6 literal remains an
+  unqualified selector; only an explicit configured-overlay prefix qualifies
+  it. A socket-address literal is not a bypass and must resolve under current
+  provider policy.
 - `Client::connect_with_registry(host, socket_path, registry)`: the same routing
   with a caller-supplied registry; ambiguous names fail closed.
 - `Client::connect_local(socket_path)`: direct Unix socket.

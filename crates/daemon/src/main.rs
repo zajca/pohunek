@@ -647,7 +647,11 @@ mod tests {
         let addr = listener
             .local_addr()
             .expect("read loopback listener address");
-        let state = DaemonState::new(HealthInfo::new("test"), SessionRegistry::default());
+        let state = DaemonState::new(
+            HealthInfo::new("test"),
+            SessionRegistry::default(),
+            netbird::configured_registry().expect("configured registry"),
+        );
         let mut remote = Some(pohunek_daemon::api::RemoteServer::from_listener(
             listener, state,
         ));

@@ -412,12 +412,14 @@ pohunek setup completions fish --dynamic
 
 Static completion performs no I/O beyond script generation. Dynamic completion
 is opt-in: it reads the existing owner-private host-discovery cache and makes a
-live, deadline-bounded `session.list` call for session targets. A qualified
-`host/id` target overrides `--host`; otherwise an explicit `--host` selects the
-session source and the default is local. Missing daemons, unavailable NetBird,
-and timeouts produce no shell diagnostics or candidates. The setup command does
-not edit shell startup files; for Zsh it prints the `fpath` step required before
-`compinit`.
+live, deadline-bounded `session.list` call for session targets. Every remote
+candidate has a provider-qualified `<overlay>:<address>` form; a short host name
+is offered only when it identifies one reachable route. A qualified `host/id`
+target overrides `--host`; otherwise an explicit `--host` selects the session
+source and the default is local. Missing daemons, unavailable overlays, name
+collisions, and timeouts produce no shell diagnostics or unsafe fallback
+candidates. The setup command does not edit shell startup files; for Zsh it
+prints the `fpath` step required before `compinit`.
 
 ### Automation and bounded observation
 

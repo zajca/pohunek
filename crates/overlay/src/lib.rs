@@ -399,14 +399,14 @@ impl OverlayRegistry {
     ///
     /// A provider-qualified selector uses `<overlay>:<selector>` and is sent
     /// only to that configured provider. Unqualified selectors are sent to all
-    /// providers; a unique healthy success wins and cross-overlay collisions
-    /// fail closed.
+    /// providers; this includes bare IPv6 literals. A unique healthy success
+    /// wins and cross-overlay collisions fail closed.
     ///
     /// # Errors
     ///
     /// Returns typed unknown, ambiguous, or aggregated provider failures.
     pub async fn resolve_host(&self, host: &str) -> Result<OverlayRoute, RegistryError> {
-        if host.contains(':') {
+        if host.parse::<IpAddr>().is_err() && host.contains(':') {
             return self.resolve_qualified_host(host).await;
         }
 

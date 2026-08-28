@@ -14,10 +14,13 @@ target a host, and session targets can use `<host>/<session-id>`.
 
 Opt-in dynamic shell completion (`pohunek setup completions <shell> --dynamic`)
 uses the same model. Host candidates come from the owner-private discovery
-cache. For a session target, an explicit `host/id` prefix wins, then `--host`,
-then `local`; completion performs a bounded live `session.list` query and emits
-no diagnostics when discovery or a daemon is unavailable. Static completion is
-the default and performs no discovery or daemon I/O.
+cache. Every reachable remote has a provider-qualified
+`<overlay>:<address>` candidate; a short name is offered only when exactly one
+reachable route owns it. Completion never resolves a collision by choosing the
+first cache record. For a session target, an explicit `host/id` prefix wins,
+then `--host`, then `local`; completion performs a bounded live `session.list`
+query and emits no diagnostics when discovery or a daemon is unavailable.
+Static completion is the default and performs no discovery or daemon I/O.
 
 Use these commands for orientation:
 
@@ -71,7 +74,8 @@ Unqualified names that resolve in more than one overlay fail closed. Clients
 keep the overlay-qualified peer identity for display and caching, and reuse the
 exact discovered socket route for control calls and the separate raw attach
 connection through the explicit trusted-route API. A socket-address literal
-cannot bypass current overlay membership and configured-port policy. A failure
-in one configured overlay does not hide healthy peers
-from another overlay; discovery reports an error only when every provider
-fails.
+cannot bypass current overlay membership and configured-port policy. A bare
+IPv6 literal such as `fd00::2` remains an unqualified selector; only an explicit
+configured-overlay prefix such as `netbird:fd00::2` qualifies it. A failure in
+one configured overlay does not hide healthy peers from another overlay;
+discovery reports an error only when every provider fails.

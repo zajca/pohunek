@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
 
 use overlay::{
@@ -199,6 +199,50 @@ async fn qualified_host_uses_only_named_overlay_and_its_port() {
     assert!(matches!(
         registry.resolve_host("missing:build").await,
         Err(RegistryError::OverlayNotConfigured(id)) if id.as_str() == "missing"
+    ));
+}
+
+#[tokio::test]
+async fn ipv6_literals_distinguish_unqualified_peers_qualifiers_and_socket_addresses() {
+    let listener = IpAddr::V6(Ipv6Addr::LOCALHOST);
+    let address = "fd00::2".parse().expect("peer address");
+    let mut unqualified = MemoryTransport::new("first", listener);
+    unqualified.add_member(address);
+    unqualified.add_peer("fd00::2", Some("first-v6"), Some(address));
+    let registry = OverlayRegistry::new(vec![configured(unqualified, 17001)]).expect("registry");
+
+    let route = registry
+        .resolve_host("fd00::2")
+        .await
+        .expect("unqualified IPv6 peer");
+    assert_eq!(route.overlay.as_str(), "first");
+    assert_eq!(route.addr, SocketAddr::new(address, 17001));
+
+    let mut first = MemoryTransport::new("first", listener);
+    first.add_member(address);
+    first.add_peer("fd00::2", Some("first-v6"), Some(address));
+    let mut second = MemoryTransport::new("second", listener);
+    second.add_member(address);
+    second.add_peer("fd00::2", Some("second-v6"), Some(address));
+    let registry = OverlayRegistry::new(vec![configured(first, 17001), configured(second, 17002)])
+        .expect("qualified registry");
+
+    assert!(matches!(
+        registry.resolve_host("fd00::2").await,
+        Err(RegistryError::AmbiguousHost { host, overlays })
+            if host == "fd00::2"
+                && overlays.iter().map(OverlayId::as_str).eq(["first", "second"])
+    ));
+
+    let route = registry
+        .resolve_host("second:fd00::2")
+        .await
+        .expect("qualified IPv6 peer");
+    assert_eq!(route.overlay.as_str(), "second");
+    assert_eq!(route.addr, SocketAddr::new(address, 17002));
+    assert!(matches!(
+        registry.resolve_host("[fd00::2]:17002").await,
+        Err(RegistryError::InvalidQualifiedHost(host)) if host == "[fd00::2]:17002"
     ));
 }
 
