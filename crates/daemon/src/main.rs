@@ -14,12 +14,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use overlay::{ConfiguredTransport, OverlayRegistry};
+use overlay::{ConfiguredTransport, OverlayId, OverlayRegistry};
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo, RemoteServer};
 use pohunek_daemon::discovery::DiscoveryCache;
 use pohunek_daemon::events::{spawn_drain, EventLog};
@@ -222,8 +223,11 @@ async fn run() -> Result<(), DaemonError> {
     let unix_serve = server.serve(async move {
         unix_shutdown.cancelled().await;
     });
-    let remote_serve = serve_remote(remote_state, &registry, shutdown);
-    tokio::join!(unix_serve, remote_serve);
+    let remote_shutdown_sessions = sessions.clone();
+    let remote_serve = serve_remote(remote_state, &registry, shutdown, move || {
+        remote_shutdown_sessions.begin_daemon_shutdown();
+    });
+    let ((), remote_result) = tokio::join!(unix_serve, remote_serve);
 
     // 11. Flush the append-only event log before exit so events buffered at
     //     shutdown are not lost (bounded so a wedged write cannot hang exit).
@@ -236,6 +240,7 @@ async fn run() -> Result<(), DaemonError> {
     sessions.shutdown_agent_state_hooks().await;
     shutdown_event_logs(event_logs).await;
 
+    remote_result?;
     info!("pohunekd stopped");
     Ok(())
 }
@@ -472,29 +477,82 @@ fn next_retry_interval(current: Duration) -> Duration {
 }
 
 /// Serve the remote transport when its port configuration is valid.
-async fn serve_remote(state: DaemonState, registry: &OverlayRegistry, shutdown: CancellationToken) {
+async fn serve_remote<F>(
+    state: DaemonState,
+    registry: &OverlayRegistry,
+    shutdown: CancellationToken,
+    begin_daemon_shutdown: F,
+) -> Result<(), DaemonError>
+where
+    F: FnOnce(),
+{
     let mut tasks = Vec::with_capacity(registry.entries().len());
     for configured in registry.entries() {
         let configured = configured.clone();
+        let overlay_id = configured.id().clone();
         let state = state.clone();
         let shutdown = shutdown.clone();
-        tasks.push(tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             serve_remote_with_retry(
                 || bind_remote_server(state.clone(), configured.clone()),
                 shutdown,
                 REMOTE_BIND_INITIAL_RETRY_INTERVAL,
             )
             .await;
-        }));
+        });
+        tasks.push((overlay_id, task));
     }
 
+    supervise_remote_tasks(tasks, shutdown, begin_daemon_shutdown).await
+}
+
+/// Monitor overlay listener supervisors and stop the daemon on task failure.
+async fn supervise_remote_tasks<F>(
+    tasks: Vec<(OverlayId, JoinHandle<()>)>,
+    shutdown: CancellationToken,
+    begin_daemon_shutdown: F,
+) -> Result<(), DaemonError>
+where
+    F: FnOnce(),
+{
     if tasks.is_empty() {
         shutdown.cancelled().await;
-        return;
+        return Ok(());
     }
-    for task in tasks {
-        let _ = task.await;
+
+    let mut completions = tasks
+        .into_iter()
+        .map(|(overlay_id, task)| async move { (overlay_id, task.await) })
+        .collect::<FuturesUnordered<_>>();
+    let mut first_failure = None;
+    let mut begin_daemon_shutdown = Some(begin_daemon_shutdown);
+
+    while let Some((overlay_id, result)) = completions.next().await {
+        let reason = match result {
+            Ok(()) if shutdown.is_cancelled() => continue,
+            Ok(()) => "supervisor exited before shutdown".to_owned(),
+            Err(join_error) => join_error.to_string(),
+        };
+        let failure = DaemonError::RemoteListenerSupervisor {
+            overlay: overlay_id.to_string(),
+            reason,
+        };
+        error!(
+            overlay = %overlay_id,
+            error = %failure,
+            "remote listener supervisor failed; shutting down daemon"
+        );
+        if first_failure.is_none() {
+            first_failure = Some(failure);
+            let begin_daemon_shutdown = begin_daemon_shutdown
+                .take()
+                .expect("daemon shutdown callback is available for the first failure");
+            begin_daemon_shutdown();
+            shutdown.cancel();
+        }
     }
+
+    first_failure.map_or(Ok(()), Err)
 }
 
 /// Bind one overlay's TCP control listener once.
@@ -584,21 +642,24 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
+    use overlay::OverlayId;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio_util::sync::CancellationToken;
 
     use pohunek_daemon::api::{DaemonState, HealthInfo};
     use pohunek_daemon::session::SessionRegistry;
+    use pohunek_daemon::DaemonError;
     use protocol::{method, Request, Response};
     use serde_json::Value;
 
     use super::{
-        next_retry_interval, serve_remote_with_retry, RemoteBind, REMOTE_BIND_MAX_RETRY_INTERVAL,
+        next_retry_interval, serve_remote_with_retry, supervise_remote_tasks, RemoteBind,
+        REMOTE_BIND_MAX_RETRY_INTERVAL,
     };
 
     #[test]
@@ -706,5 +767,93 @@ mod tests {
         supervisor
             .await
             .expect("remote supervisor exits after shutdown");
+    }
+
+    #[tokio::test]
+    async fn remote_supervisor_panic_cancels_and_drains_siblings() {
+        let shutdown = CancellationToken::new();
+        let daemon_shutdown_started = Arc::new(AtomicBool::new(false));
+        let daemon_shutdown_started_by_failure = Arc::clone(&daemon_shutdown_started);
+        let sibling_shutdown = shutdown.clone();
+        let sibling_stopped = Arc::new(AtomicBool::new(false));
+        let sibling_stopped_by_task = Arc::clone(&sibling_stopped);
+        let sibling = tokio::spawn(async move {
+            sibling_shutdown.cancelled().await;
+            sibling_stopped_by_task.store(true, Ordering::Relaxed);
+        });
+        let failed = tokio::spawn(async {
+            panic!("simulated remote listener supervisor panic");
+        });
+
+        let result = supervise_remote_tasks(
+            vec![
+                (
+                    OverlayId::new("healthy").expect("valid overlay id"),
+                    sibling,
+                ),
+                (OverlayId::new("failed").expect("valid overlay id"), failed),
+            ],
+            shutdown.clone(),
+            move || {
+                daemon_shutdown_started_by_failure.store(true, Ordering::Relaxed);
+            },
+        )
+        .await;
+
+        assert!(shutdown.is_cancelled());
+        assert!(daemon_shutdown_started.load(Ordering::Relaxed));
+        assert!(sibling_stopped.load(Ordering::Relaxed));
+        match result.expect_err("panic must fail the remote transport") {
+            DaemonError::RemoteListenerSupervisor { overlay, reason } => {
+                assert_eq!(overlay, "failed");
+                assert!(reason.contains("panicked"), "unexpected reason: {reason}");
+            }
+            error => panic!("unexpected daemon error: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_supervisor_clean_exit_before_shutdown_fails_closed() {
+        let shutdown = CancellationToken::new();
+        let exited = tokio::spawn(async {});
+
+        let result = supervise_remote_tasks(
+            vec![(OverlayId::new("exited").expect("valid overlay id"), exited)],
+            shutdown.clone(),
+            || {},
+        )
+        .await;
+
+        assert!(shutdown.is_cancelled());
+        match result.expect_err("early exit must fail the remote transport") {
+            DaemonError::RemoteListenerSupervisor { overlay, reason } => {
+                assert_eq!(overlay, "exited");
+                assert_eq!(reason, "supervisor exited before shutdown");
+            }
+            error => panic!("unexpected daemon error: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_supervisors_exit_cleanly_after_shutdown() {
+        let shutdown = CancellationToken::new();
+        let daemon_shutdown_started = Arc::new(AtomicBool::new(false));
+        let daemon_shutdown_started_by_failure = Arc::clone(&daemon_shutdown_started);
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move {
+            task_shutdown.cancelled().await;
+        });
+        shutdown.cancel();
+
+        supervise_remote_tasks(
+            vec![(OverlayId::new("stopped").expect("valid overlay id"), task)],
+            shutdown,
+            move || {
+                daemon_shutdown_started_by_failure.store(true, Ordering::Relaxed);
+            },
+        )
+        .await
+        .expect("shutdown completion is expected");
+        assert!(!daemon_shutdown_started.load(Ordering::Relaxed));
     }
 }

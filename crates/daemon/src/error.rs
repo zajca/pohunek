@@ -92,6 +92,15 @@ pub enum DaemonError {
     #[error("overlay configuration failed: {0}")]
     OverlayConfig(#[from] overlay::OverlayError),
 
+    /// A configured overlay listener supervisor stopped before daemon shutdown.
+    #[error("remote listener supervisor for overlay {overlay} stopped unexpectedly: {reason}")]
+    RemoteListenerSupervisor {
+        /// Stable overlay identifier for the failed listener supervisor.
+        overlay: String,
+        /// Whether the supervisor exited normally, panicked, or was cancelled.
+        reason: String,
+    },
+
     /// Durable logical sessions could not be loaded for startup reconciliation.
     #[error("session worker reconciliation failed: {0}")]
     Reconcile(#[source] protocol::ProtocolError),
