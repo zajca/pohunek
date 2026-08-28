@@ -577,22 +577,35 @@ fn render_status_human(result: &IntegrationStatusResult) -> String {
     if result.agents.is_empty() {
         return "no agents selected\n".to_owned();
     }
-    let mut output = String::from("AGENT       AVAILABLE  STATE         VERSION\n");
+    let mut output = String::from("AGENT       AVAILABLE  STATE          INSTALLED  EXPECTED\n");
     for report in &result.agents {
         let _ = writeln!(
             output,
-            "{:<11} {:<9} {:<13} {}",
+            "{:<11} {:<9} {:<14} {:<10} {}",
             agent_label(&report.agent),
             report.available,
             state_label(report.state),
-            version_label(report.installed_version, report.expected_version)
+            installed_version_label(report.installed_version),
+            report.expected_version,
         );
-        let _ = writeln!(output, "  hook: {}", report.expected_hook_path);
-        for path in &report.managed_hook_paths {
-            let _ = writeln!(output, "  managed: {path}");
+        for path in &report.expected_asset_paths {
+            let _ = writeln!(output, "  expected asset: {path}");
         }
-        if let Some(warning) = &report.warning {
+        for path in &report.present_asset_paths {
+            let _ = writeln!(output, "  present asset: {path}");
+        }
+        for path in &report.registration_paths {
+            let _ = writeln!(output, "  registration: {path}");
+        }
+        for warning in &report.warnings {
             let _ = writeln!(output, "  warning: {warning}");
+        }
+        if report.state != IntegrationInstallState::Current {
+            let agent = agent_label(&report.agent);
+            let _ = writeln!(
+                output,
+                "  hint: run `pohunek integration install --agent {agent}` to repair"
+            );
         }
     }
     output
@@ -606,11 +619,8 @@ fn state_label(state: IntegrationInstallState) -> &'static str {
     }
 }
 
-fn version_label(installed: Option<u32>, expected: u32) -> String {
-    match installed {
-        Some(version) => format!("{version}/{expected}"),
-        None => format!("unknown/{expected}"),
-    }
+fn installed_version_label(installed: Option<u32>) -> String {
+    installed.map_or_else(|| "none".to_owned(), |version| version.to_string())
 }
 
 #[expect(
@@ -716,7 +726,7 @@ fn render_hermes_human(result: &HermesResult) -> String {
 
 #[cfg(test)]
 mod status_tests {
-    use super::{render_status_human, version_label};
+    use super::{installed_version_label, render_status_human};
     use protocol::{
         AgentKind, IntegrationAgentStatus, IntegrationInstallState, IntegrationStatusResult,
     };
@@ -728,30 +738,36 @@ mod status_tests {
                 IntegrationAgentStatus {
                     agent: AgentKind::Claude,
                     available: true,
-                    expected_hook_path: "/home/u/.claude/hooks/pohunek-agent-state.sh".to_owned(),
-                    managed_hook_paths: vec![
+                    expected_asset_paths: vec![
                         "/home/u/.claude/hooks/pohunek-agent-state.sh".to_owned(),
                         "/home/u/.claude/hooks/pohunek-agent-notify.sh".to_owned(),
                     ],
+                    present_asset_paths: vec![
+                        "/home/u/.claude/hooks/pohunek-agent-state.sh".to_owned(),
+                        "/home/u/.claude/hooks/pohunek-agent-notify.sh".to_owned(),
+                    ],
+                    registration_paths: vec!["/home/u/.claude/settings.json".to_owned()],
                     installed_version: Some(4),
                     expected_version: 4,
                     state: IntegrationInstallState::Current,
-                    warning: Some(
-                        "notification hook version marker is missing, invalid, or outdated"
-                            .to_owned(),
-                    ),
+                    warnings: Vec::new(),
                 },
                 IntegrationAgentStatus {
                     agent: AgentKind::Codex,
                     available: true,
-                    expected_hook_path: "/home/u/.codex/pohunek-agent-state.sh".to_owned(),
-                    managed_hook_paths: vec!["/home/u/.codex/pohunek-agent-state.sh".to_owned()],
+                    expected_asset_paths: vec![
+                        "/home/u/.codex/pohunek-agent-state.sh".to_owned(),
+                        "/home/u/.codex/pohunek-agent-notify.sh".to_owned(),
+                    ],
+                    present_asset_paths: vec!["/home/u/.codex/pohunek-agent-state.sh".to_owned()],
+                    registration_paths: vec![
+                        "/home/u/.codex/hooks.json".to_owned(),
+                        "/home/u/.codex/config.toml".to_owned(),
+                    ],
                     installed_version: None,
                     expected_version: 4,
                     state: IntegrationInstallState::Outdated,
-                    warning: Some(
-                        "state hook version marker is missing, invalid, or outdated".to_owned(),
-                    ),
+                    warnings: vec!["managed notification hook is missing".to_owned()],
                 },
             ],
         };
@@ -762,25 +778,25 @@ mod status_tests {
             .lines()
             .filter(|line| line.starts_with("claude "))
             .collect();
-        assert!(rows.len() == 1 && rows[0].contains("current") && rows[0].ends_with("4/4"));
-        assert!(output.contains("  hook: /home/u/.claude/hooks/pohunek-agent-state.sh"));
-        assert!(output.contains("  managed: /home/u/.claude/hooks/pohunek-agent-notify.sh"));
-        assert!(output.contains(
-            "  warning: notification hook version marker is missing, invalid, or outdated"
-        ));
+        assert!(rows.len() == 1 && rows[0].contains("current") && rows[0].ends_with('4'));
+        assert!(output.contains("  expected asset: /home/u/.claude/hooks/pohunek-agent-state.sh"));
+        assert!(output.contains("  present asset: /home/u/.claude/hooks/pohunek-agent-notify.sh"));
+        assert!(output.contains("  registration: /home/u/.claude/settings.json"));
         let rows: Vec<&str> = output
             .lines()
             .filter(|line| line.starts_with("codex "))
             .collect();
-        assert!(rows.len() == 1 && rows[0].contains("outdated") && rows[0].ends_with("unknown/4"));
-        assert!(output
-            .contains("  warning: state hook version marker is missing, invalid, or outdated"));
+        assert!(rows.len() == 1 && rows[0].contains("outdated") && rows[0].contains("none"));
+        assert!(output.contains("  warning: managed notification hook is missing"));
+        assert!(
+            output.contains("  hint: run `pohunek integration install --agent codex` to repair")
+        );
     }
 
     #[test]
     fn renders_installed_and_expected_versions() {
-        assert_eq!(version_label(Some(4), 5), "4/5");
-        assert_eq!(version_label(None, 5), "unknown/5");
+        assert_eq!(installed_version_label(Some(4)), "4");
+        assert_eq!(installed_version_label(None), "none");
     }
 }
 

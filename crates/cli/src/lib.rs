@@ -722,8 +722,12 @@ struct HermesRequiredTarget {
 /// Read-only Hermes status options.
 #[derive(Debug, Args)]
 struct HermesStatusCliOptions {
-    #[command(flatten)]
-    target: HermesRequiredTarget,
+    /// Select the default or one named Hermes profile.
+    #[arg(long, conflicts_with = "hermes_home")]
+    hermes_profile: Option<String>,
+    /// Select one absolute, owner-private Hermes home.
+    #[arg(long)]
+    hermes_home: Option<PathBuf>,
     /// Use one absolute Hermes executable instead of a bounded absolute PATH lookup.
     #[arg(long)]
     hermes_bin: Option<PathBuf>,
@@ -732,8 +736,8 @@ struct HermesStatusCliOptions {
 impl From<HermesStatusCliOptions> for commands::integration::HermesOptions {
     fn from(value: HermesStatusCliOptions) -> Self {
         Self {
-            profile: value.target.hermes_profile,
-            home: value.target.hermes_home,
+            profile: value.hermes_profile,
+            home: value.hermes_home,
             hermes_bin: value.hermes_bin,
             pohunek_bin: None,
             access_mode: None,
@@ -1725,19 +1729,20 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     hermes,
                     json,
                 } => {
-                    if let Some(agent) = agent {
-                        if agent == commands::integration::HookAgentArg::Hermes {
-                            return run_integration_hermes_action(
-                                commands::integration::HermesAction::Status,
-                                agent,
-                                &hermes.into(),
-                                json,
-                            );
-                        }
-                        return Err(commands::integration::unsupported_action(Some(agent)));
+                    let hermes = commands::integration::HermesOptions::from(hermes);
+                    if agent == Some(commands::integration::HookAgentArg::Hermes) {
+                        return run_integration_hermes_action(
+                            commands::integration::HermesAction::Status,
+                            commands::integration::HookAgentArg::Hermes,
+                            &hermes,
+                            json,
+                        );
+                    }
+                    if hermes.is_explicit() {
+                        return Err(commands::integration::hermes_options_require_hermes());
                     }
                     let paths = Paths::resolve()?;
-                    commands::integration::run_status(&paths, None, json).await?;
+                    commands::integration::run_status(&paths, agent, json).await?;
                     return Ok(ExitCode::SUCCESS);
                 }
                 IntegrationAction::Doctor {
@@ -2235,7 +2240,7 @@ mod tests {
     }
 
     #[test]
-    fn integration_rejects_conflicting_hermes_targets_and_missing_lifecycle_agent() {
+    fn integration_preserves_status_target_conflicts_and_other_required_targets() {
         let conflict = Cli::try_parse_from([
             "pohunek",
             "integration",
@@ -2250,14 +2255,29 @@ mod tests {
         .expect_err("targets conflict");
         assert_eq!(conflict.kind(), clap::error::ErrorKind::ArgumentConflict);
 
-        let missing = Cli::try_parse_from(["pohunek", "integration", "status"])
-            .expect_err("lifecycle requires an agent");
-        assert_eq!(
-            missing.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
+        Cli::try_parse_from(["pohunek", "integration", "status"])
+            .expect("bare daemon-backed status remains reachable");
+        for agent in ["codex", "claude"] {
+            Cli::try_parse_from(["pohunek", "integration", "status", "--agent", agent])
+                .expect("explicit daemon-backed status remains reachable");
+        }
+        Cli::try_parse_from([
+            "pohunek",
+            "integration",
+            "status",
+            "--agent",
+            "hermes",
+            "--hermes-profile",
+            "default",
+            "--hermes-bin",
+            "/opt/hermes/bin/hermes",
+        ])
+        .expect("explicit local Hermes status preserves target flags");
 
-        for action in ["status", "doctor", "update", "uninstall"] {
+        Cli::try_parse_from(["pohunek", "integration", "status", "--agent", "hermes"])
+            .expect("Hermes target validation runs before local filesystem access");
+
+        for action in ["doctor", "update", "uninstall"] {
             let missing_target =
                 Cli::try_parse_from(["pohunek", "integration", action, "--agent", "hermes"])
                     .expect_err("Hermes-only action requires an explicit target");
@@ -2275,7 +2295,7 @@ mod tests {
     #[test]
     fn integration_rejects_non_hermes_lifecycle_before_dispatch() {
         let error = run_integration_hermes_action(
-            commands::integration::HermesAction::Status,
+            commands::integration::HermesAction::Doctor,
             commands::integration::HookAgentArg::Codex,
             &commands::integration::HermesOptions {
                 profile: None,

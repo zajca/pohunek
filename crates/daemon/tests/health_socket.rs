@@ -17,18 +17,18 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use protocol::{
     event, method, AgentActivity, AgentKind, AssistantMaterializeParams,
-    AssistantMaterializeResult, AttachHeader, ErrorClass, Event, IntegrationStatusParams,
-    IntegrationStatusResult, NotificationCreateParams, NotificationCreateResult,
-    NotificationDeleteParams, NotificationDeleteResult, NotificationKind, NotificationKindPolicy,
-    NotificationListParams, NotificationListResult, NotificationPolicy, NotificationPolicyParams,
-    NotificationPolicyResult, NotificationRetentionParams, NotificationRetentionResult,
-    NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
-    NotificationUpdateResult, ReportSequence, Request as ProtocolRequest, Response,
-    SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
-    SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
-    SessionNewParams, SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
-    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult, StateSource,
-    TerminalDimensions, PROTOCOL_VERSION,
+    AssistantMaterializeResult, AttachHeader, ErrorClass, Event, IntegrationInstallState,
+    IntegrationStatusParams, IntegrationStatusResult, NotificationCreateParams,
+    NotificationCreateResult, NotificationDeleteParams, NotificationDeleteResult, NotificationKind,
+    NotificationKindPolicy, NotificationListParams, NotificationListResult, NotificationPolicy,
+    NotificationPolicyParams, NotificationPolicyResult, NotificationRetentionParams,
+    NotificationRetentionResult, NotificationSeverity, NotificationSource, NotificationStatus,
+    NotificationUpdateParams, NotificationUpdateResult, ReportSequence, Request as ProtocolRequest,
+    Response, SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult,
+    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter,
+    SessionListParams, SessionNewParams, SessionRemoveResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionResizeParams, SessionResizeResult, SessionState,
+    SessionStopResult, StateSource, TerminalDimensions, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -134,6 +134,7 @@ impl Drop for PathGuard {
 struct XdgGuard {
     _guard: MutexGuard<'static, ()>,
     saved: Vec<(&'static str, Option<String>)>,
+    root: PathBuf,
 }
 
 impl XdgGuard {
@@ -161,7 +162,12 @@ impl XdgGuard {
         Self {
             _guard: guard,
             saved,
+            root,
         }
+    }
+
+    fn home(&self) -> PathBuf {
+        self.root.join("home")
     }
 }
 
@@ -237,7 +243,14 @@ async fn spawn_server(
 
 #[tokio::test]
 async fn integration_status_dispatches_at_daemon_boundary() {
-    let _xdg = XdgGuard::set_all("integration-status-rpc").await;
+    let xdg = XdgGuard::set_all("integration-status-rpc").await;
+    let claude = xdg.home().join(".claude");
+    let codex = xdg.home().join(".codex");
+    std::fs::create_dir_all(&claude).expect("create isolated Claude config");
+    std::fs::create_dir_all(&codex).expect("create isolated Codex config");
+    pohunek_daemon::integration::install_claude(&claude).expect("install Claude fixture");
+    pohunek_daemon::integration::install_codex(&codex).expect("install Codex fixture");
+    let before = tree_snapshot(&xdg.home());
     let socket = temp_socket("integration-status-rpc");
     let (shutdown, server) = spawn_server(&socket, "test").await;
     let mut framed = connect(&socket).await;
@@ -251,11 +264,54 @@ async fn integration_status_dispatches_at_daemon_boundary() {
     let result: IntegrationStatusResult =
         serde_json::from_value(payload).expect("deserialize status result");
     assert_eq!(result.agents.len(), 2);
-    assert!(result.agents.iter().all(|agent| !agent.available));
+    assert!(result.agents.iter().all(|agent| agent.available));
+    assert!(result
+        .agents
+        .iter()
+        .all(|agent| agent.state == IntegrationInstallState::Current));
+    assert!(result.agents.iter().all(|agent| agent.warnings.is_empty()));
+    assert_eq!(
+        tree_snapshot(&xdg.home()),
+        before,
+        "integration.status must not mutate provider configuration"
+    );
 
     framed.get_mut().shutdown().await.expect("close client");
     shutdown.send(()).expect("send integration status shutdown");
     server.await.expect("integration status server task");
+}
+
+fn tree_snapshot(root: &Path) -> Vec<(PathBuf, u32, Vec<u8>)> {
+    fn visit(root: &Path, path: &Path, entries: &mut Vec<(PathBuf, u32, Vec<u8>)>) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut children = std::fs::read_dir(path)
+            .expect("read snapshot directory")
+            .map(|entry| entry.expect("read snapshot entry").path())
+            .collect::<Vec<_>>();
+        children.sort();
+        for child in children {
+            let metadata = std::fs::symlink_metadata(&child).expect("snapshot metadata");
+            let relative = child.strip_prefix(root).expect("relative snapshot path");
+            let content = if metadata.is_file() {
+                std::fs::read(&child).expect("snapshot file")
+            } else {
+                Vec::new()
+            };
+            entries.push((
+                relative.to_path_buf(),
+                metadata.permissions().mode(),
+                content,
+            ));
+            if metadata.is_dir() {
+                visit(root, &child, entries);
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    visit(root, root, &mut entries);
+    entries
 }
 
 /// Build a `SessionRegistry` wired to a real `SubprocessWorkerLauncher` (the

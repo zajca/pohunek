@@ -166,100 +166,190 @@ pub fn install(agent: Option<AgentKind>) -> Result<IntegrationInstallResult, Pro
 /// Returns [`ProtocolError`] for unsupported agents or when the agent config
 /// directory cannot be resolved.
 pub fn status(params: IntegrationStatusParams) -> Result<IntegrationStatusResult, ProtocolError> {
-    let reports = match params.agent {
-        Some(agent) => vec![agent_status(agent)?],
+    let agents = match params.agent {
+        Some(AgentKind::Claude) => vec![reported_agent_status(StatusAgent::Claude)],
+        Some(AgentKind::Codex) => vec![reported_agent_status(StatusAgent::Codex)],
+        Some(AgentKind::Shell) => return Err(status_unsupported(&AgentKind::Shell)),
+        Some(AgentKind::Hermes) => return Err(status_unsupported(&AgentKind::Hermes)),
+        Some(AgentKind::Unknown(value)) => {
+            return Err(ProtocolError::agent_kind_unsupported(&value));
+        }
         None => vec![
-            agent_status(AgentKind::Claude)?,
-            agent_status(AgentKind::Codex)?,
+            reported_agent_status(StatusAgent::Claude),
+            reported_agent_status(StatusAgent::Codex),
         ],
     };
-    Ok(IntegrationStatusResult { agents: reports })
+    Ok(IntegrationStatusResult { agents })
 }
 
-/// Build one agent's read-only status report.
-fn agent_status(agent: AgentKind) -> Result<IntegrationAgentStatus, ProtocolError> {
-    let (config_dir, notify_asset) = match agent {
-        AgentKind::Claude => (claude_config_dir()?, CLAUDE_NOTIFY_HOOK_ASSET),
-        AgentKind::Codex => (codex_config_dir()?, CODEX_NOTIFY_HOOK_ASSET),
-        AgentKind::Shell | AgentKind::Hermes => {
-            return Err(ProtocolError::new(
-                ErrorClass::Runtime,
-                "agent_not_installable",
-                format!("{} has no managed hook integration", agent.as_wire()),
-                None,
-            ));
-        }
-        AgentKind::Unknown(value) => return Err(ProtocolError::agent_kind_unsupported(&value)),
-    };
-    let expected_hook_path = managed_hook_path(&config_dir, &agent, STATE_HOOK_INSTALL_NAME)
-        .display()
-        .to_string();
-    let expected_notify_path = managed_hook_path(&config_dir, &agent, NOTIFY_HOOK_INSTALL_NAME)
-        .display()
-        .to_string();
+/// Degrade one supported agent's config-resolution failure into a warning.
+fn reported_agent_status(agent: StatusAgent) -> IntegrationAgentStatus {
+    match agent_status(agent) {
+        Ok(report) => report,
+        Err(error) => IntegrationAgentStatus {
+            agent: agent.kind(),
+            available: false,
+            expected_asset_paths: Vec::new(),
+            present_asset_paths: Vec::new(),
+            registration_paths: Vec::new(),
+            installed_version: None,
+            expected_version: EXPECTED_INTEGRATION_VERSION,
+            state: IntegrationInstallState::Outdated,
+            warnings: vec![format!(
+                "agent config directory could not be resolved ({})",
+                error.code
+            )],
+        },
+    }
+}
 
-    let mut managed_hook_paths = Vec::new();
-    let mut primary_content = None;
-    let mut notify_content = None;
-    for (path, content_slot) in [
-        (&expected_hook_path, &mut primary_content),
-        (&expected_notify_path, &mut notify_content),
-    ] {
-        match fs::read_to_string(path) {
-            Ok(content) => {
-                managed_hook_paths.push(path.clone());
-                *content_slot = Some(content);
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(io_error("read", Path::new(path), &err)),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusAgent {
+    Claude,
+    Codex,
+}
+
+impl StatusAgent {
+    fn kind(self) -> AgentKind {
+        match self {
+            Self::Claude => AgentKind::Claude,
+            Self::Codex => AgentKind::Codex,
         }
     }
+}
 
-    let warning = drift_warnings(
-        &agent,
-        &config_dir,
-        &[
-            (
-                ManagedAssetKind::StateHook,
-                primary_content.as_deref(),
-                expected_primary_asset(&agent),
-            ),
-            (
-                ManagedAssetKind::NotificationHook,
-                notify_content.as_deref(),
-                notify_asset,
-            ),
-        ],
+fn status_unsupported(agent: &AgentKind) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Runtime,
+        "agent_not_installable",
+        format!("{} has no daemon-managed hook integration", agent.as_wire()),
+        None,
     )
-    .join("; ");
-    let state = install_state(
-        &agent,
-        primary_content.as_deref(),
-        notify_content.as_deref(),
-        notify_asset,
-        managed_hook_paths.is_empty(),
-    );
+}
 
-    Ok(IntegrationAgentStatus {
-        agent,
-        available: config_dir.is_dir(),
-        expected_hook_path,
-        managed_hook_paths,
-        installed_version: primary_content
-            .as_deref()
-            .and_then(parse_integration_version),
+/// Build one supported agent's read-only status report.
+fn agent_status(agent: StatusAgent) -> Result<IntegrationAgentStatus, ProtocolError> {
+    match agent {
+        StatusAgent::Claude => Ok(status_at(
+            StatusAgent::Claude,
+            claude_config_dir()?,
+            CLAUDE_HOOK_ASSET,
+            CLAUDE_NOTIFY_HOOK_ASSET,
+        )),
+        StatusAgent::Codex => Ok(status_at(
+            StatusAgent::Codex,
+            codex_config_dir()?,
+            CODEX_HOOK_ASSET,
+            CODEX_NOTIFY_HOOK_ASSET,
+        )),
+    }
+}
+
+fn status_at(
+    agent: StatusAgent,
+    config_dir: PathBuf,
+    state_asset: &'static str,
+    notify_asset: &'static str,
+) -> IntegrationAgentStatus {
+    let state_path = managed_hook_path(&config_dir, agent, STATE_HOOK_INSTALL_NAME);
+    let notify_path = managed_hook_path(&config_dir, agent, NOTIFY_HOOK_INSTALL_NAME);
+    let registration_paths = registration_paths(&config_dir, agent);
+    let expected_asset_paths = vec![path_text(&state_path), path_text(&notify_path)];
+    let registration_path_strings = registration_paths
+        .iter()
+        .map(|path| path_text(path))
+        .collect();
+
+    let available = match fs::metadata(&config_dir) {
+        Ok(metadata) if metadata.is_dir() => true,
+        Ok(_metadata) => false,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(_error) => false,
+    };
+    if !available {
+        let warning = match fs::metadata(&config_dir) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                "agent config directory could not be inspected"
+            }
+            Ok(_metadata) => "agent config path is not a directory",
+            _ => "agent config directory does not exist",
+        };
+        return IntegrationAgentStatus {
+            agent: agent.kind(),
+            available: false,
+            expected_asset_paths,
+            present_asset_paths: Vec::new(),
+            registration_paths: registration_path_strings,
+            installed_version: None,
+            expected_version: EXPECTED_INTEGRATION_VERSION,
+            state: if warning == "agent config directory does not exist" {
+                IntegrationInstallState::NotInstalled
+            } else {
+                IntegrationInstallState::Outdated
+            },
+            warnings: vec![warning.to_owned()],
+        };
+    }
+
+    let mut warnings = Vec::new();
+    let assets = [
+        inspect_asset(
+            ManagedAssetKind::StateHook,
+            state_path,
+            state_asset,
+            &mut warnings,
+        ),
+        inspect_asset(
+            ManagedAssetKind::NotificationHook,
+            notify_path,
+            notify_asset,
+            &mut warnings,
+        ),
+    ];
+    let (registration_footprint, registrations_current) = match agent {
+        StatusAgent::Claude => inspect_claude_registration(
+            &config_dir,
+            &assets[0].path,
+            &assets[1].path,
+            &mut warnings,
+        ),
+        StatusAgent::Codex => {
+            inspect_codex_registration(&config_dir, &assets[0].path, &assets[1].path, &mut warnings)
+        }
+    };
+    let present_asset_paths = assets
+        .iter()
+        .filter(|asset| asset.present)
+        .map(|asset| path_text(&asset.path))
+        .collect();
+    let installed_version = installed_version(&assets, &mut warnings);
+    let footprint = registration_footprint || assets.iter().any(|asset| asset.footprint);
+    let state = if !footprint {
+        IntegrationInstallState::NotInstalled
+    } else if registrations_current && assets.iter().all(|asset| asset.current) {
+        IntegrationInstallState::Current
+    } else {
+        IntegrationInstallState::Outdated
+    };
+
+    IntegrationAgentStatus {
+        agent: agent.kind(),
+        available,
+        expected_asset_paths,
+        present_asset_paths,
+        registration_paths: registration_path_strings,
+        installed_version,
         expected_version: EXPECTED_INTEGRATION_VERSION,
         state,
-        warning: (!warning.is_empty()).then_some(warning),
-    })
+        warnings,
+    }
 }
 
 /// Resolve the platform-specific managed hook path for an agent.
-fn managed_hook_path(config_dir: &Path, agent: &AgentKind, file_name: &str) -> PathBuf {
-    if *agent == AgentKind::Codex {
-        config_dir.join(file_name)
-    } else {
-        config_dir.join("hooks").join(file_name)
+fn managed_hook_path(config_dir: &Path, agent: StatusAgent, file_name: &str) -> PathBuf {
+    match agent {
+        StatusAgent::Claude => config_dir.join("hooks").join(file_name),
+        StatusAgent::Codex => config_dir.join(file_name),
     }
 }
 
@@ -272,8 +362,17 @@ fn parse_integration_version(content: &str) -> Option<u32> {
     })
 }
 
+#[derive(Debug)]
+struct AssetStatus {
+    path: PathBuf,
+    content: Option<String>,
+    present: bool,
+    footprint: bool,
+    current: bool,
+}
+
 /// Independently classifies each read-only managed hook asset.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManagedAssetKind {
     StateHook,
     NotificationHook,
@@ -288,57 +387,479 @@ impl ManagedAssetKind {
     }
 }
 
-/// Return a concise non-fatal warning for every independently drifted asset.
-fn drift_warnings(
-    _agent: &AgentKind,
-    config_dir: &Path,
-    assets: &[(ManagedAssetKind, Option<&str>, &'static str)],
-) -> Vec<String> {
-    if !config_dir.is_dir() {
-        return vec!["agent config dir does not exist".to_owned()];
-    }
-
-    let mut warnings = Vec::new();
-    for (asset_kind, content, expected_asset) in assets {
-        let asset_kind_description = asset_kind.description();
-        let Some(content) = content else {
-            warnings.push(format!("managed {asset_kind_description} is missing"));
-            continue;
+fn inspect_asset(
+    kind: ManagedAssetKind,
+    path: PathBuf,
+    expected: &'static str,
+    warnings: &mut Vec<String>,
+) -> AssetStatus {
+    let description = kind.description();
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            warnings.push(format!("managed {description} is missing"));
+            return AssetStatus {
+                path,
+                content: None,
+                present: false,
+                footprint: false,
+                current: false,
+            };
+        }
+        Err(_error) => {
+            warnings.push(format!("managed {description} metadata could not be read"));
+            return AssetStatus {
+                path,
+                content: None,
+                present: false,
+                footprint: true,
+                current: false,
+            };
+        }
+    };
+    if !metadata.file_type().is_file() {
+        warnings.push(format!("managed {description} is not a regular file"));
+        return AssetStatus {
+            path,
+            content: None,
+            present: true,
+            footprint: true,
+            current: false,
         };
-        if *content != *expected_asset {
-            warnings.push(format!(
-                "{asset_kind_description} version marker is missing, invalid, or outdated"
-            ));
+    }
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(_error) => {
+            warnings.push(format!("managed {description} could not be read"));
+            return AssetStatus {
+                path,
+                content: None,
+                present: true,
+                footprint: true,
+                current: false,
+            };
+        }
+    };
+    let version = parse_integration_version(&content);
+    let content_current = content == expected;
+    if !content_current {
+        match version {
+            Some(version) if version != EXPECTED_INTEGRATION_VERSION => warnings.push(format!(
+                "managed {description} version {version} does not match expected {EXPECTED_INTEGRATION_VERSION}"
+            )),
+            Some(_version) => warnings.push(format!(
+                "managed {description} content differs from the embedded asset"
+            )),
+            None => warnings.push(format!(
+                "managed {description} version marker is missing or invalid"
+            )),
         }
     }
-    warnings
+    let executable = asset_is_executable(&metadata);
+    if !executable {
+        warnings.push(format!("managed {description} is not executable"));
+    }
+    AssetStatus {
+        path,
+        content: Some(content),
+        present: true,
+        footprint: true,
+        current: content_current && executable,
+    }
 }
 
-/// Aggregate health from both managed files; version drift wins over edits.
-fn install_state(
-    agent: &AgentKind,
-    primary_content: Option<&str>,
-    notify_content: Option<&str>,
-    expected_notify_asset: &str,
-    no_managed_files: bool,
-) -> IntegrationInstallState {
-    if no_managed_files {
-        return IntegrationInstallState::NotInstalled;
-    }
-    let contents_current = primary_content == Some(expected_primary_asset(agent))
-        && notify_content == Some(expected_notify_asset);
-    if contents_current {
-        IntegrationInstallState::Current
+#[cfg(unix)]
+fn asset_is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn asset_is_executable(_metadata: &fs::Metadata) -> bool {
+    true
+}
+
+fn installed_version(assets: &[AssetStatus], warnings: &mut Vec<String>) -> Option<u32> {
+    let mut versions = assets
+        .iter()
+        .filter_map(|asset| asset.content.as_deref())
+        .filter_map(parse_integration_version)
+        .collect::<Vec<_>>();
+    versions.sort_unstable();
+    versions.dedup();
+    if versions.len() > 1 {
+        warnings.push("managed asset version markers are inconsistent".to_owned());
+        None
     } else {
-        IntegrationInstallState::Outdated
+        versions.first().copied()
     }
 }
 
-/// Return the exact embedded state-hook asset for one supported agent.
-fn expected_primary_asset(agent: &AgentKind) -> &'static str {
+fn registration_paths(config_dir: &Path, agent: StatusAgent) -> Vec<PathBuf> {
     match agent {
-        AgentKind::Codex => CODEX_HOOK_ASSET,
-        _ => CLAUDE_HOOK_ASSET,
+        StatusAgent::Claude => vec![config_dir.join("settings.json")],
+        StatusAgent::Codex => vec![
+            config_dir.join("hooks.json"),
+            config_dir.join("config.toml"),
+        ],
+    }
+}
+
+fn path_text(path: &Path) -> String {
+    path.display().to_string()
+}
+
+#[derive(Debug)]
+struct HookSpec {
+    label: String,
+    event: &'static str,
+    command: String,
+    matcher: Option<&'static str>,
+    trust_event: Option<&'static str>,
+}
+
+#[derive(Debug)]
+struct HookFileStatus {
+    footprint: bool,
+    current: bool,
+    positions: Vec<Option<(usize, usize)>>,
+}
+
+enum ReadState {
+    Missing,
+    Unreadable,
+    Content(String),
+}
+
+fn inspect_claude_registration(
+    config_dir: &Path,
+    state_path: &Path,
+    notify_path: &Path,
+    warnings: &mut Vec<String>,
+) -> (bool, bool) {
+    let settings_path = config_dir.join("settings.json");
+    let mut specs = vec![
+        HookSpec {
+            label: "Claude SessionStart".to_owned(),
+            event: SESSION_START_EVENT,
+            command: hook_command(state_path, HOOK_ACTION),
+            matcher: Some("*"),
+            trust_event: None,
+        },
+        HookSpec {
+            label: "Claude SessionEnd".to_owned(),
+            event: SESSION_END_EVENT,
+            command: hook_command(state_path, HOOK_RELEASE_ACTION),
+            matcher: Some("*"),
+            trust_event: None,
+        },
+    ];
+    specs.extend(CLAUDE_NOTIFICATION_MATCHERS.iter().map(|matcher| HookSpec {
+        label: format!("Claude Notification ({matcher})"),
+        event: CLAUDE_NOTIFICATION_EVENT,
+        command: hook_command_with_args(notify_path, &[NOTIFICATION_ACTION, matcher]),
+        matcher: Some(matcher),
+        trust_event: None,
+    }));
+    specs.extend([
+        HookSpec {
+            label: "Claude Stop".to_owned(),
+            event: CLAUDE_STOP_EVENT,
+            command: hook_command(notify_path, STOP_ACTION),
+            matcher: Some("*"),
+            trust_event: None,
+        },
+        HookSpec {
+            label: "Claude StopFailure".to_owned(),
+            event: CLAUDE_STOP_FAILURE_EVENT,
+            command: hook_command(notify_path, STOP_FAILURE_ACTION),
+            matcher: Some("*"),
+            trust_event: None,
+        },
+    ]);
+    let status = inspect_hook_file(&settings_path, "Claude settings.json", &specs, warnings);
+    (status.footprint, status.current)
+}
+
+fn inspect_codex_registration(
+    config_dir: &Path,
+    state_path: &Path,
+    notify_path: &Path,
+    warnings: &mut Vec<String>,
+) -> (bool, bool) {
+    let hooks_path = config_dir.join("hooks.json");
+    let specs = vec![
+        HookSpec {
+            label: "Codex SessionStart".to_owned(),
+            event: SESSION_START_EVENT,
+            command: hook_command(state_path, HOOK_ACTION),
+            matcher: None,
+            trust_event: Some(CODEX_SESSION_START_TRUST_EVENT),
+        },
+        HookSpec {
+            label: "Codex PermissionRequest".to_owned(),
+            event: CODEX_PERMISSION_REQUEST_EVENT,
+            command: hook_command(notify_path, PERMISSION_REQUEST_ACTION),
+            matcher: None,
+            trust_event: Some(CODEX_PERMISSION_REQUEST_TRUST_EVENT),
+        },
+        HookSpec {
+            label: "Codex Stop".to_owned(),
+            event: CODEX_STOP_EVENT,
+            command: hook_command(notify_path, STOP_ACTION),
+            matcher: None,
+            trust_event: Some(CODEX_STOP_TRUST_EVENT),
+        },
+    ];
+    let hooks = inspect_hook_file(&hooks_path, "Codex hooks.json", &specs, warnings);
+    let config = inspect_codex_config(
+        &config_dir.join("config.toml"),
+        &hooks_path,
+        &specs,
+        &hooks.positions,
+        warnings,
+    );
+    (hooks.footprint || config.0, hooks.current && config.1)
+}
+
+fn inspect_hook_file(
+    path: &Path,
+    label: &str,
+    specs: &[HookSpec],
+    warnings: &mut Vec<String>,
+) -> HookFileStatus {
+    let content = match read_status_file(path, label, warnings) {
+        ReadState::Missing => {
+            return HookFileStatus {
+                footprint: false,
+                current: false,
+                positions: vec![None; specs.len()],
+            };
+        }
+        ReadState::Unreadable => {
+            return HookFileStatus {
+                footprint: true,
+                current: false,
+                positions: vec![None; specs.len()],
+            };
+        }
+        ReadState::Content(content) => content,
+    };
+    let document: Value = match serde_json::from_str(&content) {
+        Ok(document) => document,
+        Err(_error) => {
+            warnings.push(format!("{label} is malformed"));
+            return HookFileStatus {
+                footprint: true,
+                current: false,
+                positions: vec![None; specs.len()],
+            };
+        }
+    };
+    let Some(hooks) = document.get("hooks").and_then(Value::as_object) else {
+        warnings.push(format!("{label} has no valid hooks object"));
+        return HookFileStatus {
+            footprint: document.get("hooks").is_some(),
+            current: false,
+            positions: vec![None; specs.len()],
+        };
+    };
+
+    let mut footprint = false;
+    let mut current = true;
+    let mut positions = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let references = hook_command_positions(hooks, spec.event, &spec.command);
+        footprint |= hooks_contains_command(hooks, &spec.command);
+        let exact = references
+            .iter()
+            .copied()
+            .filter(|&(group_index, handler_index)| {
+                hook_registration_matches(hooks, spec.event, group_index, handler_index, spec)
+            })
+            .collect::<Vec<_>>();
+        let spec_current = references.len() == 1 && exact.len() == 1;
+        if !spec_current {
+            warnings.push(format!(
+                "managed {} registration is missing or modified",
+                spec.label
+            ));
+        }
+        current &= spec_current;
+        positions.push(spec_current.then(|| exact[0]));
+    }
+    HookFileStatus {
+        footprint,
+        current,
+        positions,
+    }
+}
+
+fn hook_command_positions(
+    hooks: &Map<String, Value>,
+    event: &str,
+    command: &str,
+) -> Vec<(usize, usize)> {
+    hooks
+        .get(event)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .flat_map(|(group_index, group)| {
+            group
+                .get("hooks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .filter_map(move |(handler_index, handler)| {
+                    (handler.get("command").and_then(Value::as_str) == Some(command))
+                        .then_some((group_index, handler_index))
+                })
+        })
+        .collect()
+}
+
+fn hooks_contains_command(hooks: &Map<String, Value>, command: &str) -> bool {
+    hooks.values().any(|events| {
+        events.as_array().is_some_and(|groups| {
+            groups.iter().any(|group| {
+                group
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .is_some_and(|handlers| {
+                        handlers.iter().any(|handler| {
+                            handler.get("command").and_then(Value::as_str) == Some(command)
+                        })
+                    })
+            })
+        })
+    })
+}
+
+fn hook_registration_matches(
+    hooks: &Map<String, Value>,
+    event: &str,
+    group_index: usize,
+    handler_index: usize,
+    spec: &HookSpec,
+) -> bool {
+    let Some(group) = hooks
+        .get(event)
+        .and_then(Value::as_array)
+        .and_then(|groups| groups.get(group_index))
+    else {
+        return false;
+    };
+    let matcher_matches = match spec.matcher {
+        Some(matcher) => group.get("matcher").and_then(Value::as_str) == Some(matcher),
+        None => group.get("matcher").is_none(),
+    };
+    let expected = json!({
+        "type": "command",
+        "command": spec.command,
+        "timeout": HOOK_TIMEOUT_SECS,
+    });
+    matcher_matches
+        && group
+            .get("hooks")
+            .and_then(Value::as_array)
+            .and_then(|handlers| handlers.get(handler_index))
+            == Some(&expected)
+}
+
+fn inspect_codex_config(
+    path: &Path,
+    hooks_path: &Path,
+    specs: &[HookSpec],
+    positions: &[Option<(usize, usize)>],
+    warnings: &mut Vec<String>,
+) -> (bool, bool) {
+    let content = match read_status_file(path, "Codex config.toml", warnings) {
+        ReadState::Missing => return (false, false),
+        ReadState::Unreadable => return (true, false),
+        ReadState::Content(content) => content,
+    };
+    let document: toml::Value = match content.parse() {
+        Ok(document) => document,
+        Err(_error) => {
+            warnings.push("Codex config.toml is malformed".to_owned());
+            return (true, false);
+        }
+    };
+    let hooks_enabled = document
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .and_then(|features| features.get("hooks"))
+        .and_then(toml::Value::as_bool)
+        == Some(true);
+    if !hooks_enabled {
+        warnings.push("Codex hooks feature is not enabled".to_owned());
+    }
+
+    let trust_state = document
+        .get("hooks")
+        .and_then(toml::Value::as_table)
+        .and_then(|hooks| hooks.get("state"))
+        .and_then(toml::Value::as_table);
+    let trust_prefix = format!("{}:", hooks_path.display());
+    let mut footprint = trust_state.is_some_and(|state| {
+        state.keys().any(|key| {
+            key.starts_with(&trust_prefix)
+                && specs
+                    .iter()
+                    .filter_map(|spec| spec.trust_event)
+                    .any(|event| key[trust_prefix.len()..].starts_with(&format!("{event}:")))
+        })
+    });
+    let mut trust_current = true;
+    for (spec, position) in specs.iter().zip(positions) {
+        let Some(trust_event) = spec.trust_event else {
+            continue;
+        };
+        let valid = position.is_some_and(|(group_index, handler_index)| {
+            let trust_key =
+                codex_hook_trust_key(hooks_path, trust_event, group_index, handler_index);
+            footprint |= trust_state.is_some_and(|state| state.contains_key(&trust_key));
+            let expected = codex_command_hook_trusted_hash(
+                trust_event,
+                &spec.command,
+                HOOK_TIMEOUT_SECS,
+                None,
+            )
+            .ok();
+            trust_state
+                .and_then(|state| state.get(&trust_key))
+                .and_then(toml::Value::as_table)
+                .and_then(|entry| entry.get("trusted_hash"))
+                .and_then(toml::Value::as_str)
+                .zip(expected.as_deref())
+                .is_some_and(|(actual, expected)| actual == expected)
+        });
+        if !valid {
+            warnings.push(format!(
+                "managed {} trust record is missing or modified",
+                spec.label
+            ));
+        }
+        trust_current &= valid;
+    }
+    (footprint, hooks_enabled && trust_current)
+}
+
+fn read_status_file(path: &Path, label: &str, warnings: &mut Vec<String>) -> ReadState {
+    match fs::read_to_string(path) {
+        Ok(content) => ReadState::Content(content),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            warnings.push(format!("{label} is missing"));
+            ReadState::Missing
+        }
+        Err(_error) => {
+            warnings.push(format!("{label} could not be read"));
+            ReadState::Unreadable
+        }
     }
 }
 
@@ -1027,7 +1548,7 @@ mod tests {
         install_codex, shell_single_quote, toml_basic_string, CLAUDE_HOOK_ASSET,
         CLAUDE_NOTIFY_HOOK_ASSET, CODEX_HOOK_ASSET, CODEX_NOTIFY_HOOK_ASSET,
         CODEX_SESSION_START_TRUST_EVENT, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID,
-        ENV_SOCKET_PATH, HOOK_TIMEOUT_SECS,
+        ENV_SOCKET_PATH, EXPECTED_INTEGRATION_VERSION, HOOK_TIMEOUT_SECS, SESSION_START_EVENT,
     };
 
     /// Large enough to expose unbounded hook stdin reads through pipe backpressure.
@@ -2001,178 +2522,221 @@ mod tests {
         assert_eq!(result.agents.len(), 2);
         for report in &result.agents {
             assert!(!report.available);
-            assert_eq!(report.managed_hook_paths, Vec::<String>::new());
+            assert_eq!(report.present_asset_paths, Vec::<String>::new());
+            assert_eq!(report.expected_asset_paths.len(), 2);
             assert_eq!(report.installed_version, None);
-            assert_eq!(report.expected_version, 4);
+            assert_eq!(report.expected_version, EXPECTED_INTEGRATION_VERSION);
             assert_eq!(
                 report.state,
                 protocol::IntegrationInstallState::NotInstalled
             );
-            assert!(report.warning.is_some());
+            assert_eq!(report.warnings.len(), 1);
         }
         assert!(!claude.exists());
         assert!(!codex.exists());
     }
 
     #[test]
-    fn status_reports_current_partial_outdated_and_modified_hooks() {
-        let root = temp_dir("status-drift");
-        let claude = root.join(".claude");
-        let codex = root.join(".codex");
-        fs::create_dir_all(claude.join("hooks")).expect("create Claude hooks");
-        fs::create_dir_all(&codex).expect("create Codex dir");
-        fs::write(
-            claude.join("hooks/pohunek-agent-state.sh"),
-            CLAUDE_HOOK_ASSET,
-        )
-        .expect("write current state hook");
-        fs::write(
-            claude.join("hooks/pohunek-agent-notify.sh"),
-            CLAUDE_NOTIFY_HOOK_ASSET,
-        )
-        .expect("write current notify hook");
-        let wrong_agent_hook = CODEX_HOOK_ASSET.replace(
-            "# POHUNEK_INTEGRATION_VERSION=4",
-            "# POHUNEK_INTEGRATION_VERSION=3",
-        );
-        fs::write(codex.join("pohunek-agent-state.sh"), wrong_agent_hook)
-            .expect("write outdated primary hook");
-        fs::write(
-            codex.join("pohunek-agent-notify.sh"),
-            CODEX_NOTIFY_HOOK_ASSET,
-        )
-        .expect("write current notify marker");
+    fn every_managed_asset_marker_matches_the_expected_version() {
+        for (name, asset) in [
+            ("Claude state", CLAUDE_HOOK_ASSET),
+            ("Claude notification", CLAUDE_NOTIFY_HOOK_ASSET),
+            ("Codex state", CODEX_HOOK_ASSET),
+            ("Codex notification", CODEX_NOTIFY_HOOK_ASSET),
+        ] {
+            assert_eq!(
+                super::parse_integration_version(asset),
+                Some(EXPECTED_INTEGRATION_VERSION),
+                "{name} marker must match the public expected version"
+            );
+        }
+    }
 
-        let reports = with_config_dirs(&claude, &codex, || {
+    #[test]
+    fn status_reports_complete_installs_current_without_mutation() {
+        let root = temp_dir("status-current");
+        let claude = root.join("claude");
+        let codex = root.join("codex");
+        fs::create_dir_all(&claude).expect("create Claude dir");
+        fs::create_dir_all(&codex).expect("create Codex dir");
+        install_claude(&claude).expect("install Claude fixture");
+        install_codex(&codex).expect("install Codex fixture");
+        let before = tree_snapshot(&root);
+
+        let result = with_config_dirs(&claude, &codex, || {
             super::status(protocol::IntegrationStatusParams { agent: None })
         })
-        .expect("status drift")
-        .agents;
-        let claude_status = reports.first().expect("Claude status");
-        let codex_status = reports.last().expect("Codex status");
+        .expect("status current");
 
+        assert_eq!(tree_snapshot(&root), before, "status must not mutate files");
+        assert_eq!(result.agents.len(), 2);
+        for report in result.agents {
+            assert_eq!(report.state, protocol::IntegrationInstallState::Current);
+            assert_eq!(report.installed_version, Some(EXPECTED_INTEGRATION_VERSION));
+            assert_eq!(report.expected_asset_paths.len(), 2);
+            assert_eq!(report.present_asset_paths.len(), 2);
+            assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        }
+    }
+
+    #[test]
+    fn status_detects_each_modified_or_missing_managed_asset() {
+        for (name, relative_path, mutation) in [
+            (
+                "state modified",
+                "pohunek-agent-state.sh",
+                Some("# modified\n"),
+            ),
+            (
+                "notification modified",
+                "pohunek-agent-notify.sh",
+                Some("# modified\n"),
+            ),
+            ("state missing", "pohunek-agent-state.sh", None),
+            ("notification missing", "pohunek-agent-notify.sh", None),
+        ] {
+            let codex = temp_dir(&format!("status-asset-{name}"));
+            install_codex(&codex).expect("install Codex fixture");
+            let path = codex.join(relative_path);
+            match mutation {
+                Some(content) => fs::write(&path, content).expect("modify managed asset"),
+                None => fs::remove_file(&path).expect("remove managed asset"),
+            }
+
+            let report = explicit_status(&codex, AgentKind::Codex);
+
+            assert_eq!(
+                report.state,
+                protocol::IntegrationInstallState::Outdated,
+                "{name}"
+            );
+            assert!(
+                report.warnings.iter().any(|warning| warning.contains(
+                    if relative_path.contains("notify") {
+                        "notification hook"
+                    } else {
+                        "state hook"
+                    }
+                )),
+                "{name}: {:?}",
+                report.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn status_detects_broken_claude_registration() {
+        let claude = temp_dir("status-claude-registration");
+        install_claude(&claude).expect("install Claude fixture");
+        let settings_path = claude.join("settings.json");
+        let mut settings = read_json(&settings_path);
+        settings["hooks"][SESSION_START_EVENT][0]["hooks"][0]["timeout"] = json!(1);
+        fs::write(
+            &settings_path,
+            serde_json::to_vec_pretty(&settings).expect("serialize modified settings"),
+        )
+        .expect("write modified settings");
+
+        let report = explicit_status(&claude, AgentKind::Claude);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Claude SessionStart registration")));
+    }
+
+    #[test]
+    fn status_detects_broken_codex_registration_trust_and_read_errors() {
+        for failure in ["registration", "trust", "read"] {
+            let codex = temp_dir(&format!("status-codex-{failure}"));
+            install_codex(&codex).expect("install Codex fixture");
+            match failure {
+                "registration" => {
+                    let hooks_path = codex.join("hooks.json");
+                    let mut hooks = read_json(&hooks_path);
+                    hooks["hooks"][SESSION_START_EVENT][0]["hooks"][0]["timeout"] = json!(1);
+                    fs::write(
+                        hooks_path,
+                        serde_json::to_vec_pretty(&hooks).expect("serialize modified hooks"),
+                    )
+                    .expect("write modified hooks");
+                }
+                "trust" => {
+                    let config_path = codex.join("config.toml");
+                    let config = fs::read_to_string(&config_path).expect("read Codex config");
+                    fs::write(
+                        config_path,
+                        config.replacen("sha256:", "sha256:modified-", 1),
+                    )
+                    .expect("modify trust hash");
+                }
+                "read" => {
+                    let hooks_path = codex.join("hooks.json");
+                    fs::remove_file(&hooks_path).expect("remove hooks file");
+                    fs::create_dir(&hooks_path).expect("replace hooks file with directory");
+                }
+                other => panic!("unknown fixture failure: {other}"),
+            }
+
+            let report = explicit_status(&codex, AgentKind::Codex);
+
+            assert_eq!(
+                report.state,
+                protocol::IntegrationInstallState::Outdated,
+                "{failure}"
+            );
+            assert!(!report.warnings.is_empty(), "{failure}");
+        }
+    }
+
+    #[test]
+    fn aggregate_status_degrades_one_resolution_failure_without_aborting() {
+        let codex = temp_dir("status-aggregate-resolve");
+        install_codex(&codex).expect("install Codex fixture");
+
+        let result = with_status_env(None, Some(&codex), None, || {
+            super::status(protocol::IntegrationStatusParams { agent: None })
+        })
+        .expect("aggregate status");
+
+        assert_eq!(result.agents.len(), 2);
+        assert_eq!(result.agents[0].agent, AgentKind::Claude);
         assert_eq!(
-            claude_status.state,
-            protocol::IntegrationInstallState::Current
-        );
-        assert_eq!(claude_status.warning, None);
-        assert_eq!(claude_status.installed_version, Some(4));
-        assert_eq!(
-            codex_status.state,
+            result.agents[0].state,
             protocol::IntegrationInstallState::Outdated
         );
-        assert_eq!(codex_status.installed_version, Some(3));
-        assert!(codex_status.warning.is_some());
-    }
-
-    #[test]
-    fn status_reports_version_matched_user_modification_as_outdated_with_warning() {
-        let codex = temp_dir("status-user-modified");
-        fs::create_dir_all(&codex).expect("create Codex dir");
-        let modified_hook = CODEX_HOOK_ASSET.replace("set -eu\n", "set -eu\n# user edit\n");
-        fs::write(codex.join("pohunek-agent-state.sh"), modified_hook)
-            .expect("write modified hook");
-        fs::write(
-            codex.join("pohunek-agent-notify.sh"),
-            CODEX_NOTIFY_HOOK_ASSET,
-        )
-        .expect("write notify hook");
-
-        let report = with_config_dirs(&codex, &codex, || {
-            super::status(protocol::IntegrationStatusParams {
-                agent: Some(AgentKind::Codex),
-            })
-        })
-        .expect("status modified")
-        .agents
-        .into_iter()
-        .next()
-        .expect("Codex status");
-
-        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert!(result.agents[0].warnings[0].contains("missing_env"));
+        assert_eq!(result.agents[1].agent, AgentKind::Codex);
         assert_eq!(
-            report.warning.as_deref(),
-            Some("state hook version marker is missing, invalid, or outdated")
+            result.agents[1].state,
+            protocol::IntegrationInstallState::Current
         );
     }
 
     #[test]
-    fn status_reports_modified_notification_hook_independently() {
-        let codex = temp_dir("status-notify-modified");
-        fs::create_dir_all(&codex).expect("create Codex dir");
-        fs::write(codex.join("pohunek-agent-state.sh"), CODEX_HOOK_ASSET)
-            .expect("write current state hook");
-        let modified_notification =
-            CODEX_NOTIFY_HOOK_ASSET.replace("set -eu\n", "set -eu\n# user edit\n");
-        fs::write(codex.join("pohunek-agent-notify.sh"), modified_notification)
-            .expect("write modified notification hook");
-
-        let report = with_config_dirs(&codex, &codex, || {
+    fn explicit_status_degrades_resolution_failure_to_warning() {
+        let report = with_status_env(None, None, None, || {
             super::status(protocol::IntegrationStatusParams {
-                agent: Some(AgentKind::Codex),
+                agent: Some(AgentKind::Claude),
             })
         })
-        .expect("status modified notification")
+        .expect("explicit status")
         .agents
-        .into_iter()
-        .next()
-        .expect("Codex status");
+        .pop()
+        .expect("Claude report");
 
         assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
-        assert!(report
-            .warning
-            .as_deref()
-            .is_some_and(|warning| warning.contains("notification hook")));
+        assert!(report.warnings[0].contains("missing_env"));
     }
 
     #[test]
-    fn status_reports_missing_notification_hook_independently() {
-        let codex = temp_dir("status-notify-missing");
-        fs::create_dir_all(&codex).expect("create Codex dir");
-        fs::write(codex.join("pohunek-agent-state.sh"), CODEX_HOOK_ASSET)
-            .expect("write current state hook");
-
-        let report = with_config_dirs(&codex, &codex, || {
-            super::status(protocol::IntegrationStatusParams {
-                agent: Some(AgentKind::Codex),
-            })
-        })
-        .expect("status missing notification")
-        .agents
-        .into_iter()
-        .next()
-        .expect("Codex status");
-
-        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
-        assert_eq!(
-            report.warning.as_deref(),
-            Some("managed notification hook is missing")
-        );
-    }
-
-    #[test]
-    fn status_reports_partial_install_as_outdated_with_warning() {
-        let codex = temp_dir("status-partial");
-        fs::create_dir_all(&codex).expect("create Codex dir");
-        fs::write(codex.join("pohunek-agent-state.sh"), CODEX_HOOK_ASSET)
-            .expect("write only the primary hook");
-
-        let report = with_config_dirs(&codex, &codex, || {
-            super::status(protocol::IntegrationStatusParams {
-                agent: Some(AgentKind::Codex),
-            })
-        })
-        .expect("status partial")
-        .agents
-        .into_iter()
-        .next()
-        .expect("Codex status");
-
-        assert_eq!(report.managed_hook_paths.len(), 1);
-        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
-        assert!(report
-            .warning
-            .is_some_and(|warning| warning.contains("notification hook is missing")));
+    fn explicit_unsupported_status_agents_return_typed_errors() {
+        for agent in [AgentKind::Shell, AgentKind::Hermes] {
+            let error = super::status(protocol::IntegrationStatusParams { agent: Some(agent) })
+                .expect_err("unsupported agent must fail");
+            assert_eq!(error.code, "agent_not_installable");
+        }
     }
 
     /// Serializes the process-global config-dir overrides used by status tests.
@@ -2182,6 +2746,7 @@ mod tests {
     struct ConfigDirGuard {
         claude_dir: Option<std::ffi::OsString>,
         codex_dir: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
     }
 
     impl Drop for ConfigDirGuard {
@@ -2196,6 +2761,11 @@ mod tests {
             } else {
                 std::env::remove_var(super::CODEX_HOME_ENV);
             }
+            if let Some(value) = self.home.take() {
+                std::env::set_var("HOME", value);
+            } else {
+                std::env::remove_var("HOME");
+            }
         }
     }
 
@@ -2204,16 +2774,84 @@ mod tests {
         codex_dir: &Path,
         operation: impl FnOnce() -> T,
     ) -> T {
+        let home = std::env::var_os("HOME");
+        with_status_env(
+            Some(claude_dir),
+            Some(codex_dir),
+            home.as_deref().map(Path::new),
+            operation,
+        )
+    }
+
+    fn with_status_env<T>(
+        claude_dir: Option<&Path>,
+        codex_dir: Option<&Path>,
+        home: Option<&Path>,
+        operation: impl FnOnce() -> T,
+    ) -> T {
         let _lock = STATUS_CONFIG_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _guard = ConfigDirGuard {
             claude_dir: std::env::var_os(super::CLAUDE_CONFIG_DIR_ENV),
             codex_dir: std::env::var_os(super::CODEX_HOME_ENV),
+            home: std::env::var_os("HOME"),
         };
-        std::env::set_var(super::CLAUDE_CONFIG_DIR_ENV, claude_dir);
-        std::env::set_var(super::CODEX_HOME_ENV, codex_dir);
+        set_optional_env(super::CLAUDE_CONFIG_DIR_ENV, claude_dir);
+        set_optional_env(super::CODEX_HOME_ENV, codex_dir);
+        set_optional_env("HOME", home);
         operation()
+    }
+
+    fn set_optional_env(key: &str, value: Option<&Path>) {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    fn explicit_status(config_dir: &Path, agent: AgentKind) -> protocol::IntegrationAgentStatus {
+        with_config_dirs(config_dir, config_dir, || {
+            super::status(protocol::IntegrationStatusParams { agent: Some(agent) })
+        })
+        .expect("explicit status")
+        .agents
+        .into_iter()
+        .next()
+        .expect("one agent report")
+    }
+
+    fn tree_snapshot(root: &Path) -> Vec<(PathBuf, u32, Vec<u8>)> {
+        fn visit(root: &Path, path: &Path, entries: &mut Vec<(PathBuf, u32, Vec<u8>)>) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut children = fs::read_dir(path)
+                .expect("read snapshot directory")
+                .map(|entry| entry.expect("read snapshot entry").path())
+                .collect::<Vec<_>>();
+            children.sort();
+            for child in children {
+                let metadata = fs::symlink_metadata(&child).expect("snapshot metadata");
+                let relative = child.strip_prefix(root).expect("relative snapshot path");
+                let content = if metadata.is_file() {
+                    fs::read(&child).expect("snapshot file")
+                } else {
+                    Vec::new()
+                };
+                entries.push((
+                    relative.to_path_buf(),
+                    metadata.permissions().mode(),
+                    content,
+                ));
+                if metadata.is_dir() {
+                    visit(root, &child, entries);
+                }
+            }
+        }
+
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries
     }
 
     #[test]

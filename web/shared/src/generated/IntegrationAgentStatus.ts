@@ -16,15 +16,19 @@ export type IntegrationAgentStatus = {
    */
   available: boolean;
   /**
-   * Expected primary state-hook path, even when the file is absent.
+   * Expected managed asset paths, including files that are absent.
    */
-  expected_hook_path: string;
+  expected_asset_paths: Array<string>;
   /**
-   * Managed scripts present on disk. Paths never contain secret values.
+   * Managed assets present on disk. Paths never contain secret values.
    */
-  managed_hook_paths: Array<string>;
+  present_asset_paths: Array<string>;
   /**
-   * Version parsed from the installed primary state hook.
+   * Registration files inspected for this agent.
+   */
+  registration_paths: Array<string>;
+  /**
+   * Common version marker found across readable managed assets.
    */
   installed_version: number | null;
   /**
@@ -36,7 +40,7 @@ export type IntegrationAgentStatus = {
    */
   state: IntegrationInstallState;
   /**
-   * Non-fatal drift explanation, such as an owner-modified current hook.
+   * Non-fatal, non-secret reasons the complete install contract is unhealthy.
    */
-  warning?: string;
+  warnings: Array<string>;
 };

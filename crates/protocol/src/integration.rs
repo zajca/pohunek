@@ -47,9 +47,9 @@ pub const ENV_PROTOCOL_VERSION: &str = "POHUNEK_PROTOCOL_VERSION";
 
 /// Expected integration asset version reported by `integration.status`.
 ///
-/// This matches the version marker embedded in the daemon's state-hook assets.
-/// It is exposed through `protocol` because CLI and web consumers need the same
-/// expected value without linking the daemon implementation.
+/// Every managed daemon hook asset carries this version marker. It is exposed
+/// through `protocol` because CLI and SDK consumers need the same expected value
+/// without linking the daemon implementation.
 pub const EXPECTED_INTEGRATION_VERSION: u32 = 4;
 
 /// Parameters for `integration.install`.
@@ -103,20 +103,21 @@ pub struct IntegrationAgentStatus {
     pub agent: AgentKind,
     /// Whether the agent's configuration directory exists.
     pub available: bool,
-    /// Expected primary state-hook path, even when the file is absent.
-    pub expected_hook_path: String,
-    /// Managed scripts present on disk. Paths never contain secret values.
-    pub managed_hook_paths: Vec<String>,
-    /// Version parsed from the installed primary state hook.
+    /// Expected managed asset paths, including files that are absent.
+    pub expected_asset_paths: Vec<String>,
+    /// Managed assets present on disk. Paths never contain secret values.
+    pub present_asset_paths: Vec<String>,
+    /// Registration files inspected for this agent.
+    pub registration_paths: Vec<String>,
+    /// Common version marker found across readable managed assets.
     pub installed_version: Option<u32>,
     /// Version currently embedded in this build.
     pub expected_version: u32,
     /// Aggregate install health derived from the files above.
     pub state: IntegrationInstallState,
-    /// Non-fatal drift explanation, such as an owner-modified current hook.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts", ts(optional))]
-    pub warning: Option<String>,
+    /// Non-fatal, non-secret reasons the complete install contract is unhealthy.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Derived installation health for one managed hook integration.
@@ -125,11 +126,11 @@ pub struct IntegrationAgentStatus {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationInstallState.ts"))]
 pub enum IntegrationInstallState {
-    /// The expected config directory exists but no managed hooks were found.
+    /// No Pohunek-managed asset or registration was detected.
     NotInstalled,
-    /// Every managed script exists at the expected asset version.
+    /// Every managed asset, registration, and trust record matches the installer.
     Current,
-    /// At least one managed script has a different version or malformed marker.
+    /// A detected or unreadable install is incomplete, modified, or malformed.
     Outdated,
 }
 
@@ -145,4 +146,23 @@ pub struct IntegrationInstallReport {
     /// Config files the installer created or merged into (settings.json /
     /// hooks.json / config.toml), in the order they were touched.
     pub config_paths: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IntegrationInstallState;
+
+    #[test]
+    fn integration_install_states_use_exact_snake_case_wire_values() {
+        for (state, expected) in [
+            (IntegrationInstallState::NotInstalled, "\"not_installed\""),
+            (IntegrationInstallState::Current, "\"current\""),
+            (IntegrationInstallState::Outdated, "\"outdated\""),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&state).expect("serialize integration state"),
+                expected
+            );
+        }
+    }
 }

@@ -3,7 +3,7 @@
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # POHUNEK_INTEGRATION_ID=claude
-# POHUNEK_INTEGRATION_VERSION=2
+# POHUNEK_INTEGRATION_VERSION=4
 #
 # Claude notification hook. Fire-and-forget: any missing handshake env, missing
 # python3, invalid input, or socket failure is a silent no-op (exit 0) so the
