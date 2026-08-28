@@ -723,22 +723,22 @@ struct HermesRequiredTarget {
 #[derive(Debug, Args)]
 struct HermesStatusCliOptions {
     /// Select the default or one named Hermes profile.
-    #[arg(long, conflicts_with = "hermes_home")]
-    hermes_profile: Option<String>,
+    #[arg(long = "hermes-profile", conflicts_with = "home")]
+    profile: Option<String>,
     /// Select one absolute, owner-private Hermes home.
-    #[arg(long)]
-    hermes_home: Option<PathBuf>,
+    #[arg(long = "hermes-home")]
+    home: Option<PathBuf>,
     /// Use one absolute Hermes executable instead of a bounded absolute PATH lookup.
-    #[arg(long)]
-    hermes_bin: Option<PathBuf>,
+    #[arg(long = "hermes-bin")]
+    binary: Option<PathBuf>,
 }
 
 impl From<HermesStatusCliOptions> for commands::integration::HermesOptions {
     fn from(value: HermesStatusCliOptions) -> Self {
         Self {
-            profile: value.hermes_profile,
-            home: value.hermes_home,
-            hermes_bin: value.hermes_bin,
+            profile: value.profile,
+            home: value.home,
+            hermes_bin: value.binary,
             pohunek_bin: None,
             access_mode: None,
             allowed_hosts: vec![],

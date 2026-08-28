@@ -232,13 +232,13 @@ fn agent_status(agent: StatusAgent) -> Result<IntegrationAgentStatus, ProtocolEr
     match agent {
         StatusAgent::Claude => Ok(status_at(
             StatusAgent::Claude,
-            claude_config_dir()?,
+            &claude_config_dir()?,
             CLAUDE_HOOK_ASSET,
             CLAUDE_NOTIFY_HOOK_ASSET,
         )),
         StatusAgent::Codex => Ok(status_at(
             StatusAgent::Codex,
-            codex_config_dir()?,
+            &codex_config_dir()?,
             CODEX_HOOK_ASSET,
             CODEX_NOTIFY_HOOK_ASSET,
         )),
@@ -247,27 +247,27 @@ fn agent_status(agent: StatusAgent) -> Result<IntegrationAgentStatus, ProtocolEr
 
 fn status_at(
     agent: StatusAgent,
-    config_dir: PathBuf,
+    config_dir: &Path,
     state_asset: &'static str,
     notify_asset: &'static str,
 ) -> IntegrationAgentStatus {
-    let state_path = managed_hook_path(&config_dir, agent, STATE_HOOK_INSTALL_NAME);
-    let notify_path = managed_hook_path(&config_dir, agent, NOTIFY_HOOK_INSTALL_NAME);
-    let registration_paths = registration_paths(&config_dir, agent);
+    let state_path = managed_hook_path(config_dir, agent, STATE_HOOK_INSTALL_NAME);
+    let notify_path = managed_hook_path(config_dir, agent, NOTIFY_HOOK_INSTALL_NAME);
+    let registration_paths = registration_paths(config_dir, agent);
     let expected_asset_paths = vec![path_text(&state_path), path_text(&notify_path)];
     let registration_path_strings = registration_paths
         .iter()
         .map(|path| path_text(path))
         .collect();
 
-    let available = match fs::metadata(&config_dir) {
+    let available = match fs::metadata(config_dir) {
         Ok(metadata) if metadata.is_dir() => true,
         Ok(_metadata) => false,
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(_error) => false,
     };
     if !available {
-        let warning = match fs::metadata(&config_dir) {
+        let warning = match fs::metadata(config_dir) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => {
                 "agent config directory could not be inspected"
             }
@@ -307,14 +307,11 @@ fn status_at(
         ),
     ];
     let (registration_footprint, registrations_current) = match agent {
-        StatusAgent::Claude => inspect_claude_registration(
-            &config_dir,
-            &assets[0].path,
-            &assets[1].path,
-            &mut warnings,
-        ),
+        StatusAgent::Claude => {
+            inspect_claude_registration(config_dir, &assets[0].path, &assets[1].path, &mut warnings)
+        }
         StatusAgent::Codex => {
-            inspect_codex_registration(&config_dir, &assets[0].path, &assets[1].path, &mut warnings)
+            inspect_codex_registration(config_dir, &assets[0].path, &assets[1].path, &mut warnings)
         }
     };
     let present_asset_paths = assets
