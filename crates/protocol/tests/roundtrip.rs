@@ -30,7 +30,7 @@ use protocol::{
     SessionWarning, SessionWarningKind, StateSource, TerminalCursor, TerminalDimensions,
     TerminalWatermark, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES, MAX_RUNTIME_ID_BYTES,
     MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
-    MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_WAIT_MS,
+    MAX_SESSION_READ_LINES, MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_WAIT_MS,
     OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, PROTOCOL_VERSION,
     SESSION_OUTPUT_METADATA_HEADROOM_BYTES, SUPPORTED_PROTOCOL_VERSIONS,
 };
@@ -2741,10 +2741,17 @@ fn session_read_contract_uses_decimal_revision_and_exact_wire_shape() {
         "unknown": true
     }))
     .expect_err("unknown read field must fail");
+    for lines in [0, MAX_SESSION_READ_LINES + 1] {
+        serde_json::from_value::<SessionReadParams>(json!({
+            "session_id": "s-42",
+            "lines": lines
+        }))
+        .expect_err("out-of-range read lines must fail");
+    }
 
     let result = SessionReadResult {
         text: "one\ntwo".to_owned(),
-        source_used: SessionReadSource::RecentUnwrapped,
+        source_used: SessionReadSource::Visible,
         runtime: SessionRuntimeIdentity::new(
             "runtime-1",
             RuntimeGeneration::new(9_007_199_254_740_993),
@@ -2757,7 +2764,7 @@ fn session_read_contract_uses_decimal_revision_and_exact_wire_shape() {
     };
     let expected = json!({
         "text": "one\ntwo",
-        "source_used": "recent_unwrapped",
+        "source_used": "visible",
         "runtime_id": "runtime-1",
         "runtime_generation": "9007199254740993",
         "revision": "9007199254740994",

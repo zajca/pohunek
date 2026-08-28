@@ -566,9 +566,9 @@ pub enum ObservationParamsError {
     #[error("has_more must equal next_offset < runtime_end_offset")]
     InvalidOutputHasMore,
 
-    /// A requested screen-read line count exceeded the protocol ceiling.
-    #[error("lines must be at most {maximum}, got {actual}")]
-    ReadLinesTooMany {
+    /// A requested screen-read line count was outside the protocol range.
+    #[error("lines must be between 1 and {maximum}, got {actual}")]
+    ReadLinesOutOfRange {
         /// Protocol maximum.
         maximum: u32,
         /// Requested value.
@@ -639,11 +639,11 @@ impl SessionScreenParams {
 pub enum SessionReadSource {
     /// Current visible terminal rows.
     Visible,
-    /// Recent rendered text with wrapping preserved.
+    /// Recent rendered text with wrapping preserved, when available.
     Recent,
-    /// Recent rendered text after removing soft wraps.
+    /// Recent rendered text after removing soft wraps, when available.
     RecentUnwrapped,
-    /// Detection-oriented recent text.
+    /// Detection-oriented recent text, when available.
     Detection,
 }
 
@@ -710,16 +710,16 @@ impl SessionReadParams {
     ///
     /// # Errors
     ///
-    /// Returns [`ObservationParamsError::ReadLinesTooMany`] when `lines`
-    /// exceeds [`MAX_SESSION_READ_LINES`].
+    /// Returns [`ObservationParamsError::ReadLinesOutOfRange`] when `lines` is
+    /// outside `1..=MAX_SESSION_READ_LINES`.
     pub fn new(
         session_id: SessionId,
         source: Option<SessionReadSource>,
         lines: Option<u32>,
         format: Option<SessionReadFormat>,
     ) -> Result<Self, ObservationParamsError> {
-        if let Some(actual) = lines.filter(|count| *count > MAX_SESSION_READ_LINES) {
-            return Err(ObservationParamsError::ReadLinesTooMany {
+        if let Some(actual) = lines.filter(|count| !(1..=MAX_SESSION_READ_LINES).contains(count)) {
+            return Err(ObservationParamsError::ReadLinesOutOfRange {
                 maximum: MAX_SESSION_READ_LINES,
                 actual,
             });
@@ -789,15 +789,16 @@ pub struct SessionReadResult {
     /// Captured terminal text in the requested format.
     pub text: String,
     /// Source actually used to produce the capture.
+    ///
+    /// Workers currently expose only visible rendered rows, so unsupported
+    /// requested sources safely report [`SessionReadSource::Visible`].
     pub source_used: SessionReadSource,
     /// Runtime identity that supplied and validated this capture.
     #[serde(flatten)]
     pub runtime: SessionRuntimeIdentity,
     /// Worker output offset represented by this snapshot.
     pub revision: TerminalWatermark,
-    /// Whether the terminal is in its alternate screen buffer.
-    ///
-    /// Recent sources fall back to visible rows when history is unavailable.
+    /// Whether the captured terminal was in its alternate screen buffer.
     pub alternate_screen: bool,
     /// Effective line limit applied by the daemon.
     pub lines_requested: u32,

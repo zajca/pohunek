@@ -704,9 +704,12 @@ async fn worker_identity_changes_project_live_into_the_logical_session() {
 }
 
 #[tokio::test]
-async fn session_read_covers_sources_truncation_ansi_and_external_rejection() {
+async fn session_read_returns_visible_tail_and_truthful_source_fallbacks() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: ShellCommand::new("/bin/sh", ["-c", "printf 'alpha\\nbeta\\n'; sleep 30"]),
+        shell_command: ShellCommand::new(
+            "/bin/sh",
+            ["-c", "printf 'alpha\\nbeta\\ngamma'; sleep 30"],
+        ),
         stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     });
@@ -717,10 +720,10 @@ async fn session_read_covers_sources_truncation_ansi_and_external_rejection() {
         SessionReadParams::new(id, Some(source), lines, None).expect("valid read params")
     };
     let visible = registry
-        .session_read(&read(SessionReadSource::Visible, Some(1)))
+        .session_read(&read(SessionReadSource::Visible, Some(2)))
         .await
         .expect("visible read");
-    assert_eq!(visible.text.split('\n').count(), 1);
+    assert_eq!(visible.text, "beta\ngamma");
     assert!(visible.truncated);
     assert_eq!(visible.source_used, SessionReadSource::Visible);
     assert!(!visible.alternate_screen);
@@ -733,32 +736,24 @@ async fn session_read_covers_sources_truncation_ansi_and_external_rejection() {
         .session_read(&read(SessionReadSource::Recent, None))
         .await
         .expect("recent read");
-    assert_eq!(
-        recent.source_used,
-        SessionReadSource::Recent,
-        "source_used must report the requested source"
-    );
+    assert_eq!(recent.source_used, SessionReadSource::Visible);
+    assert_eq!(recent.text, "alpha\nbeta\ngamma");
     assert!(!recent.alternate_screen);
 
     let unwrapped = registry
         .session_read(&read(SessionReadSource::RecentUnwrapped, None))
         .await
         .expect("unwrapped read");
-    assert_eq!(unwrapped.source_used, SessionReadSource::RecentUnwrapped);
+    assert_eq!(unwrapped.source_used, SessionReadSource::Visible);
+    assert_eq!(unwrapped.text, recent.text);
     assert!(!unwrapped.alternate_screen);
-    let rendered_lines: Vec<&str> = unwrapped.text.split('\n').collect();
-    for line in rendered_lines {
-        assert!(
-            !line.ends_with(' '),
-            "unwrapped read must not preserve trailing spaces"
-        );
-    }
 
     let detection = registry
         .session_read(&read(SessionReadSource::Detection, Some(1)))
         .await
         .expect("detection read");
-    assert_eq!(detection.source_used, SessionReadSource::Detection);
+    assert_eq!(detection.source_used, SessionReadSource::Visible);
+    assert_eq!(detection.text, "gamma");
     assert!(detection.truncated);
 
     let ansi = SessionReadParams::new(
@@ -774,6 +769,76 @@ async fn session_read_covers_sources_truncation_ansi_and_external_rejection() {
         .expect_err("ANSI is unavailable");
     assert_eq!(ansi_error.code, "session_read_ansi_unavailable");
 
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_read_preserves_alternate_screen_state_during_fallback() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new(
+            "/bin/sh",
+            ["-c", "printf '\\033[?1049hTUI-one\\nTUI-two'; sleep 30"],
+        ),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let params = SessionReadParams::new(
+        created.id.clone(),
+        Some(SessionReadSource::RecentUnwrapped),
+        None,
+        None,
+    )
+    .expect("read params");
+
+    let result = registry
+        .session_read(&params)
+        .await
+        .expect("read alternate screen");
+
+    assert_eq!(result.source_used, SessionReadSource::Visible);
+    assert!(result.alternate_screen);
+    assert_eq!(result.text, "TUI-one\nTUI-two");
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_read_identity_guard_rejects_runtime_replacement_race() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "printf ready; sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let observed = registry
+        .managed_session(&created.id)
+        .await
+        .expect("managed session");
+    let replacement_generation = RuntimeGeneration::new(observed.runtime_generation.get() + 1);
+    {
+        let mut sessions = registry.inner.sessions.lock().await;
+        sessions
+            .get_mut(&created.id)
+            .and_then(|entry| entry.info.runtime.as_mut())
+            .expect("live runtime")
+            .runtime_generation = replacement_generation;
+    };
+
+    let error = registry
+        .verify_managed_identity(&created.id, &observed)
+        .await
+        .expect_err("replaced runtime must invalidate an in-flight snapshot");
+
+    assert_eq!(error.code, "session_runtime_changed");
+    {
+        let mut sessions = registry.inner.sessions.lock().await;
+        sessions
+            .get_mut(&created.id)
+            .and_then(|entry| entry.info.runtime.as_mut())
+            .expect("live runtime")
+            .runtime_generation = observed.runtime_generation;
+    };
     let _ = registry.stop(&created.id).await;
 }
 
@@ -4807,6 +4872,10 @@ async fn session_read_rejects_external_observe_only_sessions() {
         .await
         .expect_err("external sessions cannot be read");
     assert_eq!(error.code, "session_external_read_only");
+    assert!(error
+        .recover
+        .as_deref()
+        .is_some_and(|hint| hint.contains("pohunek")));
 }
 
 #[tokio::test]

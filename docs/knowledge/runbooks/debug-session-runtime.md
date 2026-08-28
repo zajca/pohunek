@@ -82,6 +82,12 @@ pohunek session read <target> --source recent --lines 100 --json
 pohunek session output <target> --max-bytes 65536 --json
 ```
 
+Current workers expose rendered visible rows rather than scrollback or
+soft-wrap metadata. For `recent`, `recent_unwrapped`, and `detection`, verify the
+truthful `source_used: "visible"` fallback and inspect `alternate_screen` before
+interpreting the tail as ordinary main-screen history. ANSI reads are reserved
+and fail with `session_read_ansi_unavailable`.
+
 Carry the returned `runtime_id`, `runtime_generation`, and `next_offset` into a
 continued output read or `session wait`. `session_runtime_changed` means the
 cursor belongs to an older PTY generation; restart from a fresh screen/tail.

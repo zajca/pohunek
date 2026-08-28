@@ -701,9 +701,12 @@ pub(crate) fn parse_read_source(value: &str) -> Result<SessionReadSource, String
     match value {
         "visible" => Ok(SessionReadSource::Visible),
         "recent" => Ok(SessionReadSource::Recent),
-        "recent_unwrapped" => Ok(SessionReadSource::RecentUnwrapped),
+        "recent_unwrapped" | "recent-unwrapped" => Ok(SessionReadSource::RecentUnwrapped),
         "detection" => Ok(SessionReadSource::Detection),
-        _ => Err("source must be visible, recent, recent-unwrapped, or detection".to_owned()),
+        _ => Err(
+            "source must be visible, recent, recent_unwrapped (alias: recent-unwrapped), or detection"
+                .to_owned(),
+        ),
     }
 }
 
@@ -719,7 +722,7 @@ pub(crate) fn parse_read_lines(value: &str) -> Result<u32, String> {
     let parsed = value
         .parse::<u32>()
         .map_err(|_error| "--lines must be an unsigned 32-bit integer".to_owned())?;
-    if parsed > MAX_SESSION_READ_LINES {
+    if !(1..=MAX_SESSION_READ_LINES).contains(&parsed) {
         return Err(format!(
             "--lines must be between 1 and {MAX_SESSION_READ_LINES}"
         ));
@@ -1698,6 +1701,23 @@ mod tests {
         )
         .expect_err("line limit should be rejected");
         assert!(error.to_string().contains("1000"));
+    }
+
+    #[test]
+    fn read_parsers_accept_unwrapped_aliases_and_reject_zero_lines() {
+        assert_eq!(
+            parse_read_source("recent_unwrapped").expect("wire-style source"),
+            SessionReadSource::RecentUnwrapped
+        );
+        assert_eq!(
+            parse_read_source("recent-unwrapped").expect("CLI-style alias"),
+            SessionReadSource::RecentUnwrapped
+        );
+        let error = parse_read_source("unknown").expect_err("unknown source");
+        assert!(error.contains("recent_unwrapped"));
+        assert!(error.contains("recent-unwrapped"));
+        parse_read_lines("0").expect_err("zero lines must fail");
+        assert_eq!(parse_read_lines("1").expect("minimum lines"), 1);
     }
 
     #[expect(

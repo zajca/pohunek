@@ -1,11 +1,15 @@
 //! Bounded point-in-time terminal reads for managed sessions.
 
+use std::time::Instant;
+
 use protocol::{
     ErrorClass, ProtocolError, SessionReadFormat, SessionReadParams, SessionReadResult,
     SessionReadSource, TerminalWatermark, MAX_SESSION_READ_LINES, MAX_SESSION_READ_RESPONSE_BYTES,
 };
 
-use super::{observation_worker_error, runtime_identity, SessionId, SessionRegistry};
+use super::{
+    observation_worker_error, runtime_identity, session_external_read_only, SessionRegistry,
+};
 
 impl SessionRegistry {
     /// Return a bounded terminal capture without taking attach ownership.
@@ -13,15 +17,16 @@ impl SessionRegistry {
         &self,
         params: &SessionReadParams,
     ) -> Result<SessionReadResult, ProtocolError> {
+        let started = Instant::now();
         let id = params.session_id();
         if self.inner.external.contains_id(id).await {
-            return Err(external_read_only(id));
+            return Err(session_external_read_only(id));
         }
 
         let managed = match self.managed_session(id).await {
             Ok(managed) => managed,
             Err(error) if error.code == "session_has_no_managed_terminal" => {
-                return Err(external_read_only(id));
+                return Err(session_external_read_only(id));
             }
             Err(error) => return Err(error),
         };
@@ -40,43 +45,56 @@ impl SessionRegistry {
         }
         let effective_lines = params.lines().unwrap_or(MAX_SESSION_READ_LINES);
 
-        let mut alternate_screen = snapshot.alternate_screen;
-        let source_used = requested_source;
-        if requested_source == SessionReadSource::Recent {
-            alternate_screen = false;
-        }
-        let mut lines = snapshot.visible_lines;
-        if requested_source == SessionReadSource::Detection {
-            for line in &mut lines {
-                *line = line.trim_end().to_owned();
-            }
-        } else if requested_source == SessionReadSource::RecentUnwrapped {
-            alternate_screen = false;
-            for line in &mut lines {
-                *line = line.replace('\n', " ");
-            }
-        }
-        let mut truncated = lines.len() > usize::try_from(effective_lines).unwrap_or(usize::MAX);
-        lines.truncate(usize::try_from(effective_lines).unwrap_or(usize::MAX));
-        Ok(SessionReadResult {
-            text: truncate_read_text(lines.join("\n"), &mut truncated),
-            source_used,
+        let line_limit = usize::try_from(effective_lines).unwrap_or(usize::MAX);
+        let (lines, line_truncated) = tail_lines(snapshot.visible_lines, line_limit);
+        let result = SessionReadResult {
+            text: lines.join("\n"),
+            source_used: available_source(requested_source),
             runtime: runtime_identity(managed.runtime_id, managed.runtime_generation)?,
             revision: TerminalWatermark::new(snapshot.watermark),
-            alternate_screen,
+            alternate_screen: snapshot.alternate_screen,
             lines_requested: effective_lines,
-            truncated,
-        })
+            truncated: line_truncated,
+        };
+        let (result, byte_truncated) = bound_read_result(result)?;
+        if byte_truncated {
+            tracing::warn!(
+                session_id = %id.0,
+                response_bytes = serialized_len(&result)?,
+                limit_bytes = MAX_SESSION_READ_RESPONSE_BYTES,
+                "session read response was truncated to the serialized byte limit"
+            );
+        }
+        tracing::debug!(
+            session_id = %id.0,
+            duration_ms = started.elapsed().as_millis(),
+            source_requested = requested_source.as_str(),
+            source_used = result.source_used.as_str(),
+            alternate_screen = result.alternate_screen,
+            lines_requested = result.lines_requested,
+            response_bytes = serialized_len(&result)?,
+            truncated = result.truncated,
+            "session read completed"
+        );
+        Ok(result)
     }
 }
 
-fn external_read_only(id: &SessionId) -> ProtocolError {
-    ProtocolError::new(
-        ErrorClass::Runtime,
-        "session_external_read_only",
-        format!("session {} is an external observe-only agent", id.0),
-        None,
-    )
+const fn available_source(requested: SessionReadSource) -> SessionReadSource {
+    match requested {
+        SessionReadSource::Visible
+        | SessionReadSource::Recent
+        | SessionReadSource::RecentUnwrapped
+        | SessionReadSource::Detection => SessionReadSource::Visible,
+    }
+}
+
+fn tail_lines(mut lines: Vec<String>, limit: usize) -> (Vec<String>, bool) {
+    let truncated = lines.len() > limit;
+    if truncated {
+        lines.drain(..lines.len() - limit);
+    }
+    (lines, truncated)
 }
 
 fn ansi_unavailable() -> ProtocolError {
@@ -88,39 +106,138 @@ fn ansi_unavailable() -> ProtocolError {
     )
 }
 
-fn truncate_read_text(mut text: String, truncated: &mut bool) -> String {
-    let mut encoded_len = text.len().saturating_mul(7);
-    while encoded_len + 2 > MAX_SESSION_READ_RESPONSE_BYTES {
-        *truncated = true;
-        let safe_end = std::str::from_utf8(&text.as_bytes()[..text.len() - 1])
-            .map_or(text.len() - 1, str::len);
-        text.truncate(safe_end);
-        if safe_end == 0 {
+fn bound_read_result(
+    mut result: SessionReadResult,
+) -> Result<(SessionReadResult, bool), ProtocolError> {
+    if serialized_len(&result)? <= MAX_SESSION_READ_RESPONSE_BYTES {
+        return Ok((result, false));
+    }
+
+    let text = std::mem::take(&mut result.text);
+    result.truncated = true;
+    let metadata_bytes = serialized_len(&result)?;
+    if metadata_bytes > MAX_SESSION_READ_RESPONSE_BYTES {
+        return Err(ProtocolError::session_output_limit_exceeded());
+    }
+    let text_budget = MAX_SESSION_READ_RESPONSE_BYTES - metadata_bytes;
+    let start = json_suffix_start(&text, text_budget);
+    text[start..].clone_into(&mut result.text);
+    Ok((result, true))
+}
+
+fn serialized_len(result: &SessionReadResult) -> Result<usize, ProtocolError> {
+    serde_json::to_vec(result)
+        .map(|serialized| serialized.len())
+        .map_err(|_error| {
+            ProtocolError::new(
+                ErrorClass::Runtime,
+                "session_read_serialize_failed",
+                "session read serialization failed",
+                None,
+            )
+        })
+}
+
+fn json_suffix_start(text: &str, escaped_budget: usize) -> usize {
+    let mut escaped_bytes = 0usize;
+    let mut start = text.len();
+    for (index, character) in text.char_indices().rev() {
+        let character_bytes = json_escaped_char_len(character);
+        if escaped_bytes.saturating_add(character_bytes) > escaped_budget {
             break;
         }
-        encoded_len = text.len().saturating_mul(7);
+        escaped_bytes += character_bytes;
+        start = index;
     }
-    text
+    start
+}
+
+const fn json_escaped_char_len(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\u{0008}' | '\u{000C}' | '\n' | '\r' | '\t' => 2,
+        '\u{0000}'..='\u{001F}' => 6,
+        _ => character.len_utf8(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{truncate_read_text, MAX_SESSION_READ_RESPONSE_BYTES};
+    use protocol::{
+        RuntimeGeneration, SessionReadResult, SessionReadSource, SessionRuntimeIdentity,
+        TerminalWatermark,
+    };
 
-    #[test]
-    fn read_text_truncates_on_serialized_bytes_and_sets_truncated() {
-        let mut truncated = false;
-        let text = truncate_read_text("\0".repeat(MAX_SESSION_READ_RESPONSE_BYTES), &mut truncated);
-        assert!(truncated);
-        let encoded = serde_json::to_string(&text).expect("serialize truncated text");
-        assert!(encoded.len() <= MAX_SESSION_READ_RESPONSE_BYTES);
+    use super::{
+        available_source, bound_read_result, json_suffix_start, serialized_len, tail_lines,
+        MAX_SESSION_READ_RESPONSE_BYTES,
+    };
+
+    fn result(text: String) -> SessionReadResult {
+        SessionReadResult {
+            text,
+            source_used: SessionReadSource::Visible,
+            runtime: SessionRuntimeIdentity::new("runtime-1", RuntimeGeneration::new(1))
+                .expect("runtime identity"),
+            revision: TerminalWatermark::new(1),
+            alternate_screen: true,
+            lines_requested: 1_000,
+            truncated: false,
+        }
     }
 
     #[test]
-    fn read_text_within_limit_does_not_set_truncated() {
-        let mut truncated = false;
-        let text = truncate_read_text("plain".to_owned(), &mut truncated);
-        assert_eq!(text, "plain");
-        assert!(!truncated);
+    fn read_result_uses_exact_serialized_bound_and_keeps_multibyte_tail() {
+        let suffix = "tail-žluťoučký-界";
+        let input = format!("{}{}", "\0".repeat(MAX_SESSION_READ_RESPONSE_BYTES), suffix);
+        let (bounded, byte_truncated) = bound_read_result(result(input)).expect("bounded result");
+
+        assert!(byte_truncated);
+        assert!(bounded.truncated);
+        assert!(bounded.text.ends_with(suffix));
+        assert!(bounded.text.is_char_boundary(0));
+        assert!(
+            serialized_len(&bounded).expect("serialized length") <= MAX_SESSION_READ_RESPONSE_BYTES
+        );
+    }
+
+    #[test]
+    fn read_result_within_limit_is_unchanged() {
+        let expected = result("plain".to_owned());
+        let (actual, byte_truncated) = bound_read_result(expected.clone()).expect("bounded result");
+
+        assert_eq!(actual, expected);
+        assert!(!byte_truncated);
+    }
+
+    #[test]
+    fn tail_lines_keep_newest_rows() {
+        let (lines, truncated) = tail_lines(
+            vec!["old".to_owned(), "middle".to_owned(), "new".to_owned()],
+            2,
+        );
+
+        assert_eq!(lines, ["middle", "new"]);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn unavailable_sources_report_visible_fallback() {
+        for source in [
+            SessionReadSource::Recent,
+            SessionReadSource::RecentUnwrapped,
+            SessionReadSource::Detection,
+        ] {
+            assert_eq!(available_source(source), SessionReadSource::Visible);
+        }
+    }
+
+    #[test]
+    fn escaped_suffix_budget_uses_json_lengths_and_utf8_boundaries() {
+        let text = "head\n\0ž界";
+        let suffix = "\0ž界";
+        let escaped = serde_json::to_string(suffix).expect("serialize suffix");
+        let start = json_suffix_start(text, escaped.len() - 2);
+
+        assert_eq!(&text[start..], suffix);
     }
 }

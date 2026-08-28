@@ -1585,6 +1585,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     json,
                 } => {
                     let host = effective_host(&global_host, Some(&target));
+                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
                     commands::session::run_read(
                         &host,
                         &paths,

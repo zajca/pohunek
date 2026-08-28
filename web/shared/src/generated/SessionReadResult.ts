@@ -14,6 +14,9 @@ export type SessionReadResult = {
   text: string;
   /**
    * Source actually used to produce the capture.
+   *
+   * Workers currently expose only visible rendered rows, so unsupported
+   * requested sources safely report [`SessionReadSource::Visible`].
    */
   source_used: SessionReadSource;
   /**
@@ -21,9 +24,7 @@ export type SessionReadResult = {
    */
   revision: TerminalWatermark;
   /**
-   * Whether the terminal is in its alternate screen buffer.
-   *
-   * Recent sources fall back to visible rows when history is unavailable.
+   * Whether the captured terminal was in its alternate screen buffer.
    */
   alternate_screen: boolean;
   /**
