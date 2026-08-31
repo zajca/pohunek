@@ -1618,6 +1618,26 @@ mod tests {
     }
 
     #[test]
+    fn codex_manifest_ignores_workspace_trust_phrase_in_transcript() {
+        let started_at = instant();
+        let mut detector_config = super::DetectorConfig::codex();
+        detector_config.detection = config().detection;
+        let mut detector = Detector::new(12, 100, started_at, detector_config);
+
+        let transitions = detector.feed(
+            started_at,
+            b"\x1b[2J\x1b[HUser: explain the phrase trust this repository\r\nAssistant: it describes a workspace trust setting",
+        );
+
+        assert!(
+            transitions
+                .iter()
+                .all(|transition| transition.activity != AgentActivity::Blocked),
+            "transcript prose must not look like the interactive trust dialog"
+        );
+    }
+
+    #[test]
     fn claude_manifest_maps_ink_selection_form_to_blocked() {
         let started_at = instant();
         let mut detector_config = super::DetectorConfig::claude();

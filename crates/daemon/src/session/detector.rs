@@ -151,17 +151,20 @@ impl SessionRegistry {
         &self,
         id: &SessionId,
     ) -> Result<protocol::SessionDetectionResult, protocol::ProtocolError> {
-        let (preview, minimum_config_generation) = {
+        let managed = {
             let sessions = self.inner.sessions.lock().await;
-            sessions
-                .get(id)
-                .map(|entry| {
-                    (
-                        entry.detector_preview.clone(),
-                        entry.detector_config.borrow().generation,
-                    )
-                })
-                .ok_or_else(|| super::session_not_found(&id.0))?
+            sessions.get(id).map(|entry| {
+                (
+                    entry.detector_preview.clone(),
+                    entry.detector_config.borrow().generation,
+                )
+            })
+        };
+        let Some((preview, minimum_config_generation)) = managed else {
+            if self.inner.external.contains_id(id).await {
+                return Err(protocol::ProtocolError::session_has_no_managed_terminal());
+            }
+            return Err(super::session_not_found(&id.0));
         };
         let (reply, response) = tokio::sync::oneshot::channel();
         preview
