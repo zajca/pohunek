@@ -74,27 +74,30 @@ For durable notification issues:
    ancestors above that explicit trust anchor are not inspected. Unsafe asset or
    parent ownership/permissions and duplicate managed registrations are
    `outdated`. A missing Claude `hooks/` child under a trusted config root is a
-   reinstallable absence; installation creates it as owner-private mode `0700`
-   and leaves an existing real user directory's mode unchanged. Claude
+   reinstallable absence; installation creates it with exact owner-private mode
+   `0700` regardless of inherited umask, removes that newly created directory if
+   mode enforcement or safe opening fails, and leaves an existing real user
+   directory's mode unchanged. Claude
    `settings.json`, Codex `hooks.json`, and Codex `config.toml` are each opened
    no-follow and require effective-UID ownership plus no group/world write bits;
    their metadata and bounded content come from the same descriptor. Codex
    managed trust uses a canonical single-handler group, so a sibling handler is
    drift even when the managed command itself is unchanged. The managed trust
-   key set must also be exact; stale managed keys or tables are reinstallable
-   drift and are removed during reinstall. `CLAUDE_CONFIG_DIR` and `CODEX_HOME`
+   key set must also be exact; stale managed tables are reinstallable drift and
+   are removed during reinstall, while a scalar anywhere in the managed trust
+   namespace requires configuration repair even when hook drift hides its
+   current position. `CLAUDE_CONFIG_DIR` and `CODEX_HOME`
    must resolve to absolute UTF-8 paths, which keeps generated registrations
    independent of the daemon and provider working directories. Follow the typed
    recovery action: `reinstall` means the installer
    can repair every finding, while `repair_configuration` means provider files,
    symlinked, special, foreign-owned, or group/world-writable managed assets or
    parents, invalid registration roots, incompatible TOML table shapes, and
-   scalar values at currently expected installer-owned trust keys must be
-   inspected and fixed first. Scalars under stale managed keys are removed like
-   stale tables. A missing `hooks` object and an exact owned command with drifted
-   handler metadata remain safely reinstallable. Oversized and non-regular files
-   are rejected by bounded, nonblocking inspection and reported with the
-   applicable recovery.
+   scalar values anywhere in the installer-owned trust namespace must be
+   inspected and fixed first. A missing `hooks` object and an exact owned
+   command with drifted handler metadata remain safely reinstallable. Oversized
+   and non-regular files are rejected by bounded, nonblocking inspection and
+   reported with the applicable recovery.
    Status itself never repairs or rewrites provider configuration. Installation
    validates all existing config and hook parents before any mutation and fails
    unsafe parents with `configuration/integration_path_untrusted`. It performs

@@ -806,8 +806,10 @@ and executable mode. Claude must also contain every exact managed registration
 in `settings.json`. Codex must contain every exact registration in `hooks.json`,
 have the hooks feature enabled, and retain the position-derived trust hash for
 each managed hook in `config.toml`. The managed Codex trust-key set must be
-exact: stale managed keys or tables make the integration outdated, and
-reinstallation removes them before writing only the currently expected keys.
+exact: stale managed tables make the integration outdated, and reinstallation
+removes them before writing only the currently expected keys. A scalar anywhere
+in the managed trust namespace requires configuration repair, including when
+hook drift temporarily prevents that key from being position-derived.
 
 `not_installed` means no Pohunek-managed asset or registration was detected;
 `current` means the complete contract above matches; `outdated` covers every
@@ -837,8 +839,10 @@ missing Claude `hooks/` child under an otherwise trusted config root is a
 reinstallable absence and can still report `not_installed`; an existing symlink,
 wrong type, foreign owner, or group/world-writable child requires
 `repair_configuration`. The installer creates a missing Claude `hooks/`
-directory as mode `0700`, but never changes permissions on an existing real user
-directory. Codex trust records describe a canonical single-handler managed
+directory with exact mode `0700` regardless of the inherited umask and removes
+that newly created directory if mode enforcement or safe opening fails, but
+never changes permissions on an existing real user directory. Codex trust
+records describe a canonical single-handler managed
 group, so adding a sibling handler makes status non-current until reinstall
 separates the managed handler while preserving the user sibling. Agent config
 roots selected through `CLAUDE_CONFIG_DIR` or `CODEX_HOME` must be absolute and
@@ -860,12 +864,11 @@ hints and warning commands for a remote report explicitly name the daemon host
 where the operator must run the local installer; passing that host back to
 `integration install` is not a remote mutation. A JSON registration root that
 is not an object, an inline TOML table where the installer requires a regular
-table, a scalar value at a currently expected installer-owned trust key, and
+table, a scalar value anywhere in the installer-owned trust namespace, and
 managed-asset metadata errors other than absence require
-`repair_configuration`. A scalar under a stale managed trust key is safely
-removed like a stale table. A missing `hooks` object remains reinstallable, and
-a handler with an exact installer-owned command identity is safely replaced
-even when its `type` field drifted. All enum values use snake_case on the wire.
+`repair_configuration`. A missing `hooks` object remains reinstallable, and a
+handler with an exact installer-owned command identity is safely replaced even
+when its `type` field drifted. All enum values use snake_case on the wire.
 
 Codex notification support requires modern lifecycle hooks for
 `PermissionRequest` and `Stop`. The installer writes managed command hooks to

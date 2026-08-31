@@ -1204,6 +1204,14 @@ fn inspect_codex_config(
             return (true, false);
         }
     };
+    let trust_prefix = format!("{}:", hooks_path.display());
+    if !codex_config_structure_valid(&document, &trust_prefix) {
+        warnings.push(
+            "Codex config.toml has invalid features, hooks, or hooks.state structure".to_owned(),
+        );
+        require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
+        return (true, false);
+    }
     let expected_keys = specs
         .iter()
         .zip(positions)
@@ -1218,13 +1226,6 @@ fn inspect_codex_config(
             ))
         })
         .collect::<BTreeSet<_>>();
-    if !codex_config_structure_valid(&document, &expected_keys) {
-        warnings.push(
-            "Codex config.toml has invalid features, hooks, or hooks.state structure".to_owned(),
-        );
-        require_recovery(recovery, IntegrationRecovery::RepairConfiguration);
-        return (true, false);
-    }
     let hooks_enabled = document
         .as_table()
         .get("features")
@@ -1243,7 +1244,6 @@ fn inspect_codex_config(
         .and_then(Item::as_table)
         .and_then(|hooks| hooks.get("state"))
         .and_then(Item::as_table);
-    let trust_prefix = format!("{}:", hooks_path.display());
     let actual_keys = trust_state
         .into_iter()
         .flat_map(|state| state.iter())
@@ -1291,7 +1291,7 @@ fn inspect_codex_config(
     (footprint, hooks_enabled && trust_current)
 }
 
-fn codex_config_structure_valid(document: &DocumentMut, expected_keys: &BTreeSet<String>) -> bool {
+fn codex_config_structure_valid(document: &DocumentMut, trust_prefix: &str) -> bool {
     let root = document.as_table();
     if root.get("features").is_some_and(|item| !item.is_table()) {
         return false;
@@ -1310,7 +1310,7 @@ fn codex_config_structure_valid(document: &DocumentMut, expected_keys: &BTreeSet
     };
     state
         .iter()
-        .all(|(key, item)| !expected_keys.contains(key) || item.is_table())
+        .all(|(key, item)| !is_managed_trust_key(key, trust_prefix) || item.is_table())
 }
 
 fn is_managed_trust_key(key: &str, trust_prefix: &str) -> bool {
@@ -1965,13 +1965,9 @@ fn update_codex_config_toml(
     let hooks = ensure_table(doc.as_table_mut(), "hooks", path)?;
     let state = ensure_table(hooks, "state", path)?;
     let trust_prefix = format!("{}:", hooks_path.display());
-    let expected_keys = trust_states
-        .iter()
-        .map(|(trust_key, _hash)| trust_key.as_str())
-        .collect::<BTreeSet<_>>();
     if state
         .iter()
-        .any(|(key, item)| expected_keys.contains(key) && !item.is_table())
+        .any(|(key, item)| is_managed_trust_key(key, &trust_prefix) && !item.is_table())
     {
         return Err(settings_invalid(
             path,
@@ -2145,18 +2141,213 @@ impl TrustedDir {
 
     fn create_child(&self, name: &str, label: &str, mode: u32) -> Result<Self, ProtocolError> {
         let path = self.path.join(name);
-        match rustix::fs::mkdirat(&self.file, name, rustix::fs::Mode::from_bits_truncate(mode)) {
-            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-            Err(error) => {
-                return Err(io_error(
-                    "create trusted directory",
-                    &path,
-                    &io::Error::from(error),
-                ));
-            }
+        let created =
+            match rustix::fs::mkdirat(&self.file, name, rustix::fs::Mode::from_bits_truncate(mode))
+            {
+                Ok(()) => true,
+                Err(rustix::io::Errno::EXIST) => false,
+                Err(error) => {
+                    return Err(io_error(
+                        "create trusted directory",
+                        &path,
+                        &io::Error::from(error),
+                    ));
+                }
+            };
+        if !created {
+            return self.open_child(name, label)?.ok_or_else(|| {
+                path_untrusted(&path, &format!("{label} disappeared after creation"))
+            });
         }
-        self.open_child(name, label)?
-            .ok_or_else(|| path_untrusted(&path, &format!("{label} disappeared after creation")))
+
+        #[cfg(target_os = "linux")]
+        let handle = match self.open_created_child_handle(name, label) {
+            Ok(handle) => handle,
+            Err(error) => {
+                // `unlinkat(..., REMOVEDIR)` never follows a replacement
+                // symlink. A disappeared or non-directory replacement is left
+                // untouched while the ordinary just-created case is cleaned.
+                let _ = rustix::fs::unlinkat(&self.file, name, rustix::fs::AtFlags::REMOVEDIR);
+                return Err(error);
+            }
+        };
+        #[cfg(target_os = "linux")]
+        let result = Self::finish_created_child(&path, label, &handle, mode);
+        #[cfg(not(target_os = "linux"))]
+        let result = (|| {
+            let child = self.open_child(name, label)?.ok_or_else(|| {
+                path_untrusted(&path, &format!("{label} disappeared after creation"))
+            })?;
+            rustix::fs::fchmod(&child.file, rustix::fs::Mode::from_bits_truncate(mode)).map_err(
+                |error| {
+                    io_error(
+                        "enforce trusted directory mode",
+                        &path,
+                        &io::Error::from(error),
+                    )
+                },
+            )?;
+            Ok(child)
+        })();
+        if result.is_err() {
+            #[cfg(target_os = "linux")]
+            self.cleanup_created_child(name, &handle);
+            #[cfg(not(target_os = "linux"))]
+            let _ = rustix::fs::unlinkat(&self.file, name, rustix::fs::AtFlags::REMOVEDIR);
+        }
+        result
+    }
+
+    #[cfg(target_os = "linux")]
+    fn finish_created_child(
+        path: &Path,
+        label: &str,
+        handle: &fs::File,
+        mode: u32,
+    ) -> Result<Self, ProtocolError> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // `mkdirat` applies the process umask. An `O_PATH` descriptor opens the
+        // created inode without requiring owner permissions and keeps mode
+        // enforcement independent of later pathname replacement.
+        chmod_path_handle(handle, mode)
+            .map_err(|error| io_error("set trusted directory mode", path, &error))?;
+        let fd = rustix::fs::openat(
+            handle,
+            ".",
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| {
+            io_error(
+                "open trusted directory after mode enforcement",
+                path,
+                &io::Error::from(error),
+            )
+        })?;
+        let file = fs::File::from(fd);
+        validate_trusted_metadata(
+            path,
+            label,
+            &file
+                .metadata()
+                .map_err(|error| io_error("read trusted directory metadata", path, &error))?,
+            true,
+        )?;
+        let child = Self {
+            path: path.to_path_buf(),
+            file,
+        };
+        rustix::fs::fchmod(&child.file, rustix::fs::Mode::from_bits_truncate(mode)).map_err(
+            |error| {
+                io_error(
+                    "enforce trusted directory mode",
+                    path,
+                    &io::Error::from(error),
+                )
+            },
+        )?;
+        let actual_mode = child
+            .file
+            .metadata()
+            .map_err(|error| io_error("verify trusted directory mode", path, &error))?
+            .permissions()
+            .mode()
+            & UNIX_MODE_MASK;
+        if actual_mode != mode {
+            return Err(io_error(
+                "verify trusted directory mode",
+                path,
+                &io::Error::other(format!(
+                    "requested mode {mode:04o}, filesystem reported {actual_mode:04o}"
+                )),
+            ));
+        }
+        Ok(child)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_created_child_handle(
+        &self,
+        name: &str,
+        label: &str,
+    ) -> Result<fs::File, ProtocolError> {
+        let path = self.path.join(name);
+        let fd = rustix::fs::openat(
+            &self.file,
+            name,
+            rustix::fs::OFlags::PATH
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| path_open_untrusted(&path, label, error))?;
+        let file = fs::File::from(fd);
+        validate_trusted_metadata(
+            &path,
+            label,
+            &file
+                .metadata()
+                .map_err(|error| io_error("read trusted directory metadata", &path, &error))?,
+            true,
+        )?;
+        Ok(file)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cleanup_created_child(&self, name: &str, created: &fs::File) {
+        use std::os::unix::fs::MetadataExt as _;
+
+        // Stage the current entry under a unique name before comparing inode
+        // identity. This prevents cleanup from deleting a replacement raced into
+        // the original name after the created directory was opened.
+        let cleanup_name = format!(".{name}.{}.cleanup", ulid::Ulid::new());
+        if rustix::fs::renameat_with(
+            &self.file,
+            name,
+            &self.file,
+            cleanup_name.as_str(),
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .is_err()
+        {
+            return;
+        }
+        let staged = rustix::fs::openat(
+            &self.file,
+            cleanup_name.as_str(),
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .ok()
+        .map(fs::File::from);
+        let same_inode = staged
+            .as_ref()
+            .and_then(|file| file.metadata().ok())
+            .zip(created.metadata().ok())
+            .is_some_and(|(staged, created)| {
+                staged.dev() == created.dev() && staged.ino() == created.ino()
+            });
+        if same_inode {
+            let _ = rustix::fs::unlinkat(
+                &self.file,
+                cleanup_name.as_str(),
+                rustix::fs::AtFlags::REMOVEDIR,
+            );
+        } else {
+            let _ = rustix::fs::renameat_with(
+                &self.file,
+                cleanup_name.as_str(),
+                &self.file,
+                name,
+                rustix::fs::RenameFlags::NOREPLACE,
+            );
+        }
     }
 
     fn read_optional(&self, name: &str, label: &str) -> Result<Option<LoadedFile>, ProtocolError> {
@@ -2238,6 +2429,45 @@ impl TrustedDir {
         }
         result
     }
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    unsafe_code,
+    reason = "fchmodat2 is required to chmod an O_PATH descriptor; SAFETY documented below"
+)]
+fn chmod_path_handle(file: &fs::File, mode: u32) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    const EMPTY_C_PATH: &[u8] = b"\0";
+
+    // SAFETY: `file` owns a live descriptor, `EMPTY_C_PATH` is a valid
+    // NUL-terminated empty path, and the remaining arguments are the documented
+    // `fchmodat2(2)` mode and `AT_EMPTY_PATH` flag. The syscall does not retain
+    // any pointer or descriptor after returning.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_fchmodat2,
+            file.as_raw_fd(),
+            EMPTY_C_PATH.as_ptr().cast::<libc::c_char>(),
+            mode,
+            libc::AT_EMPTY_PATH,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::ENOSYS) {
+        return Err(error);
+    }
+
+    // Linux before fchmodat2 can still address the same held descriptor through
+    // procfs. The descriptor remains open, so its number cannot be reused while
+    // this stable kernel-generated link is followed.
+    let proc_path = PathBuf::from("/proc/self/fd").join(file.as_raw_fd().to_string());
+    fs::set_permissions(proc_path, fs::Permissions::from_mode(mode))
 }
 
 #[cfg(unix)]
@@ -3597,9 +3827,68 @@ mod tests {
         assert!(!root.join("sentinel").exists());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn created_dir_mode_and_cleanup_are_anchored_against_name_swap() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let root = temp_dir("created-dir-name-swap");
+        let trusted = super::TrustedDir::open(&root, "test root").expect("open trusted dirfd");
+        let child = root.join("hooks");
+        fs::create_dir(&child).expect("create child directory");
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o000))
+            .expect("mask child owner permissions");
+        let handle = trusted
+            .open_created_child_handle("hooks", "test child")
+            .expect("open owner-masked child with O_PATH");
+        let moved = root.join("opened");
+        fs::rename(&child, &moved).expect("move opened child");
+        let victim = root.join("victim");
+        fs::create_dir(&victim).expect("create symlink target");
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o750))
+            .expect("set symlink target mode");
+        symlink(&victim, &child).expect("replace child name with symlink");
+
+        let _opened = super::TrustedDir::finish_created_child(
+            &child,
+            "test child",
+            &handle,
+            super::MANAGED_HOOK_DIR_MODE,
+        )
+        .expect("finish opened child descriptor");
+
+        let moved_mode = fs::symlink_metadata(&moved)
+            .expect("moved child metadata")
+            .permissions()
+            .mode()
+            & super::UNIX_MODE_MASK;
+        let victim_mode = fs::symlink_metadata(&victim)
+            .expect("symlink target metadata")
+            .permissions()
+            .mode()
+            & super::UNIX_MODE_MASK;
+        assert_eq!(moved_mode, super::MANAGED_HOOK_DIR_MODE);
+        assert_eq!(victim_mode, 0o750, "chmod must not follow the raced name");
+
+        trusted.cleanup_created_child("hooks", &handle);
+        assert!(
+            fs::symlink_metadata(&child)
+                .expect("replacement symlink remains")
+                .file_type()
+                .is_symlink(),
+            "cleanup must restore a raced replacement"
+        );
+        assert!(moved.is_dir(), "cleanup must not delete the moved inode");
+
+        fs::remove_file(&child).expect("remove replacement symlink");
+        fs::rename(&moved, &child).expect("restore created inode name");
+        trusted.cleanup_created_child("hooks", &handle);
+        assert!(!child.exists(), "cleanup removes the created inode");
+    }
+
     #[cfg(unix)]
     #[test]
-    fn install_claude_creates_private_hooks_under_group_writable_umask() {
+    fn install_claude_creates_private_hooks_under_owner_masking_umask() {
         use nix::sys::stat::{umask, Mode};
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -3607,7 +3896,7 @@ mod tests {
             let output = Command::new(std::env::current_exe().expect("current test executable"))
                 .arg("--exact")
                 .arg(
-                    "integration::tests::install_claude_creates_private_hooks_under_group_writable_umask",
+                    "integration::tests::install_claude_creates_private_hooks_under_owner_masking_umask",
                 )
                 .arg("--test-threads=1")
                 .arg("--nocapture")
@@ -3630,7 +3919,7 @@ mod tests {
         fs::set_permissions(&existing_hooks, fs::Permissions::from_mode(0o750))
             .expect("set existing hooks mode");
 
-        let previous_umask = umask(Mode::from_bits_truncate(0o002));
+        let previous_umask = umask(Mode::from_bits_truncate(0o700));
         install_claude(&new_config).expect("install Claude with new hooks directory");
         let new_mode = fs::symlink_metadata(new_config.join("hooks"))
             .expect("new hooks metadata")
@@ -4195,8 +4484,6 @@ mod tests {
         let config_path = codex.join("config.toml");
         let stale_key =
             super::codex_hook_trust_key(&hooks_path, CODEX_SESSION_START_TRUST_EVENT, 99, 99);
-        let stale_scalar_key =
-            super::codex_hook_trust_key(&hooks_path, super::CODEX_STOP_TRUST_EVENT, 98, 98);
         let mut config = fs::read_to_string(&config_path).expect("read Codex config");
         write!(
             config,
@@ -4204,14 +4491,7 @@ mod tests {
             toml_basic_string(&stale_key)
         )
         .expect("append stale trust table");
-        let mut document = config
-            .parse::<toml_edit::DocumentMut>()
-            .expect("parse Codex config with stale trust table");
-        document["hooks"]["state"]
-            .as_table_mut()
-            .expect("Codex trust state table")
-            .insert(&stale_scalar_key, toml_edit::value("sha256:stale"));
-        fs::write(&config_path, document.to_string()).expect("append stale trust entries");
+        fs::write(&config_path, config).expect("append stale trust entry");
 
         let report = explicit_status(&codex, AgentKind::Codex);
 
@@ -4227,7 +4507,6 @@ mod tests {
         let repaired_config = fs::read_to_string(&config_path).expect("read repaired config");
         assert_eq!(repaired.state, protocol::IntegrationInstallState::Current);
         assert!(!repaired_config.contains(&stale_key));
-        assert!(!repaired_config.contains(&stale_scalar_key));
     }
 
     #[test]
@@ -4425,6 +4704,58 @@ mod tests {
             protocol::IntegrationRecovery::RepairConfiguration
         );
         let error = install_codex(&codex).expect_err("scalar trust key must fail install");
+        assert_eq!(error.code, "integration_settings_invalid");
+        assert_eq!(
+            fs::read_to_string(&hook_path).expect("read managed asset sentinel"),
+            sentinel,
+            "config validation must precede managed asset replacement"
+        );
+    }
+
+    #[test]
+    fn scalar_future_trust_key_with_hook_drift_requires_manual_repair() {
+        let codex = temp_dir("status-scalar-future-trust-key");
+        install_codex(&codex).expect("install Codex fixture");
+        let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
+        let sentinel = "# managed asset sentinel\n";
+        fs::write(&hook_path, sentinel).expect("write managed asset sentinel");
+        let hooks_path = codex.join("hooks.json");
+        let mut hooks = read_json(&hooks_path);
+        hooks["hooks"][SESSION_START_EVENT][0]["hooks"]
+            .as_array_mut()
+            .expect("managed Codex handler group")
+            .push(json!({
+                "type": "command",
+                "command": "echo user-sibling",
+            }));
+        fs::write(
+            &hooks_path,
+            serde_json::to_vec_pretty(&hooks).expect("serialize drifted Codex hooks"),
+        )
+        .expect("write drifted Codex hooks");
+
+        let config_path = codex.join("config.toml");
+        // Reinstall preserves the sibling as group zero and recreates the
+        // managed handler at this future position.
+        let trust_key = codex_hook_trust_key(&hooks_path, CODEX_SESSION_START_TRUST_EVENT, 1, 0);
+        let mut config = fs::read_to_string(&config_path)
+            .expect("read Codex config")
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse Codex config");
+        config["hooks"]["state"]
+            .as_table_mut()
+            .expect("Codex trust state table")
+            .insert(&trust_key, toml_edit::value("sha256:invalid"));
+        fs::write(&config_path, config.to_string()).expect("write scalar future trust key");
+
+        let report = explicit_status(&codex, AgentKind::Codex);
+
+        assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
+        assert_eq!(
+            report.recovery,
+            protocol::IntegrationRecovery::RepairConfiguration
+        );
+        let error = install_codex(&codex).expect_err("scalar future trust key must fail install");
         assert_eq!(error.code, "integration_settings_invalid");
         assert_eq!(
             fs::read_to_string(&hook_path).expect("read managed asset sentinel"),

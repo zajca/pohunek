@@ -34,11 +34,14 @@ The assistant must:
   owner-private registration authority. Status reads metadata and bounded
   content from one no-follow descriptor and requires a regular effective-UID-
   owned file without group/world write access. A missing Claude `hooks/` child
-  below a trusted config root is safe absence; installation creates it as
-  `0700`, never chmods an existing real user directory, and rejects unsafe path
-  shapes. Codex trust identity covers a canonical single-handler managed group,
-  so sibling handlers cannot inherit the managed trust record. Its managed
-  trust-key set is exact; stale managed keys and tables are removed on reinstall.
+  below a trusted config root is safe absence; installation creates it with
+  exact mode `0700` regardless of inherited umask, removes that newly created
+  directory if mode enforcement or safe opening fails, never chmods an existing
+  real user directory, and rejects unsafe path shapes. Codex trust identity
+  covers a canonical single-handler managed group, so sibling handlers cannot
+  inherit the managed trust record. Its managed trust-key set is exact; stale
+  managed tables are removed on reinstall, while scalars anywhere in the
+  managed trust namespace require configuration repair.
 - Require `CLAUDE_CONFIG_DIR` and `CODEX_HOME` to resolve to absolute UTF-8 paths
   before registration commands are constructed. Before any integration install
   mutation, open and validate all existing config and hook parents within the
