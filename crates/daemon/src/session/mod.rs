@@ -447,7 +447,7 @@ struct SessionEntry {
     desired_state: DesiredState,
     detector_cancel: CancellationToken,
     detector_resize: watch::Sender<(u16, u16)>,
-    detector_config: watch::Sender<DetectorConfig>,
+    detector_config: watch::Sender<DetectorConfigUpdate>,
     detector_preview: mpsc::Sender<DetectionPreviewRequest>,
     default_detector_config: DetectorConfig,
     procwatch_cancel: CancellationToken,
@@ -467,14 +467,24 @@ struct SessionEntry {
     observed_agents: Vec<ObservedAgent>,
 }
 
-type DetectionPreviewRequest = oneshot::Sender<Vec<protocol::DetectionRegionPreview>>;
+#[derive(Debug, Clone)]
+struct DetectorConfigUpdate {
+    generation: u64,
+    config: DetectorConfig,
+}
+
+#[derive(Debug)]
+struct DetectionPreviewRequest {
+    minimum_config_generation: u64,
+    reply: oneshot::Sender<Result<Vec<protocol::DetectionRegionPreview>, protocol::ProtocolError>>,
+}
 
 struct DetectorInputs {
     output: broadcast::Receiver<Vec<u8>>,
     initial_size: (u16, u16),
     cancel: CancellationToken,
     resize: watch::Receiver<(u16, u16)>,
-    config: watch::Receiver<DetectorConfig>,
+    config: watch::Receiver<DetectorConfigUpdate>,
     preview: mpsc::Receiver<DetectionPreviewRequest>,
 }
 
@@ -1808,7 +1818,7 @@ impl SessionRegistry {
                 entry.info.activity = Some(activity);
                 entry.info.state_source = StateSource::Report;
             }
-            let _ = entry.detector_config.send(active_detector_config);
+            send_detector_config(entry, active_detector_config);
             entry.info.updated_at = timestamp_now();
             (entry.info.clone(), Arc::clone(&entry.procwatch_rescan))
         };
@@ -3468,9 +3478,21 @@ fn clear_active_agent(entry: &mut SessionEntry, tombstone: ActiveAgentReport) ->
         entry.info.state_source = StateSource::Process;
     }
     let default_detector_config = entry.default_detector_config.clone();
-    let _ = entry.detector_config.send(default_detector_config);
+    send_detector_config(entry, default_detector_config);
     entry.info.updated_at = timestamp_now();
     entry.info.clone()
+}
+
+fn send_detector_config(entry: &SessionEntry, config: DetectorConfig) {
+    let generation = entry
+        .detector_config
+        .borrow()
+        .generation
+        .checked_add(1)
+        .expect("detector configuration generation must not exhaust u64");
+    let _ = entry
+        .detector_config
+        .send_replace(DetectorConfigUpdate { generation, config });
 }
 
 fn report_is_current(

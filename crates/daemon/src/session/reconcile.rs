@@ -12,17 +12,17 @@ use sha2::{Digest, Sha256};
 
 use super::{
     event, event_payload, identity_claim_expiry_is_valid, mpsc, runtime_error, timestamp_now,
-    watch, ActiveAgentReport, CancellationToken, DesiredState, DetectorConfig, DetectorInputs,
-    Notify, ObservedAgent, ProtocolError, ResumeSnapshot, RuntimeHandle, RuntimeState,
-    RuntimeWatchIdentity, SessionEntry, SessionId, SessionRecord, SessionRef, SessionRefKind,
-    SessionRegistry, SessionRuntime, SessionState, StateSource, Worker, WorkerError,
-    WORKER_CONNECT_RETRY,
+    watch, ActiveAgentReport, CancellationToken, DesiredState, DetectorConfig,
+    DetectorConfigUpdate, DetectorInputs, Notify, ObservedAgent, ProtocolError, ResumeSnapshot,
+    RuntimeHandle, RuntimeState, RuntimeWatchIdentity, SessionEntry, SessionId, SessionRecord,
+    SessionRef, SessionRefKind, SessionRegistry, SessionRuntime, SessionState, StateSource, Worker,
+    WorkerError, WORKER_CONNECT_RETRY,
 };
 use crate::procwatch::ProcessInspector;
 use crate::session::target::open_detector_output;
 use crate::store::{ResumeBinding, SessionWriteOutcome};
 
-// Rust guideline compliant 2026-07-29
+// Rust guideline compliant 2026-08-31
 
 #[derive(Debug, Clone)]
 struct DiscoveredWorker {
@@ -741,7 +741,10 @@ impl SessionRegistry {
         let procwatch_rescan = Arc::new(Notify::new());
         let (detector_resize, detector_resize_rx) =
             watch::channel((record.info.rows, record.info.cols));
-        let (detector_config, detector_config_rx) = watch::channel(default_detector_config.clone());
+        let (detector_config, detector_config_rx) = watch::channel(DetectorConfigUpdate {
+            generation: 0,
+            config: default_detector_config.clone(),
+        });
         let (detector_preview, detector_preview_rx) = mpsc::channel(1);
         let info = record.info.clone();
         let entry = SessionEntry {
@@ -852,7 +855,10 @@ impl SessionRegistry {
         );
         let default_detector_config = DetectorConfig::for_agent(&record.info.agent_base);
         let (detector_resize, _) = watch::channel((record.info.rows, record.info.cols));
-        let (detector_config, _) = watch::channel(default_detector_config.clone());
+        let (detector_config, _) = watch::channel(DetectorConfigUpdate {
+            generation: 0,
+            config: default_detector_config.clone(),
+        });
         let (detector_preview, _) = mpsc::channel::<super::DetectionPreviewRequest>(1);
         let info = record.info.clone();
         let entry = SessionEntry {

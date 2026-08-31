@@ -86,7 +86,11 @@ Use `session detection` when activity classification is surprising. Its
 `supported_regions` array identifies the engine's accepted region kinds, while
 `previews` shows the exact current text supplied to each region required by the
 active manifest. Empty text is meaningful: for example,
-`last_non_empty_above_prompt_box` is empty without a complete prompt box.
+`last_non_empty_above_prompt_box` is empty without a complete prompt box. The
+preview waits for accepted agent/configuration changes before rendering.
+`session_detection_response_too_large` means the complete diagnostic would
+exceed the public response budget; reduce the manifest's number or size of
+parameterized regions before retrying.
 
 Carry the returned `runtime_id`, `runtime_generation`, and `next_offset` into a
 continued output read or `session wait`. `session_runtime_changed` means the

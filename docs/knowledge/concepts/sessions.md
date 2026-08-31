@@ -37,7 +37,10 @@ Detection manifests can read `osc_title`, `osc_progress`, `whole_recent`,
 their count in each diagnostic preview. Top and prompt-adjacent regions use the
 same visible-grid, wide-glyph, and soft-wrap semantics as live matching. An
 unknown region fails manifest parsing instead of falling back to a broader
-region.
+region. A preview waits for an accepted active-agent configuration change before
+it renders. If all active previews cannot fit the public response budget,
+`session detection` returns `session_detection_response_too_large` instead of
+closing the control connection.
 
 Use `--input-stdin` (alias `--stdin`) with `session new`, or `--stdin` with
 `session input`, when prompt text should not appear in argv. Stdin and inline

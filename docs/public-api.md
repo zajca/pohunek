@@ -429,8 +429,12 @@ complete prompt box or preceding content is absent. All screen regions use the
 same visible-grid, wide-glyph, and soft-wrap semantics as activity matching.
 Unknown region names remain a typed manifest parse failure, so older engines
 reject manifests that use regions they do not implement instead of silently
-over-matching another surface. A stopped or unavailable detector returns
-`session_terminal_unavailable`.
+over-matching another surface. A preview observes every accepted detector
+configuration update before it renders, so it cannot return regions from the
+previous active manifest after an agent report or release succeeds. A stopped
+or unavailable detector returns `session_terminal_unavailable`. If the complete
+success envelope would exceed the 1 MiB control-line cap, the daemon returns the
+payload-free `runtime/session_detection_response_too_large` error instead.
 
 `session.output` uses an optional nested runtime identity and an exclusive
 cursor. Omitting `after_offset` requests the newest retained tail. A cursor

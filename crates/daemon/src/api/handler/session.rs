@@ -6,15 +6,15 @@
 //! are thin transport glue.
 
 use protocol::{
-    Request, Response, SessionAttachParams, SessionDetachParams, SessionDetectionParams,
-    SessionDiffParams, SessionForkParams, SessionForkResult, SessionId, SessionInputParams,
-    SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
+    ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams,
+    SessionDetectionParams, SessionDiffParams, SessionForkParams, SessionForkResult, SessionId,
+    SessionInputParams, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
     SessionReleaseAgentParams, SessionRenameParams, SessionReportAgentParams,
     SessionReportNativeIdParams, SessionResizeParams, SessionResumeResult, SessionScreenParams,
     SessionSetMetadataParams, SessionWaitParams,
 };
 
-use super::util::{error_value, ok_value, parse_optional_params, parse_params};
+use super::util::{error_value, ok_value, ok_value_bounded, parse_optional_params, parse_params};
 use crate::session::SessionRegistry;
 
 pub(super) async fn handle_session_new(request: &Request, sessions: &SessionRegistry) -> Response {
@@ -253,7 +253,11 @@ pub(super) async fn handle_session_detection(
         Err(err) => return error_value(request, err),
     };
     match sessions.detection(params.session_id()).await {
-        Ok(result) => ok_value(request, &result),
+        Ok(result) => ok_value_bounded(
+            request,
+            &result,
+            ProtocolError::session_detection_response_too_large(),
+        ),
         Err(err) => error_value(request, err),
     }
 }

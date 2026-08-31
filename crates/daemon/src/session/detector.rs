@@ -2,14 +2,50 @@
 
 use super::{
     broadcast, debug, event, event_payload, is_terminal, log_lag_warn, timestamp_now,
-    ActivityTransition, AgentActivity, AgentStateEvent, Detector, DetectorConfig, DetectorInputs,
-    Instant, LagWarnThrottle, SessionId, SessionRegistry,
+    ActivityTransition, AgentActivity, AgentStateEvent, DetectionPreviewRequest, Detector,
+    DetectorConfig, DetectorConfigUpdate, DetectorInputs, Instant, LagWarnThrottle, SessionId,
+    SessionRegistry,
 };
 
 fn detection_interval(config: &DetectorConfig) -> tokio::time::Interval {
     let mut tick = tokio::time::interval(config.detection.recheck_after);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick
+}
+
+fn apply_detector_config(
+    detector: &mut Detector,
+    tick: &mut tokio::time::Interval,
+    applied_generation: &mut u64,
+    update: DetectorConfigUpdate,
+) {
+    *tick = detection_interval(&update.config);
+    tick.reset();
+    detector.reconfigure(Instant::now(), update.config);
+    *applied_generation = update.generation;
+}
+
+fn reply_to_preview(
+    detector: &mut Detector,
+    tick: &mut tokio::time::Interval,
+    config_rx: &mut tokio::sync::watch::Receiver<DetectorConfigUpdate>,
+    applied_generation: &mut u64,
+    request: DetectionPreviewRequest,
+) {
+    if *applied_generation < request.minimum_config_generation
+        || config_rx.has_changed().is_ok_and(|changed| changed)
+    {
+        let update = config_rx.borrow_and_update().clone();
+        if update.generation < request.minimum_config_generation {
+            let _ = request
+                .reply
+                .send(Err(protocol::ProtocolError::session_terminal_unavailable()));
+            return;
+        }
+        apply_detector_config(detector, tick, applied_generation, update);
+    }
+
+    let _ = request.reply.send(Ok(detector.region_previews()));
 }
 
 impl SessionRegistry {
@@ -24,17 +60,42 @@ impl SessionRegistry {
         } = inputs;
         let registry = self.clone();
         tokio::spawn(async move {
-            let detector_config = detector_config_rx.borrow().clone();
-            let mut tick = detection_interval(&detector_config);
+            let initial_config = detector_config_rx.borrow().clone();
+            let mut applied_config_generation = initial_config.generation;
+            let mut tick = detection_interval(&initial_config.config);
             tick.tick().await;
             let (rows, cols) = size;
-            let mut detector = Detector::new(rows, cols, Instant::now(), detector_config);
+            let mut detector = Detector::new(rows, cols, Instant::now(), initial_config.config);
             let mut lag_warn =
                 LagWarnThrottle::new(registry.inner.config.detector_lag_warn_interval);
 
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => break,
+                    changed = detector_config_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let update = detector_config_rx.borrow_and_update().clone();
+                        apply_detector_config(
+                            &mut detector,
+                            &mut tick,
+                            &mut applied_config_generation,
+                            update,
+                        );
+                    }
+                    request = preview_rx.recv() => {
+                        let Some(request) = request else {
+                            break;
+                        };
+                        reply_to_preview(
+                            &mut detector,
+                            &mut tick,
+                            &mut detector_config_rx,
+                            &mut applied_config_generation,
+                            request,
+                        );
+                    }
                     _ = tick.tick() => {
                         for transition in detector.tick(Instant::now()) {
                             registry.record_activity(&id, transition).await;
@@ -51,21 +112,6 @@ impl SessionRegistry {
                         }
                         let (rows, cols) = *resize_rx.borrow();
                         detector.resize(rows, cols);
-                    }
-                    changed = detector_config_rx.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                        let detector_config = detector_config_rx.borrow().clone();
-                        tick = detection_interval(&detector_config);
-                        tick.tick().await;
-                        detector.reconfigure(Instant::now(), detector_config);
-                    }
-                    request = preview_rx.recv() => {
-                        let Some(reply) = request else {
-                            break;
-                        };
-                        let _ = reply.send(detector.region_previews());
                     }
                     received = output_rx.recv() => {
                         match received {
@@ -105,21 +151,29 @@ impl SessionRegistry {
         &self,
         id: &SessionId,
     ) -> Result<protocol::SessionDetectionResult, protocol::ProtocolError> {
-        let preview = {
+        let (preview, minimum_config_generation) = {
             let sessions = self.inner.sessions.lock().await;
             sessions
                 .get(id)
-                .map(|entry| entry.detector_preview.clone())
+                .map(|entry| {
+                    (
+                        entry.detector_preview.clone(),
+                        entry.detector_config.borrow().generation,
+                    )
+                })
                 .ok_or_else(|| super::session_not_found(&id.0))?
         };
         let (reply, response) = tokio::sync::oneshot::channel();
         preview
-            .send(reply)
+            .send(DetectionPreviewRequest {
+                minimum_config_generation,
+                reply,
+            })
             .await
             .map_err(|_send_error| protocol::ProtocolError::session_terminal_unavailable())?;
         let previews = response
             .await
-            .map_err(|_receive_error| protocol::ProtocolError::session_terminal_unavailable())?;
+            .map_err(|_receive_error| protocol::ProtocolError::session_terminal_unavailable())??;
 
         Ok(protocol::SessionDetectionResult {
             session_id: id.clone(),
@@ -168,5 +222,86 @@ impl SessionRegistry {
             }),
         );
         let _ = self.inner.events.send(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use protocol::DetectionRegionKind;
+
+    use super::{
+        detection_interval, reply_to_preview, DetectionPreviewRequest, Detector, DetectorConfig,
+        DetectorConfigUpdate, Instant,
+    };
+    use crate::detect::{DetectionConfig, Manifest};
+
+    #[tokio::test]
+    async fn preview_applies_an_accepted_pending_configuration_first() {
+        let initial = DetectorConfig {
+            detection: DetectionConfig::default(),
+            manifest: Some(
+                Manifest::parse_str(
+                    r#"
+                    [[rules]]
+                    id = "old"
+                    state = "idle"
+                    priority = 1
+                    region = "osc_title"
+                    contains = "old"
+                    "#,
+                )
+                .expect("initial manifest parses"),
+            ),
+        };
+        let updated = DetectorConfig {
+            detection: DetectionConfig::default(),
+            manifest: Some(
+                Manifest::parse_str(
+                    r#"
+                    [[rules]]
+                    id = "new"
+                    state = "idle"
+                    priority = 1
+                    region = "bottom_lines(3)"
+                    contains = "new"
+                    "#,
+                )
+                .expect("updated manifest parses"),
+            ),
+        };
+        let (config_tx, mut config_rx) = tokio::sync::watch::channel(DetectorConfigUpdate {
+            generation: 0,
+            config: initial.clone(),
+        });
+        let mut detector = Detector::new(24, 80, Instant::now(), initial.clone());
+        let mut tick = detection_interval(&initial);
+        tick.tick().await;
+        let mut applied_generation = 0;
+        config_tx
+            .send(DetectorConfigUpdate {
+                generation: 1,
+                config: updated,
+            })
+            .expect("detector accepts configuration");
+        let (reply, response) = tokio::sync::oneshot::channel();
+        reply_to_preview(
+            &mut detector,
+            &mut tick,
+            &mut config_rx,
+            &mut applied_generation,
+            DetectionPreviewRequest {
+                minimum_config_generation: 1,
+                reply,
+            },
+        );
+
+        let previews = response
+            .await
+            .expect("detector replies")
+            .expect("preview succeeds");
+        assert_eq!(applied_generation, 1);
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0].kind, DetectionRegionKind::BottomLines);
+        assert_eq!(previews[0].region, "bottom_lines(3)");
     }
 }

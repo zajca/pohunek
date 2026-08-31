@@ -170,6 +170,15 @@ impl ProtocolError {
         )
     }
 
+    /// The canonical error for detection metadata that cannot fit the response budget.
+    #[must_use]
+    pub fn session_detection_response_too_large() -> Self {
+        Self::observation(
+            "session_detection_response_too_large",
+            "detection metadata exceeds the public response budget",
+        )
+    }
+
     /// The canonical `runtime/session_has_no_managed_terminal` error.
     #[must_use]
     pub fn session_has_no_managed_terminal() -> Self {

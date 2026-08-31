@@ -48,7 +48,10 @@ use netbird::validate_netbird_bind_addr;
 use crate::error::DaemonError;
 use crate::session::{RedeemedAttach, RedeemedRuntime, SessionRegistry};
 
+#[cfg(not(test))]
 use handler::Dispatch;
+#[cfg(test)]
+pub(crate) use handler::{dispatch_line, Dispatch};
 pub use handler::{handle_request, DaemonState, HealthInfo};
 
 /// Directory mode for the runtime dir: owner rwx only (`0700`).
