@@ -4028,7 +4028,7 @@ async fn session_input_wait_shutdown_while_worker_reserved_never_sends_late_inpu
         }
     });
     tokio::time::sleep(Duration::from_millis(20)).await;
-    registry.shutdown_event_log().await;
+    registry.begin_daemon_shutdown();
 
     let error = request
         .await
@@ -4771,7 +4771,7 @@ async fn session_input_wait_is_cancelled_by_daemon_shutdown() {
     });
     wait_for_session_waiters(&registry, &created.id, 1).await;
 
-    registry.shutdown_event_log().await;
+    registry.begin_daemon_shutdown();
     let error = wait
         .await
         .expect("input wait task joins")

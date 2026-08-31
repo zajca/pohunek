@@ -257,7 +257,7 @@ impl SessionRegistry {
     ) -> Result<tokio::sync::OwnedMutexGuard<()>, ProtocolError> {
         tokio::select! {
             biased;
-            () = self.inner.event_log_shutdown.cancelled() => Err(input_wait_shutdown_error(
+            () = self.inner.daemon_shutdown.cancelled() => Err(input_wait_shutdown_error(
                 "daemon shutdown cancelled input while waiting for the session input gate",
             )),
             () = tokio::time::sleep_until(deadline) => {
@@ -278,7 +278,7 @@ impl SessionRegistry {
         }
         tokio::select! {
             biased;
-            () = self.inner.event_log_shutdown.cancelled() => Err(input_wait_shutdown_error(
+            () = self.inner.daemon_shutdown.cancelled() => Err(input_wait_shutdown_error(
                 "daemon shutdown cancelled input before worker delivery",
             )),
             () = tokio::time::sleep_until(deadline) => {
@@ -332,7 +332,7 @@ impl SessionRegistry {
                 }
             }
             result = &mut write => return worker_write_task_result(result),
-            () = self.inner.event_log_shutdown.cancelled() => {
+            () = self.inner.daemon_shutdown.cancelled() => {
                 write.abort();
                 let _result = write.await;
                 return Err(input_wait_shutdown_error(
@@ -349,7 +349,7 @@ impl SessionRegistry {
         tokio::select! {
             biased;
             result = &mut write => worker_write_task_result(result),
-            () = self.inner.event_log_shutdown.cancelled() => {
+            () = self.inner.daemon_shutdown.cancelled() => {
                 shield_worker_ack(write);
                 Err(input_wait_shutdown_error(
                     "daemon shutdown cancelled input after worker delivery began",
@@ -390,7 +390,7 @@ impl SessionRegistry {
         loop {
             tokio::select! {
                 biased;
-                () = self.inner.event_log_shutdown.cancelled() => {
+                () = self.inner.daemon_shutdown.cancelled() => {
                     return Err(input_wait_shutdown_error(
                         "daemon shutdown cancelled the bounded input wait",
                     ));

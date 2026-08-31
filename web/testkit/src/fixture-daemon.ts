@@ -123,6 +123,7 @@ export interface FixtureDaemonHandle {
   readonly endpoints: readonly FixtureDaemonEndpoint[];
   readonly unixSocketPath: string | undefined;
   readonly tcpAddress: { readonly host: string; readonly port: number } | undefined;
+  readonly activeInputWaiterCount: number;
   readonly scenario: FixtureScenario;
   close(): Promise<void>;
   stopAbruptly(): Promise<void>;
@@ -170,7 +171,8 @@ type FixtureInputWaitEvent =
   | { readonly kind: "activity"; readonly evidence: FixtureActivityEvidence }
   | { readonly kind: "removed" }
   | { readonly kind: "runtime_changed" }
-  | { readonly kind: "stopped" };
+  | { readonly kind: "stopped" }
+  | { readonly kind: "shutdown" };
 
 const U64_MAX = 18_446_744_073_709_551_615n;
 const U64_DECIMAL_DIGITS = U64_MAX.toString().length;
@@ -283,6 +285,14 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       return undefined;
     }
     return { host: endpoint.host, port: endpoint.port };
+  }
+
+  public get activeInputWaiterCount(): number {
+    let count = 0;
+    for (const waiters of this.activityWaiters.values()) {
+      count += waiters.size;
+    }
+    return count;
   }
 
   public async start(): Promise<FixtureDaemonHandle> {
@@ -951,6 +961,9 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       }
       if (event.kind === "runtime_changed") {
         return errResponse(request.id, sessionRuntimeChanged());
+      }
+      if (event.kind === "shutdown") {
+        return errResponse(request.id, daemonShuttingDown());
       }
       const evidence = event.evidence;
       if (
@@ -1627,6 +1640,9 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     }
     this.closed = true;
 
+    for (const sessionId of [...this.activityWaiters.keys()]) {
+      this.notifyInputWaiters(sessionId, { kind: "shutdown" });
+    }
     this.subscribers.clear();
     this.pty.closeAll();
     for (const socket of this.sockets) {
@@ -2223,6 +2239,15 @@ function sessionRuntimeChanged(): ProtocolError {
     "session_runtime_changed",
     "session runtime changed during the bounded operation",
     "inspect the session and restart from its current runtime identity",
+  );
+}
+
+function daemonShuttingDown(): ProtocolError {
+  return protocolError(
+    "daemon",
+    "daemon_shutting_down",
+    "daemon shutdown cancelled the bounded input wait",
+    "inspect the current session after the daemon is available again",
   );
 }
 

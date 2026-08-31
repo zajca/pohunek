@@ -395,6 +395,11 @@ struct SessionRegistryInner {
     /// Set when daemon process shutdown starts. Natural PTY exits observed after
     /// this point are treated as restart fallout, not terminal session state.
     daemon_shutdown_started: AtomicBool,
+    /// Cancellation signal fired when production daemon shutdown starts.
+    ///
+    /// Bounded input operations use this token instead of the event-log drain
+    /// token so shutdown cancellation does not depend on later flush ordering.
+    daemon_shutdown: CancellationToken,
     /// Opaque id unique to this daemon process instance, injected into every
     /// session PTY as `POHUNEK_DAEMON_ID` and compared against the attach origin
     /// so the self-feeding-attach guard fires only for this instance's own PTYs
@@ -1081,6 +1086,7 @@ impl SessionRegistry {
                 observation_waiters: AtomicUsize::new(0),
                 observation_session_waiters: std::sync::Mutex::new(HashMap::new()),
                 daemon_shutdown_started: AtomicBool::new(false),
+                daemon_shutdown: CancellationToken::new(),
                 daemon_instance_id: generate_daemon_instance_id(),
                 config,
                 launcher,
@@ -1155,6 +1161,7 @@ impl SessionRegistry {
             .inner
             .daemon_shutdown_started
             .swap(true, Ordering::Relaxed);
+        self.inner.daemon_shutdown.cancel();
         if !already_started {
             info!("daemon shutdown started; preserving durable worker runtimes");
         }

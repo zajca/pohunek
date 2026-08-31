@@ -34,6 +34,7 @@ const RESIZED_COLS = 100;
 const RESIZED_ROWS = 30;
 const MISMATCHED_PROTOCOL_VERSION = PROTOCOL_VERSION + 1;
 const SOCKET_END_TIMEOUT_MS = 5_000;
+const INPUT_WAITER_POLL_INTERVAL_MS = 1;
 const NON_UTF8_PAYLOAD = Uint8Array.of(0x00, 0xff, 0x80, 0x61, 0xc3, 0x28);
 const ABOVE_MAX_SAFE_U64 = "9007199254740993";
 const U64_MAX_WIRE = "18446744073709551615";
@@ -296,6 +297,37 @@ describe("@pohunek/testkit fixture daemon", () => {
       } finally {
         await daemon.close();
       }
+    }
+  });
+
+  test("fixture shutdown cancels active session input waiters", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-shutdown") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const created = await client.call("session.new", {
+        agent: "shell",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      });
+      const waiting = client.call("session.input", {
+        session_id: created.id,
+        text: "wait for shutdown",
+        wait: { until: ["blocked"], timeout_ms: MAX_SESSION_WAIT_MS },
+      }).catch((error: unknown) => error);
+      await withTimeout(
+        waitForActiveInputWaiter(daemon),
+        SOCKET_END_TIMEOUT_MS,
+        "fixture input waiter registration",
+      );
+      expect(daemon.activeInputWaiterCount).toBe(1);
+
+      await daemon.close();
+
+      expect(daemon.activeInputWaiterCount).toBe(0);
+      expect(await waiting).toBeInstanceOf(ClientError);
+      await client.close();
+    } finally {
+      await daemon.close();
     }
   });
 
@@ -1090,6 +1122,12 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, action: string):
       },
     );
   });
+}
+
+async function waitForActiveInputWaiter(daemon: FixtureDaemonHandle): Promise<void> {
+  while (daemon.activeInputWaiterCount === 0) {
+    await new Promise((resolve) => setTimeout(resolve, INPUT_WAITER_POLL_INTERVAL_MS));
+  }
 }
 
 async function expectClientError(promise: Promise<unknown>): Promise<ClientError> {
