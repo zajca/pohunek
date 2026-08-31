@@ -126,6 +126,9 @@ export function startRelay(options: StartRelayOptions): Promise<RelayHandle> {
         if (route === undefined) {
           return await options.httpHandler?.(request) ?? RESPONSE_NOT_FOUND;
         }
+        if (!isWebSocketUpgrade(request)) {
+          return RESPONSE_UPGRADE_REQUIRED;
+        }
 
         let target: DaemonTarget | undefined;
         try {
@@ -135,9 +138,6 @@ export function startRelay(options: StartRelayOptions): Promise<RelayHandle> {
         }
         if (target === undefined) {
           return RESPONSE_NOT_FOUND;
-        }
-        if (!isWebSocketUpgrade(request)) {
-          return RESPONSE_UPGRADE_REQUIRED;
         }
 
         const upgraded = upgradeServer.upgrade(request, {

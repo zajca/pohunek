@@ -158,7 +158,7 @@ fn invalid_option(detail: &str) -> crate::ClientError {
 ///
 /// Returns [`crate::ClientError::InvalidDiscoveryOptions`] when a configured
 /// port is invalid. Returns [`crate::ClientError::RemoteDiscoveryFailed`] when
-/// complete discovery exceeds its deadline.
+/// no configured overlay completes discovery before the deadline.
 pub async fn discover_hosts(
     registry: &OverlayRegistry,
 ) -> Result<Vec<HostRecord>, crate::ClientError> {
@@ -172,10 +172,11 @@ pub async fn discover_hosts(
 ///
 /// # Errors
 ///
-/// Returns [`crate::ClientError::RemoteDiscoveryFailed`] when
-/// complete discovery exceeds [`DiscoveryOptions::deadline`]. Returns an
-/// origin-environment error when exactly one origin marker is present or a
-/// marker value is invalid.
+/// Returns [`crate::ClientError::RemoteDiscoveryFailed`] when no configured
+/// overlay completes before [`DiscoveryOptions::deadline`]. Completed healthy
+/// overlay snapshots remain usable when another provider reaches that
+/// deadline. Returns an origin-environment error when exactly one origin marker
+/// is present or a marker value is invalid.
 pub async fn discover_hosts_with_options(
     registry: &OverlayRegistry,
     options: DiscoveryOptions,
@@ -189,45 +190,68 @@ async fn discover_with_registry(
     options: DiscoveryOptions,
     origin: Option<RequestOrigin>,
 ) -> Result<Vec<HostRecord>, crate::ClientError> {
-    tokio::time::timeout(options.deadline(), async {
-        let mut results = stream::iter(registry.entries().iter().cloned().enumerate())
-            .map(|(index, configured)| async move {
-                let overlay = configured.id().clone();
-                let result = configured.discover_peers().await;
-                (index, overlay, result)
-            })
-            .buffer_unordered(registry.entries().len())
-            .collect::<Vec<_>>()
-            .await;
-        results.sort_by_key(|(index, _, _)| *index);
-        let mut snapshots = Vec::new();
-        let mut failures = Vec::new();
-        let mut healthy_overlays = 0_usize;
-        for (_, overlay, result) in results {
-            match result {
-                Ok(peers) => {
-                    healthy_overlays += 1;
-                    snapshots.extend(peers);
-                }
-                Err(error) => {
-                    tracing::debug!(
-                        overlay = %overlay,
-                        error = %error,
-                        "one configured overlay was unavailable during discovery"
-                    );
-                    failures.push(OverlayFailure { overlay, error });
-                }
+    let deadline = tokio::time::Instant::now() + options.deadline();
+    let mut results = Vec::with_capacity(registry.entries().len());
+    let mut completed = vec![false; registry.entries().len()];
+    let mut pending = stream::iter(registry.entries().iter().cloned().enumerate())
+        .map(|(index, configured)| async move {
+            let overlay = configured.id().clone();
+            let result = configured.discover_peers().await;
+            (index, overlay, result)
+        })
+        .buffer_unordered(registry.entries().len());
+    let providers_timed_out = loop {
+        match tokio::time::timeout_at(deadline, pending.next()).await {
+            Ok(Some(result)) => {
+                completed[result.0] = true;
+                results.push(result);
+            }
+            Ok(None) => break false,
+            Err(_timeout) => break true,
+        }
+    };
+    drop(pending);
+
+    if providers_timed_out {
+        for (index, configured) in registry.entries().iter().enumerate() {
+            if !completed[index] {
+                tracing::debug!(
+                    overlay = %configured.id(),
+                    "one configured overlay exceeded the discovery deadline"
+                );
             }
         }
-        if healthy_overlays == 0 {
-            return Err(crate::ClientError::OverlayDiscoveryFailed { failures });
+    }
+
+    results.sort_by_key(|(index, _, _)| *index);
+    let mut snapshots = Vec::new();
+    let mut failures = Vec::new();
+    let mut healthy_overlays = 0_usize;
+    for (_, overlay, result) in results {
+        match result {
+            Ok(peers) => {
+                healthy_overlays += 1;
+                snapshots.extend(peers);
+            }
+            Err(error) => {
+                tracing::debug!(
+                    overlay = %overlay,
+                    error = %error,
+                    "one configured overlay was unavailable during discovery"
+                );
+                failures.push(OverlayFailure { overlay, error });
+            }
         }
-        Ok(discover_peers(snapshots, options, origin.as_ref()).await)
-    })
-    .await
-    .map_err(|_timeout| crate::ClientError::RemoteDiscoveryFailed {
-        detail: "discovery exceeded its configured deadline".to_owned(),
-    })?
+    }
+    if healthy_overlays == 0 {
+        if providers_timed_out {
+            return Err(crate::ClientError::RemoteDiscoveryFailed {
+                detail: "no overlay completed discovery before the configured deadline".to_owned(),
+            });
+        }
+        return Err(crate::ClientError::OverlayDiscoveryFailed { failures });
+    }
+    Ok(discover_peers(snapshots, options, origin.as_ref(), Some(deadline)).await)
 }
 
 /// Classify aggregated overlay peer snapshots.
@@ -236,6 +260,7 @@ async fn discover_peers(
     peers: Vec<RoutedPeer>,
     options: DiscoveryOptions,
     origin: Option<&RequestOrigin>,
+    deadline: Option<tokio::time::Instant>,
 ) -> Vec<HostRecord> {
     stream::iter(peers)
         .map(|peer| async move {
@@ -246,8 +271,13 @@ async fn discover_peers(
             let fqdn = peer.fqdn.clone();
             let address = peer.addr.map(|addr| addr.ip().to_string());
             let port = peer.port;
+            let probe_timeout = deadline.map_or(options.probe_timeout(), |deadline| {
+                options
+                    .probe_timeout()
+                    .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            });
             let class = match peer.addr {
-                Some(addr) => classify(addr, options.probe_timeout(), origin).await,
+                Some(addr) => classify(addr, probe_timeout, origin).await,
                 None => HostClass::Candidate,
             };
             HostRecord {
@@ -731,6 +761,7 @@ mod tests {
                 .with_concurrency(2)
                 .expect("concurrency"),
             None,
+            None,
         )
         .await;
         assert_eq!(records[0].name.as_deref(), Some("first"));
@@ -814,6 +845,46 @@ mod tests {
         assert!(
             dropped.load(Ordering::SeqCst),
             "deadline must drop the provider-owned future"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_deadline_preserves_completed_overlay_results() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let pending = ConfiguredTransport::new(
+            Arc::new(PendingTransport {
+                id: OverlayId::new("pending").expect("id"),
+                dropped: Arc::clone(&dropped),
+            }),
+            17001,
+        )
+        .expect("pending transport");
+        let candidate = DiscoveredPeer {
+            peer_id: None,
+            display_name: Some("healthy-peer".to_owned()),
+            fqdn: Some("healthy-peer.example".to_owned()),
+            address: None,
+        };
+        let registry = OverlayRegistry::new(vec![
+            pending,
+            configured(TestTransport::healthy("healthy", vec![candidate]), 17002),
+        ])
+        .expect("mixed registry");
+        let options = DiscoveryOptions::new()
+            .with_deadline(Duration::from_millis(10))
+            .expect("test deadline");
+
+        let records = discover_with_registry(&registry, options, None)
+            .await
+            .expect("healthy overlay must survive another provider timing out");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name.as_deref(), Some("healthy-peer"));
+        assert_eq!(records[0].overlay, "healthy");
+        assert_eq!(records[0].class, HostClass::Candidate);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "deadline must cancel the pending provider future"
         );
     }
 }

@@ -7,6 +7,7 @@ import {
   BackendStartupError,
   startBackend,
   startHostsPipeline,
+  startRelay,
   type BackendHandle,
   type BackendHostEntry,
   type BackendLogger,
@@ -46,6 +47,26 @@ interface BackendFixture {
 }
 
 describe("@pohunek/backend", () => {
+  test("rejects non-WebSocket relay requests before resolving a target", async () => {
+    let resolutionCount = 0;
+    const relay = await startRelay({
+      bindHost: LOOPBACK_HOST,
+      port: 0,
+      allowLoopbackBind: true,
+      targets: (): undefined => {
+        resolutionCount += 1;
+        return undefined;
+      },
+    });
+    try {
+      const response = await fetch(`${relay.url}/daemon/remote/control`);
+      expect(response.status).toBe(426);
+      expect(resolutionCount).toBe(0);
+    } finally {
+      await relay.close();
+    }
+  });
+
   test("discovers and tunnels to local and peer daemons on one origin", async () => {
     const fixture = await startBackendFixture();
     try {
@@ -118,8 +139,15 @@ describe("@pohunek/backend", () => {
         { host: PEER_HOST, reachability: "unreachable" },
       ]);
 
-      const removedRoute = await fetch(`${fixture.backend.url}/daemon/${PEER_HOST}/control`);
-      expect(removedRoute.status).toBe(404);
+      let removedRouteConnected = false;
+      try {
+        const removedRoute = await Client.connectWs(fixture.backend.url, PEER_HOST);
+        removedRouteConnected = true;
+        await removedRoute.close();
+      } catch {
+        removedRouteConnected = false;
+      }
+      expect(removedRouteConnected).toBe(false);
     } finally {
       await fixture.close();
     }
