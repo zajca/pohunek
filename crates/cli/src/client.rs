@@ -107,8 +107,8 @@ mod tests {
     use std::sync::Arc;
 
     use overlay::{
-        BindAddrError, ConfiguredTransport, DiscoveredPeer, OverlayError, OverlayFuture, OverlayId,
-        OverlayRegistry, OverlayTransport, ResolvedPeer,
+        BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, ExternalIdentityKind,
+        OverlayError, OverlayFuture, OverlayId, OverlayRegistry, OverlayTransport, ResolvedPeer,
     };
     use pohunek_gui_core::{render_attach_command, AttachTemplateValues};
     use tokio::net::TcpListener;
@@ -159,6 +159,28 @@ mod tests {
             } else {
                 Err(OverlayError::HostUnknown {
                     host: host.to_owned(),
+                    overlay: self.id.clone(),
+                })
+            };
+            Box::pin(async move { result })
+        }
+
+        fn resolve_peer_identity<'a>(
+            &'a self,
+            identity: &'a ExternalIdentity,
+        ) -> OverlayFuture<'a, ResolvedPeer> {
+            let result = if identity.kind() == ExternalIdentityKind::PeerId
+                && identity.value() == "stable-peer"
+            {
+                Ok(ResolvedPeer {
+                    peer_id: Some(format!("{}-peer", self.id)),
+                    display_name: Some(format!("{} host", self.id)),
+                    fqdn: None,
+                    address: self.address,
+                })
+            } else {
+                Err(OverlayError::HostUnknown {
+                    host: identity.value().to_owned(),
                     overlay: self.id.clone(),
                 })
             };

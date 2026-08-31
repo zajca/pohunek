@@ -1157,6 +1157,9 @@ Public exports:
   with an explicit non-zero daemon port.
 - `ConfiguredTransport` and `OverlayRegistry`: validated provider registry with
   stable overlay IDs and one non-zero daemon port per provider.
+- `OverlayTransport`: provider contract whose required typed identity resolver
+  must match only the requested peer-ID or FQDN field; implementations cannot
+  inherit an untyped selector fallback.
 - `discover_hosts(registry)`: aggregated configured-overlay discovery with
   default bounded probes.
 - `discover_hosts_with_options(registry, options)`: the same discovery with an
@@ -1183,8 +1186,9 @@ Connection APIs:
   `@` character is reserved by this route grammar. Generated stable selectors
   use `peer~<base64url>` or `fqdn~<base64url>` without padding; the registry
   decodes the value and preserves its identity kind before provider resolution.
-  This keeps raw provider IDs containing `/`, `+`, `=`, or `@` out of target
-  grammar. A bare IPv6 literal
+  Providers must implement that typed resolution explicitly and cannot reinterpret
+  an FQDN as a peer ID or short name. This keeps raw provider IDs containing `/`,
+  `+`, `=`, or `@` out of target grammar. A bare IPv6 literal
   remains an unqualified selector; only an explicit configured-overlay prefix
   qualifies it. A socket-address literal is not a bypass and must resolve under
   current provider policy.

@@ -1110,8 +1110,8 @@ mod tests {
 
     use super::*;
     use overlay::{
-        BindAddrError, ConfiguredTransport, DiscoveredPeer, OverlayError, OverlayFuture, OverlayId,
-        OverlayTransport, ResolvedPeer,
+        BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, ExternalIdentityKind,
+        OverlayError, OverlayFuture, OverlayId, OverlayTransport, ResolvedPeer,
     };
     use tokio::io::{AsyncBufReadExt as _, BufReader};
     use tokio::net::TcpListener;
@@ -1163,6 +1163,30 @@ mod tests {
             Box::pin(async move { result })
         }
 
+        fn resolve_peer_identity<'a>(
+            &'a self,
+            identity: &'a ExternalIdentity,
+        ) -> OverlayFuture<'a, ResolvedPeer> {
+            let matches = match identity.kind() {
+                ExternalIdentityKind::PeerId => identity.value() == "policy-member",
+                ExternalIdentityKind::Fqdn => identity.value() == "member.test",
+            };
+            let result = if matches {
+                Ok(ResolvedPeer {
+                    peer_id: Some("policy-member".to_owned()),
+                    display_name: Some("member".to_owned()),
+                    fqdn: Some("member.test".to_owned()),
+                    address: self.member,
+                })
+            } else {
+                Err(OverlayError::HostUnknown {
+                    host: identity.value().to_owned(),
+                    overlay: self.id.clone(),
+                })
+            };
+            Box::pin(async move { result })
+        }
+
         fn discover_peers(&self) -> OverlayFuture<'_, Vec<DiscoveredPeer>> {
             let peer = DiscoveredPeer {
                 peer_id: Some("policy-member".to_owned()),
@@ -1203,6 +1227,28 @@ mod tests {
             } else {
                 Err(OverlayError::HostUnknown {
                     host: host.to_owned(),
+                    overlay: self.id.clone(),
+                })
+            };
+            Box::pin(async move { result })
+        }
+
+        fn resolve_peer_identity<'a>(
+            &'a self,
+            identity: &'a ExternalIdentity,
+        ) -> OverlayFuture<'a, ResolvedPeer> {
+            let result = if identity.kind() == ExternalIdentityKind::PeerId
+                && identity.value() == "stable-peer"
+            {
+                Ok(ResolvedPeer {
+                    peer_id: Some("stable-peer".to_owned()),
+                    display_name: Some("member".to_owned()),
+                    fqdn: Some("member.test".to_owned()),
+                    address: *self.member.read().expect("member read lock"),
+                })
+            } else {
+                Err(OverlayError::HostUnknown {
+                    host: identity.value().to_owned(),
                     overlay: self.id.clone(),
                 })
             };

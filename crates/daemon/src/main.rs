@@ -706,8 +706,8 @@ mod tests {
     use std::time::Duration;
 
     use overlay::{
-        BindAddrError, ConfiguredTransport, DiscoveredPeer, OverlayError, OverlayFuture, OverlayId,
-        OverlayTransport, ResolvedPeer,
+        BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, OverlayError,
+        OverlayFuture, OverlayId, OverlayTransport, ResolvedPeer,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -863,6 +863,17 @@ mod tests {
         fn resolve_peer<'a>(&'a self, host: &'a str) -> OverlayFuture<'a, ResolvedPeer> {
             let error = OverlayError::HostUnknown {
                 host: host.to_owned(),
+                overlay: self.id.clone(),
+            };
+            Box::pin(async move { Err(error) })
+        }
+
+        fn resolve_peer_identity<'a>(
+            &'a self,
+            identity: &'a ExternalIdentity,
+        ) -> OverlayFuture<'a, ResolvedPeer> {
+            let error = OverlayError::HostUnknown {
+                host: identity.value().to_owned(),
                 overlay: self.id.clone(),
             };
             Box::pin(async move { Err(error) })

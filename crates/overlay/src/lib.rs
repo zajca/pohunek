@@ -385,12 +385,14 @@ pub trait OverlayTransport: Send + Sync + fmt::Debug {
     fn resolve_peer<'a>(&'a self, host: &'a str) -> OverlayFuture<'a, ResolvedPeer>;
 
     /// Resolve one typed canonical identity to an exact current peer.
+    ///
+    /// Providers must match only the identity field selected by
+    /// [`ExternalIdentity::kind`]. They must not reinterpret the raw value as an
+    /// untyped selector.
     fn resolve_peer_identity<'a>(
         &'a self,
         identity: &'a ExternalIdentity,
-    ) -> OverlayFuture<'a, ResolvedPeer> {
-        self.resolve_peer(identity.value())
-    }
+    ) -> OverlayFuture<'a, ResolvedPeer>;
 
     /// Enumerate visible remote peers while preserving address-less candidates.
     fn discover_peers(&self) -> OverlayFuture<'_, Vec<DiscoveredPeer>>;
@@ -630,4 +632,4 @@ impl OverlayRegistry {
     }
 }
 
-// Rust guideline compliant 2026-08-28
+// Rust guideline compliant 2026-08-31

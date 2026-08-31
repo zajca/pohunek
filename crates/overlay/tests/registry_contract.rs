@@ -3,8 +3,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
 
 use overlay::{
-    BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, OverlayError,
-    OverlayFuture, OverlayId, OverlayRegistry, OverlayTransport, RegistryError, ResolvedPeer,
+    BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, ExternalIdentityKind,
+    OverlayError, OverlayFuture, OverlayId, OverlayRegistry, OverlayTransport, RegistryError,
+    ResolvedPeer,
 };
 
 #[derive(Debug)]
@@ -14,6 +15,8 @@ struct MemoryTransport {
     members: Vec<IpAddr>,
     peers: Vec<DiscoveredPeer>,
     resolutions: HashMap<String, Result<ResolvedPeer, OverlayError>>,
+    peer_id_resolutions: HashMap<String, Result<ResolvedPeer, OverlayError>>,
+    fqdn_resolutions: HashMap<String, Result<ResolvedPeer, OverlayError>>,
 }
 
 impl MemoryTransport {
@@ -24,6 +27,8 @@ impl MemoryTransport {
             members: vec![listener],
             peers: Vec::new(),
             resolutions: HashMap::new(),
+            peer_id_resolutions: HashMap::new(),
+            fqdn_resolutions: HashMap::new(),
         }
     }
 
@@ -38,6 +43,8 @@ impl MemoryTransport {
             members: Vec::new(),
             peers: Vec::new(),
             resolutions: HashMap::new(),
+            peer_id_resolutions: HashMap::new(),
+            fqdn_resolutions: HashMap::new(),
         }
     }
 
@@ -46,23 +53,37 @@ impl MemoryTransport {
     }
 
     fn add_peer(&mut self, host: &str, peer_id: Option<&str>, advertised: Option<IpAddr>) {
+        self.add_peer_with_fqdn(host, peer_id, &format!("{host}.example"), advertised);
+    }
+
+    fn add_peer_with_fqdn(
+        &mut self,
+        host: &str,
+        peer_id: Option<&str>,
+        fqdn: &str,
+        advertised: Option<IpAddr>,
+    ) {
         let safe_address = advertised.filter(|address| self.members.contains(address));
         self.peers.push(DiscoveredPeer {
             peer_id: peer_id.map(str::to_owned),
             display_name: Some(host.to_owned()),
-            fqdn: Some(format!("{host}.example")),
+            fqdn: Some(fqdn.to_owned()),
             address: safe_address,
         });
         if let Some(address) = safe_address {
-            self.resolutions.insert(
-                host.to_owned(),
-                Ok(ResolvedPeer {
-                    peer_id: peer_id.map(str::to_owned),
-                    display_name: Some(host.to_owned()),
-                    fqdn: Some(format!("{host}.example")),
-                    address,
-                }),
-            );
+            let resolved = ResolvedPeer {
+                peer_id: peer_id.map(str::to_owned),
+                display_name: Some(host.to_owned()),
+                fqdn: Some(fqdn.to_owned()),
+                address,
+            };
+            self.resolutions
+                .insert(host.to_owned(), Ok(resolved.clone()));
+            if let Some(peer_id) = peer_id {
+                self.peer_id_resolutions
+                    .insert(peer_id.to_owned(), Ok(resolved.clone()));
+            }
+            self.fqdn_resolutions.insert(fqdn.to_owned(), Ok(resolved));
         }
     }
 
@@ -107,6 +128,28 @@ impl OverlayTransport for MemoryTransport {
                 })
             })
         });
+        Box::pin(async move { result })
+    }
+
+    fn resolve_peer_identity<'a>(
+        &'a self,
+        identity: &'a ExternalIdentity,
+    ) -> OverlayFuture<'a, ResolvedPeer> {
+        let resolutions = match identity.kind() {
+            ExternalIdentityKind::PeerId => &self.peer_id_resolutions,
+            ExternalIdentityKind::Fqdn => &self.fqdn_resolutions,
+        };
+        let result = resolutions
+            .get(identity.value())
+            .cloned()
+            .unwrap_or_else(|| {
+                self.listener.clone().and_then(|_| {
+                    Err(OverlayError::HostUnknown {
+                        host: identity.value().to_owned(),
+                        overlay: self.id.clone(),
+                    })
+                })
+            });
         Box::pin(async move { result })
     }
 
@@ -228,6 +271,42 @@ async fn canonical_identity_is_slash_safe_and_decoded_before_provider_resolution
 }
 
 #[tokio::test]
+async fn canonical_fqdn_identity_cannot_resolve_a_colliding_peer_id() {
+    let listener = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let peer_id_address = "100.64.0.2".parse().expect("peer ID address");
+    let fqdn_address = "100.64.0.3".parse().expect("FQDN address");
+    let collision = "build.example";
+    let mut transport = MemoryTransport::new("memory", listener);
+    transport.add_member(peer_id_address);
+    transport.add_member(fqdn_address);
+    transport.add_peer_with_fqdn(
+        collision,
+        Some(collision),
+        "peer-id-owner.example",
+        Some(peer_id_address),
+    );
+    transport.add_peer_with_fqdn(
+        "fqdn-owner",
+        Some("fqdn-owner-id"),
+        collision,
+        Some(fqdn_address),
+    );
+    let registry = OverlayRegistry::new(vec![configured(transport, 17001)]).expect("registry");
+    let selector = ExternalIdentity::fqdn(collision)
+        .expect("FQDN identity")
+        .selector();
+
+    let route = registry
+        .resolve_host(&format!("memory:{selector}"))
+        .await
+        .expect("typed FQDN route");
+
+    assert_eq!(route.peer_id.as_deref(), Some("fqdn-owner-id"));
+    assert_eq!(route.fqdn.as_deref(), Some(collision));
+    assert_eq!(route.addr, SocketAddr::new(fqdn_address, 17001));
+}
+
+#[tokio::test]
 async fn ipv6_literals_distinguish_unqualified_peers_qualifiers_and_socket_addresses() {
     let listener = IpAddr::V6(Ipv6Addr::LOCALHOST);
     let address = "fd00::2".parse().expect("peer address");
@@ -315,4 +394,4 @@ async fn diagnostics_and_concurrent_listeners_keep_per_overlay_ports() {
     drop((first_socket, second_socket));
 }
 
-// Rust guideline compliant 2026-08-28
+// Rust guideline compliant 2026-08-31

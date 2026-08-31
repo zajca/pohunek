@@ -423,9 +423,11 @@ attach reuse the same selected socket route within one SDK client.
 Client-generated stable selectors are typed as `peer~<base64url>` or
 `fqdn~<base64url>` with no padding. The registry decodes them before provider
 resolution and preserves the identity kind, so a stable peer ID is matched only
-against the provider's peer-ID field. The base64url alphabet avoids `/`, `+`,
-`=`, and `@`, keeping selectors unambiguous in session targets, relay URLs, and
-the exact-port grammar.
+against the provider's peer-ID field. The provider contract requires a typed
+identity resolver and forbids falling back to untyped selector matching, so an
+FQDN cannot resolve as another peer's ID or short name. The base64url alphabet
+avoids `/`, `+`, `=`, and `@`, keeping selectors unambiguous in session targets,
+relay URLs, and the exact-port grammar.
 
 Daemon construction requires a validated registry up front. The shared
 discovery cache has no registry-less state, including when the Unix control

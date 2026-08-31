@@ -77,8 +77,10 @@ identity through current provider state; only control and raw attach opened by
 one SDK client reuse its exact selected socket endpoint. The explicit
 `<overlay>:<selector>@<port>` form carries the discovered port without trusting
 a cached IP. Generated selectors encode typed identities as unpadded base64url:
-`peer~<base64url>` for provider peer IDs and `fqdn~<base64url>` for the fallback. This
-keeps raw `/`, `+`, `=`, and `@` characters out of target and exact-port grammar.
+`peer~<base64url>` for provider peer IDs and `fqdn~<base64url>` for the fallback.
+Providers must resolve the requested identity field explicitly, so an FQDN can
+never fall through to a colliding peer ID or short name. This keeps raw `/`, `+`,
+`=`, and `@` characters out of target and exact-port grammar.
 A socket-address literal cannot bypass current overlay membership. NetBird uses
 `publicKey` or legacy `pubKey` as `peer_id`; when absent, `peer_id` stays null
 and clients fall back to FQDN. The web relay forces a new local-daemon discovery

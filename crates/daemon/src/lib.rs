@@ -56,8 +56,8 @@ pub(crate) mod test_support {
     use std::sync::Arc;
 
     use overlay::{
-        BindAddrError, ConfiguredTransport, DiscoveredPeer, OverlayError, OverlayFuture, OverlayId,
-        OverlayRegistry, OverlayTransport, ResolvedPeer,
+        BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, OverlayError,
+        OverlayFuture, OverlayId, OverlayRegistry, OverlayTransport, ResolvedPeer,
     };
 
     pub(crate) static XDG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -85,6 +85,19 @@ pub(crate) mod test_support {
             Box::pin(async move {
                 Err(OverlayError::HostUnknown {
                     host: host.to_owned(),
+                    overlay,
+                })
+            })
+        }
+
+        fn resolve_peer_identity<'a>(
+            &'a self,
+            identity: &'a ExternalIdentity,
+        ) -> OverlayFuture<'a, ResolvedPeer> {
+            let overlay = self.id.clone();
+            Box::pin(async move {
+                Err(OverlayError::HostUnknown {
+                    host: identity.value().to_owned(),
                     overlay,
                 })
             })

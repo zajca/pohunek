@@ -360,8 +360,8 @@ mod tests {
 
     use super::*;
     use overlay::{
-        BindAddrError, ConfiguredTransport, DiscoveredPeer, OverlayError, OverlayFuture, OverlayId,
-        OverlayTransport, ResolvedPeer,
+        BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, OverlayError,
+        OverlayFuture, OverlayId, OverlayTransport, ResolvedPeer,
     };
 
     #[derive(Debug)]
@@ -411,6 +411,17 @@ mod tests {
             Box::pin(async move { Err(error) })
         }
 
+        fn resolve_peer_identity<'a>(
+            &'a self,
+            identity: &'a ExternalIdentity,
+        ) -> OverlayFuture<'a, ResolvedPeer> {
+            let error = OverlayError::HostUnknown {
+                host: identity.value().to_owned(),
+                overlay: self.id.clone(),
+            };
+            Box::pin(async move { Err(error) })
+        }
+
         fn discover_peers(&self) -> OverlayFuture<'_, Vec<DiscoveredPeer>> {
             let discovery = self.discovery.clone();
             Box::pin(async move { discovery })
@@ -437,6 +448,13 @@ mod tests {
         }
 
         fn resolve_peer<'a>(&'a self, _host: &'a str) -> OverlayFuture<'a, ResolvedPeer> {
+            Box::pin(std::future::pending())
+        }
+
+        fn resolve_peer_identity<'a>(
+            &'a self,
+            _identity: &'a ExternalIdentity,
+        ) -> OverlayFuture<'a, ResolvedPeer> {
             Box::pin(std::future::pending())
         }
 
