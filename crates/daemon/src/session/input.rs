@@ -138,16 +138,55 @@ impl SessionRegistry {
         text: &str,
         deadline: tokio::time::Instant,
     ) -> Result<InputSubmission, ProtocolError> {
-        self.write_waited_input_with_ack_delay(session_id, text, deadline, Duration::ZERO)
-            .await
+        self.write_waited_input_inner(
+            session_id,
+            text,
+            deadline,
+            Duration::ZERO,
+            #[cfg(test)]
+            None,
+        )
+        .await
     }
 
+    #[cfg(test)]
     pub(super) async fn write_waited_input_with_ack_delay(
         &self,
         session_id: &SessionId,
         text: &str,
         deadline: tokio::time::Instant,
         plan_ack_delay: Duration,
+    ) -> Result<InputSubmission, ProtocolError> {
+        self.write_waited_input_inner(
+            session_id,
+            text,
+            deadline,
+            plan_ack_delay,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn write_waited_input_at_send_boundary(
+        &self,
+        session_id: &SessionId,
+        text: &str,
+        deadline: tokio::time::Instant,
+        boundary: std::sync::Arc<tokio::sync::Barrier>,
+    ) -> Result<InputSubmission, ProtocolError> {
+        self.write_waited_input_inner(session_id, text, deadline, Duration::ZERO, Some(boundary))
+            .await
+    }
+
+    async fn write_waited_input_inner(
+        &self,
+        session_id: &SessionId,
+        text: &str,
+        deadline: tokio::time::Instant,
+        plan_ack_delay: Duration,
+        #[cfg(test)] send_boundary: Option<std::sync::Arc<tokio::sync::Barrier>>,
     ) -> Result<InputSubmission, ProtocolError> {
         let input_gate = self.input_gate(session_id).await?;
         let input_guard = self
@@ -184,6 +223,8 @@ impl SessionRegistry {
                 session_id.clone(),
                 runtime.clone(),
                 deadline,
+                #[cfg(test)]
+                send_boundary,
             )
             .await?;
         self.input_activity_snapshot(session_id, Some(&runtime))
@@ -254,20 +295,32 @@ impl SessionRegistry {
         session_id: SessionId,
         runtime: SessionRuntimeIdentity,
         deadline: tokio::time::Instant,
+        #[cfg(test)] send_boundary: Option<std::sync::Arc<tokio::sync::Barrier>>,
     ) -> Result<InputActivitySnapshot, ProtocolError> {
         let (send_started_tx, send_started_rx) = tokio::sync::oneshot::channel();
         let registry = self.clone();
         let mut write = tokio::spawn(async move {
             let _input_guard = input_guard;
-            let boundary = registry
-                .input_activity_snapshot(&session_id, Some(&runtime))
-                .await?;
+            let sessions = registry.inner.sessions.lock().await;
+            let entry = sessions
+                .get(&session_id)
+                .ok_or_else(|| session_not_found(&session_id.0))?;
+            let boundary = input_activity_snapshot_for_entry(entry, &session_id, Some(&runtime))?;
             reject_blocked_wait(boundary.activity)?;
+            #[cfg(test)]
+            if let Some(send_boundary) = send_boundary {
+                send_boundary.wait().await;
+                send_boundary.wait().await;
+            }
+            let completed_boundary = boundary.clone();
             reservation
-                .commit(Some(send_started_tx))
+                .commit(move || {
+                    let _result = send_started_tx.send(());
+                    drop(sessions);
+                })
                 .await
                 .map_err(worker_error_to_protocol)?;
-            Ok(boundary)
+            Ok(completed_boundary)
         });
         tokio::pin!(send_started_rx);
 
@@ -318,15 +371,7 @@ impl SessionRegistry {
         let entry = sessions
             .get(session_id)
             .ok_or_else(|| session_not_found(&session_id.0))?;
-        let runtime = input_runtime_identity(entry, session_id)?;
-        if expected_runtime.is_some_and(|expected| expected != &runtime) {
-            return Err(ProtocolError::session_runtime_changed());
-        }
-        Ok(InputActivitySnapshot {
-            activity: entry.info.activity,
-            revision: ActivityRevision::new(entry.activity_revision),
-            runtime,
-        })
+        input_activity_snapshot_for_entry(entry, session_id, expected_runtime)
     }
 
     pub(super) async fn await_input_settled(
@@ -463,6 +508,22 @@ impl SessionRegistry {
 
         Ok(())
     }
+}
+
+fn input_activity_snapshot_for_entry(
+    entry: &SessionEntry,
+    session_id: &SessionId,
+    expected_runtime: Option<&SessionRuntimeIdentity>,
+) -> Result<InputActivitySnapshot, ProtocolError> {
+    let runtime = input_runtime_identity(entry, session_id)?;
+    if expected_runtime.is_some_and(|expected| expected != &runtime) {
+        return Err(ProtocolError::session_runtime_changed());
+    }
+    Ok(InputActivitySnapshot {
+        activity: entry.info.activity,
+        revision: ActivityRevision::new(entry.activity_revision),
+        runtime,
+    })
 }
 
 fn input_runtime_identity(

@@ -15,9 +15,9 @@ use pohunek_worker_protocol::{
 };
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
-use tokio::sync::{oneshot, Mutex, OwnedMutexGuard};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
-// Rust guideline compliant 2026-08-28
+// Rust guideline compliant 2026-08-31
 
 /// Prefix for daemon-generated, producer-scoped control input identifiers.
 const INPUT_WRITE_ID_PREFIX: &str = "input";
@@ -500,7 +500,7 @@ impl Worker {
     ///
     /// Returns [`WorkerError`] for unavailable runtime or worker rejection.
     pub async fn write(&self, fragments: Vec<InputFragment>) -> Result<u64, WorkerError> {
-        self.reserve_write(fragments).await?.commit(None).await
+        self.reserve_write(fragments).await?.commit(|| {}).await
     }
 
     /// Reserves the worker control connection and prepares one input plan.
@@ -760,13 +760,13 @@ impl Worker {
 impl WriteReservation {
     /// Starts the prepared write and consumes its worker acknowledgement.
     ///
-    /// `send_started` is completed immediately before the first control writer
-    /// await. Callers may cancel safely until that signal; after it, they must
-    /// keep this future alive until the acknowledgement is consumed.
-    pub(crate) async fn commit(
-        mut self,
-        send_started: Option<oneshot::Sender<()>>,
-    ) -> Result<u64, WorkerError> {
+    /// `send_started` runs immediately before the first control writer await.
+    /// Callers may cancel safely until that callback; after it, they must keep
+    /// this future alive until the acknowledgement is consumed.
+    pub(crate) async fn commit<F>(mut self, send_started: F) -> Result<u64, WorkerError>
+    where
+        F: FnOnce(),
+    {
         let inner = &mut *self.inner;
         let response = exchange_marked(
             &mut inner.reader,
@@ -1092,19 +1092,20 @@ async fn exchange(
     writer: &mut ControlWriter<OwnedWriteHalf>,
     request: ControlRequest,
 ) -> Result<ControlResponse, WorkerError> {
-    exchange_marked(reader, writer, request, None).await
+    exchange_marked(reader, writer, request, || {}).await
 }
 
-async fn exchange_marked(
+async fn exchange_marked<F>(
     reader: &mut ControlReader<OwnedReadHalf>,
     writer: &mut ControlWriter<OwnedWriteHalf>,
     request: ControlRequest,
-    send_started: Option<oneshot::Sender<()>>,
-) -> Result<ControlResponse, WorkerError> {
+    send_started: F,
+) -> Result<ControlResponse, WorkerError>
+where
+    F: FnOnce(),
+{
     let expected = request.request_id.clone();
-    if let Some(send_started) = send_started {
-        let _result = send_started.send(());
-    }
+    send_started();
     writer
         .write(&ControlMessage::Request(request))
         .await

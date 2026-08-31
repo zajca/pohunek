@@ -3846,6 +3846,81 @@ async fn session_input_wait_boundary_excludes_activity_before_worker_write_reser
 }
 
 #[tokio::test]
+async fn session_input_wait_serializes_activity_snapshot_with_send_start() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Working, 1)
+            .await
+            .recorded
+    );
+    let mut events = registry.subscribe();
+    let send_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    let write = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        let send_boundary = Arc::clone(&send_boundary);
+        async move {
+            registry
+                .write_waited_input_at_send_boundary(
+                    &session_id,
+                    "serialized-boundary",
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                    send_boundary,
+                )
+                .await
+        }
+    });
+    send_boundary.wait().await;
+
+    let mut report = Box::pin(report_input_activity(
+        &registry,
+        &created.id,
+        AgentActivity::Idle,
+        2,
+    ));
+    tokio::select! {
+        biased;
+        result = &mut report => panic!("activity crossed the pre-send boundary: {result:?}"),
+        () = tokio::task::yield_now() => {}
+    }
+    registry
+        .inner
+        .sessions
+        .try_lock()
+        .expect_err("activity boundary must retain the session lock until send starts");
+
+    send_boundary.wait().await;
+    assert!(report.await.recorded);
+    let submission = write
+        .await
+        .expect("write task joins")
+        .expect("write starts after the serialized boundary");
+    let result = registry
+        .await_input_settled(
+            &created.id,
+            protocol::SessionInputWait {
+                until: Some(vec![AgentActivity::Idle]),
+                timeout_ms: Some(1_000),
+            },
+            submission.clone(),
+            &mut events,
+        )
+        .await
+        .expect("post-send activity settles the wait");
+
+    assert!(result.activity_revision > Some(submission.after_revision));
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
 async fn session_input_wait_timeout_while_worker_reserved_never_sends_late_input() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: observable_input_shell(),
