@@ -3,7 +3,7 @@
 //! Codex and Claude hook installation remains a local daemon RPC. Hermes is an
 //! owner-local plugin lifecycle and deliberately never contacts the daemon.
 
-// Rust guideline compliant 2026-08-12
+// Rust guideline compliant 2026-08-31
 
 use std::env;
 use std::fmt::Write as _;
@@ -640,9 +640,17 @@ fn qualify_status_warning(host: &str, warning: &str) -> String {
     if host.is_empty() || host == LOCAL_HOST {
         return warning.to_owned();
     }
-    warning.replacen(
+    let qualified = warning.replacen(
         "run `pohunek integration install",
         &format!("on daemon host `{host}`, run `pohunek integration install"),
+        1,
+    );
+    if qualified != warning {
+        return qualified;
+    }
+    warning.replacen(
+        "running `pohunek integration install",
+        &format!("running on daemon host `{host}`: `pohunek integration install"),
         1,
     )
 }
@@ -873,6 +881,7 @@ mod status_tests {
                 recovery: IntegrationRecovery::Reinstall,
                 warnings: vec![
                     "managed state hook permissions drifted; run `pohunek integration install --agent codex` to restore them".to_owned(),
+                    "managed asset parent is unsafe; repair its permissions before running `pohunek integration install --agent codex`".to_owned(),
                 ],
             }],
         };
@@ -884,6 +893,9 @@ mod status_tests {
         ));
         assert!(output.contains(
             "hint: on daemon host `buildbox`, run `pohunek integration install --agent codex` directly to repair"
+        ));
+        assert!(output.contains(
+            "warning: managed asset parent is unsafe; repair its permissions before running on daemon host `buildbox`: `pohunek integration install --agent codex`"
         ));
         assert!(!output.contains("pohunek --host buildbox integration install"));
     }

@@ -254,7 +254,7 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         }
         method::DAEMON_DOCTOR => daemon::handle_daemon_doctor(request).await,
         method::ASSISTANT_MATERIALIZE => assistant::handle_assistant_materialize(request).await,
-        method::INTEGRATION_INSTALL => integration::handle_integration_install(request),
+        method::INTEGRATION_INSTALL => integration::handle_integration_install(request).await,
         method::INTEGRATION_STATUS => integration::handle_integration_status(request).await,
         method::HOST_INSPECT => host::handle_host_inspect(request, &state.health, &state.sessions),
         method::HOST_DISCOVER => host::handle_host_discover(request, &state.discovery).await,
@@ -359,7 +359,7 @@ mod tests {
     };
 
     use super::assistant::run_assistant_materialize_blocking;
-    use super::integration::run_integration_status_blocking;
+    use super::integration::{run_integration_install_blocking, run_integration_status_blocking};
     use super::project::live_sessions;
     use super::util::parse_attach_prelude;
     use super::{handle_request, DaemonState, HealthInfo};
@@ -945,6 +945,23 @@ mod tests {
         let err = error_value(response, "integration.status");
         assert_eq!(err.class, protocol::ErrorClass::Daemon);
         assert_eq!(err.code, "integration_status_task_panicked");
+    }
+
+    #[tokio::test]
+    async fn integration_install_blocking_task_panic_returns_daemon_error() {
+        let request = request(
+            "integration-install-panic",
+            method::INTEGRATION_INSTALL,
+            serde_json::json!({ "agent": "codex" }),
+        );
+
+        let response =
+            run_integration_install_blocking(&request, || panic!("integration installation panic"))
+                .await;
+
+        let err = error_value(response, "integration.install");
+        assert_eq!(err.class, protocol::ErrorClass::Daemon);
+        assert_eq!(err.code, "integration_install_task_panicked");
     }
 
     async fn assistant_materialize_result(

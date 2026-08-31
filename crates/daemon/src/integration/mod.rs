@@ -2333,13 +2333,20 @@ impl TrustedDir {
             .is_some_and(|(staged, created)| {
                 staged.dev() == created.dev() && staged.ino() == created.ino()
             });
-        if same_inode {
-            let _ = rustix::fs::unlinkat(
+        let restore = if same_inode {
+            rustix::fs::unlinkat(
                 &self.file,
                 cleanup_name.as_str(),
                 rustix::fs::AtFlags::REMOVEDIR,
-            );
+            )
+            .is_err()
         } else {
+            true
+        };
+        if restore {
+            // A raced writer can make the created directory non-empty after it
+            // was staged. Restore the original name when it is still free so a
+            // failed cleanup never hides live contents under a cleanup name.
             let _ = rustix::fs::renameat_with(
                 &self.file,
                 cleanup_name.as_str(),
@@ -3884,6 +3891,37 @@ mod tests {
         fs::rename(&moved, &child).expect("restore created inode name");
         trusted.cleanup_created_child("hooks", &handle);
         assert!(!child.exists(), "cleanup removes the created inode");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_restores_nonempty_created_directory() {
+        let root = temp_dir("created-dir-nonempty-cleanup");
+        let trusted = super::TrustedDir::open(&root, "test root").expect("open trusted dirfd");
+        let child = root.join("hooks");
+        fs::create_dir(&child).expect("create child directory");
+        let handle = trusted
+            .open_created_child_handle("hooks", "test child")
+            .expect("open created child handle");
+        fs::write(child.join("raced-entry"), "live\n")
+            .expect("simulate a concurrent directory writer");
+
+        trusted.cleanup_created_child("hooks", &handle);
+
+        assert_eq!(
+            fs::read_to_string(child.join("raced-entry")).expect("read restored raced entry"),
+            "live\n"
+        );
+        assert!(
+            fs::read_dir(&root)
+                .expect("read test root")
+                .all(|entry| !entry
+                    .expect("read test root entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".cleanup")),
+            "failed cleanup must not strand a staged directory"
+        );
     }
 
     #[cfg(unix)]
