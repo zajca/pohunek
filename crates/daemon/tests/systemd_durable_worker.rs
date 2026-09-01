@@ -212,6 +212,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
         .call::<method::SessionInput>(SessionInputParams {
             session_id: SessionId(fixture.session_id.clone()),
             text: "post-reconnect-input".to_owned(),
+            wait: None,
         })
         .await
         .expect("input same runtime after daemon reconnect");

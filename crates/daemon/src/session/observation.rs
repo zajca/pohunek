@@ -32,9 +32,9 @@ struct WaitSnapshot {
 }
 
 #[derive(Debug)]
-struct WaitPermit {
-    registry: SessionRegistry,
-    session_id: SessionId,
+pub(super) struct WaitPermit {
+    pub(super) registry: SessionRegistry,
+    pub(super) session_id: SessionId,
 }
 
 impl Drop for WaitPermit {
@@ -444,7 +444,7 @@ impl SessionRegistry {
         Ok(wait_result(SessionWaitReason::Timeout, snapshot))
     }
 
-    fn acquire_waiter(&self, id: &SessionId) -> Result<WaitPermit, ProtocolError> {
+    pub(super) fn acquire_waiter(&self, id: &SessionId) -> Result<WaitPermit, ProtocolError> {
         let previous = self
             .inner
             .observation_waiters

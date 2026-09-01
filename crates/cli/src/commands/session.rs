@@ -19,7 +19,7 @@ use protocol::Request;
 use protocol::{
     method, AgentActivity, CwdSource, ForkCwdMode, OutputOffset, RuntimeGeneration,
     SessionDiffParams, SessionForkParams, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
+    SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
     SessionOutputParams, SessionReadFormat, SessionReadParams, SessionReadResult,
     SessionReadSource, SessionRemoveResult, SessionRenameParams, SessionResizeParams,
     SessionRuntimeIdentity, SessionScreenParams, SessionSetMetadataParams, SessionState,
@@ -62,12 +62,21 @@ pub(crate) fn parse_output_bytes(value: &str) -> Result<u32, String> {
 
 /// Parse a required bounded wait timeout against the shared protocol ceiling.
 pub(crate) fn parse_wait_timeout_ms(value: &str) -> Result<u32, String> {
+    parse_bounded_wait_timeout_ms(value, "--timeout-ms")
+}
+
+/// Parse an input-wait timeout against the shared protocol ceiling.
+pub(crate) fn parse_input_timeout_ms(value: &str) -> Result<u32, String> {
+    parse_bounded_wait_timeout_ms(value, "--timeout")
+}
+
+fn parse_bounded_wait_timeout_ms(value: &str, flag: &str) -> Result<u32, String> {
     let parsed = value
         .parse::<u32>()
-        .map_err(|_error| "--timeout-ms must be an unsigned 32-bit integer".to_owned())?;
+        .map_err(|_error| format!("{flag} must be an unsigned 32-bit integer"))?;
     if parsed == 0 || parsed > protocol::MAX_SESSION_WAIT_MS {
         return Err(format!(
-            "--timeout-ms must be between 1 and {}",
+            "{flag} must be between 1 and {}",
             protocol::MAX_SESSION_WAIT_MS
         ));
     }
@@ -651,12 +660,23 @@ pub(crate) async fn run_input(
     paths: &Paths,
     target: &Target,
     text: &str,
+    wait_until: &[AgentActivity],
+    timeout_ms: Option<u32>,
     json: bool,
 ) -> Result<(), CliError> {
     let mut client = Client::connect(host, paths).await?;
-    let input = client
-        .call::<method::SessionInput>(input_params(target, text))
-        .await?;
+    let params = input_params(target, text, wait_until, timeout_ms);
+    let input = if params.wait.is_some() {
+        tokio::select! {
+            result = client.session_input(params) => result?,
+            signal = process_cancellation() => {
+                signal?;
+                return Err(CliError::InputWaitInterrupted);
+            }
+        }
+    } else {
+        client.session_input(params).await?
+    };
 
     if json {
         print!("{}", crate::commands::render_json(&input)?);
@@ -1161,16 +1181,28 @@ fn build_fork_request(
     request_with_params(method::SESSION_FORK, &fork_params(target, name, cols, rows))
 }
 
-fn input_params(target: &Target, text: &str) -> SessionInputParams {
+fn input_params(
+    target: &Target,
+    text: &str,
+    wait_until: &[AgentActivity],
+    timeout_ms: Option<u32>,
+) -> SessionInputParams {
     SessionInputParams {
         session_id: SessionId(target.session_id.clone()),
         text: text.to_owned(),
+        wait: (!wait_until.is_empty() || timeout_ms.is_some()).then(|| SessionInputWait {
+            until: Some(wait_until.to_vec()),
+            timeout_ms,
+        }),
     }
 }
 
 #[cfg(test)]
 fn build_input_request(target: &Target, text: &str) -> Result<Request, CliError> {
-    request_with_params(method::SESSION_INPUT, &input_params(target, text))
+    request_with_params(
+        method::SESSION_INPUT,
+        &input_params(target, text, &[], None),
+    )
 }
 
 fn rename_params(target: &Target, name: Option<String>) -> SessionRenameParams {
@@ -1525,10 +1557,18 @@ fn render_remove_human(session_id: &str, result: &SessionRemoveResult) -> String
 }
 
 fn render_input_human(session_id: &str, result: &SessionInputResult) -> String {
-    if result.accepted {
-        format!("session {session_id}: input accepted\n")
+    let disposition = if result.accepted {
+        "accepted"
     } else {
-        format!("session {session_id}: input rejected\n")
+        "rejected"
+    };
+    match (result.activity, result.activity_source) {
+        (Some(activity), Some(source)) => format!(
+            "session {session_id}: input {disposition} activity={} source={}\n",
+            activity_label(activity),
+            state_source_label(source)
+        ),
+        _ => format!("session {session_id}: input {disposition}\n"),
     }
 }
 
@@ -2765,9 +2805,45 @@ mod tests {
 
     #[test]
     fn renders_input_result_with_target_id() {
-        let output = render_input_human("s-42", &protocol::SessionInputResult { accepted: true });
+        let output = render_input_human(
+            "s-42",
+            &protocol::SessionInputResult {
+                accepted: true,
+                activity: None,
+                activity_source: None,
+                runtime: None,
+                activity_epoch: None,
+                activity_revision: None,
+            },
+        );
 
         assert_eq!(output, "session s-42: input accepted\n");
+    }
+
+    #[test]
+    fn renders_settled_input_activity_and_source() {
+        let output = render_input_human(
+            "s-42",
+            &protocol::SessionInputResult {
+                accepted: true,
+                activity: Some(AgentActivity::Blocked),
+                activity_source: Some(StateSource::Report),
+                runtime: Some(
+                    protocol::SessionRuntimeIdentity::new(
+                        "runtime-42",
+                        protocol::RuntimeGeneration::new(1),
+                    )
+                    .expect("valid runtime identity"),
+                ),
+                activity_epoch: Some("d-epoch-1".to_owned()),
+                activity_revision: Some(protocol::ActivityRevision::new(2)),
+            },
+        );
+
+        assert_eq!(
+            output,
+            "session s-42: input accepted activity=blocked source=report\n"
+        );
     }
 
     #[test]
@@ -2859,7 +2935,14 @@ mod tests {
 
     #[test]
     fn renders_input_result_as_json_that_deserializes() {
-        let result = protocol::SessionInputResult { accepted: true };
+        let result = protocol::SessionInputResult {
+            accepted: true,
+            activity: None,
+            activity_source: None,
+            runtime: None,
+            activity_epoch: None,
+            activity_revision: None,
+        };
         let doc = crate::commands::render_json(&result).expect("json doc");
         let parsed: protocol::SessionInputResult = crate::commands::parse_json_ok(&doc);
         assert_eq!(parsed, result);

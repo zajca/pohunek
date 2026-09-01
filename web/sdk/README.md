@@ -107,11 +107,35 @@ const client = await connectLocal(socketPath, {
 ```
 
 The origin is an atomic pair of bounded safe identifiers. The SDK copies it to
-ordinary calls, subscriptions, waiting `session.output`, and `session.wait`,
-including their dedicated connections. A partial, unsafe, oversized, or
+ordinary calls, subscriptions, waiting `session.input`, waiting
+`session.output`, and `session.wait`, including their dedicated connections. A
+partial, unsafe, oversized, or
 conflicting pair is rejected before a control line is written. Omit `origin`
 for ordinary browser or host-side clients that are not running inside a managed
 session.
+
+`client.sessionInput({ ..., wait })` opens a dedicated bounded connection and
+accepts success only when the daemon returns the requested activity, its source,
+the exact runtime identity, a nonempty daemon activity epoch, and a canonical
+decimal activity revision. The wait timeout is the daemon's overall
+delivery-and-activity deadline measured before delivery; the transport adds only
+fixed response headroom. The SDK rejects a timeout outside `1..=8000` before
+opening the dedicated connection and normalizes an omitted `wait.until` to `[]`
+before validation and wire serialization. The target array is copied before the
+first transport await, so caller mutation cannot change the in-flight contract.
+Both `sessionInput(...)` and generic typed `call("session.input", ...)` route
+waited input through this path. Delayed provider framing returns
+`session_input_wait_unsupported` before delivery because the daemon cannot
+safely revalidate approval state inside a worker-owned delay. Deduplicate evidence by `(activity_epoch, runtime,
+activity_revision)`, since daemon reconnect preserves the runtime but starts a
+new epoch-scoped revision sequence. Missing or contradictory evidence fails closed as
+`session_input_wait_contract_mismatch`; it is never treated as delivery
+confirmation from a daemon that ignored `wait`. Its recovery hint treats delivery
+as unknown and forbids blind retry; inspect the session before deciding whether
+to resend.
+
+`session_input_timeout` uses the same no-blind-retry posture: delivery may have
+completed, so inspect the current session before deciding whether to resend.
 
 ## Attach
 

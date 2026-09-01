@@ -12,13 +12,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use protocol::{
-    event, AgentActivity, AgentKind, AgentStateEvent, AttachEvent, CwdSource, ErrorClass, Event,
-    ProjectRemoveResult, ProtocolError, RuntimeInventoryEntry, RuntimeInventoryResult,
-    RuntimeState, SessionAttachParams, SessionEvent, SessionForkParams, SessionId, SessionInfo,
-    SessionInputParams, SessionInputResult, SessionNativeRecoveredEvent, SessionNewParams,
-    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionRuntime, SessionSetMetadataResult, SessionState,
+    event, ActivityRevision, AgentActivity, AgentKind, AgentStateEvent, AttachEvent, CwdSource,
+    ErrorClass, Event, ProjectRemoveResult, ProtocolError, RuntimeInventoryEntry,
+    RuntimeInventoryResult, RuntimeState, SessionAttachParams, SessionEvent, SessionForkParams,
+    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait,
+    SessionNativeRecoveredEvent, SessionNewParams, SessionReleaseAgentParams,
+    SessionReleaseAgentResult, SessionRemoveResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionRuntime, SessionRuntimeIdentity, SessionSetMetadataResult, SessionState,
     SessionStopResult, SessionWarning, StateSource, WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 use serde_json::Value;
@@ -80,7 +81,7 @@ use hooks::SessionHookRequest;
 #[cfg(test)]
 use hooks::{parse_agent_activity, spawn_agent_state_hook_dispatcher};
 #[cfg(test)]
-use input::build_input_writes;
+use input::{build_input_writes, InputSubmission};
 use input::{input_rules_for_agent, plan_initial_input_delivery};
 use lag::{log_lag_warn, LagWarnThrottle};
 use resume::ResumeSnapshot;
@@ -108,6 +109,14 @@ const MAX_RUNTIME_TRANSITION_COMMIT_ATTEMPTS: usize = 8;
 const DEFAULT_WORKER_SUBSCRIBER_BYTES: u64 = 1_000_000;
 /// Number of completed input plans retained by a worker for deduplication.
 const DEFAULT_WORKER_WRITE_DEDUP_ENTRIES: u32 = 4_096;
+/// Maximum number of recent activity observations retained per session.
+///
+/// The time window is authoritative for ordinary report rates; the hard cap
+/// prevents a misbehaving local hook from growing daemon memory without bound.
+const MAX_ACTIVITY_EVIDENCE_HISTORY: usize = 4_096;
+/// Keeps evidence through the longest public input-wait deadline.
+const ACTIVITY_EVIDENCE_RETENTION: Duration =
+    Duration::from_millis(protocol::MAX_SESSION_WAIT_MS as u64);
 /// Final runtime retention while no daemon is present.
 const DEFAULT_WORKER_TERMINAL_RETENTION: Duration = Duration::from_hours(24);
 /// Initial durable logical-session record schema.
@@ -389,6 +398,11 @@ struct SessionRegistryInner {
     /// Set when daemon process shutdown starts. Natural PTY exits observed after
     /// this point are treated as restart fallout, not terminal session state.
     daemon_shutdown_started: AtomicBool,
+    /// Cancellation signal fired when production daemon shutdown starts.
+    ///
+    /// Bounded input operations use this token instead of the event-log drain
+    /// token so shutdown cancellation does not depend on later flush ordering.
+    daemon_shutdown: CancellationToken,
     /// Opaque id unique to this daemon process instance, injected into every
     /// session PTY as `POHUNEK_DAEMON_ID` and compared against the attach origin
     /// so the self-feeding-attach guard fires only for this instance's own PTYs
@@ -446,6 +460,12 @@ struct SessionRegistryInner {
 #[derive(Debug, Clone)]
 struct SessionEntry {
     info: SessionInfo,
+    /// Monotonic in-memory cursor advanced for every emitted activity report.
+    activity_revision: u64,
+    /// Bounded runtime-scoped activity history for input-wait evidence.
+    activity_evidence: VecDeque<ActivityEvidence>,
+    /// Serializes complete input framing transactions for this logical session.
+    input_gate: Arc<Mutex<()>>,
     runtime: RuntimeHandle,
     desired_state: DesiredState,
     detector_cancel: CancellationToken,
@@ -467,6 +487,72 @@ struct SessionEntry {
     last_agent_report: Option<ActiveAgentReport>,
     last_native_report: Option<NativeIdentityReport>,
     observed_agents: Vec<ObservedAgent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActivityEvidence {
+    activity: AgentActivity,
+    source: StateSource,
+    runtime: SessionRuntimeIdentity,
+    activity_epoch: String,
+    revision: ActivityRevision,
+    observed_at: tokio::time::Instant,
+}
+
+impl ActivityEvidence {
+    fn event(&self, session_id: SessionId) -> AgentStateEvent {
+        AgentStateEvent {
+            session_id,
+            activity: self.activity,
+            source: self.source,
+            runtime: Some(self.runtime.clone()),
+            activity_epoch: Some(self.activity_epoch.clone()),
+            revision: Some(self.revision),
+        }
+    }
+}
+
+fn record_activity_evidence(
+    entry: &mut SessionEntry,
+    activity: AgentActivity,
+    source: StateSource,
+    activity_epoch: &str,
+) -> Option<ActivityEvidence> {
+    entry.activity_revision = entry
+        .activity_revision
+        .checked_add(1)
+        .expect("session activity revision overflowed");
+    let runtime = entry.info.runtime.as_ref().and_then(|runtime| {
+        if runtime.state != RuntimeState::Live {
+            return None;
+        }
+        SessionRuntimeIdentity::new(runtime.runtime_id.clone()?, runtime.runtime_generation).ok()
+    })?;
+    let evidence = ActivityEvidence {
+        activity,
+        source,
+        runtime,
+        activity_epoch: activity_epoch.to_owned(),
+        revision: ActivityRevision::new(entry.activity_revision),
+        observed_at: tokio::time::Instant::now(),
+    };
+    if let Some(cutoff) = evidence
+        .observed_at
+        .checked_sub(ACTIVITY_EVIDENCE_RETENTION)
+    {
+        while entry
+            .activity_evidence
+            .front()
+            .is_some_and(|previous| previous.observed_at < cutoff)
+        {
+            entry.activity_evidence.pop_front();
+        }
+    }
+    entry.activity_evidence.push_back(evidence.clone());
+    while entry.activity_evidence.len() > MAX_ACTIVITY_EVIDENCE_HISTORY {
+        entry.activity_evidence.pop_front();
+    }
+    Some(evidence)
 }
 
 /// Runtime transport selected for one logical session.
@@ -507,6 +593,12 @@ struct RuntimeWatchIdentity {
     worker_id: String,
     runtime_id: String,
     generation: protocol::RuntimeGeneration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetectorScope {
+    id: SessionId,
+    runtime: RuntimeWatchIdentity,
 }
 
 impl RuntimeWatchIdentity {
@@ -997,6 +1089,7 @@ impl SessionRegistry {
                 observation_waiters: AtomicUsize::new(0),
                 observation_session_waiters: std::sync::Mutex::new(HashMap::new()),
                 daemon_shutdown_started: AtomicBool::new(false),
+                daemon_shutdown: CancellationToken::new(),
                 daemon_instance_id: generate_daemon_instance_id(),
                 config,
                 launcher,
@@ -1071,6 +1164,7 @@ impl SessionRegistry {
             .inner
             .daemon_shutdown_started
             .swap(true, Ordering::Relaxed);
+        self.inner.daemon_shutdown.cancel();
         if !already_started {
             info!("daemon shutdown started; preserving durable worker runtimes");
         }
@@ -1727,6 +1821,7 @@ impl SessionRegistry {
     /// Record the active nested agent currently owning a live session.
     pub async fn report_agent(&self, params: SessionReportAgentParams) -> SessionReportAgentResult {
         let not_recorded = SessionReportAgentResult { recorded: false };
+        let activity_epoch = self.daemon_instance_id().to_owned();
         let resolved = match self.inner.profiles.resolve_agent(&params.agent) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -1747,7 +1842,7 @@ impl SessionRegistry {
         let reported_activity = params.activity;
         let report_sequence = params.seq.map(protocol::ReportSequence::get);
         let active_detector_config = detector_config_for_resolved_agent(&resolved);
-        let (info, rescan) = {
+        let (info, rescan, evidence) = {
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(&params.session_id) else {
                 debug!(
@@ -1795,25 +1890,26 @@ impl SessionRegistry {
             entry.info.active_agent_pid = pid;
             entry.info.active_agent_session_id = valid_session_id;
             entry.info.active_agent_session_path = valid_session_path;
-            if let Some(activity) = reported_activity {
+            let evidence = reported_activity.and_then(|activity| {
                 entry.info.activity = Some(activity);
                 entry.info.state_source = StateSource::Report;
-            }
+                record_activity_evidence(entry, activity, StateSource::Report, &activity_epoch)
+            });
             let _ = entry.detector_config.send(active_detector_config);
             entry.info.updated_at = timestamp_now();
-            (entry.info.clone(), Arc::clone(&entry.procwatch_rescan))
+            (
+                entry.info.clone(),
+                Arc::clone(&entry.procwatch_rescan),
+                evidence,
+            )
         };
 
         self.emit(event::SESSION_UPDATED, &info);
         rescan.notify_one();
-        if let Some(activity) = reported_activity {
+        if let Some(evidence) = evidence {
             let event = crate::events::event(
                 event::AGENT_STATE,
-                event_payload(AgentStateEvent {
-                    session_id: params.session_id.clone(),
-                    activity,
-                    source: StateSource::Report,
-                }),
+                event_payload(evidence.event(params.session_id.clone())),
             );
             let _ = self.inner.events.send(event);
         }
@@ -1961,7 +2057,17 @@ impl SessionRegistry {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) async fn record_cwd_hint(&self, id: &SessionId, path: String) {
+        self.record_cwd_hint_scoped(id, path, None).await;
+    }
+
+    async fn record_cwd_hint_scoped(
+        &self,
+        id: &SessionId,
+        path: String,
+        expected: Option<&RuntimeWatchIdentity>,
+    ) {
         let cwd = PathBuf::from(path);
         if !cwd.is_absolute() {
             debug!(
@@ -1972,7 +2078,10 @@ impl SessionRegistry {
             return;
         }
         match cwd.try_exists() {
-            Ok(true) => self.apply_cwd_change(id, cwd, CwdSource::Osc7).await,
+            Ok(true) => {
+                self.apply_cwd_change(id, cwd, CwdSource::Osc7, expected)
+                    .await;
+            }
             Ok(false) => {
                 debug!(
                     session_id = %id.0,
@@ -1991,7 +2100,13 @@ impl SessionRegistry {
         }
     }
 
-    async fn apply_cwd_change(&self, id: &SessionId, cwd: PathBuf, source: CwdSource) {
+    async fn apply_cwd_change(
+        &self,
+        id: &SessionId,
+        cwd: PathBuf,
+        source: CwdSource,
+        expected: Option<&RuntimeWatchIdentity>,
+    ) {
         if !self.cwd_update_needed(id, &cwd).await {
             return;
         }
@@ -2003,6 +2118,10 @@ impl SessionRegistry {
                 debug!(session_id = %id.0, "cwd update arrived for unknown session");
                 return;
             };
+            if expected.is_some_and(|expected| !expected.matches(entry)) {
+                debug!(session_id = %id.0, "cwd update arrived for a superseded runtime");
+                return;
+            }
             if entry.stopping || is_terminal(entry.info.state) || entry.info.cwd == cwd {
                 return;
             }
@@ -3476,7 +3595,15 @@ fn report_is_current(
     if current.source != source || current.agent != agent {
         return true;
     }
-    seq_is_current(current.seq, seq)
+    report_seq_is_newer(current.seq, seq)
+}
+
+fn report_seq_is_newer(current: Option<u64>, incoming: Option<u64>) -> bool {
+    match (current, incoming) {
+        (Some(current), Some(incoming)) => incoming > current,
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
 }
 
 fn native_report_is_current(

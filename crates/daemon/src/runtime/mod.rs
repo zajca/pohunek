@@ -10,6 +10,7 @@ mod client;
 mod launcher;
 mod systemd;
 
+pub(crate) use client::WriteReservation;
 pub use client::{DataStream, DimensionUpdate, Worker, WorkerError};
 #[cfg(test)]
 pub use launcher::InProcessWorkerLauncher;

@@ -82,6 +82,9 @@ where they are doing it, and when they need you.
   local `pohunekd`, and uses a short owner-private cache; `--refresh` re-probes.
   Status loading and peer probing have explicit bounded deadlines.
   `host inspect` queries live capabilities straight from the selected daemon.
+- **Shell completion**: generate static Bash, Zsh, or Fish completion from the
+  clap command tree. An explicit `--dynamic` mode adds bounded, failure-silent
+  host and session-target lookup without starting a daemon.
 
 **Projects and worktree isolation**
 
@@ -364,12 +367,14 @@ them `--json` for machine-readable output (the exceptions are `attach`,
 | `pohunek project add / list / show / rename / rm` | Manage git-repo-aware project records. |
 | `pohunek project actions / action / prompt` | Resolve per-project launch recipes and prompt templates. |
 | `pohunek host discover / list / inspect` | Find NetBird peers running daemons (standalone cache; `--refresh`) and query live capabilities. |
+| `pohunek completions <bash\|zsh\|fish>` | Print static shell completion; add `--dynamic` for bounded host/session candidates. |
 | `pohunek notifications list / watch` | Inspect or stream the durable inbox; `--all-hosts` fans out. |
 | `pohunek notifications read / ack / archive / delete` | Drive one record's lifecycle (`host/id` targets a specific host). |
 | `pohunek notifications policy / retention` | Per-kind/provider policy (including `hermes`), retention pruning (`--dry-run` / `--apply`). |
 | `pohunek integration install` | Install Codex/Claude hooks, or a selected Hermes profile's managed plugin with explicit access mode and host allowlist. |
 | `pohunek integration status / doctor / update / uninstall --agent hermes` | Inspect, diagnose, atomically refresh, or safely remove one explicitly selected Hermes plugin target. |
 | `pohunek setup [scripts\|config\|sway]` | Install launcher scripts, default config + prompt templates, sway keybindings. |
+| `pohunek setup completions <bash\|zsh\|fish>` | Install completion in the shell's conventional user directory; add `--dynamic` to opt in to runtime candidates. |
 | `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + live snapshot. |
 | `pohunek prompt render / link` | Render provider prompt templates and work-item link metadata (used by launchers). |
 
@@ -391,6 +396,26 @@ pohunek notifications watch --all-hosts        # one triage stream for every mac
 Remote session starts ask for confirmation (skip with `--yes`); project
 references resolve on the *target* host, so no filesystem path ever crosses
 the wire.
+
+### Shell completion
+
+Print a static script for manual loading, or install it in the shell's
+conventional per-user directory:
+
+```bash
+pohunek completions bash > pohunek.bash
+pohunek setup completions zsh
+pohunek setup completions fish --dynamic
+```
+
+Static completion performs no I/O beyond script generation. Dynamic completion
+is opt-in: it reads the existing owner-private host-discovery cache and makes a
+live, deadline-bounded `session.list` call for session targets. A qualified
+`host/id` target overrides `--host`; otherwise an explicit `--host` selects the
+session source and the default is local. Missing daemons, unavailable NetBird,
+and timeouts produce no shell diagnostics or candidates. The setup command does
+not edit shell startup files; for Zsh it prints the `fpath` step required before
+`compinit`.
 
 ### Automation and bounded observation
 

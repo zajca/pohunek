@@ -1,6 +1,6 @@
 //! Launch-target resolution (project / in-place / worktree) and PTY registration.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use pohunek_worker_protocol::{
     read_frame, Dimensions, FrameKind, Initialize, InitializeLimits,
@@ -11,14 +11,14 @@ use pohunek_worker_protocol::{
 use super::{
     build_pty_command, debug, detect_at, event, launch_adapter_for, plan_initial_input_delivery,
     runtime_error, timestamp_now, warn, watch, AgentKind, Arc, CancellationToken, CwdSource,
-    DesiredState, DetectedProject, DetectorConfig, InputRules, LaunchCommand, LaunchOpts, Manifest,
-    Notify, Ordering, PathBuf, ProjectRecord, ProtocolError, ResolvedAgent, ResumeBinding,
-    ResumeSnapshot, RuntimeHandle, RuntimeRecord, RuntimeState, RuntimeWatchIdentity, SessionEntry,
-    SessionId, SessionInfo, SessionNewParams, SessionRecord, SessionRefKind, SessionRegistry,
-    SessionRuntime, SessionState, SessionTransaction, SessionWarning, ShellCommand, StateSource,
-    TransactionKind, Worker, WorkerLaunchMode, WorktreeRequest, DEFAULT_WORKER_SUBSCRIBER_BYTES,
-    DEFAULT_WORKER_TERMINAL_RETENTION, DEFAULT_WORKER_WRITE_DEDUP_ENTRIES,
-    SESSION_RECORD_SCHEMA_VERSION, WORKER_CONNECT_RETRY,
+    DesiredState, DetectedProject, DetectorConfig, DetectorScope, InputRules, LaunchCommand,
+    LaunchOpts, Manifest, Mutex, Notify, Ordering, PathBuf, ProjectRecord, ProtocolError,
+    ResolvedAgent, ResumeBinding, ResumeSnapshot, RuntimeHandle, RuntimeRecord, RuntimeState,
+    RuntimeWatchIdentity, SessionEntry, SessionId, SessionInfo, SessionNewParams, SessionRecord,
+    SessionRefKind, SessionRegistry, SessionRuntime, SessionState, SessionTransaction,
+    SessionWarning, ShellCommand, StateSource, TransactionKind, Worker, WorkerLaunchMode,
+    WorktreeRequest, DEFAULT_WORKER_SUBSCRIBER_BYTES, DEFAULT_WORKER_TERMINAL_RETENTION,
+    DEFAULT_WORKER_WRITE_DEDUP_ENTRIES, SESSION_RECORD_SCHEMA_VERSION, WORKER_CONNECT_RETRY,
 };
 use crate::store::StoredInputRules;
 
@@ -642,6 +642,9 @@ impl SessionRegistry {
 
         let entry = SessionEntry {
             info: info.clone(),
+            activity_revision: 0,
+            activity_evidence: VecDeque::new(),
+            input_gate: Arc::new(Mutex::new(())),
             runtime: started.handle.clone(),
             desired_state: DesiredState::Running,
             detector_cancel: detector_cancel.clone(),
@@ -670,8 +673,13 @@ impl SessionRegistry {
                 ..
             } => self.emit_native_recovered(&info, previous_runtime_id),
         }
+        let expected = RuntimeWatchIdentity::from_info(&info)
+            .expect("committed live runtime has a complete watcher identity");
         self.spawn_detector(
-            id.clone(),
+            DetectorScope {
+                id: id.clone(),
+                runtime: expected.clone(),
+            },
             started.detector_output,
             (rows, cols),
             detector_cancel,
@@ -679,8 +687,6 @@ impl SessionRegistry {
             detector_config_rx,
         );
         self.spawn_procwatch(id.clone(), root_pid, procwatch_cancel, procwatch_rescan);
-        let expected = RuntimeWatchIdentity::from_info(&info)
-            .expect("committed live runtime has a complete watcher identity");
         match started.handle {
             RuntimeHandle::Worker(worker) => {
                 self.spawn_worker_exit_watcher(id, worker, expected, runtime_watch_cancel);

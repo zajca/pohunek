@@ -37,7 +37,9 @@ export interface ScenarioBackend {
   createScenarioNotification(input: ScenarioNotificationInput): NotificationRecord;
   deleteNotification(id: NotificationId): void;
   initialAttachDimensions(sessionId: SessionId): ReadonlyArray<TerminalDimensions>;
+  inputs(sessionId: SessionId): ReadonlyArray<Uint8Array>;
   resizes(sessionId: SessionId): ReadonlyArray<ScenarioResize>;
+  replaceRuntime(sessionId: SessionId, runtimeId?: string): void;
   writeToPty(sessionId: SessionId, bytes: Uint8Array): number;
   queuePtyOutput(sessionId: SessionId, bytes: Uint8Array): void;
   setRetainedOutput(
@@ -89,6 +91,16 @@ export class FixtureScenario {
   /** Returns a snapshot of terminal sizes delivered for one session. */
   public resizes(sessionId: SessionId): ReadonlyArray<ScenarioResize> {
     return this.backend.resizes(sessionId);
+  }
+
+  /** Returns input fragments delivered through `session.input`. */
+  public inputs(sessionId: SessionId): ReadonlyArray<Uint8Array> {
+    return this.backend.inputs(sessionId);
+  }
+
+  /** Replaces one live runtime and wakes runtime-scoped waiters. */
+  public replaceRuntime(sessionId: SessionId, runtimeId?: string): void {
+    this.backend.replaceRuntime(sessionId, runtimeId);
   }
 
   public writeToPty(sessionId: SessionId, bytes: Uint8Array): number {

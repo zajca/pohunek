@@ -12,9 +12,9 @@ use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
-    envelope::StateSource, OutputOffset, ProcessStartIdentity, ProtocolError, ReportSequence,
-    RuntimeGeneration, TerminalWatermark, MAX_RUNTIME_ID_BYTES, MAX_SESSION_ID_BYTES,
-    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_WAIT_MS,
+    envelope::StateSource, ActivityRevision, OutputOffset, ProcessStartIdentity, ProtocolError,
+    ReportSequence, RuntimeGeneration, TerminalWatermark, MAX_RUNTIME_ID_BYTES,
+    MAX_SESSION_ID_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_WAIT_MS,
 };
 
 /// The kind of agent backing a session.
@@ -456,6 +456,32 @@ pub struct SessionInputParams {
     pub session_id: SessionId,
     /// Text to inject. The daemon applies agent-specific submit framing.
     pub text: String,
+    /// Optional bounded delivery-and-activity wait; absent keeps fire-and-forget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub wait: Option<SessionInputWait>,
+}
+
+/// Optional delivery-wait contract attached to a `session.input` request.
+///
+/// Agents that require delayed submit framing reject this contract before any
+/// input bytes are written because activity cannot be revalidated inside the
+/// worker-owned delay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionInputWait.ts"))]
+pub struct SessionInputWait {
+    /// Agent activities that complete the wait once observed after submission.
+    /// An absent or empty list defaults to `idle` and `blocked`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub until: Option<Vec<AgentActivity>>,
+    /// Overall gate, worker-reservation, delivery, and activity-wait deadline in
+    /// milliseconds from `1` to [`MAX_SESSION_WAIT_MS`]. A pre-send timeout
+    /// writes no input; a post-send timeout may have an unknown delivery outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub timeout_ms: Option<u32>,
 }
 
 /// Result returned by `session.input`.
@@ -465,6 +491,26 @@ pub struct SessionInputParams {
 pub struct SessionInputResult {
     /// Whether the daemon accepted the input for delivery.
     pub accepted: bool,
+    /// Final detected agent activity when a wait was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub activity: Option<AgentActivity>,
+    /// Evidence source behind [`Self::activity`] when a wait was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub activity_source: Option<StateSource>,
+    /// Runtime that produced the activity evidence for a waited delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub runtime: Option<SessionRuntimeIdentity>,
+    /// Daemon epoch that scopes [`Self::activity_revision`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub activity_epoch: Option<String>,
+    /// Exact post-submission activity revision within [`Self::activity_epoch`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub activity_revision: Option<ActivityRevision>,
 }
 
 /// Reports an invalid bounded-observation request.
@@ -2316,6 +2362,18 @@ pub struct AgentStateEvent {
     pub activity: AgentActivity,
     /// Signal source that produced the activity value.
     pub source: StateSource,
+    /// Runtime that produced this activity transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub runtime: Option<SessionRuntimeIdentity>,
+    /// Daemon epoch that scopes [`Self::revision`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub activity_epoch: Option<String>,
+    /// Exact monotonic revision within [`Self::activity_epoch`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub revision: Option<ActivityRevision>,
 }
 
 /// Payload shared by attach lifecycle events.
@@ -2726,23 +2784,49 @@ mod tests {
     }
 
     #[test]
-    fn agent_state_event_payload_matches_legacy_json_payload() {
+    fn agent_state_event_payload_matches_json_payload() {
         let typed = serde_json::to_value(AgentStateEvent {
             session_id: SessionId("s-1".to_owned()),
             activity: AgentActivity::Working,
             source: StateSource::Report,
+            runtime: Some(
+                SessionRuntimeIdentity::new("runtime-1", RuntimeGeneration::new(2))
+                    .expect("valid runtime identity"),
+            ),
+            activity_epoch: Some("d-epoch-1".to_owned()),
+            revision: Some(ActivityRevision::new(3)),
         })
         .expect("serialize typed agent-state event");
         let legacy = serde_json::json!({
             "session_id": SessionId("s-1".to_owned()),
             "activity": AgentActivity::Working,
             "source": StateSource::Report,
+            "runtime": {
+                "runtime_id": "runtime-1",
+                "runtime_generation": "2"
+            },
+            "activity_epoch": "d-epoch-1",
+            "revision": "3",
         });
 
         assert_eq!(
             serde_json::to_string(&typed).expect("typed json string"),
             serde_json::to_string(&legacy).expect("legacy json string")
         );
+    }
+
+    #[test]
+    fn agent_state_event_accepts_v2_payload_without_wait_evidence() {
+        let event: AgentStateEvent = serde_json::from_value(serde_json::json!({
+            "session_id": "s-1",
+            "activity": "working",
+            "source": "report",
+        }))
+        .expect("parse pre-evidence agent-state event");
+
+        assert_eq!(event.runtime, None);
+        assert_eq!(event.activity_epoch, None);
+        assert_eq!(event.revision, None);
     }
 
     #[test]
