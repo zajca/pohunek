@@ -7,7 +7,8 @@
 //! implementation of each convention rather than re-deriving it.
 
 use protocol::{
-    negotiate, ProtocolError, ProtocolVersion, Request, Response, SUPPORTED_PROTOCOL_VERSIONS,
+    negotiate, ProtocolError, ProtocolVersion, Request, Response, MAX_CONTROL_LINE_BYTES,
+    SUPPORTED_PROTOCOL_VERSIONS,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -77,6 +78,34 @@ where
         Err(err) => error_value(
             request,
             protocol::ProtocolError::new(
+                protocol::ErrorClass::Daemon,
+                "serialize_failed",
+                format!("failed to serialize response: {err}"),
+                None,
+            ),
+        ),
+    }
+}
+
+/// Serialize a typed result while enforcing the public control-line limit.
+///
+/// The response contains `too_large` when the complete success envelope exceeds
+/// the framing ceiling, or `serialize_failed` when serialization fails.
+pub(super) fn ok_value_bounded<T>(
+    request: &Request,
+    value: &T,
+    too_large: ProtocolError,
+) -> Response
+where
+    T: Serialize,
+{
+    let response = ok_value(request, value);
+    match serde_json::to_vec(&response) {
+        Ok(serialized) if serialized.len() <= MAX_CONTROL_LINE_BYTES => response,
+        Ok(_) => error_value(request, too_large),
+        Err(err) => error_value(
+            request,
+            ProtocolError::new(
                 protocol::ErrorClass::Daemon,
                 "serialize_failed",
                 format!("failed to serialize response: {err}"),

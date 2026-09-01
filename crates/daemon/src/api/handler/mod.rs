@@ -243,7 +243,11 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::SESSION_DIFF => session::handle_session_diff(request, &state.sessions).await,
         method::SESSION_INPUT => session::handle_session_input(request, &state.sessions).await,
         method::SESSION_SCREEN => session::handle_session_screen(request, &state.sessions).await,
+        method::SESSION_DETECTION => {
+            session::handle_session_detection(request, &state.sessions).await
+        }
         method::SESSION_OUTPUT => session::handle_session_output(request, &state.sessions).await,
+        method::SESSION_READ => session::handle_session_read(request, &state.sessions).await,
         method::SESSION_WAIT => session::handle_session_wait(request, &state.sessions).await,
         method::SESSION_REPORT_NATIVE_ID => {
             session::handle_session_report_native_id(request, &state.sessions).await
@@ -256,7 +260,8 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         }
         method::DAEMON_DOCTOR => daemon::handle_daemon_doctor(request).await,
         method::ASSISTANT_MATERIALIZE => assistant::handle_assistant_materialize(request).await,
-        method::INTEGRATION_INSTALL => integration::handle_integration_install(request),
+        method::INTEGRATION_INSTALL => integration::handle_integration_install(request).await,
+        method::INTEGRATION_STATUS => integration::handle_integration_status(request).await,
         method::HOST_INSPECT => host::handle_host_inspect(request, &state.health, &state.sessions),
         method::HOST_DISCOVER => host::handle_host_discover(request, &state.discovery).await,
         method::NOTIFICATION_CREATE => {
@@ -354,12 +359,14 @@ mod tests {
 
     use protocol::{
         method, AgentKind, AssistantMaterializeParams, AssistantMaterializeResult,
-        DaemonDoctorResult, ForkCwdMode, ProtocolError, Request, SessionForkParams, SessionId,
-        SessionInfo, SessionNewParams, SessionSetMetadataParams, SessionSetMetadataResult,
-        SessionState, StateSource,
+        DaemonDoctorResult, DetectionRegionKind, ForkCwdMode, ProtocolError, Request,
+        SessionDetectionParams, SessionDetectionResult, SessionForkParams, SessionId, SessionInfo,
+        SessionNewParams, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
+        StateSource,
     };
 
     use super::assistant::run_assistant_materialize_blocking;
+    use super::integration::{run_integration_install_blocking, run_integration_status_blocking};
     use super::project::live_sessions;
     use super::util::parse_attach_prelude;
     use super::{handle_request, DaemonState, HealthInfo};
@@ -635,6 +642,81 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, created.id);
         let _ = sessions.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn session_detection_dispatch_returns_active_manifest_previews() {
+        let sessions = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let created = sessions
+            .create(SessionNewParams {
+                agent: "shell".to_owned(),
+                name: None,
+                cwd: Some(PathBuf::from("/tmp")),
+                cols: 80,
+                rows: 24,
+                project: None,
+                repo: None,
+                branch: None,
+                base_branch: None,
+                input: None,
+                metadata: BTreeMap::new(),
+            })
+            .await
+            .expect("create shell session");
+        let state = daemon_state(HealthInfo::new("test"), sessions.clone());
+        let request = request(
+            "detection-preview",
+            method::SESSION_DETECTION,
+            serde_json::to_value(SessionDetectionParams::new(created.id.clone()))
+                .expect("params serialize"),
+        );
+
+        let result: SessionDetectionResult = serde_json::from_value(ok_value(
+            handle_request(&request, &state).await,
+            "session.detection",
+        ))
+        .expect("result deserializes");
+
+        assert_eq!(result.session_id, created.id);
+        assert_eq!(result.supported_regions, DetectionRegionKind::ALL);
+        assert_eq!(
+            result
+                .previews
+                .iter()
+                .map(|preview| preview.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                DetectionRegionKind::OscTitle,
+                DetectionRegionKind::OscProgress,
+                DetectionRegionKind::WholeRecent,
+            ]
+        );
+        let _ = sessions.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn session_detection_dispatch_rejects_unknown_session() {
+        let state = daemon_state(
+            HealthInfo::new("test"),
+            SessionRegistry::new(SessionRegistryConfig::default()),
+        );
+        let request = request(
+            "detection-missing",
+            method::SESSION_DETECTION,
+            serde_json::to_value(SessionDetectionParams::new(SessionId("missing".to_owned())))
+                .expect("params serialize"),
+        );
+
+        let error = error_value(
+            handle_request(&request, &state).await,
+            "session.detection missing",
+        );
+
+        assert_eq!(error.code, "session_not_found");
     }
 
     fn notification_temp_dir(tag: &str) -> PathBuf {
@@ -933,6 +1015,39 @@ mod tests {
         let err = error_value(response, "assistant.materialize");
         assert_eq!(err.class, protocol::ErrorClass::Daemon);
         assert_eq!(err.code, "assistant_materialize_task_panicked");
+    }
+
+    #[tokio::test]
+    async fn integration_status_blocking_task_panic_returns_daemon_error() {
+        let request = request(
+            "integration-status-panic",
+            method::INTEGRATION_STATUS,
+            serde_json::Value::Null,
+        );
+
+        let response =
+            run_integration_status_blocking(&request, || panic!("integration status panic")).await;
+
+        let err = error_value(response, "integration.status");
+        assert_eq!(err.class, protocol::ErrorClass::Daemon);
+        assert_eq!(err.code, "integration_status_task_panicked");
+    }
+
+    #[tokio::test]
+    async fn integration_install_blocking_task_panic_returns_daemon_error() {
+        let request = request(
+            "integration-install-panic",
+            method::INTEGRATION_INSTALL,
+            serde_json::json!({ "agent": "codex" }),
+        );
+
+        let response =
+            run_integration_install_blocking(&request, || panic!("integration installation panic"))
+                .await;
+
+        let err = error_value(response, "integration.install");
+        assert_eq!(err.class, protocol::ErrorClass::Daemon);
+        assert_eq!(err.code, "integration_install_task_panicked");
     }
 
     async fn assistant_materialize_result(

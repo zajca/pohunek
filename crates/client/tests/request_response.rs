@@ -368,6 +368,106 @@ async fn waiting_output_uses_a_dedicated_remote_tcp_connection() {
 }
 
 #[tokio::test]
+async fn input_wait_without_timeout_uses_dedicated_connection_and_headroom() {
+    let socket_path = unique_socket_path();
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).expect("bind unix daemon");
+    let socket_file = SocketFile(socket_path.clone());
+
+    let task = tokio::spawn(async move {
+        let (primary, _) = listener.accept().await.expect("accept primary connection");
+        let mut primary = BufReader::new(primary);
+        let mut handshake_line = String::new();
+        primary
+            .read_line(&mut handshake_line)
+            .await
+            .expect("read handshake request");
+        let handshake: Request =
+            serde_json::from_str(trim_line_end(&handshake_line)).expect("parse handshake request");
+        write_health_reply(primary.get_mut(), handshake.id()).await;
+
+        let (dedicated, _) = listener
+            .accept()
+            .await
+            .expect("accept dedicated input wait connection");
+        let mut dedicated = BufReader::new(dedicated);
+        let mut input_line = String::new();
+        dedicated
+            .read_line(&mut input_line)
+            .await
+            .expect("read input wait request");
+        let input: Request =
+            serde_json::from_str(trim_line_end(&input_line)).expect("parse input wait request");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let response = Response::ok(
+            protocol::PROTOCOL_VERSION,
+            input.id(),
+            json!({
+                "accepted": true,
+                "activity": "idle",
+                "activity_source": "screen",
+                "runtime": {
+                    "runtime_id": "runtime-1",
+                    "runtime_generation": "1"
+                },
+                "activity_epoch": "d-epoch-1",
+                "activity_revision": "2",
+            }),
+        )
+        .expect("create input response");
+        dedicated
+            .get_mut()
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&response).expect("serialize input response")
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write input response");
+
+        let mut follow_up_line = String::new();
+        primary
+            .read_line(&mut follow_up_line)
+            .await
+            .expect("read shared follow-up request");
+        let follow_up: Request = serde_json::from_str(trim_line_end(&follow_up_line))
+            .expect("parse shared follow-up request");
+        write_health_reply(primary.get_mut(), follow_up.id()).await;
+        (handshake, input, follow_up)
+    });
+
+    let options = ClientOptions::default().with_request_timeout(Duration::from_millis(20));
+    let mut client = Client::connect_local_with_options(&socket_path, options)
+        .await
+        .expect("connect test daemon");
+    client.handshake().await.expect("negotiate protocol");
+    let result = client
+        .session_input(protocol::SessionInputParams {
+            session_id: protocol::SessionId("s-1".to_owned()),
+            text: "hello".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: Some(vec![protocol::AgentActivity::Idle]),
+                timeout_ms: None,
+            }),
+        })
+        .await
+        .expect("default input wait receives dedicated transport headroom");
+    assert_eq!(result.activity, Some(protocol::AgentActivity::Idle));
+    client
+        .call::<protocol::method::DaemonHealth>(())
+        .await
+        .expect("shared connection remains usable");
+
+    let (handshake, input, follow_up) = task.await.expect("daemon task completed");
+    assert_eq!(handshake.method(), protocol::method::DAEMON_HEALTH);
+    assert_eq!(input.method(), protocol::method::SESSION_INPUT);
+    assert_eq!(follow_up.method(), protocol::method::DAEMON_HEALTH);
+    drop(socket_file);
+}
+
+#[tokio::test]
 async fn cancelling_session_wait_keeps_the_shared_connection_usable() {
     let socket_path = unique_socket_path();
     let _ = std::fs::remove_file(&socket_path);
@@ -589,6 +689,62 @@ async fn request_response_typed_call_sends_method_params_and_decodes_output() {
         "id: {}",
         request.id()
     );
+}
+
+#[tokio::test]
+async fn integration_status_sdk_helper_sends_typed_read_only_request() {
+    let daemon = spawn_unix_echo_daemon(json!({
+        "agents": [{
+            "agent": "codex",
+            "available": true,
+            "expected_asset_paths": [
+                "/isolated/.codex/pohunek-agent-state.sh",
+                "/isolated/.codex/pohunek-agent-notify.sh"
+            ],
+            "present_asset_paths": [
+                "/isolated/.codex/pohunek-agent-state.sh",
+                "/isolated/.codex/pohunek-agent-notify.sh"
+            ],
+            "registration_paths": [
+                "/isolated/.codex/hooks.json",
+                "/isolated/.codex/config.toml"
+            ],
+            "installed_version": 4,
+            "expected_version": 4,
+            "state": "current",
+            "recovery": "none",
+            "warnings": []
+        }]
+    }));
+    let mut client = Client::connect_local(&daemon.socket_path)
+        .await
+        .expect("connect local test daemon");
+
+    let result = client
+        .integration_status(protocol::IntegrationStatusParams {
+            agent: Some(protocol::AgentKind::Codex),
+        })
+        .await
+        .expect("integration status succeeds");
+
+    assert_eq!(result.agents.len(), 1);
+    assert_eq!(result.agents[0].agent, protocol::AgentKind::Codex);
+    assert_eq!(
+        result.agents[0].state,
+        protocol::IntegrationInstallState::Current
+    );
+    assert_eq!(
+        result.agents[0].recovery,
+        protocol::IntegrationRecovery::None
+    );
+    let request_line = daemon
+        .request_line
+        .await
+        .expect("test daemon received a request");
+    daemon.task.await.expect("test daemon task completed");
+    let request: Request = serde_json::from_str(&request_line).expect("parse request");
+    assert_eq!(request.method(), protocol::method::INTEGRATION_STATUS);
+    assert_eq!(request.params(), &json!({"agent": "codex"}));
 }
 
 #[tokio::test]

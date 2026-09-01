@@ -68,6 +68,13 @@ pub enum ClientError {
     #[error("protocol framing error: {0}")]
     Framing(String),
 
+    /// A successful input-wait response omitted or contradicted delivery evidence.
+    #[error("invalid session.input wait response: {detail}")]
+    InputWaitContract {
+        /// Non-secret description of the violated response invariant.
+        detail: &'static str,
+    },
+
     /// A daemon returned a typed protocol error.
     #[error("daemon error: {0}")]
     Protocol(#[from] ProtocolError),
@@ -227,6 +234,16 @@ impl ClientError {
                 "framing",
                 format!("protocol framing error: {msg}"),
                 None,
+            ),
+            ClientError::InputWaitContract { detail } => ProtocolError::new(
+                ErrorClass::Daemon,
+                "session_input_wait_contract_mismatch",
+                format!("invalid session.input wait response: {detail}"),
+                Some(
+                    "delivery outcome is unknown; do not retry blindly; upgrade the daemon and \
+                     client together, then inspect the session before deciding whether to resend"
+                        .to_owned(),
+                ),
             ),
             ClientError::Protocol(err) => err.clone(),
             ClientError::Overlay(error) => overlay_error_to_protocol(error),

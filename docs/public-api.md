@@ -191,9 +191,11 @@ All params and result type names below refer to structs exported by
 | `session.attach` | `SessionAttachParams` | `SessionAttachResult` | Mints a one-shot attach stream id. |
 | `session.detach` | `SessionDetachParams` | `SessionDetachResult` | Cancels an active attach stream. After a worker stream failure, the first call returns its optional typed `error` and consumes that short-lived result; unknown or already-consumed streams return `detached: false` without `error`. |
 | `session.resize` | `SessionResizeParams` | `SessionResizeResult` | Resizes the PTY on the control connection. |
-| `session.input` | `SessionInputParams` | `SessionInputResult` | Injects text using agent-specific input framing. Hermes accepts at most `MAX_SESSION_INPUT_BYTES` UTF-8 bytes, permits LF and tab but rejects other C0/C1 controls without rewriting them, and returns `session_input_blocked` while approval-visible activity is blocked. Unsafe or oversized Hermes text returns `session_input_rejected`. |
+| `session.input` | `SessionInputParams` | `SessionInputResult` | Injects text using agent-specific input framing. Hermes accepts at most `MAX_SESSION_INPUT_BYTES` UTF-8 bytes, permits LF and tab but rejects other C0/C1 controls without rewriting them, and returns `session_input_blocked` for fire-and-forget input while approval-visible activity is blocked. Unsafe or oversized Hermes text returns `session_input_rejected`. Every per-session input holds one gate through its complete framing transaction, preventing waited/waited and waited/fire-and-forget interleaving. Every worker plan contains a body fragment with the provider `delay_after_ms` and a separate submit fragment; body and Enter are never merged into one paste burst. With `wait`, every Rust/TypeScript typed call path, including generic `Client.call`, routes through the dedicated helper, normalizes absent `until` to `[]` before wire validation, and rejects `timeout_ms` outside `1..=8000` before transport. The daemon deduplicates targets, acquires a waiter permit, starts the overall deadline before the input gate, and rejects blocked activity with `session_agent_blocked` both before the gate and at the causal boundary, independently of provider fire-and-forget policy. A worker-owned submit delay cannot be activity-revalidated and already-written text cannot be safely retracted from an arbitrary TUI, so waited input rejects nonzero-delay framing with `session_input_wait_unsupported` before writing bytes. Zero-delay framing acquires the exclusive worker write reservation before capturing runtime-scoped activity revision evidence immediately before send. Timeout or shutdown before send cancels the reservation and writes no bytes. After send begins, the exchange is cancellation-shielded and retains the session input gate until the late ACK is consumed. Matching evidence above that lower bound and observed through the fixed deadline succeeds, including evidence between PTY plan flush and worker ACK. After the plan is sent delivery outcome may be unknown, so callers inspect the session and do not retry blindly. Bounded evidence history retains the maximum wait window, so a later same-activity report cannot erase valid pre-deadline evidence. The result includes `activity`, `activity_source`, `runtime`, `activity_epoch`, and decimal-string `activity_revision`; SDK helpers require all five and return `session_input_wait_contract_mismatch` when a same-version daemon ignores `wait` or omits evidence. Clients deduplicate by `(activity_epoch, runtime, activity_revision)`. Runtime exit returns `session_not_running`; replacement returns `session_runtime_changed`; external sessions return `session_external_read_only`; shutdown cancels delivery or waiting. The dedicated connection adds fixed response headroom beyond the overall deadline. |
 | `session.screen` | `SessionScreenParams` | `SessionScreenResult` | Reads one bounded, rendered, runtime-bound terminal snapshot without acquiring attach ownership or resizing the terminal. |
-| `session.output` | `SessionOutputParams` | `SessionOutputResult` | Reads a newest retained tail or continues from an exact runtime-scoped output cursor. A request with `wait_ms` uses a dedicated connection. |
+| `session.detection` | `SessionDetectionParams` | `SessionDetectionResult` | Read-only detector diagnostic. Returns the complete supported region-kind set and current text previews for regions required by the session's active manifest. |
+| `session.read` | `SessionReadParams` | `SessionReadResult` | Reads bounded text from the current rendered terminal without attaching. `lines` accepts `1..=1,000`, defaults to that ceiling, and keeps the newest rendered rows. The complete serialized result is capped by `MAX_SESSION_READ_RESPONSE_BYTES`; byte truncation keeps the newest UTF-8 text and sets `truncated`. ANSI is a reserved request value that v2 always rejects. |
+| `session.output` | `SessionOutputParams` | `SessionOutputResult` | Reads a newest retained tail or continues from an exact runtime-scoped output cursor. A request with `wait_ms` uses a dedicated connection with bounded-wait headroom. |
 | `session.wait` | `SessionWaitParams` | `SessionWaitResult` | Performs one bounded long poll for state, activity, metadata, terminal, output, or runtime change. It always uses a dedicated connection. |
 | `session.report_agent` | `SessionReportAgentParams` | `SessionReportAgentResult` | Hook callback for nested agents running inside an existing session. It records an active-agent claim, optional process binding, and optional active native metadata without changing launch identity or resume binding; ignored reports return `recorded: false`. Claims are reconciled with process facts and can be auto-released when no live backing process remains. |
 | `session.release_agent` | `SessionReleaseAgentParams` | `SessionReleaseAgentResult` | Hook callback that clears a matching active nested-agent report and restores the session's default detector identity. Claude `SessionEnd` hooks use this as the clean-exit fast path; non-current releases return `released: false`; process-backed auto-release uses the same clear path. |
@@ -203,6 +205,7 @@ All params and result type names below refer to structs exported by
 | `session.diff` | `SessionDiffParams` | `SessionDiffResult` | Computes a unified diff of a session's worktree against a base ref. `base: null` defers to the worktree binding's recorded base branch, then the repository default. A session without a bound worktree returns `session_no_worktree`; a hostile explicit `base` (empty, leading `-`, or a control character) returns `invalid_branch`; a `base` that cannot be resolved to a merge-base against `HEAD` returns `session_diff_base_unresolved`. See `SessionDiffResult` under Core Payloads for the size cap and truncation semantics. |
 | `subscribe` | `null` | `{subscribed: true}` then event stream | Consumes the connection into a one-way event stream. |
 | `integration.install` | `IntegrationInstallParams` or `null` | `IntegrationInstallResult` | Installs agent hooks for active-agent state, native session id capture, and provider notifications. |
+| `integration.status` | `IntegrationStatusParams` or `null` | `IntegrationStatusResult` | Returns a read-only per-agent report for managed Codex and Claude hooks: availability, expected and present asset paths, inspected registration paths, installed and expected versions, aggregate health (`not_installed`, `current`, or `outdated`), typed recovery (`none`, `reinstall`, or `repair_configuration`), and non-secret warnings. `null` selects both agents; unknown parameter fields return `bad_request`. `current` requires exact managed executable permissions and exactly one registration under each installer-owned event. Inspection is size-bounded and runs outside the Tokio request task. It never mutates provider configuration. |
 | `assistant.materialize` | `AssistantMaterializeParams` | `AssistantMaterializeResult` | Materializes the assistant knowledge bundle on the daemon host. |
 | `notification.create` | `NotificationCreateParams` | `NotificationCreateResult` | Creates a host-local notification. Daemon policy is enforced for every producer, including provider hooks and daemon projectors. Dedupe may return `created: false` with an existing or upgraded record. `agent_blocked`/`approval_required` with `attention:<session_id>` and `turn_completed` with `turn:<session_id>` are deferred: the result still reports `created: true` with a minted id, but the record is held pending until `attention_debounce_secs` elapses; see `NotificationPolicy`. |
 | `notification.list` | `NotificationListParams` or `null` | `NotificationListResult` | Lists notification records with exact-match filters and cursor pagination. Deleted records are excluded unless `status: deleted` is requested. |
@@ -305,7 +308,10 @@ Important fields:
 - `active_agent_base`: optional runtime base kind (`shell`, `codex`, `claude`,
   or `hermes`) for `active_agent`.
 - `active_agent_pid`: optional process id backing `active_agent`. When present,
-  the daemon auto-releases the active agent if that process exits.
+  the daemon validates it with kernel process-start identity and auto-releases
+  the active agent if that exact process exits. Foreground reconciliation uses
+  the terminal PGID as the primary selection hint; structured daemon diagnostics
+  report the selected `focus_pid` and `foreground_pgid` when either changes.
 - `active_agent_session_id` / `active_agent_session_path`: optional native
   metadata for the active nested agent. These fields are display/runtime
   metadata only and do not make the parent session resumable as that nested
@@ -398,6 +404,75 @@ The protocol ceiling for the serialized result is
 with response-envelope headroom. The daemon additionally defaults to at most
 200 rows and 500 columns. Oversize results return the payload-free
 `runtime/session_output_limit_exceeded` error.
+
+`session.detection` accepts the same single-session parameter shape:
+
+```json
+{"session_id":"s-42"}
+```
+
+It asks the live detector task to render its active manifest regions on demand;
+previews are not copied for every PTY output chunk. The result lists every
+region kind supported by this engine, then only the regions required by the
+active manifest in manifest order:
+
+```json
+{
+  "session_id": "s-42",
+  "supported_regions": [
+    "osc_title",
+    "osc_progress",
+    "whole_recent",
+    "bottom_lines",
+    "bottom_non_empty_lines",
+    "top_non_empty_lines",
+    "last_non_empty_above_prompt_box",
+    "after_last_prompt_marker",
+    "prompt_box_body",
+    "after_last_horizontal_rule"
+  ],
+  "previews": [
+    {
+      "kind": "top_non_empty_lines",
+      "region": "top_non_empty_lines(8)",
+      "text": "Do you trust the contents of this directory?"
+    }
+  ]
+}
+```
+
+Parameterized manifest syntax is `bottom_lines(N)`,
+`bottom_non_empty_lines(N)`, or `top_non_empty_lines(N)`; the preview's
+`region` preserves the canonical count while `kind` stays count-independent.
+`top_non_empty_lines(N)` returns the first `N` non-empty visible rows.
+`last_non_empty_above_prompt_box` returns the nearest non-empty row above the
+second horizontal rule counted from the bottom, or an empty preview when a
+complete prompt box or preceding content is absent. All screen regions use the
+same visible-grid, wide-glyph, and soft-wrap semantics as activity matching.
+Unknown region names remain a typed manifest parse failure, so older engines
+reject manifests that use regions they do not implement instead of silently
+over-matching another surface. A preview observes every accepted detector
+configuration update before it renders, so it cannot return regions from the
+previous active manifest after an agent report or release succeeds. A stopped
+or unavailable detector returns `session_terminal_unavailable`. If the complete
+success envelope would exceed the 1 MiB control-line cap, the daemon returns the
+payload-free `runtime/session_detection_response_too_large` error instead.
+
+`session.read` accepts an optional source (`visible`, `recent`,
+`recent_unwrapped`, or `detection`; default `visible`) and optional `lines`
+(`1..=1000`, default `1000`). Current workers expose only the current rendered
+screen and do not expose scrollback, soft-wrap metadata, or one canonical
+detection text. Requests for `recent`, `recent_unwrapped`, or `detection`
+therefore safely fall back to visible rows and report `source_used: "visible"`.
+`alternate_screen` always reports the captured terminal's real buffer state, so
+callers can recognize alternate-screen fallback without a false history claim.
+Line and byte truncation both retain the newest tail.
+The result carries exact runtime identity after post-snapshot verification,
+canonical decimal-string `revision`, effective `lines_requested`, and
+`truncated`. The daemon caps the complete JSON-serialized result at
+`MAX_SESSION_READ_RESPONSE_BYTES` (1,048,418 bytes). `format: "ansi"` is
+reserved for future raw capture support and currently returns
+`runtime/session_read_ansi_unavailable`.
 
 `session.output` uses an optional nested runtime identity and an exclusive
 cursor. Omitting `after_offset` requests the newest retained tail. A cursor
@@ -544,7 +619,8 @@ deadline. It does not imply a healthy, idle, or terminal session.
 
 Observation errors are stable and payload-free: `session_terminal_unavailable`,
 `session_has_no_managed_terminal`, `session_runtime_changed`,
-`session_output_limit_exceeded`, `session_wait_limit_exceeded`,
+`session_read_ansi_unavailable`, `session_output_limit_exceeded`,
+`session_wait_limit_exceeded`,
 `session_waiter_limit_reached`, and `worker_feature_unavailable`. Restart from a
 fresh screen/tail after runtime change. A worker on the immediately preceding
 private protocol remains usable for existing lifecycle and attach operations,
@@ -815,6 +891,77 @@ answer different questions:
 current Codex and Claude builds only. There is no fallback for older provider
 hook APIs.
 
+`integration.status` is the corresponding read-only drift report. Bare status
+reports both daemon-managed agents; `--agent codex` and `--agent claude` select
+one. Every managed script is checked independently against its embedded asset
+and executable mode. Claude must also contain every exact managed registration
+in `settings.json`. Codex must contain every exact registration in `hooks.json`,
+have the hooks feature enabled, and retain the position-derived trust hash for
+each managed hook in `config.toml`. The managed Codex trust-key set must be
+exact: stale managed tables make the integration outdated, and reinstallation
+removes them before writing only the currently expected keys. A scalar anywhere
+in the managed trust namespace requires configuration repair, including when
+hook drift temporarily prevents that key from being position-derived.
+
+`not_installed` means no Pohunek-managed asset or registration was detected;
+`current` means the complete contract above matches; `outdated` covers every
+partial, modified, malformed, unreadable, or otherwise unverifiable detected
+installation. A supported agent's path-resolution failure becomes an `outdated`
+report with a non-secret warning; in aggregate mode it does not suppress the
+other agent. Explicit unsupported agents still return a typed error. The response
+reports real installed and expected version fields. `installed_version` is
+unknown when any readable managed asset lacks a valid marker. The typed recovery
+is `reinstall` only when the installer can repair every finding; malformed,
+unreadable, oversized, or unresolved provider configuration instead reports
+`repair_configuration`. Symlinked, special, foreign-owned, or group/world-writable
+managed assets also require manual repair, while an explicit reinstall replaces
+installer-owned assets atomically without following an existing symlink. Managed
+asset type, effective-UID ownership, mode, and content are inspected through one
+non-following descriptor. The relevant parent chain starts at the explicitly
+resolved agent config root and ends at the asset's direct parent; every path in
+that chain must be a real directory owned by the daemon's effective UID without
+group or world write access. System ancestors above the config root are outside
+this check, so ordinary safe home/XDG roots are not rejected merely because an
+ancestor such as `/tmp` is shared. Each Claude `settings.json`, Codex
+`hooks.json`, and Codex `config.toml` is opened without following symlinks and
+must be a regular file owned by the daemon effective UID without group/world
+write access; metadata and bounded content come from the same descriptor.
+Provider inspection is nonblocking so FIFOs cannot stall the daemon worker. A
+missing Claude `hooks/` child under an otherwise trusted config root is a
+reinstallable absence and can still report `not_installed`; an existing symlink,
+wrong type, foreign owner, or group/world-writable child requires
+`repair_configuration`. The installer creates a missing Claude `hooks/`
+directory with exact mode `0700` regardless of the inherited umask and removes
+that newly created directory if mode enforcement or safe opening fails, but
+never changes permissions on an existing real user directory. Codex trust
+records describe a canonical single-handler managed
+group, so adding a sibling handler makes status non-current until reinstall
+separates the managed handler while preserving the user sibling. Agent config
+roots selected through `CLAUDE_CONFIG_DIR` or `CODEX_HOME` must be absolute and
+UTF-8 representable after tilde expansion. Invalid roots fail with
+`agent_config_dir_invalid` before registration commands are constructed, so a
+daemon working directory cannot change where a provider process resolves them.
+Before any mutation, installation opens and validates every existing config and
+hook parent as a no-follow, effective-UID-owned real directory without group or
+world write access. An unsafe parent fails with
+`configuration/integration_path_untrusted`. Provider files are prepared in
+memory, then replaced through the already-opened directory descriptor using an
+exclusive temporary file, `fchmod`, and `renameat`; parent or pathname swaps
+cannot redirect the write. Existing safe provider-file modes are preserved,
+while new registration files use mode `0600` and managed executable assets use
+mode `0755`. An oversized file is `outdated` with an actionable warning. The CLI
+routes Codex and Claude status to the effective global `--host`; mutating hook
+installation and every Hermes lifecycle action remain local. Human recovery
+hints and warning commands for a remote report explicitly name the daemon host
+where the operator must run the local installer; passing that host back to
+`integration install` is not a remote mutation. A JSON registration root that
+is not an object, an inline TOML table where the installer requires a regular
+table, a scalar value anywhere in the installer-owned trust namespace, and
+managed-asset metadata errors other than absence require
+`repair_configuration`. A missing `hooks` object remains reinstallable, and a
+handler with an exact installer-owned command identity is safely replaced even
+when its `type` field drifted. All enum values use snake_case on the wire.
+
 Codex notification support requires modern lifecycle hooks for
 `PermissionRequest` and `Stop`. The installer writes managed command hooks to
 `hooks.json` and records trust metadata in `config.toml`; the legacy Codex
@@ -886,8 +1033,8 @@ Canonical public codes currently emitted include:
 
 | Class | Codes |
 |---|---|
-| `configuration` | `paths_unavailable`, `netbird_configuration_invalid`, `overlay_registry_invalid`, `invalid_discovery_options` |
-| `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback` |
+| `configuration` | `paths_unavailable`, `netbird_configuration_invalid`, `overlay_registry_invalid`, `invalid_discovery_options`, `agent_config_dir_invalid`, `integration_path_untrusted` |
+| `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback` |
 | `transport` | `framing`, `host_unreachable`, `request_timeout` |
 | `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `remote_discovery_failed` |
 | `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy` |
@@ -896,13 +1043,30 @@ Protocol v3 emits these runtime codes for provider-neutral agent and
 observation behavior: `agent_kind_unsupported`,
 `agent_fork_unsupported`, `session_terminal_unavailable`,
 `session_has_no_managed_terminal`, `session_runtime_changed`,
-`session_output_limit_exceeded`, `session_wait_limit_exceeded`,
+`session_read_ansi_unavailable`, `session_output_limit_exceeded`,
+`session_wait_limit_exceeded`,
 `session_waiter_limit_reached`, `worker_feature_unavailable`, and
 `plugin_self_target_denied`, `agent_runtime_unsupported`,
-`session_input_rejected`, and `session_input_blocked`. Daemon startup may additionally return
+`session_input_rejected`, `session_input_blocked`, `session_agent_blocked`,
+`session_input_invalid_wait`, `session_input_wait_unsupported`,
+`session_input_timeout`, and the CLI-local `session_input_interrupted`. Daemon startup may additionally return
 `observation_limits_invalid`. Observation request errors intentionally carry no terminal
 payload or current-runtime payload; refresh `session.inspect` or restart
 observation from a fresh screen/tail when recovery requires new coordinates.
+
+`session_input_wait_contract_mismatch` means the SDK cannot prove whether a
+same-version daemon honored the wait contract. Delivery outcome is unknown: do
+not retry blindly. Upgrade daemon and client together, inspect the session, and
+only resend when the observed terminal state proves the original input was not
+applied.
+
+`session_input_timeout` also treats delivery as potentially unknown. Inspect the
+current session before deciding whether to resend, and do not retry blindly.
+
+`session_input_interrupted` means SIGINT or SIGTERM interrupted a waited CLI
+input after delivery may have begun. Its JSON error intentionally has no retry
+hint because the delivery outcome is unknown; inspect the session before taking
+any further action.
 
 `session_runtime_commit_stale` means a lifecycle or runtime transition lost a
 concurrent durable commit: another runtime is already authoritative for the
@@ -944,7 +1108,7 @@ The daemon then writes these events:
 | `session_runtime_conflict` | `{session: SessionInfo}` | Runtime discovery found duplicate, mismatched, or otherwise ambiguous live identity. The daemon quarantines the conflict and does not kill a worker automatically. |
 | `session_runtime_discovered` | `{entry: RuntimeInventoryEntry}` | Startup reconciliation classified a discovered durable worker that is not a plainly managed runtime (orphaned, conflicting, incompatible, or identity-mismatched). Emitted once per non-managed discovery so operators can inspect quarantined runtimes. |
 | `session_native_recovered` | `{session: SessionInfo, previous_runtime_id?: string, runtime_id?: string}` | Explicit provider-native recovery created a new worker and runtime generation for the same logical session. `previous_runtime_id` can be absent for a one-time migrated legacy session; production worker recovery includes the new `runtime_id`. |
-| `agent_state` | `{session_id: SessionId, activity: AgentActivity, source: StateSource}` | Agent activity changed. `source` may be `report` when a hook report supplied explicit active-agent state. |
+| `agent_state` | `{session_id: SessionId, activity: AgentActivity, source: StateSource, runtime?: SessionRuntimeIdentity, activity_epoch?: string, revision?: ActivityRevision}` | Agent activity changed. `source` may be `report` when a hook report supplied explicit active-agent state. Current daemons emit `runtime`, `activity_epoch`, and decimal-string `revision`, making `(activity_epoch, runtime, revision)` exact reconnect-safe evidence rather than a hint to re-read only the latest snapshot; the fields remain additive for general v2 subscribers, while input-wait success requires them through `SessionInputResult`. |
 | `attach_opened` | `{session_id: SessionId, stream_id: string}` | A pending attach token was redeemed and a raw stream opened. |
 | `attach_closed` | `{session_id: SessionId, stream_id: string}` | A raw attach stream ended or was detached. |
 | `notification_created` | `{record: NotificationRecord}` | A durable notification record was created. |
@@ -1011,9 +1175,17 @@ pohunek integration doctor --agent hermes --hermes-profile default --json
 
 `--hermes-profile default`, a named `--hermes-profile`, and an absolute
 `--hermes-home` are explicit target selections; a profile and home cannot be
-combined. `status`, `doctor`, `update`, and `uninstall` are Hermes-only and
-return `configuration/integration_action_unsupported` for another agent. The
-existing daemon-backed Codex/Claude `integration install` behavior is unchanged.
+combined. `doctor`, `update`, and `uninstall` are Hermes-only and return
+`configuration/integration_action_unsupported` for another agent. Hermes status
+uses the same local target contract; daemon-backed Codex/Claude status uses the
+new RPC without those local Hermes flags, and their install behavior is unchanged:
+
+```bash
+pohunek integration status --json
+pohunek integration status --agent codex --json
+pohunek integration status --agent claude --json
+pohunek integration status --agent hermes --hermes-profile default --json
+```
 
 The installation policy is Pohunek-owned, owner-private, and external to the
 immutable plugin checksum set. It fixes the absolute `pohunek` executable,
@@ -1213,13 +1385,26 @@ Request APIs:
   per-connection selection after the first response.
 - `Client::session_screen(SessionScreenParams)`: reads one rendered snapshot on
   the current connection.
+- `Client::session_detection(SessionDetectionParams)`: requests current active
+  manifest-region previews from the live detector task.
+- `Client::session_read(SessionReadParams)`: reads bounded current-screen text on
+  the current connection.
 - `Client::session_output(SessionOutputParams)`: uses the current connection for
   an immediate read and automatically opens a dedicated connection when
   `wait_ms` is present.
+- `Client::session_input(SessionInputParams)` and generic typed
+  `Client::call::<SessionInput>`: use a dedicated connection when
+  `wait` is present, budgets the wire timeout as the daemon's overall
+  delivery-and-wait deadline plus fixed response headroom, and rejects successful
+  responses that omit epoch- and runtime-scoped activity evidence.
 - `Client::session_wait(SessionWaitParams)`: automatically opens a dedicated
   connection for the bounded long poll.
 - `Client::session_resume`, `session_resize`, and `session_set_metadata`: typed
   lifecycle helpers used by automation clients.
+- `Client::integration_status(IntegrationStatusParams)`: reads the complete
+  daemon-managed Codex/Claude install contract without mutation. `gui-core`
+  exposes matching `integration_status` and `integration_status_with_options`
+  host helpers.
 - `Client::request(&Request) -> serde_json::Value`: sends one request and returns
   the raw `ok` payload for low-level callers and framing tests.
 - `Client::subscribe(&Request) -> Subscription`: consumes the client connection
@@ -1330,6 +1515,10 @@ Request APIs:
 
 - `client.call(method, params)`: typed call keyed by the generated `Methods`
   map. A configured origin is added to the wire request.
+- `client.sessionInput(params)`: uses a dedicated connection when `wait` is
+  present, budgets the wire timeout as the daemon's overall delivery-and-wait
+  deadline plus fixed response headroom, and rejects successful responses that
+  omit epoch- and runtime-scoped activity evidence.
 - `client.handshake()`: calls `daemon.health` and enforces strict protocol
   version equality.
 - `client.request(request)`: validates the optional atomic wire origin, applies
@@ -1365,7 +1554,7 @@ SDK error mapping:
 - SDK-originated errors map into the public protocol taxonomy through
   `ClientErrorClass` and `ClientErrorCode`: `daemon_unreachable`, `framing`,
   `host_unreachable`, `remote_daemon_unavailable`, `request_timeout`, `io_error`,
-  `json_error`, and `version_mismatch`.
+  `json_error`, `session_input_wait_contract_mismatch`, and `version_mismatch`.
 - `ClientError.toProtocolError()` returns the structured `ProtocolError` for
   CLI/API rendering, and `recoverHint()` returns the optional recovery text.
 

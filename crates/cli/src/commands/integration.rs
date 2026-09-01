@@ -3,7 +3,7 @@
 //! Codex and Claude hook installation remains a local daemon RPC. Hermes is an
 //! owner-local plugin lifecycle and deliberately never contacts the daemon.
 
-// Rust guideline compliant 2026-08-12
+// Rust guideline compliant 2026-08-31
 
 use std::env;
 use std::fmt::Write as _;
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use clap::ValueEnum;
 use protocol::{
     method, AgentKind, ErrorClass, IntegrationInstallParams, IntegrationInstallResult,
-    ProtocolError,
+    IntegrationInstallState, IntegrationStatusParams, IntegrationStatusResult, ProtocolError,
 };
 use serde::Serialize;
 
@@ -236,6 +236,31 @@ pub(crate) async fn run_install(
         print!("{}", crate::commands::render_json(&result)?);
     } else {
         print!("{}", render_install_human(&result));
+    }
+    Ok(())
+}
+
+/// Run the read-only Codex and Claude integration status RPC.
+///
+/// # Errors
+///
+/// Returns [`CliError`] if the effective host daemon is unreachable or rejects the call.
+pub(crate) async fn run_status(
+    host: &str,
+    paths: &Paths,
+    agent: Option<HookAgentArg>,
+    json: bool,
+) -> Result<(), CliError> {
+    let params = IntegrationStatusParams {
+        agent: agent.map(Into::into),
+    };
+    let mut client = Client::connect(host, paths).await?;
+    let result: IntegrationStatusResult = client.call::<method::IntegrationStatus>(params).await?;
+
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        print!("{}", render_status_human(host, &result));
     }
     Ok(())
 }
@@ -549,6 +574,99 @@ fn render_install_human(result: &IntegrationInstallResult) -> String {
     output
 }
 
+fn render_status_human(host: &str, result: &IntegrationStatusResult) -> String {
+    if result.agents.is_empty() {
+        return "no agents selected\n".to_owned();
+    }
+    let mut output = String::from("AGENT       AVAILABLE  STATE          INSTALLED  EXPECTED\n");
+    for report in &result.agents {
+        let _ = writeln!(
+            output,
+            "{:<11} {:<9} {:<14} {:<10} {}",
+            agent_label(&report.agent),
+            report.available,
+            state_label(report.state),
+            installed_version_label(report.installed_version),
+            report.expected_version,
+        );
+        for path in &report.expected_asset_paths {
+            let _ = writeln!(output, "  expected asset: {path}");
+        }
+        for path in &report.present_asset_paths {
+            let _ = writeln!(output, "  present asset: {path}");
+        }
+        for path in &report.registration_paths {
+            let _ = writeln!(output, "  registration: {path}");
+        }
+        for warning in &report.warnings {
+            let warning = qualify_status_warning(host, warning);
+            let _ = writeln!(output, "  warning: {warning}");
+        }
+        match report.recovery {
+            protocol::IntegrationRecovery::None => {}
+            protocol::IntegrationRecovery::Reinstall => {
+                let agent = agent_label(&report.agent);
+                if host.is_empty() || host == LOCAL_HOST {
+                    let _ = writeln!(
+                        output,
+                        "  hint: run `pohunek integration install --agent {agent}` to repair"
+                    );
+                } else {
+                    let _ = writeln!(
+                        output,
+                        "  hint: on daemon host `{host}`, run `pohunek integration install --agent {agent}` directly to repair"
+                    );
+                }
+            }
+            protocol::IntegrationRecovery::RepairConfiguration => {
+                if host.is_empty() || host == LOCAL_HOST {
+                    let _ = writeln!(
+                        output,
+                        "  hint: inspect and repair the reported provider configuration before reinstalling"
+                    );
+                } else {
+                    let _ = writeln!(
+                        output,
+                        "  hint: inspect and repair the reported provider configuration directly on daemon host `{host}` before reinstalling there"
+                    );
+                }
+            }
+        }
+    }
+    output
+}
+
+fn qualify_status_warning(host: &str, warning: &str) -> String {
+    if host.is_empty() || host == LOCAL_HOST {
+        return warning.to_owned();
+    }
+    let qualified = warning.replacen(
+        "run `pohunek integration install",
+        &format!("on daemon host `{host}`, run `pohunek integration install"),
+        1,
+    );
+    if qualified != warning {
+        return qualified;
+    }
+    warning.replacen(
+        "running `pohunek integration install",
+        &format!("running on daemon host `{host}`: `pohunek integration install"),
+        1,
+    )
+}
+
+fn state_label(state: IntegrationInstallState) -> &'static str {
+    match state {
+        IntegrationInstallState::NotInstalled => "not_installed",
+        IntegrationInstallState::Current => "current",
+        IntegrationInstallState::Outdated => "outdated",
+    }
+}
+
+fn installed_version_label(installed: Option<u32>) -> String {
+    installed.map_or_else(|| "none".to_owned(), |version| version.to_string())
+}
+
 #[expect(
     clippy::struct_excessive_bools,
     reason = "the serialized lifecycle contract intentionally exposes independent findings"
@@ -648,6 +766,145 @@ fn render_hermes_human(result: &HermesResult) -> String {
         }
     }
     output
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::{installed_version_label, render_status_human};
+    use crate::target::LOCAL_HOST;
+    use protocol::{
+        AgentKind, IntegrationAgentStatus, IntegrationInstallState, IntegrationRecovery,
+        IntegrationStatusResult,
+    };
+
+    #[test]
+    fn renders_status_table_with_paths_warnings_and_versions() {
+        let result = IntegrationStatusResult {
+            agents: vec![
+                IntegrationAgentStatus {
+                    agent: AgentKind::Claude,
+                    available: true,
+                    expected_asset_paths: vec![
+                        "/home/u/.claude/hooks/pohunek-agent-state.sh".to_owned(),
+                        "/home/u/.claude/hooks/pohunek-agent-notify.sh".to_owned(),
+                    ],
+                    present_asset_paths: vec![
+                        "/home/u/.claude/hooks/pohunek-agent-state.sh".to_owned(),
+                        "/home/u/.claude/hooks/pohunek-agent-notify.sh".to_owned(),
+                    ],
+                    registration_paths: vec!["/home/u/.claude/settings.json".to_owned()],
+                    installed_version: Some(4),
+                    expected_version: 4,
+                    state: IntegrationInstallState::Current,
+                    recovery: IntegrationRecovery::None,
+                    warnings: Vec::new(),
+                },
+                IntegrationAgentStatus {
+                    agent: AgentKind::Codex,
+                    available: true,
+                    expected_asset_paths: vec![
+                        "/home/u/.codex/pohunek-agent-state.sh".to_owned(),
+                        "/home/u/.codex/pohunek-agent-notify.sh".to_owned(),
+                    ],
+                    present_asset_paths: vec!["/home/u/.codex/pohunek-agent-state.sh".to_owned()],
+                    registration_paths: vec![
+                        "/home/u/.codex/hooks.json".to_owned(),
+                        "/home/u/.codex/config.toml".to_owned(),
+                    ],
+                    installed_version: None,
+                    expected_version: 4,
+                    state: IntegrationInstallState::Outdated,
+                    recovery: IntegrationRecovery::Reinstall,
+                    warnings: vec!["managed notification hook is missing".to_owned()],
+                },
+            ],
+        };
+
+        let output = render_status_human(LOCAL_HOST, &result);
+
+        let rows: Vec<&str> = output
+            .lines()
+            .filter(|line| line.starts_with("claude "))
+            .collect();
+        assert!(rows.len() == 1 && rows[0].contains("current") && rows[0].ends_with('4'));
+        assert!(output.contains("  expected asset: /home/u/.claude/hooks/pohunek-agent-state.sh"));
+        assert!(output.contains("  present asset: /home/u/.claude/hooks/pohunek-agent-notify.sh"));
+        assert!(output.contains("  registration: /home/u/.claude/settings.json"));
+        let rows: Vec<&str> = output
+            .lines()
+            .filter(|line| line.starts_with("codex "))
+            .collect();
+        assert!(rows.len() == 1 && rows[0].contains("outdated") && rows[0].contains("none"));
+        assert!(output.contains("  warning: managed notification hook is missing"));
+        assert!(
+            output.contains("  hint: run `pohunek integration install --agent codex` to repair")
+        );
+    }
+
+    #[test]
+    fn configuration_recovery_never_recommends_reinstall() {
+        let result = IntegrationStatusResult {
+            agents: vec![IntegrationAgentStatus {
+                agent: AgentKind::Codex,
+                available: true,
+                expected_asset_paths: Vec::new(),
+                present_asset_paths: Vec::new(),
+                registration_paths: vec!["/home/u/.codex/config.toml".to_owned()],
+                installed_version: None,
+                expected_version: 4,
+                state: IntegrationInstallState::Outdated,
+                recovery: IntegrationRecovery::RepairConfiguration,
+                warnings: vec!["Codex config.toml is malformed".to_owned()],
+            }],
+        };
+
+        let output = render_status_human(LOCAL_HOST, &result);
+
+        assert!(output.contains(
+            "  hint: inspect and repair the reported provider configuration before reinstalling"
+        ));
+        assert!(!output.contains("pohunek integration install"));
+    }
+
+    #[test]
+    fn remote_status_qualifies_install_commands_with_the_daemon_host() {
+        let result = IntegrationStatusResult {
+            agents: vec![IntegrationAgentStatus {
+                agent: AgentKind::Codex,
+                available: true,
+                expected_asset_paths: Vec::new(),
+                present_asset_paths: Vec::new(),
+                registration_paths: Vec::new(),
+                installed_version: Some(3),
+                expected_version: 4,
+                state: IntegrationInstallState::Outdated,
+                recovery: IntegrationRecovery::Reinstall,
+                warnings: vec![
+                    "managed state hook permissions drifted; run `pohunek integration install --agent codex` to restore them".to_owned(),
+                    "managed asset parent is unsafe; repair its permissions before running `pohunek integration install --agent codex`".to_owned(),
+                ],
+            }],
+        };
+
+        let output = render_status_human("buildbox", &result);
+
+        assert!(output.contains(
+            "warning: managed state hook permissions drifted; on daemon host `buildbox`, run `pohunek integration install --agent codex` to restore them"
+        ));
+        assert!(output.contains(
+            "hint: on daemon host `buildbox`, run `pohunek integration install --agent codex` directly to repair"
+        ));
+        assert!(output.contains(
+            "warning: managed asset parent is unsafe; repair its permissions before running on daemon host `buildbox`: `pohunek integration install --agent codex`"
+        ));
+        assert!(!output.contains("pohunek --host buildbox integration install"));
+    }
+
+    #[test]
+    fn renders_installed_and_expected_versions() {
+        assert_eq!(installed_version_label(Some(4)), "4");
+        assert_eq!(installed_version_label(None), "none");
+    }
 }
 
 #[cfg(test)]

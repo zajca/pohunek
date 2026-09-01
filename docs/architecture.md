@@ -341,6 +341,24 @@ the active agent's manifest so Codex/Claude UI patterns are interpreted
 correctly inside the shell session. Releasing the active report clears the
 active fields and restores the shell/default detector manifest. See the resume
 model below.
+Each detector task is scoped to the exact worker id, runtime id, and runtime
+generation that created its output stream. Cancellation is advisory; a final
+transition from a superseded detector is discarded instead of being stamped
+with a replacement runtime's identity.
+
+Procwatch reads Linux `/proc/<root>/stat` `tpgid` as the terminal foreground
+identity. A recognized process-group leader wins; an unrecognized wrapper lets
+the oldest deterministic recognized member of that exact PGID win. A known
+foreground group suppresses first-seen descendant fallback, so returning to a
+shell cannot re-claim a background agent on the next poll. A recent unbound
+hook claim remains valid until its claim TTL because foreground identity alone
+cannot identify its process; process-bound nested claims clear immediately.
+The PTY-root claim is preserved only for a direct-launch agent matching the
+launch provider.
+Transient probe failures retain the last-known PGID and active claim. Provider
+replacement clears report-derived activity and nested native metadata, switches
+the detector manifest, and uses PID plus kernel start identity to reject reused
+PIDs and delayed exit notifications.
 
 ### Agent input injection (TUI quirks)
 
@@ -365,6 +383,43 @@ Kandev's hard-won handling:
 
 These per-agent input rules live in the agent adapter next to its launch command,
 state manifest, and resume command.
+
+Every worker input plan preserves provider framing as two fragments: the body
+fragment owns the provider submit delay and a separate fragment carries the
+submit byte. The per-session input gate serializes that complete plan against
+both waited and fire-and-forget calls. Fire-and-forget retains each provider's
+blocked-input policy and delayed submit behavior.
+
+An optional bounded input wait uses one overall deadline measured before
+delivery. Waiting for the per-session input gate consumes the same budget
+advertised to Rust and TypeScript transports. A waited request rejects blocked
+activity with `session_agent_blocked` both before the gate and at the causal
+boundary, independently of the provider's fire-and-forget policy. The daemon
+cannot revalidate activity inside a worker-owned delay or safely retract body
+text already consumed by an arbitrary TUI. It therefore rejects nonzero-delay
+wait framing with `session_input_wait_unsupported` before writing any bytes.
+For zero-delay framing, the daemon first obtains the exclusive worker write
+reservation, then captures the runtime-scoped activity boundary immediately
+before starting the prepared two-fragment worker plan. A timeout or shutdown
+while acquiring that reservation cancels the unsent plan and writes no bytes.
+Once send starts, the worker exchange remains cancellation-shielded and retains
+the per-session input gate until its late acknowledgement is consumed. This fail-closed tradeoff
+preserves provider paste-burst behavior without risking an Enter against a newly
+visible approval UI. Once the atomic plan was sent,
+delivery outcome may be unknown, so clients inspect the session and never retry
+blindly. A fixed upper deadline rejects evidence observed later, including the
+timeout recheck.
+Each event carries its runtime identity, daemon `activity_epoch`, and exact
+decimal-string activity revision. The registry retains the latest evidence for
+the full maximum wait window, subject to a hard per-session memory bound, so a
+later report of the same activity cannot erase valid pre-deadline evidence. The
+dedupe cursor is `(activity_epoch, runtime, revision)` because a replacement
+daemon adopts the same runtime but starts a fresh revision sequence. Runtime
+exit returns `session_not_running`; replacement returns
+`session_runtime_changed`. Rust and TypeScript SDK wait helpers reject a success
+response unless it includes the matching activity, source, runtime identity,
+activity epoch, and activity revision, preventing a same-version daemon that
+ignored the additive `wait` request from confirming delivery.
 
 ### Hermes operator plugin
 

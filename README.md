@@ -324,9 +324,11 @@ NetBird, never through SSH. `*` needs `--confirm-wildcard`. Use
 `integration update` for a version/policy refresh and `integration uninstall`
 to remove only managed assets; add `--confirm-modified` when the ownership
 check reports changed assets. `status`, `doctor`, `update`, and `uninstall` are
-Hermes-only; Codex and Claude retain their existing `integration install`
-behavior and receive a typed unsupported-action error for these lifecycle
-actions.
+local for Hermes. Codex and Claude expose daemon-backed `integration status`
+on the effective `--host`; `doctor`, `update`, and `uninstall` remain
+Hermes-only and return a typed unsupported-action error for those agents. A
+remote status recovery hint names the daemon host where the local-only installer
+must run; `--host` never turns `integration install` into a remote mutation.
 
 The plugin is a delegated-tool guardrail, not a sandbox against a same-user
 Hermes process with shell or file-write access. It repeats the daemon's exact
@@ -367,6 +369,7 @@ port is retained.
 | `pohunek attach <target>` | Attach the current terminal; `Ctrl-]` detaches. |
 | `pohunek session input <target> <text>` | Inject a prompt with agent-correct framing; use `--stdin` for non-argv input. |
 | `pohunek session screen <target>` | Read the current rendered terminal; `--json` preserves runtime identity, watermark, geometry, cursor, and visible lines. |
+| `pohunek session detection <target>` | Preview the active detection manifest regions; `--json` also lists every supported region kind. |
 | `pohunek session output <target>` | Read a newest retained tail or continue with `--runtime-id`, `--runtime-generation`, and `--after-offset`; `--wait-ms` performs a bounded wait. |
 | `pohunek session wait <target>` | Long-poll up to 8000 ms for explicit state, activity, metadata, terminal, output, or runtime predicates. |
 | `pohunek session fork <target>` | Fork an agent conversation into a new session when that session advertises fork capability (currently Claude Code). |
@@ -380,7 +383,8 @@ port is retained.
 | `pohunek notifications read / ack / archive / delete` | Drive one record's lifecycle (`host/id` targets a specific host). |
 | `pohunek notifications policy / retention` | Per-kind/provider policy (including `hermes`), retention pruning (`--dry-run` / `--apply`). |
 | `pohunek integration install` | Install Codex/Claude hooks, or a selected Hermes profile's managed plugin with explicit access mode and host allowlist. |
-| `pohunek integration status / doctor / update / uninstall --agent hermes` | Inspect, diagnose, atomically refresh, or safely remove one explicitly selected Hermes plugin target. |
+| `pohunek integration status` | Inspect daemon-managed Codex/Claude hooks on the effective `--host`, or one explicitly selected local Hermes target. |
+| `pohunek integration doctor / update / uninstall --agent hermes` | Diagnose, atomically refresh, or safely remove one explicitly selected local Hermes plugin target. |
 | `pohunek setup [scripts\|config\|sway]` | Install launcher scripts, default config + prompt templates, sway keybindings. |
 | `pohunek setup completions <bash\|zsh\|fish>` | Install completion in the shell's conventional user directory; add `--dynamic` to opt in to runtime candidates. |
 | `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + live snapshot. |
@@ -452,6 +456,7 @@ runtime identity and cursor into later calls:
 
 ```bash
 pohunek session screen s-01J00000000000000000000000 --json
+pohunek session detection s-01J00000000000000000000000 --json
 pohunek session output s-01J00000000000000000000000 --max-bytes 65536 --json
 pohunek session output s-01J00000000000000000000000 \
   --runtime-id runtime-1 --runtime-generation 3 --after-offset 4096 \
@@ -460,6 +465,14 @@ pohunek session wait s-01J00000000000000000000000 \
   --runtime-id runtime-1 --runtime-generation 3 --after-output-offset 4096 \
   --timeout-ms 8000 --json
 ```
+
+Detection manifests support `osc_title`, `osc_progress`, `whole_recent`,
+`bottom_lines(N)`, `bottom_non_empty_lines(N)`, `top_non_empty_lines(N)`,
+`last_non_empty_above_prompt_box`, `after_last_prompt_marker`,
+`prompt_box_body`, and `after_last_horizontal_rule`. The detection diagnostic
+shows the current matcher text for only the active manifest's required regions;
+screen previews preserve the same wide-glyph and soft-wrap behavior as live
+matching.
 
 Waiting output and `session wait` use dedicated connections. Re-issue short
 waits as needed; a killed client does not promise immediate daemon-side waiter

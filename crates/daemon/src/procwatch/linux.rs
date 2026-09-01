@@ -1,6 +1,6 @@
 //! Linux `/proc` and pidfd process inspection.
 
-// Rust guideline compliant 2026-07-07
+// Rust guideline compliant 2026-08-28
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
@@ -24,6 +24,18 @@ const PROC_ROOT: &str = "/proc";
 /// The syscall currently defines no behavioral flags for our use case; `0`
 /// requests the default pidfd suitable for readiness polling.
 const PIDFD_OPEN_FLAGS: libc::c_uint = 0;
+/// `/proc/<pid>/stat` process-group field number (`pgrp`).
+const STAT_PGRP_FIELD: usize = 5;
+/// `/proc/<pid>/stat` controlling-terminal foreground group field number
+/// (`tpgid`). The value is signed; `-1` means no controlling terminal.
+const STAT_TPGID_FIELD: usize = 8;
+/// `/proc/<pid>/stat` process start-time field number (`starttime`).
+const STAT_STARTTIME_FIELD: usize = 22;
+/// First `/proc/<pid>/stat` field that appears after the parenthesized command.
+///
+/// Kernel numbering starts at field 1 (`pid`), but the parser removes fields 1–2
+/// with the command, leaving field 3 (`state`) at offset zero.
+const FIRST_FIELD_AFTER_COMMAND: usize = 3;
 
 /// Linux process inspector backed by procfs and pidfds.
 #[derive(Debug, Clone, Copy, Default)]
@@ -72,6 +84,65 @@ impl ProcessInspector for LinuxInspector {
     fn ownership_markers(&self, pid: Pid) -> io::Result<OwnershipMarkers> {
         ownership_markers(pid)
     }
+
+    fn foreground_process_group(&self, root_pid: Pid) -> io::Result<Option<Pid>> {
+        foreground_process_group(root_pid)
+    }
+}
+
+/// Reads the terminal foreground group without signaling the target process.
+fn foreground_process_group(root_pid: Pid) -> io::Result<Option<Pid>> {
+    let euid = current_euid()?;
+    if !same_user(root_pid, euid) {
+        return Ok(None);
+    }
+    read_stat_process_group(root_pid)
+}
+
+fn read_stat_process_group(process_id: Pid) -> io::Result<Option<Pid>> {
+    read_stat_pid_field(process_id, STAT_TPGID_FIELD)
+}
+
+fn parse_stat_pid_field(stat: &str, field_number: usize) -> Option<Pid> {
+    parse_stat_field::<libc::pid_t>(stat, field_number).and_then(|value| Pid::try_from(value).ok())
+}
+
+fn parse_stat_field<T>(stat: &str, field_number: usize) -> Option<T>
+where
+    T: std::str::FromStr,
+{
+    let command_end = stat.rfind(')')?;
+    let fields = stat.get(command_end + 1..)?;
+    fields
+        .split_whitespace()
+        .nth(field_number.checked_sub(FIRST_FIELD_AFTER_COMMAND)?)
+        .and_then(|value| value.parse().ok())
+}
+
+/// Reads one process-id `/proc/<pid>/stat` field by its kernel-defined number.
+/// A malformed, negative, or unparsable value yields `None`.
+fn read_stat_pid_field(process_id: Pid, field_number: usize) -> io::Result<Option<Pid>> {
+    let stat = match fs::read_to_string(proc_path(process_id).join("stat")) {
+        Ok(stat) => stat,
+        Err(err) if is_process_race(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    Ok(parse_stat_pid_field(&stat, field_number))
+}
+
+fn read_process_stat(process_id: Pid) -> io::Result<Option<(Pid, u64)>> {
+    let stat = match fs::read_to_string(proc_path(process_id).join("stat")) {
+        Ok(stat) => stat,
+        Err(err) if is_process_race(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let Some(pgid) = parse_stat_pid_field(&stat, STAT_PGRP_FIELD) else {
+        return Ok(None);
+    };
+    let Some(start_identity) = parse_stat_field(&stat, STAT_STARTTIME_FIELD) else {
+        return Ok(None);
+    };
+    Ok(Some((pgid, start_identity)))
 }
 
 /// Reads `POHUNEK_DAEMON_ID` / `POHUNEK_SESSION_ID` from `/proc/<pid>/environ`.
@@ -221,36 +292,17 @@ fn read_process_fact(process_id: Pid, euid: u32) -> io::Result<Option<ProcessFac
     let Some((comm, parent_id)) = read_status(process_id)? else {
         return Ok(None);
     };
-    let Some(start_identity) = read_start_identity(process_id)? else {
+    let Some((pgid, start_identity)) = read_process_stat(process_id)? else {
         return Ok(None);
     };
     Ok(Some(ProcessFact {
         pid: process_id,
+        pgid,
         ppid: parent_id,
         start_identity,
         comm,
         cmdline: read_cmdline(process_id)?,
     }))
-}
-
-fn read_start_identity(process_id: Pid) -> io::Result<Option<u64>> {
-    let stat = match fs::read_to_string(proc_path(process_id).join("stat")) {
-        Ok(stat) => stat,
-        Err(err) if is_process_race(&err) => return Ok(None),
-        Err(err) => return Err(err),
-    };
-    let Some(command_end) = stat.rfind(')') else {
-        return Ok(None);
-    };
-    let Some(fields) = stat.get(command_end + 1..) else {
-        return Ok(None);
-    };
-    // After the command, field 3 (`state`) is first. Skipping 19 values lands
-    // on field 22 (`starttime`), whose value is stable for the process lifetime.
-    Ok(fields
-        .split_whitespace()
-        .nth(19)
-        .and_then(|value| value.parse().ok()))
 }
 
 fn read_status(process_id: Pid) -> io::Result<Option<(String, Pid)>> {
@@ -333,4 +385,80 @@ fn pidfd_open(pid: Pid) -> io::Result<OwnedFd> {
     // SAFETY: `pidfd_open` returned a fresh file descriptor owned by this process,
     // and `OwnedFd` takes responsibility for closing it exactly once.
     Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stat_foreground_group_reads_tpgid_after_command() {
+        assert_eq!(
+            parse_stat_pid_field(
+                "123 (agent with spaces) S 1 2 3 456 789 8",
+                STAT_TPGID_FIELD,
+            ),
+            Some(789)
+        );
+    }
+
+    #[test]
+    fn stat_process_group_reads_pgrp_after_command() {
+        assert_eq!(
+            parse_stat_pid_field("123 (agent with spaces) S 1 456 3 4 789 8", STAT_PGRP_FIELD,),
+            Some(456)
+        );
+    }
+
+    #[test]
+    fn stat_start_identity_uses_shared_production_parser() {
+        let stat = concat!(
+            "123 (agent) S 1 456 3 4 789 0 0 0 0 0 0 0 0 0 ",
+            "20 0 1 0 987654"
+        );
+        assert_eq!(
+            parse_stat_field::<u64>(stat, STAT_STARTTIME_FIELD),
+            Some(987_654)
+        );
+    }
+
+    #[test]
+    fn stat_parser_rejects_fields_before_state() {
+        assert_eq!(parse_stat_pid_field("123 (agent) S 1 2 3 4 5", 2), None);
+    }
+
+    #[test]
+    fn stat_foreground_group_uses_production_offset_arithmetic() {
+        assert_eq!(
+            parse_stat_pid_field("123 (agent) S 1 2 3 456 7 8", STAT_TPGID_FIELD),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn stat_foreground_group_parses_signed_absent_value() {
+        assert_eq!(
+            parse_stat_pid_field("123 (agent) S 1 2 3 456 -1", STAT_TPGID_FIELD),
+            None
+        );
+    }
+
+    #[test]
+    fn stat_foreground_group_handles_escaped_parenthesis_in_command() {
+        assert_eq!(
+            parse_stat_pid_field("123 (escaped \\() name) S 1 2 3 456 789", STAT_TPGID_FIELD,),
+            Some(789)
+        );
+    }
+
+    #[test]
+    fn malformed_stat_has_no_process_group() {
+        assert_eq!(
+            parse_stat_pid_field(
+                "123 (agent with \\() parenthesis) S 1 2 3",
+                STAT_TPGID_FIELD,
+            ),
+            None
+        );
+    }
 }

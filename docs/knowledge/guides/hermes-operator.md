@@ -88,9 +88,22 @@ pohunek integration uninstall --agent hermes \
   --hermes-home /absolute/owner/private/hermes-home --json
 ```
 
-`status`, `doctor`, `update`, and `uninstall` are Hermes-only actions. Asking
-for them with Codex or Claude returns a typed unsupported-action error; their
-existing `integration install` behavior remains separate.
+`doctor`, `update`, and `uninstall` are Hermes-only actions. Asking for them
+with Codex or Claude returns a typed unsupported-action error; their separate
+daemon-backed status reports the complete managed install contract, while
+install remains available. Bare status selects both daemon-managed agents;
+Codex and Claude status honors the effective global `--host`, while explicit
+Hermes status keeps its local target and executable flags. For remote
+Codex/Claude reports, run any suggested `integration install` directly on the
+named daemon host; adding `--host` does not make installation remote:
+
+```sh
+pohunek integration status --json
+pohunek --host buildbox integration status --agent codex --json
+pohunek integration status --agent claude --json
+pohunek integration status --agent hermes --hermes-profile work \
+  --hermes-bin /absolute/path/to/hermes --json
+```
 
 ## Access policy and targets
 

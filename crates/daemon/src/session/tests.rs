@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -10,18 +10,21 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use protocol::{
-    AgentActivity, AgentKind, CwdSource, Event, ForkCwdMode, OutputOffset, ProcessStartIdentity,
-    ProjectSource, ReportSequence, RuntimeGeneration, RuntimeState, SessionAttachParams,
-    SessionForkParams, SessionId, SessionInfo, SessionNativeRecoveredEvent, SessionNewParams,
-    SessionOutputParams, SessionReleaseAgentParams, SessionReportAgentParams,
-    SessionReportNativeIdParams, SessionRuntime, SessionRuntimeIdentity, SessionState,
-    SessionWaitParams, SessionWaitReason, StateSource, TerminalWatermark,
+    method, AgentActivity, AgentKind, CwdSource, DetectionRegionKind, DetectionRegionPreview,
+    ErrorClass, Event, ForkCwdMode, OutputOffset, ProcessStartIdentity, ProjectSource,
+    ReportSequence, Request, Response, RuntimeGeneration, RuntimeState, SessionAttachParams,
+    SessionDetectionParams, SessionForkParams, SessionId, SessionInfo, SessionNativeRecoveredEvent,
+    SessionNewParams, SessionOutputParams, SessionReadFormat, SessionReadParams, SessionReadSource,
+    SessionReleaseAgentParams, SessionReportAgentParams, SessionReportNativeIdParams,
+    SessionRuntime, SessionRuntimeIdentity, SessionState, SessionWaitParams, SessionWaitReason,
+    StateSource, TerminalWatermark, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
 };
 
 use crate::agent::LaunchCommand;
 use crate::agent::{InputRules, ResumeMode, SessionRefKind};
+use crate::api::{dispatch_line, DaemonState, HealthInfo};
 use crate::detect::{ActivityTransition, DetectorConfig, ManifestRegion, MatchContext};
-use crate::external::TranscriptIndex;
+use crate::external::{external_session_id, TranscriptIndex};
 use crate::integration::{
     ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
@@ -30,9 +33,9 @@ use crate::project::detect::project_id;
 use crate::runtime::{Worker, WorkerError};
 
 use super::{
-    native_report_is_current, worker_error_to_protocol, RuntimeExit, RuntimeHandle,
-    RuntimeWatchIdentity, SessionEntry, SessionRegistry, SessionRegistryConfig, ShellCommand,
-    MAX_SESSION_NAME_BYTES,
+    native_report_is_current, worker_error_to_protocol, InputSubmission, RuntimeExit,
+    RuntimeHandle, RuntimeWatchIdentity, SessionEntry, SessionRegistry, SessionRegistryConfig,
+    ShellCommand, MAX_SESSION_NAME_BYTES,
 };
 
 /// Bounds retries around intentional same-runtime snapshot races in transition tests.
@@ -703,6 +706,145 @@ async fn worker_identity_changes_project_live_into_the_logical_session() {
 }
 
 #[tokio::test]
+async fn session_read_returns_visible_tail_and_truthful_source_fallbacks() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new(
+            "/bin/sh",
+            ["-c", "printf 'alpha\\nbeta\\ngamma'; sleep 30"],
+        ),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+
+    let read = |source: SessionReadSource, lines: Option<u32>| {
+        let id = created.id.clone();
+        SessionReadParams::new(id, Some(source), lines, None).expect("valid read params")
+    };
+    let visible = registry
+        .session_read(&read(SessionReadSource::Visible, Some(2)))
+        .await
+        .expect("visible read");
+    assert_eq!(visible.text, "beta\ngamma");
+    assert!(visible.truncated);
+    assert_eq!(visible.source_used, SessionReadSource::Visible);
+    assert!(!visible.alternate_screen);
+    assert_eq!(
+        visible.runtime.runtime_generation(),
+        RuntimeGeneration::new(1)
+    );
+
+    let recent = registry
+        .session_read(&read(SessionReadSource::Recent, None))
+        .await
+        .expect("recent read");
+    assert_eq!(recent.source_used, SessionReadSource::Visible);
+    assert_eq!(recent.text, "alpha\nbeta\ngamma");
+    assert!(!recent.alternate_screen);
+
+    let unwrapped = registry
+        .session_read(&read(SessionReadSource::RecentUnwrapped, None))
+        .await
+        .expect("unwrapped read");
+    assert_eq!(unwrapped.source_used, SessionReadSource::Visible);
+    assert_eq!(unwrapped.text, recent.text);
+    assert!(!unwrapped.alternate_screen);
+
+    let detection = registry
+        .session_read(&read(SessionReadSource::Detection, Some(1)))
+        .await
+        .expect("detection read");
+    assert_eq!(detection.source_used, SessionReadSource::Visible);
+    assert_eq!(detection.text, "gamma");
+    assert!(detection.truncated);
+
+    let ansi = SessionReadParams::new(
+        created.id.clone(),
+        None,
+        None,
+        Some(SessionReadFormat::Ansi),
+    )
+    .expect("valid ANSI params");
+    let ansi_error = registry
+        .session_read(&ansi)
+        .await
+        .expect_err("ANSI is unavailable");
+    assert_eq!(ansi_error.code, "session_read_ansi_unavailable");
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_read_preserves_alternate_screen_state_during_fallback() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new(
+            "/bin/sh",
+            ["-c", "printf '\\033[?1049hTUI-one\\nTUI-two'; sleep 30"],
+        ),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let params = SessionReadParams::new(
+        created.id.clone(),
+        Some(SessionReadSource::RecentUnwrapped),
+        None,
+        None,
+    )
+    .expect("read params");
+
+    let result = registry
+        .session_read(&params)
+        .await
+        .expect("read alternate screen");
+
+    assert_eq!(result.source_used, SessionReadSource::Visible);
+    assert!(result.alternate_screen);
+    assert_eq!(result.text, "TUI-one\nTUI-two");
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_read_identity_guard_rejects_runtime_replacement_race() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "printf ready; sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let observed = registry
+        .managed_session(&created.id)
+        .await
+        .expect("managed session");
+    let replacement_generation = RuntimeGeneration::new(observed.runtime_generation.get() + 1);
+    {
+        let mut sessions = registry.inner.sessions.lock().await;
+        sessions
+            .get_mut(&created.id)
+            .and_then(|entry| entry.info.runtime.as_mut())
+            .expect("live runtime")
+            .runtime_generation = replacement_generation;
+    };
+
+    let error = registry
+        .verify_managed_identity(&created.id, &observed)
+        .await
+        .expect_err("replaced runtime must invalidate an in-flight snapshot");
+
+    assert_eq!(error.code, "session_runtime_changed");
+    {
+        let mut sessions = registry.inner.sessions.lock().await;
+        sessions
+            .get_mut(&created.id)
+            .and_then(|entry| entry.info.runtime.as_mut())
+            .expect("live runtime")
+            .runtime_generation = observed.runtime_generation;
+    };
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
 async fn mutations_fail_closed_for_an_unsupported_persisted_agent_kind() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
@@ -883,9 +1025,18 @@ struct MockInspector {
 struct MockInspectorState {
     descendants: HashMap<Pid, Vec<ProcessFact>>,
     descendants_error: Option<std::io::ErrorKind>,
+    foreground_groups: HashMap<Pid, Option<Pid>>,
+    foreground_error: Option<std::io::ErrorKind>,
+    foreground_block: Option<Arc<ForegroundBlock>>,
     cwd: HashMap<Pid, PathBuf>,
-    exits: HashMap<Pid, tokio::sync::watch::Sender<bool>>,
+    exits: HashMap<Pid, Vec<tokio::sync::watch::Sender<bool>>>,
     ownership_markers: HashMap<Pid, OwnershipMarkers>,
+}
+
+#[derive(Debug, Default)]
+struct ForegroundBlock {
+    entered: AtomicBool,
+    released: AtomicBool,
 }
 
 impl MockInspector {
@@ -896,10 +1047,6 @@ impl MockInspector {
                 .cwd
                 .entry(fact.pid)
                 .or_insert_with(|| PathBuf::from("/tmp"));
-            inner
-                .exits
-                .entry(fact.pid)
-                .or_insert_with(|| tokio::sync::watch::channel(false).0);
         }
         inner.descendants.insert(root, facts);
     }
@@ -911,16 +1058,56 @@ impl MockInspector {
             .descendants_error = Some(kind);
     }
 
+    fn fail_foreground_with(&self, kind: std::io::ErrorKind) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .foreground_error = Some(kind);
+    }
+
+    fn clear_foreground_error(&self) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .foreground_error = None;
+    }
+
+    fn block_foreground(&self) -> Arc<ForegroundBlock> {
+        let block = Arc::new(ForegroundBlock::default());
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .foreground_block = Some(Arc::clone(&block));
+        block
+    }
+
     fn fire_exit(&self, pid: Pid) {
-        let sender = {
-            let mut inner = self.inner.lock().expect("mock inspector lock");
-            inner
-                .exits
-                .entry(pid)
-                .or_insert_with(|| tokio::sync::watch::channel(false).0)
-                .clone()
-        };
+        let mut inner = self.inner.lock().expect("mock inspector lock");
+        for sender in inner.exits.entry(pid).or_default() {
+            sender.send_replace(true);
+        }
+    }
+
+    fn fire_exit_watch(&self, pid: Pid, generation: usize) {
+        let sender = self
+            .inner
+            .lock()
+            .expect("mock inspector lock")
+            .exits
+            .get(&pid)
+            .and_then(|watches| watches.get(generation))
+            .cloned()
+            .expect("exit watch generation");
         sender.send_replace(true);
+    }
+
+    fn exit_watch_count(&self, pid: Pid) -> usize {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .exits
+            .get(&pid)
+            .map_or(0, Vec::len)
     }
 
     fn set_cwd(&self, pid: Pid, cwd: PathBuf) {
@@ -937,6 +1124,14 @@ impl MockInspector {
             .expect("mock inspector lock")
             .ownership_markers
             .insert(pid, markers);
+    }
+
+    fn set_foreground_group(&self, pid: Pid, group: Option<Pid>) {
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .foreground_groups
+            .insert(pid, group);
     }
 }
 
@@ -991,14 +1186,14 @@ impl ProcessInspector for MockInspector {
     }
 
     fn exit_watch(&self, pid: Pid) -> std::io::Result<ExitWatch> {
-        let receiver = {
-            let mut inner = self.inner.lock().expect("mock inspector lock");
-            inner
-                .exits
-                .entry(pid)
-                .or_insert_with(|| tokio::sync::watch::channel(false).0)
-                .subscribe()
-        };
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        self.inner
+            .lock()
+            .expect("mock inspector lock")
+            .exits
+            .entry(pid)
+            .or_default()
+            .push(sender);
         Ok(ExitWatch::from_test_signal(receiver))
     }
 
@@ -1012,6 +1207,402 @@ impl ProcessInspector for MockInspector {
             .cloned()
             .unwrap_or_default())
     }
+
+    fn foreground_process_group(&self, root_pid: Pid) -> std::io::Result<Option<Pid>> {
+        let (kind, foreground, block) = {
+            let inner = self.inner.lock().expect("mock inspector lock");
+            (
+                inner.foreground_error,
+                inner.foreground_groups.get(&root_pid).copied().flatten(),
+                inner.foreground_block.clone(),
+            )
+        };
+        if let Some(block) = block {
+            block.entered.store(true, Ordering::Release);
+            while !block.released.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        }
+        if let Some(kind) = kind {
+            return Err(std::io::Error::new(kind, "mock foreground failure"));
+        }
+        Ok(foreground)
+    }
+}
+
+#[tokio::test]
+async fn foreground_leader_selects_agent_and_shell_return_clears_claim() {
+    let (registry, inspector, created) = mock_procwatch_registry("foreground-leader").await;
+    let first = codex_fact(300, created.pid);
+    let replacement = claude_fact(310, created.pid);
+    inspector.set_descendants(created.pid, vec![first]);
+    inspector.set_cwd(300, temp_dir("foreground-first"));
+    inspector.set_foreground_group(created.pid, Some(300));
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+
+    let active = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(active.active_agent.as_deref(), Some("codex"));
+    assert_eq!(active.active_agent_pid, Some(300));
+
+    inspector.set_descendants(created.pid, vec![replacement]);
+    inspector.set_cwd(310, temp_dir("foreground-replacement"));
+    inspector.set_foreground_group(created.pid, Some(310));
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let rebound = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(rebound.active_agent.as_deref(), Some("claude"));
+    assert_eq!(rebound.active_agent_pid, Some(310));
+
+    inspector.set_foreground_group(created.pid, Some(created.pid));
+    for _ in 0..DIRECT_AGENT_RESCAN_COUNT {
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let cleared = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(cleared.active_agent, None);
+        assert_eq!(cleared.active_agent_base, None);
+        assert_eq!(cleared.active_agent_pid, None);
+    }
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn shell_foreground_preserves_recent_unbound_claim_until_ttl() {
+    let (registry, inspector, created) = mock_procwatch_registry("foreground-unbound-ttl").await;
+    inspector.set_foreground_group(created.pid, Some(created.pid));
+    let report = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: CODEX_HOOK_SOURCE.to_owned(),
+            agent: CODEX_HOOK_AGENT.to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
+            pid: None,
+            agent_session_id: None,
+            agent_session_path: None,
+        })
+        .await;
+    assert!(report.recorded);
+    let reported_at = registry.inner.sessions.lock().await[&created.id]
+        .active_agent
+        .as_ref()
+        .expect("active report")
+        .reported_at;
+
+    registry
+        .rescan_procwatch_at(
+            &created.id,
+            created.pid,
+            reported_at + Duration::from_millis(49),
+        )
+        .await;
+    let retained = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect retained");
+    assert_eq!(retained.active_agent.as_deref(), Some(CODEX_HOOK_AGENT));
+
+    registry
+        .rescan_procwatch_at(
+            &created.id,
+            created.pid,
+            reported_at + Duration::from_millis(50),
+        )
+        .await;
+    let expired = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect expired");
+    assert_eq!(expired.active_agent, None);
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn root_foreground_group_selects_member_until_member_exits() {
+    let (registry, inspector, created) = mock_procwatch_registry("foreground-root-member").await;
+    let mut member = codex_fact(320, created.pid);
+    member.pgid = created.pid;
+    inspector.set_descendants(created.pid, vec![member]);
+    inspector.set_foreground_group(created.pid, Some(created.pid));
+
+    for _ in 0..DIRECT_AGENT_RESCAN_COUNT {
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let selected = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(selected.active_agent.as_deref(), Some("codex"));
+        assert_eq!(selected.active_agent_pid, Some(320));
+    }
+
+    inspector.set_descendants(created.pid, Vec::new());
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let cleared = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(cleared.active_agent, None);
+    assert_eq!(cleared.active_agent_pid, None);
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn foreign_foreground_process_does_not_hijack_reconciliation() {
+    let (registry, inspector, created) = mock_procwatch_registry("foreground-foreign").await;
+    let mut foreign = codex_fact(FOREIGN_AGENT_PID, created.pid);
+    foreign.pgid = FOREIGN_AGENT_PID;
+    inspector.set_descendants(
+        created.pid,
+        vec![foreign, codex_fact(FOREIGN_AGENT_PID + 1, created.pid)],
+    );
+    inspector.set_ownership_markers(
+        FOREIGN_AGENT_PID,
+        OwnershipMarkers {
+            daemon_id: Some("foreign-daemon".to_owned()),
+            session_id: Some("foreign-session".to_owned()),
+        },
+    );
+    let root_cwd = temp_dir("foreign-foreground-root");
+    inspector.set_cwd(created.pid, root_cwd.clone());
+    inspector.set_foreground_group(created.pid, Some(FOREIGN_AGENT_PID));
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let inspected = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(inspected.active_agent, None);
+    assert_eq!(inspected.active_agent_pid, None);
+    assert_eq!(inspected.cwd, root_cwd);
+}
+
+#[tokio::test]
+async fn foreground_member_matches_pgid_without_crossing_groups() {
+    let (registry, inspector, created) = mock_procwatch_registry("foreground-member").await;
+
+    // The unrecognized wrapper owns the foreground group. Only a recognized
+    // member of that exact PGID is eligible; another group must never win.
+    let mut wrapper = ProcessFact {
+        comm: "wrapper".to_owned(),
+        cmdline: vec!["/usr/bin/wrapper".to_owned()],
+        ..codex_fact(400, created.pid)
+    };
+    wrapper.pgid = 399;
+    let mut member = claude_fact(410, 400);
+    member.pgid = 399;
+    let unrelated = codex_fact(420, created.pid);
+    inspector.set_descendants(created.pid, vec![wrapper, member, unrelated]);
+    inspector.set_foreground_group(created.pid, Some(399));
+
+    for _ in 0..DIRECT_AGENT_RESCAN_COUNT {
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let selected = registry.inspect(&created.id).await.expect("inspect");
+
+        assert_eq!(selected.active_agent.as_deref(), Some("claude"));
+        assert_eq!(selected.active_agent_base, Some(AgentKind::Claude));
+        assert_eq!(selected.active_agent_pid, Some(410));
+    }
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn foreground_recognized_leader_wins_over_older_same_kind_other_group() {
+    let (registry, inspector, created) = mock_procwatch_registry("foreground-exact-leader").await;
+    inspector.set_descendants(created.pid, vec![codex_fact(430, created.pid)]);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+
+    let mut leader = codex_fact(440, created.pid);
+    leader.pgid = 440;
+    let mut member = claude_fact(441, 440);
+    member.pgid = 440;
+    inspector.set_descendants(
+        created.pid,
+        vec![codex_fact(430, created.pid), member, leader],
+    );
+    inspector.set_foreground_group(created.pid, Some(440));
+
+    for _ in 0..DIRECT_AGENT_RESCAN_COUNT {
+        registry
+            .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+            .await;
+        let selected = registry.inspect(&created.id).await.expect("inspect");
+        assert_eq!(selected.active_agent.as_deref(), Some("codex"));
+        assert_eq!(selected.active_agent_pid, Some(440));
+    }
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn foreground_replacement_replaces_hook_identity_and_detector() {
+    let (registry, inspector, created) = mock_direct_codex_registry("foreground-replace").await;
+    inspector.set_descendants(created.pid, vec![claude_fact(500, created.pid)]);
+    inspector.set_cwd(500, temp_dir("foreground-replacement"));
+    inspector.set_foreground_group(created.pid, Some(500));
+
+    let report = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: CODEX_HOOK_SOURCE.to_owned(),
+            agent: "codex".to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
+            pid: Some(created.pid),
+            agent_session_id: Some("stale-codex-native".to_owned()),
+            agent_session_path: Some("/tmp/stale-codex.jsonl".to_owned()),
+        })
+        .await;
+    assert!(report.recorded);
+    let initial_detector = registry.inner.sessions.lock().await[&created.id]
+        .detector_config
+        .subscribe();
+    assert!(initial_detector.borrow().config.manifest.is_some());
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let replaced = registry.inspect(&created.id).await.expect("inspect");
+    let replacement_detector = registry.inner.sessions.lock().await[&created.id]
+        .detector_config
+        .subscribe();
+
+    assert_eq!(replaced.active_agent.as_deref(), Some("claude"));
+    assert_eq!(replaced.active_agent_base, Some(AgentKind::Claude));
+    assert_eq!(replaced.active_agent_pid, Some(500));
+    assert_eq!(replaced.active_agent_session_id, None);
+    assert_eq!(replaced.active_agent_session_path, None);
+    assert_eq!(replaced.activity, None);
+    assert_eq!(replaced.state_source, StateSource::Process);
+    assert_eq!(
+        replacement_detector.borrow().config.detection,
+        DetectorConfig::for_agent(&AgentKind::Claude).detection
+    );
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn first_foreground_scan_binds_hook_identity_without_replacing_metadata() {
+    let (registry, inspector, created) = mock_procwatch_registry("foreground-hook-bind").await;
+    let observed = codex_fact(510, created.pid);
+    inspector.set_descendants(created.pid, vec![observed.clone()]);
+    inspector.set_cwd(observed.pid, temp_dir("foreground-hook-bind"));
+    inspector.set_foreground_group(created.pid, Some(observed.pid));
+
+    let report = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: CODEX_HOOK_SOURCE.to_owned(),
+            agent: CODEX_HOOK_AGENT.to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
+            pid: Some(observed.pid),
+            agent_session_id: Some("hook-native-id".to_owned()),
+            agent_session_path: Some("/tmp/hook-native.jsonl".to_owned()),
+        })
+        .await;
+    assert!(report.recorded);
+    assert_eq!(
+        registry.inner.sessions.lock().await[&created.id]
+            .active_agent
+            .as_ref()
+            .and_then(|active| active.start_identity),
+        None
+    );
+
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+
+    let inspected = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(inspected.active_agent.as_deref(), Some(CODEX_HOOK_AGENT));
+    assert_eq!(inspected.active_agent_pid, Some(observed.pid));
+    assert_eq!(
+        inspected.active_agent_session_id.as_deref(),
+        Some("hook-native-id")
+    );
+    assert_eq!(
+        inspected.active_agent_session_path.as_deref(),
+        Some("/tmp/hook-native.jsonl")
+    );
+    assert_eq!(inspected.activity, Some(AgentActivity::Working));
+    assert_eq!(inspected.state_source, StateSource::Report);
+    {
+        let sessions = registry.inner.sessions.lock().await;
+        let entry = &sessions[&created.id];
+        assert_eq!(
+            entry
+                .active_agent
+                .as_ref()
+                .and_then(|active| active.start_identity),
+            Some(observed.start_identity)
+        );
+        assert_eq!(
+            entry
+                .last_agent_report
+                .as_ref()
+                .and_then(|active| active.start_identity),
+            Some(observed.start_identity)
+        );
+    };
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn transient_foreground_error_preserves_last_known_claim() {
+    let (registry, inspector, created) = mock_procwatch_registry("foreground-error").await;
+    inspector.set_descendants(created.pid, vec![codex_fact(600, created.pid)]);
+    inspector.set_foreground_group(created.pid, Some(600));
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("initial inspect")
+            .active_agent_pid,
+        Some(600)
+    );
+
+    inspector.fail_foreground_with(std::io::ErrorKind::PermissionDenied);
+    inspector.set_descendants(created.pid, vec![codex_fact(610, created.pid)]);
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+
+    let preserved = registry
+        .inspect(&created.id)
+        .await
+        .expect("preserved inspect");
+    assert_eq!(preserved.active_agent.as_deref(), Some("codex"));
+    assert_eq!(preserved.active_agent_pid, Some(600));
+    assert_eq!(
+        registry.inner.sessions.lock().await[&created.id].foreground_process_group,
+        Some(600)
+    );
+
+    inspector.clear_foreground_error();
+    inspector.set_foreground_group(created.pid, Some(610));
+    registry
+        .rescan_procwatch_at(&created.id, created.pid, Instant::now())
+        .await;
+    let recovered = registry
+        .inspect(&created.id)
+        .await
+        .expect("recovered inspect");
+    assert_eq!(recovered.active_agent_pid, Some(610));
+
+    let _ = registry.stop(&created.id).await;
 }
 
 fn title_activity(config: &DetectorConfig, title: &str) -> Option<AgentActivity> {
@@ -3367,19 +3958,52 @@ async fn inspect_missing_session_returns_not_found() {
     assert_eq!(missing.code, "session_not_found");
 }
 
+#[tokio::test]
+async fn superseded_detector_output_cannot_stamp_replacement_runtime() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let expected = RuntimeWatchIdentity::from_info(&created).expect("live detector identity");
+    let original_runtime = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("session entry");
+        let original = entry.info.runtime.clone();
+        let runtime = entry.info.runtime.as_mut().expect("runtime projection");
+        runtime.runtime_id = Some("runtime-replacement".to_owned());
+        runtime.runtime_generation = RuntimeGeneration::new(runtime.runtime_generation.get() + 1);
+        original
+    };
+
+    registry
+        .record_detector_activity(&created.id, &expected, transition(AgentActivity::Idle))
+        .await;
+
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&created.id).expect("session entry");
+    assert_eq!(entry.info.activity, None);
+    assert_eq!(entry.activity_revision, 0);
+    assert!(entry.activity_evidence.is_empty());
+    entry.info.runtime = original_runtime;
+    drop(sessions);
+    let _ = registry.stop(&created.id).await;
+}
+
 #[test]
-fn bracketed_paste_input_frame_wraps_text_and_submit_together() {
+fn bracketed_paste_input_frame_keeps_submit_separate() {
     let writes = super::build_input_writes(
         "hello\nworld",
         InputRules::unrestricted(true, Duration::ZERO),
     )
     .expect("unrestricted input");
 
-    assert_eq!(
-        writes.immediate,
-        b"\x1b[200~hello\nworld\x1b[201~\r".to_vec()
-    );
-    assert_eq!(writes.delayed_submit, None);
+    assert_eq!(writes.body, b"\x1b[200~hello\nworld\x1b[201~".to_vec());
+    assert_eq!(writes.submit_delay, Duration::ZERO);
 }
 
 #[test]
@@ -3390,11 +4014,15 @@ fn delayed_submit_input_frame_splits_text_and_submit() {
     )
     .expect("unrestricted input");
 
-    assert_eq!(writes.immediate, b"hello Claude".to_vec());
-    assert_eq!(
-        writes.delayed_submit,
-        Some((Duration::from_millis(150), b"\r".to_vec()))
-    );
+    assert_eq!(writes.body, b"hello Claude".to_vec());
+    assert_eq!(writes.submit_delay, Duration::from_millis(150));
+
+    let fragments = super::input::worker_input_fragments(writes, Duration::from_millis(25));
+    assert_eq!(fragments.len(), 2);
+    assert_eq!(fragments[0].bytes.expose(), b"hello Claude");
+    assert_eq!(fragments[0].delay_after_ms, 150);
+    assert_eq!(fragments[1].bytes.expose(), super::input::SUBMIT);
+    assert_eq!(fragments[1].delay_after_ms, 25);
 }
 
 #[test]
@@ -3404,13 +4032,10 @@ fn hermes_multiline_input_is_one_bracketed_paste_then_separate_submit() {
         .expect("Hermes multiline safe text");
 
     assert_eq!(
-        writes.immediate,
+        writes.body,
         b"\x1b[200~first line\nsecond line\x1b[201~".to_vec()
     );
-    assert_eq!(
-        writes.delayed_submit,
-        Some((Duration::from_millis(150), b"\r".to_vec()))
-    );
+    assert_eq!(writes.submit_delay, Duration::from_millis(150));
 }
 
 #[test]
@@ -3431,10 +4056,7 @@ fn hermes_input_rejects_terminal_controls_without_mutating_text() {
 
     let safe = super::build_input_writes("first\n\tsecond", rules)
         .expect("Hermes allows intentional multiline LF and tab");
-    assert_eq!(
-        safe.immediate,
-        b"\x1b[200~first\n\tsecond\x1b[201~".to_vec()
-    );
+    assert_eq!(safe.body, b"\x1b[200~first\n\tsecond\x1b[201~".to_vec());
 }
 
 #[test]
@@ -3456,7 +4078,7 @@ fn codex_input_control_behavior_is_unchanged() {
     let writes = super::build_input_writes(text, rules).expect("Codex remains unrestricted");
 
     assert!(writes
-        .immediate
+        .body
         .windows(text.len())
         .any(|window| window == text.as_bytes()));
 }
@@ -3478,6 +4100,1447 @@ fn hermes_programmatic_input_fails_closed_while_blocked() {
     codex
         .validate_activity(Some(AgentActivity::Blocked))
         .expect("Codex blocked-input behavior remains unchanged");
+}
+
+#[tokio::test]
+async fn session_input_wait_rejects_invalid_contract_before_delivery() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: observable_input_shell(),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+
+    for timeout_ms in [Some(0), Some(protocol::MAX_SESSION_WAIT_MS + 1)] {
+        let error = registry
+            .input(protocol::SessionInputParams {
+                session_id: created.id.clone(),
+                text: "must not be delivered".to_owned(),
+                wait: Some(protocol::SessionInputWait {
+                    until: Some(vec![AgentActivity::Idle]),
+                    timeout_ms,
+                }),
+            })
+            .await
+            .expect_err("invalid wait contract must be rejected");
+        if timeout_ms == Some(0) {
+            assert_eq!(error.code, "session_input_invalid_wait");
+        } else {
+            assert_eq!(error.code, "session_wait_limit_exceeded");
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    assert!(
+        !output.contains("must not be delivered"),
+        "invalid wait must not deliver input; output={output:?}"
+    );
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_preserves_external_read_only_error() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: observable_input_shell(),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create managed session fixture");
+    let external_id = external_session_id(91_337);
+    let mut external = created.clone();
+    external.id = external_id.clone();
+    external.pid = 91_337;
+    external.external = Some(true);
+    registry.inner.external.upsert(external).await;
+
+    let error = registry
+        .input(protocol::SessionInputParams {
+            session_id: external_id,
+            text: "must-not-write".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: Some(vec![AgentActivity::Idle]),
+                timeout_ms: Some(100),
+            }),
+        })
+        .await
+        .expect_err("external waited input remains read-only");
+
+    assert_eq!(error.code, "session_external_read_only");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_times_out_with_typed_error() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+
+    let error = registry
+        .input(protocol::SessionInputParams {
+            session_id: created.id.clone(),
+            text: "submitted but never settled".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: Some(vec![AgentActivity::Blocked]),
+                timeout_ms: Some(25),
+            }),
+        })
+        .await
+        .expect_err("missing target activity must time out");
+
+    assert_eq!(error.code, "session_input_timeout");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_rejects_blocked_session_before_delivery() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: observable_input_shell(),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Blocked, 1)
+            .await
+            .recorded
+    );
+
+    let error = registry
+        .input(protocol::SessionInputParams {
+            session_id: created.id.clone(),
+            text: "blocked-input-marker".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: Some(vec![AgentActivity::Idle]),
+                timeout_ms: Some(250),
+            }),
+        })
+        .await
+        .expect_err("blocked wait input must be rejected");
+
+    assert_eq!(error.code, "session_agent_blocked");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    assert!(
+        !output.contains("blocked-input-marker"),
+        "output={output:?}"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_rejects_delayed_provider_framing_before_delivery() {
+    let agents_dir = temp_agents_dir_with(
+        "input-wait-delayed-provider",
+        "input-wait-codex",
+        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
+    );
+    std::fs::write(
+        agents_dir.join("input-wait-claude.toml"),
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
+    )
+    .expect("write Claude profile");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+
+    for agent in ["input-wait-codex", "input-wait-claude"] {
+        let mut create = params();
+        create.agent = agent.to_owned();
+        let created = registry.create(create).await.expect("create agent session");
+        let marker = format!("unsafe-wait-{agent}");
+
+        let error = registry
+            .input(protocol::SessionInputParams {
+                session_id: created.id.clone(),
+                text: marker.clone(),
+                wait: Some(protocol::SessionInputWait {
+                    until: Some(Vec::new()),
+                    timeout_ms: Some(500),
+                }),
+            })
+            .await
+            .expect_err("delayed provider wait must fail before delivery");
+
+        assert_eq!(error.code, "session_input_wait_unsupported");
+        registry
+            .input(protocol::SessionInputParams {
+                session_id: created.id.clone(),
+                text: "next-input".to_owned(),
+                wait: None,
+            })
+            .await
+            .expect("fire-and-forget keeps provider framing");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let output = read_session_output_after_rejection(&registry, &created.id).await;
+        assert!(!output.contains(&marker), "output={output:?}");
+        assert!(output.contains("got:next-input"), "output={output:?}");
+        let _ = registry.stop(&created.id).await;
+    }
+}
+
+#[tokio::test]
+async fn session_input_wait_rejects_blocked_transition_during_gate_for_all_adapters() {
+    let agents_dir = temp_agents_dir_with(
+        "input-wait-blocked-gate",
+        "input-wait-gate-codex",
+        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
+    );
+    std::fs::write(
+        agents_dir.join("input-wait-gate-claude.toml"),
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
+    )
+    .expect("write Claude profile");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        shell_command: observable_input_shell(),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+
+    for agent in ["shell", "input-wait-gate-codex", "input-wait-gate-claude"] {
+        let mut create = params();
+        create.agent = agent.to_owned();
+        let created = registry.create(create).await.expect("create agent session");
+        let input_gate = {
+            let sessions = registry.inner.sessions.lock().await;
+            std::sync::Arc::clone(&sessions.get(&created.id).expect("session entry").input_gate)
+        };
+        let gate_guard = input_gate.lock_owned().await;
+        let marker = format!("blocked-gate-{agent}");
+        let request = tokio::spawn({
+            let registry = registry.clone();
+            let session_id = created.id.clone();
+            let marker = marker.clone();
+            async move {
+                registry
+                    .input(protocol::SessionInputParams {
+                        session_id,
+                        text: marker,
+                        wait: Some(protocol::SessionInputWait {
+                            until: Some(vec![AgentActivity::Idle]),
+                            timeout_ms: Some(500),
+                        }),
+                    })
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        registry
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get_mut(&created.id)
+            .expect("session entry")
+            .info
+            .activity = Some(AgentActivity::Blocked);
+        drop(gate_guard);
+
+        let error = request
+            .await
+            .expect("wait request task joins")
+            .expect_err("blocked causal boundary must reject input");
+        assert_eq!(error.code, "session_agent_blocked", "agent={agent}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let output = read_session_output_after_rejection(&registry, &created.id).await;
+        assert!(
+            !output.contains(&marker),
+            "agent={agent}; output={output:?}"
+        );
+        let _ = registry.stop(&created.id).await;
+    }
+}
+
+#[tokio::test]
+async fn session_input_wait_boundary_excludes_activity_before_worker_write_reservation() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Working, 1)
+            .await
+            .recorded
+    );
+    let worker = {
+        let sessions = registry.inner.sessions.lock().await;
+        match &sessions.get(&created.id).expect("session entry").runtime {
+            RuntimeHandle::Worker(worker) => worker.clone(),
+            RuntimeHandle::Unavailable(state) => panic!("unexpected runtime state: {state:?}"),
+        }
+    };
+    let reservation = worker
+        .reserve_write(super::input::worker_input_fragments(
+            super::build_input_writes(
+                "never-sent-reservation",
+                InputRules::unrestricted(false, Duration::ZERO),
+            )
+            .expect("valid blocker plan"),
+            Duration::ZERO,
+        ))
+        .await
+        .expect("reserve worker write");
+    let request = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id,
+                    text: "reservation-boundary".to_owned(),
+                    wait: Some(protocol::SessionInputWait {
+                        until: Some(vec![AgentActivity::Idle]),
+                        timeout_ms: Some(150),
+                    }),
+                })
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Idle, 2)
+            .await
+            .recorded
+    );
+    drop(reservation);
+
+    let error = request
+        .await
+        .expect("waited input task joins")
+        .expect_err("pre-reservation activity must not confirm delivered input");
+    assert_eq!(error.code, "session_input_timeout");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_serializes_activity_snapshot_with_send_start() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Working, 1)
+            .await
+            .recorded
+    );
+    let mut events = registry.subscribe();
+    let send_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    let write = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        let send_boundary = Arc::clone(&send_boundary);
+        async move {
+            registry
+                .write_waited_input_at_send_boundary(
+                    &session_id,
+                    "serialized-boundary",
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                    send_boundary,
+                )
+                .await
+        }
+    });
+    send_boundary.wait().await;
+
+    let mut report = Box::pin(report_input_activity(
+        &registry,
+        &created.id,
+        AgentActivity::Idle,
+        2,
+    ));
+    tokio::select! {
+        biased;
+        result = &mut report => panic!("activity crossed the pre-send boundary: {result:?}"),
+        () = tokio::task::yield_now() => {}
+    }
+    registry
+        .inner
+        .sessions
+        .try_lock()
+        .expect_err("activity boundary must retain the session lock until send starts");
+
+    send_boundary.wait().await;
+    assert!(report.await.recorded);
+    let submission = write
+        .await
+        .expect("write task joins")
+        .expect("write starts after the serialized boundary");
+    let result = registry
+        .await_input_settled(
+            &created.id,
+            protocol::SessionInputWait {
+                until: Some(vec![AgentActivity::Idle]),
+                timeout_ms: Some(1_000),
+            },
+            submission.clone(),
+            &mut events,
+        )
+        .await
+        .expect("post-send activity settles the wait");
+
+    assert!(result.activity_revision > Some(submission.after_revision));
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_timeout_while_worker_reserved_never_sends_late_input() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: observable_input_shell(),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let worker = {
+        let sessions = registry.inner.sessions.lock().await;
+        match &sessions.get(&created.id).expect("session entry").runtime {
+            RuntimeHandle::Worker(worker) => worker.clone(),
+            RuntimeHandle::Unavailable(state) => panic!("unexpected runtime state: {state:?}"),
+        }
+    };
+    let reservation = worker
+        .reserve_write(super::input::worker_input_fragments(
+            super::build_input_writes(
+                "never-sent-reservation",
+                InputRules::unrestricted(false, Duration::ZERO),
+            )
+            .expect("valid blocker plan"),
+            Duration::ZERO,
+        ))
+        .await
+        .expect("reserve worker write");
+
+    let error = registry
+        .input(protocol::SessionInputParams {
+            session_id: created.id.clone(),
+            text: "must-not-arrive-late".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: Some(vec![AgentActivity::Idle]),
+                timeout_ms: Some(25),
+            }),
+        })
+        .await
+        .expect_err("blocked reservation must consume the overall deadline");
+    assert_eq!(error.code, "session_input_timeout");
+    drop(reservation);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    registry
+        .input(protocol::SessionInputParams {
+            session_id: created.id.clone(),
+            text: "next-input".to_owned(),
+            wait: None,
+        })
+        .await
+        .expect("next input succeeds after timed out reservation");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    assert!(
+        !output.contains("must-not-arrive-late"),
+        "output={output:?}"
+    );
+    assert!(output.contains("received:next-input"), "output={output:?}");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_shutdown_while_worker_reserved_never_sends_late_input() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: observable_input_shell(),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let worker = {
+        let sessions = registry.inner.sessions.lock().await;
+        match &sessions.get(&created.id).expect("session entry").runtime {
+            RuntimeHandle::Worker(worker) => worker.clone(),
+            RuntimeHandle::Unavailable(state) => panic!("unexpected runtime state: {state:?}"),
+        }
+    };
+    let reservation = worker
+        .reserve_write(super::input::worker_input_fragments(
+            super::build_input_writes(
+                "never-sent-reservation",
+                InputRules::unrestricted(false, Duration::ZERO),
+            )
+            .expect("valid blocker plan"),
+            Duration::ZERO,
+        ))
+        .await
+        .expect("reserve worker write");
+    let request = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id,
+                    text: "must-not-arrive-after-shutdown".to_owned(),
+                    wait: Some(protocol::SessionInputWait {
+                        until: Some(vec![AgentActivity::Idle]),
+                        timeout_ms: Some(1_000),
+                    }),
+                })
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    registry.begin_daemon_shutdown();
+
+    let error = request
+        .await
+        .expect("waited input task joins")
+        .expect_err("shutdown must cancel the unsent reservation");
+    assert_eq!(error.code, "daemon_shutting_down");
+    drop(reservation);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    assert!(
+        !output.contains("must-not-arrive-after-shutdown"),
+        "output={output:?}"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_timeout_after_atomic_plan_does_not_stage_body() {
+    let agents_dir = temp_agents_dir_with(
+        "input-wait-plan-ack-deadline",
+        "input-wait-plan-ack-claude",
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        claude_submit_delay: Duration::ZERO,
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let mut create = params();
+    create.agent = "input-wait-plan-ack-claude".to_owned();
+    let created = registry
+        .create(create)
+        .await
+        .expect("create Claude session");
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+
+    let error = tokio::time::timeout(
+        Duration::from_millis(150),
+        registry.write_waited_input_with_ack_delay(
+            &created.id,
+            "atomic-plan-timeout",
+            deadline,
+            Duration::from_millis(250),
+        ),
+    )
+    .await
+    .expect("atomic plan must respect the overall deadline")
+    .expect_err("delayed plan ACK must time out");
+
+    assert_eq!(error.code, "session_input_timeout");
+    let mut next_input = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id,
+                    text: "next-input".to_owned(),
+                    wait: None,
+                })
+                .await
+        }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut next_input)
+            .await
+            .is_err(),
+        "input gate must remain held until the late worker ACK is consumed"
+    );
+    next_input
+        .await
+        .expect("next input task joins")
+        .expect("next input succeeds after the late plan ACK is consumed");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    assert!(
+        output.contains("got:atomic-plan-timeout"),
+        "output={output:?}"
+    );
+    assert!(output.contains("got:next-input"), "output={output:?}");
+    assert!(!output.contains("got:atomic-plan-timeoutnext-input"));
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_serializes_waited_transactions() {
+    let agents_dir = temp_agents_dir_with(
+        "input-wait-serialized",
+        "input-wait-serialized-claude",
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        claude_submit_delay: Duration::ZERO,
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let mut create = params();
+    create.agent = "input-wait-serialized-claude".to_owned();
+    let created = registry
+        .create(create)
+        .await
+        .expect("create Claude session");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let first = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            registry
+                .write_waited_input_with_ack_delay(
+                    &session_id,
+                    "first-waited",
+                    deadline,
+                    Duration::from_millis(100),
+                )
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let second = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            registry
+                .write_waited_input_with_ack_delay(
+                    &session_id,
+                    "second-waited",
+                    deadline,
+                    Duration::ZERO,
+                )
+                .await
+        }
+    });
+
+    first
+        .await
+        .expect("first waited task joins")
+        .expect("first waited transaction succeeds");
+    second
+        .await
+        .expect("second waited task joins")
+        .expect("second waited transaction succeeds");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    let first_position = output.find("got:first-waited").expect("first output");
+    let second_position = output.find("got:second-waited").expect("second output");
+    assert!(first_position < second_position, "output={output:?}");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_serializes_waited_and_fire_and_forget_transactions() {
+    let agents_dir = temp_agents_dir_with(
+        "input-wait-fire-serialized",
+        "input-wait-fire-serialized-claude",
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        claude_submit_delay: Duration::ZERO,
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let mut create = params();
+    create.agent = "input-wait-fire-serialized-claude".to_owned();
+    let created = registry
+        .create(create)
+        .await
+        .expect("create Claude session");
+    let first = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            registry
+                .write_waited_input_with_ack_delay(
+                    &session_id,
+                    "first-waited",
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                    Duration::from_millis(100),
+                )
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let second = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id,
+                    text: "second-fire".to_owned(),
+                    wait: None,
+                })
+                .await
+        }
+    });
+
+    first
+        .await
+        .expect("waited task joins")
+        .expect("waited transaction succeeds");
+    second
+        .await
+        .expect("fire task joins")
+        .expect("fire-and-forget transaction succeeds");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let output = read_session_output_after_rejection(&registry, &created.id).await;
+    let first_position = output.find("got:first-waited").expect("waited output");
+    let second_position = output.find("got:second-fire").expect("fire output");
+    assert!(first_position < second_position, "output={output:?}");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_accepts_activity_between_submit_flush_and_ack() {
+    let agents_dir = temp_agents_dir_with(
+        "input-wait-submit-ack",
+        "input-wait-ack-claude",
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        claude_submit_delay: Duration::ZERO,
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let mut create = params();
+    create.agent = "input-wait-ack-claude".to_owned();
+    let created = registry
+        .create(create)
+        .await
+        .expect("create Claude session");
+    let mut events = registry.subscribe();
+    let reports = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert!(
+                report_input_activity(&registry, &session_id, AgentActivity::Idle, 1)
+                    .await
+                    .recorded
+            );
+            tokio::time::sleep(Duration::from_millis(225)).await;
+            report_input_activity(&registry, &session_id, AgentActivity::Blocked, 2).await
+        }
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+
+    let submission = registry
+        .write_waited_input_with_ack_delay(
+            &created.id,
+            "submit-boundary",
+            deadline,
+            Duration::from_millis(500),
+        )
+        .await
+        .expect("submit write completes after delayed acknowledgement");
+    let result = registry
+        .await_input_settled(
+            &created.id,
+            protocol::SessionInputWait {
+                until: Some(Vec::new()),
+                timeout_ms: Some(1_000),
+            },
+            submission,
+            &mut events,
+        )
+        .await
+        .expect("activity after submit flush but before ACK settles the wait");
+
+    assert_eq!(result.activity, Some(AgentActivity::Idle));
+    assert_eq!(result.activity_source, Some(StateSource::Report));
+    assert!(reports.await.expect("report task joins").recorded);
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_timeout_recheck_rejects_evidence_after_deadline() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let snapshot = registry
+        .input_activity_snapshot(&created.id, None)
+        .await
+        .expect("capture causal boundary");
+    tokio::time::pause();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+    let submission = InputSubmission {
+        runtime: snapshot.runtime,
+        activity_epoch: registry.daemon_instance_id().to_owned(),
+        after_revision: snapshot.revision,
+        deadline,
+    };
+    tokio::time::advance(Duration::from_millis(11)).await;
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Idle, 1)
+            .await
+            .recorded
+    );
+
+    assert!(registry
+        .evaluate_input_wait(&created.id, &[AgentActivity::Idle], &submission, None,)
+        .await
+        .expect("evaluate late evidence")
+        .is_none());
+    let mut events = registry.subscribe();
+    let error = registry
+        .await_input_settled(
+            &created.id,
+            protocol::SessionInputWait {
+                until: Some(vec![AgentActivity::Idle]),
+                timeout_ms: Some(10),
+            },
+            submission,
+            &mut events,
+        )
+        .await
+        .expect_err("timeout recheck must reject post-deadline evidence");
+    assert_eq!(error.code, "session_input_timeout");
+    tokio::time::resume();
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_retains_pre_deadline_evidence_after_late_same_activity() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let snapshot = registry
+        .input_activity_snapshot(&created.id, None)
+        .await
+        .expect("capture causal boundary");
+    tokio::time::pause();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+    let expected_revision = protocol::ActivityRevision::new(snapshot.revision.get() + 1);
+    let submission = InputSubmission {
+        runtime: snapshot.runtime,
+        activity_epoch: registry.daemon_instance_id().to_owned(),
+        after_revision: snapshot.revision,
+        deadline,
+    };
+    tokio::time::advance(Duration::from_millis(5)).await;
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Idle, 1)
+            .await
+            .recorded
+    );
+    tokio::time::advance(Duration::from_millis(6)).await;
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Idle, 2)
+            .await
+            .recorded
+    );
+
+    let result = registry
+        .evaluate_input_wait(&created.id, &[AgentActivity::Idle], &submission, None)
+        .await
+        .expect("evaluate retained evidence")
+        .expect("pre-deadline evidence remains available");
+    assert_eq!(result.activity_revision, Some(expected_revision));
+    tokio::time::resume();
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn daemon_reconnect_scopes_reset_activity_revision_with_new_epoch() {
+    let first = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let second = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let first_session = first.create(params()).await.expect("create first session");
+    let second_session = second
+        .create(params())
+        .await
+        .expect("create second session");
+    let first_runtime = first
+        .inspect(&first_session.id)
+        .await
+        .expect("inspect first runtime")
+        .runtime
+        .expect("first runtime");
+    let second_runtime = {
+        let mut sessions = second.inner.sessions.lock().await;
+        let entry = sessions
+            .get_mut(&second_session.id)
+            .expect("second session entry");
+        entry.info.runtime.replace(first_runtime.clone())
+    };
+    let mut first_events = first.subscribe();
+    let mut second_events = second.subscribe();
+
+    assert!(
+        report_input_activity(&first, &first_session.id, AgentActivity::Idle, 1)
+            .await
+            .recorded
+    );
+    assert!(
+        report_input_activity(&second, &second_session.id, AgentActivity::Idle, 1)
+            .await
+            .recorded
+    );
+    let first_event = next_agent_state_event(&mut first_events).await;
+    let second_event = next_agent_state_event(&mut second_events).await;
+
+    assert_eq!(first_event.runtime, second_event.runtime);
+    assert_eq!(first_event.revision, second_event.revision);
+    assert_eq!(
+        first_event.revision,
+        Some(protocol::ActivityRevision::new(1))
+    );
+    assert_eq!(
+        first_event.activity_epoch.as_deref(),
+        Some(first.daemon_instance_id())
+    );
+    assert_eq!(
+        second_event.activity_epoch.as_deref(),
+        Some(second.daemon_instance_id())
+    );
+    assert_ne!(first_event.activity_epoch, second_event.activity_epoch);
+
+    let mut sessions = second.inner.sessions.lock().await;
+    sessions
+        .get_mut(&second_session.id)
+        .expect("second session entry")
+        .info
+        .runtime = second_runtime;
+    drop(sessions);
+    let _ = first.stop(&first_session.id).await;
+    let _ = second.stop(&second_session.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_resnapshots_after_broadcast_lag() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let mut events = registry.subscribe();
+    let submitted_revision = registry
+        .input_activity_snapshot(&created.id, None)
+        .await
+        .expect("snapshot activity");
+    let submission = InputSubmission {
+        runtime: submitted_revision.runtime.clone(),
+        activity_epoch: registry.daemon_instance_id().to_owned(),
+        after_revision: submitted_revision.revision,
+        deadline: tokio::time::Instant::now() + Duration::from_millis(250),
+    };
+    for sequence in 1..=130 {
+        assert!(
+            report_input_activity(&registry, &created.id, AgentActivity::Working, sequence,)
+                .await
+                .recorded
+        );
+    }
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Idle, 131)
+            .await
+            .recorded
+    );
+
+    let result = registry
+        .await_input_settled(
+            &created.id,
+            protocol::SessionInputWait {
+                until: Some(vec![AgentActivity::Idle]),
+                timeout_ms: Some(100),
+            },
+            submission,
+            &mut events,
+        )
+        .await
+        .expect("lagged receiver must settle from a fresh snapshot");
+
+    assert_eq!(result.activity, Some(AgentActivity::Idle));
+    assert_eq!(result.activity_source, Some(StateSource::Report));
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_uses_rapid_target_event_after_latest_state_changes() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let mut events = registry.subscribe();
+    let submitted = registry
+        .input_activity_snapshot(&created.id, None)
+        .await
+        .expect("capture submitted revision");
+    let submission = InputSubmission {
+        runtime: submitted.runtime.clone(),
+        activity_epoch: registry.daemon_instance_id().to_owned(),
+        after_revision: submitted.revision,
+        deadline: tokio::time::Instant::now() + Duration::from_millis(250),
+    };
+
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Idle, 1)
+            .await
+            .recorded
+    );
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Working, 2)
+            .await
+            .recorded
+    );
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect latest activity")
+            .activity,
+        Some(AgentActivity::Working)
+    );
+
+    let result = registry
+        .await_input_settled(
+            &created.id,
+            protocol::SessionInputWait {
+                until: Some(vec![AgentActivity::Idle]),
+                timeout_ms: Some(100),
+            },
+            submission,
+            &mut events,
+        )
+        .await
+        .expect("queued target event settles despite a newer non-target snapshot");
+
+    assert_eq!(result.activity, Some(AgentActivity::Idle));
+    assert_eq!(result.runtime.as_ref(), Some(&submitted.runtime));
+    assert!(result.activity_revision > Some(submitted.revision));
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_rejects_replaced_runtime() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let mut events = registry.subscribe();
+    let submitted = registry
+        .input_activity_snapshot(&created.id, None)
+        .await
+        .expect("capture original runtime");
+    let submission = InputSubmission {
+        runtime: submitted.runtime,
+        activity_epoch: registry.daemon_instance_id().to_owned(),
+        after_revision: submitted.revision,
+        deadline: tokio::time::Instant::now() + Duration::from_millis(250),
+    };
+    let replacement = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("session entry");
+        let runtime = entry.info.runtime.as_mut().expect("managed runtime");
+        runtime.runtime_id = Some("runtime-replacement".to_owned());
+        runtime.runtime_generation =
+            protocol::RuntimeGeneration::new(runtime.runtime_generation.get() + 1);
+        entry.info.clone()
+    };
+    registry.emit(protocol::event::SESSION_UPDATED, &replacement);
+
+    let error = registry
+        .await_input_settled(
+            &created.id,
+            protocol::SessionInputWait {
+                until: Some(vec![AgentActivity::Idle]),
+                timeout_ms: Some(100),
+            },
+            submission,
+            &mut events,
+        )
+        .await
+        .expect_err("replacement runtime must not confirm prior input");
+
+    assert_eq!(error.code, "session_runtime_changed");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_rejects_runtime_exit() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let mut events = registry.subscribe();
+    let submitted = registry
+        .input_activity_snapshot(&created.id, None)
+        .await
+        .expect("capture running runtime");
+    let submission = InputSubmission {
+        runtime: submitted.runtime,
+        activity_epoch: registry.daemon_instance_id().to_owned(),
+        after_revision: submitted.revision,
+        deadline: tokio::time::Instant::now() + Duration::from_millis(250),
+    };
+    registry.stop(&created.id).await.expect("stop session");
+
+    let error = registry
+        .await_input_settled(
+            &created.id,
+            protocol::SessionInputWait {
+                until: Some(vec![AgentActivity::Idle]),
+                timeout_ms: Some(100),
+            },
+            submission,
+            &mut events,
+        )
+        .await
+        .expect_err("exited runtime must not confirm prior input");
+
+    assert_eq!(error.code, "session_not_running");
+}
+
+#[tokio::test]
+async fn duplicate_agent_report_sequence_is_idempotent_for_input_waits() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let submitted = registry
+        .input_activity_snapshot(&created.id, None)
+        .await
+        .expect("capture initial revision");
+    let submission = InputSubmission {
+        runtime: submitted.runtime.clone(),
+        activity_epoch: registry.daemon_instance_id().to_owned(),
+        after_revision: submitted.revision,
+        deadline: tokio::time::Instant::now() + Duration::from_millis(250),
+    };
+    assert!(
+        report_input_activity(&registry, &created.id, AgentActivity::Idle, 7)
+            .await
+            .recorded
+    );
+    let first = registry
+        .input_activity_snapshot(&created.id, Some(&submitted.runtime))
+        .await
+        .expect("capture first accepted report");
+
+    let duplicate = report_input_activity(&registry, &created.id, AgentActivity::Blocked, 7).await;
+    assert!(!duplicate.recorded);
+    let after_duplicate = registry
+        .input_activity_snapshot(&created.id, Some(&submitted.runtime))
+        .await
+        .expect("capture duplicate outcome");
+    assert_eq!(after_duplicate.revision, first.revision);
+    assert_eq!(after_duplicate.activity, Some(AgentActivity::Idle));
+
+    let mut events = registry.subscribe();
+    let error = registry
+        .await_input_settled(
+            &created.id,
+            protocol::SessionInputWait {
+                until: Some(vec![AgentActivity::Blocked]),
+                timeout_ms: Some(25),
+            },
+            submission,
+            &mut events,
+        )
+        .await
+        .expect_err("duplicate sequence must not synthesize blocked evidence");
+    assert_eq!(error.code, "session_input_timeout");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_is_cancelled_by_daemon_shutdown() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let wait = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id,
+                    text: "wait for shutdown".to_owned(),
+                    wait: Some(protocol::SessionInputWait {
+                        until: Some(vec![AgentActivity::Blocked]),
+                        timeout_ms: Some(1_000),
+                    }),
+                })
+                .await
+        }
+    });
+    wait_for_session_waiters(&registry, &created.id, 1).await;
+
+    registry.begin_daemon_shutdown();
+    let error = wait
+        .await
+        .expect("input wait task joins")
+        .expect_err("shutdown must cancel input wait");
+
+    assert_eq!(error.code, "daemon_shutting_down");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_obeys_per_session_waiter_limit() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        observation_global_waiters: 2,
+        observation_session_waiters: 1,
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let first = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            registry
+                .input(protocol::SessionInputParams {
+                    session_id,
+                    text: "first waiter".to_owned(),
+                    wait: Some(protocol::SessionInputWait {
+                        until: Some(vec![AgentActivity::Blocked]),
+                        timeout_ms: Some(1_000),
+                    }),
+                })
+                .await
+        }
+    });
+    wait_for_session_waiters(&registry, &created.id, 1).await;
+
+    let error = registry
+        .input(protocol::SessionInputParams {
+            session_id: created.id.clone(),
+            text: "second waiter".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: Some(vec![AgentActivity::Blocked]),
+                timeout_ms: Some(1_000),
+            }),
+        })
+        .await
+        .expect_err("second waiter for one session must be rejected");
+
+    assert_eq!(error.code, "session_waiter_limit_reached");
+    first.abort();
+    let _ = first.await;
+    wait_for_session_waiters(&registry, &created.id, 0).await;
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn session_input_wait_deduplicates_targets_and_requires_new_event() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let mut events = registry.subscribe();
+
+    let report_task = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            registry
+                .report_agent(protocol::SessionReportAgentParams {
+                    session_id,
+                    source: "test:pohunek-input-wait".to_owned(),
+                    agent: "codex".to_owned(),
+                    activity: Some(AgentActivity::Idle),
+                    seq: Some(protocol::ReportSequence::new(1)),
+                    pid: None,
+                    agent_session_id: None,
+                    agent_session_path: None,
+                })
+                .await
+        }
+    });
+
+    let result = registry
+        .input(protocol::SessionInputParams {
+            session_id: created.id.clone(),
+            text: "\n".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: Some(vec![
+                    AgentActivity::Idle,
+                    AgentActivity::Blocked,
+                    AgentActivity::Idle,
+                ]),
+                timeout_ms: Some(1_000),
+            }),
+        })
+        .await
+        .expect("input waits for a new matching state event");
+    assert!(result.accepted);
+    assert_eq!(result.activity, Some(AgentActivity::Idle));
+    assert_eq!(result.activity_source, Some(StateSource::Report));
+
+    let report = report_task.await.expect("report task joins");
+    assert!(report.recorded);
+    while let Ok(event) = tokio::time::timeout(Duration::from_millis(20), events.recv()).await {
+        let _ = event;
+    }
+
+    let _ = registry.stop(&created.id).await;
+}
+
+async fn read_session_output_after_rejection(registry: &SessionRegistry, id: &SessionId) -> String {
+    let output = registry
+        .screen(id)
+        .await
+        .expect("inspect terminal after rejected input");
+    output.visible_lines.join("\n")
+}
+
+fn observable_input_shell() -> ShellCommand {
+    ShellCommand::new(
+        "/bin/sh",
+        [
+            "-c",
+            "IFS= read -r line; printf 'received:%s\\n' \"$line\"; sleep 30",
+        ],
+    )
+}
+
+async fn report_input_activity(
+    registry: &SessionRegistry,
+    session_id: &SessionId,
+    activity: AgentActivity,
+    sequence: u64,
+) -> protocol::SessionReportAgentResult {
+    registry
+        .report_agent(protocol::SessionReportAgentParams {
+            session_id: session_id.clone(),
+            source: "test:pohunek-input-wait".to_owned(),
+            agent: "codex".to_owned(),
+            activity: Some(activity),
+            seq: Some(protocol::ReportSequence::new(sequence)),
+            pid: None,
+            agent_session_id: None,
+            agent_session_path: None,
+        })
+        .await
+}
+
+async fn wait_for_session_waiters(
+    registry: &SessionRegistry,
+    session_id: &SessionId,
+    expected: usize,
+) {
+    for _ in 0..100 {
+        let count = registry
+            .inner
+            .observation_session_waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .copied()
+            .unwrap_or_default();
+        if count == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("timed out waiting for {expected} session input waiters");
 }
 
 #[test]
@@ -3749,7 +5812,7 @@ async fn report_agent_reconfigures_detector_and_release_restores_default_config(
             .subscribe()
     };
 
-    let default_config = detector_config_rx.borrow().clone();
+    let default_config = detector_config_rx.borrow().config.clone();
     assert_eq!(title_activity(&default_config, "profile-only-title"), None);
 
     let report = registry
@@ -3769,7 +5832,7 @@ async fn report_agent_reconfigures_detector_and_release_restores_default_config(
         .changed()
         .await
         .expect("active detector config");
-    let active_config = detector_config_rx.borrow().clone();
+    let active_config = detector_config_rx.borrow().config.clone();
     assert_eq!(
         title_activity(&active_config, "profile-only-title"),
         Some(AgentActivity::Blocked)
@@ -3788,8 +5851,68 @@ async fn report_agent_reconfigures_detector_and_release_restores_default_config(
         .changed()
         .await
         .expect("default detector config");
-    let restored_config = detector_config_rx.borrow().clone();
+    let restored_config = detector_config_rx.borrow().config.clone();
     assert_eq!(title_activity(&restored_config, "profile-only-title"), None);
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn detection_rpc_returns_a_bounded_typed_error_for_oversized_previews() {
+    const PREVIEW_COUNT: usize = 128;
+    const PREVIEW_TEXT_BYTES: usize = 16 * 1024;
+
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let previews = (0..PREVIEW_COUNT)
+        .map(|index| DetectionRegionPreview {
+            kind: DetectionRegionKind::BottomLines,
+            region: format!("bottom_lines({})", index + 1),
+            text: "x".repeat(PREVIEW_TEXT_BYTES),
+        })
+        .collect::<Vec<_>>();
+    let (preview_tx, mut preview_rx) = tokio::sync::mpsc::channel(1);
+    let mut sessions = registry.inner.sessions.lock().await;
+    sessions
+        .get_mut(&created.id)
+        .expect("session entry")
+        .detector_preview = preview_tx;
+    drop(sessions);
+    tokio::spawn(async move {
+        let request = preview_rx.recv().await.expect("preview request");
+        request.reply.send(Ok(previews)).expect("preview reply");
+    });
+    let request = Request::new(
+        "x".repeat(MAX_REQUEST_ID_BYTES),
+        method::SESSION_DETECTION,
+        serde_json::to_value(SessionDetectionParams::new(created.id.clone()))
+            .expect("detection params serialize"),
+    )
+    .expect("valid request");
+    let state = DaemonState::new(
+        HealthInfo::new("test"),
+        registry.clone(),
+        crate::test_support::overlay_registry(),
+    );
+
+    let line = serde_json::to_string(&request).expect("request serializes");
+    let crate::api::Dispatch::Reply(serialized) = dispatch_line(&line, &state).await else {
+        panic!("session.detection returns a one-shot reply");
+    };
+    assert!(serialized.len() <= MAX_CONTROL_LINE_BYTES);
+    let response: Response = serde_json::from_str(&serialized).expect("response deserializes");
+    let error = response
+        .into_result()
+        .expect_err("oversized detection returns a typed error");
+    assert_eq!(error.class, ErrorClass::Runtime);
+    assert_eq!(error.code, "session_detection_response_too_large");
 
     let _ = registry.stop(&created.id).await;
 }
@@ -3819,6 +5942,7 @@ async fn osc_7_output_updates_cwd_before_next_procwatch_tick() {
         .input(protocol::SessionInputParams {
             session_id: created.id.clone(),
             text: "trigger".to_owned(),
+            wait: None,
         })
         .await
         .expect("trigger OSC 7 output");
@@ -4270,6 +6394,7 @@ async fn report_agent_returns_false_for_unknown_agent() {
 fn codex_fact(process_id: Pid, parent_id: Pid) -> ProcessFact {
     ProcessFact {
         pid: process_id,
+        pgid: process_id,
         ppid: parent_id,
         start_identity: u64::from(process_id),
         comm: "codex".to_owned(),
@@ -4280,6 +6405,7 @@ fn codex_fact(process_id: Pid, parent_id: Pid) -> ProcessFact {
 fn claude_fact(process_id: Pid, parent_id: Pid) -> ProcessFact {
     ProcessFact {
         pid: process_id,
+        pgid: process_id,
         ppid: parent_id,
         start_identity: u64::from(process_id),
         comm: "claude".to_owned(),
@@ -4309,6 +6435,8 @@ const PID_REUSE_AGENT_PID: Pid = 225;
 const FOREIGN_AGENT_PID: Pid = 240;
 /// Delay separating pid-reuse observations so `first_seen` changes if reset.
 const PID_REUSE_RESCAN_DELAY: Duration = Duration::from_millis(5);
+/// Bound proving a blocked foreground probe does not hold the session mutex.
+const FOREGROUND_LOCK_TEST_TIMEOUT: Duration = Duration::from_secs(1);
 
 async fn mock_procwatch_registry(tag: &str) -> (SessionRegistry, Arc<MockInspector>, SessionInfo) {
     let inspector = Arc::new(MockInspector::default());
@@ -4409,6 +6537,7 @@ async fn direct_agent_root_pid_hook_claim_survives_procwatch_reconciles() {
     let (registry, inspector, created) = mock_direct_codex_registry("direct-root").await;
     inspector.set_descendants(created.pid, Vec::new());
     inspector.set_cwd(created.pid, temp_dir("direct-root-cwd"));
+    inspector.set_foreground_group(created.pid, Some(created.pid));
 
     let report = registry
         .report_agent(SessionReportAgentParams {
@@ -4446,6 +6575,7 @@ async fn direct_agent_without_hook_does_not_auto_report_root() {
     let (registry, inspector, created) = mock_direct_codex_registry("direct-no-hook").await;
     inspector.set_descendants(created.pid, Vec::new());
     inspector.set_cwd(created.pid, temp_dir("direct-no-hook-cwd"));
+    inspector.set_foreground_group(created.pid, Some(created.pid));
 
     for _ in 0..DIRECT_AGENT_RESCAN_COUNT {
         registry
@@ -4457,6 +6587,39 @@ async fn direct_agent_without_hook_does_not_auto_report_root() {
         assert_eq!(inspected.active_agent_pid, None);
     }
 
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreground_probe_does_not_hold_global_session_lock() {
+    let (registry, inspector, created) = mock_procwatch_registry("foreground-lock").await;
+    inspector.set_descendants(created.pid, Vec::new());
+    inspector.set_foreground_group(created.pid, Some(created.pid));
+    let block = inspector.block_foreground();
+    let scan_registry = registry.clone();
+    let scan_id = created.id.clone();
+    let root_pid = created.pid;
+    let scan = tokio::spawn(async move {
+        scan_registry
+            .rescan_procwatch_at(&scan_id, root_pid, Instant::now())
+            .await;
+    });
+
+    tokio::time::timeout(FOREGROUND_LOCK_TEST_TIMEOUT, async {
+        while !block.entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("foreground probe should start");
+
+    tokio::time::timeout(FOREGROUND_LOCK_TEST_TIMEOUT, registry.inspect(&created.id))
+        .await
+        .expect("inspect must not wait for foreground probe")
+        .expect("inspect session");
+
+    block.released.store(true, Ordering::Release);
+    scan.await.expect("foreground rescan task");
     let _ = registry.stop(&created.id).await;
 }
 
@@ -4484,14 +6647,15 @@ async fn procwatch_refreshes_agent_base_when_pid_is_reused() {
         observed.first_seen
     };
 
-    inspector.set_descendants(
-        created.pid,
-        vec![claude_fact(PID_REUSE_AGENT_PID, created.pid)],
-    );
+    let mut replacement = claude_fact(PID_REUSE_AGENT_PID, created.pid);
+    replacement.start_identity = u64::from(PID_REUSE_AGENT_PID) + 1;
+    replacement.pgid = PID_REUSE_AGENT_PID + 10;
+    inspector.set_descendants(created.pid, vec![replacement]);
     let second_scan = first_seen + PID_REUSE_RESCAN_DELAY;
     registry
         .rescan_procwatch_at(&created.id, created.pid, second_scan)
         .await;
+    assert_eq!(inspector.exit_watch_count(PID_REUSE_AGENT_PID), 2);
 
     {
         let sessions = registry.inner.sessions.lock().await;
@@ -4503,8 +6667,26 @@ async fn procwatch_refreshes_agent_base_when_pid_is_reused() {
             .find(|observed| observed.pid == PID_REUSE_AGENT_PID)
             .expect("observed reused pid");
         assert_eq!(observed.agent_base, AgentKind::Claude);
+        assert_eq!(observed.start_identity, u64::from(PID_REUSE_AGENT_PID) + 1);
+        assert_eq!(observed.pgid, PID_REUSE_AGENT_PID + 10);
         assert_eq!(observed.first_seen, second_scan);
     };
+
+    registry
+        .on_observed_agent_exit(
+            &created.id,
+            (PID_REUSE_AGENT_PID, u64::from(PID_REUSE_AGENT_PID)),
+        )
+        .await;
+    let after_old_exit = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(after_old_exit.active_agent.as_deref(), Some("claude"));
+    assert_eq!(after_old_exit.active_agent_pid, Some(PID_REUSE_AGENT_PID));
+
+    inspector.set_descendants(created.pid, Vec::new());
+    inspector.fire_exit_watch(PID_REUSE_AGENT_PID, 1);
+    let after_new_exit = wait_for_active_agent_pid(&registry, &created.id, None).await;
+    assert_eq!(after_new_exit.active_agent, None);
+
     let _ = registry.stop(&created.id).await;
 }
 
@@ -4705,6 +6887,37 @@ async fn external_rescan_skips_processes_marked_by_any_pohunek_daemon() {
     assert_eq!(sessions.len(), 1, "unmarked agent surfaces as external");
     assert_eq!(sessions[0].external, Some(true));
     assert_eq!(sessions[0].pid, FOREIGN_AGENT_PID);
+}
+
+#[tokio::test]
+async fn session_read_rejects_external_observe_only_sessions() {
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    inspector.set_descendants(1, vec![codex_fact(FOREIGN_AGENT_PID, 1)]);
+    inspector.set_cwd(FOREIGN_AGENT_PID, temp_dir("external-session-read"));
+
+    registry
+        .rescan_external_agents(&TranscriptIndex::default())
+        .await;
+    let external = registry.list().await.into_iter().next().expect("external");
+
+    let params = SessionReadParams::new(external.id, None, None, None).expect("read params");
+    let error = registry
+        .session_read(&params)
+        .await
+        .expect_err("external sessions cannot be read");
+    assert_eq!(error.code, "session_external_read_only");
+    assert!(error
+        .recover
+        .as_deref()
+        .is_some_and(|hint| hint.contains("pohunek")));
 }
 
 #[tokio::test]
@@ -5784,6 +7997,22 @@ async fn next_runtime_event(events: &mut tokio::sync::broadcast::Receiver<Event>
             .expect("runtime event");
         if is_runtime_transition_event(event.event()) {
             return event.event().to_owned();
+        }
+    }
+}
+
+async fn next_agent_state_event(
+    events: &mut tokio::sync::broadcast::Receiver<Event>,
+) -> protocol::AgentStateEvent {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("agent state event timeout")
+            .expect("agent state event");
+        if event.event() == protocol::event::AGENT_STATE {
+            return serde_json::from_value(event.payload().clone())
+                .expect("valid agent state event");
         }
     }
 }

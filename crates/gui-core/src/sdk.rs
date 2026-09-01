@@ -4,14 +4,15 @@ use std::collections::BTreeMap;
 
 use pohunek_client::Client;
 use protocol::{
-    method, NotificationDeleteParams, NotificationDeleteResult, NotificationListParams,
-    NotificationListResult, NotificationPolicyParams, NotificationPolicyResult, NotificationRecord,
-    NotificationStatus, NotificationUpdateParams, NotificationUpdateResult, ProjectActionParams,
-    ProjectActionResult, ProjectActionsParams, ProjectActionsResult, ProjectAddParams, ProjectInfo,
-    ProjectListParams, ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams,
-    ProjectRemoveResult, ProjectRenameParams, ProjectShowParams, ProjectShowResult,
-    SessionDiffParams, SessionDiffResult, SessionForkParams, SessionForkResult, SessionId,
-    SessionInfo, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
+    method, IntegrationStatusParams, IntegrationStatusResult, NotificationDeleteParams,
+    NotificationDeleteResult, NotificationListParams, NotificationListResult,
+    NotificationPolicyParams, NotificationPolicyResult, NotificationRecord, NotificationStatus,
+    NotificationUpdateParams, NotificationUpdateResult, ProjectActionParams, ProjectActionResult,
+    ProjectActionsParams, ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams,
+    ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult,
+    ProjectRenameParams, ProjectShowParams, ProjectShowResult, SessionDiffParams,
+    SessionDiffResult, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
+    SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
     SessionOutputResult, SessionRemoveResult, SessionRenameParams, SessionRenameResult,
     SessionResumeResult, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
     SessionSetMetadataResult, SessionStopResult, SessionWaitParams, SessionWaitResult,
@@ -39,6 +40,27 @@ pub async fn load_host(config: HostConfig) -> DomainEvent {
 /// Load one host snapshot and return typed data for headless tests.
 pub async fn load_host_snapshot(config: &HostConfig) -> Result<HostSnapshot, CoreError> {
     load_host_snapshot_with_options(config, ConnectionOptions::default()).await
+}
+
+/// Inspect daemon-managed hook integrations on a host.
+pub async fn integration_status(
+    config: &HostConfig,
+    params: IntegrationStatusParams,
+) -> Result<IntegrationStatusResult, CoreError> {
+    integration_status_with_options(config, params, ConnectionOptions::default()).await
+}
+
+/// Inspect hook integrations with explicit connection options.
+pub async fn integration_status_with_options(
+    config: &HostConfig,
+    params: IntegrationStatusParams,
+    options: ConnectionOptions,
+) -> Result<IntegrationStatusResult, CoreError> {
+    let mut client = connect_client(config, options).await?;
+    client
+        .integration_status(params)
+        .await
+        .map_err(CoreError::from)
 }
 
 /// Create a session on a host through the SDK.

@@ -10,6 +10,8 @@ import type {
   HostRecord,
   IntegrationInstallParams,
   IntegrationInstallResult,
+  IntegrationStatusParams,
+  IntegrationStatusResult,
   JsonValue,
   NotificationCreateParams,
   NotificationCreateResult,
@@ -42,6 +44,8 @@ import type {
   SessionAttachResult,
   SessionDetachParams,
   SessionDetachResult,
+  SessionDetectionParams,
+  SessionDetectionResult,
   SessionDiffParams,
   SessionDiffResult,
   SessionForkParams,
@@ -55,6 +59,8 @@ import type {
   SessionNewResult,
   SessionOutputParams,
   SessionOutputResult,
+  SessionReadParams,
+  SessionReadResult,
   SessionReleaseAgentParams,
   SessionReleaseAgentResult,
   SessionRemoveResult,
@@ -85,6 +91,7 @@ export interface Methods {
   "host.discover": { params: HostDiscoverParams; output: HostRecord[] };
   "host.inspect": { params: null; output: HostCapabilities };
   "integration.install": { params: IntegrationInstallParams; output: IntegrationInstallResult };
+  "integration.status": { params: IntegrationStatusParams; output: IntegrationStatusResult };
   "notification.create": { params: NotificationCreateParams; output: NotificationCreateResult };
   "notification.delete": { params: NotificationDeleteParams; output: NotificationDeleteResult };
   "notification.list": { params: NotificationListParams; output: NotificationListResult };
@@ -102,6 +109,7 @@ export interface Methods {
   "project.show": { params: ProjectShowParams; output: ProjectShowResult };
   "session.attach": { params: SessionAttachParams; output: SessionAttachResult };
   "session.detach": { params: SessionDetachParams; output: SessionDetachResult };
+  "session.detection": { params: SessionDetectionParams; output: SessionDetectionResult };
   "session.diff": { params: SessionDiffParams; output: SessionDiffResult };
   "session.fork": { params: SessionForkParams; output: SessionForkResult };
   "session.input": { params: SessionInputParams; output: SessionInputResult };
@@ -109,6 +117,7 @@ export interface Methods {
   "session.list": { params: SessionListParams; output: SessionInfo[] };
   "session.new": { params: SessionNewParams; output: SessionNewResult };
   "session.output": { params: SessionOutputParams; output: SessionOutputResult };
+  "session.read": { params: SessionReadParams; output: SessionReadResult };
   "session.release_agent": { params: SessionReleaseAgentParams; output: SessionReleaseAgentResult };
   "session.remove": { params: SessionId; output: SessionRemoveResult };
   "session.rename": { params: SessionRenameParams; output: SessionRenameResult };

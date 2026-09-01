@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, type ProtocolError, type SessionInfo } from "@pohunek/protocol";
+import { MAX_CONTROL_LINE_BYTES, MAX_SESSION_WAIT_MS, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, type ProtocolError, type SessionInfo } from "@pohunek/protocol";
 import {
   Client,
   ClientError,
@@ -350,8 +350,17 @@ describe("Client request/response", () => {
       terminal_watermark: "2",
       output_offset: "0",
     } as const;
+    const input = {
+      accepted: true,
+      activity: "idle",
+      activity_source: "report",
+      runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+      activity_epoch: "d-epoch-1",
+      activity_revision: "2",
+    } as const;
     const daemon = await startUnixDaemon([
       { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), screen) },
+      { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), input) },
       { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), output) },
       { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), wait) },
     ]);
@@ -360,6 +369,11 @@ describe("Client request/response", () => {
         origin: { sessionId: "s-origin", daemonId: "daemon-origin" },
       });
       await client.sessionScreen({ session_id: "s-target" });
+      await client.sessionInput({
+        session_id: "s-target",
+        text: "hello",
+        wait: { until: ["idle"] },
+      });
       await client.sessionOutput({
         session_id: "s-target",
         runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
@@ -373,7 +387,7 @@ describe("Client request/response", () => {
         timeout_ms: 25,
       });
 
-      for (const method of ["session.screen", "session.output", "session.wait"]) {
+      for (const method of ["session.screen", "session.input", "session.output", "session.wait"]) {
         const sent = parseRequestLine(await daemon.nextRequest());
         expect(sent["method"]).toBe(method);
         expect(sent["origin_session_id"]).toBe("s-origin");
@@ -382,6 +396,302 @@ describe("Client request/response", () => {
       await client.close();
     } finally {
       await daemon.close();
+    }
+  });
+
+  test("input wait overall deadline uses a dedicated connection with headroom", async () => {
+    const input = {
+      accepted: true,
+      activity: "idle",
+      activity_source: "screen",
+      runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+      activity_epoch: "d-epoch-1",
+      activity_revision: "2",
+    } as const;
+    const daemon = await startUnixDaemon([
+      {
+        kind: "delay",
+        ms: 60,
+        line: (line) => okResponseLine(requestIdFromLine(line), input),
+      },
+      {
+        kind: "reply",
+        line: (line) => okResponseLine(requestIdFromLine(line), {
+          status: "ok",
+          daemon_version: "test",
+          protocol_version: PROTOCOL_VERSION,
+        }),
+      },
+    ]);
+    try {
+      const client = await connectClient(daemon, undefined, { requestTimeoutMs: 20 });
+
+      expect(await client.sessionInput({
+        session_id: "s-target",
+        text: "hello",
+        wait: { until: ["idle"] },
+      })).toEqual(input);
+      expect(await client.call("daemon.health", null)).toEqual({
+        status: "ok",
+        daemon_version: "test",
+        protocol_version: PROTOCOL_VERSION,
+      });
+
+      const waiting = parseRequestLine(await daemon.nextRequest());
+      expect(waiting["method"]).toBe("session.input");
+      expect(waiting["params"]).toEqual({
+        session_id: "s-target",
+        text: "hello",
+        wait: { until: ["idle"] },
+      });
+      const followUp = parseRequestLine(await daemon.nextRequest());
+      expect(followUp["method"]).toBe("daemon.health");
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("input wait normalizes absent targets before wire validation", async () => {
+    const input = {
+      accepted: true,
+      activity: "idle",
+      activity_source: "report",
+      runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+      activity_epoch: "d-epoch-1",
+      activity_revision: "2",
+    } as const;
+    const daemon = await startUnixDaemon([{
+      kind: "reply",
+      line: (line) => okResponseLine(requestIdFromLine(line), input),
+    }]);
+    try {
+      const client = await connectClient(daemon);
+
+      expect(await client.sessionInput({
+        session_id: "s-target",
+        text: "hello",
+        wait: {},
+      })).toEqual(input);
+
+      const request = parseRequestLine(await daemon.nextRequest());
+      expect(request["params"]).toEqual({
+        session_id: "s-target",
+        text: "hello",
+        wait: { until: [] },
+      });
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("session input timeout preserves unknown-delivery recovery", async () => {
+    const source: ProtocolError = {
+      class: "runtime",
+      code: "session_input_timeout",
+      msg: "the overall input deadline elapsed before delivery and requested activity were confirmed",
+      recover: "delivery outcome may be unknown; inspect the current session before deciding whether to resend, and do not retry blindly",
+    };
+    const daemon = await startUnixDaemon([{
+      kind: "reply",
+      line: (line) => errResponseLine(requestIdFromLine(line), source),
+    }]);
+    try {
+      const client = await connectClient(daemon);
+      const error = await expectClientError(client.sessionInput({
+        session_id: "s-target",
+        text: "hello",
+        wait: {},
+      }));
+
+      expect(error.toProtocolError().recover).toBe(source.recover);
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("input wait rejects a legacy success without runtime evidence", async () => {
+    const daemon = await startUnixDaemon([
+      {
+        kind: "reply",
+        line: (line) => okResponseLine(requestIdFromLine(line), { accepted: true }),
+      },
+    ]);
+    try {
+      const client = await connectClient(daemon);
+      const error = await expectClientError(client.sessionInput({
+        session_id: "s-target",
+        text: "hello",
+        wait: { until: ["idle"] },
+      }));
+
+      const structured = error.toProtocolError();
+      expect(structured.code).toBe("session_input_wait_contract_mismatch");
+      expect(structured.recover).toContain("outcome is unknown");
+      expect(structured.recover).toContain("do not retry blindly");
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("generic typed call routes input waits through fail-closed validation", async () => {
+    const daemon = await startUnixDaemon([{
+      kind: "reply",
+      line: (line) => okResponseLine(requestIdFromLine(line), { accepted: true }),
+    }]);
+    try {
+      const client = await connectClient(daemon);
+      const error = await expectClientError(client.call("session.input", {
+        session_id: "s-target",
+        text: "hello",
+        wait: {},
+      }));
+
+      expect(error.toProtocolError().code).toBe("session_input_wait_contract_mismatch");
+      const request = parseRequestLine(await daemon.nextRequest());
+      expect(request["params"]).toEqual({
+        session_id: "s-target",
+        text: "hello",
+        wait: { until: [] },
+      });
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("input wait snapshots target arrays before opening dedicated transport", async () => {
+    const input = {
+      accepted: true,
+      activity: "idle",
+      activity_source: "report",
+      runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+      activity_epoch: "d-epoch-1",
+      activity_revision: "2",
+    } as const;
+    const daemon = await startUnixDaemon([{
+      kind: "reply",
+      line: (line) => okResponseLine(requestIdFromLine(line), input),
+    }]);
+    try {
+      const client = await connectClient(daemon);
+      const until: Array<"idle" | "blocked"> = ["idle"];
+      const waiting = client.sessionInput({
+        session_id: "s-target",
+        text: "hello",
+        wait: { until },
+      });
+      until[0] = "blocked";
+
+      expect(await waiting).toEqual(input);
+      const request = parseRequestLine(await daemon.nextRequest());
+      expect(request["params"]).toEqual({
+        session_id: "s-target",
+        text: "hello",
+        wait: { until: ["idle"] },
+      });
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("input wait rejects invalid timeouts before transport", async () => {
+    const daemon = await startUnixDaemon([{ kind: "silent" }]);
+    try {
+      const client = await connectClient(daemon);
+      for (const [timeoutMs, expectedCode] of [
+        [0, "session_input_invalid_wait"],
+        [MAX_SESSION_WAIT_MS + 1, "session_wait_limit_exceeded"],
+      ] as const) {
+        const error = await expectClientError(client.sessionInput({
+          session_id: "s-target",
+          text: "hello",
+          wait: { until: ["idle"], timeout_ms: timeoutMs },
+        }));
+        expect(error.toProtocolError().code).toBe(expectedCode);
+      }
+      await daemon.expectNoRequest(50);
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("input wait rejects malformed runtime-scoped evidence", async () => {
+    const malformedResults = [
+      {
+        accepted: true,
+        activity: "idle",
+        activity_source: "report",
+        runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+        activity_revision: "2",
+      },
+      {
+        accepted: true,
+        activity: "idle",
+        activity_source: "unknown",
+        runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+        activity_epoch: "d-epoch-1",
+        activity_revision: "2",
+      },
+      {
+        accepted: true,
+        activity: "idle",
+        activity_source: "report",
+        runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+        activity_epoch: "d-epoch-1",
+        activity_revision: "18446744073709551616",
+      },
+      {
+        accepted: true,
+        activity: "idle",
+        activity_source: "report",
+        runtime: { runtime_id: "r".repeat(129), runtime_generation: "1" },
+        activity_epoch: "d-epoch-1",
+        activity_revision: "2",
+      },
+      {
+        accepted: true,
+        activity: "idle",
+        activity_source: "report",
+        runtime: { runtime_id: "ž".repeat(65), runtime_generation: "1" },
+        activity_epoch: "d-epoch-1",
+        activity_revision: "2",
+      },
+      {
+        accepted: true,
+        activity: "idle",
+        activity_source: "report",
+        runtime: { runtime_id: "runtime\u0000control", runtime_generation: "1" },
+        activity_epoch: "d-epoch-1",
+        activity_revision: "2",
+      },
+    ];
+
+    for (const result of malformedResults) {
+      const daemon = await startUnixDaemon([
+        {
+          kind: "reply",
+          line: (line) => okResponseLine(requestIdFromLine(line), result),
+        },
+      ]);
+      try {
+        const client = await connectClient(daemon);
+        const error = await expectClientError(client.sessionInput({
+          session_id: "s-target",
+          text: "hello",
+          wait: { until: ["idle"] },
+        }));
+
+        expect(error.toProtocolError().code).toBe("session_input_wait_contract_mismatch");
+        await client.close();
+      } finally {
+        await daemon.close();
+      }
     }
   });
 
