@@ -17,11 +17,11 @@ use super::{
     WorkerError,
 };
 
-struct ManagedSession {
-    worker: Worker,
-    worker_id: String,
-    runtime_id: String,
-    runtime_generation: RuntimeGeneration,
+pub(super) struct ManagedSession {
+    pub(super) worker: Worker,
+    pub(super) worker_id: String,
+    pub(super) runtime_id: String,
+    pub(super) runtime_generation: RuntimeGeneration,
 }
 
 struct WaitSnapshot {
@@ -32,9 +32,9 @@ struct WaitSnapshot {
 }
 
 #[derive(Debug)]
-struct WaitPermit {
-    registry: SessionRegistry,
-    session_id: SessionId,
+pub(super) struct WaitPermit {
+    pub(super) registry: SessionRegistry,
+    pub(super) session_id: SessionId,
 }
 
 impl Drop for WaitPermit {
@@ -300,7 +300,10 @@ impl SessionRegistry {
         }
     }
 
-    async fn managed_session(&self, id: &SessionId) -> Result<ManagedSession, ProtocolError> {
+    pub(super) async fn managed_session(
+        &self,
+        id: &SessionId,
+    ) -> Result<ManagedSession, ProtocolError> {
         let sessions = self.inner.sessions.lock().await;
         let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
         if entry.info.external == Some(true) {
@@ -332,7 +335,7 @@ impl SessionRegistry {
         })
     }
 
-    async fn verify_managed_identity(
+    pub(super) async fn verify_managed_identity(
         &self,
         id: &SessionId,
         observed: &ManagedSession,
@@ -441,7 +444,7 @@ impl SessionRegistry {
         Ok(wait_result(SessionWaitReason::Timeout, snapshot))
     }
 
-    fn acquire_waiter(&self, id: &SessionId) -> Result<WaitPermit, ProtocolError> {
+    pub(super) fn acquire_waiter(&self, id: &SessionId) -> Result<WaitPermit, ProtocolError> {
         let previous = self
             .inner
             .observation_waiters
@@ -501,7 +504,7 @@ fn log_wait_completed(params: &SessionWaitParams, result: &SessionWaitResult, st
     );
 }
 
-fn runtime_identity(
+pub(crate) fn runtime_identity(
     runtime_id: String,
     runtime_generation: RuntimeGeneration,
 ) -> Result<SessionRuntimeIdentity, ProtocolError> {
@@ -565,7 +568,7 @@ fn wait_result(reason: SessionWaitReason, snapshot: WaitSnapshot) -> SessionWait
     clippy::needless_pass_by_value,
     reason = "map_err transfers ownership of the typed worker error into this protocol boundary"
 )]
-fn observation_worker_error(error: WorkerError) -> ProtocolError {
+pub(crate) fn observation_worker_error(error: WorkerError) -> ProtocolError {
     match error {
         WorkerError::ObservationUnsupported { .. }
         | WorkerError::Rejected {

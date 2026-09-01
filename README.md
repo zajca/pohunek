@@ -82,6 +82,9 @@ where they are doing it, and when they need you.
   local `pohunekd`, and uses a short owner-private cache; `--refresh` re-probes.
   Status loading and peer probing have explicit bounded deadlines.
   `host inspect` queries live capabilities straight from the selected daemon.
+- **Shell completion**: generate static Bash, Zsh, or Fish completion from the
+  clap command tree. An explicit `--dynamic` mode adds bounded, failure-silent
+  host and session-target lookup without starting a daemon.
 
 **Projects and worktree isolation**
 
@@ -358,6 +361,7 @@ them `--json` for machine-readable output (the exceptions are `attach`,
 | `pohunek attach <target>` | Attach the current terminal; `Ctrl-]` detaches. |
 | `pohunek session input <target> <text>` | Inject a prompt with agent-correct framing; use `--stdin` for non-argv input. |
 | `pohunek session screen <target>` | Read the current rendered terminal; `--json` preserves runtime identity, watermark, geometry, cursor, and visible lines. |
+| `pohunek session detection <target>` | Preview the active detection manifest regions; `--json` also lists every supported region kind. |
 | `pohunek session output <target>` | Read a newest retained tail or continue with `--runtime-id`, `--runtime-generation`, and `--after-offset`; `--wait-ms` performs a bounded wait. |
 | `pohunek session wait <target>` | Long-poll up to 8000 ms for explicit state, activity, metadata, terminal, output, or runtime predicates. |
 | `pohunek session fork <target>` | Fork an agent conversation into a new session when that session advertises fork capability (currently Claude Code). |
@@ -366,6 +370,7 @@ them `--json` for machine-readable output (the exceptions are `attach`,
 | `pohunek project add / list / show / rename / rm` | Manage git-repo-aware project records. |
 | `pohunek project actions / action / prompt` | Resolve per-project launch recipes and prompt templates. |
 | `pohunek host discover / list / inspect` | Find NetBird peers running daemons (standalone cache; `--refresh`) and query live capabilities. |
+| `pohunek completions <bash\|zsh\|fish>` | Print static shell completion; add `--dynamic` for bounded host/session candidates. |
 | `pohunek notifications list / watch` | Inspect or stream the durable inbox; `--all-hosts` fans out. |
 | `pohunek notifications read / ack / archive / delete` | Drive one record's lifecycle (`host/id` targets a specific host). |
 | `pohunek notifications policy / retention` | Per-kind/provider policy (including `hermes`), retention pruning (`--dry-run` / `--apply`). |
@@ -373,6 +378,7 @@ them `--json` for machine-readable output (the exceptions are `attach`,
 | `pohunek integration status` | Inspect daemon-managed Codex/Claude hooks on the effective `--host`, or one explicitly selected local Hermes target. |
 | `pohunek integration doctor / update / uninstall --agent hermes` | Diagnose, atomically refresh, or safely remove one explicitly selected local Hermes plugin target. |
 | `pohunek setup [scripts\|config\|sway]` | Install launcher scripts, default config + prompt templates, sway keybindings. |
+| `pohunek setup completions <bash\|zsh\|fish>` | Install completion in the shell's conventional user directory; add `--dynamic` to opt in to runtime candidates. |
 | `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + live snapshot. |
 | `pohunek prompt render / link` | Render provider prompt templates and work-item link metadata (used by launchers). |
 
@@ -394,6 +400,26 @@ pohunek notifications watch --all-hosts        # one triage stream for every mac
 Remote session starts ask for confirmation (skip with `--yes`); project
 references resolve on the *target* host, so no filesystem path ever crosses
 the wire.
+
+### Shell completion
+
+Print a static script for manual loading, or install it in the shell's
+conventional per-user directory:
+
+```bash
+pohunek completions bash > pohunek.bash
+pohunek setup completions zsh
+pohunek setup completions fish --dynamic
+```
+
+Static completion performs no I/O beyond script generation. Dynamic completion
+is opt-in: it reads the existing owner-private host-discovery cache and makes a
+live, deadline-bounded `session.list` call for session targets. A qualified
+`host/id` target overrides `--host`; otherwise an explicit `--host` selects the
+session source and the default is local. Missing daemons, unavailable NetBird,
+and timeouts produce no shell diagnostics or candidates. The setup command does
+not edit shell startup files; for Zsh it prints the `fpath` step required before
+`compinit`.
 
 ### Automation and bounded observation
 
@@ -420,6 +446,7 @@ runtime identity and cursor into later calls:
 
 ```bash
 pohunek session screen s-01J00000000000000000000000 --json
+pohunek session detection s-01J00000000000000000000000 --json
 pohunek session output s-01J00000000000000000000000 --max-bytes 65536 --json
 pohunek session output s-01J00000000000000000000000 \
   --runtime-id runtime-1 --runtime-generation 3 --after-offset 4096 \
@@ -428,6 +455,14 @@ pohunek session wait s-01J00000000000000000000000 \
   --runtime-id runtime-1 --runtime-generation 3 --after-output-offset 4096 \
   --timeout-ms 8000 --json
 ```
+
+Detection manifests support `osc_title`, `osc_progress`, `whole_recent`,
+`bottom_lines(N)`, `bottom_non_empty_lines(N)`, `top_non_empty_lines(N)`,
+`last_non_empty_above_prompt_box`, `after_last_prompt_marker`,
+`prompt_box_body`, and `after_last_horizontal_rule`. The detection diagnostic
+shows the current matcher text for only the active manifest's required regions;
+screen previews preserve the same wide-glyph and soft-wrap behavior as live
+matching.
 
 Waiting output and `session wait` use dedicated connections. Re-issue short
 waits as needed; a killed client does not promise immediate daemon-side waiter

@@ -71,6 +71,15 @@ not = { any = [
   { contains = ["↑/↓ to navigate"] },
 ] }
 
+# A completed turn leaves a status line immediately above the restored prompt
+# box. This precise region confirms idle without scanning transcript history.
+[[rules]]
+id = "completed_turn_status"
+state = "idle"
+priority = 955
+region = "last_non_empty_above_prompt_box"
+line_regex = ['^[·✢✳✶✻✽*] \S.* for [0-9]+(?:\.[0-9]+)?s$']
+
 [[rules]]
 id = "bash_permission_prompt"
 state = "blocked"

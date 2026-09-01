@@ -10,10 +10,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures::{SinkExt, StreamExt};
 use protocol::{
     AttachHeader, Event, Method, ProtocolError, ProtocolVersion, ProtocolVersionRange, Request,
-    Response, SessionId, SessionOutputParams, SessionOutputResult, SessionResizeParams,
-    SessionResizeResult, SessionResumeResult, SessionScreenParams, SessionScreenResult,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionWaitParams, SessionWaitResult,
-    ENV_DAEMON_ID, ENV_SESSION_ID, MAX_CONTROL_LINE_BYTES,
+    Response, SessionDetectionParams, SessionDetectionResult, SessionId, SessionInputParams,
+    SessionInputResult, SessionOutputParams, SessionOutputResult, SessionReadParams,
+    SessionReadResult, SessionResizeParams, SessionResizeResult, SessionResumeResult,
+    SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
+    SessionWaitParams, SessionWaitResult, ENV_DAEMON_ID, ENV_SESSION_ID, MAX_CONTROL_LINE_BYTES,
 };
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -26,11 +27,11 @@ use crate::ClientError;
 pub const LOCAL_HOST: &str = "local";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Transport processing budget added after a validated daemon-side wait.
+/// Transport processing budget added after a validated daemon-side deadline.
 ///
 /// One second leaves room for request framing, waiter teardown, scheduling,
 /// response serialization, and local mesh latency without racing the daemon's
-/// authoritative bounded-wait deadline.
+/// authoritative overall delivery-and-wait deadline.
 const DEDICATED_WAIT_TRANSPORT_HEADROOM: Duration = Duration::from_secs(1);
 
 /// A connected SDK client over either the local Unix socket or remote TCP.
@@ -271,6 +272,19 @@ impl Client {
     where
         M: Method,
     {
+        if M::NAME == protocol::method::SESSION_INPUT {
+            let params =
+                serde_json::from_value::<SessionInputParams>(serde_json::to_value(params)?)?;
+            let result = self.session_input(params).await?;
+            return Ok(serde_json::from_value(serde_json::to_value(result)?)?);
+        }
+        self.call_direct::<M>(params).await
+    }
+
+    async fn call_direct<M>(&mut self, params: M::Params) -> Result<M::Output, ClientError>
+    where
+        M: Method,
+    {
         let request = Request::new(
             next_request_id(M::NAME),
             M::NAME,
@@ -304,6 +318,23 @@ impl Client {
         self.call::<protocol::method::SessionScreen>(params).await
     }
 
+    /// Preview the active detector's manifest regions.
+    pub async fn session_detection(
+        &mut self,
+        params: SessionDetectionParams,
+    ) -> Result<SessionDetectionResult, ClientError> {
+        self.call::<protocol::method::SessionDetection>(params)
+            .await
+    }
+
+    /// Read bounded current-screen text without attaching.
+    pub async fn session_read(
+        &mut self,
+        params: SessionReadParams,
+    ) -> Result<SessionReadResult, ClientError> {
+        self.call::<protocol::method::SessionRead>(params).await
+    }
+
     /// Read bounded retained output, using a dedicated connection when it waits.
     pub async fn session_output(
         &mut self,
@@ -325,6 +356,26 @@ impl Client {
         let timeout_ms = params.timeout_ms();
         self.call_dedicated::<protocol::method::SessionWait>(params, timeout_ms)
             .await
+    }
+
+    /// Deliver input with an optional dedicated overall-deadline connection.
+    pub async fn session_input(
+        &mut self,
+        mut params: SessionInputParams,
+    ) -> Result<SessionInputResult, ClientError> {
+        if let Some(wait) = params.wait.as_mut() {
+            wait.until.get_or_insert_with(Vec::new);
+            let wait = wait.clone();
+            let timeout_ms = validated_input_wait_timeout(&wait)?;
+            let result = self
+                .call_dedicated::<protocol::method::SessionInput>(params, timeout_ms)
+                .await?;
+            validate_input_wait_result(&wait, &result)?;
+            Ok(result)
+        } else {
+            self.call_direct::<protocol::method::SessionInput>(params)
+                .await
+        }
     }
 
     /// Resume one logical session through the typed lifecycle API.
@@ -373,7 +424,7 @@ impl Client {
             dedicated_request_timeout(self.options.request_timeout, wire_timeout_ms);
         let options = self.options.with_request_timeout(request_timeout);
         let mut client = self.connect_dedicated(options).await?;
-        client.call::<M>(params).await
+        client.call_direct::<M>(params).await
     }
 
     async fn connect_dedicated(&self, options: ClientOptions) -> Result<Self, ClientError> {
@@ -436,6 +487,58 @@ impl Client {
             }
         }
     }
+}
+
+fn validated_input_wait_timeout(wait: &protocol::SessionInputWait) -> Result<u32, ClientError> {
+    match wait.timeout_ms {
+        Some(0) => Err(ClientError::Protocol(ProtocolError::observation(
+            "session_input_invalid_wait",
+            "timeout_ms must be greater than zero",
+        ))),
+        Some(timeout_ms) if timeout_ms > protocol::MAX_SESSION_WAIT_MS => Err(
+            ClientError::Protocol(ProtocolError::session_wait_limit_exceeded()),
+        ),
+        Some(timeout_ms) => Ok(timeout_ms),
+        None => Ok(protocol::MAX_SESSION_WAIT_MS),
+    }
+}
+
+fn validate_input_wait_result(
+    wait: &protocol::SessionInputWait,
+    result: &SessionInputResult,
+) -> Result<(), ClientError> {
+    if !result.accepted {
+        return Err(ClientError::InputWaitContract {
+            detail: "the daemon reported that delivered input was not accepted",
+        });
+    }
+    let activity = result.activity.ok_or(ClientError::InputWaitContract {
+        detail: "the response omitted the post-submission activity",
+    })?;
+    if result.activity_source.is_none()
+        || result.runtime.is_none()
+        || result.activity_epoch.as_deref().is_none_or(str::is_empty)
+        || result.activity_revision.is_none()
+    {
+        return Err(ClientError::InputWaitContract {
+            detail: "the response omitted epoch- and runtime-scoped activity evidence",
+        });
+    }
+    let until = wait.until.as_deref().unwrap_or_default();
+    let target_matches = if until.is_empty() {
+        matches!(
+            activity,
+            protocol::AgentActivity::Idle | protocol::AgentActivity::Blocked
+        )
+    } else {
+        until.contains(&activity)
+    };
+    if !target_matches {
+        return Err(ClientError::InputWaitContract {
+            detail: "the response activity did not match the requested wait target",
+        });
+    }
+    Ok(())
 }
 
 /// Build a unique correlation id for one SDK control request.
@@ -1195,6 +1298,229 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dedicated_input_wait_carries_the_connection_origin() {
+        let result = serde_json::json!({
+            "accepted": true,
+            "activity": "idle",
+            "activity_source": "report",
+            "runtime": {
+                "runtime_id": "runtime-1",
+                "runtime_generation": "1"
+            },
+            "activity_epoch": "d-epoch-1",
+            "activity_revision": "2"
+        });
+        let (address, server) = spawn_dedicated_capture_server(result).await;
+        let mut client = Client::connect_tcp_addr("fixture-remote", address)
+            .await
+            .expect("connect remote");
+        client.origin = Some(test_request_origin());
+        let params = SessionInputParams {
+            session_id: SessionId("s-target".to_owned()),
+            text: "hello".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: Some(vec![protocol::AgentActivity::Idle]),
+                timeout_ms: None,
+            }),
+        };
+
+        client
+            .session_input(params)
+            .await
+            .expect("session input wait succeeds");
+        let request = server.await.expect("capture server");
+        assert_eq!(request.method(), protocol::method::SESSION_INPUT);
+        assert_test_request_origin(&request);
+    }
+
+    #[tokio::test]
+    async fn input_wait_normalizes_absent_targets_before_wire() {
+        let result = serde_json::json!({
+            "accepted": true,
+            "activity": "idle",
+            "activity_source": "report",
+            "runtime": {
+                "runtime_id": "runtime-1",
+                "runtime_generation": "1"
+            },
+            "activity_epoch": "d-epoch-1",
+            "activity_revision": "2"
+        });
+        let (address, server) = spawn_dedicated_capture_server(result).await;
+        let mut client = Client::connect_tcp_addr("fixture-remote", address)
+            .await
+            .expect("connect remote");
+
+        client
+            .session_input(SessionInputParams {
+                session_id: SessionId("s-target".to_owned()),
+                text: "hello".to_owned(),
+                wait: Some(protocol::SessionInputWait {
+                    until: None,
+                    timeout_ms: None,
+                }),
+            })
+            .await
+            .expect("session input wait succeeds");
+
+        let request = server.await.expect("capture server");
+        assert_eq!(request.params()["wait"]["until"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn input_wait_rejects_legacy_success_without_runtime_evidence() {
+        let result = serde_json::json!({"accepted": true});
+        let (address, server) = spawn_dedicated_capture_server(result).await;
+        let mut client = Client::connect_tcp_addr("fixture-remote", address)
+            .await
+            .expect("connect remote");
+        let params = SessionInputParams {
+            session_id: SessionId("s-target".to_owned()),
+            text: "hello".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: Some(vec![protocol::AgentActivity::Idle]),
+                timeout_ms: None,
+            }),
+        };
+
+        let error = client
+            .session_input(params)
+            .await
+            .expect_err("legacy success must fail closed");
+        assert!(matches!(error, ClientError::InputWaitContract { .. }));
+        assert_eq!(
+            error.to_protocol_error().code,
+            "session_input_wait_contract_mismatch"
+        );
+        let recovery = error
+            .to_protocol_error()
+            .recover
+            .expect("contract mismatch recovery");
+        assert!(recovery.contains("outcome is unknown"));
+        assert!(recovery.contains("do not retry blindly"));
+        let request = server.await.expect("capture server");
+        assert_eq!(request.method(), protocol::method::SESSION_INPUT);
+    }
+
+    #[tokio::test]
+    async fn generic_typed_call_routes_input_wait_through_contract_validation() {
+        let (address, server) =
+            spawn_dedicated_capture_server(serde_json::json!({"accepted": true})).await;
+        let mut client = Client::connect_tcp_addr("fixture-remote", address)
+            .await
+            .expect("connect remote");
+
+        let error = client
+            .call::<protocol::method::SessionInput>(SessionInputParams {
+                session_id: SessionId("s-target".to_owned()),
+                text: "hello".to_owned(),
+                wait: Some(protocol::SessionInputWait {
+                    until: None,
+                    timeout_ms: Some(100),
+                }),
+            })
+            .await
+            .expect_err("generic typed wait must reject a legacy success");
+
+        assert_eq!(
+            error.to_protocol_error().code,
+            "session_input_wait_contract_mismatch"
+        );
+        let request = server.await.expect("capture server");
+        assert_eq!(request.method(), protocol::method::SESSION_INPUT);
+        assert_eq!(request.params()["wait"]["until"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn input_wait_rejects_invalid_timeout_before_dedicated_transport() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind invalid-wait fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let mut client = Client::connect_tcp_addr("fixture-remote", address)
+            .await
+            .expect("connect shared client");
+        let (_shared_stream, _) = listener.accept().await.expect("accept shared client");
+
+        for (timeout_ms, expected_code) in [
+            (0, "session_input_invalid_wait"),
+            (
+                protocol::MAX_SESSION_WAIT_MS + 1,
+                "session_wait_limit_exceeded",
+            ),
+        ] {
+            let error = client
+                .session_input(SessionInputParams {
+                    session_id: SessionId("s-target".to_owned()),
+                    text: "hello".to_owned(),
+                    wait: Some(protocol::SessionInputWait {
+                        until: Some(vec![protocol::AgentActivity::Idle]),
+                        timeout_ms: Some(timeout_ms),
+                    }),
+                })
+                .await
+                .expect_err("invalid wait timeout must fail locally");
+            assert_eq!(error.to_protocol_error().code, expected_code);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), listener.accept())
+                    .await
+                    .is_err(),
+                "invalid wait opened a dedicated connection"
+            );
+        }
+    }
+
+    #[test]
+    fn input_wait_timeout_preserves_unknown_delivery_recovery() {
+        let error = ClientError::Protocol(ProtocolError::session_input_timeout());
+        let recovery = error
+            .to_protocol_error()
+            .recover
+            .expect("timeout recovery hint");
+
+        assert!(recovery.contains("inspect the current session"));
+        assert!(recovery.contains("do not retry blindly"));
+    }
+
+    #[tokio::test]
+    async fn input_wait_rejects_success_without_activity_epoch() {
+        let result = serde_json::json!({
+            "accepted": true,
+            "activity": "idle",
+            "activity_source": "report",
+            "runtime": {
+                "runtime_id": "runtime-1",
+                "runtime_generation": "1"
+            },
+            "activity_revision": "2"
+        });
+        let (address, server) = spawn_dedicated_capture_server(result).await;
+        let mut client = Client::connect_tcp_addr("fixture-remote", address)
+            .await
+            .expect("connect remote");
+        let params = SessionInputParams {
+            session_id: SessionId("s-target".to_owned()),
+            text: "hello".to_owned(),
+            wait: Some(protocol::SessionInputWait {
+                until: Some(vec![protocol::AgentActivity::Idle]),
+                timeout_ms: None,
+            }),
+        };
+
+        let error = client
+            .session_input(params)
+            .await
+            .expect_err("unscoped revision must fail closed");
+        assert!(matches!(error, ClientError::InputWaitContract { .. }));
+        assert_eq!(
+            error.to_protocol_error().code,
+            "session_input_wait_contract_mismatch"
+        );
+        let request = server.await.expect("capture server");
+        assert_eq!(request.method(), protocol::method::SESSION_INPUT);
+    }
+
+    #[tokio::test]
     async fn subscription_request_carries_the_connection_origin() {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1343,7 +1669,7 @@ mod tests {
     }
 
     #[test]
-    fn dedicated_timeout_covers_wire_wait_and_transport_headroom() {
+    fn dedicated_timeout_covers_overall_deadline_and_transport_headroom() {
         assert_eq!(
             dedicated_request_timeout(Duration::from_secs(5), 8_000),
             Duration::from_secs(9)

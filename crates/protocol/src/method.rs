@@ -20,10 +20,11 @@ use crate::{
     ProjectAddParams, ProjectInfo, ProjectListParams, ProjectPromptParams, ProjectPromptResult,
     ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams, ProjectShowParams,
     ProjectShowResult, RuntimeInventoryResult, SessionAttachParams, SessionAttachResult,
-    SessionDetachParams, SessionDetachResult, SessionDiffParams, SessionDiffResult,
-    SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
-    SessionOutputResult, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
+    SessionDiffParams, SessionDiffResult, SessionForkParams, SessionForkResult, SessionId,
+    SessionInfo, SessionInputParams, SessionInputResult, SessionListParams, SessionNewParams,
+    SessionNewResult, SessionOutputParams, SessionOutputResult, SessionReadParams,
+    SessionReadResult, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
     SessionRenameParams, SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
     SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
     SessionResizeResult, SessionResumeResult, SessionScreenParams, SessionScreenResult,
@@ -248,6 +249,15 @@ method_table!(
     "SessionScreenParams",
     "SessionScreenResult";
 
+    /// Preview the regions supplied to the active detection manifest.
+    SessionDetection,
+    SESSION_DETECTION,
+    "session.detection",
+    SessionDetectionParams,
+    SessionDetectionResult,
+    "SessionDetectionParams",
+    "SessionDetectionResult";
+
     /// Read bounded retained PTY output without taking attach ownership.
     SessionOutput,
     SESSION_OUTPUT,
@@ -256,6 +266,15 @@ method_table!(
     SessionOutputResult,
     "SessionOutputParams",
     "SessionOutputResult";
+
+    /// Read a bounded point-in-time terminal text capture.
+    SessionRead,
+    SESSION_READ,
+    "session.read",
+    SessionReadParams,
+    SessionReadResult,
+    "SessionReadParams",
+    "SessionReadResult";
 
     /// Wait on a bounded dedicated connection for session activity.
     SessionWait,

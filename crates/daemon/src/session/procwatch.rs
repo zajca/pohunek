@@ -1,6 +1,6 @@
 //! Per-session process watcher and active-agent reconciliation.
 
-// Rust guideline compliant 2026-07-07
+// Rust guideline compliant 2026-08-31
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -13,9 +13,9 @@ use crate::detect::{identify_agent, DetectorConfig};
 use crate::procwatch::{ExitWatch, Pid, ProcessFact};
 
 use super::{
-    agent_kind_label, clear_active_agent, is_terminal, report_is_current, timestamp_now,
-    ActiveAgentReport, CancellationToken, Notify, ObservedAgent, Ordering, SessionEntry, SessionId,
-    SessionRegistry,
+    agent_kind_label, clear_active_agent, is_terminal, report_is_current, send_detector_config,
+    timestamp_now, ActiveAgentReport, CancellationToken, Notify, ObservedAgent, Ordering,
+    SessionEntry, SessionId, SessionRegistry,
 };
 
 const PROCWATCH_SOURCE: &str = "pohunek:procwatch";
@@ -123,7 +123,10 @@ impl SessionRegistry {
             self.emit(event::SESSION_UPDATED, &info);
         }
         match self.inner.inspector.cwd(focus_pid) {
-            Ok(cwd) => self.apply_cwd_change(id, cwd, CwdSource::Procwatch).await,
+            Ok(cwd) => {
+                self.apply_cwd_change(id, cwd, CwdSource::Procwatch, None)
+                    .await;
+            }
             Err(err) => {
                 debug!(
                     session_id = %id.0,
@@ -380,9 +383,7 @@ impl SessionRegistry {
         // agent's own hook will republish native identity when available.
         entry.info.active_agent_session_id = None;
         entry.info.active_agent_session_path = None;
-        let _ = entry
-            .detector_config
-            .send(DetectorConfig::for_agent(&observed.agent_base));
+        send_detector_config(entry, DetectorConfig::for_agent(&observed.agent_base));
         entry.info.updated_at = timestamp_now();
         Some(entry.info.clone())
     }

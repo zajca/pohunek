@@ -21,6 +21,7 @@ export const ClientErrorCode = {
   RequestTimeout: "request_timeout",
   Io: "io_error",
   Json: "json_error",
+  InputWaitContract: "session_input_wait_contract_mismatch",
   VersionMismatch: "version_mismatch",
 } as const;
 
@@ -34,6 +35,7 @@ export type ClientErrorKind =
   | "remoteProtocol"
   | "io"
   | "json"
+  | "inputWaitContract"
   | "versionMismatch";
 
 export class ClientError extends Error {
@@ -154,6 +156,20 @@ export class ClientError extends Error {
       msg,
       protocolError(ClientErrorClass.Daemon, ClientErrorCode.Json, msg),
       source,
+    );
+  }
+
+  public static inputWaitContract(detail: string): ClientError {
+    const msg = `invalid session.input wait response: ${detail}`;
+    return new ClientError(
+      "inputWaitContract",
+      msg,
+      protocolError(
+        ClientErrorClass.Daemon,
+        ClientErrorCode.InputWaitContract,
+        msg,
+        "delivery outcome is unknown; do not retry blindly; upgrade the daemon and client together, then inspect the session before deciding whether to resend",
+      ),
     );
   }
 

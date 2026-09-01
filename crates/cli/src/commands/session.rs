@@ -18,12 +18,14 @@ use base64::Engine as _;
 use protocol::Request;
 use protocol::{
     method, AgentActivity, CwdSource, ForkCwdMode, OutputOffset, RuntimeGeneration,
-    SessionDiffParams, SessionForkParams, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
-    SessionOutputParams, SessionRemoveResult, SessionRenameParams, SessionResizeParams,
-    SessionRuntimeIdentity, SessionScreenParams, SessionSetMetadataParams, SessionState,
-    SessionStopResult, SessionWaitParams, SessionWarningKind, StateSource, TerminalWatermark,
-    MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
+    SessionDetectionParams, SessionDetectionResult, SessionDiffParams, SessionForkParams,
+    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait,
+    SessionListFilter, SessionListParams, SessionNewParams, SessionOutputParams, SessionReadFormat,
+    SessionReadParams, SessionReadResult, SessionReadSource, SessionRemoveResult,
+    SessionRenameParams, SessionResizeParams, SessionRuntimeIdentity, SessionScreenParams,
+    SessionSetMetadataParams, SessionState, SessionStopResult, SessionWaitParams,
+    SessionWarningKind, StateSource, TerminalWatermark, MAX_SESSION_INPUT_BYTES,
+    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
 };
 
 use crate::client::Client;
@@ -61,12 +63,21 @@ pub(crate) fn parse_output_bytes(value: &str) -> Result<u32, String> {
 
 /// Parse a required bounded wait timeout against the shared protocol ceiling.
 pub(crate) fn parse_wait_timeout_ms(value: &str) -> Result<u32, String> {
+    parse_bounded_wait_timeout_ms(value, "--timeout-ms")
+}
+
+/// Parse an input-wait timeout against the shared protocol ceiling.
+pub(crate) fn parse_input_timeout_ms(value: &str) -> Result<u32, String> {
+    parse_bounded_wait_timeout_ms(value, "--timeout")
+}
+
+fn parse_bounded_wait_timeout_ms(value: &str, flag: &str) -> Result<u32, String> {
     let parsed = value
         .parse::<u32>()
-        .map_err(|_error| "--timeout-ms must be an unsigned 32-bit integer".to_owned())?;
+        .map_err(|_error| format!("{flag} must be an unsigned 32-bit integer"))?;
     if parsed == 0 || parsed > protocol::MAX_SESSION_WAIT_MS {
         return Err(format!(
-            "--timeout-ms must be between 1 and {}",
+            "{flag} must be between 1 and {}",
             protocol::MAX_SESSION_WAIT_MS
         ));
     }
@@ -650,12 +661,23 @@ pub(crate) async fn run_input(
     paths: &Paths,
     target: &Target,
     text: &str,
+    wait_until: &[AgentActivity],
+    timeout_ms: Option<u32>,
     json: bool,
 ) -> Result<(), CliError> {
     let mut client = Client::connect(host, paths).await?;
-    let input = client
-        .call::<method::SessionInput>(input_params(target, text))
-        .await?;
+    let params = input_params(target, text, wait_until, timeout_ms);
+    let input = if params.wait.is_some() {
+        tokio::select! {
+            result = client.session_input(params) => result?,
+            signal = process_cancellation() => {
+                signal?;
+                return Err(CliError::InputWaitInterrupted);
+            }
+        }
+    } else {
+        client.session_input(params).await?
+    };
 
     if json {
         print!("{}", crate::commands::render_json(&input)?);
@@ -686,6 +708,121 @@ pub(crate) async fn run_screen(
         }
     }
     Ok(())
+}
+
+pub(crate) async fn run_detection(
+    host: &str,
+    paths: &Paths,
+    target: &Target,
+    json: bool,
+) -> Result<(), CliError> {
+    let client = Client::connect(host, paths).await?;
+    let result = client
+        .into_sdk()
+        .session_detection(SessionDetectionParams::new(SessionId(
+            target.session_id.clone(),
+        )))
+        .await?;
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        print!("{}", render_detection_human(&result));
+    }
+    Ok(())
+}
+
+/// Arguments for a bounded `session read`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadArgs {
+    pub source: Option<SessionReadSource>,
+    pub lines: Option<u32>,
+    pub format: Option<SessionReadFormat>,
+}
+
+pub(crate) fn parse_read_source(value: &str) -> Result<SessionReadSource, String> {
+    match value {
+        "visible" => Ok(SessionReadSource::Visible),
+        "recent" => Ok(SessionReadSource::Recent),
+        "recent_unwrapped" | "recent-unwrapped" => Ok(SessionReadSource::RecentUnwrapped),
+        "detection" => Ok(SessionReadSource::Detection),
+        _ => Err(
+            "source must be visible, recent, recent_unwrapped (alias: recent-unwrapped), or detection"
+                .to_owned(),
+        ),
+    }
+}
+
+pub(crate) fn parse_read_format(value: &str) -> Result<SessionReadFormat, String> {
+    match value {
+        "text" => Ok(SessionReadFormat::Text),
+        "ansi" => Ok(SessionReadFormat::Ansi),
+        _ => Err("format must be text or ansi".to_owned()),
+    }
+}
+
+pub(crate) fn parse_read_lines(value: &str) -> Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_error| "--lines must be an unsigned 32-bit integer".to_owned())?;
+    if !(1..=MAX_SESSION_READ_LINES).contains(&parsed) {
+        return Err(format!(
+            "--lines must be between 1 and {MAX_SESSION_READ_LINES}"
+        ));
+    }
+    Ok(parsed)
+}
+
+pub(crate) async fn run_read(
+    host: &str,
+    paths: &Paths,
+    target: &Target,
+    args: ReadArgs,
+    json: bool,
+) -> Result<(), CliError> {
+    let params = SessionReadParams::new(
+        SessionId(target.session_id.clone()),
+        args.source,
+        args.lines,
+        args.format,
+    )
+    .map_err(|error| CliError::InvalidObservation {
+        detail: error.to_string(),
+    })?;
+    let mut client = Client::connect(host, paths).await?;
+    let result = client.call::<method::SessionRead>(params).await?;
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        if result.truncated {
+            eprintln!("warning: session read was truncated to the requested line limit");
+        }
+        print!("{}", render_read_text(&result));
+    }
+    Ok(())
+}
+
+fn render_detection_human(result: &SessionDetectionResult) -> String {
+    let mut rendered = String::new();
+    for preview in &result.previews {
+        rendered.push_str("--- ");
+        rendered.push_str(&preview.region);
+        rendered.push_str(" ---\n");
+        if preview.text.is_empty() {
+            rendered.push_str("<empty>\n");
+        } else {
+            rendered.push_str(&preview.text);
+            rendered.push('\n');
+        }
+    }
+    rendered
+}
+
+fn render_read_text(result: &SessionReadResult) -> String {
+    let mut output = result.text.clone();
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output
 }
 
 /// Cursor and filtering arguments for `session output`.
@@ -1082,16 +1219,28 @@ fn build_fork_request(
     request_with_params(method::SESSION_FORK, &fork_params(target, name, cols, rows))
 }
 
-fn input_params(target: &Target, text: &str) -> SessionInputParams {
+fn input_params(
+    target: &Target,
+    text: &str,
+    wait_until: &[AgentActivity],
+    timeout_ms: Option<u32>,
+) -> SessionInputParams {
     SessionInputParams {
         session_id: SessionId(target.session_id.clone()),
         text: text.to_owned(),
+        wait: (!wait_until.is_empty() || timeout_ms.is_some()).then(|| SessionInputWait {
+            until: Some(wait_until.to_vec()),
+            timeout_ms,
+        }),
     }
 }
 
 #[cfg(test)]
 fn build_input_request(target: &Target, text: &str) -> Result<Request, CliError> {
-    request_with_params(method::SESSION_INPUT, &input_params(target, text))
+    request_with_params(
+        method::SESSION_INPUT,
+        &input_params(target, text, &[], None),
+    )
 }
 
 fn rename_params(target: &Target, name: Option<String>) -> SessionRenameParams {
@@ -1116,6 +1265,33 @@ fn diff_params(target: &Target, base: Option<String>) -> SessionDiffParams {
 #[cfg(test)]
 fn build_diff_request(target: &Target, base: Option<String>) -> Result<Request, CliError> {
     request_with_params(method::SESSION_DIFF, &diff_params(target, base))
+}
+
+#[cfg(test)]
+fn read_params(
+    target: &Target,
+    source: Option<SessionReadSource>,
+    lines: Option<u32>,
+    format: Option<SessionReadFormat>,
+) -> Result<SessionReadParams, CliError> {
+    SessionReadParams::new(SessionId(target.session_id.clone()), source, lines, format).map_err(
+        |error| CliError::InvalidObservation {
+            detail: error.to_string(),
+        },
+    )
+}
+
+#[cfg(test)]
+fn build_read_request(
+    target: &Target,
+    source: Option<SessionReadSource>,
+    lines: Option<u32>,
+    format: Option<SessionReadFormat>,
+) -> Result<Request, CliError> {
+    request_with_params(
+        method::SESSION_READ,
+        &read_params(target, source, lines, format)?,
+    )
 }
 
 fn render_new_human(info: &SessionInfo) -> String {
@@ -1419,10 +1595,18 @@ fn render_remove_human(session_id: &str, result: &SessionRemoveResult) -> String
 }
 
 fn render_input_human(session_id: &str, result: &SessionInputResult) -> String {
-    if result.accepted {
-        format!("session {session_id}: input accepted\n")
+    let disposition = if result.accepted {
+        "accepted"
     } else {
-        format!("session {session_id}: input rejected\n")
+        "rejected"
+    };
+    match (result.activity, result.activity_source) {
+        (Some(activity), Some(source)) => format!(
+            "session {session_id}: input {disposition} activity={} source={}\n",
+            activity_label(activity),
+            state_source_label(source)
+        ),
+        _ => format!("session {session_id}: input {disposition}\n"),
     }
 }
 
@@ -1565,6 +1749,53 @@ mod tests {
             request_timeout_ms: None,
             meta: Vec::new(),
         }
+    }
+
+    #[test]
+    fn read_request_uses_bounded_defaults() {
+        let target = Target {
+            host: Some(LOCAL_HOST.to_owned()),
+            session_id: "session-1".to_owned(),
+        };
+        let request = build_read_request(&target, None, None, None).expect("valid params");
+        assert_request(
+            &request,
+            method::SESSION_READ,
+            json!({"session_id": "session-1"}),
+        );
+    }
+
+    #[test]
+    fn read_request_rejects_lines_above_ceiling() {
+        let target = Target {
+            host: Some(LOCAL_HOST.to_owned()),
+            session_id: "session-1".to_owned(),
+        };
+        let error = build_read_request(
+            &target,
+            Some(SessionReadSource::Recent),
+            Some(MAX_SESSION_READ_LINES + 1),
+            Some(SessionReadFormat::Text),
+        )
+        .expect_err("line limit should be rejected");
+        assert!(error.to_string().contains("1000"));
+    }
+
+    #[test]
+    fn read_parsers_accept_unwrapped_aliases_and_reject_zero_lines() {
+        assert_eq!(
+            parse_read_source("recent_unwrapped").expect("wire-style source"),
+            SessionReadSource::RecentUnwrapped
+        );
+        assert_eq!(
+            parse_read_source("recent-unwrapped").expect("CLI-style alias"),
+            SessionReadSource::RecentUnwrapped
+        );
+        let error = parse_read_source("unknown").expect_err("unknown source");
+        assert!(error.contains("recent_unwrapped"));
+        assert!(error.contains("recent-unwrapped"));
+        parse_read_lines("0").expect_err("zero lines must fail");
+        assert_eq!(parse_read_lines("1").expect("minimum lines"), 1);
     }
 
     #[expect(
@@ -2612,9 +2843,45 @@ mod tests {
 
     #[test]
     fn renders_input_result_with_target_id() {
-        let output = render_input_human("s-42", &protocol::SessionInputResult { accepted: true });
+        let output = render_input_human(
+            "s-42",
+            &protocol::SessionInputResult {
+                accepted: true,
+                activity: None,
+                activity_source: None,
+                runtime: None,
+                activity_epoch: None,
+                activity_revision: None,
+            },
+        );
 
         assert_eq!(output, "session s-42: input accepted\n");
+    }
+
+    #[test]
+    fn renders_settled_input_activity_and_source() {
+        let output = render_input_human(
+            "s-42",
+            &protocol::SessionInputResult {
+                accepted: true,
+                activity: Some(AgentActivity::Blocked),
+                activity_source: Some(StateSource::Report),
+                runtime: Some(
+                    protocol::SessionRuntimeIdentity::new(
+                        "runtime-42",
+                        protocol::RuntimeGeneration::new(1),
+                    )
+                    .expect("valid runtime identity"),
+                ),
+                activity_epoch: Some("d-epoch-1".to_owned()),
+                activity_revision: Some(protocol::ActivityRevision::new(2)),
+            },
+        );
+
+        assert_eq!(
+            output,
+            "session s-42: input accepted activity=blocked source=report\n"
+        );
     }
 
     #[test]
@@ -2706,10 +2973,42 @@ mod tests {
 
     #[test]
     fn renders_input_result_as_json_that_deserializes() {
-        let result = protocol::SessionInputResult { accepted: true };
+        let result = protocol::SessionInputResult {
+            accepted: true,
+            activity: None,
+            activity_source: None,
+            runtime: None,
+            activity_epoch: None,
+            activity_revision: None,
+        };
         let doc = crate::commands::render_json(&result).expect("json doc");
         let parsed: protocol::SessionInputResult = crate::commands::parse_json_ok(&doc);
         assert_eq!(parsed, result);
+    }
+
+    #[test]
+    fn renders_detection_previews_with_empty_regions_visible() {
+        let result = SessionDetectionResult {
+            session_id: SessionId("s-42".to_owned()),
+            supported_regions: protocol::DetectionRegionKind::ALL.to_vec(),
+            previews: vec![
+                protocol::DetectionRegionPreview {
+                    kind: protocol::DetectionRegionKind::TopNonEmptyLines,
+                    region: "top_non_empty_lines(8)".to_owned(),
+                    text: "trust this repository".to_owned(),
+                },
+                protocol::DetectionRegionPreview {
+                    kind: protocol::DetectionRegionKind::LastNonEmptyAbovePromptBox,
+                    region: "last_non_empty_above_prompt_box".to_owned(),
+                    text: String::new(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            render_detection_human(&result),
+            "--- top_non_empty_lines(8) ---\ntrust this repository\n--- last_non_empty_above_prompt_box ---\n<empty>\n"
+        );
     }
 
     #[test]
