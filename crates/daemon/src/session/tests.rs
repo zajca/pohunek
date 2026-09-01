@@ -10,17 +10,19 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use protocol::{
-    AgentActivity, AgentKind, CwdSource, Event, ForkCwdMode, OutputOffset, ProcessStartIdentity,
-    ProjectSource, ReportSequence, RuntimeGeneration, RuntimeState, SessionAttachParams,
-    SessionForkParams, SessionId, SessionInfo, SessionNativeRecoveredEvent, SessionNewParams,
-    SessionOutputParams, SessionReadFormat, SessionReadParams, SessionReadSource,
+    method, AgentActivity, AgentKind, CwdSource, DetectionRegionKind, DetectionRegionPreview,
+    ErrorClass, Event, ForkCwdMode, OutputOffset, ProcessStartIdentity, ProjectSource,
+    ReportSequence, Request, Response, RuntimeGeneration, RuntimeState, SessionAttachParams,
+    SessionDetectionParams, SessionForkParams, SessionId, SessionInfo, SessionNativeRecoveredEvent,
+    SessionNewParams, SessionOutputParams, SessionReadFormat, SessionReadParams, SessionReadSource,
     SessionReleaseAgentParams, SessionReportAgentParams, SessionReportNativeIdParams,
     SessionRuntime, SessionRuntimeIdentity, SessionState, SessionWaitParams, SessionWaitReason,
-    StateSource, TerminalWatermark,
+    StateSource, TerminalWatermark, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
 };
 
 use crate::agent::LaunchCommand;
 use crate::agent::{InputRules, ResumeMode, SessionRefKind};
+use crate::api::{dispatch_line, DaemonState, HealthInfo};
 use crate::detect::{ActivityTransition, DetectorConfig, ManifestRegion, MatchContext};
 use crate::external::{external_session_id, TranscriptIndex};
 use crate::integration::{
@@ -5361,7 +5363,7 @@ async fn report_agent_reconfigures_detector_and_release_restores_default_config(
             .subscribe()
     };
 
-    let default_config = detector_config_rx.borrow().clone();
+    let default_config = detector_config_rx.borrow().config.clone();
     assert_eq!(title_activity(&default_config, "profile-only-title"), None);
 
     let report = registry
@@ -5381,7 +5383,7 @@ async fn report_agent_reconfigures_detector_and_release_restores_default_config(
         .changed()
         .await
         .expect("active detector config");
-    let active_config = detector_config_rx.borrow().clone();
+    let active_config = detector_config_rx.borrow().config.clone();
     assert_eq!(
         title_activity(&active_config, "profile-only-title"),
         Some(AgentActivity::Blocked)
@@ -5400,8 +5402,64 @@ async fn report_agent_reconfigures_detector_and_release_restores_default_config(
         .changed()
         .await
         .expect("default detector config");
-    let restored_config = detector_config_rx.borrow().clone();
+    let restored_config = detector_config_rx.borrow().config.clone();
     assert_eq!(title_activity(&restored_config, "profile-only-title"), None);
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn detection_rpc_returns_a_bounded_typed_error_for_oversized_previews() {
+    const PREVIEW_COUNT: usize = 128;
+    const PREVIEW_TEXT_BYTES: usize = 16 * 1024;
+
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let previews = (0..PREVIEW_COUNT)
+        .map(|index| DetectionRegionPreview {
+            kind: DetectionRegionKind::BottomLines,
+            region: format!("bottom_lines({})", index + 1),
+            text: "x".repeat(PREVIEW_TEXT_BYTES),
+        })
+        .collect::<Vec<_>>();
+    let (preview_tx, mut preview_rx) = tokio::sync::mpsc::channel(1);
+    let mut sessions = registry.inner.sessions.lock().await;
+    sessions
+        .get_mut(&created.id)
+        .expect("session entry")
+        .detector_preview = preview_tx;
+    drop(sessions);
+    tokio::spawn(async move {
+        let request = preview_rx.recv().await.expect("preview request");
+        request.reply.send(Ok(previews)).expect("preview reply");
+    });
+    let request = Request::new(
+        "x".repeat(MAX_REQUEST_ID_BYTES),
+        method::SESSION_DETECTION,
+        serde_json::to_value(SessionDetectionParams::new(created.id.clone()))
+            .expect("detection params serialize"),
+    )
+    .expect("valid request");
+    let state = DaemonState::new(HealthInfo::new("test"), registry.clone());
+
+    let line = serde_json::to_string(&request).expect("request serializes");
+    let crate::api::Dispatch::Reply(serialized) = dispatch_line(&line, &state).await else {
+        panic!("session.detection returns a one-shot reply");
+    };
+    assert!(serialized.len() <= MAX_CONTROL_LINE_BYTES);
+    let response: Response = serde_json::from_str(&serialized).expect("response deserializes");
+    let error = response
+        .into_result()
+        .expect_err("oversized detection returns a typed error");
+    assert_eq!(error.class, ErrorClass::Runtime);
+    assert_eq!(error.code, "session_detection_response_too_large");
 
     let _ = registry.stop(&created.id).await;
 }

@@ -78,9 +78,20 @@ For non-destructive terminal diagnosis, start without a historical cursor:
 
 ```bash
 pohunek session screen <target> --json
+pohunek session detection <target> --json
 pohunek session read <target> --source recent --lines 100 --json
 pohunek session output <target> --max-bytes 65536 --json
 ```
+
+Use `session detection` when activity classification is surprising. Its
+`supported_regions` array identifies the engine's accepted region kinds, while
+`previews` shows the exact current text supplied to each region required by the
+active manifest. Empty text is meaningful: for example,
+`last_non_empty_above_prompt_box` is empty without a complete prompt box. The
+preview waits for accepted agent/configuration changes before rendering.
+`session_detection_response_too_large` means the complete diagnostic would
+exceed the public response budget; reduce the manifest's number or size of
+parameterized regions before retrying.
 
 Current workers expose rendered visible rows rather than scrollback or
 soft-wrap metadata. For `recent`, `recent_unwrapped`, and `detection`, verify the

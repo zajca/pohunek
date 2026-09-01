@@ -189,6 +189,7 @@ All params and result type names below refer to structs exported by
 | `session.resize` | `SessionResizeParams` | `SessionResizeResult` | Resizes the PTY on the control connection. |
 | `session.input` | `SessionInputParams` | `SessionInputResult` | Injects text using agent-specific input framing. Hermes accepts at most `MAX_SESSION_INPUT_BYTES` UTF-8 bytes, permits LF and tab but rejects other C0/C1 controls without rewriting them, and returns `session_input_blocked` for fire-and-forget input while approval-visible activity is blocked. Unsafe or oversized Hermes text returns `session_input_rejected`. Every per-session input holds one gate through its complete framing transaction, preventing waited/waited and waited/fire-and-forget interleaving. Every worker plan contains a body fragment with the provider `delay_after_ms` and a separate submit fragment; body and Enter are never merged into one paste burst. With `wait`, every Rust/TypeScript typed call path, including generic `Client.call`, routes through the dedicated helper, normalizes absent `until` to `[]` before wire validation, and rejects `timeout_ms` outside `1..=8000` before transport. The daemon deduplicates targets, acquires a waiter permit, starts the overall deadline before the input gate, and rejects blocked activity with `session_agent_blocked` both before the gate and at the causal boundary, independently of provider fire-and-forget policy. A worker-owned submit delay cannot be activity-revalidated and already-written text cannot be safely retracted from an arbitrary TUI, so waited input rejects nonzero-delay framing with `session_input_wait_unsupported` before writing bytes. Zero-delay framing acquires the exclusive worker write reservation before capturing runtime-scoped activity revision evidence immediately before send. Timeout or shutdown before send cancels the reservation and writes no bytes. After send begins, the exchange is cancellation-shielded and retains the session input gate until the late ACK is consumed. Matching evidence above that lower bound and observed through the fixed deadline succeeds, including evidence between PTY plan flush and worker ACK. After the plan is sent delivery outcome may be unknown, so callers inspect the session and do not retry blindly. Bounded evidence history retains the maximum wait window, so a later same-activity report cannot erase valid pre-deadline evidence. The result includes `activity`, `activity_source`, `runtime`, `activity_epoch`, and decimal-string `activity_revision`; SDK helpers require all five and return `session_input_wait_contract_mismatch` when a same-version daemon ignores `wait` or omits evidence. Clients deduplicate by `(activity_epoch, runtime, activity_revision)`. Runtime exit returns `session_not_running`; replacement returns `session_runtime_changed`; external sessions return `session_external_read_only`; shutdown cancels delivery or waiting. The dedicated connection adds fixed response headroom beyond the overall deadline. |
 | `session.screen` | `SessionScreenParams` | `SessionScreenResult` | Reads one bounded, rendered, runtime-bound terminal snapshot without acquiring attach ownership or resizing the terminal. |
+| `session.detection` | `SessionDetectionParams` | `SessionDetectionResult` | Read-only detector diagnostic. Returns the complete supported region-kind set and current text previews for regions required by the session's active manifest. |
 | `session.read` | `SessionReadParams` | `SessionReadResult` | Reads bounded text from the current rendered terminal without attaching. `lines` accepts `1..=1,000`, defaults to that ceiling, and keeps the newest rendered rows. The complete serialized result is capped by `MAX_SESSION_READ_RESPONSE_BYTES`; byte truncation keeps the newest UTF-8 text and sets `truncated`. ANSI is a reserved request value that v2 always rejects. |
 | `session.output` | `SessionOutputParams` | `SessionOutputResult` | Reads a newest retained tail or continues from an exact runtime-scoped output cursor. A request with `wait_ms` uses a dedicated connection with bounded-wait headroom. |
 | `session.wait` | `SessionWaitParams` | `SessionWaitResult` | Performs one bounded long poll for state, activity, metadata, terminal, output, or runtime change. It always uses a dedicated connection. |
@@ -382,6 +383,59 @@ The protocol ceiling for the serialized result is
 with response-envelope headroom. The daemon additionally defaults to at most
 200 rows and 500 columns. Oversize results return the payload-free
 `runtime/session_output_limit_exceeded` error.
+
+`session.detection` accepts the same single-session parameter shape:
+
+```json
+{"session_id":"s-42"}
+```
+
+It asks the live detector task to render its active manifest regions on demand;
+previews are not copied for every PTY output chunk. The result lists every
+region kind supported by this engine, then only the regions required by the
+active manifest in manifest order:
+
+```json
+{
+  "session_id": "s-42",
+  "supported_regions": [
+    "osc_title",
+    "osc_progress",
+    "whole_recent",
+    "bottom_lines",
+    "bottom_non_empty_lines",
+    "top_non_empty_lines",
+    "last_non_empty_above_prompt_box",
+    "after_last_prompt_marker",
+    "prompt_box_body",
+    "after_last_horizontal_rule"
+  ],
+  "previews": [
+    {
+      "kind": "top_non_empty_lines",
+      "region": "top_non_empty_lines(8)",
+      "text": "Do you trust the contents of this directory?"
+    }
+  ]
+}
+```
+
+Parameterized manifest syntax is `bottom_lines(N)`,
+`bottom_non_empty_lines(N)`, or `top_non_empty_lines(N)`; the preview's
+`region` preserves the canonical count while `kind` stays count-independent.
+`top_non_empty_lines(N)` returns the first `N` non-empty visible rows.
+`last_non_empty_above_prompt_box` returns the nearest non-empty row above the
+second horizontal rule counted from the bottom, or an empty preview when a
+complete prompt box or preceding content is absent. All screen regions use the
+same visible-grid, wide-glyph, and soft-wrap semantics as activity matching.
+Unknown region names remain a typed manifest parse failure, so older engines
+reject manifests that use regions they do not implement instead of silently
+over-matching another surface. A preview observes every accepted detector
+configuration update before it renders, so it cannot return regions from the
+previous active manifest after an agent report or release succeeds. A stopped
+or unavailable detector returns `session_terminal_unavailable`. If the complete
+success envelope would exceed the 1 MiB control-line cap, the daemon returns the
+payload-free `runtime/session_detection_response_too_large` error instead.
 
 `session.read` accepts an optional source (`visible`, `recent`,
 `recent_unwrapped`, or `detection`; default `visible`) and optional `lines`
@@ -1197,6 +1251,8 @@ Request APIs:
   per-connection selection after the first response.
 - `Client::session_screen(SessionScreenParams)`: reads one rendered snapshot on
   the current connection.
+- `Client::session_detection(SessionDetectionParams)`: requests current active
+  manifest-region previews from the live detector task.
 - `Client::session_read(SessionReadParams)`: reads bounded current-screen text on
   the current connection.
 - `Client::session_output(SessionOutputParams)`: uses the current connection for

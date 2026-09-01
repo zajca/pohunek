@@ -1109,6 +1109,13 @@ enum SessionAction {
         json: bool,
     },
 
+    /// Preview the active detection manifest regions.
+    Detection {
+        target: Target,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Read a bounded terminal capture.
     Read {
         /// Session target: `session-id` or `local/session-id`.
@@ -1391,6 +1398,7 @@ impl SessionAction {
             | SessionAction::Rm { json, .. }
             | SessionAction::Input { json, .. }
             | SessionAction::Screen { json, .. }
+            | SessionAction::Detection { json, .. }
             | SessionAction::Read { json, .. }
             | SessionAction::Output { json, .. }
             | SessionAction::Wait { json, .. }
@@ -1629,6 +1637,11 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     let host = effective_host(&global_host, Some(&target));
                     let target = commands::session::resolve_target(&host, &paths, &target).await?;
                     commands::session::run_screen(&host, &paths, &target, json).await?;
+                }
+                SessionAction::Detection { target, json } => {
+                    let host = effective_host(&global_host, Some(&target));
+                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    commands::session::run_detection(&host, &paths, &target, json).await?;
                 }
                 SessionAction::Read {
                     target,

@@ -6,32 +6,34 @@ use std::{collections::BTreeMap, path::PathBuf};
 use protocol::{
     event, method, negotiate, ActivityRevision, AgentActivity, AgentKind, AgentRuntime,
     AssistantMaterializeParams, AssistantMaterializeResult, AttachHeader, ConceptDeprecation,
-    ConceptIntent, ConceptMeta, ConceptType, CwdSource, DaemonDoctorResult, DoctorCheck,
-    DoctorReport, DoctorStatus, ErrorClass, Event, ForkCwdMode, HostCapabilities,
-    IntegrationInstallParams, IntegrationInstallReport, IntegrationInstallResult,
-    NotificationCreateParams, NotificationCreateResult, NotificationCreatedEvent,
-    NotificationDeleteParams, NotificationDeleteResult, NotificationDeletedEvent, NotificationId,
-    NotificationKind, NotificationKindPolicy, NotificationListParams, NotificationListResult,
-    NotificationPolicy, NotificationPolicyParams, NotificationPolicyResult, NotificationRecord,
-    NotificationRetentionParams, NotificationRetentionPolicy, NotificationRetentionResult,
-    NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
-    NotificationUpdateResult, NotificationUpdatedEvent, ObservationParamsError, OutputOffset,
-    ProcessStartIdentity, ProjectSource, ProtocolError, ProtocolVersion, ProtocolVersionRange,
-    ProviderKind, ReportSequence, Request, Response, RuntimeGeneration, SessionAttachParams,
-    SessionAttachResult, SessionCapabilities, SessionDetachParams, SessionDetachResult,
-    SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
-    SessionOutputGap, SessionOutputParams, SessionOutputResult, SessionReadFormat,
-    SessionReadParams, SessionReadResult, SessionReadSource, SessionReleaseAgentParams,
-    SessionReleaseAgentResult, SessionReportAgentParams, SessionReportAgentResult,
-    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
-    SessionResizeResult, SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
-    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
-    StateSource, TerminalCursor, TerminalDimensions, TerminalWatermark, MAX_CONTROL_LINE_BYTES,
-    MAX_REQUEST_ID_BYTES, MAX_RUNTIME_ID_BYTES, MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES,
-    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_SCREEN_RESPONSE_BYTES,
-    MAX_SESSION_WAIT_MS, OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, PROTOCOL_VERSION,
+    ConceptIntent, ConceptMeta, ConceptType, CwdSource, DaemonDoctorResult, DetectionRegionKind,
+    DetectionRegionPreview, DoctorCheck, DoctorReport, DoctorStatus, ErrorClass, Event,
+    ForkCwdMode, HostCapabilities, IntegrationInstallParams, IntegrationInstallReport,
+    IntegrationInstallResult, NotificationCreateParams, NotificationCreateResult,
+    NotificationCreatedEvent, NotificationDeleteParams, NotificationDeleteResult,
+    NotificationDeletedEvent, NotificationId, NotificationKind, NotificationKindPolicy,
+    NotificationListParams, NotificationListResult, NotificationPolicy, NotificationPolicyParams,
+    NotificationPolicyResult, NotificationRecord, NotificationRetentionParams,
+    NotificationRetentionPolicy, NotificationRetentionResult, NotificationSeverity,
+    NotificationSource, NotificationStatus, NotificationUpdateParams, NotificationUpdateResult,
+    NotificationUpdatedEvent, ObservationParamsError, OutputOffset, ProcessStartIdentity,
+    ProjectSource, ProtocolError, ProtocolVersion, ProtocolVersionRange, ProviderKind,
+    ReportSequence, Request, Response, RuntimeGeneration, SessionAttachParams, SessionAttachResult,
+    SessionCapabilities, SessionDetachParams, SessionDetachResult, SessionDetectionParams,
+    SessionDetectionResult, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
+    SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams,
+    SessionNewParams, SessionOutputGap, SessionOutputParams, SessionOutputResult,
+    SessionReadFormat, SessionReadParams, SessionReadResult, SessionReadSource,
+    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionRuntimeIdentity, SessionScreenParams,
+    SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
+    SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning,
+    SessionWarningKind, StateSource, TerminalCursor, TerminalDimensions, TerminalWatermark,
+    MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES, MAX_RUNTIME_ID_BYTES, MAX_SESSION_ID_BYTES,
+    MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
+    MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_WAIT_MS,
+    OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, PROTOCOL_VERSION,
     SESSION_OUTPUT_METADATA_HEADROOM_BYTES, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use serde_json::{json, Value};
@@ -2408,6 +2410,7 @@ fn assistant_method_names_are_stable() {
 #[test]
 fn observation_method_names_and_limits_are_stable() {
     assert_eq!(method::SESSION_SCREEN, "session.screen");
+    assert_eq!(method::SESSION_DETECTION, "session.detection");
     assert_eq!(method::SESSION_OUTPUT, "session.output");
     assert_eq!(method::SESSION_WAIT, "session.wait");
     assert_eq!(
@@ -2436,6 +2439,58 @@ fn observation_method_names_and_limits_are_stable() {
                 > MAX_CONTROL_LINE_BYTES
         );
     }
+}
+
+#[test]
+fn session_detection_contract_has_exact_wire_shape() {
+    let params = SessionDetectionParams::new(SessionId("s-42".to_owned()));
+    assert_eq!(
+        serde_json::to_value(&params).expect("serialize detection params"),
+        json!({"session_id": "s-42"})
+    );
+    let result = SessionDetectionResult {
+        session_id: SessionId("s-42".to_owned()),
+        supported_regions: DetectionRegionKind::ALL.to_vec(),
+        previews: vec![DetectionRegionPreview {
+            kind: DetectionRegionKind::TopNonEmptyLines,
+            region: "top_non_empty_lines(8)".to_owned(),
+            text: "Do you trust the contents of this directory?".to_owned(),
+        }],
+    };
+    let expected = json!({
+        "session_id": "s-42",
+        "supported_regions": [
+            "osc_title",
+            "osc_progress",
+            "whole_recent",
+            "bottom_lines",
+            "bottom_non_empty_lines",
+            "top_non_empty_lines",
+            "last_non_empty_above_prompt_box",
+            "after_last_prompt_marker",
+            "prompt_box_body",
+            "after_last_horizontal_rule"
+        ],
+        "previews": [{
+            "kind": "top_non_empty_lines",
+            "region": "top_non_empty_lines(8)",
+            "text": "Do you trust the contents of this directory?"
+        }]
+    });
+
+    assert_eq!(
+        serde_json::to_value(&result).expect("serialize detection result"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<SessionDetectionResult>(expected).expect("parse detection result"),
+        result
+    );
+    serde_json::from_value::<SessionDetectionParams>(json!({
+        "session_id": "s-42",
+        "unknown": true
+    }))
+    .expect_err("unknown detection field must fail");
 }
 
 #[test]

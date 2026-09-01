@@ -19,6 +19,8 @@ with `pohunek attach`.
 
 Automation can observe a managed terminal without attaching. Use
 `pohunek session screen <target> --json` for one rendered snapshot,
+`pohunek session detection <target> --json` for the active detector's region
+previews and complete supported region-kind set,
 `pohunek session read <target> --source recent --lines 100 --json` for the newest
 bounded current-screen text. Current workers safely report `source_used:
 "visible"` for recent, unwrapped, and detection requests because they do not
@@ -31,6 +33,18 @@ the previous result. A retained-history `gap` means older requested bytes were
 evicted; a runtime change means discard old cursors and restart from a fresh
 screen or tail. Waiting calls use dedicated connections, and their timeout is
 the guaranteed waiter-slot release bound after a client disappears.
+
+Detection manifests can read `osc_title`, `osc_progress`, `whole_recent`,
+`bottom_lines(N)`, `bottom_non_empty_lines(N)`, `top_non_empty_lines(N)`,
+`last_non_empty_above_prompt_box`, `after_last_prompt_marker`,
+`prompt_box_body`, and `after_last_horizontal_rule`. Parameterized regions keep
+their count in each diagnostic preview. Top and prompt-adjacent regions use the
+same visible-grid, wide-glyph, and soft-wrap semantics as live matching. An
+unknown region fails manifest parsing instead of falling back to a broader
+region. A preview waits for an accepted active-agent configuration change before
+it renders. If all active previews cannot fit the public response budget,
+`session detection` returns `session_detection_response_too_large` instead of
+closing the control connection.
 
 Use `--input-stdin` (alias `--stdin`) with `session new`, or `--stdin` with
 `session input`, when prompt text should not appear in argv. Stdin and inline

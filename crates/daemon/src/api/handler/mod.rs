@@ -241,6 +241,9 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
         method::SESSION_DIFF => session::handle_session_diff(request, &state.sessions).await,
         method::SESSION_INPUT => session::handle_session_input(request, &state.sessions).await,
         method::SESSION_SCREEN => session::handle_session_screen(request, &state.sessions).await,
+        method::SESSION_DETECTION => {
+            session::handle_session_detection(request, &state.sessions).await
+        }
         method::SESSION_OUTPUT => session::handle_session_output(request, &state.sessions).await,
         method::SESSION_READ => session::handle_session_read(request, &state.sessions).await,
         method::SESSION_WAIT => session::handle_session_wait(request, &state.sessions).await,
@@ -353,9 +356,10 @@ mod tests {
 
     use protocol::{
         method, AgentKind, AssistantMaterializeParams, AssistantMaterializeResult,
-        DaemonDoctorResult, ForkCwdMode, ProtocolError, Request, SessionForkParams, SessionId,
-        SessionInfo, SessionNewParams, SessionSetMetadataParams, SessionSetMetadataResult,
-        SessionState, StateSource,
+        DaemonDoctorResult, DetectionRegionKind, ForkCwdMode, ProtocolError, Request,
+        SessionDetectionParams, SessionDetectionResult, SessionForkParams, SessionId, SessionInfo,
+        SessionNewParams, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
+        StateSource,
     };
 
     use super::assistant::run_assistant_materialize_blocking;
@@ -630,6 +634,81 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, created.id);
         let _ = sessions.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn session_detection_dispatch_returns_active_manifest_previews() {
+        let sessions = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        });
+        let created = sessions
+            .create(SessionNewParams {
+                agent: "shell".to_owned(),
+                name: None,
+                cwd: Some(PathBuf::from("/tmp")),
+                cols: 80,
+                rows: 24,
+                project: None,
+                repo: None,
+                branch: None,
+                base_branch: None,
+                input: None,
+                metadata: BTreeMap::new(),
+            })
+            .await
+            .expect("create shell session");
+        let state = DaemonState::new(HealthInfo::new("test"), sessions.clone());
+        let request = request(
+            "detection-preview",
+            method::SESSION_DETECTION,
+            serde_json::to_value(SessionDetectionParams::new(created.id.clone()))
+                .expect("params serialize"),
+        );
+
+        let result: SessionDetectionResult = serde_json::from_value(ok_value(
+            handle_request(&request, &state).await,
+            "session.detection",
+        ))
+        .expect("result deserializes");
+
+        assert_eq!(result.session_id, created.id);
+        assert_eq!(result.supported_regions, DetectionRegionKind::ALL);
+        assert_eq!(
+            result
+                .previews
+                .iter()
+                .map(|preview| preview.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                DetectionRegionKind::OscTitle,
+                DetectionRegionKind::OscProgress,
+                DetectionRegionKind::WholeRecent,
+            ]
+        );
+        let _ = sessions.stop(&created.id).await;
+    }
+
+    #[tokio::test]
+    async fn session_detection_dispatch_rejects_unknown_session() {
+        let state = DaemonState::new(
+            HealthInfo::new("test"),
+            SessionRegistry::new(SessionRegistryConfig::default()),
+        );
+        let request = request(
+            "detection-missing",
+            method::SESSION_DETECTION,
+            serde_json::to_value(SessionDetectionParams::new(SessionId("missing".to_owned())))
+                .expect("params serialize"),
+        );
+
+        let error = error_value(
+            handle_request(&request, &state).await,
+            "session.detection missing",
+        );
+
+        assert_eq!(error.code, "session_not_found");
     }
 
     fn notification_temp_dir(tag: &str) -> PathBuf {
