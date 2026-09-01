@@ -11,25 +11,25 @@ use serde::Serialize;
 use crate::{
     AssistantMaterializeParams, AssistantMaterializeResult, DaemonDoctorResult, DaemonHealthResult,
     HostCapabilities, HostDiscoverParams, HostRecord, IntegrationInstallParams,
-    IntegrationInstallResult, NotificationCreateParams, NotificationCreateResult,
-    NotificationDeleteParams, NotificationDeleteResult, NotificationListParams,
-    NotificationListResult, NotificationPolicyParams, NotificationPolicyResult,
-    NotificationRetentionParams, NotificationRetentionResult, NotificationUpdateParams,
-    NotificationUpdateResult, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
-    ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams, ProjectPromptParams,
-    ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
-    ProjectShowParams, ProjectShowResult, RuntimeInventoryResult, SessionAttachParams,
-    SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionDetectionParams,
-    SessionDetectionResult, SessionDiffParams, SessionDiffResult, SessionForkParams,
-    SessionForkResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
-    SessionOutputResult, SessionReadParams, SessionReadResult, SessionReleaseAgentParams,
-    SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams, SessionRenameResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeResult,
-    SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
-    SessionStopResult, SessionWaitParams, SessionWaitResult, WorktreeRemoveParams,
-    WorktreeRemoveResult,
+    IntegrationInstallResult, IntegrationStatusParams, IntegrationStatusResult,
+    NotificationCreateParams, NotificationCreateResult, NotificationDeleteParams,
+    NotificationDeleteResult, NotificationListParams, NotificationListResult,
+    NotificationPolicyParams, NotificationPolicyResult, NotificationRetentionParams,
+    NotificationRetentionResult, NotificationUpdateParams, NotificationUpdateResult,
+    ProjectActionParams, ProjectActionResult, ProjectActionsParams, ProjectActionsResult,
+    ProjectAddParams, ProjectInfo, ProjectListParams, ProjectPromptParams, ProjectPromptResult,
+    ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams, ProjectShowParams,
+    ProjectShowResult, RuntimeInventoryResult, SessionAttachParams, SessionAttachResult,
+    SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
+    SessionDiffParams, SessionDiffResult, SessionForkParams, SessionForkResult, SessionId,
+    SessionInfo, SessionInputParams, SessionInputResult, SessionListParams, SessionNewParams,
+    SessionNewResult, SessionOutputParams, SessionOutputResult, SessionReadParams,
+    SessionReadResult, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    SessionRenameParams, SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionResumeResult, SessionScreenParams, SessionScreenResult,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult, SessionWaitParams,
+    SessionWaitResult, WorktreeRemoveParams, WorktreeRemoveResult,
 };
 
 /// A typed control-protocol method contract.
@@ -356,6 +356,15 @@ method_table!(
     IntegrationInstallResult,
     "IntegrationInstallParams",
     "IntegrationInstallResult";
+
+    /// Inspect managed Codex and Claude hook installations without mutation.
+    IntegrationStatus,
+    INTEGRATION_STATUS,
+    "integration.status",
+    IntegrationStatusParams,
+    IntegrationStatusResult,
+    "IntegrationStatusParams",
+    "IntegrationStatusResult";
 
     /// Inspect live host capabilities.
     HostInspect,

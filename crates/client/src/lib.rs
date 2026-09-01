@@ -4,6 +4,7 @@
 
 mod discovery;
 mod error;
+mod integration;
 mod notifications;
 mod transport;
 

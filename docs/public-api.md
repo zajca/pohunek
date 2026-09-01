@@ -201,6 +201,7 @@ All params and result type names below refer to structs exported by
 | `session.diff` | `SessionDiffParams` | `SessionDiffResult` | Computes a unified diff of a session's worktree against a base ref. `base: null` defers to the worktree binding's recorded base branch, then the repository default. A session without a bound worktree returns `session_no_worktree`; a hostile explicit `base` (empty, leading `-`, or a control character) returns `invalid_branch`; a `base` that cannot be resolved to a merge-base against `HEAD` returns `session_diff_base_unresolved`. See `SessionDiffResult` under Core Payloads for the size cap and truncation semantics. |
 | `subscribe` | `null` | `{subscribed: true}` then event stream | Consumes the connection into a one-way event stream. |
 | `integration.install` | `IntegrationInstallParams` or `null` | `IntegrationInstallResult` | Installs agent hooks for active-agent state, native session id capture, and provider notifications. |
+| `integration.status` | `IntegrationStatusParams` or `null` | `IntegrationStatusResult` | Returns a read-only per-agent report for managed Codex and Claude hooks: availability, expected and present asset paths, inspected registration paths, installed and expected versions, aggregate health (`not_installed`, `current`, or `outdated`), typed recovery (`none`, `reinstall`, or `repair_configuration`), and non-secret warnings. `null` selects both agents; unknown parameter fields return `bad_request`. `current` requires exact managed executable permissions and exactly one registration under each installer-owned event. Inspection is size-bounded and runs outside the Tokio request task. It never mutates provider configuration. |
 | `assistant.materialize` | `AssistantMaterializeParams` | `AssistantMaterializeResult` | Materializes the assistant knowledge bundle on the daemon host. |
 | `notification.create` | `NotificationCreateParams` | `NotificationCreateResult` | Creates a host-local notification. Daemon policy is enforced for every producer, including provider hooks and daemon projectors. Dedupe may return `created: false` with an existing or upgraded record. `agent_blocked`/`approval_required` with `attention:<session_id>` and `turn_completed` with `turn:<session_id>` are deferred: the result still reports `created: true` with a minted id, but the record is held pending until `attention_debounce_secs` elapses; see `NotificationPolicy`. |
 | `notification.list` | `NotificationListParams` or `null` | `NotificationListResult` | Lists notification records with exact-match filters and cursor pagination. Deleted records are excluded unless `status: deleted` is requested. |
@@ -870,6 +871,77 @@ answer different questions:
 current Codex and Claude builds only. There is no fallback for older provider
 hook APIs.
 
+`integration.status` is the corresponding read-only drift report. Bare status
+reports both daemon-managed agents; `--agent codex` and `--agent claude` select
+one. Every managed script is checked independently against its embedded asset
+and executable mode. Claude must also contain every exact managed registration
+in `settings.json`. Codex must contain every exact registration in `hooks.json`,
+have the hooks feature enabled, and retain the position-derived trust hash for
+each managed hook in `config.toml`. The managed Codex trust-key set must be
+exact: stale managed tables make the integration outdated, and reinstallation
+removes them before writing only the currently expected keys. A scalar anywhere
+in the managed trust namespace requires configuration repair, including when
+hook drift temporarily prevents that key from being position-derived.
+
+`not_installed` means no Pohunek-managed asset or registration was detected;
+`current` means the complete contract above matches; `outdated` covers every
+partial, modified, malformed, unreadable, or otherwise unverifiable detected
+installation. A supported agent's path-resolution failure becomes an `outdated`
+report with a non-secret warning; in aggregate mode it does not suppress the
+other agent. Explicit unsupported agents still return a typed error. The response
+reports real installed and expected version fields. `installed_version` is
+unknown when any readable managed asset lacks a valid marker. The typed recovery
+is `reinstall` only when the installer can repair every finding; malformed,
+unreadable, oversized, or unresolved provider configuration instead reports
+`repair_configuration`. Symlinked, special, foreign-owned, or group/world-writable
+managed assets also require manual repair, while an explicit reinstall replaces
+installer-owned assets atomically without following an existing symlink. Managed
+asset type, effective-UID ownership, mode, and content are inspected through one
+non-following descriptor. The relevant parent chain starts at the explicitly
+resolved agent config root and ends at the asset's direct parent; every path in
+that chain must be a real directory owned by the daemon's effective UID without
+group or world write access. System ancestors above the config root are outside
+this check, so ordinary safe home/XDG roots are not rejected merely because an
+ancestor such as `/tmp` is shared. Each Claude `settings.json`, Codex
+`hooks.json`, and Codex `config.toml` is opened without following symlinks and
+must be a regular file owned by the daemon effective UID without group/world
+write access; metadata and bounded content come from the same descriptor.
+Provider inspection is nonblocking so FIFOs cannot stall the daemon worker. A
+missing Claude `hooks/` child under an otherwise trusted config root is a
+reinstallable absence and can still report `not_installed`; an existing symlink,
+wrong type, foreign owner, or group/world-writable child requires
+`repair_configuration`. The installer creates a missing Claude `hooks/`
+directory with exact mode `0700` regardless of the inherited umask and removes
+that newly created directory if mode enforcement or safe opening fails, but
+never changes permissions on an existing real user directory. Codex trust
+records describe a canonical single-handler managed
+group, so adding a sibling handler makes status non-current until reinstall
+separates the managed handler while preserving the user sibling. Agent config
+roots selected through `CLAUDE_CONFIG_DIR` or `CODEX_HOME` must be absolute and
+UTF-8 representable after tilde expansion. Invalid roots fail with
+`agent_config_dir_invalid` before registration commands are constructed, so a
+daemon working directory cannot change where a provider process resolves them.
+Before any mutation, installation opens and validates every existing config and
+hook parent as a no-follow, effective-UID-owned real directory without group or
+world write access. An unsafe parent fails with
+`configuration/integration_path_untrusted`. Provider files are prepared in
+memory, then replaced through the already-opened directory descriptor using an
+exclusive temporary file, `fchmod`, and `renameat`; parent or pathname swaps
+cannot redirect the write. Existing safe provider-file modes are preserved,
+while new registration files use mode `0600` and managed executable assets use
+mode `0755`. An oversized file is `outdated` with an actionable warning. The CLI
+routes Codex and Claude status to the effective global `--host`; mutating hook
+installation and every Hermes lifecycle action remain local. Human recovery
+hints and warning commands for a remote report explicitly name the daemon host
+where the operator must run the local installer; passing that host back to
+`integration install` is not a remote mutation. A JSON registration root that
+is not an object, an inline TOML table where the installer requires a regular
+table, a scalar value anywhere in the installer-owned trust namespace, and
+managed-asset metadata errors other than absence require
+`repair_configuration`. A missing `hooks` object remains reinstallable, and a
+handler with an exact installer-owned command identity is safely replaced even
+when its `type` field drifted. All enum values use snake_case on the wire.
+
 Codex notification support requires modern lifecycle hooks for
 `PermissionRequest` and `Stop`. The installer writes managed command hooks to
 `hooks.json` and records trust metadata in `config.toml`; the legacy Codex
@@ -941,7 +1013,7 @@ Canonical public codes currently emitted include:
 
 | Class | Codes |
 |---|---|
-| `configuration` | `paths_unavailable`, `netbird_invalid_config`, `invalid_discovery_options` |
+| `configuration` | `paths_unavailable`, `netbird_invalid_config`, `invalid_discovery_options`, `agent_config_dir_invalid`, `integration_path_untrusted` |
 | `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback` |
 | `transport` | `framing`, `host_unreachable`, `request_timeout` |
 | `discovery` | `netbird_cli_missing`, `netbird_state_unavailable`, `host_unknown`, `remote_discovery_failed` |
@@ -1083,9 +1155,17 @@ pohunek integration doctor --agent hermes --hermes-profile default --json
 
 `--hermes-profile default`, a named `--hermes-profile`, and an absolute
 `--hermes-home` are explicit target selections; a profile and home cannot be
-combined. `status`, `doctor`, `update`, and `uninstall` are Hermes-only and
-return `configuration/integration_action_unsupported` for another agent. The
-existing daemon-backed Codex/Claude `integration install` behavior is unchanged.
+combined. `doctor`, `update`, and `uninstall` are Hermes-only and return
+`configuration/integration_action_unsupported` for another agent. Hermes status
+uses the same local target contract; daemon-backed Codex/Claude status uses the
+new RPC without those local Hermes flags, and their install behavior is unchanged:
+
+```bash
+pohunek integration status --json
+pohunek integration status --agent codex --json
+pohunek integration status --agent claude --json
+pohunek integration status --agent hermes --hermes-profile default --json
+```
 
 The installation policy is Pohunek-owned, owner-private, and external to the
 immutable plugin checksum set. It fixes the absolute `pohunek` executable,
@@ -1267,6 +1347,10 @@ Request APIs:
   connection for the bounded long poll.
 - `Client::session_resume`, `session_resize`, and `session_set_metadata`: typed
   lifecycle helpers used by automation clients.
+- `Client::integration_status(IntegrationStatusParams)`: reads the complete
+  daemon-managed Codex/Claude install contract without mutation. `gui-core`
+  exposes matching `integration_status` and `integration_status_with_options`
+  host helpers.
 - `Client::request(&Request) -> serde_json::Value`: sends one request and returns
   the raw `ok` payload for low-level callers and framing tests.
 - `Client::subscribe(&Request) -> Subscription`: consumes the client connection

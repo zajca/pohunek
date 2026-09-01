@@ -59,6 +59,52 @@ For durable notification issues:
    not enough. Claude requires `Notification`, `Stop`, and `StopFailure` hooks.
    Reinstall preserves user hooks unless their command exactly matches a
    Pohunek-managed hook command.
+   First inspect both agents with `pohunek integration status --json`, or select
+   one with `pohunek --host <name> integration status --agent
+   <codex-or-claude> --json`; daemon-backed status honors the effective host.
+   For human output, remote recovery commands explicitly name the daemon host;
+   run the local-only installer on that machine rather than adding `--host` to
+   `integration install`.
+   `current` verifies both executable assets with the installer-owned permission
+   mode and effective-UID owner, exactly one managed registration under each
+   expected provider event, and Codex feature/trust state. Asset type, UID, mode,
+   and content come from one no-follow descriptor. The parent chain from the
+   selected agent config root through the direct asset parent must contain only
+   effective-UID-owned real directories with no group/world write access;
+   ancestors above that explicit trust anchor are not inspected. Unsafe asset or
+   parent ownership/permissions and duplicate managed registrations are
+   `outdated`. A missing Claude `hooks/` child under a trusted config root is a
+   reinstallable absence; installation creates it with exact owner-private mode
+   `0700` regardless of inherited umask, removes that newly created directory if
+   mode enforcement or safe opening fails, and leaves an existing real user
+   directory's mode unchanged. Claude
+   `settings.json`, Codex `hooks.json`, and Codex `config.toml` are each opened
+   no-follow and require effective-UID ownership plus no group/world write bits;
+   their metadata and bounded content come from the same descriptor. Codex
+   managed trust uses a canonical single-handler group, so a sibling handler is
+   drift even when the managed command itself is unchanged. The managed trust
+   key set must also be exact; stale managed tables are reinstallable drift and
+   are removed during reinstall, while a scalar anywhere in the managed trust
+   namespace requires configuration repair even when hook drift hides its
+   current position. `CLAUDE_CONFIG_DIR` and `CODEX_HOME`
+   must resolve to absolute UTF-8 paths, which keeps generated registrations
+   independent of the daemon and provider working directories. Follow the typed
+   recovery action: `reinstall` means the installer
+   can repair every finding, while `repair_configuration` means provider files,
+   symlinked, special, foreign-owned, or group/world-writable managed assets or
+   parents, invalid registration roots, incompatible TOML table shapes, and
+   scalar values anywhere in the installer-owned trust namespace must be
+   inspected and fixed first. A missing `hooks` object and an exact owned
+   command with drifted handler metadata remain safely reinstallable. Oversized
+   and non-regular files are rejected by bounded, nonblocking inspection and
+   reported with the applicable recovery.
+   Status itself never repairs or rewrites provider configuration. Installation
+   validates all existing config and hook parents before any mutation and fails
+   unsafe parents with `configuration/integration_path_untrusted`. It performs
+   replacements through already-opened directory descriptors with exclusive
+   temporary files, explicit modes, and descriptor-relative rename, so a
+   concurrent parent-name swap cannot redirect a managed write. Existing safe
+   provider-file modes are preserved; new registration files use `0600`.
 9. If a notification is missing its session link, inspect the hook environment
    setup. Hook adapters silently drop an invalid `POHUNEK_SESSION_ID` and still
    create the notification without linkage.

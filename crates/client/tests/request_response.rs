@@ -686,6 +686,62 @@ async fn request_response_typed_call_sends_method_params_and_decodes_output() {
 }
 
 #[tokio::test]
+async fn integration_status_sdk_helper_sends_typed_read_only_request() {
+    let daemon = spawn_unix_echo_daemon(json!({
+        "agents": [{
+            "agent": "codex",
+            "available": true,
+            "expected_asset_paths": [
+                "/isolated/.codex/pohunek-agent-state.sh",
+                "/isolated/.codex/pohunek-agent-notify.sh"
+            ],
+            "present_asset_paths": [
+                "/isolated/.codex/pohunek-agent-state.sh",
+                "/isolated/.codex/pohunek-agent-notify.sh"
+            ],
+            "registration_paths": [
+                "/isolated/.codex/hooks.json",
+                "/isolated/.codex/config.toml"
+            ],
+            "installed_version": 4,
+            "expected_version": 4,
+            "state": "current",
+            "recovery": "none",
+            "warnings": []
+        }]
+    }));
+    let mut client = Client::connect_local(&daemon.socket_path)
+        .await
+        .expect("connect local test daemon");
+
+    let result = client
+        .integration_status(protocol::IntegrationStatusParams {
+            agent: Some(protocol::AgentKind::Codex),
+        })
+        .await
+        .expect("integration status succeeds");
+
+    assert_eq!(result.agents.len(), 1);
+    assert_eq!(result.agents[0].agent, protocol::AgentKind::Codex);
+    assert_eq!(
+        result.agents[0].state,
+        protocol::IntegrationInstallState::Current
+    );
+    assert_eq!(
+        result.agents[0].recovery,
+        protocol::IntegrationRecovery::None
+    );
+    let request_line = daemon
+        .request_line
+        .await
+        .expect("test daemon received a request");
+    daemon.task.await.expect("test daemon task completed");
+    let request: Request = serde_json::from_str(&request_line).expect("parse request");
+    assert_eq!(request.method(), protocol::method::INTEGRATION_STATUS);
+    assert_eq!(request.params(), &json!({"agent": "codex"}));
+}
+
+#[tokio::test]
 async fn request_response_typed_call_reports_output_deserialization_errors() {
     let daemon = spawn_unix_echo_daemon(json!({
         "status": "ok",
