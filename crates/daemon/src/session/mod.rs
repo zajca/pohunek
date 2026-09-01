@@ -485,6 +485,7 @@ struct SessionEntry {
     /// re-persist can never overwrite the launch-time program/args/resume shape.
     snapshot: ResumeSnapshot,
     active_agent: Option<ActiveAgentReport>,
+    foreground_process_group: Option<Pid>,
     last_agent_report: Option<ActiveAgentReport>,
     last_native_report: Option<NativeIdentityReport>,
     observed_agents: Vec<ObservedAgent>,
@@ -591,6 +592,7 @@ struct ActiveAgentReport {
     agent: String,
     seq: Option<u64>,
     pid: Option<Pid>,
+    start_identity: Option<u64>,
     reported_at: Instant,
     activity_reported: bool,
 }
@@ -600,6 +602,8 @@ type NativeIdentityReport = crate::store::NativeIdentityOrdering;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ObservedAgent {
     pid: Pid,
+    pgid: Pid,
+    start_identity: u64,
     agent_base: AgentKind,
     first_seen: Instant,
     cwd: Option<PathBuf>,
@@ -1897,12 +1901,13 @@ impl SessionRegistry {
                 return not_recorded;
             }
 
-            let pid = bind_report_pid(entry, params.pid, &resolved.base);
+            let (pid, start_identity) = bind_report_process(entry, params.pid, &resolved.base);
             let report = ActiveAgentReport {
                 source: params.source.clone(),
                 agent: resolved.name.clone(),
                 seq: report_sequence,
                 pid,
+                start_identity,
                 reported_at: Instant::now(),
                 activity_reported: reported_activity.is_some(),
             };
@@ -1993,6 +1998,7 @@ impl SessionRegistry {
                 agent: resolved.name.clone(),
                 seq: report_sequence,
                 pid: None,
+                start_identity: None,
                 reported_at: Instant::now(),
                 activity_reported: false,
             };
@@ -3563,25 +3569,36 @@ fn detector_config_for_resolved_agent(resolved: &ResolvedAgent) -> DetectorConfi
     )
 }
 
-fn bind_report_pid(
+fn bind_report_process(
     entry: &SessionEntry,
     reported_pid: Option<Pid>,
     agent_base: &AgentKind,
-) -> Option<Pid> {
+) -> (Option<Pid>, Option<u64>) {
     if let Some(pid) = reported_pid {
         // PID-bearing hooks are exact claims. If procwatch has not observed the
         // process yet, keep the exact pid so the immediate rescan can either bind
         // it or release it instead of falling back to an ambiguous base-kind match.
-        return Some(pid);
+        let start_identity = entry
+            .observed_agents
+            .iter()
+            .find(|observed| observed.pid == pid && &observed.agent_base == agent_base)
+            .map(|observed| observed.start_identity);
+        return (Some(pid), start_identity);
     }
 
     let mut matching = entry
         .observed_agents
         .iter()
         .filter(|observed| &observed.agent_base == agent_base)
-        .map(|observed| observed.pid);
-    let first = matching.next()?;
-    matching.next().is_none().then_some(first)
+        .map(|observed| (observed.pid, observed.start_identity));
+    let Some(first) = matching.next() else {
+        return (None, None);
+    };
+    if matching.next().is_none() {
+        (Some(first.0), Some(first.1))
+    } else {
+        (None, None)
+    }
 }
 
 fn clear_active_agent(entry: &mut SessionEntry, tombstone: ActiveAgentReport) -> SessionInfo {

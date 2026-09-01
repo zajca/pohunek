@@ -346,6 +346,20 @@ generation that created its output stream. Cancellation is advisory; a final
 transition from a superseded detector is discarded instead of being stamped
 with a replacement runtime's identity.
 
+Procwatch reads Linux `/proc/<root>/stat` `tpgid` as the terminal foreground
+identity. A recognized process-group leader wins; an unrecognized wrapper lets
+the oldest deterministic recognized member of that exact PGID win. A known
+foreground group suppresses first-seen descendant fallback, so returning to a
+shell cannot re-claim a background agent on the next poll. A recent unbound
+hook claim remains valid until its claim TTL because foreground identity alone
+cannot identify its process; process-bound nested claims clear immediately.
+The PTY-root claim is preserved only for a direct-launch agent matching the
+launch provider.
+Transient probe failures retain the last-known PGID and active claim. Provider
+replacement clears report-derived activity and nested native metadata, switches
+the detector manifest, and uses PID plus kernel start identity to reject reused
+PIDs and delayed exit notifications.
+
 ### Agent input injection (TUI quirks)
 
 Sending a prompt into an agent's PTY is not simply "write bytes + `\r`". From

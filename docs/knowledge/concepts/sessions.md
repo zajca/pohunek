@@ -228,6 +228,21 @@ backed by a live process and age out when unbound. `active_agent`,
 filtering, and detector behavior; they do not change the launch `agent` /
 `agent_base`.
 
+Foreground reconciliation selects the recognized process-group leader first;
+when the leader is an unidentified wrapper, it selects a recognized member of
+the same foreground PGID. It never selects a nested agent by kind from another
+process group. Replacing an active agent clears stale native identity metadata
+and switches the detector configuration with the new agent.
+
+A known shell foreground group suppresses descendant fallback after clearing a
+process-bound nested claim, which prevents claim/clear flapping while the agent
+remains in the process tree. A recent unbound hook claim remains valid until its
+claim TTL because the foreground group alone does not identify that process.
+Direct-launch agent sessions preserve a matching PTY-root claim.
+Transient foreground probe failures retain the last-known PGID and claim. PID
+reuse is distinguished by kernel process-start identity, including delayed exit
+notifications from the replaced process.
+
 The same runtime model keeps `cwd` current. A session starts with its launch
 directory, then procwatch reads the cwd of the focus process on each tick: the
 active nested-agent PID when one is bound, otherwise the root PTY child. OSC 7

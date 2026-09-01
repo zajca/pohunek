@@ -313,6 +313,7 @@ mod tests {
 
         assert!(matchers.matches(&ProcessFact {
             pid: 100,
+            pgid: 100,
             ppid: 1,
             start_identity: 100,
             comm: "codex".to_owned(),
@@ -320,6 +321,7 @@ mod tests {
         }));
         assert!(matchers.matches(&ProcessFact {
             pid: 101,
+            pgid: 101,
             ppid: 1,
             start_identity: 101,
             comm: "sleep".to_owned(),
@@ -327,6 +329,7 @@ mod tests {
         }));
         assert!(!matchers.matches(&ProcessFact {
             pid: 102,
+            pgid: 102,
             ppid: 1,
             start_identity: 102,
             comm: "sleep".to_owned(),

@@ -291,7 +291,10 @@ Important fields:
 - `active_agent_base`: optional runtime base kind (`shell`, `codex`, `claude`,
   or `hermes`) for `active_agent`.
 - `active_agent_pid`: optional process id backing `active_agent`. When present,
-  the daemon auto-releases the active agent if that process exits.
+  the daemon validates it with kernel process-start identity and auto-releases
+  the active agent if that exact process exits. Foreground reconciliation uses
+  the terminal PGID as the primary selection hint; structured daemon diagnostics
+  report the selected `focus_pid` and `foreground_pgid` when either changes.
 - `active_agent_session_id` / `active_agent_session_path`: optional native
   metadata for the active nested agent. These fields are display/runtime
   metadata only and do not make the parent session resumable as that nested

@@ -766,6 +766,7 @@ impl SessionRegistry {
             input_rules,
             snapshot,
             active_agent: active_agent.clone(),
+            foreground_process_group: None,
             last_agent_report: active_agent,
             last_native_report: record.native_identity_ordering.clone(),
             observed_agents: Vec::<ObservedAgent>::new(),
@@ -798,6 +799,10 @@ impl SessionRegistry {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "unavailable-record reconstruction keeps one atomic registry transition together"
+    )]
     async fn insert_unavailable_record(
         &self,
         mut record: SessionRecord,
@@ -884,6 +889,7 @@ impl SessionRegistry {
             input_rules,
             snapshot: relaunch,
             active_agent: None,
+            foreground_process_group: None,
             last_agent_report: None,
             last_native_report: record.native_identity_ordering.clone(),
             observed_agents: Vec::new(),
@@ -1216,6 +1222,7 @@ fn active_report_from_info(info: &protocol::SessionInfo) -> Option<ActiveAgentRe
         agent: info.active_agent.clone()?,
         seq: None,
         pid: info.active_agent_pid,
+        start_identity: None,
         reported_at: std::time::Instant::now(),
         activity_reported: false,
     })
@@ -1230,6 +1237,7 @@ fn release_tombstone(
         agent: release.provider.clone(),
         seq: Some(release.sequence),
         pid: Some(release.process.pid),
+        start_identity: Some(release.process.start_identity),
         reported_at: std::time::Instant::now(),
         activity_reported: false,
     }
@@ -1300,6 +1308,7 @@ fn apply_worker_identities(
             agent: identity.provider.clone(),
             seq: Some(identity.sequence),
             pid: Some(identity.process.pid),
+            start_identity: Some(identity.process.start_identity),
             reported_at: std::time::Instant::now(),
             activity_reported: false,
         }),
@@ -2073,6 +2082,7 @@ mod tests {
         let snapshot = identity_snapshot("native-launch");
         let root = crate::procwatch::ProcessFact {
             pid: 50,
+            pgid: 50,
             ppid: 1,
             start_identity: 500,
             comm: "codex".to_owned(),
@@ -2080,6 +2090,7 @@ mod tests {
         };
         let descendant = crate::procwatch::ProcessFact {
             pid: 60,
+            pgid: 50,
             ppid: 50,
             start_identity: 600,
             comm: "claude".to_owned(),
