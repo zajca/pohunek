@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Command, CommandFactory, Parser, Subcommand};
-use protocol::{method, Request};
+use protocol::{method, Request, SessionReadFormat, SessionReadSource};
 
 use crate::error::CliError;
 use crate::paths::Paths;
@@ -1109,6 +1109,24 @@ enum SessionAction {
         json: bool,
     },
 
+    /// Read a bounded terminal capture.
+    Read {
+        /// Session target: `session-id` or `local/session-id`.
+        target: Target,
+        /// Capture source. Defaults to the current visible screen.
+        #[arg(long, value_parser = commands::session::parse_read_source)]
+        source: Option<SessionReadSource>,
+        /// Maximum returned lines.
+        #[arg(long, value_parser = commands::session::parse_read_lines)]
+        lines: Option<u32>,
+        /// Capture encoding.
+        #[arg(long, value_parser = commands::session::parse_read_format)]
+        format: Option<SessionReadFormat>,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Read bounded retained terminal output.
     Output {
         target: Target,
@@ -1373,6 +1391,7 @@ impl SessionAction {
             | SessionAction::Rm { json, .. }
             | SessionAction::Input { json, .. }
             | SessionAction::Screen { json, .. }
+            | SessionAction::Read { json, .. }
             | SessionAction::Output { json, .. }
             | SessionAction::Wait { json, .. }
             | SessionAction::Resume { json, .. }
@@ -1610,6 +1629,28 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     let host = effective_host(&global_host, Some(&target));
                     let target = commands::session::resolve_target(&host, &paths, &target).await?;
                     commands::session::run_screen(&host, &paths, &target, json).await?;
+                }
+                SessionAction::Read {
+                    target,
+                    source,
+                    lines,
+                    format,
+                    json,
+                } => {
+                    let host = effective_host(&global_host, Some(&target));
+                    let target = commands::session::resolve_target(&host, &paths, &target).await?;
+                    commands::session::run_read(
+                        &host,
+                        &paths,
+                        &target,
+                        commands::session::ReadArgs {
+                            source,
+                            lines,
+                            format,
+                        },
+                        json,
+                    )
+                    .await?;
                 }
                 SessionAction::Output {
                     target,

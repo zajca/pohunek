@@ -189,6 +189,7 @@ All params and result type names below refer to structs exported by
 | `session.resize` | `SessionResizeParams` | `SessionResizeResult` | Resizes the PTY on the control connection. |
 | `session.input` | `SessionInputParams` | `SessionInputResult` | Injects text using agent-specific input framing. Hermes accepts at most `MAX_SESSION_INPUT_BYTES` UTF-8 bytes, permits LF and tab but rejects other C0/C1 controls without rewriting them, and returns `session_input_blocked` for fire-and-forget input while approval-visible activity is blocked. Unsafe or oversized Hermes text returns `session_input_rejected`. Every per-session input holds one gate through its complete framing transaction, preventing waited/waited and waited/fire-and-forget interleaving. Every worker plan contains a body fragment with the provider `delay_after_ms` and a separate submit fragment; body and Enter are never merged into one paste burst. With `wait`, every Rust/TypeScript typed call path, including generic `Client.call`, routes through the dedicated helper, normalizes absent `until` to `[]` before wire validation, and rejects `timeout_ms` outside `1..=8000` before transport. The daemon deduplicates targets, acquires a waiter permit, starts the overall deadline before the input gate, and rejects blocked activity with `session_agent_blocked` both before the gate and at the causal boundary, independently of provider fire-and-forget policy. A worker-owned submit delay cannot be activity-revalidated and already-written text cannot be safely retracted from an arbitrary TUI, so waited input rejects nonzero-delay framing with `session_input_wait_unsupported` before writing bytes. Zero-delay framing acquires the exclusive worker write reservation before capturing runtime-scoped activity revision evidence immediately before send. Timeout or shutdown before send cancels the reservation and writes no bytes. After send begins, the exchange is cancellation-shielded and retains the session input gate until the late ACK is consumed. Matching evidence above that lower bound and observed through the fixed deadline succeeds, including evidence between PTY plan flush and worker ACK. After the plan is sent delivery outcome may be unknown, so callers inspect the session and do not retry blindly. Bounded evidence history retains the maximum wait window, so a later same-activity report cannot erase valid pre-deadline evidence. The result includes `activity`, `activity_source`, `runtime`, `activity_epoch`, and decimal-string `activity_revision`; SDK helpers require all five and return `session_input_wait_contract_mismatch` when a same-version daemon ignores `wait` or omits evidence. Clients deduplicate by `(activity_epoch, runtime, activity_revision)`. Runtime exit returns `session_not_running`; replacement returns `session_runtime_changed`; external sessions return `session_external_read_only`; shutdown cancels delivery or waiting. The dedicated connection adds fixed response headroom beyond the overall deadline. |
 | `session.screen` | `SessionScreenParams` | `SessionScreenResult` | Reads one bounded, rendered, runtime-bound terminal snapshot without acquiring attach ownership or resizing the terminal. |
+| `session.read` | `SessionReadParams` | `SessionReadResult` | Reads bounded text from the current rendered terminal without attaching. `lines` accepts `1..=1,000`, defaults to that ceiling, and keeps the newest rendered rows. The complete serialized result is capped by `MAX_SESSION_READ_RESPONSE_BYTES`; byte truncation keeps the newest UTF-8 text and sets `truncated`. ANSI is a reserved request value that v2 always rejects. |
 | `session.output` | `SessionOutputParams` | `SessionOutputResult` | Reads a newest retained tail or continues from an exact runtime-scoped output cursor. A request with `wait_ms` uses a dedicated connection with bounded-wait headroom. |
 | `session.wait` | `SessionWaitParams` | `SessionWaitResult` | Performs one bounded long poll for state, activity, metadata, terminal, output, or runtime change. It always uses a dedicated connection. |
 | `session.report_agent` | `SessionReportAgentParams` | `SessionReportAgentResult` | Hook callback for nested agents running inside an existing session. It records an active-agent claim, optional process binding, and optional active native metadata without changing launch identity or resume binding; ignored reports return `recorded: false`. Claims are reconciled with process facts and can be auto-released when no live backing process remains. |
@@ -382,6 +383,22 @@ with response-envelope headroom. The daemon additionally defaults to at most
 200 rows and 500 columns. Oversize results return the payload-free
 `runtime/session_output_limit_exceeded` error.
 
+`session.read` accepts an optional source (`visible`, `recent`,
+`recent_unwrapped`, or `detection`; default `visible`) and optional `lines`
+(`1..=1000`, default `1000`). Current workers expose only the current rendered
+screen and do not expose scrollback, soft-wrap metadata, or one canonical
+detection text. Requests for `recent`, `recent_unwrapped`, or `detection`
+therefore safely fall back to visible rows and report `source_used: "visible"`.
+`alternate_screen` always reports the captured terminal's real buffer state, so
+callers can recognize alternate-screen fallback without a false history claim.
+Line and byte truncation both retain the newest tail.
+The result carries exact runtime identity after post-snapshot verification,
+canonical decimal-string `revision`, effective `lines_requested`, and
+`truncated`. The daemon caps the complete JSON-serialized result at
+`MAX_SESSION_READ_RESPONSE_BYTES` (1,048,418 bytes). `format: "ansi"` is
+reserved for future raw capture support and currently returns
+`runtime/session_read_ansi_unavailable`.
+
 `session.output` uses an optional nested runtime identity and an exclusive
 cursor. Omitting `after_offset` requests the newest retained tail. A cursor
 requires its exact runtime identity, and `wait_ms` requires a cursor:
@@ -527,7 +544,8 @@ deadline. It does not imply a healthy, idle, or terminal session.
 
 Observation errors are stable and payload-free: `session_terminal_unavailable`,
 `session_has_no_managed_terminal`, `session_runtime_changed`,
-`session_output_limit_exceeded`, `session_wait_limit_exceeded`,
+`session_read_ansi_unavailable`, `session_output_limit_exceeded`,
+`session_wait_limit_exceeded`,
 `session_waiter_limit_reached`, and `worker_feature_unavailable`. Restart from a
 fresh screen/tail after runtime change. A worker on the immediately preceding
 private protocol remains usable for existing lifecycle and attach operations,
@@ -879,8 +897,9 @@ Protocol v2 additionally emits these runtime codes for provider-neutral agent
 and observation behavior: `agent_kind_unsupported`,
 `agent_fork_unsupported`, `session_terminal_unavailable`,
 `session_has_no_managed_terminal`, `session_runtime_changed`,
-`session_output_limit_exceeded`, `session_wait_limit_exceeded`,
-`session_waiter_limit_reached`, `worker_feature_unavailable`,
+`session_read_ansi_unavailable`, `session_output_limit_exceeded`,
+`session_wait_limit_exceeded`,
+`session_waiter_limit_reached`, `worker_feature_unavailable`, and
 `plugin_self_target_denied`, `agent_runtime_unsupported`,
 `session_input_rejected`, `session_input_blocked`, `session_agent_blocked`,
 `session_input_invalid_wait`, `session_input_wait_unsupported`,
@@ -1177,6 +1196,8 @@ Request APIs:
 - `Client::selected_version() -> Option<ProtocolVersion>`: returns the fixed
   per-connection selection after the first response.
 - `Client::session_screen(SessionScreenParams)`: reads one rendered snapshot on
+  the current connection.
+- `Client::session_read(SessionReadParams)`: reads bounded current-screen text on
   the current connection.
 - `Client::session_output(SessionOutputParams)`: uses the current connection for
   an immediate read and automatically opens a dedicated connection when

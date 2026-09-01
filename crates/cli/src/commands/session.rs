@@ -20,10 +20,11 @@ use protocol::{
     method, AgentActivity, CwdSource, ForkCwdMode, OutputOffset, RuntimeGeneration,
     SessionDiffParams, SessionForkParams, SessionId, SessionInfo, SessionInputParams,
     SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
-    SessionOutputParams, SessionRemoveResult, SessionRenameParams, SessionResizeParams,
+    SessionOutputParams, SessionReadFormat, SessionReadParams, SessionReadResult,
+    SessionReadSource, SessionRemoveResult, SessionRenameParams, SessionResizeParams,
     SessionRuntimeIdentity, SessionScreenParams, SessionSetMetadataParams, SessionState,
     SessionStopResult, SessionWaitParams, SessionWarningKind, StateSource, TerminalWatermark,
-    MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
+    MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
 };
 
 use crate::client::Client;
@@ -708,6 +709,84 @@ pub(crate) async fn run_screen(
     Ok(())
 }
 
+/// Arguments for a bounded `session read`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadArgs {
+    pub source: Option<SessionReadSource>,
+    pub lines: Option<u32>,
+    pub format: Option<SessionReadFormat>,
+}
+
+pub(crate) fn parse_read_source(value: &str) -> Result<SessionReadSource, String> {
+    match value {
+        "visible" => Ok(SessionReadSource::Visible),
+        "recent" => Ok(SessionReadSource::Recent),
+        "recent_unwrapped" | "recent-unwrapped" => Ok(SessionReadSource::RecentUnwrapped),
+        "detection" => Ok(SessionReadSource::Detection),
+        _ => Err(
+            "source must be visible, recent, recent_unwrapped (alias: recent-unwrapped), or detection"
+                .to_owned(),
+        ),
+    }
+}
+
+pub(crate) fn parse_read_format(value: &str) -> Result<SessionReadFormat, String> {
+    match value {
+        "text" => Ok(SessionReadFormat::Text),
+        "ansi" => Ok(SessionReadFormat::Ansi),
+        _ => Err("format must be text or ansi".to_owned()),
+    }
+}
+
+pub(crate) fn parse_read_lines(value: &str) -> Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_error| "--lines must be an unsigned 32-bit integer".to_owned())?;
+    if !(1..=MAX_SESSION_READ_LINES).contains(&parsed) {
+        return Err(format!(
+            "--lines must be between 1 and {MAX_SESSION_READ_LINES}"
+        ));
+    }
+    Ok(parsed)
+}
+
+pub(crate) async fn run_read(
+    host: &str,
+    paths: &Paths,
+    target: &Target,
+    args: ReadArgs,
+    json: bool,
+) -> Result<(), CliError> {
+    let params = SessionReadParams::new(
+        SessionId(target.session_id.clone()),
+        args.source,
+        args.lines,
+        args.format,
+    )
+    .map_err(|error| CliError::InvalidObservation {
+        detail: error.to_string(),
+    })?;
+    let mut client = Client::connect(host, paths).await?;
+    let result = client.call::<method::SessionRead>(params).await?;
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        if result.truncated {
+            eprintln!("warning: session read was truncated to the requested line limit");
+        }
+        print!("{}", render_read_text(&result));
+    }
+    Ok(())
+}
+
+fn render_read_text(result: &SessionReadResult) -> String {
+    let mut output = result.text.clone();
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output
+}
+
 /// Cursor and filtering arguments for `session output`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OutputArgs {
@@ -1148,6 +1227,33 @@ fn diff_params(target: &Target, base: Option<String>) -> SessionDiffParams {
 #[cfg(test)]
 fn build_diff_request(target: &Target, base: Option<String>) -> Result<Request, CliError> {
     request_with_params(method::SESSION_DIFF, &diff_params(target, base))
+}
+
+#[cfg(test)]
+fn read_params(
+    target: &Target,
+    source: Option<SessionReadSource>,
+    lines: Option<u32>,
+    format: Option<SessionReadFormat>,
+) -> Result<SessionReadParams, CliError> {
+    SessionReadParams::new(SessionId(target.session_id.clone()), source, lines, format).map_err(
+        |error| CliError::InvalidObservation {
+            detail: error.to_string(),
+        },
+    )
+}
+
+#[cfg(test)]
+fn build_read_request(
+    target: &Target,
+    source: Option<SessionReadSource>,
+    lines: Option<u32>,
+    format: Option<SessionReadFormat>,
+) -> Result<Request, CliError> {
+    request_with_params(
+        method::SESSION_READ,
+        &read_params(target, source, lines, format)?,
+    )
 }
 
 fn render_new_human(info: &SessionInfo) -> String {
@@ -1605,6 +1711,53 @@ mod tests {
             request_timeout_ms: None,
             meta: Vec::new(),
         }
+    }
+
+    #[test]
+    fn read_request_uses_bounded_defaults() {
+        let target = Target {
+            host: Some(LOCAL_HOST.to_owned()),
+            session_id: "session-1".to_owned(),
+        };
+        let request = build_read_request(&target, None, None, None).expect("valid params");
+        assert_request(
+            &request,
+            method::SESSION_READ,
+            json!({"session_id": "session-1"}),
+        );
+    }
+
+    #[test]
+    fn read_request_rejects_lines_above_ceiling() {
+        let target = Target {
+            host: Some(LOCAL_HOST.to_owned()),
+            session_id: "session-1".to_owned(),
+        };
+        let error = build_read_request(
+            &target,
+            Some(SessionReadSource::Recent),
+            Some(MAX_SESSION_READ_LINES + 1),
+            Some(SessionReadFormat::Text),
+        )
+        .expect_err("line limit should be rejected");
+        assert!(error.to_string().contains("1000"));
+    }
+
+    #[test]
+    fn read_parsers_accept_unwrapped_aliases_and_reject_zero_lines() {
+        assert_eq!(
+            parse_read_source("recent_unwrapped").expect("wire-style source"),
+            SessionReadSource::RecentUnwrapped
+        );
+        assert_eq!(
+            parse_read_source("recent-unwrapped").expect("CLI-style alias"),
+            SessionReadSource::RecentUnwrapped
+        );
+        let error = parse_read_source("unknown").expect_err("unknown source");
+        assert!(error.contains("recent_unwrapped"));
+        assert!(error.contains("recent-unwrapped"));
+        parse_read_lines("0").expect_err("zero lines must fail");
+        assert_eq!(parse_read_lines("1").expect("minimum lines"), 1);
     }
 
     #[expect(

@@ -19,6 +19,10 @@ with `pohunek attach`.
 
 Automation can observe a managed terminal without attaching. Use
 `pohunek session screen <target> --json` for one rendered snapshot,
+`pohunek session read <target> --source recent --lines 100 --json` for the newest
+bounded current-screen text. Current workers safely report `source_used:
+"visible"` for recent, unwrapped, and detection requests because they do not
+expose scrollback or soft-wrap metadata; `alternate_screen` remains truthful.
 `pohunek session output <target> --json` for a bounded newest retained tail,
 and `pohunek session wait <target> ... --timeout-ms <1..8000> --json` for one
 bounded state/activity/terminal/output change. Continue output with the exact
