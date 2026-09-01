@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use protocol::{Method, Request};
+use protocol::{Method, Request, SessionInputParams, SessionInputResult};
 use serde_json::Value;
 
 use crate::error::CliError;
@@ -55,6 +55,17 @@ impl Client {
         M: Method,
     {
         self.inner.call::<M>(params).await.map_err(map_client_error)
+    }
+
+    /// Deliver input with dedicated transport when the request waits.
+    pub(crate) async fn session_input(
+        &mut self,
+        params: SessionInputParams,
+    ) -> Result<SessionInputResult, CliError> {
+        self.inner
+            .session_input(params)
+            .await
+            .map_err(map_client_error)
     }
 
     /// Convert this compatibility wrapper into the SDK client.

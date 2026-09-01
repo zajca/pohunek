@@ -254,6 +254,7 @@ async fn procwatch_updates_cwd_after_shell_cd() {
         .input(SessionInputParams {
             session_id: created.id.clone(),
             text: format!("cd {}", target_dir.display()),
+            wait: None,
         })
         .await
         .expect("send cd command");
@@ -327,6 +328,7 @@ async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
         .input(SessionInputParams {
             session_id: observed.id.clone(),
             text: "hello".to_owned(),
+            wait: None,
         })
         .await
         .expect_err("external sessions cannot receive input");

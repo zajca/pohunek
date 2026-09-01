@@ -36,6 +36,7 @@ enum Scenario {
     Ambiguous,
     OutputRuntimeChanged,
     SlowWait,
+    SlowInput,
     WaitTimeout,
     OutputLogSafety,
 }
@@ -287,6 +288,11 @@ fn handle_connection<S>(
     {
         thread::sleep(SLOW_RESPONSE_DELAY);
     }
+    if matches!(scenario, Scenario::SlowInput)
+        && request.method() == protocol::method::SESSION_INPUT
+    {
+        thread::sleep(SLOW_RESPONSE_DELAY);
+    }
     let response = fixture_response(&request, scenario);
     let mut stream = reader.into_inner();
     let write_result = writeln!(
@@ -294,7 +300,7 @@ fn handle_connection<S>(
         "{}",
         serde_json::to_string(&response).expect("serialize response")
     );
-    if !matches!(scenario, Scenario::SlowWait) {
+    if !matches!(scenario, Scenario::SlowWait | Scenario::SlowInput) {
         write_result.expect("write fixture response");
     }
 }
@@ -838,6 +844,44 @@ fn process_signals_cancel_local_wait_while_wire_timeout_remains_bounded() {
             wait_request.params()["timeout_ms"],
             protocol::MAX_SESSION_WAIT_MS
         );
+    }
+}
+
+#[test]
+fn process_signals_report_unknown_delivery_for_waited_input_without_retry_hint() {
+    for (signal, signal_name) in [(libc::SIGINT, "SIGINT"), (libc::SIGTERM, "SIGTERM")] {
+        let home = TestHome::new();
+        let fixture = FixtureDaemon::start(&home.socket(), Scenario::SlowInput);
+        let mut child = home
+            .command()
+            .args([
+                "session",
+                "input",
+                SESSION_ID,
+                "approval response",
+                "--until",
+                "idle",
+                "--timeout",
+                "8000",
+                "--json",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn pohunek");
+        wait_for_method(&fixture, protocol::method::SESSION_INPUT);
+        send_signal(&mut child, signal, signal_name);
+        let output = child.wait_with_output().expect("wait for interrupted CLI");
+        let requests = fixture.finish();
+        let document = assert_json_error(&output, "session_input_interrupted");
+        assert!(document["err"].get("recover").is_none());
+        assert!(document["err"]["msg"]
+            .as_str()
+            .expect("typed message")
+            .contains("delivery outcome is unknown"));
+        assert!(requests
+            .iter()
+            .any(|request| request.method() == protocol::method::SESSION_INPUT));
     }
 }
 

@@ -34,6 +34,7 @@ const RESIZED_COLS = 100;
 const RESIZED_ROWS = 30;
 const MISMATCHED_PROTOCOL_VERSION = PROTOCOL_VERSION + 1;
 const SOCKET_END_TIMEOUT_MS = 5_000;
+const INPUT_WAITER_POLL_INTERVAL_MS = 1;
 const NON_UTF8_PAYLOAD = Uint8Array.of(0x00, 0xff, 0x80, 0x61, 0xc3, 0x28);
 const ABOVE_MAX_SAFE_U64 = "9007199254740993";
 const U64_MAX_WIRE = "18446744073709551615";
@@ -102,6 +103,229 @@ describe("@pohunek/testkit fixture daemon", () => {
 
       await client.close();
       await subscriber.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("session input wait returns runtime-scoped activity evidence", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-wait") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const created = await client.call("session.new", {
+        agent: "shell",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      });
+      setTimeout(() => {
+        daemon.scenario.setAgentState(created.id, "idle", "report");
+      }, 20);
+
+      const result = await client.call("session.input", {
+        session_id: created.id,
+        text: "hello",
+        wait: { until: ["idle"], timeout_ms: 200 },
+      });
+
+      expect(result.accepted).toBe(true);
+      expect(result.activity).toBe("idle");
+      expect(result.activity_source).toBe("report");
+      expect(result.runtime?.runtime_id).toBe(`runtime-${created.id}`);
+      expect(result.activity_epoch?.startsWith("d-testkit-")).toBe(true);
+      expect(result.activity_revision).toBe("1");
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("session input wait accepts absent targets as the default target set", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-default-targets") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const created = await client.call("session.new", {
+        agent: "shell",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      });
+      setTimeout(() => {
+        daemon.scenario.setAgentState(created.id, "idle", "report");
+      }, 20);
+
+      const result = await client.call("session.input", {
+        session_id: created.id,
+        text: "hello",
+        wait: { timeout_ms: 200 },
+      });
+
+      expect(result.activity).toBe("idle");
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("session input wait rejects invalid timeout contracts", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-invalid") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const created = await client.call("session.new", {
+        agent: "codex",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      });
+
+      await expectProtocolError(client.call("session.input", {
+        session_id: created.id,
+        text: "hello",
+        wait: { until: ["idle"], timeout_ms: 0 },
+      }), "session_input_invalid_wait");
+      await expectProtocolError(client.call("session.input", {
+        session_id: created.id,
+        text: "hello",
+        wait: { until: ["idle"], timeout_ms: MAX_SESSION_WAIT_MS + 1 },
+      }), "session_wait_limit_exceeded");
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("session input wait rejects delayed provider framing before delivery", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-delayed") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const created = await client.call("session.new", {
+        agent: "codex",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      });
+
+      await expectProtocolError(client.call("session.input", {
+        session_id: created.id,
+        text: "hello",
+        wait: {},
+      }), "session_input_wait_unsupported");
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("session input wait returns a typed timeout without matching activity", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-timeout") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const created = await client.call("session.new", {
+        agent: "shell",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      });
+
+      const error = await client.call("session.input", {
+        session_id: created.id,
+        text: "hello",
+        wait: { until: ["idle"], timeout_ms: 10 },
+      }).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(ClientError);
+      const structured = (error as ClientError).toProtocolError();
+      expect(structured.code).toBe("session_input_timeout");
+      expect(structured.recover).toContain("inspect the current session");
+      expect(structured.recover).toContain("do not retry blindly");
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("session input wait rejects blocked activity before writing PTY bytes", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-blocked") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const created = await client.call("session.new", {
+        agent: "shell",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      });
+      daemon.scenario.setAgentState(created.id, "blocked", "report");
+
+      await expectProtocolError(client.call("session.input", {
+        session_id: created.id,
+        text: "must-not-write",
+        wait: { until: ["idle"], timeout_ms: 200 },
+      }), "session_agent_blocked");
+      expect(daemon.scenario.inputs(created.id)).toEqual([]);
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("session input wait wakes on stop, remove, and runtime replacement", async () => {
+    for (const lifecycle of ["stop", "remove", "replace"] as const) {
+      const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath(`input-${lifecycle}`) } });
+      try {
+        const client = await connectLocal(requireUnixSocket(daemon));
+        const control = await connectLocal(requireUnixSocket(daemon));
+        const created = await client.call("session.new", {
+          agent: "shell",
+          cols: TEST_COLS,
+          rows: TEST_ROWS,
+        });
+        const waiting = client.call("session.input", {
+          session_id: created.id,
+          text: `wait-${lifecycle}`,
+          wait: { until: ["idle"], timeout_ms: 500 },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        if (lifecycle === "stop") {
+          await control.call("session.stop", created.id);
+        } else if (lifecycle === "remove") {
+          daemon.scenario.removeSession(created.id);
+        } else {
+          daemon.scenario.replaceRuntime(created.id);
+        }
+
+        const expected = lifecycle === "stop"
+          ? "session_not_running"
+          : lifecycle === "remove"
+            ? "session_not_found"
+            : "session_runtime_changed";
+        await expectProtocolError(waiting, expected);
+        await control.close();
+        await client.close();
+      } finally {
+        await daemon.close();
+      }
+    }
+  });
+
+  test("fixture shutdown cancels active session input waiters", async () => {
+    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-shutdown") } });
+    try {
+      const client = await connectLocal(requireUnixSocket(daemon));
+      const created = await client.call("session.new", {
+        agent: "shell",
+        cols: TEST_COLS,
+        rows: TEST_ROWS,
+      });
+      const waiting = client.call("session.input", {
+        session_id: created.id,
+        text: "wait for shutdown",
+        wait: { until: ["blocked"], timeout_ms: MAX_SESSION_WAIT_MS },
+      }).catch((error: unknown) => error);
+      await withTimeout(
+        waitForActiveInputWaiter(daemon),
+        SOCKET_END_TIMEOUT_MS,
+        "fixture input waiter registration",
+      );
+      expect(daemon.activeInputWaiterCount).toBe(1);
+
+      await daemon.close();
+
+      expect(daemon.activeInputWaiterCount).toBe(0);
+      expect(await waiting).toBeInstanceOf(ClientError);
+      await client.close();
     } finally {
       await daemon.close();
     }
@@ -898,6 +1122,12 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, action: string):
       },
     );
   });
+}
+
+async function waitForActiveInputWaiter(daemon: FixtureDaemonHandle): Promise<void> {
+  while (daemon.activeInputWaiterCount === 0) {
+    await new Promise((resolve) => setTimeout(resolve, INPUT_WAITER_POLL_INTERVAL_MS));
+  }
 }
 
 async function expectClientError(promise: Promise<unknown>): Promise<ClientError> {

@@ -1,4 +1,6 @@
 import {
+  MAX_RUNTIME_ID_BYTES,
+  MAX_SESSION_WAIT_MS,
   PROTOCOL_VERSION,
   SUPPORTED_PROTOCOL_VERSIONS,
   type Methods,
@@ -7,8 +9,12 @@ import {
   type ProtocolVersionRange,
   type SessionOutputParams,
   type SessionOutputResult,
+  type SessionInputParams,
+  type SessionInputResult,
+  type SessionInputWait,
   type SessionScreenParams,
   type SessionScreenResult,
+  type StateSource,
   type SessionWaitParams,
   type SessionWaitResult,
 } from "@pohunek/protocol";
@@ -22,8 +28,17 @@ import { WsTransport } from "./transport-ws";
 
 // A 128-bit prefix keeps independently started SDK clients collision-resistant.
 const RUN_TOKEN_RANDOM_BYTES = 16;
-// Dedicated long polls need transport cleanup headroom beyond the wire timeout.
+// Dedicated calls need response headroom beyond the daemon's overall wire deadline.
 const DEDICATED_REQUEST_HEADROOM_MS = 1_000;
+const MAX_U64 = 18_446_744_073_709_551_615n;
+const UTF8_ENCODER = new TextEncoder();
+const STATE_SOURCES = new Set<StateSource>([
+  "osc_title",
+  "osc_progress",
+  "screen",
+  "process",
+  "report",
+]);
 const RUN_TOKEN = `${randomToken()}${Date.now().toString(16)}`;
 let nextSequence = 0;
 
@@ -73,6 +88,16 @@ export class Client {
     method: K,
     params: Methods[K]["params"],
   ): Promise<Methods[K]["output"]> {
+    if (method === "session.input" && isWaitingSessionInput(params)) {
+      return this.sessionInput(params);
+    }
+    return this.callDirect(method, params);
+  }
+
+  private async callDirect<K extends keyof Methods>(
+    method: K,
+    params: Methods[K]["params"],
+  ): Promise<Methods[K]["output"]> {
     const request: Request = {
       v: SUPPORTED_PROTOCOL_VERSIONS,
       id: nextRequestId(String(method)),
@@ -92,6 +117,23 @@ export class Client {
       return this.callDedicated("session.output", params, params.wait_ms);
     }
     return this.call("session.output", params);
+  }
+
+  public async sessionInput(params: SessionInputParams): Promise<SessionInputResult> {
+    if (params.wait !== undefined) {
+      const wait = {
+        ...params.wait,
+        until: [...(params.wait.until ?? [])],
+      };
+      const timeoutMs = validatedInputWaitTimeout(wait);
+      const result = await this.callDedicated(
+        "session.input",
+        { ...params, wait },
+        timeoutMs,
+      );
+      return validateInputWaitResult(wait.until, result);
+    }
+    return this.callDirect("session.input", params);
   }
 
   public async sessionWait(params: SessionWaitParams): Promise<SessionWaitResult> {
@@ -222,7 +264,7 @@ export class Client {
     this.selectedVersion = received;
   }
 
-  private async callDedicated<K extends "session.output" | "session.wait">(
+  private async callDedicated<K extends "session.input" | "session.output" | "session.wait">(
     method: K,
     params: Methods[K]["params"],
     wireTimeoutMs: number,
@@ -237,7 +279,7 @@ export class Client {
       this.remoteHost,
     );
     try {
-      return await client.call(method, params);
+      return await client.callDirect(method, params);
     } finally {
       await client.close();
     }
@@ -277,6 +319,87 @@ export class Client {
       throw ClientError.json(error);
     }
   }
+}
+
+function isWaitingSessionInput(value: unknown): value is SessionInputParams & { wait: SessionInputWait } {
+  return typeof value === "object"
+    && value !== null
+    && "wait" in value
+    && (value as { wait?: unknown }).wait !== undefined;
+}
+
+function validatedInputWaitTimeout(wait: SessionInputWait): number {
+  const timeoutMs = wait.timeout_ms ?? MAX_SESSION_WAIT_MS;
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+    throw ClientError.protocol({
+      class: "runtime",
+      code: "session_input_invalid_wait",
+      msg: "timeout_ms must be greater than zero",
+    });
+  }
+  if (timeoutMs > MAX_SESSION_WAIT_MS) {
+    throw ClientError.protocol({
+      class: "runtime",
+      code: "session_wait_limit_exceeded",
+      msg: "the requested wait exceeds the configured maximum",
+    });
+  }
+  return timeoutMs;
+}
+
+function validateInputWaitResult(
+  until: NonNullable<SessionInputWait["until"]>,
+  value: unknown,
+): SessionInputResult {
+  if (typeof value !== "object" || value === null) {
+    throw ClientError.inputWaitContract("the daemon returned a non-object result");
+  }
+  const result = value as Record<string, unknown>;
+  if (result["accepted"] !== true) {
+    throw ClientError.inputWaitContract("the daemon did not confirm accepted delivery");
+  }
+  const activity = result["activity"];
+  const targets = until.length === 0 ? ["idle", "blocked"] : until;
+  if (typeof activity !== "string" || !targets.includes(activity)) {
+    throw ClientError.inputWaitContract(
+      "the response activity did not match the requested wait target",
+    );
+  }
+  if (!isStateSource(result["activity_source"])) {
+    throw ClientError.inputWaitContract("the response omitted a valid activity source");
+  }
+  if (!isRuntimeIdentity(result["runtime"])) {
+    throw ClientError.inputWaitContract("the response omitted a valid runtime identity");
+  }
+  if (typeof result["activity_epoch"] !== "string" || result["activity_epoch"].length === 0) {
+    throw ClientError.inputWaitContract("the response omitted a valid activity epoch");
+  }
+  if (!isCanonicalDecimal(result["activity_revision"])) {
+    throw ClientError.inputWaitContract("the response omitted a valid activity revision");
+  }
+  return value as SessionInputResult;
+}
+
+function isRuntimeIdentity(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const runtime = value as Record<string, unknown>;
+  return typeof runtime["runtime_id"] === "string"
+    && runtime["runtime_id"].length > 0
+    && UTF8_ENCODER.encode(runtime["runtime_id"]).byteLength <= MAX_RUNTIME_ID_BYTES
+    && !/\p{Cc}/u.test(runtime["runtime_id"])
+    && isCanonicalDecimal(runtime["runtime_generation"]);
+}
+
+function isStateSource(value: unknown): value is StateSource {
+  return typeof value === "string" && STATE_SOURCES.has(value as StateSource);
+}
+
+function isCanonicalDecimal(value: unknown): boolean {
+  return typeof value === "string"
+    && /^(0|[1-9][0-9]*)$/.test(value)
+    && BigInt(value) <= MAX_U64;
 }
 
 function applyRequestOrigin(request: Request, configured: RequestOrigin | undefined): Request {

@@ -152,6 +152,43 @@ impl ProtocolError {
         )
     }
 
+    /// The canonical rejection for confirmed delivery into a blocked agent.
+    #[must_use]
+    pub fn session_agent_blocked() -> Self {
+        Self::observation(
+            "session_agent_blocked",
+            "the agent awaits owner action; delivery cannot be confirmed",
+        )
+    }
+
+    /// The canonical rejection for a bounded input wait whose deadline elapsed.
+    #[must_use]
+    pub fn session_input_timeout() -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "session_input_timeout",
+            "the overall input deadline elapsed before delivery and requested activity were confirmed",
+            Some(
+                "delivery outcome may be unknown; inspect the current session before deciding whether to resend, and do not retry blindly"
+                    .to_owned(),
+            ),
+        )
+    }
+
+    /// The canonical rejection for delayed framing that cannot safely confirm input.
+    #[must_use]
+    pub fn session_input_wait_unsupported() -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "session_input_wait_unsupported",
+            "bounded input confirmation is unavailable for agents that require delayed submit framing",
+            Some(
+                "use fire-and-forget input only when safe, or select a zero-delay agent profile"
+                    .to_owned(),
+            ),
+        )
+    }
+
     /// The canonical rejection for a missing or incompatible managed runtime.
     #[must_use]
     pub fn agent_runtime_unsupported() -> Self {

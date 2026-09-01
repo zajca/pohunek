@@ -36,6 +36,47 @@ Hermes is visibly blocked on owner approval. In JSON mode, stdout contains
 exactly one versioned document with either `ok` or `err`; diagnostics remain on
 stderr.
 
+`pohunek session input s-01J00000000000000000000000 'Continue.' --until idle --timeout 1000`
+can confirm delivery for an
+agent profile whose submit framing has no delay. The daemon first validates the
+whole wait contract, so zero or over-limit timeouts cannot deliver text;
+duplicate `--until` values are deduplicated in first-occurrence order; omitted
+targets default to `idle` and `blocked`; the timeout range is `1..8000` ms
+(default 8000). The timeout is one overall deadline measured before the
+per-session input gate, so gate contention, the two-fragment worker-plan
+acknowledgement, and activity waiting all consume it. Every input plan preserves
+the body fragment and separate submit fragment; fire-and-forget keeps the
+provider delay on the body fragment. A waited request rejects blocked activity
+as `session_agent_blocked` regardless of provider policy. Because the daemon
+cannot revalidate activity during a worker-owned delay or safely retract text
+already consumed by an arbitrary TUI, waited input rejects delayed framing with
+`session_input_wait_unsupported` before any bytes are written. Zero-delay waited
+input reserves the exclusive worker write first, then captures its causal
+boundary immediately before the prepared atomic two-fragment plan starts. A
+timeout or shutdown while reserving the worker cancels the unsent plan without
+PTY bytes. After send starts, the exchange continues consuming its late
+acknowledgement and holds the per-session gate to keep the shared control stream
+synchronized; after the plan is sent, delivery
+outcome may be unknown, so callers inspect the session and do not retry blindly. Waiting
+acquires one observation waiter slot and returns exact post-submit evidence as
+`activity`, `activity_source`, `runtime`, `activity_epoch`, and decimal-string
+`activity_revision`. Clients deduplicate by `(activity_epoch, runtime,
+activity_revision)` because a daemon reconnect changes the epoch while retaining
+the worker runtime. Rapid matching transitions remain valid even when the latest
+activity changes again, arrives before submit ACK, or the event receiver lags. The wait returns
+`session_not_running` if that runtime exits, `session_runtime_changed` if it is
+replaced, `session_input_wait_unsupported` for delayed provider framing, and
+`session_input_timeout` when delivery acknowledgement or a target does not
+arrive before the deadline. Rust and TypeScript
+SDK helpers validate the timeout locally and fail closed with
+`session_input_wait_contract_mismatch` when a daemon ignores `wait` or omits
+runtime-scoped evidence. Its recovery guidance says to inspect the session rather
+than blindly resending input because delivery may already have happened.
+Generic typed Rust and TypeScript `Client.call` paths route waited input through
+the same helper, so they cannot bypass this validation. SIGINT or SIGTERM during
+a waited CLI input returns JSON code `session_input_interrupted` without a retry
+hint because delivery outcome is unknown.
+
 `pohunek session diff <target> [--base <ref>] [--json]` prints a unified diff
 of a session's worktree against a base ref: raw diff text on stdout by
 default, or the structured `SessionDiffResult` (`diff`, `base`, `truncated`)
